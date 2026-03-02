@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/onelf",
+  "crates/onelf-format",
+  "crates/onelf-rt"
+]
+default-members = ["crates/onelf"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/QaidVoid/onelf"
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1

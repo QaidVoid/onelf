@@ -1,0 +1,9 @@
+[package]
+name = "onelf-format"
+description = "Binary format definitions for onelf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
