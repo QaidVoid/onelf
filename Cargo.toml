@@ -21,4 +21,10 @@ panic = "abort"
 codegen-units = 1
 
 [workspace.dependencies]
+blake3 = "1.8"
+indicatif = "0.18"
+jwalk = "0.8"
+onelf-format = { path = "crates/onelf-format" }
+rayon = "1.11"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = "0.13"
