@@ -116,27 +116,13 @@ pub fn execute_fuse(
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    let strict = std::env::var("ONELF_FUSE_STRICT").is_ok_and(|v| v == "1");
-
     if !mount::fusermount3_available() {
-        if strict {
-            eprintln!("onelf-rt: fusermount3 not found (ONELF_FUSE_STRICT=1, not falling back)");
-            std::process::exit(1);
-        }
-        eprintln!("onelf-rt: fusermount3 not found, falling back to cache mode");
         return false;
     }
 
     let mountpoint = match create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id) {
         Some(m) => m,
-        None => {
-            if strict {
-                eprintln!("onelf-rt: failed to create mountpoint");
-                std::process::exit(1);
-            }
-            eprintln!("onelf-rt: failed to create mountpoint, falling back to cache mode");
-            return false;
-        }
+        None => return false,
     };
 
     let fuse_fd = match mount::fuse_mount(&mountpoint) {
@@ -145,13 +131,8 @@ pub fn execute_fuse(
             let _ = rustix::io::fcntl_setfd(&fd, FdFlags::CLOEXEC);
             fd
         }
-        Err(e) => {
+        Err(_) => {
             let _ = std::fs::remove_dir(&mountpoint);
-            if strict {
-                eprintln!("onelf-rt: FUSE mount failed: {e}");
-                std::process::exit(1);
-            }
-            eprintln!("onelf-rt: FUSE mount failed: {e}, falling back to cache mode");
             return false;
         }
     };
@@ -190,11 +171,6 @@ pub fn execute_fuse(
         Ok(p) => p,
         Err(_) => {
             cleanup_mountpoint(&mountpoint);
-            if strict {
-                eprintln!("onelf-rt: pipe creation failed");
-                std::process::exit(1);
-            }
-            eprintln!("onelf-rt: pipe creation failed, falling back to cache mode");
             return false;
         }
     };

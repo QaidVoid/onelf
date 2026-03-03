@@ -58,36 +58,45 @@ fn main() {
         final_args.extend_from_slice(&args[1..]);
     }
 
-    if ep_memfd {
-        let data = match loader::read_payload_blocks(
+    // ONELF_MODE: "memfd", "fuse", or "cache" to force a specific mode.
+    // Default order: memfd (if eligible) -> fuse -> cache
+    let forced_mode = std::env::var("ONELF_MODE").ok();
+    let force = forced_mode.as_deref();
+
+    // Memfd mode: single static binary, no libs needed
+    if force == Some("memfd") || (force.is_none() && ep_memfd) {
+        if let Ok(data) = loader::read_payload_blocks(
             &mut pkg.file,
             pkg.footer.payload_offset,
             &target_blocks,
             pkg.dict.as_deref(),
         ) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("onelf-rt: failed to read payload: {e}");
-                std::process::exit(1);
+            let lib_paths_str = pkg.manifest.lib_dirs().join(":");
+            env::setup_env("", argv0, &exec_path, &ep_name, "memfd", &lib_paths_str);
+
+            if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
+                if force == Some("memfd") {
+                    eprintln!("onelf-rt: memfd execution failed: {e}");
+                    std::process::exit(1);
+                }
             }
-        };
-
-        let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-        env::setup_env("", argv0, &exec_path, &ep_name, "memfd", &lib_paths_str);
-
-        if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
-            eprintln!("onelf-rt: memfd execution failed: {e}");
+        } else if force == Some("memfd") {
+            eprintln!("onelf-rt: failed to read payload for memfd");
             std::process::exit(1);
         }
     }
 
-    // Try FUSE mode if requested
-    if std::env::var("ONELF_FUSE").is_ok_and(|v| v == "1") {
+    // FUSE mode: mount package as filesystem (default for non-memfd)
+    if force != Some("cache") {
         fuse::execute_fuse(&mut pkg, ep_idx, argv0, &exec_path, &final_args);
         // Only reaches here if FUSE fell back (fusermount3 unavailable)
+        if force == Some("fuse") {
+            eprintln!("onelf-rt: FUSE mode unavailable");
+            std::process::exit(1);
+        }
     }
 
-    // Cache extraction mode
+    // Cache extraction mode (fallback)
     let pkg_dir = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
         Err(e) => {
