@@ -1,6 +1,7 @@
 mod cache;
 mod env;
 mod loader;
+mod memfd;
 mod multicall;
 
 use std::os::unix::process::CommandExt;
@@ -36,6 +37,9 @@ fn main() {
         .to_string();
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
     let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
+    let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible();
+
+    let target_blocks = pkg.manifest.entries[ep_target_entry].blocks.clone();
 
     let ep_args_str = pkg
         .manifest
@@ -51,6 +55,29 @@ fn main() {
     let mut final_args = extra_args;
     if args.len() > 1 {
         final_args.extend_from_slice(&args[1..]);
+    }
+
+    if ep_memfd {
+        let data = match loader::read_payload_blocks(
+            &mut pkg.file,
+            pkg.footer.payload_offset,
+            &target_blocks,
+            pkg.dict.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("onelf-rt: failed to read payload: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let lib_paths_str = pkg.manifest.lib_dirs().join(":");
+        env::setup_env("", argv0, &exec_path, &ep_name, "memfd", &lib_paths_str);
+
+        if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
+            eprintln!("onelf-rt: memfd execution failed: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Cache extraction mode

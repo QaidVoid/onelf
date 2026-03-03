@@ -8,5 +8,5 @@ repository.workspace = true
 
 [dependencies]
 onelf-format = { workspace = true }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "mm"] }
 zstd = { version = "0.13", default-features = false }
