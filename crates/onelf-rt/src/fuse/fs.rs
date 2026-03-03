@@ -1,3 +1,9 @@
+//! FUSE filesystem operations.
+//!
+//! Implements the low-level FUSE ops (lookup, getattr, readdir, read, etc.)
+//! against the in-memory manifest. File reads decompress payload blocks on
+//! demand with a per-inode block cache and sequential prefetch.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;

@@ -81,6 +81,12 @@ fn main() {
         }
     }
 
+    // Try FUSE mode if requested
+    if std::env::var("ONELF_FUSE").is_ok_and(|v| v == "1") {
+        fuse::execute_fuse(&mut pkg, ep_idx, argv0, &exec_path, &final_args);
+        // Only reaches here if FUSE fell back (fusermount3 unavailable)
+    }
+
     // Cache extraction mode
     let pkg_dir = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
