@@ -1,5 +1,6 @@
 mod cache;
 mod env;
+mod fuse;
 mod loader;
 mod memfd;
 mod multicall;
