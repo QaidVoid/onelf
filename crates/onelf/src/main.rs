@@ -1,3 +1,4 @@
+mod bundle;
 mod cache;
 mod compress;
 mod extract;
@@ -102,6 +103,36 @@ enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
+
+    /// Bundle shared library dependencies into a directory
+    BundleLibs {
+        /// Directory containing the application to bundle
+        directory: PathBuf,
+
+        /// Specific binary to analyze (default: scan all ELF files)
+        #[arg(long)]
+        target: Option<PathBuf>,
+
+        /// Where to copy libs, relative to DIRECTORY
+        #[arg(long, default_value = "lib")]
+        lib_dir: PathBuf,
+
+        /// Exclude libs matching pattern (prefix match, repeatable)
+        #[arg(long)]
+        exclude: Vec<String>,
+
+        /// Additional directories to search for libraries (repeatable)
+        #[arg(long)]
+        search_path: Vec<PathBuf>,
+
+        /// Show what would be copied without copying
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Don't resolve transitive dependencies
+        #[arg(long)]
+        no_recursive: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -191,6 +222,23 @@ fn main() {
             CacheAction::Clear => cache::cache_clear(),
             CacheAction::Gc { max_age } => cache::cache_gc(max_age),
         },
+        Commands::BundleLibs {
+            directory,
+            target,
+            lib_dir,
+            exclude,
+            search_path,
+            dry_run,
+            no_recursive,
+        } => bundle::bundle_libs(&bundle::BundleOptions {
+            directory,
+            target,
+            lib_dir,
+            exclude,
+            search_path,
+            dry_run,
+            recursive: !no_recursive,
+        }),
     };
 
     if let Err(e) = result {
