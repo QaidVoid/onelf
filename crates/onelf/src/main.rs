@@ -1,8 +1,16 @@
+mod cache;
 mod compress;
+mod extract;
+mod info;
+mod list;
 mod pack;
 
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use onelf_format::WorkingDir;
+
+const RUNTIME_BINARY: &[u8] = include_bytes!(env!("ONELF_RT_PATH"));
 
 #[derive(Parser)]
 #[command(name = "onelf", about = "Single-binary packaging tool", version)]
@@ -13,25 +21,180 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Pack a directory into a single executable
     Pack {
+        /// Directory to pack
         directory: PathBuf,
+
+        /// Output file path
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Relative path to the command within the directory
         #[arg(long)]
         command: String,
+
+        /// Package name (for identification, defaults to command basename)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Additional entrypoints (name=path)
+        #[arg(long, value_parser = parse_entrypoint)]
+        entrypoint: Vec<(String, String)>,
+
+        /// Default entrypoint name
+        #[arg(long)]
+        default_entrypoint: Option<String>,
+
+        /// Library directories to add to LD_LIBRARY_PATH (repeatable)
+        #[arg(long)]
+        lib_dir: Vec<String>,
+
+        /// Zstd compression level (0-22)
+        #[arg(long, default_value = "12")]
+        level: i32,
+
+        /// Build a shared zstd dictionary
+        #[arg(long)]
+        dict: bool,
+
+        /// Mark default entrypoint as memfd-eligible
+        #[arg(long)]
+        memfd: bool,
+
+        /// Force cache mode (disable memfd)
+        #[arg(long)]
+        no_memfd: bool,
+
+        /// Working directory strategy
+        #[arg(long, default_value = "inherit")]
+        working_dir: WorkingDirArg,
     },
+
+    /// Show metadata about a packed binary
+    Info {
+        /// Path to the onelf binary
+        binary: PathBuf,
+    },
+
+    /// List all files in a packed binary
+    List {
+        /// Path to the onelf binary
+        binary: PathBuf,
+    },
+
+    /// Extract files from a packed binary
+    Extract {
+        /// Path to the onelf binary
+        binary: PathBuf,
+
+        /// Output path (directory, file, or "-" for stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Extract only specific files by path (repeatable)
+        #[arg(long)]
+        file: Vec<String>,
+    },
+
+    /// Manage the onelf cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// List cached packages
+    List,
+    /// Remove all cached data
+    Clear,
+    /// Garbage collect old cache entries
+    Gc {
+        /// Maximum age in days
+        #[arg(long, default_value = "30")]
+        max_age: u64,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+enum WorkingDirArg {
+    Inherit,
+    Package,
+    Command,
+}
+
+fn parse_entrypoint(s: &str) -> Result<(String, String), String> {
+    let (name, path) = s.split_once('=').ok_or("expected format: name=path")?;
+    Ok((name.to_string(), path.to_string()))
 }
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
+
+    let result = match cli.command {
         Commands::Pack {
             directory,
             output,
             command,
+            name,
+            entrypoint,
+            default_entrypoint,
+            lib_dir,
+            level,
+            dict,
+            memfd,
+            no_memfd,
+            working_dir,
         } => {
-            println!("Packing {} -> {}", directory.display(), output.display());
-            println!("Command: {}", command);
+            let memfd_opt = if no_memfd {
+                Some(false)
+            } else if memfd {
+                Some(true)
+            } else {
+                None
+            };
+
+            let wd = match working_dir {
+                WorkingDirArg::Inherit => WorkingDir::Inherit,
+                WorkingDirArg::Package => WorkingDir::PackageRoot,
+                WorkingDirArg::Command => WorkingDir::EntrypointParent,
+            };
+
+            pack::pack(
+                &pack::PackOptions {
+                    directory,
+                    output,
+                    command,
+                    name,
+                    entrypoints: entrypoint,
+                    default_entrypoint,
+                    lib_dirs: lib_dir,
+                    level,
+                    use_dict: dict,
+                    memfd: memfd_opt,
+                    working_dir: wd,
+                },
+                RUNTIME_BINARY,
+            )
         }
+        Commands::Info { binary } => info::info(&binary),
+        Commands::List { binary } => list::list(&binary),
+        Commands::Extract {
+            binary,
+            output,
+            file,
+        } => extract::extract(&binary, output.as_deref(), &file),
+        Commands::Cache { action } => match action {
+            CacheAction::List => cache::cache_list(),
+            CacheAction::Clear => cache::cache_clear(),
+            CacheAction::Gc { max_age } => cache::cache_gc(max_age),
+        },
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
 }
