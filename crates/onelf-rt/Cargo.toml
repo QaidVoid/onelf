@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+onelf-format = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
+zstd = { version = "0.13", default-features = false }
