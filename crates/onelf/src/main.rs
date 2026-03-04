@@ -4,6 +4,7 @@ mod compress;
 mod extract;
 mod info;
 mod list;
+mod metadata;
 mod pack;
 
 use std::path::PathBuf;
@@ -96,6 +97,34 @@ enum Commands {
         /// Extract only specific files by path (repeatable)
         #[arg(long)]
         file: Vec<String>,
+    },
+
+    /// Extract icon from a packed binary
+    Icon {
+        /// Path to the onelf binary
+        binary: PathBuf,
+
+        /// Entrypoint name (default: default entrypoint)
+        #[arg(long)]
+        entrypoint: Option<String>,
+
+        /// Output path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Extract desktop file from a packed binary
+    Desktop {
+        /// Path to the onelf binary
+        binary: PathBuf,
+
+        /// Entrypoint name (default: default entrypoint)
+        #[arg(long)]
+        entrypoint: Option<String>,
+
+        /// Output path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 
     /// Manage the onelf cache
@@ -217,6 +246,16 @@ fn main() {
             output,
             file,
         } => extract::extract(&binary, output.as_deref(), &file),
+        Commands::Icon {
+            binary,
+            entrypoint,
+            output,
+        } => metadata::icon(&binary, entrypoint.as_deref(), output.as_deref()),
+        Commands::Desktop {
+            binary,
+            entrypoint,
+            output,
+        } => metadata::desktop(&binary, entrypoint.as_deref(), output.as_deref()),
         Commands::Cache { action } => match action {
             CacheAction::List => cache::cache_list(),
             CacheAction::Clear => cache::cache_clear(),

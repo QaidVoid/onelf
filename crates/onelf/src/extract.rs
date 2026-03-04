@@ -24,7 +24,7 @@ pub fn extract(binary: &Path, output: Option<&Path>, files: &[String]) -> io::Re
     extract_selective(binary, output, files)
 }
 
-fn decompress_entry(
+pub(crate) fn decompress_entry(
     file: &mut File,
     footer: &onelf_format::Footer,
     entry: &onelf_format::Entry,

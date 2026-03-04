@@ -3,6 +3,7 @@ mod env;
 mod fuse;
 mod loader;
 mod memfd;
+mod metadata;
 mod multicall;
 
 use std::os::unix::process::CommandExt;
@@ -36,6 +37,12 @@ fn main() {
         .manifest
         .get_string(pkg.manifest.entrypoints[ep_idx].name)
         .to_string();
+
+    // Handle --onelf-icon / --onelf-desktop before dispatching
+    if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
+        return;
+    }
+
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
     let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
     let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible();
