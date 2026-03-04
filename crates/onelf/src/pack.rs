@@ -89,7 +89,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut files: Vec<CollectedFile> = Vec::new();
     let mut symlinks: Vec<CollectedSymlink> = Vec::new();
 
-    for entry in WalkDir::new(&dir).sort(true) {
+    for entry in WalkDir::new(&dir).skip_hidden(false).sort(true) {
         let entry = entry.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let abs_path = entry.path();
         let rel_path = abs_path.strip_prefix(&dir).unwrap().to_path_buf();
