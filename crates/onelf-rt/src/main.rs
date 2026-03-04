@@ -5,6 +5,7 @@ mod loader;
 mod memfd;
 mod metadata;
 mod multicall;
+mod portable;
 
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -17,6 +18,18 @@ fn main() {
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
+
+    let exe_path = std::path::Path::new(&exec_path);
+    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+    let exe_name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("onelf");
+
+    // Handle --onelf-portable-* flags (create dirs and exit)
+    if portable::handle_portable_flags(&args, exe_dir, exe_name) {
+        return;
+    }
 
     let mut pkg = match loader::load() {
         Ok(p) => p,
@@ -80,6 +93,7 @@ fn main() {
         ) {
             let lib_paths_str = pkg.manifest.lib_dirs().join(":");
             env::setup_env("", argv0, &exec_path, &ep_name, "memfd", &lib_paths_str);
+            portable::setup_portable(exe_dir, exe_name);
 
             if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
                 if force == Some("memfd") {
@@ -145,6 +159,7 @@ fn main() {
         "cache",
         &lib_paths_str,
     );
+    portable::setup_portable(exe_dir, exe_name);
 
     // Handle working directory
     match ep_working_dir {

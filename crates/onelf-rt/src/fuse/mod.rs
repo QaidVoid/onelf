@@ -158,6 +158,15 @@ pub fn execute_fuse(
         &lib_paths_str,
     );
 
+    // Set up portable directories
+    let exe_path = std::path::Path::new(exec_path);
+    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+    let exe_name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("onelf");
+    crate::portable::setup_portable(exe_dir, exe_name);
+
     // Handle working directory
     let child_cwd: Option<PathBuf> = match ep_working_dir {
         onelf_format::WorkingDir::PackageRoot => Some(mountpoint.clone()),
