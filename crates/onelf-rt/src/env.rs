@@ -90,6 +90,11 @@ pub fn setup_env(
         }
     }
 
+    // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
+    // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
+    // so system themes, schemas, and desktop integrations still work.
+    setup_xdg_data_dirs(pkg);
+
     // Auto-set __EGL_VENDOR_LIBRARY_DIRS if package has EGL vendor configs
     if env::var("__EGL_VENDOR_LIBRARY_DIRS").is_err() {
         let egl_dir = pkg.join("share/glvnd/egl_vendor.d");
@@ -153,5 +158,29 @@ pub fn setup_env(
                 }
             }
         }
+    }
+}
+
+/// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find
+/// bundled GSettings schemas, icons, MIME types, etc. Host dirs are preserved
+/// so system themes and desktop integrations still work.
+fn setup_xdg_data_dirs(pkg: &Path) {
+    let share = pkg.join("share");
+    if !share.is_dir() {
+        return;
+    }
+
+    let pkg_share = share.to_string_lossy();
+    let existing = env::var("XDG_DATA_DIRS").unwrap_or_default();
+
+    let new_val = if existing.is_empty() {
+        // XDG spec default when unset is /usr/local/share:/usr/share
+        format!("{pkg_share}:/usr/local/share:/usr/share")
+    } else {
+        format!("{pkg_share}:{existing}")
+    };
+
+    unsafe {
+        env::set_var("XDG_DATA_DIRS", new_val);
     }
 }

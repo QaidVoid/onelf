@@ -242,6 +242,7 @@ pub struct BundleOptions {
     pub dri: bool,
     pub vulkan: bool,
     pub wayland: bool,
+    pub gtk: bool,
     pub strip: bool,
 }
 
@@ -302,6 +303,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             opts.dry_run,
             opts.strip,
         )?;
+    }
+
+    if opts.gtk {
+        bundle_gtk_data(&opts.directory, opts.dry_run)?;
     }
 
     let excludes: Vec<&str> = DEFAULT_EXCLUDES
@@ -1646,6 +1651,220 @@ fn bundle_wayland(
     }
 
     Ok(())
+}
+
+/// Bundle GSettings compiled schemas so GTK/GLib apps don't crash with
+/// "No GSettings schemas are installed on the system".
+///
+/// Collects `.gschema.xml` files from all discoverable schema directories
+/// (system, NixOS store, XDG_DATA_DIRS) and compiles them into a single
+/// `gschemas.compiled` using `glib-compile-schemas`.
+fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()> {
+    eprintln!("{} GTK data...", color::bold("Bundling"));
+
+    let dest = directory.join("share/glib-2.0/schemas");
+    if dest.join("gschemas.compiled").exists() {
+        eprintln!("  {} already present", color::dim("gschemas.compiled"));
+        return Ok(());
+    }
+
+    // Collect all schema source directories
+    let mut schema_dirs: Vec<PathBuf> = Vec::new();
+
+    // Standard paths (non-NixOS distros)
+    for path in &[
+        "/usr/share/glib-2.0/schemas",
+        "/usr/local/share/glib-2.0/schemas",
+    ] {
+        let p = PathBuf::from(path);
+        if p.is_dir() && !schema_dirs.contains(&p) {
+            schema_dirs.push(p);
+        }
+    }
+
+    // NixOS: scan store closures for schema dirs
+    if Path::new("/nix/store").is_dir() {
+        for sp in &collect_nix_store_paths() {
+            let p = PathBuf::from(sp);
+            // Standard layout
+            let standard = p.join("share/glib-2.0/schemas");
+            if standard.is_dir() && !schema_dirs.contains(&standard) {
+                schema_dirs.push(standard);
+            }
+            // NixOS layout: share/gsettings-schemas/<pkg>/glib-2.0/schemas/
+            let gs_dir = p.join("share/gsettings-schemas");
+            if gs_dir.is_dir() {
+                if let Ok(entries) = fs::read_dir(&gs_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let schemas = entry.path().join("glib-2.0/schemas");
+                        if schemas.is_dir() && !schema_dirs.contains(&schemas) {
+                            schema_dirs.push(schemas);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // XDG_DATA_DIRS (including NixOS gsettings-schemas subdirs)
+    if let Ok(xdg) = std::env::var("XDG_DATA_DIRS") {
+        for dir in xdg.split(':').filter(|d| !d.is_empty()) {
+            let schemas = PathBuf::from(dir).join("glib-2.0/schemas");
+            if schemas.is_dir() && !schema_dirs.contains(&schemas) {
+                schema_dirs.push(schemas);
+            }
+            let gs_dir = PathBuf::from(dir).join("gsettings-schemas");
+            if gs_dir.is_dir() {
+                if let Ok(entries) = fs::read_dir(&gs_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let schemas = entry.path().join("glib-2.0/schemas");
+                        if schemas.is_dir() && !schema_dirs.contains(&schemas) {
+                            schema_dirs.push(schemas);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if schema_dirs.is_empty() {
+        eprintln!(
+            "  {} no GSettings schema directories found",
+            color::bold_red("warning:")
+        );
+        return Ok(());
+    }
+
+    // Collect all .gschema.xml files into a temp dir, then compile
+    let tmp = directory.join(".onelf-schemas-tmp");
+    if !dry_run {
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp)?;
+    }
+
+    let mut xml_count = 0usize;
+    let mut seen: HashSet<String> = HashSet::new();
+    for schema_dir in &schema_dirs {
+        let Ok(entries) = fs::read_dir(schema_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => continue,
+            };
+            if !name.ends_with(".gschema.xml") && !name.ends_with(".enums.xml") {
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if !dry_run {
+                fs::copy(&path, tmp.join(&name))?;
+            }
+            xml_count += 1;
+        }
+    }
+
+    if xml_count == 0 {
+        eprintln!(
+            "  {} no .gschema.xml files found",
+            color::bold_red("warning:")
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        return Ok(());
+    }
+
+    eprintln!(
+        "  Collected {} schema XML files from {} source(s)",
+        xml_count,
+        schema_dirs.len()
+    );
+
+    if dry_run {
+        eprintln!(
+            "  {} compile {} schema files",
+            color::bold("Would"),
+            xml_count
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        return Ok(());
+    }
+
+    // Compile schemas (find glib-compile-schemas, may not be in PATH on NixOS)
+    let compiler = find_glib_compile_schemas();
+    fs::create_dir_all(&dest)?;
+    let output = Command::new(&compiler)
+        .arg("--targetdir")
+        .arg(&dest)
+        .arg(&tmp)
+        .output();
+
+    let _ = fs::remove_dir_all(&tmp);
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let size = fs::metadata(dest.join("gschemas.compiled"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            eprintln!(
+                "  {} GSettings schemas ({}, {} sources)",
+                color::bold_green("Compiled"),
+                format_size(size),
+                xml_count
+            );
+        }
+        Ok(out) => {
+            eprintln!(
+                "  {} glib-compile-schemas failed: {}",
+                color::bold_red("error:"),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} glib-compile-schemas not found: {e}",
+                color::bold_red("error:")
+            );
+            eprintln!("  hint: install glib development tools");
+        }
+    }
+
+    Ok(())
+}
+
+/// Find `glib-compile-schemas` binary. On NixOS it's in glib-dev which may
+/// not be in PATH, so we search the nix store.
+fn find_glib_compile_schemas() -> PathBuf {
+    // Try PATH first
+    if let Ok(output) = Command::new("which").arg("glib-compile-schemas").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+
+    // NixOS: search store for glib-*-dev/bin/glib-compile-schemas
+    if Path::new("/nix/store").is_dir() {
+        if let Ok(entries) = fs::read_dir("/nix/store") {
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.contains("glib-") && name.ends_with("-dev") {
+                    let candidate = entry.path().join("bin/glib-compile-schemas");
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback — let Command::new fail with a clear error
+    PathBuf::from("glib-compile-schemas")
 }
 
 /// Copy vendor JSON configs (EGL or Vulkan ICD), rewriting `library_path` to

@@ -190,6 +190,10 @@ enum Commands {
         #[arg(long)]
         wayland: bool,
 
+        /// Bundle GSettings schemas for GTK apps
+        #[arg(long)]
+        gtk: bool,
+
         /// Strip debug symbols from copied libraries
         #[arg(long)]
         strip: bool,
@@ -310,6 +314,7 @@ fn main() {
             dri,
             vulkan,
             wayland,
+            gtk,
             strip,
         } => bundle::bundle_libs(&bundle::BundleOptions {
             directory,
@@ -324,6 +329,7 @@ fn main() {
             dri,
             vulkan,
             wayland,
+            gtk,
             strip,
         }),
     };
