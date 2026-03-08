@@ -93,8 +93,93 @@ fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBu
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
     let mountpoint = base.join(&dir_name);
-    std::fs::create_dir_all(&mountpoint).ok()?;
+
+    if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+        eprintln!(
+            "onelf-rt: fuse: cannot create {}: {e}",
+            mountpoint.display()
+        );
+        return None;
+    }
     Some(mountpoint)
+}
+
+/// Check if a path is currently a mountpoint by reading /proc/self/mountinfo.
+/// This avoids stat/exists calls that can hang on dead FUSE mounts.
+fn is_mountpoint(path: &Path) -> bool {
+    let target = path.to_string_lossy();
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // Field 5 (0-indexed: 4) in mountinfo is the mount point
+    info.lines().any(|line| {
+        line.split(' ')
+            .nth(4)
+            .map(|mp| mp.replace("\\040", " ") == *target)
+            .unwrap_or(false)
+    })
+}
+
+/// Execute directly from an existing FUSE mount (another instance is serving).
+/// This process becomes the child — no fork/FUSE loop needed.
+fn exec_from_mount(
+    pkg: &mut PackageData,
+    ep_idx: usize,
+    argv0: &str,
+    exec_path: &str,
+    args: &[String],
+    interp_data: Option<&[u8]>,
+    mountpoint: &Path,
+) -> bool {
+    use std::os::unix::process::CommandExt;
+
+    let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
+    let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
+    let ep_name = pkg
+        .manifest
+        .get_string(pkg.manifest.entrypoints[ep_idx].name)
+        .to_string();
+    let target_path_str = pkg.manifest.entry_path(ep_target_entry);
+    let target_path = mountpoint.join(&target_path_str);
+    let mountpoint_str = mountpoint.to_str().unwrap_or("").to_string();
+    let lib_paths_str = pkg.manifest.lib_dirs().join(":");
+
+    let exe_path = std::path::Path::new(exec_path);
+    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+    let exe_name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("onelf");
+    crate::portable::setup_portable(exe_dir, exe_name);
+
+    let child_cwd: Option<PathBuf> = match ep_working_dir {
+        onelf_format::WorkingDir::PackageRoot => Some(mountpoint.to_path_buf()),
+        onelf_format::WorkingDir::EntrypointParent => target_path.parent().map(|p| p.to_path_buf()),
+        onelf_format::WorkingDir::Inherit => None,
+    };
+
+    if let Some(data) = interp_data {
+        crate::interp::setup_interp_symlink(data, mountpoint);
+    }
+
+    crate::env::setup_env(
+        &mountpoint_str,
+        argv0,
+        exec_path,
+        &ep_name,
+        "fuse",
+        &lib_paths_str,
+    );
+
+    let lib_dirs = pkg.manifest.lib_dirs();
+    let mut cmd =
+        crate::interp::build_exec_command(&target_path, mountpoint, &lib_dirs, argv0, args);
+    if let Some(cwd) = &child_cwd {
+        cmd.current_dir(cwd);
+    }
+    let err = cmd.exec();
+    eprintln!("onelf-rt: exec failed: {err}");
+    std::process::exit(1);
 }
 
 fn cleanup_mountpoint(mountpoint: &Path) {
@@ -112,9 +197,9 @@ pub fn execute_fuse(
     argv0: &str,
     exec_path: &str,
     args: &[String],
+    interp_data: Option<&[u8]>,
 ) -> bool {
     use std::os::unix::process::CommandExt;
-    use std::process::Command;
 
     if !mount::fusermount3_available() {
         return false;
@@ -125,13 +210,27 @@ pub fn execute_fuse(
         None => return false,
     };
 
+    // If already mounted by another instance, reuse it — just exec directly.
+    if is_mountpoint(&mountpoint) {
+        return exec_from_mount(
+            pkg,
+            ep_idx,
+            argv0,
+            exec_path,
+            args,
+            interp_data,
+            &mountpoint,
+        );
+    }
+
     let fuse_fd = match mount::fuse_mount(&mountpoint) {
         Ok(fd) => {
             // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
             let _ = rustix::io::fcntl_setfd(&fd, FdFlags::CLOEXEC);
             fd
         }
-        Err(_) => {
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: mount failed: {e}");
             let _ = std::fs::remove_dir(&mountpoint);
             return false;
         }
@@ -149,16 +248,8 @@ pub fn execute_fuse(
 
     let mountpoint_str = mountpoint.to_str().unwrap_or("").to_string();
     let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-    crate::env::setup_env(
-        &mountpoint_str,
-        argv0,
-        exec_path,
-        &ep_name,
-        "fuse",
-        &lib_paths_str,
-    );
 
-    // Set up portable directories
+    // Set up portable directories (doesn't access FUSE mount)
     let exe_path = std::path::Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
     let exe_name = exe_path
@@ -173,6 +264,11 @@ pub fn execute_fuse(
         onelf_format::WorkingDir::EntrypointParent => target_path.parent().map(|p| p.to_path_buf()),
         onelf_format::WorkingDir::Inherit => None,
     };
+
+    // Set up interpreter symlink (doesn't access FUSE mount)
+    if let Some(data) = interp_data {
+        crate::interp::setup_interp_symlink(data, &mountpoint);
+    }
 
     // Death pipe: when the child (and all its descendants) exit, the write end
     // closes and poll() on the read end returns POLLHUP.
@@ -190,8 +286,26 @@ pub fn execute_fuse(
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
-            let mut cmd = Command::new(&target_path);
-            cmd.arg0(argv0).args(args);
+            // setup_env must run in the child (after fork) because it probes
+            // directories on the FUSE mount (lib/dri/, share/vulkan/, etc.).
+            // The parent's FUSE event loop is now running concurrently.
+            crate::env::setup_env(
+                &mountpoint_str,
+                argv0,
+                exec_path,
+                &ep_name,
+                "fuse",
+                &lib_paths_str,
+            );
+
+            let lib_dirs = pkg.manifest.lib_dirs();
+            let mut cmd = crate::interp::build_exec_command(
+                &target_path,
+                &mountpoint,
+                &lib_dirs,
+                argv0,
+                args,
+            );
             if let Some(cwd) = &child_cwd {
                 cmd.current_dir(cwd);
             }

@@ -1,7 +1,8 @@
 //! Environment variable setup for the running package.
 //!
 //! Sets `ONELF_*` variables and configures `LD_LIBRARY_PATH` for packages
-//! that bundle shared libraries.
+//! that bundle shared libraries. Also auto-detects and configures paths for
+//! graphics drivers (OpenGL/EGL/Vulkan/VA-API).
 
 use std::env;
 use std::path::Path;
@@ -29,20 +30,126 @@ pub fn setup_env(
         env::set_var("ONELF_MODE", mode);
     }
 
+    if onelf_dir.is_empty() {
+        return;
+    }
+
+    let pkg = Path::new(onelf_dir);
+
     // Auto-set LD_LIBRARY_PATH if package has lib directories
-    if !lib_subpath.is_empty() && !onelf_dir.is_empty() {
+    if !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
-            .map(|p| Path::new(onelf_dir).join(p).to_string_lossy().to_string())
+            .map(|p| pkg.join(p).to_string_lossy().to_string())
             .collect();
         let lib_str = lib_paths.join(":");
         if !lib_str.is_empty() {
             let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
             unsafe {
                 if existing.is_empty() {
-                    env::set_var("LD_LIBRARY_PATH", lib_str);
+                    env::set_var("LD_LIBRARY_PATH", &lib_str);
                 } else {
                     env::set_var("LD_LIBRARY_PATH", format!("{lib_str}:{existing}"));
+                }
+            }
+
+            // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
+            // contains a dri/ subdirectory (both use the same paths)
+            let dri_paths: Vec<String> = lib_paths
+                .iter()
+                .map(|p| Path::new(p).join("dri").to_string_lossy().to_string())
+                .filter(|p| Path::new(p).is_dir())
+                .collect();
+            if !dri_paths.is_empty() {
+                let joined = dri_paths.join(":");
+                if env::var("LIBGL_DRIVERS_PATH").is_err() {
+                    unsafe {
+                        env::set_var("LIBGL_DRIVERS_PATH", &joined);
+                    }
+                }
+                if env::var("LIBVA_DRIVERS_PATH").is_err() {
+                    unsafe {
+                        env::set_var("LIBVA_DRIVERS_PATH", &joined);
+                    }
+                }
+            }
+
+            // Auto-set GBM_BACKENDS_PATH if any lib dir contains a gbm/ subdirectory
+            if env::var("GBM_BACKENDS_PATH").is_err() {
+                let gbm_paths: Vec<String> = lib_paths
+                    .iter()
+                    .map(|p| Path::new(p).join("gbm").to_string_lossy().to_string())
+                    .filter(|p| Path::new(p).is_dir())
+                    .collect();
+                if !gbm_paths.is_empty() {
+                    unsafe {
+                        env::set_var("GBM_BACKENDS_PATH", gbm_paths.join(":"));
+                    }
+                }
+            }
+        }
+    }
+
+    // Auto-set __EGL_VENDOR_LIBRARY_DIRS if package has EGL vendor configs
+    if env::var("__EGL_VENDOR_LIBRARY_DIRS").is_err() {
+        let egl_dir = pkg.join("share/glvnd/egl_vendor.d");
+        if egl_dir.is_dir() {
+            unsafe {
+                env::set_var(
+                    "__EGL_VENDOR_LIBRARY_DIRS",
+                    egl_dir.to_string_lossy().as_ref(),
+                );
+            }
+        }
+    }
+
+    // Auto-set DRIRC_CONFIGDIR if package has DRI config files
+    if env::var("DRIRC_CONFIGDIR").is_err() {
+        let drirc_dir = pkg.join("share/drirc.d");
+        if drirc_dir.is_dir() {
+            unsafe {
+                env::set_var("DRIRC_CONFIGDIR", drirc_dir.to_string_lossy().as_ref());
+            }
+        }
+    }
+
+    // Auto-set LIBDRM_IDS_PATH if package has libdrm data
+    if env::var("LIBDRM_IDS_PATH").is_err() {
+        let libdrm_dir = pkg.join("share/libdrm");
+        if libdrm_dir.is_dir() {
+            unsafe {
+                env::set_var("LIBDRM_IDS_PATH", libdrm_dir.to_string_lossy().as_ref());
+            }
+        }
+    }
+
+    // Auto-set LIBDECOR_PLUGIN_DIR if package has libdecor plugins
+    if env::var("LIBDECOR_PLUGIN_DIR").is_err() {
+        let libdecor_dir = pkg.join("share/libdecor/plugins-1");
+        if libdecor_dir.is_dir() {
+            unsafe {
+                env::set_var(
+                    "LIBDECOR_PLUGIN_DIR",
+                    libdecor_dir.to_string_lossy().as_ref(),
+                );
+            }
+        }
+    }
+
+    // Auto-set VK_DRIVER_FILES if package has Vulkan ICD configs
+    if env::var("VK_DRIVER_FILES").is_err() {
+        let vk_dir = pkg.join("share/vulkan/icd.d");
+        if vk_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&vk_dir) {
+                let icd_files: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .collect();
+                if !icd_files.is_empty() {
+                    unsafe {
+                        env::set_var("VK_DRIVER_FILES", icd_files.join(":"));
+                    }
                 }
             }
         }

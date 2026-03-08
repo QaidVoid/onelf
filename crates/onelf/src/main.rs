@@ -71,6 +71,14 @@ enum Commands {
         /// Working directory strategy
         #[arg(long, default_value = "inherit")]
         working_dir: WorkingDirArg,
+
+        /// Base URL for delta updates (stored in .onelf/update-url)
+        #[arg(long)]
+        update_url: Option<String>,
+
+        /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 
     /// Show metadata about a packed binary
@@ -146,9 +154,13 @@ enum Commands {
         #[arg(long, default_value = "lib")]
         lib_dir: PathBuf,
 
-        /// Exclude libs matching pattern (prefix match, repeatable)
-        #[arg(long)]
+        /// Exclude libs matching pattern (prefix match, comma-separated or repeatable)
+        #[arg(long, value_delimiter = ',')]
         exclude: Vec<String>,
+
+        /// Additional libraries to include by soname (e.g. dlopen'd libs, comma-separated or repeatable)
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
 
         /// Additional directories to search for libraries (repeatable)
         #[arg(long)]
@@ -161,6 +173,26 @@ enum Commands {
         /// Don't resolve transitive dependencies
         #[arg(long)]
         no_recursive: bool,
+
+        /// Bundle Mesa GL/EGL/GBM libraries
+        #[arg(long)]
+        gl: bool,
+
+        /// Bundle DRI drivers (architecture-filtered)
+        #[arg(long)]
+        dri: bool,
+
+        /// Bundle Vulkan ICD drivers (architecture-filtered)
+        #[arg(long)]
+        vulkan: bool,
+
+        /// Bundle Wayland client libraries (libwayland, libdecor, libxkbcommon)
+        #[arg(long)]
+        wayland: bool,
+
+        /// Strip debug symbols from copied libraries
+        #[arg(long)]
+        strip: bool,
     },
 }
 
@@ -207,6 +239,8 @@ fn main() {
             memfd,
             no_memfd,
             working_dir,
+            update_url,
+            exclude,
         } => {
             let memfd_opt = if no_memfd {
                 Some(false)
@@ -235,6 +269,8 @@ fn main() {
                     use_dict: dict,
                     memfd: memfd_opt,
                     working_dir: wd,
+                    update_url,
+                    exclude,
                 },
                 RUNTIME_BINARY,
             )
@@ -266,17 +302,29 @@ fn main() {
             target,
             lib_dir,
             exclude,
+            include,
             search_path,
             dry_run,
             no_recursive,
+            gl,
+            dri,
+            vulkan,
+            wayland,
+            strip,
         } => bundle::bundle_libs(&bundle::BundleOptions {
             directory,
             target,
             lib_dir,
             exclude,
+            include,
             search_path,
             dry_run,
             recursive: !no_recursive,
+            gl,
+            dri,
+            vulkan,
+            wayland,
+            strip,
         }),
     };
 

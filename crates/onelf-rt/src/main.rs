@@ -1,6 +1,7 @@
 mod cache;
 mod env;
 mod fuse;
+mod interp;
 mod loader;
 mod memfd;
 mod metadata;
@@ -8,7 +9,6 @@ mod multicall;
 mod portable;
 
 use std::os::unix::process::CommandExt;
-use std::process::Command;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -107,9 +107,19 @@ fn main() {
         }
     }
 
+    // Read interpreter metadata for cross-libc portability (if packed with interp patching)
+    let interp_data = read_package_file(&mut pkg, ".onelf/interp");
+
     // FUSE mode: mount package as filesystem (default for non-memfd)
     if force != Some("cache") {
-        fuse::execute_fuse(&mut pkg, ep_idx, argv0, &exec_path, &final_args);
+        fuse::execute_fuse(
+            &mut pkg,
+            ep_idx,
+            argv0,
+            &exec_path,
+            &final_args,
+            interp_data.as_deref(),
+        );
         // Only reaches here if FUSE fell back (fusermount3 unavailable)
         if force == Some("fuse") {
             eprintln!("onelf-rt: FUSE mode unavailable");
@@ -174,11 +184,28 @@ fn main() {
         onelf_format::WorkingDir::Inherit => {}
     }
 
-    let err = Command::new(&target_path)
-        .arg0(argv0)
-        .args(&final_args)
-        .exec();
+    let lib_dirs = pkg.manifest.lib_dirs();
+    if let Some(ref data) = interp_data {
+        interp::setup_interp_symlink(data, &pkg_dir);
+    }
+    let mut cmd = interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
+
+    let err = cmd.exec();
 
     eprintln!("onelf-rt: exec failed: {err}");
     std::process::exit(1);
+}
+
+fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
+    let idx = (0..pkg.manifest.entries.len()).find(|&i| {
+        pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
+            && pkg.manifest.entry_path(i) == path
+    })?;
+    loader::read_payload_blocks(
+        &mut pkg.file,
+        pkg.footer.payload_offset,
+        &pkg.manifest.entries[idx].blocks,
+        pkg.dict.as_deref(),
+    )
+    .ok()
 }
