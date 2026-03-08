@@ -1,5 +1,5 @@
 
-## [0.0.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.0.0...onelf-rt-v0.0.1) - 2026-03-08
+## [0.1.0] - 2026-03-08
 
 ### ⛰️  Features
 
