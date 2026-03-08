@@ -71,14 +71,16 @@ fn main() {
     // Build onelf-rt for musl
     let mut cmd = Command::new(&cargo);
 
-    // Clean cargo env vars to avoid interference
+    // Clean cargo env vars to avoid interference, but preserve linker settings
     for (key, _) in env::vars() {
-        if key.starts_with("CARGO") || key.starts_with("RUSTC") {
+        if (key.starts_with("CARGO") || key.starts_with("RUSTC")) && !key.ends_with("_LINKER") {
             cmd.env_remove(&key);
         }
     }
 
-    let mut rustflags = String::from("-Ctarget-feature=+crt-static");
+    let mut rustflags = String::from(
+        "-Ctarget-feature=+crt-static -Crelocation-model=static -Clink-arg=-Wl,--no-dynamic-linker",
+    );
     if profile == "release" {
         rustflags.push_str(" -Cdebuginfo=0");
     }
