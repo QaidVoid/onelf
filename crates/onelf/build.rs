@@ -56,9 +56,12 @@ fn find_musl_gcc(target: &str) -> Option<String> {
 }
 
 fn main() {
+    let target = musl_target();
+    let cc_env = format!("CC_{}", target.replace('-', "_"));
+
     println!("cargo:rerun-if-env-changed=ONELF_RT_PATH");
     println!("cargo:rerun-if-env-changed=ONELF_MUSL_CC");
-    println!("cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_musl");
+    println!("cargo:rerun-if-env-changed={cc_env}");
 
     // Allow pre-built runtime via env var (needed for cargo publish/install)
     if let Ok(rt_path) = env::var("ONELF_RT_PATH") {
@@ -75,7 +78,6 @@ fn main() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let profile = env::var("PROFILE").unwrap();
-    let target = musl_target();
 
     let cargo = PathBuf::from(env::var("CARGO").unwrap())
         .canonicalize()

@@ -20,16 +20,25 @@ use crate::loader::PackageData;
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-// x86_64 signal restorer -- calls rt_sigreturn (syscall 15).
-// Required because kernel_sigaction bypasses libc, and x86_64 Linux
-// requires SA_RESTORER for signal handler return to work.
+// Signal restorer -- required because kernel_sigaction bypasses libc.
+// x86_64 Linux requires SA_RESTORER for signal handler return to work.
+// aarch64 Linux handles signal return in the kernel, no restorer needed.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     ".global __onelf_signal_restorer",
     ".type __onelf_signal_restorer, @function",
     "__onelf_signal_restorer:",
-    "mov rax, 15",
+    "mov rax, 15", // __NR_rt_sigreturn
     "syscall",
+);
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".global __onelf_signal_restorer",
+    ".type __onelf_signal_restorer, @function",
+    "__onelf_signal_restorer:",
+    "mov x8, #139", // __NR_rt_sigreturn
+    "svc #0",
 );
 
 unsafe extern "C" {
