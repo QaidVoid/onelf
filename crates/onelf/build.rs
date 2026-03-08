@@ -2,17 +2,32 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn find_musl_gcc() -> Option<String> {
+fn musl_target() -> String {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64".to_string()
+        } else {
+            "x86_64".to_string()
+        }
+    });
+    format!("{arch}-unknown-linux-musl")
+}
+
+fn find_musl_gcc(target: &str) -> Option<String> {
+    let cc_env = format!("CC_{}", target.replace('-', "_"));
+
     // Check explicit env override
     if let Ok(cc) = env::var("ONELF_MUSL_CC") {
         return Some(cc);
     }
-    if let Ok(cc) = env::var("CC_x86_64_unknown_linux_musl") {
+    if let Ok(cc) = env::var(&cc_env) {
         return Some(cc);
     }
 
-    // Try common names in PATH
-    for name in &["x86_64-linux-musl-gcc", "musl-gcc"] {
+    // Try architecture-specific and generic names in PATH
+    let arch = target.split('-').next().unwrap_or("x86_64");
+    let names = [format!("{arch}-linux-musl-gcc"), "musl-gcc".to_string()];
+    for name in &names {
         if let Ok(output) = Command::new("which").arg(name).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -41,31 +56,51 @@ fn find_musl_gcc() -> Option<String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=../onelf-rt/src/");
-    println!("cargo:rerun-if-changed=../onelf-format/src/");
+    println!("cargo:rerun-if-env-changed=ONELF_RT_PATH");
     println!("cargo:rerun-if-env-changed=ONELF_MUSL_CC");
     println!("cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_musl");
 
+    // Allow pre-built runtime via env var (needed for cargo publish/install)
+    if let Ok(rt_path) = env::var("ONELF_RT_PATH") {
+        let path = PathBuf::from(&rt_path);
+        if !path.exists() {
+            panic!("ONELF_RT_PATH={rt_path} does not exist");
+        }
+        println!("cargo:rustc-env=ONELF_RT_PATH={rt_path}");
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=../onelf-rt/src/");
+    println!("cargo:rerun-if-changed=../onelf-format/src/");
+
     let out_dir = env::var("OUT_DIR").unwrap();
     let profile = env::var("PROFILE").unwrap();
-    let target = "x86_64-unknown-linux-musl";
+    let target = musl_target();
 
     let cargo = PathBuf::from(env::var("CARGO").unwrap())
         .canonicalize()
         .unwrap();
 
-    let rt_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("../onelf-rt")
-        .canonicalize()
-        .unwrap();
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let rt_dir = manifest_dir.join("../onelf-rt");
+    if !rt_dir.exists() {
+        panic!(
+            "onelf-rt source not found at {}. Set ONELF_RT_PATH to a pre-built runtime binary.",
+            rt_dir.display()
+        );
+    }
+    let rt_dir = rt_dir.canonicalize().unwrap();
 
     let target_dir = PathBuf::from(&out_dir).join("onelf-rt-build");
 
     // Find musl CC
-    let musl_cc = find_musl_gcc().expect(
-        "Could not find musl-gcc. Set ONELF_MUSL_CC or CC_x86_64_unknown_linux_musl, \
-         or install musl-gcc to PATH.",
-    );
+    let musl_cc = find_musl_gcc(&target).unwrap_or_else(|| {
+        let cc_env = format!("CC_{}", target.replace('-', "_"));
+        panic!(
+            "Could not find musl-gcc for {target}. Set ONELF_MUSL_CC or {cc_env}, \
+             or install musl-gcc to PATH.",
+        )
+    });
     eprintln!("Using musl CC: {musl_cc}");
 
     // Build onelf-rt for musl
@@ -87,11 +122,11 @@ fn main() {
 
     cmd.env("RUSTFLAGS", &rustflags)
         .env("CC", &musl_cc)
-        .env("CC_x86_64_unknown_linux_musl", &musl_cc)
+        .env(format!("CC_{}", target.replace('-', "_")), &musl_cc)
         .current_dir(&rt_dir)
         .arg("build")
         .arg("--target")
-        .arg(target)
+        .arg(&target)
         .arg("--target-dir")
         .arg(&target_dir);
 

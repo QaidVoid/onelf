@@ -27,6 +27,14 @@ changelog_include = [
 ]
 changelog_path="./CHANGELOG.md"
 
+[[package]]
+name = "onelf-format"
+git_tag_enable = false
+
+[[package]]
+name = "onelf-rt"
+git_tag_enable = false
+
 [changelog]
 header = """
 """

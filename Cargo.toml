@@ -8,7 +8,7 @@ members = [
 default-members = ["crates/onelf"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/QaidVoid/onelf"
@@ -26,7 +26,7 @@ clap = { version = "4.5", features = ["derive"] }
 goblin = { version = "0.9", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
 indicatif = "0.18"
 jwalk = "0.8"
-onelf-format = { path = "crates/onelf-format" }
+onelf-format = "0.1.0"
 rayon = "1.11"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = "0.13"
