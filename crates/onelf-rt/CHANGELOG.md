@@ -1,4 +1,10 @@
 
+## [0.1.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.1.0...onelf-rt-v0.1.1) - 2026-03-08
+
+### 🐛 Bug Fixes
+
+- Resolve aarch64 rt build - ([08b7f00](https://github.com/QaidVoid/onelf/commit/08b7f004a7629b393d227747d8579f5c6919ee6b))
+
 ## [0.1.0] - 2026-03-08
 
 ### ⛰️  Features
