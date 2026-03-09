@@ -1,4 +1,10 @@
 
+## [0.1.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.1.1...onelf-rt-v0.1.2) - 2026-03-09
+
+### 🐛 Bug Fixes
+
+- Always use bundled interpreter to match bundled libc - ([8c91234](https://github.com/QaidVoid/onelf/commit/8c91234d83260dda0ab44eca8ed3397f7a6f0c56))
+
 ## [0.1.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.1.0...onelf-rt-v0.1.1) - 2026-03-08
 
 ### 🐛 Bug Fixes
