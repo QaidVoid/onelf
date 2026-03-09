@@ -119,9 +119,10 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
 /// Set up the interpreter symlink for cross-libc portability.
 ///
 /// Reads `.onelf/interp` metadata (injected at pack time) and creates a symlink
-/// at the specified path pointing to either the system interpreter or the
-/// bundled one. This makes all ELF binaries in the package work regardless
-/// of how they're invoked (directly or via shell scripts).
+/// at the specified path pointing to the bundled interpreter (preferred, since it
+/// matches the bundled libc) or the system interpreter as fallback.
+/// This makes all ELF binaries in the package work regardless of how they're
+/// invoked (directly or via shell scripts).
 pub fn setup_interp_symlink(interp_data: &[u8], pkg_root: &Path) {
     let text = match std::str::from_utf8(interp_data) {
         Ok(t) => t,
@@ -144,12 +145,10 @@ pub fn setup_interp_symlink(interp_data: &[u8], pkg_root: &Path) {
 
     let symlink_path = Path::new(symlink_str);
 
-    // Prefer system interpreter if available, otherwise use bundled
-    let target = if Path::new(original).exists() {
-        PathBuf::from(original)
-    } else {
-        pkg_root.join(bundled_rel)
-    };
+    // Always use the bundled interpreter - it matches the bundled libc.
+    // We trust the metadata: if bundled_rel is present, the file exists in the
+    // package.
+    let target = pkg_root.join(bundled_rel);
 
     // Idempotent: check if symlink already points to the right target
     if let Ok(existing) = std::fs::read_link(symlink_path) {
@@ -160,6 +159,23 @@ pub fn setup_interp_symlink(interp_data: &[u8], pkg_root: &Path) {
     }
 
     let _ = std::os::unix::fs::symlink(&target, symlink_path);
+}
+
+/// Remove the interpreter symlink created by [`setup_interp_symlink`].
+pub fn cleanup_interp_symlink(interp_data: &[u8]) {
+    let text = match std::str::from_utf8(interp_data) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let mut lines = text.lines();
+    let _original = lines.next(); // skip original interp path
+    let symlink_str = match lines.next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let _ = std::fs::remove_file(symlink_str);
 }
 
 /// Build a `Command` for executing the target binary.

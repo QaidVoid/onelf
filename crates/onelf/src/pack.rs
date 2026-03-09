@@ -292,8 +292,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             });
 
             if let Some(ref bundled_rel) = bundled_relpath {
-                let name_hash = blake3::hash(package_name.as_bytes());
-                let hash_hex: String = name_hash.as_bytes()[..4]
+                // Hash package name + bundled interpreter path to avoid collisions
+                // between different packages with the same name.
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(package_name.as_bytes());
+                hasher.update(bundled_rel.as_bytes());
+                let hash = hasher.finalize();
+                let hash_hex: String = hash.as_bytes()[..8]
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect();

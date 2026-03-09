@@ -284,6 +284,9 @@ pub fn execute_fuse(
     let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
         Ok(p) => p,
         Err(_) => {
+            if let Some(data) = interp_data {
+                crate::interp::cleanup_interp_symlink(data);
+            }
             cleanup_mountpoint(&mountpoint);
             return false;
         }
@@ -348,12 +351,18 @@ pub fn execute_fuse(
                         Ok(None) => continue,
                         Err(rustix::io::Errno::INTR) => continue,
                         Err(_) => {
+                            if let Some(data) = interp_data {
+                                crate::interp::cleanup_interp_symlink(data);
+                            }
                             cleanup_mountpoint(&mountpoint);
                             std::process::exit(1);
                         }
                     },
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(_) => {
+                        if let Some(data) = interp_data {
+                            crate::interp::cleanup_interp_symlink(data);
+                        }
                         cleanup_mountpoint(&mountpoint);
                         std::process::exit(1);
                     }
@@ -361,6 +370,9 @@ pub fn execute_fuse(
             };
 
             drop(fuse_fd);
+            if let Some(data) = interp_data {
+                crate::interp::cleanup_interp_symlink(data);
+            }
             cleanup_mountpoint(&mountpoint);
 
             if let Some(code) = exit_status.exit_status() {
@@ -384,6 +396,9 @@ pub fn execute_fuse(
             }
         }
         Err(e) => {
+            if let Some(data) = interp_data {
+                crate::interp::cleanup_interp_symlink(data);
+            }
             cleanup_mountpoint(&mountpoint);
             eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);
