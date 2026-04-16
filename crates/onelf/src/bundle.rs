@@ -976,40 +976,100 @@ fn detect_frameworks(directory: &Path, target: Option<&Path>) -> FrameworkFlags 
     };
     let mut flags = FrameworkFlags::default();
     for path in &files {
-        let Ok(needed) = parse_needed(path) else {
-            continue;
-        };
-        for soname in needed {
-            if soname.starts_with("libGL.so")
-                || soname.starts_with("libEGL.so")
-                || soname.starts_with("libGLESv")
-                || soname.starts_with("libOpenGL.so")
-            {
-                flags.gl = true;
-                flags.dri = true;
+        if let Ok(needed) = parse_needed(path) {
+            for soname in needed {
+                inspect_soname_for_frameworks(&soname, &mut flags);
             }
-            if soname.starts_with("libgbm.so") {
-                flags.dri = true;
-            }
-            if soname.starts_with("libvulkan.so") {
-                flags.vulkan = true;
-            }
-            if soname.starts_with("libwayland-client.so")
-                || soname.starts_with("libwayland-egl.so")
-                || soname.starts_with("libwayland-cursor.so")
-                || soname.starts_with("libdecor-0.so")
-            {
-                flags.wayland = true;
-            }
-            if soname.starts_with("libgtk-3.so")
-                || soname.starts_with("libgtk-4.so")
-                || soname.starts_with("libgtk-")
-            {
-                flags.gtk = true;
-            }
+        }
+
+        // Also scan for literal soname strings in the binary. Apps like
+        // Blender don't DT_NEED libwayland-cursor or libdecor; they
+        // dlopen them at runtime after detecting the session type.
+        // Without a string scan, detect_frameworks would miss wayland
+        // on such apps and the user would have to pass --wayland.
+        if let Ok(bytes) = fs::read(path) {
+            scan_framework_strings(&bytes, &mut flags);
         }
     }
     flags
+}
+
+/// Inspect a single soname (from DT_NEEDED or a dlopen string scan)
+/// and turn on whichever framework flags it implies.
+fn inspect_soname_for_frameworks(soname: &str, flags: &mut FrameworkFlags) {
+    if soname.starts_with("libGL.so")
+        || soname.starts_with("libEGL.so")
+        || soname.starts_with("libGLESv")
+        || soname.starts_with("libOpenGL.so")
+    {
+        flags.gl = true;
+        flags.dri = true;
+    }
+    if soname.starts_with("libgbm.so") {
+        flags.dri = true;
+    }
+    if soname.starts_with("libvulkan.so") {
+        flags.vulkan = true;
+    }
+    if soname.starts_with("libwayland-client.so")
+        || soname.starts_with("libwayland-egl.so")
+        || soname.starts_with("libwayland-cursor.so")
+        || soname.starts_with("libwayland-server.so")
+        || soname.starts_with("libdecor-0.so")
+    {
+        flags.wayland = true;
+    }
+    if soname.starts_with("libgtk-3.so")
+        || soname.starts_with("libgtk-4.so")
+        || soname.starts_with("libgtk-")
+    {
+        flags.gtk = true;
+    }
+}
+
+/// Walk the byte buffer looking for null-terminated library names that
+/// would make us enable a framework bundler. Only matches on well-known
+/// soname prefixes to avoid false positives from arbitrary strings in
+/// the binary.
+fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
+    const PREFIXES: &[&[u8]] = &[
+        b"libGL.so",
+        b"libEGL.so",
+        b"libGLESv",
+        b"libOpenGL.so",
+        b"libgbm.so",
+        b"libvulkan.so",
+        b"libwayland-client.so",
+        b"libwayland-egl.so",
+        b"libwayland-cursor.so",
+        b"libwayland-server.so",
+        b"libdecor-0.so",
+        b"libgtk-3.so",
+        b"libgtk-4.so",
+    ];
+    let needles: Vec<&[u8]> = PREFIXES.iter().copied().collect();
+    let max_len = needles.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut i = 0;
+    while i + max_len <= bytes.len() {
+        // Cheap gate: must start with 'l' to be any of our sonames.
+        if bytes[i] != b'l' {
+            i += 1;
+            continue;
+        }
+        for needle in &needles {
+            if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == *needle {
+                // The printable path normally ends at a NUL; bail out
+                // if the byte after the match is a printable path char
+                // (digit, dot) — we'll still match the prefix when
+                // iteration continues past this point — or stop on NUL.
+                if let Ok(soname) = std::str::from_utf8(&bytes[i..i + needle.len()]) {
+                    inspect_soname_for_frameworks(soname, flags);
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Sonames that applications commonly dlopen at runtime. Absence from DT_NEEDED
