@@ -8,6 +8,7 @@ mod list;
 mod metadata;
 mod pack;
 mod recipe;
+mod run;
 mod verify;
 
 use std::os::unix::fs::PermissionsExt;
@@ -111,6 +112,31 @@ enum Commands {
         /// Override the output path from the recipe
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Run an AppDir in place, without packing, for fast dev iteration
+    Run {
+        /// AppDir path, or a .toml recipe file (default: .)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Path to the binary to exec, relative to the AppDir (overrides any
+        /// recipe-specified command). Handy when there's no onelf.toml.
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Entrypoint name to run (default: the recipe's default entrypoint)
+        #[arg(long)]
+        entrypoint: Option<String>,
+
+        /// Run bundle-libs first using the recipe's [bundle] settings. Useful
+        /// for a one-shot dev loop; does nothing if the AppDir has no recipe.
+        #[arg(long)]
+        bundle: bool,
+
+        /// Arguments passed to the entrypoint after its own args
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Verify a packed binary's integrity (recompute hashes vs manifest)
@@ -359,6 +385,19 @@ fn main() {
             force,
         } => init::init(&output, binary.as_deref(), force),
         Commands::Build { path, output } => run_build(&path, output.as_deref()),
+        Commands::Run {
+            path,
+            command,
+            entrypoint,
+            bundle,
+            args,
+        } => run::run(
+            &path,
+            command.as_deref(),
+            entrypoint.as_deref(),
+            bundle,
+            &args,
+        ),
         Commands::Verify { binary } => verify::verify(&binary),
         Commands::Info { binary } => info::info(&binary),
         Commands::List { binary } => list::list(&binary),
@@ -434,7 +473,7 @@ fn run_build(
     path: &std::path::Path,
     output_override: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
-    let recipe_path = recipe::resolve(path);
+    let recipe_path = recipe::resolve(path)?;
     let recipe = recipe::load(&recipe_path)?;
     let dir = recipe_path
         .parent()

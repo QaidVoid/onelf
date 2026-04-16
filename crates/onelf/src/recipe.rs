@@ -62,7 +62,7 @@ pub struct Package {
     pub homepage: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkingDirSpec {
     #[default]
@@ -158,18 +158,48 @@ pub struct Bundle {
 /// Load a recipe from a file path. Returns an io::Error with a descriptive
 /// message on failure (parse errors are converted via `InvalidData`).
 pub fn load(path: &Path) -> std::io::Result<Recipe> {
-    let text = std::fs::read_to_string(path)?;
-    toml::from_str(&text)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path:?}: {e}")))
+    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidData => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{}: not a valid recipe (expected a TOML file)",
+                path.display()
+            ),
+        ),
+        _ => std::io::Error::new(e.kind(), format!("{}: {e}", path.display())),
+    })?;
+    toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })
 }
 
-/// If `spec` is a directory, return `spec/onelf.toml`. Otherwise return `spec`.
-pub fn resolve(spec: &Path) -> PathBuf {
+/// Resolve a recipe file from a user-supplied spec:
+/// - If `spec` is a directory, use `<spec>/onelf.toml`.
+/// - If `spec` is a file with a `.toml` extension, use it.
+/// - Otherwise error — the input isn't something this tool can read as a recipe.
+pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
     if spec.is_dir() {
-        spec.join("onelf.toml")
-    } else {
-        spec.to_path_buf()
+        return Ok(spec.join("onelf.toml"));
     }
+    if !spec.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{}: no such file or directory", spec.display()),
+        ));
+    }
+    if spec.extension().and_then(|s| s.to_str()) != Some("toml") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{}: expected a directory containing onelf.toml or a .toml file",
+                spec.display()
+            ),
+        ));
+    }
+    Ok(spec.to_path_buf())
 }
 
 /// Expand `${VAR}` references in a string from the environment.
