@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::io::FdFlags;
-use rustix::process::{kill_process, waitpid, Pid, Signal, WaitOptions};
-use rustix::runtime::{kernel_sigaction, KernelSigSet, KernelSigaction, KernelSigactionFlags};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+use rustix::runtime::{KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sigaction};
 
 use crate::loader::PackageData;
 
@@ -296,7 +296,7 @@ pub fn execute_fuse(
     // Remove CLOEXEC from write end so the exec'd child inherits it.
     let _ = rustix::io::fcntl_setfd(&pipe_write, FdFlags::empty());
 
-    use rustix::runtime::{kernel_fork, Fork};
+    use rustix::runtime::{Fork, kernel_fork};
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {

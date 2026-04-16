@@ -12,8 +12,8 @@ use std::process::Command;
 
 use rustix::io::FdFlags;
 use rustix::net::{
-    recvmsg, socketpair, AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
-    SocketFlags, SocketType,
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketFlags, SocketType,
+    recvmsg, socketpair,
 };
 
 /// Mount a FUSE filesystem via fusermount3 and return the /dev/fuse fd.

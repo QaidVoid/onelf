@@ -88,18 +88,10 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
     None
 }
 
-/// Check if target is an ELF binary with a patched interpreter (starts with /tmp/.oi)
-pub fn has_patched_interp(target: &Path) -> bool {
-    match read_elf_interp(target) {
-        Some(interp) => interp.starts_with("/tmp/.oi"),
-        None => false,
-    }
-}
-
 /// Check if we should use userland-execve for this target.
 ///
 /// Returns the bundled interpreter path if:
-/// - Target is an ELF binary with patched PT_INTERP
+/// - Target is an ELF binary
 /// - Bundled interpreter exists
 /// - userland-execve is supported on this platform
 pub fn should_use_userland_exec(
@@ -118,7 +110,7 @@ pub fn should_use_userland_exec(
         return None;
     }
 
-    if !has_patched_interp(target) {
+    if read_elf_interp(target).is_none() {
         return None;
     }
 
@@ -203,11 +195,6 @@ pub fn build_exec_command(
 }
 
 /// Parse the bundled interpreter relative path from `.onelf/interp` metadata.
-/// Returns the third line (bundled interpreter path relative to package root).
 pub fn parse_bundled_interp_rel(interp_data: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(interp_data).ok()?;
-    let mut lines = text.lines();
-    lines.next()?;
-    lines.next()?;
-    lines.next()
+    std::str::from_utf8(interp_data).ok()?.lines().next()
 }

@@ -265,73 +265,44 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         });
     }
 
-    // Patch ELF PT_INTERP for cross-libc portability.
-    // Scans collected files for ELF binaries with PT_INTERP and checks if the
-    // corresponding interpreter is bundled in the package (e.g. via bundle-libs).
     let package_name = opts
         .name
         .as_deref()
         .unwrap_or_else(|| opts.command.split('/').last().unwrap_or("app"));
 
+    // Detect bundled ELF interpreter for cross-libc portability.
+    // When a matching interpreter is bundled (e.g. via bundle-libs), record its
+    // relative path in .onelf/interp so the runtime can use userland-execve with
+    // the bundled interpreter instead of the system one.
     {
-        // Find first PT_INTERP from any ELF file
         let original_interp = files.iter().find_map(|f| elf_interp(&f.content));
-
-        if let Some(ref interp) = original_interp {
-            let interp_name = Path::new(interp).file_name().and_then(|n| n.to_str());
-
-            // Find the bundled interpreter among collected files by filename match
-            let bundled_relpath = interp_name.and_then(|name| {
-                files.iter().find_map(|f| {
-                    if f.rel_path.file_name().and_then(|n| n.to_str()) == Some(name) {
-                        Some(f.rel_path.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                })
-            });
-
-            if let Some(ref bundled_rel) = bundled_relpath {
-                // Hash package name + bundled interpreter path to avoid collisions
-                // between different packages with the same name.
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(package_name.as_bytes());
-                hasher.update(bundled_rel.as_bytes());
-                let hash = hasher.finalize();
-                let hash_hex: String = hash.as_bytes()[..8]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                let new_interp = format!("/tmp/.oi{hash_hex}");
-
-                let mut patched_count = 0usize;
-                for f in files.iter_mut() {
-                    if patch_elf_interp(&mut f.content, &new_interp) {
-                        patched_count += 1;
-                    }
+        let bundled_relpath = original_interp.as_ref().and_then(|interp| {
+            let interp_name = Path::new(interp).file_name()?.to_str()?;
+            files.iter().find_map(|f| {
+                if f.rel_path.file_name().and_then(|n| n.to_str()) == Some(interp_name) {
+                    Some(f.rel_path.to_string_lossy().into_owned())
+                } else {
+                    None
                 }
+            })
+        });
 
-                if patched_count > 0 {
-                    eprintln!("Patched {patched_count} ELF binaries: {interp} → {new_interp}");
-
-                    // Inject .onelf/interp metadata for runtime symlink creation
-                    if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-                        dirs.push(CollectedDir {
-                            rel_path: PathBuf::from(".onelf"),
-                            mode: 0o755,
-                            mtime_secs: 0,
-                            mtime_nsec: 0,
-                        });
-                    }
-                    files.push(CollectedFile {
-                        rel_path: PathBuf::from(".onelf/interp"),
-                        content: format!("{interp}\n{new_interp}\n{bundled_rel}").into_bytes(),
-                        mode: 0o644,
-                        mtime_secs: 0,
-                        mtime_nsec: 0,
-                    });
-                }
+        if let Some(bundled_rel) = bundled_relpath {
+            if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+                dirs.push(CollectedDir {
+                    rel_path: PathBuf::from(".onelf"),
+                    mode: 0o755,
+                    mtime_secs: 0,
+                    mtime_nsec: 0,
+                });
             }
+            files.push(CollectedFile {
+                rel_path: PathBuf::from(".onelf/interp"),
+                content: bundled_rel.into_bytes(),
+                mode: 0o644,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+            });
         }
     }
 
@@ -743,12 +714,6 @@ fn get_mtime(meta: &fs::Metadata) -> (u64, u32) {
 
 /// Parse PT_INTERP from ELF data, returning the interpreter path.
 fn elf_interp(data: &[u8]) -> Option<String> {
-    let info = elf_interp_info(data)?;
-    Some(info.2)
-}
-
-/// Find PT_INTERP info: (offset, max_len, original_path).
-fn elf_interp_info(data: &[u8]) -> Option<(usize, usize, String)> {
     if data.len() < 64 || data[0..4] != *b"\x7fELF" {
         return None;
     }
@@ -800,39 +765,12 @@ fn elf_interp_info(data: &[u8]) -> Option<(usize, usize, String)> {
         }
 
         let interp = &data[p_offset..p_offset + p_filesz];
-        // Truncate at first NUL — patched binaries pad the shorter new path with NULs
         let interp = match interp.iter().position(|&b| b == 0) {
             Some(pos) => &interp[..pos],
             None => interp,
         };
-        let path = std::str::from_utf8(interp).ok()?.to_string();
-        return Some((p_offset, p_filesz, path));
+        return std::str::from_utf8(interp).ok().map(String::from);
     }
 
     None
-}
-
-/// Patch PT_INTERP in ELF data to point to a new path. Returns true if patched.
-fn patch_elf_interp(data: &mut [u8], new_interp: &str) -> bool {
-    let (offset, max_len, original) = match elf_interp_info(data) {
-        Some(info) => info,
-        None => return false,
-    };
-
-    if original == new_interp {
-        return false;
-    }
-
-    let needed = new_interp.len() + 1;
-    if needed > max_len {
-        return false;
-    }
-
-    let dest = &mut data[offset..offset + max_len];
-    dest[..new_interp.len()].copy_from_slice(new_interp.as_bytes());
-    for b in &mut dest[new_interp.len()..] {
-        *b = 0;
-    }
-
-    true
 }

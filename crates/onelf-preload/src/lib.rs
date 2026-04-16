@@ -1,9 +1,9 @@
 //! LD_PRELOAD library that intercepts execve() for onelf cross-libc portability.
 //!
-//! When a process tries to exec a binary with patched PT_INTERP (starting with
-//! /tmp/.oi), this library intercepts the call and uses userland-execve instead
-//! of the kernel's execve. This allows spawned processes to work without needing
-//! symlinks in /tmp.
+//! When running inside an onelf package (ONELF_PKG_ROOT set) and the target is
+//! an ELF binary, this library intercepts execve() and uses userland-execve
+//! with the bundled interpreter, ensuring spawned processes use the same libc
+//! as the packed binary.
 
 use std::ffi::{CStr, CString};
 use std::io::Read;
@@ -14,73 +14,7 @@ type ExecveFn = unsafe extern "C" fn(*const i8, *const *const i8, *const *const 
 
 static mut REAL_EXECVE: Option<ExecveFn> = None;
 
-fn read_elf_interp(data: &[u8]) -> Option<String> {
-    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
-        return None;
-    }
-
-    let class = data[4];
-
-    let (e_phoff, e_phentsize, e_phnum) = match class {
-        2 => {
-            let e_phoff = u64::from_le_bytes(data[32..40].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[54..56].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[56..58].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
-        1 => {
-            let e_phoff = u32::from_le_bytes(data[28..32].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[42..44].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[44..46].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
-        _ => return None,
-    };
-
-    for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + e_phentsize > data.len() {
-            break;
-        }
-
-        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
-        if p_type != 3 {
-            continue;
-        }
-
-        let (p_offset, p_filesz) = match class {
-            2 => {
-                let p_offset =
-                    u64::from_le_bytes(data[off + 8..off + 16].try_into().ok()?) as usize;
-                let p_filesz =
-                    u64::from_le_bytes(data[off + 32..off + 40].try_into().ok()?) as usize;
-                (p_offset, p_filesz)
-            }
-            1 => {
-                let p_offset = u32::from_le_bytes(data[off + 4..off + 8].try_into().ok()?) as usize;
-                let p_filesz =
-                    u32::from_le_bytes(data[off + 16..off + 20].try_into().ok()?) as usize;
-                (p_offset, p_filesz)
-            }
-            _ => return None,
-        };
-
-        if p_offset + p_filesz > data.len() {
-            return None;
-        }
-
-        let interp = &data[p_offset..p_offset + p_filesz];
-        let interp = match interp.iter().position(|&b| b == 0) {
-            Some(pos) => &interp[..pos],
-            None => interp,
-        };
-        return std::str::from_utf8(interp).ok().map(String::from);
-    }
-
-    None
-}
-
-fn has_patched_interp(path: &CStr) -> bool {
+fn is_elf(path: &CStr) -> bool {
     let path_str = match path.to_str() {
         Ok(s) => s,
         Err(_) => return false,
@@ -91,17 +25,11 @@ fn has_patched_interp(path: &CStr) -> bool {
         Err(_) => return false,
     };
 
-    let mut buf = vec![0u8; 8192];
-    let n = match file.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    buf.truncate(n);
-
-    match read_elf_interp(&buf) {
-        Some(interp) => interp.starts_with("/tmp/.oi"),
-        None => false,
+    let mut magic = [0u8; 4];
+    if file.read(&mut magic).unwrap_or(0) < 4 {
+        return false;
     }
+    magic == *b"\x7fELF"
 }
 
 fn get_bundled_interp() -> Option<CString> {
@@ -187,7 +115,7 @@ pub unsafe extern "C" fn execve(
 
     let path_cstr = CStr::from_ptr(pathname);
 
-    if has_patched_interp(path_cstr) {
+    if is_elf(path_cstr) {
         if let Some(interp) = get_bundled_interp() {
             do_userland_execve(pathname, argv, envp, &interp);
         }
