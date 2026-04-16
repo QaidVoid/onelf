@@ -246,6 +246,8 @@ pub struct BundleOptions {
     pub strip: bool,
     pub strict_libc: bool,
     pub scan_dlopen: bool,
+    /// Additional sonames added to the dlopen scan allow-list.
+    pub dlopen_extra: Vec<String>,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -427,7 +429,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if opts.scan_dlopen {
         let mut scanned: HashSet<String> = HashSet::new();
         for path in &elf_files {
-            if let Ok(hits) = scan_dlopen(path) {
+            if let Ok(hits) = scan_dlopen(path, &opts.dlopen_extra) {
                 for soname in hits {
                     if scanned.insert(soname.clone()) {
                         let requirer = path
@@ -1011,13 +1013,12 @@ const DLOPEN_CANDIDATES: &[&str] = &[
 ];
 
 /// Scan a binary's string table for soname-shaped values that match the
-/// dlopen allow-list. Matches are candidates for bundling even though they
-/// don't appear in DT_NEEDED.
-fn scan_dlopen(path: &Path) -> io::Result<Vec<String>> {
+/// dlopen allow-list (built-in plus any user-supplied additions). Matches
+/// are candidates for bundling even though they don't appear in DT_NEEDED.
+fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
     let data = fs::read(path)?;
     let mut found: Vec<String> = Vec::new();
 
-    // Walk printable runs of length >= 5, test each against the allow-list.
     let mut start = None;
     for (i, &b) in data.iter().enumerate() {
         let printable = (0x20..=0x7e).contains(&b);
@@ -1028,10 +1029,10 @@ fn scan_dlopen(path: &Path) -> io::Result<Vec<String>> {
         } else if let Some(s) = start.take() {
             if i - s >= 5 {
                 if let Ok(text) = std::str::from_utf8(&data[s..i]) {
-                    for &cand in DLOPEN_CANDIDATES {
-                        if text == cand && !found.iter().any(|x| x == cand) {
-                            found.push(cand.to_string());
-                        }
+                    let match_builtin = DLOPEN_CANDIDATES.iter().any(|c| *c == text);
+                    let match_extra = extra.iter().any(|c| c == text);
+                    if (match_builtin || match_extra) && !found.iter().any(|x| x == text) {
+                        found.push(text.to_string());
                     }
                 }
             }

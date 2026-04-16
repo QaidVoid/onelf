@@ -8,6 +8,7 @@ mod metadata;
 mod pack;
 mod recipe;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -229,6 +230,12 @@ enum Commands {
         /// audio, DBus, etc.) and bundle the matches.
         #[arg(long)]
         scan_dlopen: bool,
+
+        /// Extra sonames added to the --scan-dlopen allow-list (repeatable
+        /// or comma-separated). Matches must still appear in the binary's
+        /// strings to be bundled.
+        #[arg(long, value_delimiter = ',')]
+        dlopen: Vec<String>,
     },
 }
 
@@ -363,6 +370,7 @@ fn main() {
             strip,
             strict_libc,
             scan_dlopen,
+            dlopen,
         } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
             bundle::bundle_libs(&bundle::BundleOptions {
                 directory,
@@ -381,6 +389,7 @@ fn main() {
                 strip,
                 strict_libc,
                 scan_dlopen,
+                dlopen_extra: dlopen,
             })
         }),
     };
@@ -428,6 +437,7 @@ fn run_build(
             strip: recipe.bundle.strip,
             strict_libc: recipe.bundle.strict_libc,
             scan_dlopen: recipe.bundle.scan_dlopen,
+            dlopen_extra: recipe.bundle.dlopen.clone(),
         })?;
     }
 
@@ -522,7 +532,6 @@ fn scaffold_from_binary(
     })?;
     let dest = bin_dir.join(name);
     std::fs::copy(src, &dest)?;
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     eprintln!("Scaffolded {} -> {}", src.display(), dest.display());
     Ok(())

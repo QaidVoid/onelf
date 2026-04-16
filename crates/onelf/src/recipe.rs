@@ -143,6 +143,9 @@ pub struct Bundle {
     pub strict_libc: bool,
     #[serde(default)]
     pub scan_dlopen: bool,
+    /// Extra sonames added to the --scan-dlopen allow-list.
+    #[serde(default)]
+    pub dlopen: Vec<String>,
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).
     #[serde(default)]
     pub skip: bool,
