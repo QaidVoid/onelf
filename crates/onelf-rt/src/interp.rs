@@ -91,9 +91,12 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
 /// Check if we should use userland-execve for this target.
 ///
 /// Returns the bundled interpreter path if:
-/// - Target is an ELF binary
+/// - Target is a PIE ELF binary (ET_DYN)
 /// - Bundled interpreter exists
 /// - userland-execve is supported on this platform
+///
+/// Non-PIE ELFs (ET_EXEC) go through the command-based fallback instead
+/// because userland-execve can't relocate them.
 pub fn should_use_userland_exec(
     target: &Path,
     pkg_root: &Path,
@@ -114,7 +117,29 @@ pub fn should_use_userland_exec(
         return None;
     }
 
+    if !is_pie(target) {
+        return None;
+    }
+
     Some(interp)
+}
+
+/// Read the ELF e_type field and return true for ET_DYN (PIE / shared object).
+fn is_pie(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 20];
+    if f.read(&mut buf).unwrap_or(0) < 20 {
+        return false;
+    }
+    if buf[0..4] != *b"\x7fELF" {
+        return false;
+    }
+    // e_type is at offset 16 as u16 little-endian. ET_DYN = 3.
+    let e_type = u16::from_le_bytes([buf[16], buf[17]]);
+    e_type == 3
 }
 
 /// Execute an ELF binary using userland-execve with bundled interpreter.
