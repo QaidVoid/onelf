@@ -494,6 +494,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 if set_origin_runpath(&path).is_ok() {
                     rewritten += 1;
                 }
+                let _ = scrub_nix_store_paths(&path);
                 if needs_chmod {
                     let _ = fs::set_permissions(
                         &path,
@@ -824,6 +825,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // target system; LD_LIBRARY_PATH (set by the runtime) is used instead.
     if !opts.dry_run {
         let mut rewritten = 0usize;
+        let mut scrubbed = 0usize;
         for path in find_elf_files(&opts.directory) {
             let perms = fs::metadata(&path)
                 .map(|m| m.permissions().mode())
@@ -838,6 +840,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             if set_origin_runpath(&path).is_ok() {
                 rewritten += 1;
             }
+            let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let _ = scrub_nix_store_paths(&path);
+            let after = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if before.is_some() && before != after {
+                scrubbed += 1;
+            }
             if needs_chmod {
                 let _ =
                     fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
@@ -848,6 +856,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 "{} RUNPATH to $ORIGIN/../lib in {} binaries",
                 color::bold("Rewrote"),
                 rewritten
+            );
+        }
+        if scrubbed > 0 {
+            eprintln!(
+                "{} /nix/store paths in {} binaries",
+                color::bold("Scrubbed"),
+                scrubbed
             );
         }
     }
@@ -1415,6 +1430,77 @@ fn scrub_loader_paths(path: &Path) -> io::Result<()> {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    if changed {
+        fs::write(path, &data)?;
+    }
+    Ok(())
+}
+
+/// Rewrite specific `/nix/store/<hash>-<name>-<version>/...` strings
+/// baked into a bundled ELF with sensible host equivalents. Called for
+/// every bundled non-loader ELF, not just the loader.
+///
+/// nixpkgs typically compiles postgres with `--with-system-tzdata=<store>`
+/// and embeds the full path to the `locale` binary it will shell out
+/// to. Both paths exist only on the packer's machine. On the user's
+/// machine postgres prints a parade of warnings about the missing
+/// directory, then falls back to internal UTC-only behavior and
+/// still-functional locale defaults. The bundle still works, but the
+/// noise is confusing.
+///
+/// Replacements are equal-length to avoid any ELF structure shifts,
+/// with the replacement null-padded to the original slot size. We
+/// target the suffix (e.g. `/share/zoneinfo`, `/bin/locale`) and walk
+/// back to the nearest NUL to find the start of the whole path
+/// string.
+fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
+    let mut data = fs::read(path)?;
+    let mut changed = false;
+
+    // (suffix to find, replacement path, friendly name)
+    let rewrites: &[(&[u8], &[u8])] = &[
+        (b"/share/zoneinfo", b"/usr/share/zoneinfo"),
+        (b"/bin/locale", b"/usr/bin/locale"),
+    ];
+
+    for (suffix, replacement) in rewrites {
+        let mut i = 0;
+        while i + suffix.len() <= data.len() {
+            if &data[i..i + suffix.len()] != *suffix {
+                i += 1;
+                continue;
+            }
+            // Walk back to find the start of this C string.
+            let mut start = i;
+            while start > 0 && data[start - 1] != 0 {
+                start -= 1;
+            }
+            // Only touch strings rooted in /nix/store/.
+            if start + 11 > data.len() || &data[start..start + 11] != b"/nix/store/" {
+                i = i + suffix.len();
+                continue;
+            }
+            // Find end of string: walk forward to the NUL.
+            let mut end = i + suffix.len();
+            while end < data.len() && data[end] != 0 {
+                end += 1;
+            }
+            let slot = end - start;
+            if replacement.len() + 1 > slot {
+                // Shouldn't happen for these specific replacements,
+                // but guard just in case.
+                i = end;
+                continue;
+            }
+            data[start..start + replacement.len()].copy_from_slice(replacement);
+            for b in &mut data[start + replacement.len()..end] {
+                *b = 0;
+            }
+            changed = true;
+            i = end;
         }
     }
 
