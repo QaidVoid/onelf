@@ -45,12 +45,25 @@ pub fn setup_env(
         let lib_str = lib_paths.join(":");
         if !lib_str.is_empty() {
             let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            // Assemble the search path as:
+            //   <bundled lib dirs> : <existing LD_LIBRARY_PATH> : <host driver/system dirs>
+            // Bundled libs win, but GPU / libGL / libcuda / libvulkan and
+            // other host-provided userspace drivers are discoverable. Our
+            // bundled ld.so has its baked-in paths scrubbed, so drivers
+            // that normally live in /usr/lib (or /run/opengl-driver/lib
+            // on NixOS) have to be added here explicitly or Cycles/OptiX
+            // and similar features won't find their driver libraries.
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(lib_str.clone());
+            if !existing.is_empty() {
+                parts.push(existing);
+            }
+            let host_paths = host_driver_paths();
+            if !host_paths.is_empty() {
+                parts.push(host_paths.join(":"));
+            }
             unsafe {
-                if existing.is_empty() {
-                    env::set_var("LD_LIBRARY_PATH", &lib_str);
-                } else {
-                    env::set_var("LD_LIBRARY_PATH", format!("{lib_str}:{existing}"));
-                }
+                env::set_var("LD_LIBRARY_PATH", parts.join(":"));
             }
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
@@ -159,6 +172,33 @@ pub fn setup_env(
             }
         }
     }
+}
+
+/// Return the host's driver / system library directories that exist on
+/// this system, in descending priority order. These are appended to the
+/// package's `LD_LIBRARY_PATH` so the bundled loader can locate host-
+/// provided GPU userspace drivers (libcuda, libvulkan, libGL, libva)
+/// without picking up host libraries that would clash with the bundle's
+/// own copies — those come first in the search path.
+fn host_driver_paths() -> Vec<String> {
+    // NixOS exposes all GPU userspace drivers under /run/opengl-driver,
+    // populated from the active nixpkgs `hardware.graphics` closure.
+    // On other distros, drivers live in the standard multiarch or lib64
+    // paths alongside the rest of the system's runtime libraries.
+    const CANDIDATES: &[&str] = &[
+        "/run/opengl-driver/lib",
+        "/run/opengl-driver-32/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+        "/lib64",
+    ];
+    CANDIDATES
+        .iter()
+        .filter(|p| Path::new(p).is_dir())
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find

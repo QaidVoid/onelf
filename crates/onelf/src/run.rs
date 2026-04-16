@@ -112,12 +112,20 @@ pub fn run(
 
     if !lib_paths_str.is_empty() {
         let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        let combined = if existing.is_empty() {
-            lib_paths_str.clone()
-        } else {
-            format!("{lib_paths_str}:{existing}")
-        };
-        cmd.env("LD_LIBRARY_PATH", combined);
+        // Assemble: <bundle lib> : <existing> : <host driver/system dirs>.
+        // The bundled loader has its baked-in paths scrubbed, so host-
+        // provided GPU drivers (libcuda, libvulkan, libGL, libva) need
+        // an explicit entry or Cycles/OptiX/Vulkan won't see them.
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(lib_paths_str.clone());
+        if !existing.is_empty() {
+            parts.push(existing);
+        }
+        let host_drivers = host_driver_paths();
+        if !host_drivers.is_empty() {
+            parts.push(host_drivers.join(":"));
+        }
+        cmd.env("LD_LIBRARY_PATH", parts.join(":"));
 
         // Auto-set GPU/driver paths if the usual subdirs exist.
         let dri_paths: Vec<String> = lib_paths
@@ -415,6 +423,26 @@ fn find_bundled_interp(interp: &str, app_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Host driver / system library directories to append to LD_LIBRARY_PATH.
+/// See `onelf-rt`'s `env.rs` for rationale; kept in sync here so `onelf run`
+/// gets the same driver discovery behavior as packed runs.
+fn host_driver_paths() -> Vec<String> {
+    const CANDIDATES: &[&str] = &[
+        "/run/opengl-driver/lib",
+        "/run/opengl-driver-32/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+        "/lib64",
+    ];
+    CANDIDATES
+        .iter()
+        .filter(|p| Path::new(p).is_dir())
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 /// Find subdirectories of `dir` that contain `.so*` files, skipping obvious
