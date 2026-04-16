@@ -60,7 +60,7 @@ onelf verify mybinary.onelf   # BLAKE3 integrity check
 
 ## What's next
 
-- [AppDir Layout](./appdir-layout) — how the directory is structured
-- [Recipe File](./recipe) — declarative packaging
-- [Execution Modes](./execution-modes) — how the runtime actually runs things
-- [Self-Update](./self-update) — delta updates over HTTP
+- [AppDir Layout](./appdir-layout): how the directory is structured
+- [Recipe File](./recipe): declarative packaging
+- [Execution Modes](./execution-modes): how the runtime actually runs things
+- [Self-Update](./self-update): delta updates over HTTP

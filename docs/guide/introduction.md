@@ -56,5 +56,5 @@ When you execute the file:
 - You need Windows or macOS support (Linux-only).
 - You need sandboxing / containerization (onelf isn't a sandbox; see bubblewrap
   or flatpak for that).
-- Your binary is already fully static and has zero dynamic-library deps — just
-  ship the binary.
+- Your binary is already fully static and has zero dynamic-library deps. In
+  that case you can just ship the binary directly.

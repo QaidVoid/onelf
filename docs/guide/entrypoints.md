@@ -88,5 +88,5 @@ the kernel resolves that path against the process CWD at exec time.
 The runtime therefore forces CWD to the AppDir root when it execs such
 a binary, which overrides `working-dir = "inherit"`. If you need the
 caller's original working directory, read `$ONELF_LAUNCH_DIR` from the
-app — the runtime sets it before exec.
+app. The runtime sets it before exec.
 :::

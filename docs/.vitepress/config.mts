@@ -57,6 +57,12 @@ export default defineConfig({
             { text: "Inspecting Packages", link: "/guide/inspecting" },
           ],
         },
+        {
+          text: "Examples",
+          items: [
+            { text: "Miniflux + PostgreSQL", link: "/guide/examples/miniflux" },
+          ],
+        },
       ],
       "/reference/": [
         {

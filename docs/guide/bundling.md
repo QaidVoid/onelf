@@ -58,7 +58,7 @@ If the binary has `DT_NEEDED` for `libGL.so.1`, onelf automatically enables
 GL/DRI bundling. Same for Qt/GTK/Vulkan/Wayland. Detection also scans the
 binary's byte content for literal soname strings, so frameworks that are
 only `dlopen`'d at runtime (Blender loading `libwayland-cursor.so` after
-checking `$XDG_SESSION_TYPE`, for example) get picked up too — no
+checking `$XDG_SESSION_TYPE`, for example) get picked up too with no
 `DT_NEEDED` entry required.
 
 You can still force any of these explicitly:

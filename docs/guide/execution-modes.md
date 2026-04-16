@@ -110,8 +110,8 @@ strategies based on the entrypoint's `PT_INTERP`:
    entrypoint's `PT_INTERP` to a path relative to the AppDir, the
    runtime chdirs into the AppDir and `execve`s the target directly.
    The kernel loads the bundled loader via the relative PT_INTERP, and
-   `/proc/self/exe` points at the real binary — what Python, Electron,
-   and Qt read to find their bundled resources.
+   `/proc/self/exe` points at the real binary, which is what Python,
+   Electron, and Qt read to find their bundled resources.
 
 2. **Userland-execve.** For PIE (`ET_DYN`) binaries on systems that
    support it, the runtime can map the bundled loader into the current
