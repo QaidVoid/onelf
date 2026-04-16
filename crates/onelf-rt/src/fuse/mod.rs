@@ -221,6 +221,9 @@ pub fn execute_fuse(
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
+    // Tidy up empty mountpoint dirs left behind by previous runs.
+    mount::sweep_stale_mountpoints();
+
     let mountpoint = match create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id) {
         Some(m) => m,
         None => return false,

@@ -105,6 +105,36 @@ pub fn fuse_unmount_direct(mountpoint: &Path) {
     let _ = unmount(mountpoint, UnmountFlags::DETACH);
 }
 
+/// Best-effort sweep of stale `onelf-*` mountpoint dirs in the base path.
+/// Dirs left behind by previous runs are empty from the host namespace's
+/// view (the actual mounts lived in private namespaces); `rmdir` succeeds
+/// on empty dirs and fails atomically on non-empty ones, so this is safe
+/// even if another onelf instance is concurrently setting up its own dir.
+pub fn sweep_stale_mountpoints() {
+    let base = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => std::path::PathBuf::from("/tmp"),
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if !s.starts_with("onelf-") {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // rmdir errors out with ENOTEMPTY if another instance has live
+        // contents, which would be surprising in the private-ns model but
+        // we don't distinguish. Ignore errors either way.
+        let _ = std::fs::remove_dir(&path);
+    }
+}
+
 /// Mount a FUSE filesystem via fusermount3 and return the /dev/fuse fd.
 ///
 /// Uses the fusermount3 protocol: create a socketpair, pass one end to
