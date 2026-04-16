@@ -1102,7 +1102,15 @@ fn locate_lib(
         }
     };
 
-    // 1. ldconfig cache
+    // 1. --search-path directories (user-provided: highest priority)
+    for dir in search_paths {
+        let candidate = dir.join(soname);
+        if candidate.exists() && class_matches(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    // 2. ldconfig cache
     if let Some(paths) = ldconfig_cache.get(soname) {
         for path in paths {
             if path.exists() && class_matches(path) {
@@ -1111,17 +1119,9 @@ fn locate_lib(
         }
     }
 
-    // 2. Standard paths
+    // 3. Standard paths
     for dir in STANDARD_LIB_PATHS {
         let candidate = Path::new(dir).join(soname);
-        if candidate.exists() && class_matches(&candidate) {
-            return Some(candidate);
-        }
-    }
-
-    // 3. --search-path directories
-    for dir in search_paths {
-        let candidate = dir.join(soname);
         if candidate.exists() && class_matches(&candidate) {
             return Some(candidate);
         }
