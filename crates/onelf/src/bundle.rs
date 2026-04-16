@@ -473,11 +473,41 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     if needed_by.is_empty() {
         eprintln!("All dependencies satisfied, nothing to bundle.");
-        // PT_INTERP patching still needs to run. A prior bundle may
-        // have left stale relative paths (e.g. from an older onelf
-        // version) that don't resolve under the current CWD policy.
+        // PT_INTERP + RUNPATH rewrites still need to run. A prior bundle
+        // may have left stale paths (e.g. from an older onelf version)
+        // that either don't resolve under the current CWD policy or
+        // still rely on LD_LIBRARY_PATH.
         if !opts.dry_run {
             let lib_dest = opts.directory.join(&opts.lib_dir);
+            let mut rewritten = 0usize;
+            for path in find_elf_files(&opts.directory) {
+                let perms = fs::metadata(&path)
+                    .map(|m| m.permissions().mode())
+                    .unwrap_or(0o755);
+                let needs_chmod = perms & 0o200 == 0;
+                if needs_chmod {
+                    let _ = fs::set_permissions(
+                        &path,
+                        std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
+                    );
+                }
+                if set_origin_runpath(&path).is_ok() {
+                    rewritten += 1;
+                }
+                if needs_chmod {
+                    let _ = fs::set_permissions(
+                        &path,
+                        std::os::unix::fs::PermissionsExt::from_mode(perms),
+                    );
+                }
+            }
+            if rewritten > 0 {
+                eprintln!(
+                    "{} RUNPATH to $ORIGIN/../lib in {} binaries",
+                    color::bold("Rewrote"),
+                    rewritten
+                );
+            }
             match patch_interps_to_bundled(&opts.directory, &lib_dest) {
                 Ok(n) if n > 0 => eprintln!(
                     "{} PT_INTERP of {} binaries",
@@ -641,9 +671,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     );
                     // Strip hardcoded RPATH/RUNPATH so the bundled lib uses
                     // LD_LIBRARY_PATH (set by the runtime) instead of absolute paths
-                    if let Err(e) = strip_rpath(&dest) {
+                    if let Err(e) = set_origin_runpath(&dest) {
                         eprintln!(
-                            "  {} failed to strip rpath from {}: {e}",
+                            "  {} failed to rewrite RUNPATH of {}: {e}",
                             color::bold_red("warning:"),
                             soname
                         );
@@ -793,7 +823,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Hardcoded absolute paths (e.g. /nix/store/...) won't exist on the
     // target system; LD_LIBRARY_PATH (set by the runtime) is used instead.
     if !opts.dry_run {
-        let mut stripped = 0usize;
+        let mut rewritten = 0usize;
         for path in find_elf_files(&opts.directory) {
             let perms = fs::metadata(&path)
                 .map(|m| m.permissions().mode())
@@ -805,19 +835,19 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                 );
             }
-            if strip_rpath(&path).is_ok() {
-                stripped += 1;
+            if set_origin_runpath(&path).is_ok() {
+                rewritten += 1;
             }
             if needs_chmod {
                 let _ =
                     fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
             }
         }
-        if stripped > 0 {
+        if rewritten > 0 {
             eprintln!(
-                "{} RPATHs from {} binaries",
-                color::bold("Stripped"),
-                stripped
+                "{} RUNPATH to $ORIGIN/../lib in {} binaries",
+                color::bold("Rewrote"),
+                rewritten
             );
         }
     }
@@ -1244,9 +1274,26 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Strip RPATH/RUNPATH from an ELF binary by zeroing the string in .dynstr.
-/// This makes the dynamic linker rely on LD_LIBRARY_PATH instead of hardcoded paths.
-fn strip_rpath(path: &Path) -> io::Result<()> {
+/// Rewrite RPATH/RUNPATH to `$ORIGIN/../lib` so the bundled ELF finds its
+/// transitive libraries via its own on-disk location, never via
+/// `LD_LIBRARY_PATH`. That matters because `LD_LIBRARY_PATH` is a
+/// per-process env variable that gets inherited into host binaries the
+/// app may spawn (for example, `postgres` uses `popen(3)` which execs
+/// `/bin/sh` - a host binary linked against the host's glibc). If we
+/// left our bundle dir on `LD_LIBRARY_PATH`, the host shell would load
+/// our newer `libc.so.6` against its own older `ld-linux.so.2` and
+/// crash with a null deref in the loader. Using `$ORIGIN/../lib` keeps
+/// the bundle's library search scoped to the bundled ELF itself.
+///
+/// Only works when the ELF already has a DT_RPATH or DT_RUNPATH entry
+/// we can reuse. Upstream Linux distros (including nixpkgs, Debian,
+/// Fedora) compile most system binaries with one set, pointing at the
+/// distro's own lib dir, so we almost always find a slot. Binaries
+/// without any RPATH entry stay unmodified, which is fine because the
+/// caller still sets `LD_LIBRARY_PATH` in the direct-ELF exec path as
+/// a fallback.
+fn set_origin_runpath(path: &Path) -> io::Result<()> {
+    const NEW: &[u8] = b"$ORIGIN/../lib";
     let data = fs::read(path)?;
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -1274,15 +1321,40 @@ fn strip_rpath(path: &Path) -> io::Result<()> {
             || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
         {
             let file_pos = dynstr_offset + dyn_entry.d_val as usize;
-            if file_pos < modified.len() && modified[file_pos] != 0 {
-                // Zero out the entire rpath string
-                let mut pos = file_pos;
-                while pos < modified.len() && modified[pos] != 0 {
-                    modified[pos] = 0;
-                    pos += 1;
-                }
-                changed = true;
+            if file_pos >= modified.len() {
+                continue;
             }
+            // Measure the writable slot size. Two cases:
+            //   (a) slot currently has content ending at a NUL: size =
+            //       string length + 1 (we can also overwrite the NUL).
+            //   (b) slot was zeroed by an older strip pass: size is the
+            //       run of consecutive NULs up to the next non-NUL, i.e.
+            //       the original string length + its NUL terminator.
+            let slot_size: usize = if modified[file_pos] == 0 {
+                let mut n = 0;
+                while file_pos + n < modified.len() && modified[file_pos + n] == 0 {
+                    n += 1;
+                }
+                n
+            } else {
+                let mut n = 0;
+                while file_pos + n < modified.len() && modified[file_pos + n] != 0 {
+                    n += 1;
+                }
+                n + 1
+            };
+            if NEW.len() + 1 > slot_size {
+                // Not enough room to fit NEW plus a NUL terminator. The
+                // caller will still fall back to LD_LIBRARY_PATH for ELF
+                // entrypoints in the direct-exec path, so this isn't
+                // fatal - just less robust.
+                continue;
+            }
+            modified[file_pos..file_pos + NEW.len()].copy_from_slice(NEW);
+            for i in NEW.len()..slot_size {
+                modified[file_pos + i] = 0;
+            }
+            changed = true;
         }
     }
 

@@ -116,7 +116,12 @@ mkdir -p "$DATA_ROOT" "$PGSOCK"
 [ -d "$PGDATA" ] && chmod 700 "$PGDATA" 2>/dev/null || true
 
 export PGSHAREDIR="$PGSHARE"
-export LD_LIBRARY_PATH="$ONELF_DIR/lib:${LD_LIBRARY_PATH:-}"
+# Intentionally NOT exporting LD_LIBRARY_PATH. Every bundled ELF has
+# DT_RUNPATH=$ORIGIN/../lib patched in by bundle-libs, so the bundled
+# loader finds transitive libs via the binary's own location. Exporting
+# LD_LIBRARY_PATH would leak the bundle lib dir into every child
+# postgres spawns - including /bin/sh via popen(3) - which crashes on
+# systems whose host glibc version differs from the bundle's.
 
 # Point postgres at a real timezone DB on the host. The postgres
 # binary has a build-time tzdata path baked in that almost never
