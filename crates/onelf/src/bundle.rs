@@ -244,6 +244,7 @@ pub struct BundleOptions {
     pub wayland: bool,
     pub gtk: bool,
     pub strip: bool,
+    pub strict_libc: bool,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -453,6 +454,38 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
                 let dest = lib_dest.join(&soname);
 
+                // Check libc family of this candidate before copying: if it
+                // mismatches the target and --strict-libc is set, skip.
+                let lib_needed = parse_needed(&resolved).unwrap_or_default();
+                let lib_family = lib_needed.iter().find_map(|d| libc_family_of_soname(d));
+                let mismatch = matches!(
+                    (target_libc, lib_family),
+                    (Some(t), Some(f)) if t != f
+                );
+                if mismatch {
+                    let msg = format!(
+                        "{} links against {:?} libc but target is {:?}",
+                        soname,
+                        lib_family.unwrap(),
+                        target_libc.unwrap()
+                    );
+                    if opts.strict_libc {
+                        eprintln!(
+                            "  {} skipping {} ({})",
+                            color::bold_red("skip:"),
+                            color::cyan(&soname),
+                            msg,
+                        );
+                        not_found.push((soname.clone(), format!("{requirer} ({msg})")));
+                        continue;
+                    }
+                    eprintln!(
+                        "  {} {}; this bundle may not work at runtime",
+                        color::bold_red("warning:"),
+                        msg,
+                    );
+                }
+
                 // On NixOS: expand cache with this store path's closure
                 // so transitive deps (e.g. libsndfile for libpulsecommon) are found
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
@@ -497,42 +530,27 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
                 // Resolve transitive dependencies
                 if opts.recursive {
-                    if let Ok(transitive) = parse_needed(&resolved) {
-                        let lib_family = transitive.iter().find_map(|d| libc_family_of_soname(d));
-                        if let (Some(target), Some(lib_fam)) = (target_libc, lib_family) {
-                            if lib_fam != target {
-                                eprintln!(
-                                    "  {} {} links against {:?} libc but target is {:?}; \
-                                     this bundle may not work at runtime",
-                                    color::bold_red("warning:"),
-                                    soname,
-                                    lib_fam,
-                                    target
-                                );
-                            }
+                    for dep in lib_needed {
+                        if already_processed.contains(&dep)
+                            || is_excluded(&dep, &excludes)
+                            || existing.contains(&dep)
+                        {
+                            continue;
                         }
-                        for dep in transitive {
-                            if already_processed.contains(&dep)
-                                || is_excluded(&dep, &excludes)
-                                || existing.contains(&dep)
-                            {
-                                continue;
-                            }
-                            // Skip wrong-family libc entries. They can't
-                            // satisfy symbols of the target's libc anyway and
-                            // just clutter the bundle.
-                            if let Some(target) = target_libc {
-                                if let Some(fam) = libc_family_of_soname(&dep) {
-                                    if fam != target {
-                                        continue;
-                                    }
+                        // Skip wrong-family libc entries. They can't satisfy
+                        // symbols of the target's libc anyway and just clutter
+                        // the bundle.
+                        if let Some(target) = target_libc {
+                            if let Some(fam) = libc_family_of_soname(&dep) {
+                                if fam != target {
+                                    continue;
                                 }
                             }
-                            needed_by
-                                .entry(dep.clone())
-                                .or_insert_with(|| soname.clone());
-                            queue.push(dep);
                         }
+                        needed_by
+                            .entry(dep.clone())
+                            .or_insert_with(|| soname.clone());
+                        queue.push(dep);
                     }
                 }
             }

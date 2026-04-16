@@ -198,6 +198,12 @@ enum Commands {
         /// Strip debug symbols from copied libraries
         #[arg(long)]
         strip: bool,
+
+        /// Skip libraries whose libc family (musl vs glibc) doesn't match
+        /// the target binary. Without this flag, mismatched libs are copied
+        /// with a warning.
+        #[arg(long)]
+        strict_libc: bool,
     },
 }
 
@@ -317,6 +323,7 @@ fn main() {
             wayland,
             gtk,
             strip,
+            strict_libc,
         } => bundle::bundle_libs(&bundle::BundleOptions {
             directory,
             target,
@@ -332,6 +339,7 @@ fn main() {
             wayland,
             gtk,
             strip,
+            strict_libc,
         }),
     };
 
