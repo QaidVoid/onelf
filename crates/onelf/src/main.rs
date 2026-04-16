@@ -48,8 +48,9 @@ enum Commands {
         #[arg(long)]
         default_entrypoint: Option<String>,
 
-        /// Library directories to add to LD_LIBRARY_PATH (repeatable)
-        #[arg(long)]
+        /// Library directories to add to LD_LIBRARY_PATH (repeatable).
+        /// Pass "auto" (default) to detect directories containing .so files.
+        #[arg(long, default_values_t = [String::from("auto")])]
         lib_dir: Vec<String>,
 
         /// Zstd compression level (0-22)
