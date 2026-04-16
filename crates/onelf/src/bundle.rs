@@ -540,6 +540,54 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
+    // Ensure each ELF's PT_INTERP basename exists in lib_dest as a file or
+    // symlink. On musl the loader is referenced as ld-musl-*.so.1 but bundled
+    // as libc.musl-*.so.1 (both are names for the same file on disk); without
+    // the alias the kernel can't find the interpreter at runtime.
+    if !opts.dry_run {
+        let mut interp_names: Vec<String> = elf_files
+            .iter()
+            .filter_map(|p| {
+                parse_interp(p).and_then(|i| {
+                    Path::new(&i)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+            })
+            .collect();
+        interp_names.sort();
+        interp_names.dedup();
+
+        for interp_name in interp_names {
+            let target = lib_dest.join(&interp_name);
+            if target.exists() || target.is_symlink() {
+                continue;
+            }
+            let Some(libc_name) = libc_alias_for(&interp_name) else {
+                continue;
+            };
+            let libc_path = lib_dest.join(&libc_name);
+            if !libc_path.exists() {
+                continue;
+            }
+            if let Err(e) = std::os::unix::fs::symlink(&libc_name, &target) {
+                eprintln!(
+                    "  {} failed to create {} -> {}: {e}",
+                    color::bold_red("warning:"),
+                    interp_name,
+                    libc_name
+                );
+            } else {
+                eprintln!(
+                    "  {} {} -> {}",
+                    color::bold_green("Linked"),
+                    interp_name,
+                    libc_name
+                );
+            }
+        }
+    }
+
     // Strip RPATHs from all ELF files in the directory for portability.
     // Hardcoded absolute paths (e.g. /nix/store/...) won't exist on the
     // target system; LD_LIBRARY_PATH (set by the runtime) is used instead.
@@ -700,6 +748,22 @@ fn parse_needed(path: &Path) -> io::Result<Vec<String>> {
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     Ok(elf.libraries.iter().map(|s| s.to_string()).collect())
+}
+
+/// Parse PT_INTERP from an ELF binary, returning the interpreter path.
+fn parse_interp(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let elf = goblin::elf::Elf::parse(&data).ok()?;
+    elf.interpreter.map(String::from)
+}
+
+/// Map an ELF interpreter basename to the libc filename that serves it.
+/// On musl, `ld-musl-<arch>.so.1` and `libc.musl-<arch>.so.1` are both
+/// names for the same file. Returns None if no mapping is known.
+fn libc_alias_for(interp_name: &str) -> Option<String> {
+    interp_name
+        .strip_prefix("ld-musl-")
+        .map(|rest| format!("libc.musl-{rest}"))
 }
 
 /// Parse RPATH and RUNPATH entries from an ELF binary.
