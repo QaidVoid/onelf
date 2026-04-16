@@ -14,5 +14,7 @@ indicatif = { workspace = true }
 onelf-format = { workspace = true }
 jwalk = { workspace = true }
 rayon = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 xxhash-rust = { workspace = true }
 zstd = { workspace = true }

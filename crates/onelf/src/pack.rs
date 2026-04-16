@@ -32,7 +32,8 @@ pub struct PackOptions {
     pub output: PathBuf,
     pub command: String,
     pub name: Option<String>,
-    pub entrypoints: Vec<(String, String)>,
+    /// (name, path, args) tuples for additional entrypoints.
+    pub entrypoints: Vec<(String, String, Vec<String>)>,
     pub default_entrypoint: Option<String>,
     pub lib_dirs: Vec<String>,
     pub level: i32,
@@ -534,7 +535,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     });
 
     // Additional entrypoints
-    for (name, path) in &opts.entrypoints {
+    for (name, path, args) in &opts.entrypoints {
         let ep_path = PathBuf::from(path);
         let ep_entry_idx = *path_to_index.get(&ep_path).ok_or_else(|| {
             io::Error::new(
@@ -543,10 +544,15 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             )
         })?;
         let ep_name = strings.add(name);
+        let ep_args = if args.is_empty() {
+            empty_args
+        } else {
+            strings.add(&args.join("\x1f"))
+        };
         entrypoints.push(EntryPoint {
             name: ep_name,
             target_entry: ep_entry_idx,
-            args: empty_args,
+            args: ep_args,
             working_dir: opts.working_dir,
             flags: EntryPointFlags::empty(),
         });

@@ -29,5 +29,7 @@ indicatif = "0.18"
 jwalk = "0.8"
 onelf-format = "0.1.0"
 rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = "0.13"

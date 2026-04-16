@@ -6,6 +6,7 @@ mod info;
 mod list;
 mod metadata;
 mod pack;
+mod recipe;
 
 use std::path::PathBuf;
 
@@ -81,6 +82,17 @@ enum Commands {
         /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
         #[arg(long)]
         exclude: Vec<String>,
+    },
+
+    /// Build from an onelf.toml recipe (runs bundle-libs + pack)
+    Build {
+        /// Path to onelf.toml, or to the directory containing it (default: .)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Override the output path from the recipe
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 
     /// Show metadata about a packed binary
@@ -268,13 +280,17 @@ fn main() {
                 WorkingDirArg::Command => WorkingDir::EntrypointParent,
             };
 
+            let entrypoints = entrypoint
+                .into_iter()
+                .map(|(n, p)| (n, p, Vec::new()))
+                .collect();
             pack::pack(
                 &pack::PackOptions {
                     directory,
                     output,
                     command,
                     name,
-                    entrypoints: entrypoint,
+                    entrypoints,
                     default_entrypoint,
                     lib_dirs: lib_dir,
                     level,
@@ -294,6 +310,7 @@ fn main() {
                 },
             )
         }
+        Commands::Build { path, output } => run_build(&path, output.as_deref()),
         Commands::Info { binary } => info::info(&binary),
         Commands::List { binary } => list::list(&binary),
         Commands::Extract {
@@ -355,4 +372,109 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+fn run_build(
+    path: &std::path::Path,
+    output_override: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let recipe_path = recipe::resolve(path);
+    let recipe = recipe::load(&recipe_path)?;
+    let dir = recipe_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Stage 1: bundle-libs
+    if !recipe.bundle.skip {
+        let search_path: Vec<PathBuf> = recipe
+            .bundle
+            .search_paths
+            .iter()
+            .map(|s| PathBuf::from(recipe::expand_env(s)))
+            .collect();
+
+        bundle::bundle_libs(&bundle::BundleOptions {
+            directory: dir.clone(),
+            target: None,
+            lib_dir: PathBuf::from("lib"),
+            exclude: recipe.bundle.exclude.clone(),
+            include: recipe.bundle.include.clone(),
+            search_path,
+            dry_run: false,
+            recursive: true,
+            gl: recipe.bundle.gl,
+            dri: recipe.bundle.dri,
+            vulkan: recipe.bundle.vulkan,
+            wayland: recipe.bundle.wayland,
+            gtk: recipe.bundle.gtk,
+            strip: recipe.bundle.strip,
+            strict_libc: recipe.bundle.strict_libc,
+        })?;
+    }
+
+    // Stage 2: pack. Relative output paths in the recipe are resolved
+    // against the recipe's directory.
+    let output = match output_override {
+        Some(o) => o.to_path_buf(),
+        None => match recipe.package.output.clone() {
+            Some(o) if o.is_absolute() => o,
+            Some(o) => dir.join(o),
+            None => {
+                let name = recipe.package.name.clone().unwrap_or_else(|| {
+                    recipe
+                        .package
+                        .command
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("app")
+                        .to_string()
+                });
+                dir.join(format!("{name}.onelf"))
+            }
+        },
+    };
+
+    let entrypoints: Vec<(String, String, Vec<String>)> = recipe
+        .entrypoint
+        .iter()
+        .map(|e| (e.name.clone(), e.path.clone(), e.args.clone()))
+        .collect();
+    let default_entrypoint = recipe
+        .entrypoint
+        .iter()
+        .find(|e| e.default)
+        .map(|e| e.name.clone());
+
+    let lib_dirs = recipe
+        .bundle
+        .lib_dirs
+        .clone()
+        .unwrap_or_else(|| vec!["auto".to_string()]);
+
+    let update_url = recipe.update.as_ref().map(|u| u.url.clone());
+    let runtime: &[u8] = if update_url.is_some() {
+        RUNTIME_BINARY_UPDATE
+    } else {
+        RUNTIME_BINARY_SLIM
+    };
+
+    pack::pack(
+        &pack::PackOptions {
+            directory: dir,
+            output,
+            command: recipe.package.command,
+            name: recipe.package.name,
+            entrypoints,
+            default_entrypoint,
+            lib_dirs,
+            level: recipe.compression.level,
+            use_dict: recipe.compression.dict,
+            memfd: recipe.package.memfd,
+            working_dir: recipe.package.working_dir.into(),
+            update_url,
+            exclude: recipe.package.exclude,
+        },
+        runtime,
+    )
 }
