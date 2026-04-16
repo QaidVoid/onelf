@@ -157,12 +157,18 @@ enum Commands {
 
     /// Bundle shared library dependencies into a directory
     BundleLibs {
-        /// Directory containing the application to bundle
+        /// Directory containing the application to bundle. When used with
+        /// --from-binary, this is the output directory (created if needed).
         directory: PathBuf,
 
         /// Specific binary to analyze (default: scan all ELF files)
         #[arg(long)]
         target: Option<PathBuf>,
+
+        /// Scaffold a fresh AppDir: copy this binary into <DIRECTORY>/bin/
+        /// (creating the directory) before bundling its dependencies.
+        #[arg(long, value_name = "PATH")]
+        from_binary: Option<PathBuf>,
 
         /// Where to copy libs, relative to DIRECTORY
         #[arg(long, default_value = "lib")]
@@ -342,6 +348,7 @@ fn main() {
         Commands::BundleLibs {
             directory,
             target,
+            from_binary,
             lib_dir,
             exclude,
             include,
@@ -356,23 +363,25 @@ fn main() {
             strip,
             strict_libc,
             scan_dlopen,
-        } => bundle::bundle_libs(&bundle::BundleOptions {
-            directory,
-            target,
-            lib_dir,
-            exclude,
-            include,
-            search_path,
-            dry_run,
-            recursive: !no_recursive,
-            gl,
-            dri,
-            vulkan,
-            wayland,
-            gtk,
-            strip,
-            strict_libc,
-            scan_dlopen,
+        } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
+            bundle::bundle_libs(&bundle::BundleOptions {
+                directory,
+                target,
+                lib_dir,
+                exclude,
+                include,
+                search_path,
+                dry_run,
+                recursive: !no_recursive,
+                gl,
+                dri,
+                vulkan,
+                wayland,
+                gtk,
+                strip,
+                strict_libc,
+                scan_dlopen,
+            })
         }),
     };
 
@@ -486,4 +495,35 @@ fn run_build(
         },
         runtime,
     )
+}
+
+/// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`
+/// first. No-op when `src` is None.
+fn scaffold_from_binary(
+    dir: &std::path::Path,
+    src: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let Some(src) = src else {
+        return Ok(());
+    };
+    if !src.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("--from-binary: {} is not a file", src.display()),
+        ));
+    }
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let name = src.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--from-binary has no filename",
+        )
+    })?;
+    let dest = bin_dir.join(name);
+    std::fs::copy(src, &dest)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    eprintln!("Scaffolded {} -> {}", src.display(), dest.display());
+    Ok(())
 }
