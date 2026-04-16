@@ -473,6 +473,24 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     if needed_by.is_empty() {
         eprintln!("All dependencies satisfied, nothing to bundle.");
+        // PT_INTERP patching still needs to run. A prior bundle may
+        // have left stale relative paths (e.g. from an older onelf
+        // version) that don't resolve under the current CWD policy.
+        if !opts.dry_run {
+            let lib_dest = opts.directory.join(&opts.lib_dir);
+            match patch_interps_to_bundled(&opts.directory, &lib_dest) {
+                Ok(n) if n > 0 => eprintln!(
+                    "{} PT_INTERP of {} binaries",
+                    color::bold("Patched"),
+                    n
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "{} PT_INTERP patching failed: {e}",
+                    color::bold_red("warning:"),
+                ),
+            }
+        }
         return Ok(());
     }
 
@@ -1060,8 +1078,8 @@ fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
             if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == *needle {
                 // The printable path normally ends at a NUL; bail out
                 // if the byte after the match is a printable path char
-                // (digit, dot) — we'll still match the prefix when
-                // iteration continues past this point — or stop on NUL.
+                // (digit, dot): we still match the prefix when iteration
+                // continues past this point, or stop on NUL.
                 if let Ok(soname) = std::str::from_utf8(&bytes[i..i + needle.len()]) {
                     inspect_soname_for_frameworks(soname, flags);
                 }
@@ -1519,24 +1537,17 @@ fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize
             continue;
         }
 
-        // Compute how far the binary sits below app_dir, then build a
-        // relative path <..>/<lib_dir>/<basename> with the right number
-        // of leading `../` segments. CWD is app_dir at exec time.
-        let rel_bin = match path.strip_prefix(app_dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let depth = rel_bin
-            .parent()
-            .map(|p| p.components().count())
-            .unwrap_or(0);
-        let mut rel: PathBuf = PathBuf::new();
-        for _ in 0..depth {
-            rel.push("..");
+        // The runtime and `onelf run` always chdir to the AppDir root
+        // before exec (so a single relative PT_INTERP works for every
+        // binary regardless of subdirectory). Build the path as it
+        // resolves from that CWD: `lib/<basename>`.
+        if path.strip_prefix(app_dir).is_err() {
+            continue;
         }
-        rel.push(&rel_lib);
-        rel.push(basename);
-        let new_interp = rel.to_string_lossy().into_owned();
+        let new_interp = rel_lib
+            .join(basename)
+            .to_string_lossy()
+            .into_owned();
 
         // ELF files may be read-only (e.g. copied with `fs::copy` from
         // a read-only source). Make writable before patching, restore after.

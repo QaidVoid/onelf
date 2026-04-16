@@ -236,9 +236,41 @@ pub fn build_exec_command(
         }
     }
 
+    // Non-ELF target (shell wrapper, python script, etc). If the bundle
+    // has a patched dynamic loader in one of its lib dirs, any ELF the
+    // wrapper execs will have a relative PT_INTERP that only resolves
+    // when CWD is pkg_root. Force it so child execves don't ENOENT.
+    let force_cwd = if has_bundled_loader(pkg_root, lib_dirs) {
+        Some(pkg_root.to_path_buf())
+    } else {
+        None
+    };
     let mut cmd = Command::new(target);
     cmd.arg0(argv0).args(args);
-    (cmd, None)
+    (cmd, force_cwd)
+}
+
+/// True if any of `lib_dirs` under `pkg_root` holds a file whose name
+/// looks like a dynamic loader (ld-linux-*, ld-musl-*). A bundled loader
+/// is the signal that bundle-libs patched PT_INTERP of the bundled ELFs
+/// to a relative path, so the runtime must control CWD at exec time.
+fn has_bundled_loader(pkg_root: &Path, lib_dirs: &[&str]) -> bool {
+    for dir in lib_dirs {
+        let d = pkg_root.join(dir);
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("ld-linux") || name.starts_with("ld-musl-") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Parse the bundled interpreter relative path from `.onelf/interp` metadata.

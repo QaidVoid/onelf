@@ -395,11 +395,42 @@ fn build_exec_command(
             Ok((cmd, None))
         }
         ExecPlan::Bare => {
+            // Non-ELF target (shell wrapper, python script, etc). If
+            // the AppDir has a patched bundled loader, any ELF the
+            // target execs will have a relative PT_INTERP that only
+            // resolves when CWD is the AppDir root. Force it.
+            let force_cwd = if has_bundled_loader(app_dir) {
+                Some(app_dir.to_path_buf())
+            } else {
+                None
+            };
             let mut cmd = Command::new(target);
             cmd.arg0(argv0);
-            Ok((cmd, None))
+            Ok((cmd, force_cwd))
         }
     }
+}
+
+/// True if any lib subdir of `app_dir` holds a file that looks like a
+/// dynamic loader (ld-linux-*, ld-musl-*). Signals that bundle-libs has
+/// patched PT_INTERP of bundled ELFs to a relative path.
+fn has_bundled_loader(app_dir: &Path) -> bool {
+    for rel in detect_lib_dirs(app_dir) {
+        let d = app_dir.join(&rel);
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("ld-linux") || name.starts_with("ld-musl-") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Read PT_INTERP from an ELF file. Returns None for non-ELF or missing interp.
