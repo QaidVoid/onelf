@@ -25,6 +25,66 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Extract all package contents directly into `target_dir` without CAS.
+/// Used for ephemeral tmpfs-backed extraction inside a private namespace,
+/// where dedup has no value and the whole tree is thrown away on exit.
+pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()> {
+    let manifest = &pkg.manifest;
+
+    // Dirs first
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind == EntryKind::Dir {
+            let path = manifest.entry_path(i);
+            if !path.is_empty() {
+                fs::create_dir_all(target_dir.join(&path))?;
+            }
+        }
+    }
+
+    // Files
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        let rel_path = manifest.entry_path(i);
+        let out_path = target_dir.join(&rel_path);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let data = loader::read_payload_blocks(
+            &mut pkg.file,
+            pkg.footer.payload_offset,
+            &entry.blocks,
+            pkg.dict.as_deref(),
+        )?;
+
+        let mut f = fs::File::create(&out_path)?;
+        f.write_all(&data)?;
+        f.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+    }
+
+    // Symlinks
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != EntryKind::Symlink {
+            continue;
+        }
+        let rel_path = manifest.entry_path(i);
+        let link_path = target_dir.join(&rel_path);
+        let target = manifest.get_string(entry.symlink_target);
+
+        if let Some(parent) = link_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if link_path.symlink_metadata().is_ok() {
+            fs::remove_file(&link_path)?;
+        }
+        std::os::unix::fs::symlink(target, &link_path)?;
+    }
+
+    Ok(())
+}
+
 pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
     let base = cache_dir();
     let package_id = hex(&pkg.manifest.header.package_id);

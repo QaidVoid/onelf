@@ -1,5 +1,6 @@
 mod cache;
 mod env;
+mod ephemeral;
 mod fuse;
 mod interp;
 mod loader;
@@ -112,7 +113,7 @@ fn main() {
     let interp_data = read_package_file(&mut pkg, ".onelf/interp");
 
     // FUSE mode: mount package as filesystem (default for non-memfd)
-    if force != Some("cache") {
+    if force != Some("cache") && force != Some("tmpfs") {
         fuse::execute_fuse(
             &mut pkg,
             ep_idx,
@@ -121,14 +122,32 @@ fn main() {
             &final_args,
             interp_data.as_deref(),
         );
-        // Only reaches here if FUSE fell back (fusermount3 unavailable)
+        // Only reaches here if FUSE fell back
         if force == Some("fuse") {
             eprintln!("onelf-rt: FUSE mode unavailable");
             std::process::exit(1);
         }
     }
 
-    // Cache extraction mode (fallback)
+    // Ephemeral tmpfs mode: private namespace + tmpfs + extract. Invisible
+    // to the host, no persistent on-disk artifacts. Preferred over cache
+    // mode whenever user namespaces are available.
+    if force != Some("cache") {
+        ephemeral::execute_tmpfs(
+            &mut pkg,
+            ep_idx,
+            argv0,
+            &exec_path,
+            &final_args,
+            interp_data.as_deref(),
+        );
+        if force == Some("tmpfs") {
+            eprintln!("onelf-rt: tmpfs mode unavailable");
+            std::process::exit(1);
+        }
+    }
+
+    // Persistent cache extraction mode (final fallback)
     let pkg_dir = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
         Err(e) => {

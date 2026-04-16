@@ -6,7 +6,7 @@
 //! child exit for reliable cleanup.
 
 pub(crate) mod fs;
-mod mount;
+pub(crate) mod mount;
 mod protocol;
 
 use std::path::{Path, PathBuf};

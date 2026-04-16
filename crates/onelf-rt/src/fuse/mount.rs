@@ -23,14 +23,10 @@ use rustix::net::{
 };
 use rustix::thread::{UnshareFlags, unshare_unsafe};
 
-/// Mount a FUSE filesystem directly, after entering a private user+mount
-/// namespace. Returns the /dev/fuse fd. No external helper required.
-///
-/// The caller must invoke this BEFORE forking the FUSE server; forked
-/// children inherit the mount namespace and see the mount automatically.
-/// When the last process in the user namespace exits, the kernel tears
-/// the mount down — no cleanup code needed.
-pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
+/// Enter a private user+mount namespace with our real uid/gid mapped 1:1.
+/// After this returns, the process has CAP_SYS_ADMIN inside the namespace
+/// and subsequent mounts are invisible to the host.
+pub fn enter_namespace() -> io::Result<()> {
     // SAFETY: single-threaded runtime; unshare only affects this thread.
     let real_uid = rustix::process::getuid().as_raw();
     let real_gid = rustix::process::getgid().as_raw();
@@ -45,6 +41,22 @@ pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
     File::create("/proc/self/setgroups")?.write_all(b"deny")?;
     File::create("/proc/self/uid_map")?.write_all(format!("{real_uid} {real_uid} 1").as_bytes())?;
     File::create("/proc/self/gid_map")?.write_all(format!("{real_gid} {real_gid} 1").as_bytes())?;
+
+    Ok(())
+}
+
+/// Mount a FUSE filesystem directly, after entering a private user+mount
+/// namespace. Returns the /dev/fuse fd. No external helper required.
+///
+/// The caller must invoke this BEFORE forking the FUSE server; forked
+/// children inherit the mount namespace and see the mount automatically.
+/// When the last process in the user namespace exits, the kernel tears
+/// the mount down — no cleanup code needed.
+pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
+    enter_namespace()?;
+
+    let real_uid = rustix::process::getuid().as_raw();
+    let real_gid = rustix::process::getgid().as_raw();
 
     let fuse_fd: OwnedFd = std::fs::OpenOptions::new()
         .read(true)
@@ -70,6 +82,22 @@ pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
     .map_err(|e| io::Error::other(format!("mount /dev/fuse: {e}")))?;
 
     Ok(fuse_fd)
+}
+
+/// Mount a tmpfs at `mountpoint`. Caller must already be in a private
+/// mount namespace (via `enter_namespace`).
+pub fn mount_tmpfs(mountpoint: &Path, size_bytes: u64) -> io::Result<()> {
+    let data = format!("size={size_bytes},mode=0755");
+    let data_c = std::ffi::CString::new(data).unwrap();
+
+    mount(
+        "tmpfs",
+        mountpoint,
+        "tmpfs",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        Some(data_c.as_c_str()),
+    )
+    .map_err(|e| io::Error::other(format!("mount tmpfs: {e}")))
 }
 
 /// Unmount a FUSE filesystem directly (for the unshare path).
