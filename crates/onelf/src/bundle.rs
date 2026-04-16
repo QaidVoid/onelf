@@ -418,6 +418,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut not_found: Vec<(String, String)> = Vec::new();
     let mut already_processed: HashSet<String> = HashSet::new();
     let mut expanded_nix: HashSet<PathBuf> = HashSet::new();
+    // BLAKE3(content) -> soname, so aliases with identical bytes symlink instead of copy.
+    let mut bundled_by_hash: HashMap<[u8; 32], String> = HashMap::new();
     let mut queue: Vec<String> = needed_by.keys().cloned().collect();
     queue.sort();
 
@@ -490,6 +492,38 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // so transitive deps (e.g. libsndfile for libpulsecommon) are found
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
 
+                let content_hash: Option<[u8; 32]> = fs::read(&resolved)
+                    .ok()
+                    .map(|bytes| blake3::hash(&bytes).into());
+                if let Some(hash) = content_hash {
+                    if let Some(existing_name) = bundled_by_hash.get(&hash).cloned() {
+                        eprintln!(
+                            "  {} {} -> {} (alias for {}, {})",
+                            color::bold_green("Linked"),
+                            soname,
+                            existing_name,
+                            color::cyan(&requirer),
+                            color::dim(&format_size(size))
+                        );
+                        if !opts.dry_run {
+                            fs::create_dir_all(&lib_dest)?;
+                            let dest = lib_dest.join(&soname);
+                            if dest.exists() || dest.is_symlink() {
+                                let _ = fs::remove_file(&dest);
+                            }
+                            if let Err(e) = std::os::unix::fs::symlink(&existing_name, &dest) {
+                                eprintln!(
+                                    "  {} failed to symlink {} -> {}: {e}",
+                                    color::bold_red("warning:"),
+                                    soname,
+                                    existing_name
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 eprintln!(
                     "  {} <- {} (needed by {}, {})",
                     color::bold_green(&soname),
@@ -519,6 +553,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     }
                 }
 
+                if let Some(hash) = content_hash {
+                    bundled_by_hash.insert(hash, soname.clone());
+                }
                 copied.push((soname.clone(), resolved.clone(), size, requirer));
 
                 // Collect RPATHs from resolved lib for transitive dep resolution
@@ -537,15 +574,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         {
                             continue;
                         }
-                        // Skip wrong-family libc entries. They can't satisfy
-                        // symbols of the target's libc anyway and just clutter
-                        // the bundle.
-                        if let Some(target) = target_libc {
-                            if let Some(fam) = libc_family_of_soname(&dep) {
-                                if fam != target {
-                                    continue;
-                                }
-                            }
+                        // Target's libc is already queued via its direct NEEDED;
+                        // any libc-family transitive is either wrong-family or a redundant alias.
+                        if libc_family_of_soname(&dep).is_some() {
+                            continue;
                         }
                         needed_by
                             .entry(dep.clone())
@@ -842,7 +874,11 @@ fn libc_family_from_interp(interp: &str) -> Option<LibcFamily> {
 fn libc_family_of_soname(soname: &str) -> Option<LibcFamily> {
     if soname == "libc.so.6" || soname.starts_with("ld-linux") {
         Some(LibcFamily::Glibc)
-    } else if soname.starts_with("libc.musl-") || soname.starts_with("ld-musl-") {
+    } else if soname.starts_with("libc.musl-")
+        || soname.starts_with("ld-musl-")
+        || soname == "libc.so"
+    {
+        // libc.so is musl's canonical libc filename; libc.musl-*/ld-musl-* are aliases.
         Some(LibcFamily::Musl)
     } else {
         None
