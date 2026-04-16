@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use onelf_format::WorkingDir;
 
-const RUNTIME_BINARY: &[u8] = include_bytes!(env!("ONELF_RT_PATH"));
+const RUNTIME_BINARY_SLIM: &[u8] = include_bytes!(env!("ONELF_RT_PATH"));
+const RUNTIME_BINARY_UPDATE: &[u8] = include_bytes!(env!("ONELF_RT_UPDATE_PATH"));
 
 #[derive(Parser)]
 #[command(name = "onelf", about = "Single-binary packaging tool", version)]
@@ -280,10 +281,17 @@ fn main() {
                     use_dict: dict,
                     memfd: memfd_opt,
                     working_dir: wd,
-                    update_url,
+                    update_url: update_url.clone(),
                     exclude,
                 },
-                RUNTIME_BINARY,
+                // Pick the runtime: slim (~700KB) by default; the
+                // update-capable runtime (~2MB) only when the user actually
+                // configures self-updates.
+                if update_url.is_some() {
+                    RUNTIME_BINARY_UPDATE
+                } else {
+                    RUNTIME_BINARY_SLIM
+                },
             )
         }
         Commands::Info { binary } => info::info(&binary),

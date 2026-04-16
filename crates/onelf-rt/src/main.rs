@@ -9,6 +9,7 @@ mod metadata;
 mod multicall;
 mod portable;
 mod ulexec;
+#[cfg(feature = "update")]
 mod update;
 
 use std::os::unix::process::CommandExt;
@@ -59,7 +60,9 @@ fn main() {
         return;
     }
 
-    // Handle --onelf-update / --onelf-check-update
+    // Handle --onelf-update / --onelf-check-update (only when built with the
+    // "update" feature; the slim runtime omits these to save ~1.3 MB).
+    #[cfg(feature = "update")]
     if let Some(flag) = update::parse_flag(&args) {
         let Some(url_bytes) = read_package_file(&mut pkg, ".onelf/update-url") else {
             eprintln!("onelf-rt: no update URL configured (repack with --update-url)");

@@ -93,8 +93,6 @@ fn main() {
     }
     let rt_dir = rt_dir.canonicalize().unwrap();
 
-    let target_dir = PathBuf::from(&out_dir).join("onelf-rt-build");
-
     // Find musl CC
     let musl_cc = find_musl_gcc(&target).unwrap_or_else(|| {
         let cc_env = format!("CC_{}", target.replace('-', "_"));
@@ -105,10 +103,48 @@ fn main() {
     });
     eprintln!("Using musl CC: {musl_cc}");
 
-    // Build onelf-rt for musl
-    let mut cmd = Command::new(&cargo);
+    // Build the slim runtime (default features only).
+    let slim = build_rt(
+        &cargo,
+        &rt_dir,
+        &out_dir,
+        &target,
+        &profile,
+        &musl_cc,
+        "slim",
+        &[],
+    );
+    println!("cargo:rustc-env=ONELF_RT_PATH={}", slim.display());
 
-    // Clean cargo env vars to avoid interference, but preserve linker settings
+    // Build the update-capable runtime (pulls in rustls/ureq, ~1.3 MB extra).
+    let full = build_rt(
+        &cargo,
+        &rt_dir,
+        &out_dir,
+        &target,
+        &profile,
+        &musl_cc,
+        "update",
+        &["update"],
+    );
+    println!("cargo:rustc-env=ONELF_RT_UPDATE_PATH={}", full.display());
+}
+
+fn build_rt(
+    cargo: &PathBuf,
+    rt_dir: &PathBuf,
+    out_dir: &str,
+    target: &str,
+    profile: &str,
+    musl_cc: &str,
+    variant: &str,
+    features: &[&str],
+) -> PathBuf {
+    let target_dir = PathBuf::from(out_dir).join(format!("onelf-rt-{variant}"));
+
+    let mut cmd = Command::new(cargo);
+
+    // Clean cargo env vars to avoid interference, but preserve linker settings.
     for (key, _) in env::vars() {
         if (key.starts_with("CARGO") || key.starts_with("RUSTC")) && !key.ends_with("_LINKER") {
             cmd.env_remove(&key);
@@ -123,12 +159,12 @@ fn main() {
     }
 
     cmd.env("RUSTFLAGS", &rustflags)
-        .env("CC", &musl_cc)
-        .env(format!("CC_{}", target.replace('-', "_")), &musl_cc)
-        .current_dir(&rt_dir)
+        .env("CC", musl_cc)
+        .env(format!("CC_{}", target.replace('-', "_")), musl_cc)
+        .current_dir(rt_dir)
         .arg("build")
         .arg("--target")
-        .arg(&target)
+        .arg(target)
         .arg("--target-dir")
         .arg(&target_dir);
 
@@ -136,20 +172,22 @@ fn main() {
         cmd.arg("--release");
     }
 
-    eprintln!("Building onelf-rt for {target}...");
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("failed to build onelf-rt: {e}"));
-
-    if !status.success() {
-        panic!("onelf-rt build failed");
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
     }
 
-    let rt_binary = target_dir.join(target).join(&profile).join("onelf-rt");
+    eprintln!("Building onelf-rt ({variant}) for {target}...");
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to build onelf-rt ({variant}): {e}"));
 
+    if !status.success() {
+        panic!("onelf-rt ({variant}) build failed");
+    }
+
+    let rt_binary = target_dir.join(target).join(profile).join("onelf-rt");
     if !rt_binary.exists() {
         panic!("onelf-rt binary not found at: {}", rt_binary.display());
     }
-
-    println!("cargo:rustc-env=ONELF_RT_PATH={}", rt_binary.display());
+    rt_binary
 }

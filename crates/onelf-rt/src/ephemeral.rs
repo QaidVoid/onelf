@@ -4,7 +4,7 @@
 //! user+mount namespace, mount a tmpfs, extract the package into it, and
 //! exec the target. The tmpfs is invisible to the host and is torn down
 //! automatically by the kernel when the last process in the namespace
-//! exits — no cleanup code, no files left on disk.
+//! exits - no cleanup code, no files left on disk.
 //!
 //! Trade-off vs. FUSE: the whole package sits in RAM (vs. on-demand).
 //! Fine for AppImage-scale bundles, use FUSE for very large packages.
@@ -126,7 +126,7 @@ pub fn execute_tmpfs(
         onelf_format::WorkingDir::Inherit => {}
     }
 
-    // Exec directly — no fork, no FUSE server. When this process exits
+    // Exec directly: no fork, no FUSE server. When this process exits
     // the namespace is released and the tmpfs disappears with it.
     let lib_dirs = pkg.manifest.lib_dirs();
     let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
