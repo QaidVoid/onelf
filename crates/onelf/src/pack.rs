@@ -709,11 +709,28 @@ fn bold(s: &str) -> String {
 }
 
 fn get_mtime(meta: &fs::Metadata) -> (u64, u32) {
-    meta.modified()
+    let raw = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0))
+        .unwrap_or((0, 0));
+
+    // Reproducible-builds convention: if SOURCE_DATE_EPOCH is set, clamp
+    // mtimes to it. Older files keep their original mtime; newer ones are
+    // pinned to the epoch. Subsecond precision is dropped entirely.
+    if let Some(epoch) = source_date_epoch() {
+        let clamped = raw.0.min(epoch);
+        return (clamped, 0);
+    }
+
+    raw
+}
+
+fn source_date_epoch() -> Option<u64> {
+    std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Parse PT_INTERP from ELF data, returning the interpreter path.
