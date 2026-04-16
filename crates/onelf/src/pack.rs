@@ -506,9 +506,23 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let ep_name = strings.add(default_name);
     let empty_args = strings.add("");
 
+    // Memfd eligibility: explicit --memfd=true/false overrides auto-detect.
+    // Auto: the entrypoint is eligible if it has no DT_NEEDED dependencies,
+    // which means it's either static-musl/-glibc or a non-ELF script.
     let memfd_flag = match opts.memfd {
         Some(true) => EntryPointFlags::MEMFD_ELIGIBLE,
-        _ => EntryPointFlags::empty(),
+        Some(false) => EntryPointFlags::empty(),
+        None => {
+            let command_content = files
+                .iter()
+                .find(|f| f.rel_path == command_path)
+                .map(|f| f.content.as_slice());
+            if command_content.is_some_and(elf_has_no_deps) {
+                EntryPointFlags::MEMFD_ELIGIBLE
+            } else {
+                EntryPointFlags::empty()
+            }
+        }
     };
 
     entrypoints.push(EntryPoint {
@@ -731,6 +745,19 @@ fn source_date_epoch() -> Option<u64> {
     std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// True if the data is a non-ELF script or an ELF with zero DT_NEEDED
+/// dependencies (static binary). Such entrypoints can run from a memfd.
+fn elf_has_no_deps(data: &[u8]) -> bool {
+    if data.len() < 4 || data[0..4] != *b"\x7fELF" {
+        // Non-ELF: shell scripts etc. — memfd works.
+        return true;
+    }
+    match goblin::elf::Elf::parse(data) {
+        Ok(elf) => elf.libraries.is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Parse PT_INTERP from ELF data, returning the interpreter path.
