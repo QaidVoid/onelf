@@ -177,24 +177,41 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
 
 /// Build a `Command` for executing the target binary.
 ///
-/// If a bundled interpreter is available, always prefer it over the host's.
-/// NixOS ships a stub loader at the standard PT_INTERP paths that exists
-/// but refuses to load foreign binaries, so checking "host has interp?"
-/// gives the wrong answer there. Using the bundled interp unconditionally
-/// also gives us a consistent runtime across distros.
+/// Preferred path: the packed binary was run through `bundle-libs`,
+/// which rewrites PT_INTERP to a path relative to the package root
+/// (like `lib/ld-linux-x86-64.so.2`). We can then execve the target
+/// directly with CWD=pkg_root, and the kernel loads the bundled ld.
+/// That keeps `/proc/self/exe` on the target itself — Python, Electron
+/// and Qt all rely on that.
+///
+/// Fallback path: PT_INTERP is absolute and unpatched (e.g. the user
+/// packed without bundling). We invoke the bundled loader explicitly
+/// with `--argv0`, which works but leaves /proc/self/exe on the ld.
+///
+/// The `force_cwd` returned value is Some(pkg_root) when the caller
+/// must chdir before exec, and None otherwise.
 pub fn build_exec_command(
     target: &Path,
     pkg_root: &Path,
     lib_dirs: &[&str],
     argv0: &str,
     args: &[String],
-) -> Command {
+) -> (Command, Option<PathBuf>) {
     use std::os::unix::process::CommandExt;
 
     if let Some(interp) = read_elf_interp(target) {
+        let interp_path = Path::new(&interp);
+        if interp_path.is_relative() {
+            let resolved = pkg_root.join(interp_path);
+            if resolved.exists() {
+                let mut cmd = Command::new(target);
+                cmd.arg0(argv0).args(args);
+                return (cmd, Some(pkg_root.to_path_buf()));
+            }
+        }
         if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
             let lib_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            let is_musl = Path::new(&interp)
+            let is_musl = interp_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("ld-musl-"));
@@ -208,9 +225,9 @@ pub fn build_exec_command(
                 cmd.arg("--library-path").arg(&lib_path);
             }
             cmd.arg("--argv0").arg(argv0).arg(target).args(args);
-            return cmd;
+            return (cmd, None);
         }
-        if !Path::new(&interp).exists() {
+        if !interp_path.exists() {
             eprintln!(
                 "onelf-rt: warning: ELF interpreter '{}' not found on this system \
                  and no bundled equivalent in the AppDir",
@@ -221,7 +238,7 @@ pub fn build_exec_command(
 
     let mut cmd = Command::new(target);
     cmd.arg0(argv0).args(args);
-    cmd
+    (cmd, None)
 }
 
 /// Parse the bundled interpreter relative path from `.onelf/interp` metadata.

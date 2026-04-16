@@ -630,6 +630,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                             soname
                         );
                     }
+                    // The dynamic loader itself ships with baked-in absolute
+                    // paths (ld.so.cache location, preload hook, fallback
+                    // library dirs). On the packer's system those resolve to
+                    // real files (e.g. /nix/store/.../glibc/etc/ld.so.cache);
+                    // on someone else's system they're dead paths at best and
+                    // wrong-content paths at worst. Scrub before shipping.
+                    if is_dynamic_loader(&soname) {
+                        if let Err(e) = scrub_loader_paths(&dest) {
+                            eprintln!(
+                                "  {} failed to scrub loader paths in {}: {e}",
+                                color::bold_red("warning:"),
+                                soname
+                            );
+                        }
+                    }
                     if opts.strip {
                         strip_debug(&dest);
                     }
@@ -786,6 +801,26 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 color::bold("Stripped"),
                 stripped
             );
+        }
+    }
+
+    // Patch PT_INTERP of every ELF with a bundled loader. This is what
+    // makes /proc/self/exe point at the real target after kernel exec
+    // (Python's stdlib detection, Electron's ASAR locator, Qt's plugin
+    // loader all read /proc/self/exe). The runtime and `onelf run` chdir
+    // into the AppDir before exec so the relative path resolves.
+    if !opts.dry_run {
+        match patch_interps_to_bundled(&opts.directory, &lib_dest) {
+            Ok(n) if n > 0 => eprintln!(
+                "{} PT_INTERP of {} binaries",
+                color::bold("Patched"),
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "{} PT_INTERP patching failed: {e}",
+                color::bold_red("warning:"),
+            ),
         }
     }
 
@@ -1060,10 +1095,17 @@ fn parse_needed(path: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Parse PT_INTERP from an ELF binary, returning the interpreter path.
+///
+/// goblin returns `p_filesz - 1` bytes verbatim, so a slot padded with
+/// trailing NULs (common after our in-place PT_INTERP rewrite if the
+/// phdr wasn't shrunk) would leak into callers as embedded NULs in
+/// the returned string. Trim them so queue lookups and `file_name()`
+/// behave correctly.
 fn parse_interp(path: &Path) -> Option<String> {
     let data = fs::read(path).ok()?;
     let elf = goblin::elf::Elf::parse(&data).ok()?;
-    elf.interpreter.map(String::from)
+    elf.interpreter
+        .map(|s| s.trim_end_matches('\0').to_string())
 }
 
 /// Map an ELF interpreter basename to the libc filename that serves it.
@@ -1174,6 +1216,297 @@ fn strip_rpath(path: &Path) -> io::Result<()> {
 
 fn is_excluded(soname: &str, excludes: &[&str]) -> bool {
     excludes.iter().any(|pat| soname.starts_with(pat))
+}
+
+/// True for sonames that denote the dynamic linker itself.
+fn is_dynamic_loader(soname: &str) -> bool {
+    soname.starts_with("ld-linux") || soname.starts_with("ld-musl-") || soname == "ld.so"
+}
+
+/// Rewrite absolute-path byte sequences baked into the dynamic loader.
+///
+/// glibc's `ld-linux` hardcodes its build-time `/etc/ld.so.cache`,
+/// `/etc/ld-nix.so.preload`, `/nix/store/<hash>-glibc-X/lib/`, and a
+/// few other absolute paths. Those exist on the packer's machine but
+/// not on the user's; worse, if any do exist, they'll point at a
+/// libc that disagrees with the one we bundled. The fix is to replace
+/// each prefix with a path that is guaranteed not to resolve (starts
+/// with `/XXX`), keeping byte length identical so ELF offsets stay
+/// valid.
+///
+/// This is the same idea as sharun's `sed` pass, done in pure Rust
+/// with a more targeted prefix list.
+fn scrub_loader_paths(path: &Path) -> io::Result<()> {
+    let mut data = fs::read(path)?;
+    let mut changed = false;
+    // Each pattern and replacement are equal length to avoid any ELF
+    // structure shifts. Replacements are paths that simply don't exist
+    // on any sane system.
+    let replacements: &[(&[u8], &[u8])] = &[
+        (b"/etc/", b"/XXX/"),
+        (b"/usr/", b"/XXX/"),
+        (b"/nix/", b"/XXX/"),
+        // /lib/ and /lib64/ appear as glibc's hardcoded fallback
+        // library search paths. Our bundled libs live in `lib/` (no
+        // leading slash), so scrubbing absolute /lib doesn't hurt.
+        (b"/lib/", b"/XXX/"),
+        (b"/lib64/", b"/XXX///"),
+    ];
+
+    for (needle, replace) in replacements {
+        debug_assert_eq!(needle.len(), replace.len());
+        let len = needle.len();
+        let mut i = 0;
+        while i + len <= data.len() {
+            if &data[i..i + len] == *needle {
+                data[i..i + len].copy_from_slice(replace);
+                changed = true;
+                i += len;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if changed {
+        fs::write(path, &data)?;
+    }
+    Ok(())
+}
+
+/// Rewrite PT_INTERP of an ELF in place.
+///
+/// Fast path: if the new string fits in the existing slot
+/// (`p_offset..p_offset+p_filesz`), overwrite and null-pad.
+/// Slow path: append the new string to the end of the file and
+/// rewrite the PT_INTERP program header's `p_offset`, `p_filesz`,
+/// and `p_memsz` to point at it. Kernel reads PT_INTERP directly
+/// from the file (no PT_LOAD coverage required) so appending bytes
+/// past the last segment is safe.
+///
+/// Returns `Ok(true)` if we rewrote, `Ok(false)` if the file has no
+/// PT_INTERP or the new value already matches.
+fn patch_interp(path: &Path, new_interp: &str) -> io::Result<bool> {
+    let data = fs::read(path)?;
+    let elf = goblin::elf::Elf::parse(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let phdr_idx = elf
+        .program_headers
+        .iter()
+        .position(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
+    let Some(phdr_idx) = phdr_idx else {
+        return Ok(false);
+    };
+    let ph = &elf.program_headers[phdr_idx];
+
+    let offset = ph.p_offset as usize;
+    let slot = ph.p_filesz as usize;
+    if offset + slot > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PT_INTERP offset out of file bounds",
+        ));
+    }
+
+    let new_bytes = new_interp.as_bytes();
+
+    // Short-circuit if the slot already holds the desired string.
+    let existing = &data[offset..offset + slot];
+    let existing_str = match existing.iter().position(|&b| b == 0) {
+        Some(n) => &existing[..n],
+        None => existing,
+    };
+    if existing_str == new_bytes {
+        return Ok(false);
+    }
+
+    let header = elf.header;
+    drop(elf);
+
+    if new_bytes.len() + 1 <= slot {
+        // Fast path: overwrite in place and shrink p_filesz / p_memsz to
+        // match the actual string. If we don't, tools that read
+        // p_filesz bytes (including goblin and readelf) will see the
+        // trailing NULs as part of the string.
+        let mut modified = data;
+        modified[offset..offset + new_bytes.len()].copy_from_slice(new_bytes);
+        for b in &mut modified[offset + new_bytes.len()..offset + slot] {
+            *b = 0;
+        }
+        rewrite_interp_phdr(
+            &mut modified,
+            &header,
+            phdr_idx,
+            offset as u64,
+            (new_bytes.len() + 1) as u64,
+        )?;
+        fs::write(path, &modified)?;
+        return Ok(true);
+    }
+
+    // Slow path: append the new interp to the end of the file and
+    // rewrite the PT_INTERP phdr to point at it.
+    patch_interp_expand(path, data, &header, phdr_idx, new_bytes)?;
+    Ok(true)
+}
+
+/// Write `p_offset` and matching `p_filesz`/`p_memsz` back into the
+/// PT_INTERP program header entry. The caller is responsible for
+/// ensuring the string bytes (and terminating NUL) are already in the
+/// file at the given offset.
+fn rewrite_interp_phdr(
+    data: &mut [u8],
+    header: &goblin::elf::Header,
+    phdr_idx: usize,
+    new_offset: u64,
+    new_size: u64,
+) -> io::Result<()> {
+    use goblin::elf::header;
+
+    let is_64 = header.e_ident[header::EI_CLASS] == header::ELFCLASS64;
+    if header.e_ident[header::EI_DATA] != header::ELFDATA2LSB {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "big-endian ELF PT_INTERP rewrite not implemented",
+        ));
+    }
+
+    let e_phoff = header.e_phoff as usize;
+    let e_phentsize = header.e_phentsize as usize;
+    let phdr_off = e_phoff + phdr_idx * e_phentsize;
+    if phdr_off + e_phentsize > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "program header table out of bounds",
+        ));
+    }
+
+    if is_64 {
+        let off_p_offset = phdr_off + 8;
+        let off_p_filesz = phdr_off + 32;
+        let off_p_memsz = phdr_off + 40;
+        data[off_p_offset..off_p_offset + 8].copy_from_slice(&new_offset.to_le_bytes());
+        data[off_p_filesz..off_p_filesz + 8].copy_from_slice(&new_size.to_le_bytes());
+        data[off_p_memsz..off_p_memsz + 8].copy_from_slice(&new_size.to_le_bytes());
+    } else {
+        let off_p_offset = phdr_off + 4;
+        let off_p_filesz = phdr_off + 16;
+        let off_p_memsz = phdr_off + 20;
+        let new_offset_u32: u32 = new_offset
+            .try_into()
+            .map_err(|_| io::Error::other("PT_INTERP offset does not fit in 32 bits"))?;
+        let new_size_u32: u32 = new_size
+            .try_into()
+            .map_err(|_| io::Error::other("PT_INTERP size does not fit in 32 bits"))?;
+        data[off_p_offset..off_p_offset + 4].copy_from_slice(&new_offset_u32.to_le_bytes());
+        data[off_p_filesz..off_p_filesz + 4].copy_from_slice(&new_size_u32.to_le_bytes());
+        data[off_p_memsz..off_p_memsz + 4].copy_from_slice(&new_size_u32.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Append `new_bytes` + NUL to the file and rewrite PT_INTERP's phdr
+/// entry so `p_offset` points at the new location and `p_filesz` /
+/// `p_memsz` cover the new length. Kernel reads PT_INTERP by file
+/// offset, so the string does not need to live inside any PT_LOAD.
+fn patch_interp_expand(
+    path: &Path,
+    data: Vec<u8>,
+    header: &goblin::elf::Header,
+    phdr_idx: usize,
+    new_bytes: &[u8],
+) -> io::Result<()> {
+    let mut modified = data;
+    let new_offset = modified.len() as u64;
+    modified.extend_from_slice(new_bytes);
+    modified.push(0);
+
+    rewrite_interp_phdr(
+        &mut modified,
+        header,
+        phdr_idx,
+        new_offset,
+        (new_bytes.len() + 1) as u64,
+    )?;
+    fs::write(path, &modified)?;
+    Ok(())
+}
+
+/// Walk every ELF under `app_dir` and rewrite PT_INTERP to a path
+/// relative to `app_dir` that resolves to the bundled loader copy.
+///
+/// Requires the caller (runtime / `onelf run`) to chdir into `app_dir`
+/// before execing the target so the kernel resolves the relative
+/// PT_INTERP correctly. Returns the count of patched files.
+fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
+    let rel_lib = lib_dest
+        .strip_prefix(app_dir)
+        .unwrap_or(lib_dest)
+        .to_path_buf();
+
+    let mut patched = 0usize;
+    for path in find_elf_files(app_dir) {
+        let Some(interp) = parse_interp(&path) else {
+            continue;
+        };
+        let Some(basename) = Path::new(&interp).file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Only patch when we actually have a bundled replacement.
+        let bundled = lib_dest.join(basename);
+        if !bundled.exists() {
+            continue;
+        }
+
+        // Compute how far the binary sits below app_dir, then build a
+        // relative path <..>/<lib_dir>/<basename> with the right number
+        // of leading `../` segments. CWD is app_dir at exec time.
+        let rel_bin = match path.strip_prefix(app_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let depth = rel_bin
+            .parent()
+            .map(|p| p.components().count())
+            .unwrap_or(0);
+        let mut rel: PathBuf = PathBuf::new();
+        for _ in 0..depth {
+            rel.push("..");
+        }
+        rel.push(&rel_lib);
+        rel.push(basename);
+        let new_interp = rel.to_string_lossy().into_owned();
+
+        // ELF files may be read-only (e.g. copied with `fs::copy` from
+        // a read-only source). Make writable before patching, restore after.
+        let perms = fs::metadata(&path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o755);
+        let needs_chmod = perms & 0o200 == 0;
+        if needs_chmod {
+            let _ = fs::set_permissions(
+                &path,
+                std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
+            );
+        }
+        match patch_interp(&path, &new_interp) {
+            Ok(true) => patched += 1,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "  {} could not patch PT_INTERP of {}: {e}",
+                    color::bold_red("warning:"),
+                    path.display()
+                );
+            }
+        }
+        if needs_chmod {
+            let _ =
+                fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
+        }
+    }
+    Ok(patched)
 }
 
 fn find_existing_libs(dir: &Path) -> HashSet<String> {
