@@ -60,16 +60,28 @@ fn main() {
     let cc_env = format!("CC_{}", target.replace('-', "_"));
 
     println!("cargo:rerun-if-env-changed=ONELF_RT_PATH");
+    println!("cargo:rerun-if-env-changed=ONELF_RT_UPDATE_PATH");
     println!("cargo:rerun-if-env-changed=ONELF_MUSL_CC");
     println!("cargo:rerun-if-env-changed={cc_env}");
 
-    // Allow pre-built runtime via env var (needed for cargo publish/install)
+    // Allow pre-built runtimes via env var (needed for cargo publish /
+    // cargo install and CI builds that skip the musl toolchain). Both
+    // the slim and update-capable variants must be wired. If only
+    // ONELF_RT_PATH is set, reuse it for the update path too; packages
+    // configured for self-update won't ship a separate update-capable
+    // runtime in that case, but everything else still compiles.
     if let Ok(rt_path) = env::var("ONELF_RT_PATH") {
         let path = PathBuf::from(&rt_path);
         if !path.exists() {
             panic!("ONELF_RT_PATH={rt_path} does not exist");
         }
         println!("cargo:rustc-env=ONELF_RT_PATH={rt_path}");
+
+        let update_path = env::var("ONELF_RT_UPDATE_PATH").unwrap_or_else(|_| rt_path.clone());
+        if !PathBuf::from(&update_path).exists() {
+            panic!("ONELF_RT_UPDATE_PATH={update_path} does not exist");
+        }
+        println!("cargo:rustc-env=ONELF_RT_UPDATE_PATH={update_path}");
         return;
     }
 
