@@ -217,6 +217,12 @@ enum Commands {
         /// with a warning.
         #[arg(long)]
         strict_libc: bool,
+
+        /// Scan binary strings for soname-shaped values that match a known
+        /// allow-list of commonly dlopen'd libraries (GL, Wayland, Vulkan,
+        /// audio, DBus, etc.) and bundle the matches.
+        #[arg(long)]
+        scan_dlopen: bool,
     },
 }
 
@@ -349,6 +355,7 @@ fn main() {
             gtk,
             strip,
             strict_libc,
+            scan_dlopen,
         } => bundle::bundle_libs(&bundle::BundleOptions {
             directory,
             target,
@@ -365,6 +372,7 @@ fn main() {
             gtk,
             strip,
             strict_libc,
+            scan_dlopen,
         }),
     };
 
@@ -410,6 +418,7 @@ fn run_build(
             gtk: recipe.bundle.gtk,
             strip: recipe.bundle.strip,
             strict_libc: recipe.bundle.strict_libc,
+            scan_dlopen: recipe.bundle.scan_dlopen,
         })?;
     }
 

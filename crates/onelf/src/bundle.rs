@@ -245,6 +245,7 @@ pub struct BundleOptions {
     pub gtk: bool,
     pub strip: bool,
     pub strict_libc: bool,
+    pub scan_dlopen: bool,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -380,6 +381,36 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         needed_by
             .entry(lib.clone())
             .or_insert_with(|| "--include".into());
+    }
+
+    // Opt-in dlopen scan: match string literals against a known allow-list
+    // of commonly dlopen'd sonames (GL, Wayland, Vulkan, audio, etc.) and
+    // queue the hits as if the user had passed them via --include.
+    if opts.scan_dlopen {
+        let mut scanned: HashSet<String> = HashSet::new();
+        for path in &elf_files {
+            if let Ok(hits) = scan_dlopen(path) {
+                for soname in hits {
+                    if scanned.insert(soname.clone()) {
+                        let requirer = path
+                            .strip_prefix(&opts.directory)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .into_owned();
+                        let label = format!("--scan-dlopen in {requirer}");
+                        needed_by.entry(soname).or_insert(label);
+                    }
+                }
+            }
+        }
+        if !scanned.is_empty() {
+            eprintln!(
+                "  {} {} dlopen candidate(s): {}",
+                color::bold("Scanned:"),
+                scanned.len(),
+                scanned.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
     }
 
     // Filter excluded
@@ -827,6 +858,82 @@ fn driver_filter(
         Some(EM_AARCH64) | Some(EM_ARM) => Some(arm_list),
         _ => None,
     }
+}
+
+/// Sonames that applications commonly dlopen at runtime. Absence from DT_NEEDED
+/// doesn't mean absence from the runtime graph; these are known offenders.
+const DLOPEN_CANDIDATES: &[&str] = &[
+    // OpenGL / GLVND
+    "libGL.so.1",
+    "libEGL.so.1",
+    "libGLX.so.0",
+    "libGLdispatch.so.0",
+    "libOpenGL.so.0",
+    "libGLESv1_CM.so.1",
+    "libGLESv2.so.2",
+    "libgbm.so.1",
+    // Vulkan
+    "libvulkan.so.1",
+    // Wayland
+    "libwayland-client.so.0",
+    "libwayland-cursor.so.0",
+    "libwayland-egl.so.1",
+    "libdecor-0.so.0",
+    // X11
+    "libX11.so.6",
+    "libxcb.so.1",
+    "libxkbcommon.so.0",
+    "libxkbcommon-x11.so.0",
+    // Video acceleration
+    "libva.so.2",
+    "libva-drm.so.2",
+    "libva-x11.so.2",
+    "libva-wayland.so.2",
+    // Audio
+    "libpulse.so.0",
+    "libasound.so.2",
+    "libjack.so.0",
+    // IPC / desktop
+    "libdbus-1.so.3",
+    // NVIDIA proprietary stack
+    "libcuda.so.1",
+    "libnvidia-ml.so.1",
+    "libnvidia-encode.so.1",
+    "libnvidia-fbc.so.1",
+    // Fonts / text
+    "libfontconfig.so.1",
+    "libfreetype.so.6",
+    "libharfbuzz.so.0",
+];
+
+/// Scan a binary's string table for soname-shaped values that match the
+/// dlopen allow-list. Matches are candidates for bundling even though they
+/// don't appear in DT_NEEDED.
+fn scan_dlopen(path: &Path) -> io::Result<Vec<String>> {
+    let data = fs::read(path)?;
+    let mut found: Vec<String> = Vec::new();
+
+    // Walk printable runs of length >= 5, test each against the allow-list.
+    let mut start = None;
+    for (i, &b) in data.iter().enumerate() {
+        let printable = (0x20..=0x7e).contains(&b);
+        if printable {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            if i - s >= 5 {
+                if let Ok(text) = std::str::from_utf8(&data[s..i]) {
+                    for &cand in DLOPEN_CANDIDATES {
+                        if text == cand && !found.iter().any(|x| x == cand) {
+                            found.push(cand.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn parse_needed(path: &Path) -> io::Result<Vec<String>> {

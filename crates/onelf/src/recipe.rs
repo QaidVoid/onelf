@@ -141,6 +141,8 @@ pub struct Bundle {
     pub strip: bool,
     #[serde(default)]
     pub strict_libc: bool,
+    #[serde(default)]
+    pub scan_dlopen: bool,
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).
     #[serde(default)]
     pub skip: bool,
