@@ -307,25 +307,26 @@ fn build_exec_command(
 ) -> io::Result<Command> {
     let interp = read_elf_interp(target);
     if let Some(ref i) = interp {
-        if !Path::new(i).exists() {
-            if let Some(bundled) = find_bundled_interp(i, app_dir) {
-                let is_musl = Path::new(i)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("ld-musl-"));
-                let mut cmd = Command::new(&bundled);
-                // glibc's ld-linux supports --inhibit-cache; musl's ld-musl rejects it.
-                if !is_musl {
-                    cmd.arg("--inhibit-cache");
-                }
-                if !lib_path.is_empty() {
-                    cmd.arg("--library-path").arg(lib_path);
-                }
-                cmd.arg("--argv0").arg(argv0).arg(target);
-                return Ok(cmd);
+        // Prefer bundled interp over host's: NixOS's stub-ld exists at
+        // standard PT_INTERP paths but refuses to run foreign binaries.
+        if let Some(bundled) = find_bundled_interp(i, app_dir) {
+            let is_musl = Path::new(i)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ld-musl-"));
+            let mut cmd = Command::new(&bundled);
+            if !is_musl {
+                cmd.arg("--inhibit-cache");
             }
+            if !lib_path.is_empty() {
+                cmd.arg("--library-path").arg(lib_path);
+            }
+            cmd.arg("--argv0").arg(argv0).arg(target);
+            return Ok(cmd);
+        }
+        if !Path::new(i).exists() {
             eprintln!(
-                "warning: ELF interpreter {i} not found and no bundled \
+                "warning: ELF interpreter {i} not found on host and no bundled \
                  equivalent in the AppDir; exec will likely fail"
             );
         }

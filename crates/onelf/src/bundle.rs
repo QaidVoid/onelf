@@ -393,19 +393,30 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut needed_by: HashMap<String, String> = HashMap::new();
     let mut rpath_dirs: Vec<PathBuf> = Vec::new();
     for path in &elf_files {
+        let requirer = path
+            .strip_prefix(&opts.directory)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
         match parse_needed(path) {
             Ok(libs) => {
-                let requirer = path
-                    .strip_prefix(&opts.directory)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .into_owned();
                 for lib in libs {
                     needed_by.entry(lib).or_insert_with(|| requirer.clone());
                 }
             }
             Err(e) => {
                 eprintln!("warning: {}: {e}", path.display());
+            }
+        }
+        // Also include the ELF interpreter itself. Distros that ship a
+        // stub loader (notably NixOS) have a PT_INTERP path that exists
+        // but won't actually run foreign binaries, so the runtime needs
+        // a real loader in the bundle to sidestep the stub.
+        if let Some(interp) = parse_interp(path) {
+            if let Some(name) = Path::new(&interp).file_name().and_then(|n| n.to_str()) {
+                needed_by
+                    .entry(name.to_string())
+                    .or_insert_with(|| format!("{requirer} (PT_INTERP)"));
             }
         }
         // Collect RPATH/RUNPATH directories from input binaries
@@ -1169,12 +1180,23 @@ fn find_existing_libs(dir: &Path) -> HashSet<String> {
     let mut libs = HashSet::new();
     for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
         let Ok(entry) = entry else { continue };
-        if let Some(name) = entry.path().file_name() {
-            let name = name.to_string_lossy();
-            if name.contains(".so") {
-                libs.insert(name.into_owned());
-            }
+        let path = entry.path();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if !name.contains(".so") {
+            continue;
         }
+        // A previous run may have copied NixOS's stub loader into the
+        // bundle. Treat it as absent so it gets replaced with a real
+        // loader on this pass; otherwise the stale stub would persist
+        // forever.
+        if is_nix_stub_ld(&path) {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        libs.insert(name.into_owned());
     }
     libs
 }
@@ -1367,11 +1389,15 @@ fn locate_lib(
             None => true,
         }
     };
+    // Reject NixOS's stub loader anywhere it surfaces. It exists on disk
+    // but refuses to actually load foreign binaries, so bundling it would
+    // produce a package that runs nowhere.
+    let acceptable = |path: &Path| class_matches(path) && !is_nix_stub_ld(path);
 
     // 1. --search-path directories (user-provided: highest priority)
     for dir in search_paths {
         let candidate = dir.join(soname);
-        if candidate.exists() && class_matches(&candidate) {
+        if candidate.exists() && acceptable(&candidate) {
             return Some(candidate);
         }
     }
@@ -1379,7 +1405,7 @@ fn locate_lib(
     // 2. ldconfig cache
     if let Some(paths) = ldconfig_cache.get(soname) {
         for path in paths {
-            if path.exists() && class_matches(path) {
+            if path.exists() && acceptable(path) {
                 return Some(path.clone());
             }
         }
@@ -1388,7 +1414,7 @@ fn locate_lib(
     // 3. Standard paths
     for dir in STANDARD_LIB_PATHS {
         let candidate = Path::new(dir).join(soname);
-        if candidate.exists() && class_matches(&candidate) {
+        if candidate.exists() && acceptable(&candidate) {
             return Some(candidate);
         }
     }
@@ -1401,7 +1427,7 @@ fn locate_lib(
                     continue;
                 }
                 let candidate = Path::new(dir).join(soname);
-                if candidate.exists() && class_matches(&candidate) {
+                if candidate.exists() && acceptable(&candidate) {
                     return Some(candidate);
                 }
             }
@@ -1415,7 +1441,7 @@ fn locate_lib(
                 let lib_dir = entry.path().join("lib");
                 // Check lib/<soname> directly
                 let candidate = lib_dir.join(soname);
-                if candidate.exists() && class_matches(&candidate) {
+                if candidate.exists() && acceptable(&candidate) {
                     return Some(candidate);
                 }
                 // Also check one level of subdirs (e.g. lib/pulseaudio/)
@@ -1423,7 +1449,7 @@ fn locate_lib(
                     for subdir in subdirs.filter_map(Result::ok) {
                         if subdir.file_type().map_or(false, |t| t.is_dir()) {
                             let candidate = subdir.path().join(soname);
-                            if candidate.exists() && class_matches(&candidate) {
+                            if candidate.exists() && acceptable(&candidate) {
                                 return Some(candidate);
                             }
                         }
@@ -1434,6 +1460,36 @@ fn locate_lib(
     }
 
     None
+}
+
+/// Detect NixOS's stub-ld, a tiny loader that prints a message and exits.
+/// The stub lives at `/lib*/ld-*` on NixOS when nix-ld isn't enabled.
+/// We check two signals:
+///
+/// 1. The canonical path contains `stub-ld` (covers the fresh symlink case).
+/// 2. The file content contains NixOS's signature error string (covers the
+///    case where a previous bundle copied the stub into the AppDir itself,
+///    so canonicalize no longer points at the nix store).
+fn is_nix_stub_ld(path: &Path) -> bool {
+    if let Ok(real) = fs::canonicalize(path) {
+        if real.to_string_lossy().contains("stub-ld") {
+            return true;
+        }
+    }
+    // Real glibc ld-linux is >100 KB; the stub is ~35 KB. Cheap filter
+    // before hashing through the file content.
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 128 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes
+        .windows(b"NixOS cannot run".len())
+        .any(|w| w == b"NixOS cannot run")
 }
 
 // ---------------------------------------------------------------------------

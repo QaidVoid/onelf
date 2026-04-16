@@ -150,13 +150,15 @@ pub fn exec_userland(target: &Path, interpreter: &Path, argv0: &str, args: &[Str
 }
 
 /// Search for the interpreter in the package's lib directories.
+///
+/// Match by the PT_INTERP's own basename (e.g. `ld-linux-x86-64.so.2`),
+/// not by whatever the host's symlink points at. On NixOS the host's
+/// `/lib64/ld-linux-x86-64.so.2` is a symlink to a `stub-ld-*` store
+/// path, and resolving the symlink would make us look for a file named
+/// `stub-ld-...` in the bundle, which of course doesn't exist; we'd
+/// then fall back to the kernel-loaded stub and fail.
 fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Option<PathBuf> {
-    let interp_path = Path::new(interp);
-
-    let interp_name = std::fs::read_link(interp_path)
-        .ok()
-        .and_then(|target| target.file_name().map(|n| n.to_os_string()))
-        .or_else(|| interp_path.file_name().map(|n| n.to_os_string()))?;
+    let interp_name = Path::new(interp).file_name()?.to_os_string();
 
     for dir in lib_dirs {
         let candidate = pkg_root.join(dir).join(&interp_name);
@@ -175,13 +177,11 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
 
 /// Build a `Command` for executing the target binary.
 ///
-/// This is a fallback for cases where userland-execve cannot be used:
-/// - Non-ELF files (shell scripts, etc.)
-/// - System interpreter exists
-/// - Platform doesn't support userland-execve
-///
-/// For ELF binaries with missing interpreter, invokes the bundled interpreter
-/// directly with --argv0.
+/// If a bundled interpreter is available, always prefer it over the host's.
+/// NixOS ships a stub loader at the standard PT_INTERP paths that exists
+/// but refuses to load foreign binaries, so checking "host has interp?"
+/// gives the wrong answer there. Using the bundled interp unconditionally
+/// also gives us a consistent runtime across distros.
 pub fn build_exec_command(
     target: &Path,
     pkg_root: &Path,
@@ -192,24 +192,29 @@ pub fn build_exec_command(
     use std::os::unix::process::CommandExt;
 
     if let Some(interp) = read_elf_interp(target) {
-        if !Path::new(&interp).exists() {
-            if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
-                let lib_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
+            let lib_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let is_musl = Path::new(&interp)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ld-musl-"));
 
-                let mut cmd = Command::new(&bundled);
+            let mut cmd = Command::new(&bundled);
+            // glibc's ld-linux supports --inhibit-cache; musl's ld-musl rejects it.
+            if !is_musl {
                 cmd.arg("--inhibit-cache");
-                if !lib_path.is_empty() {
-                    cmd.arg("--library-path").arg(&lib_path);
-                }
-                cmd.arg("--argv0").arg(argv0).arg(target).args(args);
-                return cmd;
             }
+            if !lib_path.is_empty() {
+                cmd.arg("--library-path").arg(&lib_path);
+            }
+            cmd.arg("--argv0").arg(argv0).arg(target).args(args);
+            return cmd;
+        }
+        if !Path::new(&interp).exists() {
             eprintln!(
-                "onelf-rt: warning: ELF interpreter '{}' not found on this system",
+                "onelf-rt: warning: ELF interpreter '{}' not found on this system \
+                 and no bundled equivalent in the AppDir",
                 interp
-            );
-            eprintln!(
-                "onelf-rt: hint: bundle the interpreter with: onelf bundle-libs --exclude ''"
             );
         }
     }
