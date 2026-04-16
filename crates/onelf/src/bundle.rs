@@ -282,22 +282,60 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
     }
 
+    // Auto-detect frameworks from the input binaries' DT_NEEDED entries.
+    // User-provided flags are OR'd with detected flags so explicit opt-ins win
+    // but the tool does the right thing when the user passes nothing.
+    let detected = detect_frameworks(&opts.directory, opts.target.as_deref());
+    let want_gl = opts.gl || detected.gl;
+    let want_dri = opts.dri || detected.dri;
+    let want_vulkan = opts.vulkan || detected.vulkan;
+    let want_wayland = opts.wayland || detected.wayland;
+    let want_gtk = opts.gtk || detected.gtk;
+
+    if (detected.gl || detected.dri || detected.vulkan || detected.wayland || detected.gtk)
+        && (!opts.gl || !opts.dri || !opts.vulkan || !opts.wayland || !opts.gtk)
+    {
+        let mut parts = Vec::new();
+        if detected.gl && !opts.gl {
+            parts.push("gl");
+        }
+        if detected.dri && !opts.dri {
+            parts.push("dri");
+        }
+        if detected.vulkan && !opts.vulkan {
+            parts.push("vulkan");
+        }
+        if detected.wayland && !opts.wayland {
+            parts.push("wayland");
+        }
+        if detected.gtk && !opts.gtk {
+            parts.push("gtk");
+        }
+        if !parts.is_empty() {
+            eprintln!(
+                "  {} auto-enabled: {}",
+                color::bold("Frameworks:"),
+                parts.join(", ")
+            );
+        }
+    }
+
     // Bundle GPU assets first so DRI driver .so files are present when
     // find_elf_files runs, letting the main loop resolve their transitive deps.
-    if opts.gl || opts.dri || opts.vulkan {
+    if want_gl || want_dri || want_vulkan {
         bundle_gpu(
             &opts.directory,
             &opts.lib_dir,
             &opts.search_path,
             opts.dry_run,
             opts.strip,
-            opts.gl,
-            opts.dri,
-            opts.vulkan,
+            want_gl,
+            want_dri,
+            want_vulkan,
         )?;
     }
 
-    if opts.wayland {
+    if want_wayland {
         bundle_wayland(
             &opts.directory,
             &opts.lib_dir,
@@ -307,7 +345,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         )?;
     }
 
-    if opts.gtk {
+    if want_gtk {
         bundle_gtk_data(&opts.directory, opts.dry_run)?;
     }
 
@@ -858,6 +896,72 @@ fn driver_filter(
         Some(EM_AARCH64) | Some(EM_ARM) => Some(arm_list),
         _ => None,
     }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct FrameworkFlags {
+    gl: bool,
+    dri: bool,
+    vulkan: bool,
+    wayland: bool,
+    gtk: bool,
+}
+
+/// Inspect DT_NEEDED across the input binaries (or the --target if set) and
+/// infer which framework bundlers should run. Heuristics track common sonames:
+/// the user can still explicitly pass the flags to force any of them on.
+fn detect_frameworks(directory: &Path, target: Option<&Path>) -> FrameworkFlags {
+    let files = match target {
+        Some(t) => {
+            let p = if t.is_absolute() {
+                t.to_path_buf()
+            } else {
+                directory.join(t)
+            };
+            if p.is_file() {
+                vec![p]
+            } else {
+                return FrameworkFlags::default();
+            }
+        }
+        None => find_elf_files(directory),
+    };
+    let mut flags = FrameworkFlags::default();
+    for path in &files {
+        let Ok(needed) = parse_needed(path) else {
+            continue;
+        };
+        for soname in needed {
+            if soname.starts_with("libGL.so")
+                || soname.starts_with("libEGL.so")
+                || soname.starts_with("libGLESv")
+                || soname.starts_with("libOpenGL.so")
+            {
+                flags.gl = true;
+                flags.dri = true;
+            }
+            if soname.starts_with("libgbm.so") {
+                flags.dri = true;
+            }
+            if soname.starts_with("libvulkan.so") {
+                flags.vulkan = true;
+            }
+            if soname.starts_with("libwayland-client.so")
+                || soname.starts_with("libwayland-egl.so")
+                || soname.starts_with("libwayland-cursor.so")
+                || soname.starts_with("libdecor-0.so")
+            {
+                flags.wayland = true;
+            }
+            if soname.starts_with("libgtk-3.so")
+                || soname.starts_with("libgtk-4.so")
+                || soname.starts_with("libgtk-")
+            {
+                flags.gtk = true;
+            }
+        }
+    }
+    flags
 }
 
 /// Sonames that applications commonly dlopen at runtime. Absence from DT_NEEDED
