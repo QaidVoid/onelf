@@ -10,9 +10,9 @@ use std::io;
 use std::os::fd::AsFd;
 use std::time::Instant;
 
-use onelf_format::Manifest;
 use onelf_format::entry::EntryKind;
-use rustix::event::{PollFd, PollFlags, poll};
+use onelf_format::Manifest;
+use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::loader;
 

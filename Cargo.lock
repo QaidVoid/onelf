@@ -280,6 +280,17 @@ dependencies = [
 
 [[package]]
 name = "goblin"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b363a30c165f666402fe6a3024d3bec7ebc898f96a4a23bd1c99f8dbf3f4f47"
+dependencies = [
+ "log",
+ "plain",
+ "scroll",
+]
+
+[[package]]
+name = "goblin"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daa0a64d21a7eb230583b4c5f4e23b7e4e57974f96620f42a7e75e08ae66d745"
@@ -363,6 +374,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "nix"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -380,7 +402,7 @@ version = "0.1.2"
 dependencies = [
  "blake3",
  "clap",
- "goblin",
+ "goblin 0.9.3",
  "indicatif",
  "jwalk",
  "onelf-format 0.1.0",
@@ -400,11 +422,20 @@ name = "onelf-format"
 version = "0.1.2"
 
 [[package]]
+name = "onelf-preload"
+version = "0.1.2"
+dependencies = [
+ "libc",
+ "userland-execve",
+]
+
+[[package]]
 name = "onelf-rt"
 version = "0.1.2"
 dependencies = [
  "onelf-format 0.1.0",
  "rustix",
+ "userland-execve",
  "zstd",
 ]
 
@@ -549,6 +580,16 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
+
+[[package]]
+name = "userland-execve"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea5394ca2e759920eefe2b20fc111d6e612cc2d71a47f9449745f93af88b61ba"
+dependencies = [
+ "goblin 0.8.2",
+ "nix",
+]
 
 [[package]]
 name = "utf8parse"

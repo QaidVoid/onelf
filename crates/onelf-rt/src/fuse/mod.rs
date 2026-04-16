@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::io::FdFlags;
-use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
-use rustix::runtime::{KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sigaction};
+use rustix::process::{kill_process, waitpid, Pid, Signal, WaitOptions};
+use rustix::runtime::{kernel_sigaction, KernelSigSet, KernelSigaction, KernelSigactionFlags};
 
 use crate::loader::PackageData;
 
@@ -167,10 +167,6 @@ fn exec_from_mount(
         onelf_format::WorkingDir::Inherit => None,
     };
 
-    if let Some(data) = interp_data {
-        crate::interp::setup_interp_symlink(data, mountpoint);
-    }
-
     crate::env::setup_env(
         &mountpoint_str,
         argv0,
@@ -181,6 +177,17 @@ fn exec_from_mount(
     );
 
     let lib_dirs = pkg.manifest.lib_dirs();
+    let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
+
+    if let Some(interp) =
+        crate::interp::should_use_userland_exec(&target_path, mountpoint, bundled_interp_rel)
+    {
+        if let Some(cwd) = &child_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        crate::interp::exec_userland(&target_path, &interp, argv0, args);
+    }
+
     let mut cmd =
         crate::interp::build_exec_command(&target_path, mountpoint, &lib_dirs, argv0, args);
     if let Some(cwd) = &child_cwd {
@@ -274,19 +281,14 @@ pub fn execute_fuse(
         onelf_format::WorkingDir::Inherit => None,
     };
 
-    // Set up interpreter symlink (doesn't access FUSE mount)
-    if let Some(data) = interp_data {
-        crate::interp::setup_interp_symlink(data, &mountpoint);
-    }
+    // Extract bundled interpreter path for direct invocation (no symlinks needed)
+    let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
 
     // Death pipe: when the child (and all its descendants) exit, the write end
     // closes and poll() on the read end returns POLLHUP.
     let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
         Ok(p) => p,
         Err(_) => {
-            if let Some(data) = interp_data {
-                crate::interp::cleanup_interp_symlink(data);
-            }
             cleanup_mountpoint(&mountpoint);
             return false;
         }
@@ -294,7 +296,7 @@ pub fn execute_fuse(
     // Remove CLOEXEC from write end so the exec'd child inherits it.
     let _ = rustix::io::fcntl_setfd(&pipe_write, FdFlags::empty());
 
-    use rustix::runtime::{Fork, kernel_fork};
+    use rustix::runtime::{kernel_fork, Fork};
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
@@ -311,6 +313,18 @@ pub fn execute_fuse(
             );
 
             let lib_dirs = pkg.manifest.lib_dirs();
+
+            if let Some(interp) = crate::interp::should_use_userland_exec(
+                &target_path,
+                &mountpoint,
+                bundled_interp_rel,
+            ) {
+                if let Some(cwd) = &child_cwd {
+                    let _ = std::env::set_current_dir(cwd);
+                }
+                crate::interp::exec_userland(&target_path, &interp, argv0, args);
+            }
+
             let mut cmd = crate::interp::build_exec_command(
                 &target_path,
                 &mountpoint,
@@ -351,18 +365,12 @@ pub fn execute_fuse(
                         Ok(None) => continue,
                         Err(rustix::io::Errno::INTR) => continue,
                         Err(_) => {
-                            if let Some(data) = interp_data {
-                                crate::interp::cleanup_interp_symlink(data);
-                            }
                             cleanup_mountpoint(&mountpoint);
                             std::process::exit(1);
                         }
                     },
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(_) => {
-                        if let Some(data) = interp_data {
-                            crate::interp::cleanup_interp_symlink(data);
-                        }
                         cleanup_mountpoint(&mountpoint);
                         std::process::exit(1);
                     }
@@ -370,9 +378,6 @@ pub fn execute_fuse(
             };
 
             drop(fuse_fd);
-            if let Some(data) = interp_data {
-                crate::interp::cleanup_interp_symlink(data);
-            }
             cleanup_mountpoint(&mountpoint);
 
             if let Some(code) = exit_status.exit_status() {
@@ -396,9 +401,6 @@ pub fn execute_fuse(
             }
         }
         Err(e) => {
-            if let Some(data) = interp_data {
-                crate::interp::cleanup_interp_symlink(data);
-            }
             cleanup_mountpoint(&mountpoint);
             eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);

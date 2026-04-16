@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/onelf",
   "crates/onelf-format",
+  "crates/onelf-preload",
   "crates/onelf-rt"
 ]
 default-members = ["crates/onelf"]

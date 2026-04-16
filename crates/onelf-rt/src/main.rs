@@ -7,6 +7,7 @@ mod memfd;
 mod metadata;
 mod multicall;
 mod portable;
+mod ulexec;
 
 use std::os::unix::process::CommandExt;
 
@@ -185,10 +186,25 @@ fn main() {
     }
 
     let lib_dirs = pkg.manifest.lib_dirs();
-    if let Some(ref data) = interp_data {
-        interp::setup_interp_symlink(data, &pkg_dir);
+    let bundled_interp_rel = interp_data
+        .as_deref()
+        .and_then(interp::parse_bundled_interp_rel);
+
+    if let Some(interp) = interp::should_use_userland_exec(
+        &target_path,
+        &pkg_dir,
+        bundled_interp_rel,
+    ) {
+        interp::exec_userland(&target_path, &interp, argv0, &final_args);
     }
-    let mut cmd = interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
+
+    let mut cmd = interp::build_exec_command(
+        &target_path,
+        &pkg_dir,
+        &lib_dirs,
+        argv0,
+        &final_args,
+    );
 
     let err = cmd.exec();
 

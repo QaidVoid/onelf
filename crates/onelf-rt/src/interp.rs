@@ -1,12 +1,12 @@
-//! ELF interpreter detection, bundled interpreter fallback, and symlink setup.
+//! ELF interpreter detection and bundled interpreter invocation.
 //!
 //! When a packed binary's ELF interpreter (PT_INTERP) doesn't exist on the
 //! host system (e.g. running a glibc binary on musl), the runtime can fall
 //! back to a bundled interpreter from the package's lib directories.
 //!
-//! For packages packed with PT_INTERP patching, all ELF binaries point to a
-//! short symlink (`/tmp/.oi<hash8>`) that the runtime creates at startup,
-//! targeting either the system interpreter or the bundled one.
+//! Two execution modes:
+//! 1. userland-execve: Maps interpreter directly, bypasses kernel loader (preferred)
+//! 2. Command-based: Invokes interpreter via --argv0 (fallback for non-ELF entrypoints)
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    let class = data[4]; // 1 = 32-bit, 2 = 64-bit
+    let class = data[4];
 
     let (e_phoff, e_phentsize, e_phnum) = match class {
         2 => {
@@ -53,7 +53,7 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
 
         let p_type = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
         if p_type != 3 {
-            continue; // Not PT_INTERP
+            continue;
         }
 
         let (p_offset, p_filesz) = match class {
@@ -78,7 +78,6 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
         }
 
         let interp = &data[p_offset..p_offset + p_filesz];
-        // Truncate at first NUL — patched binaries pad the shorter new path with NULs
         let interp = match interp.iter().position(|&b| b == 0) {
             Some(pos) => &interp[..pos],
             None => interp,
@@ -86,15 +85,57 @@ fn parse_elf_interp(data: &[u8]) -> Option<String> {
         return std::str::from_utf8(interp).ok().map(String::from);
     }
 
-    None // Statically linked
+    None
+}
+
+/// Check if target is an ELF binary with a patched interpreter (starts with /tmp/.oi)
+pub fn has_patched_interp(target: &Path) -> bool {
+    match read_elf_interp(target) {
+        Some(interp) => interp.starts_with("/tmp/.oi"),
+        None => false,
+    }
+}
+
+/// Check if we should use userland-execve for this target.
+///
+/// Returns the bundled interpreter path if:
+/// - Target is an ELF binary with patched PT_INTERP
+/// - Bundled interpreter exists
+/// - userland-execve is supported on this platform
+pub fn should_use_userland_exec(
+    target: &Path,
+    pkg_root: &Path,
+    bundled_interp_rel: Option<&str>,
+) -> Option<PathBuf> {
+    if !crate::ulexec::is_supported() {
+        return None;
+    }
+
+    let rel_path = bundled_interp_rel?;
+    let interp = pkg_root.join(rel_path);
+
+    if !interp.exists() {
+        return None;
+    }
+
+    if !has_patched_interp(target) {
+        return None;
+    }
+
+    Some(interp)
+}
+
+/// Execute an ELF binary using userland-execve with bundled interpreter.
+///
+/// This function never returns on success.
+pub fn exec_userland(target: &Path, interpreter: &Path, argv0: &str, args: &[String]) -> ! {
+    crate::ulexec::exec_with_interp(target, interpreter, argv0, args)
 }
 
 /// Search for the interpreter in the package's lib directories.
 fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Option<PathBuf> {
     let interp_path = Path::new(interp);
 
-    // If interp is a symlink (e.g. patched /tmp/.oiXXXX), resolve it to get
-    // the real interpreter filename. read_link works even on dead symlinks.
     let interp_name = std::fs::read_link(interp_path)
         .ok()
         .and_then(|target| target.file_name().map(|n| n.to_os_string()))
@@ -107,7 +148,6 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
         }
     }
 
-    // Also check the package root directly
     let candidate = pkg_root.join(&interp_name);
     if candidate.exists() {
         return Some(candidate);
@@ -116,73 +156,15 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
     None
 }
 
-/// Set up the interpreter symlink for cross-libc portability.
-///
-/// Reads `.onelf/interp` metadata (injected at pack time) and creates a symlink
-/// at the specified path pointing to the bundled interpreter (preferred, since it
-/// matches the bundled libc) or the system interpreter as fallback.
-/// This makes all ELF binaries in the package work regardless of how they're
-/// invoked (directly or via shell scripts).
-pub fn setup_interp_symlink(interp_data: &[u8], pkg_root: &Path) {
-    let text = match std::str::from_utf8(interp_data) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
-    let mut lines = text.lines();
-    let original = match lines.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
-    };
-    let symlink_str = match lines.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
-    };
-    let bundled_rel = match lines.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
-    let symlink_path = Path::new(symlink_str);
-
-    // Always use the bundled interpreter - it matches the bundled libc.
-    // We trust the metadata: if bundled_rel is present, the file exists in the
-    // package.
-    let target = pkg_root.join(bundled_rel);
-
-    // Idempotent: check if symlink already points to the right target
-    if let Ok(existing) = std::fs::read_link(symlink_path) {
-        if existing == target {
-            return;
-        }
-        let _ = std::fs::remove_file(symlink_path);
-    }
-
-    let _ = std::os::unix::fs::symlink(&target, symlink_path);
-}
-
-/// Remove the interpreter symlink created by [`setup_interp_symlink`].
-pub fn cleanup_interp_symlink(interp_data: &[u8]) {
-    let text = match std::str::from_utf8(interp_data) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
-    let mut lines = text.lines();
-    let _original = lines.next(); // skip original interp path
-    let symlink_str = match lines.next() {
-        Some(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
-    let _ = std::fs::remove_file(symlink_str);
-}
-
 /// Build a `Command` for executing the target binary.
 ///
-/// If the binary's ELF interpreter doesn't exist on this system but a bundled
-/// copy is found in the package's lib dirs, returns a command that invokes the
-/// bundled interpreter with `--argv0` to preserve the original program name.
+/// This is a fallback for cases where userland-execve cannot be used:
+/// - Non-ELF files (shell scripts, etc.)
+/// - System interpreter exists
+/// - Platform doesn't support userland-execve
+///
+/// For ELF binaries with missing interpreter, invokes the bundled interpreter
+/// directly with --argv0.
 pub fn build_exec_command(
     target: &Path,
     pkg_root: &Path,
@@ -194,9 +176,6 @@ pub fn build_exec_command(
 
     if let Some(interp) = read_elf_interp(target) {
         if !Path::new(&interp).exists() {
-            // Interpreter not found (e.g. cross-libc: glibc binary on musl host).
-            // Fall back to invoking the bundled interpreter directly with
-            // --inhibit-cache and --library-path to avoid host library contamination.
             if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
                 let lib_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
 
@@ -216,11 +195,19 @@ pub fn build_exec_command(
                 "onelf-rt: hint: bundle the interpreter with: onelf bundle-libs --exclude ''"
             );
         }
-        // Interpreter exists (via system or interp symlink) — use normal exec
-        // so /proc/self/exe points to the actual binary (needed by Python, etc.)
     }
 
     let mut cmd = Command::new(target);
     cmd.arg0(argv0).args(args);
     cmd
+}
+
+/// Parse the bundled interpreter relative path from `.onelf/interp` metadata.
+/// Returns the third line (bundled interpreter path relative to package root).
+pub fn parse_bundled_interp_rel(interp_data: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(interp_data).ok()?;
+    let mut lines = text.lines();
+    lines.next()?;
+    lines.next()?;
+    lines.next()
 }
