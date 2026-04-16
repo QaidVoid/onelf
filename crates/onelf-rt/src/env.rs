@@ -14,6 +14,7 @@ pub fn setup_env(
     entrypoint_name: &str,
     mode: &str,
     lib_subpath: &str,
+    target_path: &str,
 ) {
     let launch_dir = env::current_dir()
         .ok()
@@ -36,8 +37,19 @@ pub fn setup_env(
 
     let pkg = Path::new(onelf_dir);
 
+    // Don't set LD_LIBRARY_PATH when the entrypoint is a script (a
+    // shebang file that the kernel hands off to a host interpreter).
+    // The host interpreter is linked against the host's glibc, but our
+    // bundled libs come first on LD_LIBRARY_PATH, so the host's
+    // ld-linux.so.2 would end up loading our bundled libc.so.6. Mixing
+    // two glibc versions inside one process blows up with a null deref
+    // in the loader's final mprotect/prlimit64 sequence. Leave the
+    // script's environment clean; the script can export LD_LIBRARY_PATH
+    // itself right before it execs bundled binaries.
+    let target_is_elf = is_elf_file(target_path);
+
     // Auto-set LD_LIBRARY_PATH if package has lib directories
-    if !lib_subpath.is_empty() {
+    if target_is_elf && !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
             .map(|p| pkg.join(p).to_string_lossy().to_string())
@@ -172,6 +184,17 @@ pub fn setup_env(
             }
         }
     }
+}
+
+/// Check whether `path` is an ELF file (first four bytes `\x7fELF`).
+/// Scripts (shebang `#!`) return false; missing files also return false.
+fn is_elf_file(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 4];
+    matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
 /// Return the host's driver / system library directories that exist on

@@ -118,7 +118,18 @@ fn main() {
             pkg.dict.as_deref(),
         ) {
             let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-            env::setup_env("", argv0, &exec_path, &ep_name, "memfd", &lib_paths_str);
+            // memfd mode: target is the memfd data itself (an ELF we
+            // just read). Pass a non-empty marker so setup_env treats
+            // it as an ELF.
+            env::setup_env(
+                "",
+                argv0,
+                &exec_path,
+                &ep_name,
+                "memfd",
+                &lib_paths_str,
+                "/proc/self/fd/0",
+            );
             portable::setup_portable(exe_dir, exe_name);
 
             if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
@@ -205,6 +216,7 @@ fn main() {
 
     let pkg_dir_str = pkg_dir.to_str().unwrap_or("");
     let lib_paths_str = pkg.manifest.lib_dirs().join(":");
+    let target_path_s = target_path.to_str().unwrap_or("");
     env::setup_env(
         pkg_dir_str,
         argv0,
@@ -212,6 +224,7 @@ fn main() {
         &ep_name,
         "cache",
         &lib_paths_str,
+        target_path_s,
     );
     portable::setup_portable(exe_dir, exe_name);
 

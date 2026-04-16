@@ -167,6 +167,7 @@ fn exec_from_mount(
         onelf_format::WorkingDir::Inherit => None,
     };
 
+    let target_path_s = target_path.to_str().unwrap_or("");
     crate::env::setup_env(
         &mountpoint_str,
         argv0,
@@ -174,6 +175,7 @@ fn exec_from_mount(
         &ep_name,
         "fuse",
         &lib_paths_str,
+        target_path_s,
     );
 
     let lib_dirs = pkg.manifest.lib_dirs();
@@ -322,6 +324,7 @@ pub fn execute_fuse(
             // setup_env must run in the child (after fork) because it probes
             // directories on the FUSE mount (lib/dri/, share/vulkan/, etc.).
             // The parent's FUSE event loop is now running concurrently.
+            let target_path_s = target_path.to_str().unwrap_or("");
             crate::env::setup_env(
                 &mountpoint_str,
                 argv0,
@@ -329,6 +332,7 @@ pub fn execute_fuse(
                 &ep_name,
                 "fuse",
                 &lib_paths_str,
+                target_path_s,
             );
 
             let lib_dirs = pkg.manifest.lib_dirs();

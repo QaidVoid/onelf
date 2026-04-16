@@ -107,6 +107,7 @@ pub fn execute_tmpfs(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
+    let target_path_s = target_path.to_str().unwrap_or("");
     crate::env::setup_env(
         &mountpoint_str,
         argv0,
@@ -114,6 +115,7 @@ pub fn execute_tmpfs(
         &ep_name,
         "tmpfs",
         &lib_paths_str,
+        target_path_s,
     );
 
     // Working dir.

@@ -110,22 +110,34 @@ pub fn run(
     cmd.env("ONELF_EXEC", &target);
     cmd.env("ONELF_ENTRYPOINT", &ep_name);
 
+    let target_is_elf = is_elf_file_at(&target);
     if !lib_paths_str.is_empty() {
-        let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        // Assemble: <bundle lib> : <existing> : <host driver/system dirs>.
-        // The bundled loader has its baked-in paths scrubbed, so host-
-        // provided GPU drivers (libcuda, libvulkan, libGL, libva) need
-        // an explicit entry or Cycles/OptiX/Vulkan won't see them.
-        let mut parts: Vec<String> = Vec::new();
-        parts.push(lib_paths_str.clone());
-        if !existing.is_empty() {
-            parts.push(existing);
+        // Only set LD_LIBRARY_PATH for ELF targets. When the entrypoint
+        // is a script the kernel hands it to a host interpreter
+        // (/bin/sh, /usr/bin/python3, ...) linked against the host
+        // glibc. If our bundled lib dir comes first on LD_LIBRARY_PATH,
+        // the host ld would load our bundled libc, mixing two glibc
+        // versions in one process and crashing before main. Let the
+        // script export LD_LIBRARY_PATH itself before exec'ing bundled
+        // ELFs.
+        if target_is_elf {
+            let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            // Assemble: <bundle lib> : <existing> : <host driver/system dirs>.
+            // The bundled loader has its baked-in paths scrubbed, so
+            // host-provided GPU drivers (libcuda, libvulkan, libGL,
+            // libva) need an explicit entry or Cycles/OptiX/Vulkan
+            // won't see them.
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(lib_paths_str.clone());
+            if !existing.is_empty() {
+                parts.push(existing);
+            }
+            let host_drivers = host_driver_paths();
+            if !host_drivers.is_empty() {
+                parts.push(host_drivers.join(":"));
+            }
+            cmd.env("LD_LIBRARY_PATH", parts.join(":"));
         }
-        let host_drivers = host_driver_paths();
-        if !host_drivers.is_empty() {
-            parts.push(host_drivers.join(":"));
-        }
-        cmd.env("LD_LIBRARY_PATH", parts.join(":"));
 
         // Auto-set GPU/driver paths if the usual subdirs exist.
         let dri_paths: Vec<String> = lib_paths
@@ -454,6 +466,21 @@ fn find_bundled_interp(interp: &str, app_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// True if `path` is an ELF file (first four bytes `\x7fELF`). Scripts
+/// (shebang `#!`) and missing files return false. Used to decide
+/// whether it's safe to set `LD_LIBRARY_PATH` in the child's env:
+/// scripts get handed to a host interpreter linked against the host's
+/// glibc, and pointing it at our bundled libc mixes versions and
+/// crashes before main.
+fn is_elf_file_at(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 4];
+    matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
 /// Host driver / system library directories to append to LD_LIBRARY_PATH.
