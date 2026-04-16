@@ -81,3 +81,12 @@ entrypoint sees:
 Use `package` for apps that expect resources at relative paths like
 `./share/myapp/data`. Use `command` for apps that look for siblings next
 to themselves. Leave `inherit` otherwise.
+
+::: warning
+After `bundle-libs` rewrites an ELF's `PT_INTERP` to a relative path,
+the kernel resolves that path against the process CWD at exec time.
+The runtime therefore forces CWD to the AppDir root when it execs such
+a binary, which overrides `working-dir = "inherit"`. If you need the
+caller's original working directory, read `$ONELF_LAUNCH_DIR` from the
+app — the runtime sets it before exec.
+:::

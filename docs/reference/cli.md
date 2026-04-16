@@ -87,7 +87,7 @@ onelf bundle-libs DIRECTORY [options]
 | `--search-path DIR` | | Extra lib search dir (highest priority) |
 | `--dry-run` | `false` | Report without copying |
 | `--no-recursive` | `false` | Don't resolve transitive deps |
-| `--gl`, `--dri`, `--vulkan`, `--wayland`, `--gtk` | auto | Framework bundlers |
+| `--gl`, `--dri`, `--vulkan`, `--wayland`, `--gtk` | auto | Framework bundlers. Auto-detect inspects both `DT_NEEDED` and raw soname strings in the binary, so dlopen'd frameworks are picked up too |
 | `--strip` | `false` | Run `strip --strip-unneeded` |
 | `--strict-libc` | `false` | Skip wrong-family libc libs |
 | `--scan-dlopen` | `false` | Scan binary strings for common dlopen sonames |

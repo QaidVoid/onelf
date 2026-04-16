@@ -17,11 +17,25 @@ entrypoint. Packaged apps can read these to discover their own context.
 ## Library paths
 
 The runtime walks the AppDir's `lib` subdirectories and prepends them to
-`LD_LIBRARY_PATH`:
+`LD_LIBRARY_PATH`, keeps whatever the caller already had, and appends
+host driver / system library dirs at the end:
 
 ```
-LD_LIBRARY_PATH=/run/user/1000/onelf-myapp-ab12cd34/lib:<previous value>
+LD_LIBRARY_PATH=<bundle lib dirs>:<previous LD_LIBRARY_PATH>:<host driver dirs>
 ```
+
+Host driver dirs currently probed (each added only if it exists):
+
+- `/run/opengl-driver/lib` — NixOS
+- `/run/opengl-driver-32/lib` — NixOS 32-bit
+- `/usr/lib/x86_64-linux-gnu` — Debian/Ubuntu multiarch
+- `/usr/lib64` — Fedora/RHEL/openSUSE
+- `/usr/lib`, `/lib/x86_64-linux-gnu`, `/lib64` — generic fallbacks
+
+This lets bundled apps find host-provided GPU userspace drivers (libcuda,
+libvulkan, libGL, libva) on every distro without the user having to set
+`LD_LIBRARY_PATH` manually. The bundle's own libs come first in the
+search path, so they always win on name conflicts.
 
 If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
 

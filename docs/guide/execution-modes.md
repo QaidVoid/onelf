@@ -101,6 +101,32 @@ across packages.
 | tmpfs | slow (full extract to RAM) | slow again | no | no | userns |
 | cache | slow (extract to disk) | fast | yes | yes | writable $HOME |
 
+## How the entrypoint is launched
+
+Regardless of which mode is active, the runtime picks one of three exec
+strategies based on the entrypoint's `PT_INTERP`:
+
+1. **Direct exec (preferred).** When `bundle-libs` has rewritten the
+   entrypoint's `PT_INTERP` to a path relative to the AppDir, the
+   runtime chdirs into the AppDir and `execve`s the target directly.
+   The kernel loads the bundled loader via the relative PT_INTERP, and
+   `/proc/self/exe` points at the real binary — what Python, Electron,
+   and Qt read to find their bundled resources.
+
+2. **Userland-execve.** For PIE (`ET_DYN`) binaries on systems that
+   support it, the runtime can map the bundled loader into the current
+   process and jump to its entry, skipping the kernel loader entirely.
+
+3. **Loader invocation (fallback).** When the target's `PT_INTERP` is
+   absolute (unpatched) but a matching bundled loader exists, the
+   runtime invokes the loader explicitly:
+   `ld-linux-x86-64.so.2 --library-path ... --argv0 NAME target`.
+   The bundle still runs, but `/proc/self/exe` will be the loader
+   rather than the target. Apps that read `/proc/self/exe` to locate
+   their own resources won't find them on this path. Re-run
+   `bundle-libs` with an up-to-date `onelf` to get the direct-exec
+   behavior.
+
 ## Forcing a mode
 
 Set `ONELF_MODE` in the environment:

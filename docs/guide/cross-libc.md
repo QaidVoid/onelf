@@ -26,20 +26,24 @@ When bundle-libs sees a musl binary (PT_INTERP matches `ld-musl-*`), it:
 
 ## What happens at runtime
 
-When the runtime execs the packed entrypoint, the kernel tries to load
-its `PT_INTERP`. Since `/lib/ld-musl-x86_64.so.1` doesn't exist on a glibc
-host, the kernel would normally refuse.
+`bundle-libs` rewrites each ELF's `PT_INTERP` to a path relative to the
+AppDir root (like `lib/ld-musl-x86_64.so.1` or `lib/ld-linux-x86-64.so.2`).
+At exec time the runtime chdirs into the AppDir and the kernel resolves
+the relative PT_INTERP against the bundled loader. The host's own loader
+is never consulted, so a musl binary runs on a glibc host and vice versa
+without any host-level setup.
 
-Instead, onelf uses `userland-execve` to skip the kernel loader entirely:
+For PIE (`ET_DYN`) binaries the runtime can also use `userland-execve`
+to map the bundled loader directly and skip the kernel loader entirely.
+Non-PIE (`ET_EXEC`) binaries always go through the kernel + patched
+PT_INTERP path.
 
-1. Map the bundled `ld-musl-x86_64.so.1` into memory directly.
-2. Jump to its entry point with the target binary set up on the stack.
-
-Spawned child processes (shelling out, `execve` calls) also go through
-this path via a small `LD_PRELOAD` library (`libonelf-preload.so`).
-
-No symlinks are created in `/tmp`. No `PT_INTERP` patching happens. The
-ELF file on disk stays unmodified.
+When the replacement PT_INTERP overflows the original slot (e.g. a
+deeply nested binary like `5.0/python/bin/python3.11` needing
+`../../../lib/ld-linux-x86-64.so.2`), bundle-libs appends the new string
+to the end of the file and rewrites the PT_INTERP program header to
+point at it. Kernel reads PT_INTERP by file offset, so the string does
+not need PT_LOAD coverage.
 
 ## Packaging musl apps on glibc hosts
 
