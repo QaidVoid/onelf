@@ -1,9 +1,14 @@
-//! FUSE mount/unmount via fusermount3.
+//! FUSE mount/unmount.
 //!
-//! Communicates with fusermount3 over a Unix socketpair, receiving the
-//! `/dev/fuse` file descriptor via `SCM_RIGHTS`.
+//! Preferred path: create a private user+mount namespace and call mount(2)
+//! directly on /dev/fuse. No external helper, mount is invisible outside
+//! our namespace, and the kernel tears it down automatically on exit.
+//!
+//! Fallback: the legacy fusermount3 helper protocol (socketpair + SCM_RIGHTS)
+//! for systems where unprivileged user namespaces are disabled.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -11,10 +16,66 @@ use std::path::Path;
 use std::process::Command;
 
 use rustix::io::FdFlags;
+use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketFlags, SocketType,
     recvmsg, socketpair,
 };
+use rustix::thread::{UnshareFlags, unshare_unsafe};
+
+/// Mount a FUSE filesystem directly, after entering a private user+mount
+/// namespace. Returns the /dev/fuse fd. No external helper required.
+///
+/// The caller must invoke this BEFORE forking the FUSE server; forked
+/// children inherit the mount namespace and see the mount automatically.
+/// When the last process in the user namespace exits, the kernel tears
+/// the mount down — no cleanup code needed.
+pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
+    // SAFETY: single-threaded runtime; unshare only affects this thread.
+    let real_uid = rustix::process::getuid().as_raw();
+    let real_gid = rustix::process::getgid().as_raw();
+
+    unsafe {
+        unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS)
+            .map_err(|e| io::Error::other(format!("unshare: {e}")))?;
+    }
+
+    // Map our real uid/gid 1:1 into the new user namespace. Must deny
+    // setgroups before writing gid_map or the kernel rejects it.
+    File::create("/proc/self/setgroups")?.write_all(b"deny")?;
+    File::create("/proc/self/uid_map")?.write_all(format!("{real_uid} {real_uid} 1").as_bytes())?;
+    File::create("/proc/self/gid_map")?.write_all(format!("{real_gid} {real_gid} 1").as_bytes())?;
+
+    let fuse_fd: OwnedFd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")?
+        .into();
+
+    // rootmode=040000 = S_IFDIR; allow_other lets the child process (running
+    // as the same uid inside the ns) access the mount through the inode.
+    let data = format!(
+        "fd={},rootmode=40000,user_id={real_uid},group_id={real_gid}",
+        fuse_fd.as_raw_fd()
+    );
+    let data_c = std::ffi::CString::new(data).unwrap();
+
+    mount(
+        "fuse",
+        mountpoint,
+        "fuse",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOATIME | MountFlags::RDONLY,
+        Some(data_c.as_c_str()),
+    )
+    .map_err(|e| io::Error::other(format!("mount /dev/fuse: {e}")))?;
+
+    Ok(fuse_fd)
+}
+
+/// Unmount a FUSE filesystem directly (for the unshare path).
+pub fn fuse_unmount_direct(mountpoint: &Path) {
+    let _ = unmount(mountpoint, UnmountFlags::DETACH);
+}
 
 /// Mount a FUSE filesystem via fusermount3 and return the /dev/fuse fd.
 ///

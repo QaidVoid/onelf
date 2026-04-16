@@ -198,8 +198,12 @@ fn exec_from_mount(
     std::process::exit(1);
 }
 
-fn cleanup_mountpoint(mountpoint: &Path) {
-    mount::fuse_unmount(mountpoint);
+fn cleanup_mountpoint(mountpoint: &Path, used_namespace: bool) {
+    if used_namespace {
+        mount::fuse_unmount_direct(mountpoint);
+    } else {
+        mount::fuse_unmount(mountpoint);
+    }
     let _ = std::fs::remove_dir(mountpoint);
 }
 
@@ -217,16 +221,13 @@ pub fn execute_fuse(
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
-    if !mount::fusermount3_available() {
-        return false;
-    }
-
     let mountpoint = match create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id) {
         Some(m) => m,
         None => return false,
     };
 
     // If already mounted by another instance, reuse it — just exec directly.
+    // (Only reachable via the fusermount3 path; namespace mounts are private.)
     if is_mountpoint(&mountpoint) {
         return exec_from_mount(
             pkg,
@@ -239,18 +240,30 @@ pub fn execute_fuse(
         );
     }
 
-    let fuse_fd = match mount::fuse_mount(&mountpoint) {
-        Ok(fd) => {
-            // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
-            let _ = rustix::io::fcntl_setfd(&fd, FdFlags::CLOEXEC);
-            fd
-        }
-        Err(e) => {
-            eprintln!("onelf-rt: fuse: mount failed: {e}");
-            let _ = std::fs::remove_dir(&mountpoint);
-            return false;
+    // Prefer the namespace-based mount. No external helper, private to us,
+    // tears down automatically on exit. Fall back to fusermount3 if the
+    // kernel disallows unprivileged user namespaces (e.g. restricted distros).
+    let (fuse_fd, used_namespace) = match mount::fuse_mount_unshare(&mountpoint) {
+        Ok(fd) => (fd, true),
+        Err(ns_err) => {
+            if !mount::fusermount3_available() {
+                eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
+                eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
+                let _ = std::fs::remove_dir(&mountpoint);
+                return false;
+            }
+            match mount::fuse_mount(&mountpoint) {
+                Ok(fd) => (fd, false),
+                Err(e) => {
+                    eprintln!("onelf-rt: fuse: mount failed: {e}");
+                    let _ = std::fs::remove_dir(&mountpoint);
+                    return false;
+                }
+            }
         }
     };
+    // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
+    let _ = rustix::io::fcntl_setfd(&fuse_fd, FdFlags::CLOEXEC);
 
     // Resolve entrypoint target path
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
@@ -289,7 +302,7 @@ pub fn execute_fuse(
     let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
         Ok(p) => p,
         Err(_) => {
-            cleanup_mountpoint(&mountpoint);
+            cleanup_mountpoint(&mountpoint, used_namespace);
             return false;
         }
     };
@@ -365,20 +378,20 @@ pub fn execute_fuse(
                         Ok(None) => continue,
                         Err(rustix::io::Errno::INTR) => continue,
                         Err(_) => {
-                            cleanup_mountpoint(&mountpoint);
+                            cleanup_mountpoint(&mountpoint, used_namespace);
                             std::process::exit(1);
                         }
                     },
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(_) => {
-                        cleanup_mountpoint(&mountpoint);
+                        cleanup_mountpoint(&mountpoint, used_namespace);
                         std::process::exit(1);
                     }
                 }
             };
 
             drop(fuse_fd);
-            cleanup_mountpoint(&mountpoint);
+            cleanup_mountpoint(&mountpoint, used_namespace);
 
             if let Some(code) = exit_status.exit_status() {
                 std::process::exit(code)
@@ -401,7 +414,7 @@ pub fn execute_fuse(
             }
         }
         Err(e) => {
-            cleanup_mountpoint(&mountpoint);
+            cleanup_mountpoint(&mountpoint, used_namespace);
             eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);
         }
