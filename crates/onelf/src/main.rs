@@ -3,6 +3,7 @@ mod cache;
 mod compress;
 mod extract;
 mod info;
+mod init;
 mod list;
 mod metadata;
 mod pack;
@@ -83,6 +84,21 @@ enum Commands {
         /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
         #[arg(long)]
         exclude: Vec<String>,
+    },
+
+    /// Scaffold a starter onelf.toml
+    Init {
+        /// Path to write the recipe to
+        #[arg(short, long, default_value = "onelf.toml")]
+        output: PathBuf,
+
+        /// Seed the recipe from a binary: sets name/command from its basename
+        #[arg(long, value_name = "PATH")]
+        binary: Option<PathBuf>,
+
+        /// Overwrite an existing file
+        #[arg(long)]
+        force: bool,
     },
 
     /// Build from an onelf.toml recipe (runs bundle-libs + pack)
@@ -329,6 +345,11 @@ fn main() {
                 },
             )
         }
+        Commands::Init {
+            output,
+            binary,
+            force,
+        } => init::init(&output, binary.as_deref(), force),
         Commands::Build { path, output } => run_build(&path, output.as_deref()),
         Commands::Info { binary } => info::info(&binary),
         Commands::List { binary } => list::list(&binary),
