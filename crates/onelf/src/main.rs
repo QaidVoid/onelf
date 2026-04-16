@@ -8,6 +8,7 @@ mod list;
 mod metadata;
 mod pack;
 mod recipe;
+mod verify;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -110,6 +111,12 @@ enum Commands {
         /// Override the output path from the recipe
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Verify a packed binary's integrity (recompute hashes vs manifest)
+    Verify {
+        /// Path to the onelf binary
+        binary: PathBuf,
     },
 
     /// Show metadata about a packed binary
@@ -351,6 +358,7 @@ fn main() {
             force,
         } => init::init(&output, binary.as_deref(), force),
         Commands::Build { path, output } => run_build(&path, output.as_deref()),
+        Commands::Verify { binary } => verify::verify(&binary),
         Commands::Info { binary } => info::info(&binary),
         Commands::List { binary } => list::list(&binary),
         Commands::Extract {
