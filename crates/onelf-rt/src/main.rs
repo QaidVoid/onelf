@@ -9,6 +9,7 @@ mod metadata;
 mod multicall;
 mod portable;
 mod ulexec;
+mod update;
 
 use std::os::unix::process::CommandExt;
 
@@ -56,6 +57,26 @@ fn main() {
     // Handle --onelf-icon / --onelf-desktop before dispatching
     if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
         return;
+    }
+
+    // Handle --onelf-update / --onelf-check-update
+    if let Some(flag) = update::parse_flag(&args) {
+        let Some(url_bytes) = read_package_file(&mut pkg, ".onelf/update-url") else {
+            eprintln!("onelf-rt: no update URL configured (repack with --update-url)");
+            std::process::exit(1);
+        };
+        let url = match std::str::from_utf8(&url_bytes) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => {
+                eprintln!("onelf-rt: update URL is not valid UTF-8");
+                std::process::exit(1);
+            }
+        };
+        let Some(self_path) = update::self_path() else {
+            eprintln!("onelf-rt: cannot resolve /proc/self/exe");
+            std::process::exit(1);
+        };
+        std::process::exit(update::run(flag, &self_path, &url));
     }
 
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;

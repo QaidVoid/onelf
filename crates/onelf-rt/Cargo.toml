@@ -11,3 +11,4 @@ onelf-format = { workspace = true }
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 userland-execve = "0.2"
 zstd = { version = "0.13", default-features = false }
+zsync-rs = "0.1"
