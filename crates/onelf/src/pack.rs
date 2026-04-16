@@ -42,6 +42,8 @@ pub struct PackOptions {
     pub working_dir: WorkingDir,
     pub update_url: Option<String>,
     pub exclude: Vec<String>,
+    /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
+    pub package_info: Option<String>,
 }
 
 struct CollectedFile {
@@ -260,6 +262,25 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         files.push(CollectedFile {
             rel_path: PathBuf::from(".onelf/update-url"),
             content: url.as_bytes().to_vec(),
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
+    }
+
+    // Inject .onelf/package-info.toml if requested
+    if let Some(ref info) = opts.package_info {
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+            });
+        }
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/package-info.toml"),
+            content: info.as_bytes().to_vec(),
             mode: 0o644,
             mtime_secs: 0,
             mtime_nsec: 0,

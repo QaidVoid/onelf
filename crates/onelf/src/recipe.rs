@@ -56,6 +56,10 @@ pub struct Package {
     pub memfd: Option<bool>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    pub homepage: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -64,6 +64,14 @@ pub fn info(path: &Path) -> io::Result<()> {
     );
     println!();
 
+    if let Some(info) = read_package_info(path, &manifest)? {
+        println!("Metadata:");
+        for line in info.lines() {
+            println!("  {line}");
+        }
+        println!();
+    }
+
     println!("Entrypoints:");
     for (i, ep) in manifest.entrypoints.iter().enumerate() {
         let name = manifest.get_string(ep.name);
@@ -160,4 +168,33 @@ pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn read_package_info(path: &Path, manifest: &Manifest) -> io::Result<Option<String>> {
+    use crate::extract::decompress_entry;
+
+    let idx = (0..manifest.entries.len()).find(|&i| {
+        manifest.entries[i].kind == EntryKind::File
+            && manifest.entry_path(i) == ".onelf/package-info.toml"
+    });
+    let Some(idx) = idx else { return Ok(None) };
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+    let mut footer_buf = [0u8; FOOTER_SIZE];
+    file.read_exact(&mut footer_buf)?;
+    let footer = Footer::from_bytes(&footer_buf)?;
+
+    let dict = if footer.dict_size > 0 {
+        file.seek(SeekFrom::Start(footer.dict_offset))?;
+        let mut buf = vec![0u8; footer.dict_size as usize];
+        file.read_exact(&mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
+
+    let data = decompress_entry(&mut file, &footer, &manifest.entries[idx], dict.as_deref())?;
+    let text = String::from_utf8(data).unwrap_or_default();
+    Ok(Some(text))
 }

@@ -31,6 +31,12 @@ pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()>
 name = "{name}"
 command = "{command}"
 
+# Optional metadata. Displayed by `onelf info`, stored as .onelf/package-info.toml.
+# version = "0.1.0"
+# description = "Short summary of what this package does"
+# license = "MIT"
+# homepage = "https://example.com/{name}"
+
 # Optional output path (relative paths resolve against this file's directory).
 # output = "{name}.onelf"
 

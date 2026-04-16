@@ -341,6 +341,7 @@ fn main() {
                     working_dir: wd,
                     update_url: update_url.clone(),
                     exclude,
+                    package_info: None,
                 },
                 // Pick the runtime: slim (~700KB) by default; the
                 // update-capable runtime (~2MB) only when the user actually
@@ -516,6 +517,8 @@ fn run_build(
         RUNTIME_BINARY_SLIM
     };
 
+    let package_info = build_package_info(&recipe.package);
+
     pack::pack(
         &pack::PackOptions {
             directory: dir,
@@ -531,9 +534,40 @@ fn run_build(
             working_dir: recipe.package.working_dir.into(),
             update_url,
             exclude: recipe.package.exclude,
+            package_info,
         },
         runtime,
     )
+}
+
+/// Serialize optional package metadata fields to TOML. Returns None if no
+/// metadata is present.
+fn build_package_info(pkg: &recipe::Package) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(ref s) = pkg.name {
+        lines.push(format!("name = {}", toml_str(s)));
+    }
+    if let Some(ref s) = pkg.version {
+        lines.push(format!("version = {}", toml_str(s)));
+    }
+    if let Some(ref s) = pkg.description {
+        lines.push(format!("description = {}", toml_str(s)));
+    }
+    if let Some(ref s) = pkg.license {
+        lines.push(format!("license = {}", toml_str(s)));
+    }
+    if let Some(ref s) = pkg.homepage {
+        lines.push(format!("homepage = {}", toml_str(s)));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n") + "\n")
+    }
+}
+
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`
