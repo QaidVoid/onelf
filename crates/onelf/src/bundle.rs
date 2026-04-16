@@ -396,6 +396,18 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Determine target ELF class (32-bit vs 64-bit) from the input binaries
     let target_class = elf_files.iter().find_map(|f| read_elf_class(f));
 
+    // Determine target libc family from PT_INTERP. Used to skip spurious
+    // cross-libc transitive dependencies (e.g. libgcc_s on a glibc host pulls
+    // in libc.so.6 + ld-linux, which can't be used by a musl-linked binary).
+    let target_libc = elf_files
+        .iter()
+        .find_map(|f| parse_interp(f).as_deref().and_then(libc_family_from_interp));
+
+    // Drop sonames from the initial queue that belong to the wrong libc family.
+    if let Some(target) = target_libc {
+        needed_by.retain(|soname, _| libc_family_of_soname(soname).is_none_or(|fam| fam == target));
+    }
+
     let mut ldconfig_cache = build_lib_cache();
     let mut search_paths: Vec<PathBuf> = opts.search_path.clone();
     search_paths.extend(rpath_dirs);
@@ -486,16 +498,40 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // Resolve transitive dependencies
                 if opts.recursive {
                     if let Ok(transitive) = parse_needed(&resolved) {
-                        for dep in transitive {
-                            if !already_processed.contains(&dep)
-                                && !is_excluded(&dep, &excludes)
-                                && !existing.contains(&dep)
-                            {
-                                needed_by
-                                    .entry(dep.clone())
-                                    .or_insert_with(|| soname.clone());
-                                queue.push(dep);
+                        let lib_family = transitive.iter().find_map(|d| libc_family_of_soname(d));
+                        if let (Some(target), Some(lib_fam)) = (target_libc, lib_family) {
+                            if lib_fam != target {
+                                eprintln!(
+                                    "  {} {} links against {:?} libc but target is {:?}; \
+                                     this bundle may not work at runtime",
+                                    color::bold_red("warning:"),
+                                    soname,
+                                    lib_fam,
+                                    target
+                                );
                             }
+                        }
+                        for dep in transitive {
+                            if already_processed.contains(&dep)
+                                || is_excluded(&dep, &excludes)
+                                || existing.contains(&dep)
+                            {
+                                continue;
+                            }
+                            // Skip wrong-family libc entries. They can't
+                            // satisfy symbols of the target's libc anyway and
+                            // just clutter the bundle.
+                            if let Some(target) = target_libc {
+                                if let Some(fam) = libc_family_of_soname(&dep) {
+                                    if fam != target {
+                                        continue;
+                                    }
+                                }
+                            }
+                            needed_by
+                                .entry(dep.clone())
+                                .or_insert_with(|| soname.clone());
+                            queue.push(dep);
                         }
                     }
                 }
@@ -764,6 +800,35 @@ fn libc_alias_for(interp_name: &str) -> Option<String> {
     interp_name
         .strip_prefix("ld-musl-")
         .map(|rest| format!("libc.musl-{rest}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibcFamily {
+    Musl,
+    Glibc,
+}
+
+/// Detect a binary's libc family from its PT_INTERP basename.
+fn libc_family_from_interp(interp: &str) -> Option<LibcFamily> {
+    let name = Path::new(interp).file_name()?.to_str()?;
+    if name.starts_with("ld-musl-") {
+        Some(LibcFamily::Musl)
+    } else if name.starts_with("ld-linux") {
+        Some(LibcFamily::Glibc)
+    } else {
+        None
+    }
+}
+
+/// Map a soname to the libc family it belongs to, when known.
+fn libc_family_of_soname(soname: &str) -> Option<LibcFamily> {
+    if soname == "libc.so.6" || soname.starts_with("ld-linux") {
+        Some(LibcFamily::Glibc)
+    } else if soname.starts_with("libc.musl-") || soname.starts_with("ld-musl-") {
+        Some(LibcFamily::Musl)
+    } else {
+        None
+    }
 }
 
 /// Parse RPATH and RUNPATH entries from an ELF binary.
