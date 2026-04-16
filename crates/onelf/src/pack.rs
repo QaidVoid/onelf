@@ -774,12 +774,15 @@ fn source_date_epoch() -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// True if the data is a non-ELF script or an ELF with zero DT_NEEDED
-/// dependencies (static binary). Such entrypoints can run from a memfd.
+/// True if the data is an ELF binary with zero DT_NEEDED dependencies.
+/// Such entrypoints are self-contained and can run from a memfd.
+///
+/// Shell scripts and other non-ELF targets are rejected: they often rely
+/// on dirname($0) or sibling files to locate resources, and both break
+/// when the process is execed from /proc/self/fd/N.
 fn elf_has_no_deps(data: &[u8]) -> bool {
     if data.len() < 4 || data[0..4] != *b"\x7fELF" {
-        // Non-ELF: shell scripts etc. — memfd works.
-        return true;
+        return false;
     }
     match goblin::elf::Elf::parse(data) {
         Ok(elf) => elf.libraries.is_empty(),
