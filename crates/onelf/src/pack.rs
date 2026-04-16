@@ -278,13 +278,17 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         let original_interp = files.iter().find_map(|f| elf_interp(&f.content));
         let bundled_relpath = original_interp.as_ref().and_then(|interp| {
             let interp_name = Path::new(interp).file_name()?.to_str()?;
-            files.iter().find_map(|f| {
-                if f.rel_path.file_name().and_then(|n| n.to_str()) == Some(interp_name) {
-                    Some(f.rel_path.to_string_lossy().into_owned())
-                } else {
-                    None
-                }
-            })
+            let match_name = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some(interp_name);
+            files
+                .iter()
+                .find(|f| match_name(&f.rel_path))
+                .map(|f| f.rel_path.to_string_lossy().into_owned())
+                .or_else(|| {
+                    symlinks
+                        .iter()
+                        .find(|s| match_name(&s.rel_path))
+                        .map(|s| s.rel_path.to_string_lossy().into_owned())
+                })
         });
 
         if let Some(bundled_rel) = bundled_relpath {
