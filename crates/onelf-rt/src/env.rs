@@ -293,3 +293,24 @@ fn setup_xdg_data_dirs(pkg: &Path) {
         env::set_var("XDG_DATA_DIRS", new_val);
     }
 }
+
+/// Apply custom environment variables from `.onelf/env` data.
+/// Each line is `KEY=VALUE`. Values containing `${ONELF_DIR}` are
+/// expanded to the package root at runtime.
+pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
+    let Ok(text) = std::str::from_utf8(env_data) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let expanded = val.replace("${ONELF_DIR}", onelf_dir);
+            unsafe {
+                env::set_var(key.trim(), expanded.trim());
+            }
+        }
+    }
+}

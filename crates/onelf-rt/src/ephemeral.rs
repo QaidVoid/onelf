@@ -55,6 +55,7 @@ pub fn execute_tmpfs(
     exec_path: &str,
     args: &[String],
     interp_data: Option<&[u8]>,
+    env_data: Option<&[u8]>,
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
@@ -117,6 +118,9 @@ pub fn execute_tmpfs(
         &lib_paths_str,
         target_path_s,
     );
+    if let Some(data) = env_data {
+        crate::env::apply_custom_env(data, &mountpoint_str);
+    }
 
     // Working dir.
     match ep_working_dir {

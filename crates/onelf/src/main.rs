@@ -369,6 +369,7 @@ fn main() {
                     update_url: update_url.clone(),
                     exclude,
                     package_info: None,
+                    env: Vec::new(),
                 },
                 // Pick the runtime: slim (~700KB) by default; the
                 // update-capable runtime (~2MB) only when the user actually
@@ -575,6 +576,7 @@ fn run_build(
             update_url,
             exclude: recipe.package.exclude,
             package_info,
+            env: recipe.env.into_iter().collect(),
         },
         runtime,
     )

@@ -26,6 +26,7 @@
 //! gl = true
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use onelf_format::WorkingDir;
@@ -42,6 +43,10 @@ pub struct Recipe {
     pub update: Option<Update>,
     #[serde(default)]
     pub bundle: Bundle,
+    /// Custom environment variables set before exec. Values support
+    /// `${ONELF_DIR}` which expands to the package root at runtime.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]

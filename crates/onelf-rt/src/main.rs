@@ -147,6 +147,9 @@ fn main() {
     // Read interpreter metadata for cross-libc portability (if packed with interp patching)
     let interp_data = read_package_file(&mut pkg, ".onelf/interp");
 
+    // Read custom environment variables from recipe [env] section
+    let env_data = read_package_file(&mut pkg, ".onelf/env");
+
     // FUSE mode: mount package as filesystem (default for non-memfd)
     if force != Some("cache") && force != Some("tmpfs") {
         fuse::execute_fuse(
@@ -156,6 +159,7 @@ fn main() {
             &exec_path,
             &final_args,
             interp_data.as_deref(),
+            env_data.as_deref(),
         );
         // Only reaches here if FUSE fell back
         if force == Some("fuse") {
@@ -175,6 +179,7 @@ fn main() {
             &exec_path,
             &final_args,
             interp_data.as_deref(),
+            env_data.as_deref(),
         );
         if force == Some("tmpfs") {
             eprintln!("onelf-rt: tmpfs mode unavailable");
@@ -226,6 +231,9 @@ fn main() {
         &lib_paths_str,
         target_path_s,
     );
+    if let Some(data) = &env_data {
+        env::apply_custom_env(data, pkg_dir_str);
+    }
     portable::setup_portable(exe_dir, exe_name);
 
     // Handle working directory

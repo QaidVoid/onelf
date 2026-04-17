@@ -44,6 +44,8 @@ pub struct PackOptions {
     pub exclude: Vec<String>,
     /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
     pub package_info: Option<String>,
+    /// Custom environment variables to set before exec (KEY=VALUE pairs).
+    pub env: Vec<(String, String)>,
 }
 
 struct CollectedFile {
@@ -330,6 +332,31 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 mtime_nsec: 0,
             });
         }
+    }
+
+    // Write custom env vars as .onelf/env (KEY=VALUE per line).
+    if !opts.env.is_empty() {
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+            });
+        }
+        let content: String = opts
+            .env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/env"),
+            content: content.into_bytes(),
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
     }
 
     pb.finish_with_message(format!(

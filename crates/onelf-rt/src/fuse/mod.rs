@@ -138,6 +138,7 @@ fn exec_from_mount(
     exec_path: &str,
     args: &[String],
     interp_data: Option<&[u8]>,
+    env_data: Option<&[u8]>,
     mountpoint: &Path,
 ) -> bool {
     use std::os::unix::process::CommandExt;
@@ -177,6 +178,9 @@ fn exec_from_mount(
         &lib_paths_str,
         target_path_s,
     );
+    if let Some(data) = env_data {
+        crate::env::apply_custom_env(data, &mountpoint_str);
+    }
 
     let lib_dirs = pkg.manifest.lib_dirs();
     let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
@@ -220,6 +224,7 @@ pub fn execute_fuse(
     exec_path: &str,
     args: &[String],
     interp_data: Option<&[u8]>,
+    env_data: Option<&[u8]>,
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
@@ -242,6 +247,7 @@ pub fn execute_fuse(
                 exec_path,
                 args,
                 interp_data,
+                env_data,
                 &mountpoint,
             );
         }
@@ -355,6 +361,9 @@ pub fn execute_fuse(
                 &lib_paths_str,
                 target_path_s,
             );
+            if let Some(data) = env_data {
+                crate::env::apply_custom_env(data, &mountpoint_str);
+            }
 
             let lib_dirs = pkg.manifest.lib_dirs();
 
