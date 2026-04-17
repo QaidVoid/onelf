@@ -153,6 +153,16 @@ pub fn setup_env(
         }
     }
 
+    // Auto-set XKB_CONFIG_ROOT if package has xkb data
+    if env::var("XKB_CONFIG_ROOT").is_err() {
+        let xkb_dir = pkg.join("share/X11/xkb");
+        if xkb_dir.is_dir() {
+            unsafe {
+                env::set_var("XKB_CONFIG_ROOT", xkb_dir.to_string_lossy().as_ref());
+            }
+        }
+    }
+
     // Auto-set LIBDECOR_PLUGIN_DIR if package has libdecor plugins
     if env::var("LIBDECOR_PLUGIN_DIR").is_err() {
         let libdecor_dir = pkg.join("share/libdecor/plugins-1");
