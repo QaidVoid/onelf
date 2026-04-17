@@ -252,14 +252,8 @@ fn main() {
         interp::exec_userland(&target_path, &interp, argv0, &final_args);
     }
 
-    let (mut cmd, force_cwd) =
+    let mut cmd =
         interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
-    // A relative PT_INTERP only resolves if we control CWD, so an
-    // explicit chdir from build_exec_command overrides whatever we
-    // set above for the recipe's working-dir.
-    if let Some(cwd) = force_cwd {
-        cmd.current_dir(cwd);
-    }
 
     let err = cmd.exec();
 

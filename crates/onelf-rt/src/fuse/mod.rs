@@ -190,12 +190,9 @@ fn exec_from_mount(
         crate::interp::exec_userland(&target_path, &interp, argv0, args);
     }
 
-    let (mut cmd, force_cwd) =
+    let mut cmd =
         crate::interp::build_exec_command(&target_path, mountpoint, &lib_dirs, argv0, args);
-    // force_cwd wins over the recipe's working-dir: a relative PT_INTERP
-    // only resolves against a CWD we control.
-    let final_cwd = force_cwd.or(child_cwd);
-    if let Some(cwd) = &final_cwd {
+    if let Some(cwd) = &child_cwd {
         cmd.current_dir(cwd);
     }
     let err = cmd.exec();
@@ -372,15 +369,14 @@ pub fn execute_fuse(
                 crate::interp::exec_userland(&target_path, &interp, argv0, args);
             }
 
-            let (mut cmd, force_cwd) = crate::interp::build_exec_command(
+            let mut cmd = crate::interp::build_exec_command(
                 &target_path,
                 &mountpoint,
                 &lib_dirs,
                 argv0,
                 args,
             );
-            let final_cwd = force_cwd.or_else(|| child_cwd.clone());
-            if let Some(cwd) = &final_cwd {
+            if let Some(cwd) = &child_cwd {
                 cmd.current_dir(cwd);
             }
             let err = cmd.exec();

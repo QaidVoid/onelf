@@ -142,11 +142,8 @@ pub fn execute_tmpfs(
         crate::interp::exec_userland(&target_path, &interp, argv0, args);
     }
 
-    let (mut cmd, force_cwd) =
+    let mut cmd =
         crate::interp::build_exec_command(&target_path, &mountpoint, &lib_dirs, argv0, args);
-    if let Some(cwd) = force_cwd {
-        cmd.current_dir(cwd);
-    }
     let err = cmd.exec();
     eprintln!("onelf-rt: tmpfs: exec failed: {err}");
     false

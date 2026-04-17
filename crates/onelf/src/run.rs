@@ -91,15 +91,11 @@ pub fn run(
         WorkingDir::Inherit => None,
     };
 
-    let (mut cmd, force_cwd) = build_exec_command(&target, &dir, &lib_paths_str, &ep_name)?;
+    let mut cmd = build_exec_command(&target, &dir, &lib_paths_str, &ep_name)?;
     cmd.args(&ep_args);
     cmd.args(passthrough_args);
 
-    // A `Direct` exec plan needs CWD=app_dir so the kernel resolves
-    // the relative PT_INTERP correctly. That overrides the recipe's
-    // working-dir setting; otherwise we honor it.
-    let final_cwd = force_cwd.or(requested_cwd);
-    if let Some(c) = final_cwd {
+    if let Some(c) = requested_cwd {
         cmd.env("ONELF_USER_CWD", std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
         cmd.current_dir(c);
     }
@@ -335,67 +331,20 @@ fn resolve_entrypoint(
 /// Falls back to invoking the bundled loader explicitly when we have
 /// one but PT_INTERP wasn't patched, or to a bare exec if nothing is
 /// bundled (the host must have the right loader).
-enum ExecPlan {
-    /// execve(target) with CWD forced to app_dir for kernel PT_INTERP resolution.
-    Direct { force_cwd: Option<PathBuf> },
-    /// execve(bundled_ld, [--argv0, name, target, ...]).
-    ViaBundledLd { bundled: PathBuf, is_musl: bool },
-    /// execve(target) with whatever CWD the caller set.
-    Bare,
-}
-
-fn plan_exec(target: &Path, app_dir: &Path) -> ExecPlan {
-    let Some(interp) = read_elf_interp(target) else {
-        return ExecPlan::Bare;
-    };
-    let interp_path = Path::new(&interp);
-
-    // PT_INTERP was patched to a relative path (the bundle-libs step
-    // does this). Kernel resolves it relative to CWD at exec time, so
-    // we have to chdir into app_dir.
-    if interp_path.is_relative() {
-        let resolved = app_dir.join(interp_path);
-        if resolved.exists() {
-            return ExecPlan::Direct {
-                force_cwd: Some(app_dir.to_path_buf()),
-            };
-        }
-    }
-
-    // Unpatched binary with an absolute PT_INTERP. If a bundled loader
-    // matches the basename, invoke it explicitly; the target won't get
-    // the right /proc/self/exe but it'll at least run.
-    if let Some(bundled) = find_bundled_interp(&interp, app_dir) {
-        let is_musl = interp_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("ld-musl-"));
-        return ExecPlan::ViaBundledLd { bundled, is_musl };
-    }
-
-    if !interp_path.exists() {
-        eprintln!(
-            "warning: ELF interpreter {} not found on host and no bundled \
-             equivalent in the AppDir; exec will likely fail",
-            interp
-        );
-    }
-    ExecPlan::Bare
-}
-
 fn build_exec_command(
     target: &Path,
     app_dir: &Path,
     lib_path: &str,
     argv0: &str,
-) -> io::Result<(Command, Option<PathBuf>)> {
-    match plan_exec(target, app_dir) {
-        ExecPlan::Direct { force_cwd } => {
-            let mut cmd = Command::new(target);
-            cmd.arg0(argv0);
-            Ok((cmd, force_cwd))
-        }
-        ExecPlan::ViaBundledLd { bundled, is_musl } => {
+) -> io::Result<Command> {
+    if let Some(interp) = read_elf_interp(target) {
+        let interp_path = Path::new(&interp);
+
+        if let Some(bundled) = find_bundled_interp(&interp, app_dir) {
+            let is_musl = interp_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ld-musl-"));
             let mut cmd = Command::new(&bundled);
             if !is_musl {
                 cmd.arg("--inhibit-cache");
@@ -404,45 +353,21 @@ fn build_exec_command(
                 cmd.arg("--library-path").arg(lib_path);
             }
             cmd.arg("--argv0").arg(argv0).arg(target);
-            Ok((cmd, None))
+            return Ok(cmd);
         }
-        ExecPlan::Bare => {
-            // Non-ELF target (shell wrapper, python script, etc). If
-            // the AppDir has a patched bundled loader, any ELF the
-            // target execs will have a relative PT_INTERP that only
-            // resolves when CWD is the AppDir root. Force it.
-            let force_cwd = if has_bundled_loader(app_dir) {
-                Some(app_dir.to_path_buf())
-            } else {
-                None
-            };
-            let mut cmd = Command::new(target);
-            cmd.arg0(argv0);
-            Ok((cmd, force_cwd))
-        }
-    }
-}
 
-/// True if any lib subdir of `app_dir` holds a file that looks like a
-/// dynamic loader (ld-linux-*, ld-musl-*). Signals that bundle-libs has
-/// patched PT_INTERP of bundled ELFs to a relative path.
-fn has_bundled_loader(app_dir: &Path) -> bool {
-    for rel in detect_lib_dirs(app_dir) {
-        let d = app_dir.join(&rel);
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.starts_with("ld-linux") || name.starts_with("ld-musl-") {
-                return true;
-            }
+        if !interp_path.exists() {
+            eprintln!(
+                "warning: ELF interpreter {} not found on host and no bundled \
+                 equivalent in the AppDir; exec will likely fail",
+                interp
+            );
         }
     }
-    false
+
+    let mut cmd = Command::new(target);
+    cmd.arg0(argv0);
+    Ok(cmd)
 }
 
 /// Read PT_INTERP from an ELF file. Returns None for non-ELF or missing interp.
