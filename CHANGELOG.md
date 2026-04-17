@@ -1,4 +1,15 @@
 
+## [0.2.4](https://github.com/QaidVoid/onelf/compare/0.2.3...0.2.4) - 2026-04-17
+
+### ⛰️  Features
+
+- *(recipe)* Add [env] section for custom environment variables - ([5156b29](https://github.com/QaidVoid/onelf/commit/5156b299a5ad1f65a869b295fa3427ee3fb987dc))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Reorder bootstrap PT_LOAD to end of phdr table - ([8a26af8](https://github.com/QaidVoid/onelf/commit/8a26af8e3e751ddb1ed32d786a6565b48e7b1a4f))
+- *(recipe)* Preserve unset env vars for runtime expansion - ([ba2045d](https://github.com/QaidVoid/onelf/commit/ba2045d66ae6bfd945ecb7abb46ad9e0993adc94))
+
 ## [0.2.3](https://github.com/QaidVoid/onelf/compare/0.2.2...0.2.3) - 2026-04-17
 
 ### ⛰️  Features
