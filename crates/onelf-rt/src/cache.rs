@@ -118,11 +118,59 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
     // Extract files to CAS and build hardlink farm
     extract_to_cas(pkg, &cas_dir, &pkg_dir)?;
 
+    // Bundle-libs patches PT_INTERP to a relative path like
+    // `lib/ld-linux-x86-64.so.2`. That resolves against the process
+    // CWD at kernel exec time, which is fine for the entrypoint we
+    // launch (the runtime chdirs to pkg_dir first) but breaks for
+    // bundled ELFs that get fork+exec'd from some other CWD -
+    // postgres spawning helpers from PGDATA, podman spawning
+    // fuse-overlayfs from a container storage path, etc.
+    //
+    // In cache mode we know the absolute path the files live at, so
+    // rewrite every bundled ELF's PT_INTERP to that absolute path.
+    // The rewriter detaches hardlinks before writing so the CAS
+    // entry stays pristine and other packages that share the same
+    // hash are unaffected.
+    rewrite_interps_absolute(&pkg_dir);
+
     // Record metadata
     touch_meta(&meta_dir, &package_id);
 
     // Lock released when lock_file goes out of scope
     Ok(pkg_dir)
+}
+
+/// Walk `pkg_dir` and rewrite every relative PT_INTERP to an
+/// absolute path rooted at `pkg_dir`. Best-effort: failures on
+/// individual files are logged to stderr but don't abort extraction.
+fn rewrite_interps_absolute(pkg_dir: &Path) {
+    walk_files(pkg_dir, &mut |path| {
+        match crate::interp::rewrite_interp_absolute(path, pkg_dir) {
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "onelf-rt: warning: failed to rewrite PT_INTERP of {}: {e}",
+                path.display()
+            ),
+        }
+    });
+}
+
+fn walk_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            walk_files(&path, f);
+        } else if meta.is_file() {
+            f(&path);
+        }
+    }
 }
 
 fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::Result<()> {

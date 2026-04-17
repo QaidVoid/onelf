@@ -1365,25 +1365,25 @@ fn set_origin_runpath(path: &Path) -> io::Result<()> {
             if file_pos >= modified.len() {
                 continue;
             }
-            // Measure the writable slot size. Two cases:
-            //   (a) slot currently has content ending at a NUL: size =
-            //       string length + 1 (we can also overwrite the NUL).
-            //   (b) slot was zeroed by an older strip pass: size is the
-            //       run of consecutive NULs up to the next non-NUL, i.e.
-            //       the original string length + its NUL terminator.
-            let slot_size: usize = if modified[file_pos] == 0 {
-                let mut n = 0;
-                while file_pos + n < modified.len() && modified[file_pos + n] == 0 {
-                    n += 1;
-                }
-                n
-            } else {
-                let mut n = 0;
-                while file_pos + n < modified.len() && modified[file_pos + n] != 0 {
-                    n += 1;
-                }
-                n + 1
-            };
+            // Measure the writable slot size: the current string plus
+            // any trailing NUL padding that follows it, up to the next
+            // non-NUL byte. That covers three cases:
+            //   (a) fresh ELF: the slot is exactly string + NUL.
+            //   (b) an older onelf pass already zeroed the string: no
+            //       leading content, just a run of NULs.
+            //   (c) an older onelf pass wrote a *shorter* replacement
+            //       (e.g. `$ORIGIN/../lib`): leading string, then a
+            //       NUL run up to where the next .dynstr entry starts.
+            //   We need (c) to grow the slot back beyond our earlier
+            //   shorter write so a longer replacement still fits.
+            let mut end = file_pos;
+            while end < modified.len() && modified[end] != 0 {
+                end += 1;
+            }
+            while end < modified.len() && modified[end] == 0 {
+                end += 1;
+            }
+            let slot_size = end - file_pos;
             if NEW.len() + 1 > slot_size {
                 // Not enough room to fit NEW plus a NUL terminator. The
                 // caller will still fall back to LD_LIBRARY_PATH for ELF
