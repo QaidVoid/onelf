@@ -224,9 +224,12 @@ const STANDARD_LIB_PATHS: &[&str] = &[
     "/usr/lib",
     "/usr/lib64",
     "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib/arm-linux-gnueabihf",
     "/lib",
     "/lib64",
     "/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
 ];
 
 pub struct BundleOptions {
@@ -2159,12 +2162,16 @@ const DRI_SEARCH_PATHS: &[&str] = &[
     "/usr/lib/dri",
     "/usr/lib64/dri",
     "/usr/lib/x86_64-linux-gnu/dri",
+    "/usr/lib/aarch64-linux-gnu/dri",
+    "/usr/lib/arm-linux-gnueabihf/dri",
 ];
 
 const GBM_SEARCH_PATHS: &[&str] = &[
     "/usr/lib/gbm",
     "/usr/lib64/gbm",
     "/usr/lib/x86_64-linux-gnu/gbm",
+    "/usr/lib/aarch64-linux-gnu/gbm",
+    "/usr/lib/arm-linux-gnueabihf/gbm",
 ];
 
 const EGL_SEARCH_PATHS: &[&str] = &["/usr/share/glvnd/egl_vendor.d"];
