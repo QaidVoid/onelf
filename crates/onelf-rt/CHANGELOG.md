@@ -1,4 +1,12 @@
 
+## [0.2.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.0...onelf-rt-v0.2.1) - 2026-04-17
+
+### ⛰️  Features
+
+- *(env)* Auto-set XKB_CONFIG_ROOT when share/X11/xkb is bundled - ([7f1bfee](https://github.com/QaidVoid/onelf/commit/7f1bfee2deaaa0b654b54c9219e0a425cb41c58f))
+- *(rt)* Add ONELF_FUSE_NO_NAMESPACE env var - ([efa86a4](https://github.com/QaidVoid/onelf/commit/efa86a45ca2ef611f182c465650fe0f8254d74f7))
+- *(rt)* Rewrite PT_INTERP to absolute path at cache extraction - ([6c52e10](https://github.com/QaidVoid/onelf/commit/6c52e10e96cdbc589e9b2bba29c8f2beffa0c1df))
+
 ## [0.2.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.1.2...onelf-rt-v0.2.0) - 2026-04-16
 
 ### ⛰️  Features

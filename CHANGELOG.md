@@ -1,4 +1,17 @@
 
+## [0.2.1](https://github.com/QaidVoid/onelf/compare/0.2.0...0.2.1) - 2026-04-17
+
+### ⛰️  Features
+
+- *(env)* Auto-set XKB_CONFIG_ROOT when share/X11/xkb is bundled - ([7f1bfee](https://github.com/QaidVoid/onelf/commit/7f1bfee2deaaa0b654b54c9219e0a425cb41c58f))
+- *(recipe)* Expand ${VAR} env vars across all recipe fields - ([5438870](https://github.com/QaidVoid/onelf/commit/54388706dbaec4be0c6dd9434dd202cbfba6801a))
+- *(rt)* Rewrite PT_INTERP to absolute path at cache extraction - ([6c52e10](https://github.com/QaidVoid/onelf/commit/6c52e10e96cdbc589e9b2bba29c8f2beffa0c1df))
+- *(rt)* Add ONELF_FUSE_NO_NAMESPACE env var - ([efa86a4](https://github.com/QaidVoid/onelf/commit/efa86a45ca2ef611f182c465650fe0f8254d74f7))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Strip absolute DT_NEEDED paths and extend RUNPATH depth - ([46a6ead](https://github.com/QaidVoid/onelf/commit/46a6ead505ccf266cbe0a8cf21f94620634bd226))
+
 ## [0.2.0](https://github.com/QaidVoid/onelf/compare/0.1.2...0.2.0) - 2026-04-16
 
 ### ⛰️  Features
