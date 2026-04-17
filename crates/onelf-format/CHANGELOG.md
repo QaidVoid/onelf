@@ -1,4 +1,10 @@
 
+## [0.2.4] - 2026-04-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Release v0.2.3 ([#11](https://github.com/QaidVoid/onelf/pull/11)) - ([ae96716](https://github.com/QaidVoid/onelf/commit/ae96716a07f6568606dcfb94c245e4c211d20590))
+
 
 
 
