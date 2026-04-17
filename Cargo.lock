@@ -568,7 +568,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onelf"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "blake3",
  "clap",
@@ -585,11 +585,11 @@ dependencies = [
 
 [[package]]
 name = "onelf-format"
-version = "0.2.2"
+version = "0.2.3"
 
 [[package]]
 name = "onelf-preload"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "libc",
  "userland-execve",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "onelf-rt"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "onelf-format",
  "rustix",
