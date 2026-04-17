@@ -1701,7 +1701,11 @@ fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
     let blob_len = blob.len() as u64;
     modified.extend_from_slice(&blob);
 
-    // Overwrite PT_INTERP phdr -> PT_LOAD
+    // Overwrite PT_INTERP phdr -> PT_LOAD, then swap it to the end of
+    // the phdr table. The bootstrap has the highest vaddr and the kernel
+    // uses the FIRST PT_LOAD to compute the ASLR base. If our high-vaddr
+    // segment is first, the base is too high and original segments at
+    // lower vaddrs fall outside the reserved region.
     let phdr_off = e_phoff + phdr_idx * e_phentsize;
     modified[phdr_off..phdr_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
     modified[phdr_off + 4..phdr_off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
@@ -1711,6 +1715,16 @@ fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
     modified[phdr_off + 32..phdr_off + 40].copy_from_slice(&blob_len.to_le_bytes());
     modified[phdr_off + 40..phdr_off + 48].copy_from_slice(&blob_len.to_le_bytes());
     modified[phdr_off + 48..phdr_off + 56].copy_from_slice(&page_size.to_le_bytes());
+
+    // Swap our phdr entry with the last one so original PT_LOADs come first.
+    let e_phnum = u16::from_le_bytes(modified[56..58].try_into().unwrap()) as usize;
+    let last_phdr_off = e_phoff + (e_phnum - 1) * e_phentsize;
+    if phdr_off != last_phdr_off {
+        let mut tmp = vec![0u8; e_phentsize];
+        tmp.copy_from_slice(&modified[phdr_off..phdr_off + e_phentsize]);
+        modified.copy_within(last_phdr_off..last_phdr_off + e_phentsize, phdr_off);
+        modified[last_phdr_off..last_phdr_off + e_phentsize].copy_from_slice(&tmp);
+    }
 
     // Rewrite e_entry
     modified[24..32].copy_from_slice(&new_vaddr.to_le_bytes());
