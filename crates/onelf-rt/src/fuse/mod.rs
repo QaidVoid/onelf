@@ -251,7 +251,27 @@ pub fn execute_fuse(
     // Prefer the namespace-based mount. No external helper, private to us,
     // tears down automatically on exit. Fall back to fusermount3 if the
     // kernel disallows unprivileged user namespaces (e.g. restricted distros).
-    let (fuse_fd, used_namespace) = match mount::fuse_mount_unshare(&mountpoint) {
+    //
+    // Setting `ONELF_FUSE_NO_NAMESPACE=1` forces the fusermount3 path,
+    // which is needed for packages that expect to stay in the host's
+    // user namespace. The specific use case is rootless podman /
+    // distrobox: they rely on setuid `newuidmap` / `newgidmap` to
+    // build their own nested user namespace, and setuid bits do not
+    // survive a CLONE_NEWUSER unshare. Staying in the host userns
+    // keeps those helpers working.
+    let skip_namespace = std::env::var_os("ONELF_FUSE_NO_NAMESPACE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+
+    let ns_result = if skip_namespace {
+        Err(std::io::Error::other(
+            "ONELF_FUSE_NO_NAMESPACE set; using fusermount3",
+        ))
+    } else {
+        mount::fuse_mount_unshare(&mountpoint)
+    };
+
+    let (fuse_fd, used_namespace) = match ns_result {
         Ok(fd) => (fd, true),
         Err(ns_err) => {
             if !mount::fusermount3_available() {
