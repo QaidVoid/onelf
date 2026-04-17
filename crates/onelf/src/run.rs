@@ -24,7 +24,7 @@ fn bundle_from_recipe(dir: &Path, r: &recipe::Recipe) -> io::Result<()> {
         .bundle
         .search_paths
         .iter()
-        .map(|s| PathBuf::from(recipe::expand_env(s)))
+        .map(|s| PathBuf::from(s.as_str()))
         .collect();
     bundle::bundle_libs(&bundle::BundleOptions {
         directory: dir.to_path_buf(),

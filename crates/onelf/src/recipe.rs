@@ -155,10 +155,20 @@ pub struct Bundle {
     pub skip: bool,
 }
 
-/// Load a recipe from a file path. Returns an io::Error with a descriptive
-/// message on failure (parse errors are converted via `InvalidData`).
+/// Load a recipe from a file path. `${VAR}` references anywhere in
+/// the TOML text are expanded from environment variables before
+/// parsing, so any field can use them:
+///
+/// ```toml
+/// [package]
+/// version = "${PKG_VERSION}"
+/// ```
+///
+/// Missing variables expand to an empty string (matches shell
+/// default). Returns an io::Error with a descriptive message on
+/// failure (parse errors are converted via `InvalidData`).
 pub fn load(path: &Path) -> std::io::Result<Recipe> {
-    let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    let raw = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::InvalidData => std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -168,6 +178,7 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
         ),
         _ => std::io::Error::new(e.kind(), format!("{}: {e}", path.display())),
     })?;
+    let text = expand_env(&raw);
     toml::from_str(&text).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
