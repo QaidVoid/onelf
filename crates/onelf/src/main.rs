@@ -1,5 +1,6 @@
 mod bundle;
 mod cache;
+mod payload;
 mod compress;
 mod extract;
 mod info;

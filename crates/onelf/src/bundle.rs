@@ -513,15 +513,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     rewritten
                 );
             }
-            match patch_interps_to_bundled(&opts.directory, &lib_dest) {
+            match inject_bootstraps(&opts.directory, &lib_dest) {
                 Ok(n) if n > 0 => eprintln!(
-                    "{} PT_INTERP of {} binaries",
-                    color::bold("Patched"),
+                    "{} AT_EXECFN bootstrap into {} binaries",
+                    color::bold("Injected"),
                     n
                 ),
                 Ok(_) => {}
                 Err(e) => eprintln!(
-                    "{} PT_INTERP patching failed: {e}",
+                    "{} bootstrap injection failed: {e}",
                     color::bold_red("warning:"),
                 ),
             }
@@ -878,15 +878,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // loader all read /proc/self/exe). The runtime and `onelf run` chdir
     // into the AppDir before exec so the relative path resolves.
     if !opts.dry_run {
-        match patch_interps_to_bundled(&opts.directory, &lib_dest) {
+        match inject_bootstraps(&opts.directory, &lib_dest) {
             Ok(n) if n > 0 => eprintln!(
-                "{} PT_INTERP of {} binaries",
-                color::bold("Patched"),
+                "{} AT_EXECFN bootstrap into {} binaries",
+                color::bold("Injected"),
                 n
             ),
             Ok(_) => {}
             Err(e) => eprintln!(
-                "{} PT_INTERP patching failed: {e}",
+                "{} bootstrap injection failed: {e}",
                 color::bold_red("warning:"),
             ),
         }
@@ -1610,178 +1610,125 @@ fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Rewrite PT_INTERP of an ELF in place.
+/// Inject the AT_EXECFN bootstrap into a single ELF binary.
 ///
-/// Fast path: if the new string fits in the existing slot
-/// (`p_offset..p_offset+p_filesz`), overwrite and null-pad.
-/// Slow path: append the new string to the end of the file and
-/// rewrite the PT_INTERP program header's `p_offset`, `p_filesz`,
-/// and `p_memsz` to point at it. Kernel reads PT_INTERP directly
-/// from the file (no PT_LOAD coverage required) so appending bytes
-/// past the last segment is safe.
+/// Repurposes PT_INTERP as PT_LOAD containing the bootstrap payload +
+/// metadata. At runtime the bootstrap reads AT_EXECFN from the aux
+/// vector, computes the interpreter path relative to the binary's own
+/// location (not CWD), mmaps the interpreter, and jumps to its entry.
 ///
-/// Returns `Ok(true)` if we rewrote, `Ok(false)` if the file has no
-/// PT_INTERP or the new value already matches.
-fn patch_interp(path: &Path, new_interp: &str) -> io::Result<bool> {
+/// Returns Ok(true) if injected, Ok(false) if the binary has no
+/// PT_INTERP (static, shared lib, or already injected).
+fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
+    use crate::payload;
+    use goblin::elf::program_header::PT_INTERP;
+
     let data = fs::read(path)?;
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let phdr_idx = elf
+    if elf.header.e_ident[4] != 2 || elf.header.e_ident[5] != 1 {
+        return Ok(false); // 64-bit little-endian only
+    }
+    let is_x86_64 = elf.header.e_machine == goblin::elf::header::EM_X86_64;
+    let is_aarch64 = elf.header.e_machine == goblin::elf::header::EM_AARCH64;
+    if !is_x86_64 && !is_aarch64 {
+        return Ok(false);
+    }
+
+    let phdr_idx = match elf
         .program_headers
         .iter()
-        .position(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
-    let Some(phdr_idx) = phdr_idx else {
-        return Ok(false);
+        .position(|p| p.p_type == PT_INTERP)
+    {
+        Some(i) => i,
+        None => return Ok(false),
     };
-    let ph = &elf.program_headers[phdr_idx];
 
-    let offset = ph.p_offset as usize;
-    let slot = ph.p_filesz as usize;
-    if offset + slot > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PT_INTERP offset out of file bounds",
-        ));
-    }
+    let highest_vend: u64 = elf
+        .program_headers
+        .iter()
+        .filter(|p| p.p_type == goblin::elf::program_header::PT_LOAD)
+        .map(|p| p.p_vaddr + p.p_memsz)
+        .max()
+        .unwrap_or(0);
 
-    let new_bytes = new_interp.as_bytes();
-
-    // Short-circuit if the slot already holds the desired string.
-    let existing = &data[offset..offset + slot];
-    let existing_str = match existing.iter().position(|&b| b == 0) {
-        Some(n) => &existing[..n],
-        None => existing,
-    };
-    if existing_str == new_bytes {
-        return Ok(false);
-    }
-
-    let header = elf.header;
+    let page_size: u64 = 4096;
+    let new_vaddr = (highest_vend + page_size - 1) & !(page_size - 1);
+    let orig_entry = elf.header.e_entry;
+    let e_phoff = elf.header.e_phoff as usize;
+    let e_phentsize = elf.header.e_phentsize as usize;
     drop(elf);
 
-    if new_bytes.len() + 1 <= slot {
-        // Fast path: overwrite in place and shrink p_filesz / p_memsz to
-        // match the actual string. If we don't, tools that read
-        // p_filesz bytes (including goblin and readelf) will see the
-        // trailing NULs as part of the string.
-        let mut modified = data;
-        modified[offset..offset + new_bytes.len()].copy_from_slice(new_bytes);
-        for b in &mut modified[offset + new_bytes.len()..offset + slot] {
-            *b = 0;
-        }
-        rewrite_interp_phdr(
-            &mut modified,
-            &header,
-            phdr_idx,
-            offset as u64,
-            (new_bytes.len() + 1) as u64,
-        )?;
-        fs::write(path, &modified)?;
-        return Ok(true);
+    let code = if is_x86_64 {
+        payload::BOOTSTRAP_X86_64
+    } else {
+        payload::BOOTSTRAP_AARCH64
+    };
+    let rel_bytes = rel_interp.as_bytes();
+
+    // Build: [code] [padding to 8-byte align] [orig_entry u64] [path_len u16] [path NUL]
+    let mut blob = Vec::with_capacity(code.len() + 64);
+    blob.extend_from_slice(code);
+    while blob.len() % 8 != 0 {
+        blob.push(0);
+    }
+    let metadata_offset = blob.len();
+    let entry_delta = (orig_entry as i64) - (new_vaddr as i64);
+    blob.extend_from_slice(&entry_delta.to_le_bytes());
+    blob.extend_from_slice(&(rel_bytes.len() as u16).to_le_bytes());
+    blob.extend_from_slice(rel_bytes);
+    blob.push(0);
+
+    // Patch the trampoline's metadata-pointer instruction.
+    if is_x86_64 {
+        let disp = (metadata_offset as i32) - (payload::X86_64_METADATA_LEA_RIP as i32);
+        blob[payload::X86_64_METADATA_LEA_DISP_OFFSET
+            ..payload::X86_64_METADATA_LEA_DISP_OFFSET + 4]
+            .copy_from_slice(&disp.to_le_bytes());
+    } else {
+        payload::patch_aarch64_adr(&mut blob, metadata_offset);
     }
 
-    // Slow path: append the new interp to the end of the file and
-    // rewrite the PT_INTERP phdr to point at it.
-    patch_interp_expand(path, data, &header, phdr_idx, new_bytes)?;
+    let mut modified = data;
+    // Pad to page alignment so p_offset % p_align == p_vaddr % p_align.
+    // The kernel rejects PT_LOAD segments where this doesn't hold.
+    let page = page_size as usize;
+    while modified.len() % page != 0 {
+        modified.push(0);
+    }
+    let file_offset = modified.len() as u64;
+    let blob_len = blob.len() as u64;
+    modified.extend_from_slice(&blob);
+
+    // Overwrite PT_INTERP phdr -> PT_LOAD
+    let phdr_off = e_phoff + phdr_idx * e_phentsize;
+    modified[phdr_off..phdr_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    modified[phdr_off + 4..phdr_off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+    modified[phdr_off + 8..phdr_off + 16].copy_from_slice(&file_offset.to_le_bytes());
+    modified[phdr_off + 16..phdr_off + 24].copy_from_slice(&new_vaddr.to_le_bytes());
+    modified[phdr_off + 24..phdr_off + 32].copy_from_slice(&new_vaddr.to_le_bytes());
+    modified[phdr_off + 32..phdr_off + 40].copy_from_slice(&blob_len.to_le_bytes());
+    modified[phdr_off + 40..phdr_off + 48].copy_from_slice(&blob_len.to_le_bytes());
+    modified[phdr_off + 48..phdr_off + 56].copy_from_slice(&page_size.to_le_bytes());
+
+    // Rewrite e_entry
+    modified[24..32].copy_from_slice(&new_vaddr.to_le_bytes());
+
+    fs::write(path, &modified)?;
     Ok(true)
 }
 
-/// Write `p_offset` and matching `p_filesz`/`p_memsz` back into the
-/// PT_INTERP program header entry. The caller is responsible for
-/// ensuring the string bytes (and terminating NUL) are already in the
-/// file at the given offset.
-fn rewrite_interp_phdr(
-    data: &mut [u8],
-    header: &goblin::elf::Header,
-    phdr_idx: usize,
-    new_offset: u64,
-    new_size: u64,
-) -> io::Result<()> {
-    use goblin::elf::header;
-
-    let is_64 = header.e_ident[header::EI_CLASS] == header::ELFCLASS64;
-    if header.e_ident[header::EI_DATA] != header::ELFDATA2LSB {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "big-endian ELF PT_INTERP rewrite not implemented",
-        ));
-    }
-
-    let e_phoff = header.e_phoff as usize;
-    let e_phentsize = header.e_phentsize as usize;
-    let phdr_off = e_phoff + phdr_idx * e_phentsize;
-    if phdr_off + e_phentsize > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "program header table out of bounds",
-        ));
-    }
-
-    if is_64 {
-        let off_p_offset = phdr_off + 8;
-        let off_p_filesz = phdr_off + 32;
-        let off_p_memsz = phdr_off + 40;
-        data[off_p_offset..off_p_offset + 8].copy_from_slice(&new_offset.to_le_bytes());
-        data[off_p_filesz..off_p_filesz + 8].copy_from_slice(&new_size.to_le_bytes());
-        data[off_p_memsz..off_p_memsz + 8].copy_from_slice(&new_size.to_le_bytes());
-    } else {
-        let off_p_offset = phdr_off + 4;
-        let off_p_filesz = phdr_off + 16;
-        let off_p_memsz = phdr_off + 20;
-        let new_offset_u32: u32 = new_offset
-            .try_into()
-            .map_err(|_| io::Error::other("PT_INTERP offset does not fit in 32 bits"))?;
-        let new_size_u32: u32 = new_size
-            .try_into()
-            .map_err(|_| io::Error::other("PT_INTERP size does not fit in 32 bits"))?;
-        data[off_p_offset..off_p_offset + 4].copy_from_slice(&new_offset_u32.to_le_bytes());
-        data[off_p_filesz..off_p_filesz + 4].copy_from_slice(&new_size_u32.to_le_bytes());
-        data[off_p_memsz..off_p_memsz + 4].copy_from_slice(&new_size_u32.to_le_bytes());
-    }
-    Ok(())
-}
-
-/// Append `new_bytes` + NUL to the file and rewrite PT_INTERP's phdr
-/// entry so `p_offset` points at the new location and `p_filesz` /
-/// `p_memsz` cover the new length. Kernel reads PT_INTERP by file
-/// offset, so the string does not need to live inside any PT_LOAD.
-fn patch_interp_expand(
-    path: &Path,
-    data: Vec<u8>,
-    header: &goblin::elf::Header,
-    phdr_idx: usize,
-    new_bytes: &[u8],
-) -> io::Result<()> {
-    let mut modified = data;
-    let new_offset = modified.len() as u64;
-    modified.extend_from_slice(new_bytes);
-    modified.push(0);
-
-    rewrite_interp_phdr(
-        &mut modified,
-        header,
-        phdr_idx,
-        new_offset,
-        (new_bytes.len() + 1) as u64,
-    )?;
-    fs::write(path, &modified)?;
-    Ok(())
-}
-
-/// Walk every ELF under `app_dir` and rewrite PT_INTERP to a path
-/// relative to `app_dir` that resolves to the bundled loader copy.
-///
-/// Requires the caller (runtime / `onelf run`) to chdir into `app_dir`
-/// before execing the target so the kernel resolves the relative
-/// PT_INTERP correctly. Returns the count of patched files.
-fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
+/// Walk every ELF under `app_dir` and inject the AT_EXECFN bootstrap
+/// so the bundled interpreter is found relative to each binary's own
+/// location. CWD-independent. Returns the count of injected files.
+fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
     let rel_lib = lib_dest
         .strip_prefix(app_dir)
         .unwrap_or(lib_dest)
         .to_path_buf();
 
-    let mut patched = 0usize;
+    let mut injected = 0usize;
     for path in find_elf_files(app_dir) {
         let Some(interp) = parse_interp(&path) else {
             continue;
@@ -1789,26 +1736,33 @@ fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize
         let Some(basename) = Path::new(&interp).file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // Only patch when we actually have a bundled replacement.
         let bundled = lib_dest.join(basename);
         if !bundled.exists() {
             continue;
         }
-
-        // The runtime and `onelf run` always chdir to the AppDir root
-        // before exec (so a single relative PT_INTERP works for every
-        // binary regardless of subdirectory). Build the path as it
-        // resolves from that CWD: `lib/<basename>`.
-        if path.strip_prefix(app_dir).is_err() {
+        // Skip everything in lib/ (shared libs, the ld, libc, etc).
+        // Only inject into application binaries outside the lib dir.
+        if path.starts_with(lib_dest) {
             continue;
         }
-        let new_interp = rel_lib
-            .join(basename)
-            .to_string_lossy()
-            .into_owned();
 
-        // ELF files may be read-only (e.g. copied with `fs::copy` from
-        // a read-only source). Make writable before patching, restore after.
+        // Compute relative path from binary's dir to the bundled loader.
+        let rel_bin = match path.strip_prefix(app_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let depth = rel_bin
+            .parent()
+            .map(|p| p.components().count())
+            .unwrap_or(0);
+        let mut rel = PathBuf::new();
+        for _ in 0..depth {
+            rel.push("..");
+        }
+        rel.push(&rel_lib);
+        rel.push(basename);
+        let rel_interp = rel.to_string_lossy().into_owned();
+
         let perms = fs::metadata(&path)
             .map(|m| m.permissions().mode())
             .unwrap_or(0o755);
@@ -1819,12 +1773,12 @@ fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize
                 std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
             );
         }
-        match patch_interp(&path, &new_interp) {
-            Ok(true) => patched += 1,
+        match inject_relative_interp(&path, &rel_interp) {
+            Ok(true) => injected += 1,
             Ok(false) => {}
             Err(e) => {
                 eprintln!(
-                    "  {} could not patch PT_INTERP of {}: {e}",
+                    "  {} could not inject bootstrap into {}: {e}",
                     color::bold_red("warning:"),
                     path.display()
                 );
@@ -1835,7 +1789,7 @@ fn patch_interps_to_bundled(app_dir: &Path, lib_dest: &Path) -> io::Result<usize
                 fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
         }
     }
-    Ok(patched)
+    Ok(injected)
 }
 
 fn find_existing_libs(dir: &Path) -> HashSet<String> {

@@ -1,1 +1,2 @@
 /target
+crates/onelf/src/payload/*.o
