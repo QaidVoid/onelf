@@ -219,7 +219,8 @@ pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Expand `${VAR}` references in a string from the environment.
-/// Missing vars become empty (matches shell's default behavior).
+/// Variables not set in the environment are preserved as-is (e.g.
+/// `${ONELF_DIR}` stays literal so the runtime can expand it later).
 pub fn expand_env(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -228,8 +229,12 @@ pub fn expand_env(s: &str) -> String {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}') {
                 let name = std::str::from_utf8(&bytes[i + 2..i + 2 + end]).unwrap_or("");
-                if let Ok(val) = std::env::var(name) {
-                    out.push_str(&val);
+                match std::env::var(name) {
+                    Ok(val) => out.push_str(&val),
+                    Err(_) => {
+                        // Preserve unset variables for runtime expansion
+                        out.push_str(&s[i..i + 3 + end]);
+                    }
                 }
                 i += 3 + end;
                 continue;
