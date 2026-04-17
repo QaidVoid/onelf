@@ -1,4 +1,10 @@
 
+## [0.2.4](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.3...onelf-rt-v0.2.4) - 2026-04-17
+
+### ⛰️  Features
+
+- *(recipe)* Add [env] section for custom environment variables - ([5156b29](https://github.com/QaidVoid/onelf/commit/5156b299a5ad1f65a869b295fa3427ee3fb987dc))
+
 ## [0.2.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.2...onelf-rt-v0.2.3) - 2026-04-17
 
 ### 🐛 Bug Fixes
