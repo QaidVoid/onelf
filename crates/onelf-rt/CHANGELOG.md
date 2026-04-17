@@ -1,4 +1,14 @@
 
+## [0.2.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.2...onelf-rt-v0.2.3) - 2026-04-17
+
+### 🐛 Bug Fixes
+
+- *(fuse)* Detect and clean up stale FUSE mounts - ([bd01211](https://github.com/QaidVoid/onelf/commit/bd01211c6f1f5f9377bda463292fe9399f6bb47f))
+
+### 🚜 Refactor
+
+- *(rt)* Remove force_cwd and cache-mode PT_INTERP rewrite - ([9314016](https://github.com/QaidVoid/onelf/commit/9314016d60d0517165da3dc4f0213bc18503f92a))
+
 ## [0.2.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.1...onelf-rt-v0.2.2) - 2026-04-17
 
 ### 🐛 Bug Fixes
