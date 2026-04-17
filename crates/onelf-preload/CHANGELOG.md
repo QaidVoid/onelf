@@ -1,4 +1,10 @@
 
+## [0.2.3] - 2026-04-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Release v0.2.2 ([#9](https://github.com/QaidVoid/onelf/pull/9)) - ([fe885e0](https://github.com/QaidVoid/onelf/commit/fe885e0ae54041550230dbd4f13cdbabbf49ae36))
+
 
 
 ## [0.2.1](https://github.com/QaidVoid/onelf/compare/onelf-preload-v0.2.0...onelf-preload-v0.2.1) - 2026-04-17
