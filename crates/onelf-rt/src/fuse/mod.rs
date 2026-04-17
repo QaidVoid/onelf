@@ -237,15 +237,19 @@ pub fn execute_fuse(
     // If already mounted by another instance, reuse it — just exec directly.
     // (Only reachable via the fusermount3 path; namespace mounts are private.)
     if is_mountpoint(&mountpoint) {
-        return exec_from_mount(
-            pkg,
-            ep_idx,
-            argv0,
-            exec_path,
-            args,
-            interp_data,
-            &mountpoint,
-        );
+        if mountpoint.read_dir().is_ok() {
+            return exec_from_mount(
+                pkg,
+                ep_idx,
+                argv0,
+                exec_path,
+                args,
+                interp_data,
+                &mountpoint,
+            );
+        }
+        // Dead mount (FUSE daemon exited). Clean up and proceed with fresh mount.
+        mount::fuse_unmount(&mountpoint);
     }
 
     // Prefer the namespace-based mount. No external helper, private to us,

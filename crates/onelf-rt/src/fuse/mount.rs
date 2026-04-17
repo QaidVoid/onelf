@@ -203,9 +203,10 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
 }
 
 /// Unmount a FUSE filesystem via fusermount3 -u.
+/// Uses lazy unmount (-z) to handle dead mounts where the FUSE daemon exited.
 pub fn fuse_unmount(mountpoint: &Path) {
     let _ = Command::new("fusermount3")
-        .args(["-u", "-q", "--"])
+        .args(["-u", "-z", "-q", "--"])
         .arg(mountpoint)
         .status();
 }
