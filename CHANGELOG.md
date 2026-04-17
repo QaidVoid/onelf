@@ -1,4 +1,12 @@
 
+## [0.2.2](https://github.com/QaidVoid/onelf/compare/0.2.1...0.2.2) - 2026-04-17
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Add aarch64 and armhf multiarch paths to lib search - ([4f8178e](https://github.com/QaidVoid/onelf/commit/4f8178e1498c1cc3d74f1c854ade6b2061644dfa))
+- *(env)* Merge host EGL vendor dirs alongside bundled ones - ([2ef5bea](https://github.com/QaidVoid/onelf/commit/2ef5beac72b3033d61b73476cd1fe1c7d8008eb7))
+- *(env)* Merge host + bundled Vulkan ICD paths instead of replacing - ([79776d4](https://github.com/QaidVoid/onelf/commit/79776d47abbde8b590d8eb48f1361a05592e1d34))
+
 ## [0.2.1](https://github.com/QaidVoid/onelf/compare/0.2.0...0.2.1) - 2026-04-17
 
 ### ⛰️  Features
