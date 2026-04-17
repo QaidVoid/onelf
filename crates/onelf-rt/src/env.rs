@@ -176,20 +176,45 @@ pub fn setup_env(
         }
     }
 
-    // Auto-set VK_DRIVER_FILES if package has Vulkan ICD configs
-    if env::var("VK_DRIVER_FILES").is_err() {
+    // Vulkan ICD discovery: use VK_ADD_DRIVER_FILES to *append* our
+    // bundled ICD configs to the loader's default search. Setting
+    // VK_DRIVER_FILES would *replace* the search and cut off host GPU
+    // drivers (e.g. NVIDIA's ICD on NixOS at /run/opengl-driver/...).
+    // Also include well-known host ICD paths that the bundled loader
+    // can't find on its own (its compiled-in /etc and /usr paths are
+    // scrubbed).
+    if env::var("VK_DRIVER_FILES").is_err() && env::var("VK_ADD_DRIVER_FILES").is_err() {
+        let mut icd_dirs: Vec<String> = Vec::new();
+
         let vk_dir = pkg.join("share/vulkan/icd.d");
         if vk_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&vk_dir) {
-                let icd_files: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
-                    .map(|e| e.path().to_string_lossy().into_owned())
-                    .collect();
-                if !icd_files.is_empty() {
-                    unsafe {
-                        env::set_var("VK_DRIVER_FILES", icd_files.join(":"));
+            icd_dirs.push(vk_dir.to_string_lossy().into_owned());
+        }
+        // Host ICD locations that the scrubbed loader can't reach.
+        for d in &[
+            "/run/opengl-driver/share/vulkan/icd.d",
+            "/etc/vulkan/icd.d",
+            "/usr/share/vulkan/icd.d",
+        ] {
+            if Path::new(d).is_dir() {
+                icd_dirs.push((*d).to_string());
+            }
+        }
+
+        if !icd_dirs.is_empty() {
+            let mut all_files: Vec<String> = Vec::new();
+            for dir in &icd_dirs {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.filter_map(|e| e.ok()) {
+                        if e.path().extension().map_or(false, |ext| ext == "json") {
+                            all_files.push(e.path().to_string_lossy().into_owned());
+                        }
                     }
+                }
+            }
+            if !all_files.is_empty() {
+                unsafe {
+                    env::set_var("VK_DRIVER_FILES", all_files.join(":"));
                 }
             }
         }
