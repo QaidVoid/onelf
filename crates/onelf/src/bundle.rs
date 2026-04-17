@@ -495,6 +495,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     rewritten += 1;
                 }
                 let _ = scrub_nix_store_paths(&path);
+                let _ = strip_absolute_needed(&path);
                 if needs_chmod {
                     let _ = fs::set_permissions(
                         &path,
@@ -842,6 +843,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
             let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
             let _ = scrub_nix_store_paths(&path);
+            let _ = strip_absolute_needed(&path);
             let after = fs::metadata(&path).and_then(|m| m.modified()).ok();
             if before.is_some() && before != after {
                 scrubbed += 1;
@@ -1214,7 +1216,27 @@ fn parse_needed(path: &Path) -> io::Result<Vec<String>> {
     let data = fs::read(path)?;
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(elf.libraries.iter().map(|s| s.to_string()).collect())
+    // nixpkgs occasionally emits DT_NEEDED entries as absolute
+    // `/nix/store/<hash>/lib/libfoo.so` paths rather than plain
+    // sonames. Reduce those to their basename so our resolver can
+    // find the lib on the host / search paths. `strip_absolute_needed`
+    // rewrites the ELF's own DT_NEEDED string after bundling so the
+    // runtime loader also picks up the bundled copy via RUNPATH.
+    Ok(elf
+        .libraries
+        .iter()
+        .map(|s| {
+            if s.starts_with('/') {
+                Path::new(s)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(s)
+                    .to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .collect())
 }
 
 /// Parse PT_INTERP from an ELF binary, returning the interpreter path.
@@ -1308,7 +1330,11 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
 /// caller still sets `LD_LIBRARY_PATH` in the direct-ELF exec path as
 /// a fallback.
 fn set_origin_runpath(path: &Path) -> io::Result<()> {
-    const NEW: &[u8] = b"$ORIGIN/../lib";
+    // Cover binaries at depth 1 (e.g. bin/foo), 2 (libexec/podman/x),
+    // and 3 (share/pkg/helpers/y). Nonexistent entries are silently
+    // ignored by the dynamic loader, so this is safe to apply
+    // uniformly without knowing where each ELF sits.
+    const NEW: &[u8] = b"$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
     let data = fs::read(path)?;
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -1371,6 +1397,77 @@ fn set_origin_runpath(path: &Path) -> io::Result<()> {
             }
             changed = true;
         }
+    }
+
+    if changed {
+        fs::write(path, &modified)?;
+    }
+    Ok(())
+}
+
+/// Rewrite any absolute-path DT_NEEDED entry to just its basename. The
+/// pack host's nixpkgs stack sometimes emits a full
+/// `/nix/store/<hash>-name/lib/libfoo.so` as the DT_NEEDED string. The
+/// dynamic loader treats those literally and ignores `RUNPATH` /
+/// `LD_LIBRARY_PATH`, so a binary built with them will try to `open`
+/// that exact path on the user's machine and fail. Stripping to the
+/// basename puts the lookup back on the standard search path and
+/// picks up our bundled copy via `$ORIGIN/../lib`.
+///
+/// Operates in place: writes the new basename over the old string and
+/// NUL-pads the rest of the slot. The old slot is always longer than
+/// the new basename, so this never needs to grow the string table.
+fn strip_absolute_needed(path: &Path) -> io::Result<()> {
+    let data = fs::read(path)?;
+    let elf = goblin::elf::Elf::parse(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let dynstr_offset = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
+        .map(|sh| sh.sh_offset as usize);
+    let Some(dynstr_offset) = dynstr_offset else {
+        return Ok(());
+    };
+    let Some(dynamic) = &elf.dynamic else {
+        return Ok(());
+    };
+
+    let mut modified = data;
+    let mut changed = false;
+
+    for dyn_entry in &dynamic.dyns {
+        if dyn_entry.d_tag != goblin::elf::dynamic::DT_NEEDED {
+            continue;
+        }
+        let file_pos = dynstr_offset + dyn_entry.d_val as usize;
+        if file_pos >= modified.len() || modified[file_pos] != b'/' {
+            continue;
+        }
+        // Read the current (absolute) path from the string table.
+        let mut end = file_pos;
+        while end < modified.len() && modified[end] != 0 {
+            end += 1;
+        }
+        let original = &modified[file_pos..end];
+        let slot_size = end - file_pos;
+
+        let basename_start = match original.iter().rposition(|&b| b == b'/') {
+            Some(p) => p + 1,
+            None => 0,
+        };
+        let basename_len = original.len() - basename_start;
+        if basename_len == 0 || basename_len >= slot_size {
+            continue;
+        }
+
+        let basename: Vec<u8> = original[basename_start..].to_vec();
+        modified[file_pos..file_pos + basename_len].copy_from_slice(&basename);
+        for i in basename_len..slot_size {
+            modified[file_pos + i] = 0;
+        }
+        changed = true;
     }
 
     if changed {
