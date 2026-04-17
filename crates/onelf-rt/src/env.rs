@@ -120,15 +120,26 @@ pub fn setup_env(
     // so system themes, schemas, and desktop integrations still work.
     setup_xdg_data_dirs(pkg);
 
-    // Auto-set __EGL_VENDOR_LIBRARY_DIRS if package has EGL vendor configs
+    // EGL vendor discovery: merge bundled + host dirs so both Mesa
+    // and proprietary drivers (NVIDIA, AMD) are visible to libglvnd.
     if env::var("__EGL_VENDOR_LIBRARY_DIRS").is_err() {
+        let mut egl_dirs: Vec<String> = Vec::new();
         let egl_dir = pkg.join("share/glvnd/egl_vendor.d");
         if egl_dir.is_dir() {
+            egl_dirs.push(egl_dir.to_string_lossy().into_owned());
+        }
+        for d in &[
+            "/run/opengl-driver/share/glvnd/egl_vendor.d",
+            "/etc/glvnd/egl_vendor.d",
+            "/usr/share/glvnd/egl_vendor.d",
+        ] {
+            if Path::new(d).is_dir() {
+                egl_dirs.push((*d).to_string());
+            }
+        }
+        if !egl_dirs.is_empty() {
             unsafe {
-                env::set_var(
-                    "__EGL_VENDOR_LIBRARY_DIRS",
-                    egl_dir.to_string_lossy().as_ref(),
-                );
+                env::set_var("__EGL_VENDOR_LIBRARY_DIRS", egl_dirs.join(":"));
             }
         }
     }
