@@ -146,6 +146,31 @@ Extract the bundled `.desktop` file.
 onelf desktop BINARY [--entrypoint NAME] [-o FILE]
 ```
 
+## `onelf integrate`
+
+Install desktop shortcut and icon for a packed binary.
+
+```
+onelf integrate BINARY [--entrypoint NAME]
+```
+
+Installs the icon to `$XDG_DATA_HOME/icons/hicolor/` and a `.desktop`
+file to `$XDG_DATA_HOME/applications/`. The `Exec=`, `TryExec=`, and
+`Icon=` fields are patched automatically. If the package has no bundled
+desktop file, a minimal one is generated.
+
+| Flag | Description |
+|------|-------------|
+| `--entrypoint` | Entrypoint name (default: default entrypoint) |
+
+## `onelf unintegrate`
+
+Remove desktop shortcut and icon installed by `integrate`.
+
+```
+onelf unintegrate BINARY [--entrypoint NAME]
+```
+
 ## `onelf cache`
 
 Manage the persistent cache (used only by the final-fallback cache mode).

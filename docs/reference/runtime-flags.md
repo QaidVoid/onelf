@@ -10,6 +10,13 @@ start with `--onelf-` and are namespace-safe: the app never has to care.
 | `--onelf-icon` | Print the bundled icon (PNG) to stdout, then exit |
 | `--onelf-desktop` | Print the bundled `.desktop` file to stdout, then exit |
 
+## Desktop integration
+
+| Flag | Action |
+|------|--------|
+| `--onelf-integrate` | Install icon and `.desktop` file to XDG directories, then exit |
+| `--onelf-unintegrate` | Remove icon and `.desktop` file installed by integrate, then exit |
+
 ## Self-update
 
 Only available when the package was built with a `[update] url`.

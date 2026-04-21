@@ -20,10 +20,15 @@ myapp/
 │   └── icons/
 │       └── hicolor/256x256/apps/myapp.png
 ├── onelf.toml                   # optional: recipe (see Recipe File)
-└── .onelf/                      # auto-generated metadata (written by pack)
+└── .onelf/                      # onelf metadata namespace
+    ├── icons/                   # icons for desktop integration
+    │   └── default.svg          #   resolved by entrypoint name, then "default"
+    ├── desktop/                 # .desktop files for desktop integration
+    │   └── default.desktop      #   resolved by entrypoint name, then "default"
     ├── interp                   # bundled interpreter path (cross-libc)
     ├── update-url               # self-update zsync URL
-    └── package-info.toml        # version, description, license
+    ├── env                      # custom environment variables (auto-generated)
+    └── package-info.toml        # version, description, license (auto-generated)
 ```
 
 ## Conventions
@@ -35,7 +40,9 @@ myapp/
   handling (`LIBGL_DRIVERS_PATH`).
 - **`share/`** is prepended to `XDG_DATA_DIRS` so GLib/GTK discover bundled
   schemas, icons, and mime types.
-- **`.onelf/`** is the onelf namespace. Don't put your own files here.
+- **`.onelf/`** is the onelf namespace. Some files here are auto-generated
+  by pack (interp, env, package-info.toml), while `icons/` and `desktop/`
+  are user-provided for [desktop integration](./desktop).
 
 ## Minimal AppDir
 
