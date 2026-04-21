@@ -1799,8 +1799,7 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
             }
         }
         if needs_chmod {
-            let _ =
-                fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
+            let _ = fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
         }
     }
     Ok(injected)

@@ -13,7 +13,7 @@ use onelf_format::{EntryKind, Manifest};
 use crate::extract::decompress_entry;
 use crate::info::read_footer_and_manifest;
 
-fn find_entry_by_path(manifest: &Manifest, path: &str) -> Option<usize> {
+pub(crate) fn find_entry_by_path(manifest: &Manifest, path: &str) -> Option<usize> {
     manifest
         .entries
         .iter()
@@ -23,7 +23,7 @@ fn find_entry_by_path(manifest: &Manifest, path: &str) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-fn resolve_icon(manifest: &Manifest, entrypoint: &str) -> Option<usize> {
+pub(crate) fn resolve_icon(manifest: &Manifest, entrypoint: &str) -> Option<usize> {
     let candidates = [
         format!(".onelf/icons/{entrypoint}.svg"),
         format!(".onelf/icons/{entrypoint}.png"),
@@ -35,7 +35,7 @@ fn resolve_icon(manifest: &Manifest, entrypoint: &str) -> Option<usize> {
         .find_map(|path| find_entry_by_path(manifest, path))
 }
 
-fn resolve_desktop(manifest: &Manifest, entrypoint: &str) -> Option<usize> {
+pub(crate) fn resolve_desktop(manifest: &Manifest, entrypoint: &str) -> Option<usize> {
     let candidates = [
         format!(".onelf/desktop/{entrypoint}.desktop"),
         ".onelf/desktop/default.desktop".to_string(),

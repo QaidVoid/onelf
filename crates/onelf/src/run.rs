@@ -96,7 +96,10 @@ pub fn run(
     cmd.args(passthrough_args);
 
     if let Some(c) = requested_cwd {
-        cmd.env("ONELF_USER_CWD", std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+        cmd.env(
+            "ONELF_USER_CWD",
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        );
         cmd.current_dir(c);
     }
 

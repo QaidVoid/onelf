@@ -1,13 +1,14 @@
 mod bundle;
 mod cache;
-mod payload;
 mod compress;
 mod extract;
 mod info;
 mod init;
+mod integrate;
 mod list;
 mod metadata;
 mod pack;
+mod payload;
 mod recipe;
 mod run;
 mod verify;
@@ -198,6 +199,26 @@ enum Commands {
         /// Output path (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Install desktop shortcut and icon for a packed binary (XDG integration)
+    Integrate {
+        /// Path to the onelf binary
+        binary: PathBuf,
+
+        /// Entrypoint name (default: default entrypoint)
+        #[arg(long)]
+        entrypoint: Option<String>,
+    },
+
+    /// Remove desktop shortcut and icon installed by integrate
+    Unintegrate {
+        /// Path to the onelf binary
+        binary: PathBuf,
+
+        /// Entrypoint name (default: default entrypoint)
+        #[arg(long)]
+        entrypoint: Option<String>,
     },
 
     /// Manage the onelf cache
@@ -418,6 +439,12 @@ fn main() {
             entrypoint,
             output,
         } => metadata::desktop(&binary, entrypoint.as_deref(), output.as_deref()),
+        Commands::Integrate { binary, entrypoint } => {
+            integrate::integrate(&binary, entrypoint.as_deref())
+        }
+        Commands::Unintegrate { binary, entrypoint } => {
+            integrate::unintegrate(&binary, entrypoint.as_deref())
+        }
         Commands::Cache { action } => match action {
             CacheAction::List => cache::cache_list(),
             CacheAction::Clear => cache::cache_clear(),

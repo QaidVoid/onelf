@@ -2,6 +2,7 @@ mod cache;
 mod env;
 mod ephemeral;
 mod fuse;
+mod integrate;
 mod interp;
 mod loader;
 mod memfd;
@@ -57,6 +58,11 @@ fn main() {
 
     // Handle --onelf-icon / --onelf-desktop before dispatching
     if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
+        return;
+    }
+
+    // Handle --onelf-integrate / --onelf-unintegrate
+    if integrate::handle_integrate_flags(&args, &mut pkg, &ep_name, &exec_path) {
         return;
     }
 
@@ -260,8 +266,7 @@ fn main() {
         interp::exec_userland(&target_path, &interp, argv0, &final_args);
     }
 
-    let mut cmd =
-        interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
+    let mut cmd = interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
 
     let err = cmd.exec();
 
