@@ -121,6 +121,14 @@ pub fn should_use_userland_exec(
         return None;
     }
 
+    // Self-extracting binaries (e.g. pre-1.3.12 Bun) need /proc/self/exe
+    // to resolve to the binary itself. userland-execve doesn't update
+    // /proc/self/exe, so we route these through the kernel-exec path
+    // (see build_exec_command's self-extract handling).
+    if crate::selfextract::has_self_extract_trailer(target) {
+        return None;
+    }
+
     Some(interp)
 }
 
@@ -197,6 +205,7 @@ pub fn build_exec_command(
     pkg_root: &Path,
     lib_dirs: &[&str],
     lib_path: &str,
+    private_ns: bool,
     argv0: &str,
     args: &[String],
 ) -> Command {
@@ -205,6 +214,34 @@ pub fn build_exec_command(
     if let Some(interp) = read_elf_interp(target) {
         let interp_path = Path::new(&interp);
         if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
+            // Self-extracting binaries (pre-1.3.12 Bun, etc.) read
+            // /proc/self/exe to find their embedded payload. The
+            // explicit linker invocation below sets /proc/self/exe to
+            // the linker, which breaks payload detection. When we're in
+            // a private mount namespace (FUSE/tmpfs modes), bind-mount
+            // the bundled linker over the binary's PT_INTERP path
+            // and kernel-exec the binary directly so /proc/self/exe
+            // resolves to the binary itself.
+            if private_ns && crate::selfextract::has_self_extract_trailer(target) {
+                match crate::selfextract::bind_mount_interp(target, &bundled) {
+                    Ok(_) => {
+                        let mut cmd = Command::new(target);
+                        cmd.arg0(argv0).args(args);
+                        if !lib_path.is_empty() {
+                            cmd.env("LD_LIBRARY_PATH", lib_path);
+                        }
+                        return cmd;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "onelf-rt: warning: self-extract bind-mount failed for {}: {e}; \
+                             falling back to explicit linker invocation",
+                            target.display()
+                        );
+                    }
+                }
+            }
+
             let is_musl = interp_path
                 .file_name()
                 .and_then(|n| n.to_str())

@@ -9,6 +9,7 @@ mod memfd;
 mod metadata;
 mod multicall;
 mod portable;
+mod selfextract;
 mod ulexec;
 #[cfg(feature = "update")]
 mod update;
@@ -271,6 +272,7 @@ fn main() {
         &pkg_dir,
         &lib_dirs,
         &lib_path,
+        false, // cache mode: not in private namespace
         argv0,
         &final_args,
     );

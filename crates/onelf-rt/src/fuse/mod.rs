@@ -199,6 +199,7 @@ fn exec_from_mount(
         mountpoint,
         &lib_dirs,
         &lib_path,
+        true, // FUSE mode: in private namespace
         argv0,
         args,
     );
@@ -389,6 +390,7 @@ pub fn execute_fuse(
                 &mountpoint,
                 &lib_dirs,
                 &lib_path,
+                true, // FUSE mode: in private namespace
                 argv0,
                 args,
             );

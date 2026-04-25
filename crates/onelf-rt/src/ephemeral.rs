@@ -151,6 +151,7 @@ pub fn execute_tmpfs(
         &mountpoint,
         &lib_dirs,
         &lib_path,
+        true, // tmpfs mode: in private namespace
         argv0,
         args,
     );
