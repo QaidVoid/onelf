@@ -144,9 +144,19 @@ fn is_pie(path: &Path) -> bool {
 
 /// Execute an ELF binary using userland-execve with bundled interpreter.
 ///
+/// `lib_path` is passed to the linker via `--library-path` instead of via
+/// the inherited `LD_LIBRARY_PATH` env var, so bundled libs aren't visible
+/// to child processes the app spawns.
+///
 /// This function never returns on success.
-pub fn exec_userland(target: &Path, interpreter: &Path, argv0: &str, args: &[String]) -> ! {
-    crate::ulexec::exec_with_interp(target, interpreter, argv0, args)
+pub fn exec_userland(
+    target: &Path,
+    interpreter: &Path,
+    lib_path: &str,
+    argv0: &str,
+    args: &[String],
+) -> ! {
+    crate::ulexec::exec_with_interp(target, interpreter, lib_path, argv0, args)
 }
 
 /// Search for the interpreter in the package's lib directories.
@@ -186,6 +196,7 @@ pub fn build_exec_command(
     target: &Path,
     pkg_root: &Path,
     lib_dirs: &[&str],
+    lib_path: &str,
     argv0: &str,
     args: &[String],
 ) -> Command {
@@ -194,7 +205,6 @@ pub fn build_exec_command(
     if let Some(interp) = read_elf_interp(target) {
         let interp_path = Path::new(&interp);
         if let Some(bundled) = find_bundled_interp(&interp, pkg_root, lib_dirs) {
-            let lib_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
             let is_musl = interp_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -205,7 +215,7 @@ pub fn build_exec_command(
                 cmd.arg("--inhibit-cache");
             }
             if !lib_path.is_empty() {
-                cmd.arg("--library-path").arg(&lib_path);
+                cmd.arg("--library-path").arg(lib_path);
             }
             cmd.arg("--argv0").arg(argv0).arg(target).args(args);
             return cmd;

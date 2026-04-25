@@ -169,7 +169,7 @@ fn exec_from_mount(
     };
 
     let target_path_s = target_path.to_str().unwrap_or("");
-    crate::env::setup_env(
+    let lib_path = crate::env::setup_env(
         &mountpoint_str,
         argv0,
         exec_path,
@@ -191,11 +191,17 @@ fn exec_from_mount(
         if let Some(cwd) = &child_cwd {
             let _ = std::env::set_current_dir(cwd);
         }
-        crate::interp::exec_userland(&target_path, &interp, argv0, args);
+        crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
     }
 
-    let mut cmd =
-        crate::interp::build_exec_command(&target_path, mountpoint, &lib_dirs, argv0, args);
+    let mut cmd = crate::interp::build_exec_command(
+        &target_path,
+        mountpoint,
+        &lib_dirs,
+        &lib_path,
+        argv0,
+        args,
+    );
     if let Some(cwd) = &child_cwd {
         cmd.current_dir(cwd);
     }
@@ -352,7 +358,7 @@ pub fn execute_fuse(
             // directories on the FUSE mount (lib/dri/, share/vulkan/, etc.).
             // The parent's FUSE event loop is now running concurrently.
             let target_path_s = target_path.to_str().unwrap_or("");
-            crate::env::setup_env(
+            let lib_path = crate::env::setup_env(
                 &mountpoint_str,
                 argv0,
                 exec_path,
@@ -375,13 +381,14 @@ pub fn execute_fuse(
                 if let Some(cwd) = &child_cwd {
                     let _ = std::env::set_current_dir(cwd);
                 }
-                crate::interp::exec_userland(&target_path, &interp, argv0, args);
+                crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
             }
 
             let mut cmd = crate::interp::build_exec_command(
                 &target_path,
                 &mountpoint,
                 &lib_dirs,
+                &lib_path,
                 argv0,
                 args,
             );

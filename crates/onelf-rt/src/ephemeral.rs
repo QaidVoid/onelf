@@ -109,7 +109,7 @@ pub fn execute_tmpfs(
     crate::portable::setup_portable(exe_dir, exe_name);
 
     let target_path_s = target_path.to_str().unwrap_or("");
-    crate::env::setup_env(
+    let lib_path = crate::env::setup_env(
         &mountpoint_str,
         argv0,
         exec_path,
@@ -143,11 +143,17 @@ pub fn execute_tmpfs(
     if let Some(interp) =
         crate::interp::should_use_userland_exec(&target_path, &mountpoint, bundled_interp_rel)
     {
-        crate::interp::exec_userland(&target_path, &interp, argv0, args);
+        crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
     }
 
-    let mut cmd =
-        crate::interp::build_exec_command(&target_path, &mountpoint, &lib_dirs, argv0, args);
+    let mut cmd = crate::interp::build_exec_command(
+        &target_path,
+        &mountpoint,
+        &lib_dirs,
+        &lib_path,
+        argv0,
+        args,
+    );
     let err = cmd.exec();
     eprintln!("onelf-rt: tmpfs: exec failed: {err}");
     false

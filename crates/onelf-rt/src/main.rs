@@ -127,7 +127,7 @@ fn main() {
             // memfd mode: target is the memfd data itself (an ELF we
             // just read). Pass a non-empty marker so setup_env treats
             // it as an ELF.
-            env::setup_env(
+            let _ = env::setup_env(
                 "",
                 argv0,
                 &exec_path,
@@ -228,7 +228,7 @@ fn main() {
     let pkg_dir_str = pkg_dir.to_str().unwrap_or("");
     let lib_paths_str = pkg.manifest.lib_dirs().join(":");
     let target_path_s = target_path.to_str().unwrap_or("");
-    env::setup_env(
+    let lib_path = env::setup_env(
         pkg_dir_str,
         argv0,
         &exec_path,
@@ -263,10 +263,17 @@ fn main() {
     if let Some(interp) =
         interp::should_use_userland_exec(&target_path, &pkg_dir, bundled_interp_rel)
     {
-        interp::exec_userland(&target_path, &interp, argv0, &final_args);
+        interp::exec_userland(&target_path, &interp, &lib_path, argv0, &final_args);
     }
 
-    let mut cmd = interp::build_exec_command(&target_path, &pkg_dir, &lib_dirs, argv0, &final_args);
+    let mut cmd = interp::build_exec_command(
+        &target_path,
+        &pkg_dir,
+        &lib_dirs,
+        &lib_path,
+        argv0,
+        &final_args,
+    );
 
     let err = cmd.exec();
 

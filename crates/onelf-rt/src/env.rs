@@ -1,12 +1,27 @@
 //! Environment variable setup for the running package.
 //!
-//! Sets `ONELF_*` variables and configures `LD_LIBRARY_PATH` for packages
-//! that bundle shared libraries. Also auto-detects and configures paths for
-//! graphics drivers (OpenGL/EGL/Vulkan/VA-API).
+//! Sets `ONELF_*` variables and computes a `lib_path` string for the
+//! dynamic linker's `--library-path` flag. Also auto-detects and configures
+//! paths for graphics drivers (OpenGL/EGL/Vulkan/VA-API).
+//!
+//! `LD_LIBRARY_PATH` is intentionally NOT set for ELF entrypoints. It
+//! would be inherited by every child process the packed app spawns,
+//! including host binaries (`/bin/sh`, `ssh`, etc.), which corrupts them
+//! by mixing the bundled libc/libcrypto with the host loader. Instead,
+//! the lib path is passed via `--library-path` on a single linker
+//! invocation.
 
 use std::env;
 use std::path::Path;
 
+/// Set up environment variables and return a colon-joined lib path
+/// string for use with the dynamic linker's `--library-path` flag.
+///
+/// For shebang scripts (non-ELF target), returns an empty string: the
+/// kernel hands off to a host interpreter linked against the host glibc,
+/// and pointing it at our bundled libs would mix two glibcs in one
+/// process. Scripts that need bundled libs must export `LD_LIBRARY_PATH`
+/// themselves before execing bundled binaries.
 pub fn setup_env(
     onelf_dir: &str,
     argv0: &str,
@@ -15,7 +30,7 @@ pub fn setup_env(
     mode: &str,
     lib_subpath: &str,
     target_path: &str,
-) {
+) -> String {
     let launch_dir = env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
@@ -32,23 +47,23 @@ pub fn setup_env(
     }
 
     if onelf_dir.is_empty() {
-        return;
+        return String::new();
     }
 
     let pkg = Path::new(onelf_dir);
 
-    // Don't set LD_LIBRARY_PATH when the entrypoint is a script (a
-    // shebang file that the kernel hands off to a host interpreter).
-    // The host interpreter is linked against the host's glibc, but our
-    // bundled libs come first on LD_LIBRARY_PATH, so the host's
-    // ld-linux.so.2 would end up loading our bundled libc.so.6. Mixing
-    // two glibc versions inside one process blows up with a null deref
-    // in the loader's final mprotect/prlimit64 sequence. Leave the
-    // script's environment clean; the script can export LD_LIBRARY_PATH
-    // itself right before it execs bundled binaries.
     let target_is_elf = is_elf_file(target_path);
 
-    // Auto-set LD_LIBRARY_PATH if package has lib directories
+    let mut lib_path = String::new();
+
+    // Build the library search path for ELF entrypoints. Order:
+    //   <bundled lib dirs> : <existing LD_LIBRARY_PATH> : <host driver/system dirs>
+    // Bundled libs win, but GPU / libGL / libcuda / libvulkan and other
+    // host-provided userspace drivers are still discoverable. Our bundled
+    // ld.so has its baked-in paths scrubbed, so drivers that normally
+    // live in /usr/lib (or /run/opengl-driver/lib on NixOS) have to be
+    // added here explicitly or Cycles/OptiX and similar features won't
+    // find their driver libraries.
     if target_is_elf && !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
@@ -56,17 +71,11 @@ pub fn setup_env(
             .collect();
         let lib_str = lib_paths.join(":");
         if !lib_str.is_empty() {
-            let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            // Assemble the search path as:
-            //   <bundled lib dirs> : <existing LD_LIBRARY_PATH> : <host driver/system dirs>
-            // Bundled libs win, but GPU / libGL / libcuda / libvulkan and
-            // other host-provided userspace drivers are discoverable. Our
-            // bundled ld.so has its baked-in paths scrubbed, so drivers
-            // that normally live in /usr/lib (or /run/opengl-driver/lib
-            // on NixOS) have to be added here explicitly or Cycles/OptiX
-            // and similar features won't find their driver libraries.
             let mut parts: Vec<String> = Vec::new();
-            parts.push(lib_str.clone());
+            parts.push(lib_str);
+            // Preserve the user's pre-existing LD_LIBRARY_PATH as a middle
+            // layer, but don't propagate it to the child env.
+            let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
             if !existing.is_empty() {
                 parts.push(existing);
             }
@@ -74,8 +83,17 @@ pub fn setup_env(
             if !host_paths.is_empty() {
                 parts.push(host_paths.join(":"));
             }
+            lib_path = parts.join(":");
+
+            // Set LD_LIBRARY_PATH as a fallback. Ideally we'd only pass
+            // bundled paths via --library-path on the linker invocation
+            // (which avoids polluting child processes), but onelf's
+            // AT_EXECFN bootstrap doesn't drive a linker invocation and
+            // doesn't pass --library-path itself, so binaries with
+            // bootstrap injected rely on LD_LIBRARY_PATH. The trade-off:
+            // it gets inherited by every child process the app spawns.
             unsafe {
-                env::set_var("LD_LIBRARY_PATH", parts.join(":"));
+                env::set_var("LD_LIBRARY_PATH", &lib_path);
             }
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
@@ -230,6 +248,8 @@ pub fn setup_env(
             }
         }
     }
+
+    lib_path
 }
 
 /// Check whether `path` is an ELF file (first four bytes `\x7fELF`).
