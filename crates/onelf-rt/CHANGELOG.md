@@ -1,4 +1,16 @@
 
+## [0.2.5](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.4...onelf-rt-v0.2.5) - 2026-04-25
+
+### ⛰️  Features
+
+- *(rt)* /tmp symlink fallback for self-extract in cache mode - ([d561bb3](https://github.com/QaidVoid/onelf/commit/d561bb310d149d176a88f22a01d775cb99bd6bc9))
+- *(rt)* Bind-mount bundled linker for self-extract binaries - ([2f0c229](https://github.com/QaidVoid/onelf/commit/2f0c2297a932d5b90bec3757f8bb597e3bd7ac66))
+- Add desktop integration (integrate/unintegrate) - ([d72b686](https://github.com/QaidVoid/onelf/commit/d72b686ab86d5ff33b853ba10313ee1e4faa501d))
+
+### 🚜 Refactor
+
+- *(rt)* Pass lib paths via --library-path on linker invocations - ([a4e4259](https://github.com/QaidVoid/onelf/commit/a4e4259d3e36110b972f6aa7b1555aa19cb4248d))
+
 ## [0.2.4](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.3...onelf-rt-v0.2.4) - 2026-04-17
 
 ### ⛰️  Features
