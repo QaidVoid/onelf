@@ -26,24 +26,23 @@ When bundle-libs sees a musl binary (PT_INTERP matches `ld-musl-*`), it:
 
 ## What happens at runtime
 
-`bundle-libs` rewrites each ELF's `PT_INTERP` to a path relative to the
-AppDir root (like `lib/ld-musl-x86_64.so.1` or `lib/ld-linux-x86-64.so.2`).
-At exec time the runtime chdirs into the AppDir and the kernel resolves
-the relative PT_INTERP against the bundled loader. The host's own loader
-is never consulted, so a musl binary runs on a glibc host and vice versa
+`bundle-libs` injects an AT_EXECFN bootstrap into each bundled
+executable. The bootstrap reads `AT_EXECFN` at startup, computes the
+bundled loader's path relative to the binary's own location, maps it
+into memory, and jumps into it. The host's own loader is never
+consulted, so a musl binary runs on a glibc host and vice versa
 without any host-level setup.
 
 For PIE (`ET_DYN`) binaries the runtime can also use `userland-execve`
-to map the bundled loader directly and skip the kernel loader entirely.
-Non-PIE (`ET_EXEC`) binaries always go through the kernel + patched
-PT_INTERP path.
+to map the bundled loader directly. Non-PIE (`ET_EXEC`) binaries go
+through the kernel exec path with the bootstrap doing the loader
+hand-off.
 
-When the replacement PT_INTERP overflows the original slot (e.g. a
-deeply nested binary like `5.0/python/bin/python3.11` needing
-`../../../lib/ld-linux-x86-64.so.2`), bundle-libs appends the new string
-to the end of the file and rewrites the PT_INTERP program header to
-point at it. Kernel reads PT_INTERP by file offset, so the string does
-not need PT_LOAD coverage.
+The bootstrap approach has no path-length constraint. Earlier
+versions of onelf rewrote `PT_INTERP` to a relative path, which
+broke when the new path didn't fit in the original slot. The
+bootstrap stores the relative path as appended metadata, so deeply
+nested binaries work the same as shallow ones.
 
 ## Packaging musl apps on glibc hosts
 
