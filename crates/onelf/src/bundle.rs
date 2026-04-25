@@ -1337,6 +1337,14 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
     const NEW: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
     let new_bytes = NEW.as_bytes();
     let data = fs::read(path)?;
+
+    // Self-extracting binaries (e.g. pre-1.3.12 Bun) have a trailer at
+    // the end of the file. patchelf can grow the file when adding a
+    // missing DT_RUNPATH, which would invalidate the trailer. The
+    // in-place rewrite is safe (same file size), so we still attempt
+    // that, but we skip the patchelf fallback for these binaries.
+    let is_self_extract = has_self_extract_trailer(&data);
+
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -1412,6 +1420,13 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
         return Ok(false);
     }
 
+    if is_self_extract {
+        // Don't risk patchelf growing the file and clobbering the
+        // self-extract trailer. The runtime still sets LD_LIBRARY_PATH
+        // as a fallback for these binaries.
+        return Ok(false);
+    }
+
     // No usable in-place slot. Fall back to patchelf, which can
     // either resize an existing slot or add a fresh DT_RUNPATH by
     // growing the file's string table.
@@ -1448,6 +1463,30 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
     // LD_LIBRARY_PATH at runtime as a fallback, so this isn't fatal.
 
     Ok(false)
+}
+
+/// Detect binaries that embed a self-extracting payload at the end of
+/// the file. Bootstrap injection appends to the file, which would clobber
+/// such payloads and prevent runtime detection.
+///
+/// Currently detects: pre-1.3.12 Bun (`bun build --compile`) binaries
+/// which end with `\n---- Bun! ----\n` followed by an 8-byte length.
+fn has_self_extract_trailer(data: &[u8]) -> bool {
+    // Bun's trailer is 16 bytes; pre-1.3.12 also has an 8-byte length
+    // word after it (so check at offsets -16 and -24). Modern Bun
+    // (>=1.3.12) uses a `.bun` ELF section instead and is unaffected.
+    const BUN_TRAILER: &[u8] = b"\n---- Bun! ----\n";
+    if data.len() >= BUN_TRAILER.len()
+        && data.ends_with(BUN_TRAILER)
+    {
+        return true;
+    }
+    if data.len() >= BUN_TRAILER.len() + 8
+        && &data[data.len() - BUN_TRAILER.len() - 8..data.len() - 8] == BUN_TRAILER
+    {
+        return true;
+    }
+    false
 }
 
 /// Locate patchelf in PATH (or ONELF_PATCHELF override).
@@ -1687,6 +1726,21 @@ fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
     use goblin::elf::program_header::PT_INTERP;
 
     let data = fs::read(path)?;
+
+    // Skip self-extracting binaries that store metadata at file end.
+    // Appending the bootstrap PT_LOAD here would clobber their trailer
+    // and break payload detection (e.g. pre-1.3.12 Bun-compiled
+    // binaries). For these, the runtime sets LD_LIBRARY_PATH and the
+    // kernel exec resolves PT_INTERP normally.
+    if has_self_extract_trailer(&data) {
+        eprintln!(
+            "  note: {} appears to be a self-extracting binary \
+             (Bun-compiled or similar); skipping bootstrap injection",
+            path.display(),
+        );
+        return Ok(false);
+    }
+
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
