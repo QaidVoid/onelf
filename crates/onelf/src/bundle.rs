@@ -494,7 +494,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                     );
                 }
-                if set_origin_runpath(&path).is_ok() {
+                if matches!(set_origin_runpath(&path), Ok(true)) {
                     rewritten += 1;
                 }
                 let _ = scrub_nix_store_paths(&path);
@@ -841,7 +841,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                 );
             }
-            if set_origin_runpath(&path).is_ok() {
+            if matches!(set_origin_runpath(&path), Ok(true)) {
                 rewritten += 1;
             }
             let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -1325,22 +1325,32 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
 /// crash with a null deref in the loader. Using `$ORIGIN/../lib` keeps
 /// the bundle's library search scoped to the bundled ELF itself.
 ///
-/// Only works when the ELF already has a DT_RPATH or DT_RUNPATH entry
-/// we can reuse. Upstream Linux distros (including nixpkgs, Debian,
-/// Fedora) compile most system binaries with one set, pointing at the
-/// distro's own lib dir, so we almost always find a slot. Binaries
-/// without any RPATH entry stay unmodified, which is fine because the
-/// caller still sets `LD_LIBRARY_PATH` in the direct-ELF exec path as
-/// a fallback.
-fn set_origin_runpath(path: &Path) -> io::Result<()> {
+/// First tries in-place patching of an existing DT_RPATH/DT_RUNPATH
+/// slot. If the binary has no slot or it's too small for our string
+/// (e.g. Bun, Go, Zig outputs), falls back to `patchelf --set-rpath`
+/// when available. Returns true if RUNPATH was successfully set.
+fn set_origin_runpath(path: &Path) -> io::Result<bool> {
     // Cover binaries at depth 1 (e.g. bin/foo), 2 (libexec/podman/x),
     // and 3 (share/pkg/helpers/y). Nonexistent entries are silently
     // ignored by the dynamic loader, so this is safe to apply
     // uniformly without knowing where each ELF sits.
-    const NEW: &[u8] = b"$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
+    const NEW: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
+    let new_bytes = NEW.as_bytes();
     let data = fs::read(path)?;
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+    // Only meaningful for binaries with dynamic dependencies. A bottom-
+    // of-stack lib like libc.so.6 or the dynamic loader has no DT_NEEDED
+    // entries and doesn't need DT_RUNPATH itself.
+    let has_needed = !elf.libraries.is_empty();
+    // PT_INTERP marks an executable; pure shared libraries lack it. We
+    // only warn / fall back to patchelf for executables, since libs
+    // typically resolve their deps via the executable's DT_RUNPATH.
+    let is_executable = elf
+        .program_headers
+        .iter()
+        .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
 
     // Find .dynstr section file offset
     let dynstr_offset = elf
@@ -1349,63 +1359,116 @@ fn set_origin_runpath(path: &Path) -> io::Result<()> {
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
         .map(|sh| sh.sh_offset as usize);
 
-    let Some(dynstr_offset) = dynstr_offset else {
-        return Ok(());
-    };
+    let dynamic_present = elf.dynamic.is_some();
+    let mut in_place_done = false;
 
-    let Some(dynamic) = &elf.dynamic else {
-        return Ok(());
-    };
-
-    let mut modified = data;
-    let mut changed = false;
-
-    for dyn_entry in &dynamic.dyns {
-        if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
-            || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
-        {
-            let file_pos = dynstr_offset + dyn_entry.d_val as usize;
-            if file_pos >= modified.len() {
-                continue;
+    if let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) {
+        let mut modified = data.clone();
+        for dyn_entry in &dynamic.dyns {
+            if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
+                || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
+            {
+                let file_pos = dynstr_offset + dyn_entry.d_val as usize;
+                if file_pos >= modified.len() {
+                    continue;
+                }
+                let mut end = file_pos;
+                while end < modified.len() && modified[end] != 0 {
+                    end += 1;
+                }
+                while end < modified.len() && modified[end] == 0 {
+                    end += 1;
+                }
+                let slot_size = end - file_pos;
+                if new_bytes.len() + 1 > slot_size {
+                    // Slot too small; will fall back to patchelf below.
+                    continue;
+                }
+                modified[file_pos..file_pos + new_bytes.len()].copy_from_slice(new_bytes);
+                for i in new_bytes.len()..slot_size {
+                    modified[file_pos + i] = 0;
+                }
+                in_place_done = true;
             }
-            // Measure the writable slot size: the current string plus
-            // any trailing NUL padding that follows it, up to the next
-            // non-NUL byte. That covers three cases:
-            //   (a) fresh ELF: the slot is exactly string + NUL.
-            //   (b) an older onelf pass already zeroed the string: no
-            //       leading content, just a run of NULs.
-            //   (c) an older onelf pass wrote a *shorter* replacement
-            //       (e.g. `$ORIGIN/../lib`): leading string, then a
-            //       NUL run up to where the next .dynstr entry starts.
-            //   We need (c) to grow the slot back beyond our earlier
-            //   shorter write so a longer replacement still fits.
-            let mut end = file_pos;
-            while end < modified.len() && modified[end] != 0 {
-                end += 1;
-            }
-            while end < modified.len() && modified[end] == 0 {
-                end += 1;
-            }
-            let slot_size = end - file_pos;
-            if NEW.len() + 1 > slot_size {
-                // Not enough room to fit NEW plus a NUL terminator. The
-                // caller will still fall back to LD_LIBRARY_PATH for ELF
-                // entrypoints in the direct-exec path, so this isn't
-                // fatal - just less robust.
-                continue;
-            }
-            modified[file_pos..file_pos + NEW.len()].copy_from_slice(NEW);
-            for i in NEW.len()..slot_size {
-                modified[file_pos + i] = 0;
-            }
-            changed = true;
+        }
+        if in_place_done {
+            fs::write(path, &modified)?;
+            return Ok(true);
         }
     }
 
-    if changed {
-        fs::write(path, &modified)?;
+    drop(elf);
+
+    if !dynamic_present || !has_needed {
+        // Nothing depends on libs (static binary, libc.so itself, the
+        // dynamic loader, etc.). DT_RUNPATH wouldn't help here.
+        return Ok(false);
     }
-    Ok(())
+
+    if !is_executable {
+        // Shared libraries usually resolve their deps via the
+        // executable's DT_RUNPATH (transitive search). Skip patchelf
+        // and the noisy warning for bare libs.
+        return Ok(false);
+    }
+
+    // No usable in-place slot. Fall back to patchelf, which can
+    // either resize an existing slot or add a fresh DT_RUNPATH by
+    // growing the file's string table.
+    if let Some(patchelf) = which_patchelf() {
+        let status = std::process::Command::new(&patchelf)
+            .arg("--force-rpath")
+            .arg("--set-rpath")
+            .arg(NEW)
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match status {
+            Ok(o) if o.status.success() => return Ok(true),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "  {} patchelf failed for {}: {}",
+                    color::bold_red("warning:"),
+                    path.display(),
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} could not run patchelf for {}: {e}",
+                    color::bold_red("warning:"),
+                    path.display(),
+                );
+            }
+        }
+    }
+    // No patchelf available and no in-place slot. Caller still sets
+    // LD_LIBRARY_PATH at runtime as a fallback, so this isn't fatal.
+
+    Ok(false)
+}
+
+/// Locate patchelf in PATH (or ONELF_PATCHELF override).
+fn which_patchelf() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ONELF_PATCHELF") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path = std::env::var("PATH").ok()?;
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(dir).join("patchelf");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Rewrite any absolute-path DT_NEEDED entry to just its basename. The
