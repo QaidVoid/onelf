@@ -217,14 +217,24 @@ pub fn build_exec_command(
             // Self-extracting binaries (pre-1.3.12 Bun, etc.) read
             // /proc/self/exe to find their embedded payload. The
             // explicit linker invocation below sets /proc/self/exe to
-            // the linker, which breaks payload detection. When we're in
-            // a private mount namespace (FUSE/tmpfs modes), bind-mount
-            // the bundled linker over the binary's PT_INTERP path
-            // and kernel-exec the binary directly so /proc/self/exe
-            // resolves to the binary itself.
-            if private_ns && crate::selfextract::has_self_extract_trailer(target) {
-                match crate::selfextract::bind_mount_interp(target, &bundled) {
-                    Ok(_) => {
+            // the linker, which breaks payload detection. We need a
+            // direct kernel-exec of the binary so /proc/self/exe
+            // resolves to it.
+            //
+            // To make the kernel resolve PT_INTERP (typically
+            // /lib64/ld-linux-x86-64.so.2) to our bundled linker:
+            //   - In a private mount namespace (FUSE/tmpfs): bind-mount
+            //     the bundled linker over PT_INTERP. Invisible outside.
+            //   - Otherwise (cache mode): create a /tmp symlink and
+            //     in-place patch PT_INTERP to point at it.
+            if crate::selfextract::has_self_extract_trailer(target) {
+                let prepped = if private_ns {
+                    crate::selfextract::bind_mount_interp(target, &bundled).map(|_| ())
+                } else {
+                    crate::selfextract::symlink_interp(target, &bundled).map(|_| ())
+                };
+                match prepped {
+                    Ok(()) => {
                         let mut cmd = Command::new(target);
                         cmd.arg0(argv0).args(args);
                         if !lib_path.is_empty() {
@@ -234,7 +244,7 @@ pub fn build_exec_command(
                     }
                     Err(e) => {
                         eprintln!(
-                            "onelf-rt: warning: self-extract bind-mount failed for {}: {e}; \
+                            "onelf-rt: warning: self-extract prep failed for {}: {e}; \
                              falling back to explicit linker invocation",
                             target.display()
                         );
