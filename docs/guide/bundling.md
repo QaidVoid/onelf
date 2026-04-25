@@ -14,18 +14,47 @@ With no flags, this:
 1. Scans every ELF file under `./myapp/` for `DT_NEEDED` entries.
 2. Resolves each soname via ldconfig (or the NixOS store, when detected).
 3. Copies the resolved `.so` files into `./myapp/lib/`.
-4. Strips `RPATH`/`RUNPATH` from bundled binaries so the runtime can
-   control `LD_LIBRARY_PATH`.
-5. Rewrites the `PT_INTERP` of every bundled ELF to a path relative to
-   the AppDir root (e.g. `lib/ld-linux-x86-64.so.2`). The runtime and
-   `onelf run` chdir into the AppDir before exec, so the kernel loads
-   the bundled loader via the rewritten PT_INTERP. This keeps
-   `/proc/self/exe` pointing at the real binary, which Python's stdlib
-   detection, Electron's ASAR locator, and Qt's plugin loader all read.
+4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to
+   `$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib`, so the
+   bundled binaries find their libs relative to their own location
+   without needing `LD_LIBRARY_PATH`. For binaries without an existing
+   slot, `bundle-libs` falls back to `patchelf --set-rpath` (when
+   patchelf is in `PATH`) to add a fresh entry.
+5. Injects an AT_EXECFN bootstrap into each bundled executable. At
+   runtime, the bootstrap reads `AT_EXECFN`, computes the bundled
+   interpreter path relative to the binary's own location, and jumps
+   into it. This keeps `/proc/self/exe` pointing at the real binary,
+   which is important for Python's stdlib detection, Electron's ASAR
+   locator, and Qt's plugin loader.
 6. Scrubs `/usr/`, `/etc/`, `/nix/`, `/lib/`, and `/lib64/` strings
    inside the bundled dynamic loader to `/XXX/`, so it won't pick up
    the host's `ld.so.preload`, `ld.so.cache`, or hardcoded fallback
    library dirs.
+
+## Self-extracting binaries (Bun, etc.)
+
+Some binaries embed their payload at the end of the file. The most
+common case is pre-1.3.12 Bun-compiled apps, which look for the
+trailer `\n---- Bun! ----\n` at `-16` from end-of-file. These need
+special handling. `bundle-libs` detects them automatically and:
+
+- Skips bootstrap injection. The bootstrap appends bytes to the
+  binary, which would clobber the trailer and break payload
+  detection.
+- Skips `patchelf --set-rpath` for binaries lacking a DT_RUNPATH
+  slot. patchelf can grow the file.
+
+At runtime, the onelf-rt arranges for the kernel to handle PT_INTERP
+directly. In FUSE and tmpfs modes, it bind-mounts the bundled linker
+over the binary's existing PT_INTERP path inside a private mount
+namespace. In cache mode, it creates a short `/tmp` symlink and
+patches the binary's PT_INTERP in-place. Either way,
+`/proc/self/exe` resolves to the binary itself and Bun finds its
+embedded JS bundle.
+
+Bun 1.3.12 and newer uses a dedicated `.bun` ELF section instead of
+the end-of-file trailer. Those binaries are unaffected by file-end
+appending and get normal bootstrap injection treatment.
 
 ## Starting from a bare binary
 

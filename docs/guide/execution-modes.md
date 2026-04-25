@@ -103,29 +103,38 @@ across packages.
 
 ## How the entrypoint is launched
 
-Regardless of which mode is active, the runtime picks one of three exec
-strategies based on the entrypoint's `PT_INTERP`:
+Regardless of which mode is active, the runtime picks an exec strategy
+based on what the binary needs:
 
-1. **Direct exec (preferred).** When `bundle-libs` has rewritten the
-   entrypoint's `PT_INTERP` to a path relative to the AppDir, the
-   runtime chdirs into the AppDir and `execve`s the target directly.
-   The kernel loads the bundled loader via the relative PT_INTERP, and
-   `/proc/self/exe` points at the real binary, which is what Python,
-   Electron, and Qt read to find their bundled resources.
+1. **AT_EXECFN bootstrap (preferred).** `bundle-libs` injects a small
+   bootstrap into bundled executables. At runtime the kernel execs
+   the binary directly. The bootstrap reads `AT_EXECFN`, computes the
+   bundled interpreter's path relative to the binary's own location,
+   and jumps into it. `/proc/self/exe` points at the real binary,
+   which is what Python, Electron, and Qt read to find their bundled
+   resources.
 
-2. **Userland-execve.** For PIE (`ET_DYN`) binaries on systems that
-   support it, the runtime can map the bundled loader into the current
-   process and jump to its entry, skipping the kernel loader entirely.
+2. **Userland-execve.** For binaries without bootstrap injection that
+   are PIE (`ET_DYN`), the runtime can map the bundled loader into
+   the current process and jump to its entry, skipping the kernel
+   loader entirely. This is used to bring up a glibc binary on a
+   musl host where the binary's `PT_INTERP` doesn't exist on disk.
 
-3. **Loader invocation (fallback).** When the target's `PT_INTERP` is
-   absolute (unpatched) but a matching bundled loader exists, the
-   runtime invokes the loader explicitly:
-   `ld-linux-x86-64.so.2 --library-path ... --argv0 NAME target`.
-   The bundle still runs, but `/proc/self/exe` will be the loader
-   rather than the target. Apps that read `/proc/self/exe` to locate
-   their own resources won't find them on this path. Re-run
-   `bundle-libs` with an up-to-date `onelf` to get the direct-exec
-   behavior.
+3. **Loader invocation (fallback).** When neither of the above fits,
+   the runtime invokes the bundled loader explicitly:
+   `ld-linux.so --library-path ... --argv0 NAME target`. The bundle
+   still runs, but `/proc/self/exe` will be the loader rather than
+   the target. Apps that read `/proc/self/exe` for self-introspection
+   may misbehave on this path.
+
+4. **Self-extract fast path.** Binaries that embed their payload at
+   end-of-file (pre-1.3.12 Bun, etc.) cannot tolerate
+   `/proc/self/exe` pointing at the loader. The runtime detects them
+   and arranges for a real kernel-exec of the binary itself. In FUSE
+   and tmpfs modes, it bind-mounts the bundled loader over the
+   binary's PT_INTERP path inside the private mount namespace. In
+   cache mode, it creates a short `/tmp` symlink and patches the
+   binary's PT_INTERP in-place.
 
 ## Forcing a mode
 
