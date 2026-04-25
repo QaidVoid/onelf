@@ -109,7 +109,7 @@ Everything `bundle-libs` accepts, as recipe keys.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `lib-dirs` | array | `["auto"]` | Directories for `LD_LIBRARY_PATH` (pass `["auto"]` to detect) |
+| `lib-dirs` | array | `["auto"]` | Bundled directories the runtime adds to its lib search (pass `["auto"]` to detect) |
 | `search-paths` | array | `[]` | Extra lib search paths (highest priority) |
 | `exclude` | array | `[]` | Excluded soname prefixes |
 | `include` | array | `[]` | Force-included sonames |
@@ -119,6 +119,22 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `scan-dlopen` | bool | `false` | Scan for dlopen'd libs in binary strings |
 | `dlopen` | array | `[]` | Extra sonames for `scan-dlopen` allow-list |
 | `skip` | bool | `false` | Don't run bundle-libs at all |
+
+### `[env]`
+
+Custom environment variables set by the runtime before exec.
+
+```toml
+[env]
+PYTHONHOME = "${ONELF_DIR}/python"
+QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
+GST_PLUGIN_PATH_1_0 = "${ONELF_DIR}/lib/gstreamer-1.0"
+```
+
+`${ONELF_DIR}` expands to the package root at runtime (the FUSE
+mount, tmpfs, or cache dir depending on execution mode), so values
+follow the running app wherever it lives. Other `${VAR}` references
+expand at recipe-load time against the packer's environment.
 
 ## Environment variable expansion
 

@@ -218,7 +218,7 @@ level = 19
 
 ```bash
 cd miniflux-onelf
-onelf bundle-libs .      # resolves libs, patches PT_INTERPs, bundles the loader
+onelf bundle-libs .      # resolves libs, rewrites RUNPATH, injects bootstrap
 onelf build              # produces miniflux.onelf
 ```
 
@@ -226,8 +226,8 @@ The `bundle-libs` pass prints something like:
 
 ```
 Copied 32 libraries (61.6 MB) to ./lib
-Stripped RPATHs from 194 binaries
-Patched PT_INTERP of 9 binaries
+Rewrote RUNPATH to $ORIGIN/../lib in 194 binaries
+Injected AT_EXECFN bootstrap into 9 binaries
 ```
 
 `onelf build` prints the final size and the number of compressed

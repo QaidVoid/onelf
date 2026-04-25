@@ -16,15 +16,23 @@ entrypoint. Packaged apps can read these to discover their own context.
 
 ## Library paths
 
-The runtime walks the AppDir's `lib` subdirectories and prepends them to
-`LD_LIBRARY_PATH`, keeps whatever the caller already had, and appends
-host driver / system library dirs at the end:
+The runtime walks the AppDir's `lib` subdirectories and builds a
+search-path string of the form:
 
 ```
-LD_LIBRARY_PATH=<bundle lib dirs>:<previous LD_LIBRARY_PATH>:<host driver dirs>
+<bundle lib dirs>:<previous LD_LIBRARY_PATH>:<host driver dirs>
 ```
 
-Host driver dirs currently probed (each added only if it exists):
+That string is used two ways:
+
+1. Passed to the bundled dynamic linker via `--library-path` when the
+   runtime invokes it explicitly.
+2. Set as `LD_LIBRARY_PATH` so AT_EXECFN-bootstrapped binaries find
+   the bundled libs through the kernel-loaded interpreter, and so any
+   nested execs the app does (where the runtime is not in the loop)
+   still resolve correctly.
+
+Host driver dirs probed (each added only if it exists):
 
 - `/run/opengl-driver/lib` (NixOS)
 - `/run/opengl-driver-32/lib` (NixOS 32-bit)
@@ -32,10 +40,10 @@ Host driver dirs currently probed (each added only if it exists):
 - `/usr/lib64` (Fedora/RHEL/openSUSE)
 - `/usr/lib`, `/lib/x86_64-linux-gnu`, `/lib64` (generic fallbacks)
 
-This lets bundled apps find host-provided GPU userspace drivers (libcuda,
-libvulkan, libGL, libva) on every distro without the user having to set
-`LD_LIBRARY_PATH` manually. The bundle's own libs come first in the
-search path, so they always win on name conflicts.
+This lets bundled apps find host-provided GPU userspace drivers
+(libcuda, libvulkan, libGL, libva) on every distro without the user
+having to set `LD_LIBRARY_PATH` manually. The bundle's own libs come
+first in the search path, so they always win on name conflicts.
 
 If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
 
@@ -44,14 +52,33 @@ If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
 
 If the AppDir has `share/vulkan/icd.d/` it sets:
 
-- `VK_DRIVER_FILES` to the comma-joined list of ICD json files
+- `VK_DRIVER_FILES` to the colon-joined list of ICD json files
 
-If `share/glvnd/egl_vendor.d/` exists, `__EGL_VENDOR_LIBRARY_DIRS` is set.
+The runtime also auto-sets a few more vars when the corresponding
+data directory exists:
 
-If `share/libdrm/` exists, `LIBDRM_IDS_PATH` is set.
+- `__EGL_VENDOR_LIBRARY_DIRS` for `share/glvnd/egl_vendor.d/`
+- `LIBDRM_IDS_PATH` for `share/libdrm/`
+- `LIBDECOR_PLUGIN_DIR` for `share/libdecor/plugins-1/`
+- `DRIRC_CONFIGDIR` for `share/drirc.d/`
+- `XKB_CONFIG_ROOT` for `share/X11/xkb/`
 
-Finally, the package's own `share/` is prepended to `XDG_DATA_DIRS`, so
-GLib/GTK discover bundled GSettings schemas and icon themes.
+Finally, the package's own `share/` is prepended to `XDG_DATA_DIRS`,
+so GLib/GTK discover bundled GSettings schemas and icon themes.
+
+## Custom environment variables
+
+The recipe's `[env]` section lets the package declare extra env vars
+the runtime should set. `${ONELF_DIR}` in values expands to the
+package root at runtime, so paths follow the running app:
+
+```toml
+[env]
+PYTHONHOME = "${ONELF_DIR}/python"
+QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
+```
+
+See [Recipe File](./recipe#env) for details.
 
 ## Set by the user
 
@@ -59,6 +86,7 @@ GLib/GTK discover bundled GSettings schemas and icon themes.
 |----------|--------|
 | `ONELF_MODE` | Force a specific [execution mode](./execution-modes) |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30, `0` disables) |
+| `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` path even when user namespaces work |
 
 ## Portable directory redirection
 

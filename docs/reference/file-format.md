@@ -1,15 +1,11 @@
 # File Format
 
-A packed onelf file is four concatenated sections:
+A packed onelf file is up to five concatenated sections:
 
 ```
 ┌────────────────────────────────────┐  offset 0
 │ Runtime (static musl ELF)          │
 │  670 KB (slim) or ~2 MB (update)   │
-├────────────────────────────────────┤
-│ Payload                            │
-│  zstd-compressed 256 KB blocks     │
-│  multiple entries share blocks     │
 ├────────────────────────────────────┤
 │ Manifest (zstd-compressed)         │
 │  - header (50 bytes)               │
@@ -17,6 +13,9 @@ A packed onelf file is four concatenated sections:
 │  - file/dir/symlink entries        │
 │  - lib_dir_offsets                 │
 │  - string_table                    │
+├────────────────────────────────────┤
+│ Payload                            │
+│  zstd-compressed 256 KB blocks     │
 ├────────────────────────────────────┤
 │ Dictionary (optional, raw)         │
 ├────────────────────────────────────┤
@@ -109,9 +108,9 @@ Each `Block` is `(payload_offset: u64, compressed_size: u64, original_size: u64)
 ## Payload
 
 Contiguous sequence of zstd-compressed blocks. Block boundaries are
-defined entirely by the `blocks` arrays in the manifest. Two files can
-share a block if their contents overlap, though pack.rs currently emits
-per-entry block lists (no content-level deduplication).
+defined entirely by the `blocks` arrays in the manifest. The format
+allows two entries to point at the same block, but pack.rs currently
+emits per-entry block lists with no content-level deduplication.
 
 Block size defaults to 256 KB uncompressed. Each block is compressed
 independently, which lets the runtime decompress them lazily as the

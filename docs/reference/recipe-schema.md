@@ -20,6 +20,9 @@ user-facing guide.
 
 [bundle]
 # optional, passes to bundle-libs
+
+[env]
+# optional, custom environment variables set before exec
 ```
 
 Unknown fields are rejected (`deny_unknown_fields`) to catch typos.
@@ -104,8 +107,24 @@ dlopen = ["libmyvendor.so.1"]    # extra sonames for scan-dlopen allow-list
 skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
 ```
 
+## `[env]`
+
+```toml
+[env]
+PYTHONHOME = "${ONELF_DIR}/python"
+RESVG_LIB_DIR = "${ONELF_DIR}/lib"
+QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
+```
+
+Each `KEY = "VALUE"` pair becomes an env var set by the runtime
+before `exec`. Values support `${ONELF_DIR}` expansion at runtime,
+which resolves to the package root (FUSE mount, tmpfs path, or cache
+dir depending on execution mode). Other `${VAR}` references are
+expanded against the user's environment at recipe-load time.
+
 ## Env var expansion
 
 All string fields support `${VAR}` expansion from the process's
-environment at recipe load time. Missing variables expand to empty
-strings.
+environment at recipe load time. Missing variables stay literal so
+`${ONELF_DIR}` and similar runtime placeholders pass through to the
+runtime.
