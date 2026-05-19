@@ -228,14 +228,29 @@ pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
     Ok(spec.to_path_buf())
 }
 
-/// Expand `${VAR}` references in a string from the environment.
-/// Variables not set in the environment are preserved as-is (e.g.
-/// `${ONELF_DIR}` stays literal so the runtime can expand it later).
+/// Expand `${VAR}` references in a string from the **packer's**
+/// environment at recipe-load time. Variables not set are preserved
+/// as-is (e.g. `${ONELF_DIR}` stays literal so the runtime can expand
+/// it later).
+///
+/// `$$` is an escape for a literal `$`: it is emitted as a single `$`
+/// and never triggers pack-time expansion. This lets a recipe defer a
+/// reference to **runtime**, e.g. `PATH = "${ONELF_DIR}/bin:$${PATH}"`
+/// reaches `.onelf/env` as `${ONELF_DIR}/bin:${PATH}` and the runtime
+/// (onelf-rt / the onelf-env constructor) expands `${PATH}` against the
+/// live process environment — i.e. prepend instead of replace.
 pub fn expand_env(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // `$$` -> literal `$` (escape; defers any following `{VAR}` to
+        // runtime since the `${` pattern is no longer present).
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}') {
                 let name = std::str::from_utf8(&bytes[i + 2..i + 2 + end]).unwrap_or("");
@@ -254,4 +269,30 @@ pub fn expand_env(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_env;
+
+    #[test]
+    fn dollar_dollar_escapes_and_defers_to_runtime() {
+        // $$ -> literal $
+        assert_eq!(expand_env("a$$b"), "a$b");
+        // $${VAR} must reach the output as ${VAR} (NOT pack-expanded),
+        // so the runtime expands it -> PATH prepend instead of replace.
+        assert_eq!(
+            expand_env("${ONELF_DIR}/bin:$${PATH}"),
+            "${ONELF_DIR}/bin:${PATH}"
+        );
+    }
+
+    #[test]
+    fn unset_vars_are_preserved_for_runtime() {
+        assert_eq!(expand_env("x${ONELF_DIR}y"), "x${ONELF_DIR}y");
+        assert_eq!(
+            expand_env("${ONELF_THIS_IS_NOT_SET_4f3a}"),
+            "${ONELF_THIS_IS_NOT_SET_4f3a}"
+        );
+    }
 }

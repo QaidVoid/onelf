@@ -314,9 +314,39 @@ fn setup_xdg_data_dirs(pkg: &Path) {
     }
 }
 
+/// Expand `${NAME}` references in a `.onelf/env` value at runtime.
+/// `${ONELF_DIR}` resolves to the package root; any other `${NAME}`
+/// resolves to the *live* process environment (empty if unset). This
+/// is what makes `PATH = "${ONELF_DIR}/bin:${PATH}"` prepend rather
+/// than replace. Unterminated `${` is left literal.
+fn expand_env_value(val: &str, onelf_dir: &str) -> String {
+    let mut out = String::with_capacity(val.len());
+    let b = val.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            if let Some(end) = b[i + 2..].iter().position(|&c| c == b'}') {
+                let name = &val[i + 2..i + 2 + end];
+                if name == "ONELF_DIR" {
+                    out.push_str(onelf_dir);
+                } else {
+                    out.push_str(&env::var(name).unwrap_or_default());
+                }
+                i += 3 + end;
+                continue;
+            }
+        }
+        let ch = val[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Apply custom environment variables from `.onelf/env` data.
-/// Each line is `KEY=VALUE`. Values containing `${ONELF_DIR}` are
-/// expanded to the package root at runtime.
+/// Each line is `KEY=VALUE`. `${ONELF_DIR}` expands to the package
+/// root; other `${NAME}` expand against the live environment (see
+/// [`expand_env_value`]).
 ///
 /// This is the *first-launch / fallback* env layer. The re-exec-safe
 /// layer is the bundled `onelf-env` constructor (injected as a
@@ -338,10 +368,35 @@ pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
             continue;
         }
         if let Some((key, val)) = line.split_once('=') {
-            let expanded = val.replace("${ONELF_DIR}", onelf_dir);
+            let expanded = expand_env_value(val.trim(), onelf_dir);
             unsafe {
-                env::set_var(key.trim(), expanded.trim());
+                env::set_var(key.trim(), expanded);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod expand_value_tests {
+    use super::expand_env_value;
+
+    #[test]
+    fn onelf_dir_live_env_and_unset() {
+        // Unique names so parallel tests don't race on the process env.
+        unsafe {
+            std::env::set_var("ONELF_T_LIVE_9c1", "LV");
+            std::env::remove_var("ONELF_T_UNSET_9c1");
+        }
+        assert_eq!(expand_env_value("${ONELF_DIR}/x", "/root"), "/root/x");
+        assert_eq!(expand_env_value("a:${ONELF_T_LIVE_9c1}:b", "/r"), "a:LV:b");
+        // Unset -> empty (so `dir:${UNSET}` doesn't keep a literal token).
+        assert_eq!(expand_env_value("${ONELF_T_UNSET_9c1}", "/r"), "");
+        // The PATH-prepend shape.
+        assert_eq!(
+            expand_env_value("${ONELF_DIR}/bin:${ONELF_T_LIVE_9c1}", "/R"),
+            "/R/bin:LV"
+        );
+        // Unterminated `${` is left literal.
+        assert_eq!(expand_env_value("a${ONELF_DIR", "/r"), "a${ONELF_DIR");
     }
 }

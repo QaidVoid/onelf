@@ -277,3 +277,101 @@ int main(int argc, char **argv) {{
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// Default behaviour: the package's own bin/ is prepended to PATH
+/// (re-exec-safe), and `[env]` values expand against the *live*
+/// environment at runtime (so `$${HOME}` defers to runtime, and the
+/// PATH prefix prepends rather than replaces).
+#[test]
+fn bin_on_path_by_default_and_runtime_env_expansion() {
+    let td = workdir("defpath");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let result = td.join("result");
+
+    // Helper that exists ONLY in the package bin/ (exit 77 if reached).
+    let hsrc = td.join("probe.c");
+    write(&hsrc, "int main(void){return 77;}\n");
+    if !cc(&hsrc, &app.join("bin/onelf_helper")) {
+        return; // no compiler: documented soft-skip
+    }
+
+    let asrc = td.join("app.c");
+    write(
+        &asrc,
+        &format!(
+            r#"#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {{
+    FILE *f = fopen("{res}", "w");
+    fprintf(f, "PATH=%s\n", getenv("PATH") ? getenv("PATH") : "(null)");
+    fprintf(f, "FOO=%s\n", getenv("ONELF_IT_FOO") ? getenv("ONELF_IT_FOO") : "(null)");
+    int rc = 127;
+    if (fork() == 0) {{
+        execvp("onelf_helper", (char *[]){{ "onelf_helper", NULL }});
+        _exit(127);
+    }}
+    int st; wait(&st); rc = WEXITSTATUS(st);
+    fprintf(f, "HELPER=%d\n", rc);
+    fclose(f);
+    return 0;
+}}"#,
+            res = result.display()
+        ),
+    );
+    if !cc(&asrc, &app.join("bin/app")) {
+        return;
+    }
+
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname=\"defpath\"\ncommand=\"bin/app\"\n\n\
+         [env]\nONELF_IT_FOO=\"pre-${ONELF_DIR}-$${HOME}-post\"\n",
+    );
+
+    let mut cmd = Command::new(onelf());
+    cmd.arg("build").current_dir(&app);
+    if let Some(pe) = patchelf() {
+        cmd.env("ONELF_PATCHELF", pe);
+    }
+    let o = cmd.output().expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let pkg = app.join("defpath.onelf");
+    let st = Command::new(&pkg)
+        .env_clear()
+        .env("HOME", "/xyzhome")
+        .env("PATH", "/sentinel/dir")
+        .status()
+        .expect("run package");
+    assert!(st.success());
+
+    let r = std::fs::read_to_string(&result).expect("result file");
+    let path_line = r.lines().find(|l| l.starts_with("PATH=")).unwrap_or("");
+    // Default: ${ONELF_DIR}/bin prepended to the inherited PATH (not replacing it).
+    assert!(
+        path_line.contains("/bin:/sentinel/dir"),
+        "expected bin/ prepended to inherited PATH, got: {path_line}"
+    );
+    // $$ deferred to runtime: HOME must be the *runtime* value, not the
+    // packer's HOME at build time.
+    let foo = r.lines().find(|l| l.starts_with("FOO=")).unwrap_or("");
+    assert!(
+        foo.starts_with("FOO=pre-/") && foo.ends_with("-/xyzhome-post"),
+        "runtime env expansion wrong: {foo}"
+    );
+    // The bundled helper resolves via the defaulted PATH.
+    assert!(
+        r.contains("HELPER=77"),
+        "bundled helper not found via default PATH:\n{r}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}

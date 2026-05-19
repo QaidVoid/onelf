@@ -342,7 +342,23 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     }
 
     // Write custom env vars as .onelf/env (KEY=VALUE per line).
-    if !opts.env.is_empty() {
+    //
+    // By default the package's own bin/ is prepended to PATH, applied
+    // re-exec-safely (onelf-env constructor) and on first launch
+    // (onelf-rt). `${PATH}` is expanded against the live environment at
+    // runtime, so this prepends rather than replaces. A recipe that
+    // sets `[env] PATH` itself takes full control and the default is
+    // skipped (use `PATH = "$${PATH}"` to opt out of the bin prefix
+    // entirely).
+    {
+        let user_sets_path = opts.env.iter().any(|(k, _)| k == "PATH");
+        let mut env_lines: Vec<String> = Vec::new();
+        if !user_sets_path {
+            env_lines.push("PATH=${ONELF_DIR}/bin:${PATH}".to_string());
+        }
+        for (k, v) in &opts.env {
+            env_lines.push(format!("{k}={v}"));
+        }
         if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),
@@ -351,15 +367,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 mtime_nsec: 0,
             });
         }
-        let content: String = opts
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
         files.push(CollectedFile {
             rel_path: PathBuf::from(".onelf/env"),
-            content: content.into_bytes(),
+            content: env_lines.join("\n").into_bytes(),
             mode: 0o644,
             mtime_secs: 0,
             mtime_nsec: 0,
