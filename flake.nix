@@ -22,6 +22,7 @@
             gcc
             musl.dev
             pkg-config
+            patchelf
           ];
 
           shellHook = ''
