@@ -354,7 +354,12 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         let user_sets_path = opts.env.iter().any(|(k, _)| k == "PATH");
         let mut env_lines: Vec<String> = Vec::new();
         if !user_sets_path {
-            env_lines.push("PATH=${ONELF_DIR}/bin:${PATH}".to_string());
+            // `${PATH:-/usr/bin:/bin}`: keep the inherited PATH, but
+            // once we set PATH at all glibc no longer applies its
+            // _CS_PATH (/bin:/usr/bin) fallback, so substitute it
+            // ourselves when the inherited PATH is empty (e.g. after a
+            // sandbox clearenv()) instead of leaving a dangling ":".
+            env_lines.push("PATH=${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}".to_string());
         }
         for (k, v) in &opts.env {
             env_lines.push(format!("{k}={v}"));

@@ -316,9 +316,13 @@ fn setup_xdg_data_dirs(pkg: &Path) {
 
 /// Expand `${NAME}` references in a `.onelf/env` value at runtime.
 /// `${ONELF_DIR}` resolves to the package root; any other `${NAME}`
-/// resolves to the *live* process environment (empty if unset). This
-/// is what makes `PATH = "${ONELF_DIR}/bin:${PATH}"` prepend rather
-/// than replace. Unterminated `${` is left literal.
+/// resolves to the *live* process environment. POSIX `${NAME:-word}`
+/// is supported: if `NAME` is unset *or empty*, the literal `word` is
+/// used instead (no nested braces in `word`). This is what makes the
+/// default `PATH = "${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}"` prepend
+/// the bundled bin/ while still falling back to system dirs (instead
+/// of a dangling empty element) when the inherited PATH is empty.
+/// Unterminated `${` is left literal.
 fn expand_env_value(val: &str, onelf_dir: &str) -> String {
     let mut out = String::with_capacity(val.len());
     let b = val.as_bytes();
@@ -326,11 +330,19 @@ fn expand_env_value(val: &str, onelf_dir: &str) -> String {
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
             if let Some(end) = b[i + 2..].iter().position(|&c| c == b'}') {
-                let name = &val[i + 2..i + 2 + end];
-                if name == "ONELF_DIR" {
-                    out.push_str(onelf_dir);
+                let token = &val[i + 2..i + 2 + end];
+                let (name, default) = match token.split_once(":-") {
+                    Some((n, d)) => (n, Some(d)),
+                    None => (token, None),
+                };
+                let resolved = if name == "ONELF_DIR" {
+                    Some(onelf_dir.to_string())
                 } else {
-                    out.push_str(&env::var(name).unwrap_or_default());
+                    env::var(name).ok()
+                };
+                match resolved {
+                    Some(ref v) if !v.is_empty() => out.push_str(v),
+                    _ => out.push_str(default.unwrap_or("")),
                 }
                 i += 3 + end;
                 continue;
@@ -398,5 +410,31 @@ mod expand_value_tests {
         );
         // Unterminated `${` is left literal.
         assert_eq!(expand_env_value("a${ONELF_DIR", "/r"), "a${ONELF_DIR");
+    }
+
+    #[test]
+    fn posix_default_word() {
+        unsafe {
+            std::env::set_var("ONELF_T_SET_d2", "S");
+            std::env::set_var("ONELF_T_EMPTY_d2", "");
+            std::env::remove_var("ONELF_T_MISSING_d2");
+        }
+        // Unset -> default word.
+        assert_eq!(
+            expand_env_value("${ONELF_T_MISSING_d2:-fallback}", "/r"),
+            "fallback"
+        );
+        // Set & non-empty -> the value, default ignored.
+        assert_eq!(expand_env_value("${ONELF_T_SET_d2:-fb}", "/r"), "S");
+        // Set but empty -> default (POSIX :- semantics).
+        assert_eq!(expand_env_value("${ONELF_T_EMPTY_d2:-fb}", "/r"), "fb");
+        // ONELF_DIR is non-empty so the default is ignored.
+        assert_eq!(expand_env_value("${ONELF_DIR:-x}", "/R"), "/R");
+        // The shipped default PATH shape, inherited PATH empty.
+        unsafe { std::env::set_var("ONELF_T_PE_d2", "") };
+        assert_eq!(
+            expand_env_value("${ONELF_DIR}/bin:${ONELF_T_PE_d2:-/usr/bin:/bin}", "/R"),
+            "/R/bin:/usr/bin:/bin"
+        );
     }
 }

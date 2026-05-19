@@ -285,6 +285,11 @@ mod expand_tests {
             expand_env("${ONELF_DIR}/bin:$${PATH}"),
             "${ONELF_DIR}/bin:${PATH}"
         );
+        // $$ + POSIX default must survive pack-time intact for runtime.
+        assert_eq!(
+            expand_env("${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}"),
+            "${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}"
+        );
     }
 
     #[test]

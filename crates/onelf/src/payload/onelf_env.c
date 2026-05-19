@@ -239,11 +239,13 @@ static int seq(const char *a, const char *b) {
 }
 
 /* Expand "${NAME}" in [src, src+n): ${ONELF_DIR} -> g_root (package
- * root), any other ${NAME} -> getenv(NAME) from the live environment
- * (empty if unset) -- this is what makes
- * `PATH=${ONELF_DIR}/bin:${PATH}` prepend rather than replace.
- * An unterminated "${" is copied literally. Writes NUL-terminated into
- * dst (capacity cap). Returns 0 on overflow. */
+ * root), any other ${NAME} -> getenv(NAME) from the live environment.
+ * Supports POSIX `${NAME:-word}`: if NAME is unset *or empty*, the
+ * literal `word` is substituted instead. This is what makes the
+ * default `PATH=${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}` keep the
+ * inherited PATH yet avoid a dangling empty element after clearenv().
+ * No nested braces inside `word`. An unterminated "${" is copied
+ * literally. Writes NUL-terminated into dst (cap). Returns 0 on overflow. */
 static int expand(char *dst, u64 cap, const char *src, u64 n) {
     u64 o = 0;
     for (u64 i = 0; i < n;) {
@@ -251,18 +253,35 @@ static int expand(char *dst, u64 cap, const char *src, u64 n) {
             u64 j = i + 2;
             while (j < n && src[j] != '}') j++;
             if (j < n) {
+                /* Split token src[i+2, j) on the first ":-". */
+                u64 ts = i + 2, te = j;
+                u64 name_end = te, def_start = 0;
+                int has_def = 0;
+                for (u64 p = ts; p + 1 < te; p++) {
+                    if (src[p] == ':' && src[p + 1] == '-') {
+                        name_end = p;
+                        def_start = p + 2;
+                        has_def = 1;
+                        break;
+                    }
+                }
                 char name[256];
-                u64 nl = j - (i + 2);
+                u64 nl = name_end - ts;
                 if (nl < sizeof(name)) {
-                    for (u64 k = 0; k < nl; k++) name[k] = src[i + 2 + k];
+                    for (u64 k = 0; k < nl; k++) name[k] = src[ts + k];
                     name[nl] = 0;
                     const char *rep = seq(name, "ONELF_DIR")
                                           ? (const char *)g_root
                                           : getenv(name);
-                    if (rep) {
+                    if (rep && rep[0]) {
                         for (u64 k = 0; rep[k]; k++) {
                             if (o + 1 >= cap) return 0;
                             dst[o++] = rep[k];
+                        }
+                    } else if (has_def) {
+                        for (u64 k = def_start; k < te; k++) {
+                            if (o + 1 >= cap) return 0;
+                            dst[o++] = src[k];
                         }
                     }
                     i = j + 1;

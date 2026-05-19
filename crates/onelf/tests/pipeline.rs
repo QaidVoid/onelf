@@ -373,5 +373,29 @@ int main(void) {{
         "bundled helper not found via default PATH:\n{r}"
     );
 
+    // Run again with NO PATH at all (sandbox/clearenv shape): the
+    // `${PATH:-/usr/bin:/bin}` default must fall back to system dirs,
+    // with NO dangling empty element, and the helper still resolves.
+    let st = Command::new(&pkg)
+        .env_clear()
+        .env("HOME", td.to_str().unwrap())
+        .status()
+        .expect("run package (empty PATH)");
+    assert!(st.success());
+    let r = std::fs::read_to_string(&result).expect("result file");
+    let path_line = r.lines().find(|l| l.starts_with("PATH=")).unwrap_or("");
+    assert!(
+        path_line.ends_with("/bin:/usr/bin:/bin"),
+        "empty PATH should fall back to /usr/bin:/bin (no dangling ':'), got: {path_line}"
+    );
+    assert!(
+        !path_line.ends_with(':'),
+        "PATH must not end in an empty element: {path_line}"
+    );
+    assert!(
+        r.contains("HELPER=77"),
+        "bundled helper not found with fallback PATH:\n{r}"
+    );
+
     let _ = std::fs::remove_dir_all(&td);
 }
