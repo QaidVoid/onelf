@@ -1,4 +1,23 @@
 
+## [0.2.6](https://github.com/QaidVoid/onelf/compare/0.2.5...0.2.6) - 2026-05-19
+
+### ⛰️  Features
+
+- *(bundle)* Surface executables without baked-in $ORIGIN RUNPATH - ([b5baadf](https://github.com/QaidVoid/onelf/commit/b5baadfa3522f19f703d74d9ae8c4527138562de))
+- *(env)* POSIX ${VAR:-word} default; PATH falls back to /usr/bin:/bin - ([fd8ec65](https://github.com/QaidVoid/onelf/commit/fd8ec65180ffa19704f497265979672f0669cb15))
+- *(env)* Runtime ${VAR} passthrough + $ONELF_DIR/bin on PATH by default - ([c81904b](https://github.com/QaidVoid/onelf/commit/c81904b6b850f1c9246bbf0ad5df0b230181e5f7))
+- *(pack)* [preload] recipe key + --preload, emit .onelf/preload - ([59dd5b3](https://github.com/QaidVoid/onelf/commit/59dd5b386b7cc0fb36d16cb0bf58b30d89c2549c))
+- Re-exec-safe payload-side env via onelf-env DT_NEEDED constructor - ([e369c92](https://github.com/QaidVoid/onelf/commit/e369c922f7945b6615cc4f49e0404109021a29c7))
+- Add store mode for uncompressed payloads - ([7da4dd1](https://github.com/QaidVoid/onelf/commit/7da4dd1d9a05eaac96f24d33773b00c87837a0f4))
+
+### 🧪 Testing
+
+- Unit + e2e coverage for store mode, onelf-env, preload - ([788d1d0](https://github.com/QaidVoid/onelf/commit/788d1d0eb7580dca7f0071ee93ad9ca205accdbe))
+
+### Build
+
+- *(payload)* Build real aarch64 onelf-env blob - ([67024a6](https://github.com/QaidVoid/onelf/commit/67024a60f6d3fbfd77834f325aba7dc0a6937a8c))
+
 ## [0.2.5](https://github.com/QaidVoid/onelf/compare/0.2.4...0.2.5) - 2026-04-25
 
 ### ⛰️  Features
