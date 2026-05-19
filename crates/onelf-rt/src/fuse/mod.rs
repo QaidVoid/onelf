@@ -413,6 +413,7 @@ pub fn execute_fuse(
                 &mut pkg.file,
                 pkg.footer.payload_offset,
                 pkg.dict.as_deref(),
+                pkg.footer.is_stored(),
             );
 
             let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];

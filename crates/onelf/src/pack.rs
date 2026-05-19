@@ -38,6 +38,9 @@ pub struct PackOptions {
     pub lib_dirs: Vec<String>,
     pub level: i32,
     pub use_dict: bool,
+    /// Store the payload raw (no zstd). Mutually exclusive with a
+    /// dictionary; trades file size for zero decompression at runtime.
+    pub no_compress: bool,
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
     pub update_url: Option<String>,
@@ -368,7 +371,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Optionally build dictionary (needs enough sample data)
     let total_content_size: usize = files.iter().map(|f| f.content.len()).sum();
-    let dict = if opts.use_dict && files.len() > 1 && total_content_size > 4096 {
+    let dict = if opts.no_compress {
+        // Store mode writes raw bytes; a dictionary would be unused.
+        if opts.use_dict {
+            eprintln!("note: store mode overrides dictionary; payload stored raw");
+        }
+        None
+    } else if opts.use_dict && files.len() > 1 && total_content_size > 4096 {
         let pb = ProgressBar::new_spinner();
         pb.set_message("Building dictionary...");
         let samples: Vec<Vec<u8>> = files.iter().map(|f| f.content.clone()).collect();
@@ -395,19 +404,26 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             .unwrap()
             .progress_chars("=> "),
     );
-    pb.set_message("Compressing files...");
+    pb.set_message(if opts.no_compress {
+        "Storing files..."
+    } else {
+        "Compressing files..."
+    });
 
     let compressed_files: Vec<CompressedFile> = files
         .par_iter()
         .map(|f| {
             let content_hash: [u8; 32] = *blake3::hash(&f.content).as_bytes();
 
-            let blocks = if let Some(ref d) = dict {
+            let blocks = if opts.no_compress {
+                compress::store_in_blocks(&f.content)
+            } else if let Some(ref d) = dict {
                 compress::compress_in_blocks(&f.content, opts.level, Some(d))
+                    .expect("compression failed")
             } else {
                 compress::compress_in_blocks(&f.content, opts.level, None)
-            }
-            .expect("compression failed");
+                    .expect("compression failed")
+            };
 
             pb.inc(1);
             CompressedFile {
@@ -421,7 +437,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         })
         .collect();
 
-    pb.finish_with_message("Compression complete");
+    pb.finish_with_message(if opts.no_compress {
+        "Files stored (uncompressed)"
+    } else {
+        "Compression complete"
+    });
 
     // Build string table and entry list
     let mut strings = StringTableBuilder::new();
@@ -659,6 +679,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.memfd == Some(true) {
         flags |= Flags::MEMFD_HINT;
     }
+    if opts.no_compress {
+        flags |= Flags::STORED;
+    }
 
     // Write the output file
     let pb = ProgressBar::new_spinner();
@@ -744,12 +767,20 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         symlink_count
     );
     eprintln!("  {} {}", bold("Content:"), format_size(total_input));
-    eprintln!(
-        "  {} {} (zstd level {})",
-        bold("Payload:"),
-        format_size(total_payload),
-        opts.level
-    );
+    if opts.no_compress {
+        eprintln!(
+            "  {} {} (stored, uncompressed)",
+            bold("Payload:"),
+            format_size(total_payload)
+        );
+    } else {
+        eprintln!(
+            "  {} {} (zstd level {})",
+            bold("Payload:"),
+            format_size(total_payload),
+            opts.level
+        );
+    }
     if let Some(ref d) = dict {
         eprintln!("  {}    {}", bold("Dict:"), format_size(d.len() as u64));
     }

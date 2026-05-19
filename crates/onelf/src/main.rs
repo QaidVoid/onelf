@@ -69,6 +69,11 @@ enum Commands {
         #[arg(long)]
         dict: bool,
 
+        /// Store the payload uncompressed (no zstd). Larger file, but
+        /// zero decompression at runtime. Overrides --dict.
+        #[arg(long)]
+        no_compress: bool,
+
         /// Mark default entrypoint as memfd-eligible
         #[arg(long)]
         memfd: bool,
@@ -350,6 +355,7 @@ fn main() {
             lib_dir,
             level,
             dict,
+            no_compress,
             memfd,
             no_memfd,
             working_dir,
@@ -385,6 +391,7 @@ fn main() {
                     lib_dirs: lib_dir,
                     level,
                     use_dict: dict,
+                    no_compress,
                     memfd: memfd_opt,
                     working_dir: wd,
                     update_url: update_url.clone(),
@@ -598,6 +605,7 @@ fn run_build(
             lib_dirs,
             level: recipe.compression.level,
             use_dict: recipe.compression.dict,
+            no_compress: recipe.compression.store,
             memfd: recipe.package.memfd,
             working_dir: recipe.package.working_dir.into(),
             update_url,

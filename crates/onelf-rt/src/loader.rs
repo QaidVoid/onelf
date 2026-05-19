@@ -74,19 +74,25 @@ pub fn read_payload_entry(
     compressed_size: u64,
     original_size: u64,
     dict: Option<&[u8]>,
+    stored: bool,
 ) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(payload_offset + entry_offset))?;
-    let mut compressed = vec![0u8; compressed_size as usize];
-    file.read_exact(&mut compressed)?;
+    let mut buf = vec![0u8; compressed_size as usize];
+    file.read_exact(&mut buf)?;
+
+    // Store mode: bytes are the file content verbatim, no zstd.
+    if stored {
+        return Ok(buf);
+    }
 
     let data = if let Some(d) = dict {
-        let cursor = Cursor::new(&compressed);
+        let cursor = Cursor::new(&buf);
         let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
         let mut result = Vec::with_capacity(original_size as usize);
         decoder.read_to_end(&mut result)?;
         result
     } else {
-        zstd::bulk::decompress(&compressed, original_size as usize).map_err(|e| {
+        zstd::bulk::decompress(&buf, original_size as usize).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
         })?
     };
@@ -99,22 +105,29 @@ pub fn read_payload_blocks(
     payload_offset: u64,
     blocks: &[onelf_format::Block],
     dict: Option<&[u8]>,
+    stored: bool,
 ) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();
 
     for block in blocks {
         file.seek(SeekFrom::Start(payload_offset + block.payload_offset))?;
-        let mut compressed = vec![0u8; block.compressed_size as usize];
-        file.read_exact(&mut compressed)?;
+        let mut buf = vec![0u8; block.compressed_size as usize];
+        file.read_exact(&mut buf)?;
+
+        // Store mode: bytes are the file content verbatim, no zstd.
+        if stored {
+            result.extend_from_slice(&buf);
+            continue;
+        }
 
         let decompressed = if let Some(d) = dict {
-            let cursor = Cursor::new(&compressed);
+            let cursor = Cursor::new(&buf);
             let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
             let mut block_result = Vec::with_capacity(block.original_size as usize);
             decoder.read_to_end(&mut block_result)?;
             block_result
         } else {
-            zstd::bulk::decompress(&compressed, block.original_size as usize).map_err(|e| {
+            zstd::bulk::decompress(&buf, block.original_size as usize).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
             })?
         };

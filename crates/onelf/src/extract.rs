@@ -39,6 +39,12 @@ pub(crate) fn decompress_entry(
         let mut compressed = vec![0u8; block.compressed_size as usize];
         file.read_exact(&mut compressed)?;
 
+        // Store mode: bytes are the file content verbatim, no zstd.
+        if footer.is_stored() {
+            result.extend_from_slice(&compressed);
+            continue;
+        }
+
         let decompressed = if let Some(d) = dict {
             let cursor = Cursor::new(&compressed);
             let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;

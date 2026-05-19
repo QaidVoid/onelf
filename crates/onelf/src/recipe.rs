@@ -104,6 +104,10 @@ pub struct Compression {
     pub level: i32,
     #[serde(default)]
     pub dict: bool,
+    /// Store the payload uncompressed (no zstd). Overrides `dict` and
+    /// `level`. Larger file, zero decompression at runtime.
+    #[serde(default)]
+    pub store: bool,
 }
 
 impl Default for Compression {
@@ -111,6 +115,7 @@ impl Default for Compression {
         Self {
             level: default_level(),
             dict: false,
+            store: false,
         }
     }
 }

@@ -68,6 +68,7 @@ pub fn handle_metadata_flags(args: &[String], pkg: &mut PackageData, ep_name: &s
         pkg.footer.payload_offset,
         &entry.blocks,
         pkg.dict.as_deref(),
+        pkg.footer.is_stored(),
     ) {
         Ok(data) => {
             if let Err(e) = io::stdout().write_all(&data) {

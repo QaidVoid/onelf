@@ -119,6 +119,7 @@ pub struct FuseState<'a> {
     file: &'a mut File,
     payload_offset: u64,
     dict: Option<&'a [u8]>,
+    stored: bool,
     children: Vec<Vec<u64>>,
     cache: BlockCache,
 }
@@ -129,6 +130,7 @@ impl<'a> FuseState<'a> {
         file: &'a mut File,
         payload_offset: u64,
         dict: Option<&'a [u8]>,
+        stored: bool,
     ) -> Self {
         let children = build_children(manifest);
         Self {
@@ -136,6 +138,7 @@ impl<'a> FuseState<'a> {
             file,
             payload_offset,
             dict,
+            stored,
             children,
             cache: BlockCache::new(),
         }
@@ -321,6 +324,7 @@ impl<'a> FuseState<'a> {
                 block.compressed_size,
                 block.original_size,
                 self.dict,
+                self.stored,
             ) {
                 Ok(data) => {
                     self.cache.insert_block(inode, block_idx, data);
@@ -345,6 +349,7 @@ impl<'a> FuseState<'a> {
                     block.compressed_size,
                     block.original_size,
                     self.dict,
+                    self.stored,
                 )
                 .map(|data| self.cache.insert_block(inode, next, data));
             }

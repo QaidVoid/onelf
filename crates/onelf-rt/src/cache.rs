@@ -57,6 +57,7 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
             pkg.footer.payload_offset,
             &entry.blocks,
             pkg.dict.as_deref(),
+            pkg.footer.is_stored(),
         )?;
 
         let mut f = fs::File::create(&out_path)?;
@@ -180,6 +181,7 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
                 pkg.footer.payload_offset,
                 &entry.blocks,
                 pkg.dict.as_deref(),
+                pkg.footer.is_stored(),
             )?;
 
             // Atomic write: temp file then rename

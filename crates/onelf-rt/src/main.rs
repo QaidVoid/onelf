@@ -123,6 +123,7 @@ fn main() {
             pkg.footer.payload_offset,
             &target_blocks,
             pkg.dict.as_deref(),
+            pkg.footer.is_stored(),
         ) {
             let lib_paths_str = pkg.manifest.lib_dirs().join(":");
             // memfd mode: target is the memfd data itself (an ELF we
@@ -293,6 +294,7 @@ fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8
         pkg.footer.payload_offset,
         &pkg.manifest.entries[idx].blocks,
         pkg.dict.as_deref(),
+        pkg.footer.is_stored(),
     )
     .ok()
 }

@@ -50,6 +50,7 @@ fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
         pkg.footer.payload_offset,
         &blocks,
         pkg.dict.as_deref(),
+        pkg.footer.is_stored(),
     )
 }
 

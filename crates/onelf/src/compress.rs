@@ -34,6 +34,29 @@ pub fn compress_with_dict(data: &[u8], level: i32, dict: &[u8]) -> io::Result<Ve
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
+/// Chunk `data` into `BLOCK_SIZE` pieces without compressing. Used by
+/// store mode (`--no-compress`): the runtime reads these bytes directly,
+/// so `data.len() == original_size` for every block. Produces the same
+/// block layout as `compress_in_blocks` (empty input -> no blocks).
+pub fn store_in_blocks(data: &[u8]) -> Vec<CompressedBlock> {
+    let mut blocks = Vec::new();
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let chunk_end = (offset + BLOCK_SIZE as usize).min(data.len());
+        let chunk = &data[offset..chunk_end];
+
+        blocks.push(CompressedBlock {
+            data: chunk.to_vec(),
+            original_size: chunk.len() as u64,
+        });
+
+        offset = chunk_end;
+    }
+
+    blocks
+}
+
 pub fn compress_in_blocks(
     data: &[u8],
     level: i32,

@@ -49,6 +49,10 @@ bitflags! {
         const HAS_DICT       = 1 << 0;
         const MEMFD_HINT     = 1 << 1;
         const SHARUN_COMPAT  = 1 << 2;
+        /// Payload blocks are stored raw (no zstd). `compressed_size`
+        /// equals `original_size` for every block; the runtime reads
+        /// payload bytes directly without decompression.
+        const STORED         = 1 << 3;
     }
 }
 
@@ -77,6 +81,12 @@ pub struct Footer {
 }
 
 impl Footer {
+    /// Whether the payload is stored raw (no zstd). When true the runtime
+    /// must skip decompression and use payload bytes directly.
+    pub fn is_stored(&self) -> bool {
+        self.flags.contains(Flags::STORED)
+    }
+
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_all(&MAGIC)?; // 8
         w.write_all(&self.format_version.to_le_bytes())?; // 2
