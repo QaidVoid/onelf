@@ -49,6 +49,10 @@ pub struct PackOptions {
     pub package_info: Option<String>,
     /// Custom environment variables to set before exec (KEY=VALUE pairs).
     pub env: Vec<(String, String)>,
+    /// Libraries to dlopen on every exec, written to `.onelf/preload` and
+    /// applied by the bundled onelf-env constructor. `${ONELF_DIR}`
+    /// expands to the package root at runtime.
+    pub preload: Vec<String>,
 }
 
 struct CollectedFile {
@@ -355,6 +359,27 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             .join("\n");
         files.push(CollectedFile {
             rel_path: PathBuf::from(".onelf/env"),
+            content: content.into_bytes(),
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
+    }
+
+    // Write preload library list as .onelf/preload (one path per line),
+    // applied by the bundled onelf-env constructor.
+    if !opts.preload.is_empty() {
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+            });
+        }
+        let content = opts.preload.join("\n");
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/preload"),
             content: content.into_bytes(),
             mode: 0o644,
             mtime_secs: 0,

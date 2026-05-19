@@ -47,6 +47,11 @@ pub struct Recipe {
     /// `${ONELF_DIR}` which expands to the package root at runtime.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Libraries dlopen'd on every exec by the bundled onelf-env
+    /// constructor. Paths support `${ONELF_DIR}`. Survives sandboxed
+    /// re-exec (DT_NEEDED + $ORIGIN RUNPATH), unlike `LD_PRELOAD`.
+    #[serde(default)]
+    pub preload: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -93,6 +93,11 @@ enum Commands {
         /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
         #[arg(long)]
         exclude: Vec<String>,
+
+        /// Library to dlopen on every exec via the onelf-env constructor
+        /// (repeatable). Survives sandboxed re-exec, unlike LD_PRELOAD.
+        #[arg(long)]
+        preload: Vec<String>,
     },
 
     /// Scaffold a starter onelf.toml
@@ -361,6 +366,7 @@ fn main() {
             working_dir,
             update_url,
             exclude,
+            preload,
         } => {
             let memfd_opt = if no_memfd {
                 Some(false)
@@ -398,6 +404,7 @@ fn main() {
                     exclude,
                     package_info: None,
                     env: Vec::new(),
+                    preload,
                 },
                 // Pick the runtime: slim (~700KB) by default; the
                 // update-capable runtime (~2MB) only when the user actually
@@ -612,6 +619,7 @@ fn run_build(
             exclude: recipe.package.exclude,
             package_info,
             env: recipe.env.into_iter().collect(),
+            preload: recipe.preload,
         },
         runtime,
     )
