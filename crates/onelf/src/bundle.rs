@@ -483,6 +483,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         if !opts.dry_run {
             let lib_dest = opts.directory.join(&opts.lib_dir);
             let mut rewritten = 0usize;
+            let mut unguaranteed: Vec<PathBuf> = Vec::new();
+            let mut self_extract: Vec<PathBuf> = Vec::new();
             for path in find_elf_files(&opts.directory) {
                 let perms = fs::metadata(&path)
                     .map(|m| m.permissions().mode())
@@ -494,9 +496,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                     );
                 }
-                if matches!(set_origin_runpath(&path), Ok(true)) {
-                    rewritten += 1;
-                }
+                tally_origin_runpath(
+                    &path,
+                    &mut rewritten,
+                    &mut unguaranteed,
+                    &mut self_extract,
+                );
                 let _ = scrub_nix_store_paths(&path);
                 let _ = strip_absolute_needed(&path);
                 if needs_chmod {
@@ -513,6 +518,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     rewritten
                 );
             }
+            report_unguaranteed_runpath(&unguaranteed, &self_extract);
             match inject_bootstraps(&opts.directory, &lib_dest) {
                 Ok(n) if n > 0 => eprintln!(
                     "{} AT_EXECFN bootstrap into {} binaries",
@@ -830,6 +836,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if !opts.dry_run {
         let mut rewritten = 0usize;
         let mut scrubbed = 0usize;
+        let mut unguaranteed: Vec<PathBuf> = Vec::new();
+        let mut self_extract: Vec<PathBuf> = Vec::new();
         for path in find_elf_files(&opts.directory) {
             let perms = fs::metadata(&path)
                 .map(|m| m.permissions().mode())
@@ -841,9 +849,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                 );
             }
-            if matches!(set_origin_runpath(&path), Ok(true)) {
-                rewritten += 1;
-            }
+            tally_origin_runpath(&path, &mut rewritten, &mut unguaranteed, &mut self_extract);
             let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
             let _ = scrub_nix_store_paths(&path);
             let _ = strip_absolute_needed(&path);
@@ -870,6 +876,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 scrubbed
             );
         }
+        report_unguaranteed_runpath(&unguaranteed, &self_extract);
     }
 
     // Patch PT_INTERP of every ELF with a bundled loader. This is what
@@ -1328,8 +1335,29 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
 /// First tries in-place patching of an existing DT_RPATH/DT_RUNPATH
 /// slot. If the binary has no slot or it's too small for our string
 /// (e.g. Bun, Go, Zig outputs), falls back to `patchelf --set-rpath`
-/// when available. Returns true if RUNPATH was successfully set.
-fn set_origin_runpath(path: &Path) -> io::Result<bool> {
+/// when available.
+///
+/// The outcome matters for re-exec safety: an executable that ends up
+/// without a baked-in `$ORIGIN` RUNPATH can only find its bundled libs
+/// via `LD_LIBRARY_PATH`, which is wiped when the app re-execs itself in
+/// a sandbox (`clearenv()` + `execve`). The caller surfaces those so the
+/// package isn't silently fragile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunpathOutcome {
+    /// `$ORIGIN` RUNPATH is baked into the ELF (in-place or via patchelf).
+    Set,
+    /// No RUNPATH needed: static binary, bare lib, or no DT_NEEDED.
+    NotNeeded,
+    /// Executable with deps but RUNPATH could not be guaranteed (no
+    /// in-place slot and patchelf missing or failed). Relies on
+    /// `LD_LIBRARY_PATH`; not sandbox-re-exec-safe.
+    Unguaranteed,
+    /// Executable with a self-extract trailer: patchelf would clobber
+    /// the trailer, so RUNPATH can't be added. Known limitation.
+    SelfExtract,
+}
+
+fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
     // Cover binaries at depth 1 (e.g. bin/foo), 2 (libexec/podman/x),
     // and 3 (share/pkg/helpers/y). Nonexistent entries are silently
     // ignored by the dynamic loader, so this is safe to apply
@@ -1355,10 +1383,15 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
     // PT_INTERP marks an executable; pure shared libraries lack it. We
     // only warn / fall back to patchelf for executables, since libs
     // typically resolve their deps via the executable's DT_RUNPATH.
-    let is_executable = elf
-        .program_headers
-        .iter()
-        .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
+    // glibc's libc.so.6 (and ld.so) carry PT_INTERP but are libraries,
+    // distinguished by a DT_SONAME; exclude anything with a SONAME so
+    // they aren't mis-flagged as un-RUNPATH'd app executables.
+    let has_soname = elf.soname.is_some();
+    let is_executable = !has_soname
+        && elf
+            .program_headers
+            .iter()
+            .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
 
     // Find .dynstr section file offset
     let dynstr_offset = elf
@@ -1401,7 +1434,7 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
         }
         if in_place_done {
             fs::write(path, &modified)?;
-            return Ok(true);
+            return Ok(RunpathOutcome::Set);
         }
     }
 
@@ -1410,21 +1443,21 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
     if !dynamic_present || !has_needed {
         // Nothing depends on libs (static binary, libc.so itself, the
         // dynamic loader, etc.). DT_RUNPATH wouldn't help here.
-        return Ok(false);
+        return Ok(RunpathOutcome::NotNeeded);
     }
 
     if !is_executable {
         // Shared libraries usually resolve their deps via the
         // executable's DT_RUNPATH (transitive search). Skip patchelf
         // and the noisy warning for bare libs.
-        return Ok(false);
+        return Ok(RunpathOutcome::NotNeeded);
     }
 
     if is_self_extract {
         // Don't risk patchelf growing the file and clobbering the
         // self-extract trailer. The runtime still sets LD_LIBRARY_PATH
         // as a fallback for these binaries.
-        return Ok(false);
+        return Ok(RunpathOutcome::SelfExtract);
     }
 
     // No usable in-place slot. Fall back to patchelf, which can
@@ -1440,7 +1473,7 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
             .stderr(std::process::Stdio::piped())
             .output();
         match status {
-            Ok(o) if o.status.success() => return Ok(true),
+            Ok(o) if o.status.success() => return Ok(RunpathOutcome::Set),
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 eprintln!(
@@ -1459,10 +1492,65 @@ fn set_origin_runpath(path: &Path) -> io::Result<bool> {
             }
         }
     }
-    // No patchelf available and no in-place slot. Caller still sets
-    // LD_LIBRARY_PATH at runtime as a fallback, so this isn't fatal.
+    // No patchelf available and no in-place slot. The runtime still sets
+    // LD_LIBRARY_PATH as a fallback for the initial launch, but it won't
+    // survive a sandboxed re-exec. The caller reports this.
+    Ok(RunpathOutcome::Unguaranteed)
+}
 
-    Ok(false)
+/// Apply `set_origin_runpath` and fold the outcome into the running
+/// tallies. `set` counts binaries that got a baked-in RUNPATH;
+/// `unguaranteed` / `self_extract` collect executables that did not, so
+/// the caller can warn that they aren't sandbox-re-exec-safe.
+fn tally_origin_runpath(
+    path: &Path,
+    set: &mut usize,
+    unguaranteed: &mut Vec<PathBuf>,
+    self_extract: &mut Vec<PathBuf>,
+) {
+    match set_origin_runpath(path) {
+        Ok(RunpathOutcome::Set) => *set += 1,
+        Ok(RunpathOutcome::Unguaranteed) => unguaranteed.push(path.to_path_buf()),
+        Ok(RunpathOutcome::SelfExtract) => self_extract.push(path.to_path_buf()),
+        Ok(RunpathOutcome::NotNeeded) | Err(_) => {}
+    }
+}
+
+/// Warn that the listed executables could not get a baked-in `$ORIGIN`
+/// RUNPATH and therefore won't survive a sandboxed re-exec. Printed once
+/// per bundling pass; empty input prints nothing.
+fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract: &[PathBuf]) {
+    if !unguaranteed.is_empty() {
+        eprintln!(
+            "{} {} executable(s) have no baked-in $ORIGIN RUNPATH and rely \
+             on LD_LIBRARY_PATH:",
+            color::bold_red("warning:"),
+            unguaranteed.len()
+        );
+        for p in unguaranteed {
+            eprintln!("  - {}", p.display());
+        }
+        eprintln!(
+            "  These break if the app re-execs itself in a sandbox \
+             (clearenv). Install `patchelf` (or set ONELF_PATCHELF) and \
+             repack to make them re-exec-safe."
+        );
+    }
+    if !self_extract.is_empty() {
+        eprintln!(
+            "{} {} self-extracting executable(s) can't take a baked-in \
+             RUNPATH (would clobber the embedded payload):",
+            color::bold_red("warning:"),
+            self_extract.len()
+        );
+        for p in self_extract {
+            eprintln!("  - {}", p.display());
+        }
+        eprintln!(
+            "  These rely on the runtime's LD_LIBRARY_PATH and are not \
+             sandbox-re-exec-safe."
+        );
+    }
 }
 
 /// Detect binaries that embed a self-extracting payload at the end of
