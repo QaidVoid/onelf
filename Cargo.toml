@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
   "crates/onelf",
-  "crates/onelf-env",
   "crates/onelf-format",
   "crates/onelf-preload",
   "crates/onelf-rt"

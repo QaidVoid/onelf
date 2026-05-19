@@ -1938,6 +1938,86 @@ fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Outcome of trying to make an entrypoint load the onelf-env
+/// constructor (re-exec-safe `.onelf/env` / `.onelf/preload`).
+enum EnvNeededOutcome {
+    /// `libonelf-env.so` is now a DT_NEEDED of the binary.
+    Added,
+    /// Already a DT_NEEDED (idempotent repack).
+    AlreadyPresent,
+    /// No onelf-env blob built for this arch; runtime-only env.
+    NoBlobForArch,
+    /// patchelf unavailable, so DT_NEEDED couldn't be added; the binary
+    /// falls back to runtime-set env (not sandbox-re-exec-safe).
+    NoPatchelf,
+    /// Self-extract trailer or unsupported ELF: left untouched.
+    Skipped,
+}
+
+/// Stage the arch-appropriate `libonelf-env.so` into `lib_dest` and add
+/// it as a `DT_NEEDED` of `path`. Run on the pristine binary *before*
+/// bootstrap injection so patchelf operates on a normal ELF (the
+/// bootstrap later only repurposes PT_INTERP and appends at EOF, which
+/// doesn't disturb the added DT_NEEDED).
+fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<EnvNeededOutcome> {
+    let data = fs::read(path)?;
+    if data.len() < 20 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
+        return Ok(EnvNeededOutcome::Skipped); // not a 64-bit ELF
+    }
+    // patchelf would grow a self-extract binary and clobber its trailer.
+    if has_self_extract_trailer(&data) {
+        return Ok(EnvNeededOutcome::Skipped);
+    }
+    let e_machine = u16::from_le_bytes([data[18], data[19]]);
+    let Some(blob) = crate::payload::onelf_env_blob(e_machine) else {
+        return Ok(EnvNeededOutcome::NoBlobForArch);
+    };
+
+    // Skip if this binary already lists the constructor (idempotent).
+    if let Ok(elf) = goblin::elf::Elf::parse(&data) {
+        if elf
+            .libraries
+            .iter()
+            .any(|l| *l == crate::payload::ONELF_ENV_SONAME)
+        {
+            return Ok(EnvNeededOutcome::AlreadyPresent);
+        }
+    }
+
+    // Stage the blob into lib/ (write once; idempotent across binaries).
+    let dest = lib_dest.join(crate::payload::ONELF_ENV_SONAME);
+    let need_write = match fs::read(&dest) {
+        Ok(existing) => existing != blob,
+        Err(_) => true,
+    };
+    if need_write {
+        fs::create_dir_all(lib_dest)?;
+        fs::write(&dest, blob)?;
+        let _ = fs::set_permissions(
+            &dest,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        );
+    }
+
+    let Some(patchelf) = which_patchelf() else {
+        return Ok(EnvNeededOutcome::NoPatchelf);
+    };
+    let out = std::process::Command::new(&patchelf)
+        .arg("--add-needed")
+        .arg(crate::payload::ONELF_ENV_SONAME)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(EnvNeededOutcome::Added),
+        Ok(o) => Err(io::Error::other(
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 /// Walk every ELF under `app_dir` and inject the AT_EXECFN bootstrap
 /// so the bundled interpreter is found relative to each binary's own
 /// location. CWD-independent. Returns the count of injected files.
@@ -1948,6 +2028,9 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
         .to_path_buf();
 
     let mut injected = 0usize;
+    let mut env_added = 0usize;
+    let mut env_no_patchelf: Vec<PathBuf> = Vec::new();
+    let mut env_no_blob = false;
     for path in find_elf_files(app_dir) {
         let Some(interp) = parse_interp(&path) else {
             continue;
@@ -1992,6 +2075,25 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
                 std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
             );
         }
+        // Make .onelf/env + .onelf/preload re-exec-safe by injecting the
+        // onelf-env constructor as a DT_NEEDED (resolved via the
+        // $ORIGIN RUNPATH set earlier). Done before bootstrap injection
+        // so patchelf sees a normal ELF.
+        match add_onelf_env_needed(&path, lib_dest) {
+            Ok(EnvNeededOutcome::Added) => env_added += 1,
+            Ok(EnvNeededOutcome::AlreadyPresent) => {}
+            Ok(EnvNeededOutcome::NoBlobForArch) => env_no_blob = true,
+            Ok(EnvNeededOutcome::NoPatchelf) => env_no_patchelf.push(path.clone()),
+            Ok(EnvNeededOutcome::Skipped) => {}
+            Err(e) => {
+                eprintln!(
+                    "  {} could not add onelf-env to {}: {e}",
+                    color::bold_red("warning:"),
+                    path.display()
+                );
+            }
+        }
+
         match inject_relative_interp(&path, &rel_interp) {
             Ok(true) => injected += 1,
             Ok(false) => {}
@@ -2006,6 +2108,37 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
         if needs_chmod {
             let _ = fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(perms));
         }
+    }
+
+    if env_added > 0 {
+        eprintln!(
+            "{} onelf-env (re-exec-safe .onelf/env) into {} binaries",
+            color::bold("Injected"),
+            env_added
+        );
+    }
+    if !env_no_patchelf.is_empty() {
+        eprintln!(
+            "{} patchelf unavailable; {} executable(s) won't re-apply \
+             .onelf/env after a sandboxed re-exec:",
+            color::bold_red("warning:"),
+            env_no_patchelf.len()
+        );
+        for p in &env_no_patchelf {
+            eprintln!("  - {}", p.display());
+        }
+        eprintln!(
+            "  Install `patchelf` (or set ONELF_PATCHELF) and repack for \
+             re-exec-safe env."
+        );
+    }
+    if env_no_blob {
+        eprintln!(
+            "{} no onelf-env blob built for this target arch; \
+             .onelf/env is runtime-only (not sandbox-re-exec-safe). \
+             Build it via crates/onelf/src/payload/Makefile.",
+            color::bold_red("warning:"),
+        );
     }
     Ok(injected)
 }

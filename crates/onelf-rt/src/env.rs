@@ -317,6 +317,17 @@ fn setup_xdg_data_dirs(pkg: &Path) {
 /// Apply custom environment variables from `.onelf/env` data.
 /// Each line is `KEY=VALUE`. Values containing `${ONELF_DIR}` are
 /// expanded to the package root at runtime.
+///
+/// This is the *first-launch / fallback* env layer. The re-exec-safe
+/// layer is the bundled `onelf-env` constructor (injected as a
+/// DT_NEEDED of the entrypoint), which re-applies the same `.onelf/env`
+/// on every exec including after a sandboxed `clearenv()`. The two are
+/// intentionally redundant: when the constructor is present they set
+/// identical `KEY=VALUE` pairs (order-independent, last-writer-wins), so
+/// double application is a no-op. This runtime pass is still required
+/// for packages where the constructor could not be wired (patchelf
+/// unavailable at pack time, no onelf-env blob for the target arch, or
+/// self-extract binaries that can't take a DT_NEEDED).
 pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
     let Ok(text) = std::str::from_utf8(env_data) else {
         return;
