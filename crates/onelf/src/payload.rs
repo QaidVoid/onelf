@@ -68,3 +68,36 @@ pub fn patch_aarch64_adr(blob: &mut [u8], target_offset: usize) {
     insn = (insn & 0x9f00001f) | (immlo << 29) | (immhi << 5);
     blob[pc..pc + 4].copy_from_slice(&insn.to_le_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EM_X86_64: u16 = 62;
+    const EM_AARCH64: u16 = 183;
+
+    #[test]
+    fn x86_64_blob_is_valid_elf_for_its_machine() {
+        let blob = onelf_env_blob(EM_X86_64)
+            .expect("x86_64 onelf-env blob must be built and committed");
+        assert_eq!(&blob[0..4], b"\x7fELF");
+        assert_eq!(u16::from_le_bytes([blob[18], blob[19]]), EM_X86_64);
+    }
+
+    #[test]
+    fn unbuilt_or_unknown_arch_returns_none() {
+        // aarch64 ships as an empty placeholder until built in an
+        // aarch64 toolchain; it must not be injected.
+        assert!(onelf_env_blob(EM_AARCH64).is_none());
+        // Unsupported machine.
+        assert!(onelf_env_blob(0xffff).is_none());
+    }
+
+    #[test]
+    fn machine_mismatch_is_rejected() {
+        // Asking for aarch64 must never hand back the x86_64 blob.
+        if let Some(b) = onelf_env_blob(EM_AARCH64) {
+            assert_eq!(u16::from_le_bytes([b[18], b[19]]), EM_AARCH64);
+        }
+    }
+}
