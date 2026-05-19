@@ -64,6 +64,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--level N` | `12` | Zstd compression level (0 to 22) |
 | `--dict` | `false` | Train shared zstd dictionary |
 | `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
+| `--preload PATH` | | Library dlopen'd on every exec via onelf-env (repeatable, re-exec-safe) |
 | `--memfd` | auto | Force memfd eligibility on |
 | `--no-memfd` | | Force memfd eligibility off |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |

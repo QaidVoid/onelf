@@ -137,6 +137,27 @@ mount, tmpfs, or cache dir depending on execution mode), so values
 follow the running app wherever it lives. Other `${VAR}` references
 expand at recipe-load time against the packer's environment.
 
+These variables are **re-exec-safe**: a small `onelf-env` constructor
+is bundled into `lib/` and injected as a `DT_NEEDED` of the entrypoint,
+so `.onelf/env` is re-applied on every exec — including after an app
+re-execs itself in a sandbox that calls `clearenv()` (Chromium/Electron
+zygotes, Steam, bwrap, etc.). This requires `patchelf` at pack time;
+without it the values are only set for the first launch. See
+[Environment › Surviving a sandboxed re-exec](./environment#surviving-a-sandboxed-re-exec).
+
+### `preload`
+
+A top-level list of libraries to `dlopen` on every exec, via the same
+`onelf-env` constructor. Unlike `LD_PRELOAD` (an env var, wiped by a
+sandboxed re-exec), this is baked into the ELF and survives.
+
+```toml
+preload = ["${ONELF_DIR}/lib/libfoo.so", "libbar.so"]
+```
+
+`${ONELF_DIR}` expands at runtime. CLI equivalent: `--preload PATH`
+(repeatable).
+
 ## Environment variable expansion
 
 Any string in `[bundle] search-paths` (and other path fields) expands

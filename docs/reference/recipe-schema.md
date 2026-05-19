@@ -23,6 +23,8 @@ user-facing guide.
 
 [env]
 # optional, custom environment variables set before exec
+
+# preload = [...]   optional, libs dlopen'd on every exec (top-level key)
 ```
 
 Unknown fields are rejected (`deny_unknown_fields`) to catch typos.
@@ -128,6 +130,23 @@ before `exec`. Values support `${ONELF_DIR}` expansion at runtime,
 which resolves to the package root (FUSE mount, tmpfs path, or cache
 dir depending on execution mode). Other `${VAR}` references are
 expanded against the user's environment at recipe-load time.
+
+`.onelf/env` is also re-applied by the bundled `onelf-env` constructor
+(`DT_NEEDED` on the entrypoint), so these survive a sandboxed
+`clearenv()` + re-exec. The constructor is wired only when `patchelf`
+is available at pack time and an `onelf-env` blob exists for the target
+arch; otherwise the values are runtime-only (first launch).
+
+## `preload`
+
+```toml
+preload = ["${ONELF_DIR}/lib/libpreload.so", "libfoo.so"]
+```
+
+Top-level array of libraries `dlopen`'d on every exec by the
+`onelf-env` constructor. `${ONELF_DIR}` expands at runtime. Survives
+sandboxed re-exec (baked into the ELF via `DT_NEEDED`), unlike
+`LD_PRELOAD`. CLI: `--preload PATH` (repeatable).
 
 ## Env var expansion
 

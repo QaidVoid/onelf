@@ -80,6 +80,36 @@ QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 
 See [Recipe File](./recipe#env) for details.
 
+## Surviving a sandboxed re-exec
+
+Some apps re-exec themselves with a wiped environment (Chromium and
+Electron zygotes, Steam, `bwrap`-based sandboxes). Anything the runtime
+exported via `LD_LIBRARY_PATH` or `[env]` is lost across that
+`clearenv()` + `execve()`, because the runtime is no longer in the
+loop on the re-exec.
+
+onelf makes this survive by moving the guarantee into the ELF itself,
+not the environment:
+
+- **Libraries**: `bundle-libs` bakes an `$ORIGIN/../lib` `DT_RUNPATH`
+  into binaries, so bundled libs resolve relative to the binary's own
+  location on every exec. Executables that could not get one (no
+  in-place slot and no `patchelf`, or self-extract binaries) are
+  reported at pack time — they fall back to `LD_LIBRARY_PATH` and are
+  not re-exec-safe.
+- **`[env]` and `preload`**: a tiny freestanding `onelf-env`
+  constructor is bundled into `lib/` and injected as a `DT_NEEDED` of
+  the entrypoint. Because `DT_NEEDED` lives in the ELF and is resolved
+  via the `$ORIGIN` RUNPATH above, it loads on *every* exec; its
+  constructor re-applies `.onelf/env` and `.onelf/preload` before
+  `main()`, no matter how the app cleared the environment.
+
+The `onelf-env` injection requires `patchelf` at pack time (set
+`ONELF_PATCHELF` to override its location) and a prebuilt `onelf-env`
+blob for the target architecture. When either is missing, packing
+prints a warning and `[env]` is applied only on the first launch (the
+runtime layer), not after a re-exec.
+
 ## Set by the user
 
 | Variable | Effect |
