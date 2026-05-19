@@ -78,6 +78,11 @@ PYTHONHOME = "${ONELF_DIR}/python"
 QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 ```
 
+`${ONELF_DIR}` and `$${VAR}` (escaped, expanded against the **live**
+environment at runtime) let values prepend instead of replace.
+`PATH` defaults to `${ONELF_DIR}/bin:$${PATH}` — the package's `bin/`
+is always on `PATH` (re-exec-safe) unless `[env]` sets `PATH` itself.
+
 See [Recipe File](./recipe#env) for details.
 
 ## Surviving a sandboxed re-exec

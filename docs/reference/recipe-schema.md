@@ -125,11 +125,18 @@ RESVG_LIB_DIR = "${ONELF_DIR}/lib"
 QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 ```
 
-Each `KEY = "VALUE"` pair becomes an env var set by the runtime
-before `exec`. Values support `${ONELF_DIR}` expansion at runtime,
-which resolves to the package root (FUSE mount, tmpfs path, or cache
-dir depending on execution mode). Other `${VAR}` references are
-expanded against the user's environment at recipe-load time.
+Each `KEY = "VALUE"` pair becomes an env var set before `exec`.
+`${ONELF_DIR}` expands at runtime to the package root (FUSE mount,
+tmpfs, or cache dir). Other `${VAR}` expand at **recipe-load** time
+against the packer's environment; `$$` is an escape for a literal `$`,
+so `$${VAR}` reaches the package as `${VAR}` and expands against the
+**live** environment at runtime (unset → empty) — use this to prepend
+instead of replace.
+
+`PATH` defaults to `${ONELF_DIR}/bin:$${PATH}` (the package's `bin/`
+is prepended, re-exec-safe) unless `[env]` sets `PATH` explicitly, in
+which case that value is used verbatim (`PATH = "$${PATH}"` opts out
+of the prefix).
 
 `.onelf/env` is also re-applied by the bundled `onelf-env` constructor
 (`DT_NEEDED` on the entrypoint), so these survive a sandboxed
