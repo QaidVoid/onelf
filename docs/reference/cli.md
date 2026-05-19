@@ -63,6 +63,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--lib-dir DIR` | `[auto]` | Library dir for `LD_LIBRARY_PATH` (repeatable) |
 | `--level N` | `12` | Zstd compression level (0 to 22) |
 | `--dict` | `false` | Train shared zstd dictionary |
+| `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
 | `--memfd` | auto | Force memfd eligibility on |
 | `--no-memfd` | | Force memfd eligibility off |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |

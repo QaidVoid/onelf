@@ -68,11 +68,18 @@ default unless another entry has `default = true`.
 [compression]
 level = 12     # i32, 0..=22, default 12
 dict = false   # bool, default false
+store = false  # bool, default false
 ```
 
 Higher levels pack tighter but are slower. `dict = true` trains a shared
 zstd dictionary across blocks, which helps ratios for packages with many
 small text files.
+
+`store = true` writes the payload raw with no zstd at all, trading
+package size for zero decompression at runtime. It overrides `dict` and
+`level`. Useful when the payload is dominated by already-compressed or
+incompressible assets. The manifest stays compressed regardless (it is
+small and separate from the payload).
 
 ## `[update]`
 

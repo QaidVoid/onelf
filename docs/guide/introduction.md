@@ -25,7 +25,7 @@ without a system-wide installation or distro-specific packages.
 ├─────────────────────────────────────┤
 │ Manifest (zstd-compressed)          │  File tree, entrypoints, metadata
 ├─────────────────────────────────────┤
-│ Payload                             │  File contents in 256 KB zstd blocks
+│ Payload                             │  File contents in 256 KB blocks (zstd or raw)
 │  - block 0                          │
 │  - block 1                          │
 │  - ...                              │

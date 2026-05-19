@@ -15,7 +15,7 @@ A packed onelf file is up to five concatenated sections:
 │  - string_table                    │
 ├────────────────────────────────────┤
 │ Payload                            │
-│  zstd-compressed 256 KB blocks     │
+│  256 KB blocks, zstd or raw        │
 ├────────────────────────────────────┤
 │ Dictionary (optional, raw)         │
 ├────────────────────────────────────┤
@@ -35,7 +35,7 @@ manifest, payload, and dictionary begin.
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
 | 8 | 2 | format_version | `1` |
-| 10 | 2 | flags | `MEMFD_HINT` (1), reserved bits |
+| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
 | 28 | 8 | manifest_original | Uncompressed manifest size |
@@ -107,10 +107,10 @@ Each `Block` is `(payload_offset: u64, compressed_size: u64, original_size: u64)
 
 ## Payload
 
-Contiguous sequence of zstd-compressed blocks. Block boundaries are
-defined entirely by the `blocks` arrays in the manifest. The format
-allows two entries to point at the same block, but pack.rs currently
-emits per-entry block lists with no content-level deduplication.
+Contiguous sequence of blocks. Block boundaries are defined entirely by
+the `blocks` arrays in the manifest. The format allows two entries to
+point at the same block, but pack.rs currently emits per-entry block
+lists with no content-level deduplication.
 
 Block size defaults to 256 KB uncompressed. Each block is compressed
 independently, which lets the runtime decompress them lazily as the
@@ -118,6 +118,13 @@ entrypoint reads files.
 
 If a dictionary is present (`dict_size > 0`), each block is decompressed
 against that dictionary.
+
+When the `STORED` footer flag is set (`onelf pack --no-compress` or
+`[compression] store = true`), blocks are written raw with no zstd:
+`compressed_size == original_size` for every block, and the runtime
+reads the bytes verbatim with zero decompression. `STORED` and
+`HAS_DICT` are mutually exclusive. The manifest stays zstd-compressed
+either way.
 
 ## Reading a packed file
 

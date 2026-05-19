@@ -93,6 +93,7 @@ entrypoint automatically.
 |-------|------|---------|-------------|
 | `level` | int | `12` | Zstd level, 0 to 22 |
 | `dict` | bool | `false` | Train a shared dictionary for better ratio |
+| `store` | bool | `false` | Store payload raw, no zstd (overrides `dict`/`level`) |
 
 ### `[update]`
 
