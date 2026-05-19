@@ -79,9 +79,11 @@ QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 ```
 
 `${ONELF_DIR}` and `$${VAR}` (escaped, expanded against the **live**
-environment at runtime) let values prepend instead of replace.
-`PATH` defaults to `${ONELF_DIR}/bin:$${PATH}` — the package's `bin/`
-is always on `PATH` (re-exec-safe) unless `[env]` sets `PATH` itself.
+environment at runtime, with POSIX `${VAR:-word}` defaults) let values
+prepend instead of replace. `PATH` defaults to
+`${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}` — the package's `bin/` is
+always on `PATH` (re-exec-safe), falling back to `/usr/bin:/bin` when
+the inherited PATH is empty — unless `[env]` sets `PATH` itself.
 
 See [Recipe File](./recipe#env) for details.
 

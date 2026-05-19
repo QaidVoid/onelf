@@ -130,13 +130,16 @@ Each `KEY = "VALUE"` pair becomes an env var set before `exec`.
 tmpfs, or cache dir). Other `${VAR}` expand at **recipe-load** time
 against the packer's environment; `$$` is an escape for a literal `$`,
 so `$${VAR}` reaches the package as `${VAR}` and expands against the
-**live** environment at runtime (unset → empty) — use this to prepend
-instead of replace.
+**live** environment at runtime — use this to prepend instead of
+replace. POSIX `${VAR:-word}` is supported (use `word` if `VAR` is
+unset or empty).
 
-`PATH` defaults to `${ONELF_DIR}/bin:$${PATH}` (the package's `bin/`
-is prepended, re-exec-safe) unless `[env]` sets `PATH` explicitly, in
-which case that value is used verbatim (`PATH = "$${PATH}"` opts out
-of the prefix).
+`PATH` defaults to `${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}` (the
+package's `bin/` prepended, re-exec-safe; falls back to `/usr/bin:/bin`
+when the inherited PATH is empty, since onelf setting `PATH` suppresses
+glibc's `_CS_PATH` fallback) unless `[env]` sets `PATH` explicitly, in
+which case that value is used verbatim (`PATH = "$${PATH}"` opts out of
+the prefix).
 
 `.onelf/env` is also re-applied by the bundled `onelf-env` constructor
 (`DT_NEEDED` on the entrypoint), so these survive a sandboxed

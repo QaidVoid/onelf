@@ -139,8 +139,9 @@ expand at recipe-load time against the **packer's** environment.
 
 To defer a reference to **runtime** instead, escape the `$` with `$$`:
 `$${VAR}` reaches the package as `${VAR}` and is expanded against the
-**live** process environment when the app runs (unset → empty). This
-is how you *prepend* rather than replace, e.g.:
+**live** process environment when the app runs. POSIX
+`${VAR:-word}` is supported: if `VAR` is unset *or empty*, the literal
+`word` is used instead. This is how you *prepend* rather than replace:
 
 ```toml
 [env]
@@ -148,15 +149,21 @@ PATH = "${ONELF_DIR}/bin:$${PATH}"   # bin/ first, keep the caller's PATH
 ```
 
 **`$ONELF_DIR/bin` is added to `PATH` by default.** Every package
-behaves as if it had `PATH = "${ONELF_DIR}/bin:$${PATH}"` so bundled
-helpers resolve even when the app or a sandbox clears `PATH` (glibc's
-`_CS_PATH` fallback is `/bin:/usr/bin` and can't be redirected). Set
-`[env] PATH` yourself to take full control (the default is then
-skipped); use `PATH = "$${PATH}"` to opt out of the `bin/` prefix
-entirely. Caveat: if the inherited `PATH` is empty (e.g. after
-`clearenv()`), `${ONELF_DIR}/bin:${PATH}` ends in a trailing `:`
-(an empty element = CWD); add explicit fallbacks
-(`${ONELF_DIR}/bin:/usr/bin:/bin`) if that matters.
+behaves as if it had:
+
+```toml
+[env]
+PATH = "${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}"
+```
+
+so bundled helpers resolve even when the app or a sandbox clears
+`PATH`. (glibc's `_CS_PATH` fallback — `/bin:/usr/bin` — only applies
+when `PATH` is *unset*; the moment onelf sets `PATH` it no longer
+kicks in, so the `:-/usr/bin:/bin` default substitutes it explicitly
+when the inherited `PATH` is empty, instead of leaving a dangling
+empty element.) Set `[env] PATH` yourself to take full control (the
+default is then skipped); use `PATH = "$${PATH}"` to opt out of the
+`bin/` prefix entirely.
 
 These variables are **re-exec-safe**: a small `onelf-env` constructor
 is bundled into `lib/` and injected as a `DT_NEEDED` of the entrypoint,
