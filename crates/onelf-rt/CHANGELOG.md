@@ -1,4 +1,13 @@
 
+## [0.2.6](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.5...onelf-rt-v0.2.6) - 2026-05-19
+
+### ⛰️  Features
+
+- *(env)* POSIX ${VAR:-word} default; PATH falls back to /usr/bin:/bin - ([fd8ec65](https://github.com/QaidVoid/onelf/commit/fd8ec65180ffa19704f497265979672f0669cb15))
+- *(env)* Runtime ${VAR} passthrough + $ONELF_DIR/bin on PATH by default - ([c81904b](https://github.com/QaidVoid/onelf/commit/c81904b6b850f1c9246bbf0ad5df0b230181e5f7))
+- Re-exec-safe payload-side env via onelf-env DT_NEEDED constructor - ([e369c92](https://github.com/QaidVoid/onelf/commit/e369c922f7945b6615cc4f49e0404109021a29c7))
+- Add store mode for uncompressed payloads - ([7da4dd1](https://github.com/QaidVoid/onelf/commit/7da4dd1d9a05eaac96f24d33773b00c87837a0f4))
+
 ## [0.2.5](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.4...onelf-rt-v0.2.5) - 2026-04-25
 
 ### ⛰️  Features
