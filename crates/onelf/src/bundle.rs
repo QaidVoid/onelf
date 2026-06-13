@@ -1057,11 +1057,12 @@ fn detect_frameworks(directory: &Path, target: Option<&Path>) -> FrameworkFlags 
             }
         }
 
-        // Also scan for literal soname strings in the binary. Apps like
-        // Blender don't DT_NEED libwayland-cursor or libdecor; they
-        // dlopen them at runtime after detecting the session type.
-        // Without a string scan, detect_frameworks would miss wayland
-        // on such apps and the user would have to pass --wayland.
+        // Scan for NUL-terminated soname strings in the binary. C/C++
+        // apps like Blender don't DT_NEED libwayland-cursor or libdecor;
+        // they dlopen them at runtime. This catches those cases for
+        // binaries with proper NUL-separated string tables. Rust binaries
+        // with merged string sections won't trigger false positives here;
+        // users should pass --scan-dlopen or explicit framework flags.
         if let Ok(bytes) = fs::read(path) {
             scan_framework_strings(&bytes, &mut flags);
         }
@@ -1106,6 +1107,13 @@ fn inspect_soname_for_frameworks(soname: &str, flags: &mut FrameworkFlags) {
 /// would make us enable a framework bundler. Only matches on well-known
 /// soname prefixes to avoid false positives from arbitrary strings in
 /// the binary.
+///
+/// Requires the match to start at a NUL boundary (preceded by `0x00` or
+/// at offset 0). This avoids false positives from:
+/// - Rust's string-merging optimization which packs string literals
+///   together without NUL separators (e.g. `glWaitSynclibEGL.so.1...`)
+/// - Error messages embedding soname-like text (e.g. `"Library
+///   libwayland-client.so could not be loaded."`)
 fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
     const PREFIXES: &[&[u8]] = &[
         b"libGL.so",
@@ -1133,10 +1141,9 @@ fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
         }
         for needle in &needles {
             if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == *needle {
-                // The printable path normally ends at a NUL; bail out
-                // if the byte after the match is a printable path char
-                // (digit, dot): we still match the prefix when iteration
-                // continues past this point, or stop on NUL.
+                if i > 0 && bytes[i - 1] != 0 {
+                    break;
+                }
                 if let Ok(soname) = std::str::from_utf8(&bytes[i..i + needle.len()]) {
                     inspect_soname_for_frameworks(soname, flags);
                 }
