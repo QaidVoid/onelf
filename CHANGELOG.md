@@ -1,4 +1,10 @@
 
+## [0.2.7](https://github.com/QaidVoid/onelf/compare/0.2.6...0.2.7) - 2026-06-13
+
+### 🐛 Bug Fixes
+
+- Require NUL boundary in scan_framework_strings to avoid false framework detection - ([f7bc735](https://github.com/QaidVoid/onelf/commit/f7bc735c34a9528df302f711e5b61e53e90808d0))
+
 ## [0.2.6](https://github.com/QaidVoid/onelf/compare/0.2.5...0.2.6) - 2026-05-19
 
 ### ⛰️  Features
