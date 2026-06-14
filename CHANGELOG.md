@@ -1,4 +1,18 @@
 
+## [0.2.8](https://github.com/QaidVoid/onelf/compare/0.2.7...0.2.8) - 2026-06-14
+
+### ⛰️  Features
+
+- *(bundle)* Detect frameworks by versioned soname; add --no-* opt-outs - ([843dd80](https://github.com/QaidVoid/onelf/commit/843dd803cf4d0c9e7a8467da6bf27bed72e53cfb))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Keep EGL vendor JSON whose library_path is a bare soname - ([b65010b](https://github.com/QaidVoid/onelf/commit/b65010bcfc98ef21bfc8c0fcfe124f48e8b73dd3))
+
+### 🎨 Styling
+
+- Rustfmt assert! and data builder in pipeline test - ([c81b7da](https://github.com/QaidVoid/onelf/commit/c81b7dae4d6c8d098079e02c8c70cf5f58805f5e))
+
 ## [0.2.7](https://github.com/QaidVoid/onelf/compare/0.2.6...0.2.7) - 2026-06-13
 
 ### 🐛 Bug Fixes
