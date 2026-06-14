@@ -95,7 +95,9 @@ fn store_mode_roundtrips_byte_exact() {
     write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
     // Incompressible-ish payload so a bug that still compresses is caught
     // by the size/extract check, not masked by zstd.
-    let data: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let data: Vec<u8> = (0..200_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     std::fs::create_dir_all(app.join("bin")).unwrap();
     std::fs::write(app.join("bin/data.bin"), &data).unwrap();
 
@@ -112,7 +114,11 @@ fn store_mode_roundtrips_byte_exact() {
         ],
         None,
     );
-    assert!(o.status.success(), "pack: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 
     // Extract the file back and compare bytes.
     let outdir = td.join("out");
@@ -125,7 +131,11 @@ fn store_mode_roundtrips_byte_exact() {
         ],
         None,
     );
-    assert!(o.status.success(), "extract: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "extract: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let got = std::fs::read(outdir.join("bin/data.bin")).unwrap();
     assert_eq!(got, data, "stored payload did not round-trip");
 
@@ -162,7 +172,11 @@ fn preload_list_is_emitted() {
         ],
         None,
     );
-    assert!(o.status.success(), "pack: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 
     let o = run_onelf(
         &[
