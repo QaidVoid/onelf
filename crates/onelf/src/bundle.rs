@@ -3378,42 +3378,56 @@ fn copy_vendor_json(
 
             let (rewritten, so_path) = rewrite_library_path(&content, &path);
 
-            // If we found a library_path, validate ELF class and copy the .so
+            // A vendor JSON's `library_path` is either an absolute path to the
+            // implementation `.so` (Vulkan ICDs, NixOS configs) or a bare
+            // soname like `libEGL_mesa.so.0` (the Mesa EGL vendor config). In
+            // the bare-soname case the path is not resolvable on disk and the
+            // library is bundled by the Mesa/glvnd step instead, so we copy the
+            // `.so` here only when the JSON points at a real file. We must NOT
+            // drop the JSON when it does not: doing so previously skipped the
+            // Mesa EGL vendor config entirely (its `read_elf_class` on the
+            // unresolvable path returned None, failing the class check), so
+            // libglvnd had no vendor to load in a clean environment such as a
+            // distrobox container and EGL came up with zero backends.
             if let Some(ref so_src) = so_path {
-                let resolved = fs::canonicalize(so_src).unwrap_or(so_src.clone());
-                // Architecture-specific driver filter
-                if let Some(allowed) = driver_filter {
-                    let so_fname = resolved.file_name().unwrap_or_default().to_string_lossy();
-                    if !allowed.iter().any(|a| so_fname.starts_with(a)) {
-                        continue;
-                    }
-                }
-                if let Some(tc) = target_class {
-                    if read_elf_class(&resolved) != Some(tc) {
-                        continue;
-                    }
-                }
+                let resolved = fs::canonicalize(so_src).unwrap_or_else(|_| so_src.clone());
                 let so_name = resolved
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                let so_size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-                eprintln!(
-                    "  {} <- {} ({})",
-                    color::bold_green(&so_name),
-                    resolved.display(),
-                    color::dim(&format_size(so_size))
-                );
-                if !dry_run {
-                    fs::create_dir_all(lib_dest)?;
-                    let dest_so = lib_dest.join(&so_name);
-                    if !dest_so.exists() {
-                        fs::copy(&resolved, &dest_so)?;
-                        let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
-                    }
+
+                // Architecture-specific driver filter (matches on filename, so
+                // it works for both absolute paths and bare sonames).
+                if let Some(allowed) = driver_filter
+                    && !allowed.iter().any(|a| so_name.starts_with(a))
+                {
+                    continue;
                 }
-                total_bytes += so_size;
+
+                if resolved.is_file() {
+                    if let Some(tc) = target_class
+                        && read_elf_class(&resolved) != Some(tc)
+                    {
+                        continue;
+                    }
+                    let so_size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+                    eprintln!(
+                        "  {} <- {} ({})",
+                        color::bold_green(&so_name),
+                        resolved.display(),
+                        color::dim(&format_size(so_size))
+                    );
+                    if !dry_run {
+                        fs::create_dir_all(lib_dest)?;
+                        let dest_so = lib_dest.join(&so_name);
+                        if !dest_so.exists() {
+                            fs::copy(&resolved, &dest_so)?;
+                            let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
+                        }
+                    }
+                    total_bytes += so_size;
+                }
             }
 
             eprintln!("  {} <- {}", color::bold_green(&name), path.display());
