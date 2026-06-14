@@ -87,6 +87,14 @@ dict = false
 # wayland = false
 # gtk = false
 
+# Opt out of a framework even when auto-detection would enable it (useful
+# for a GUI-capable binary you only ship as a TUI).
+# no-gl = false
+# no-dri = false
+# no-vulkan = false
+# no-wayland = false
+# no-gtk = false
+
 # Strip debug symbols from bundled libs.
 # strip = false
 

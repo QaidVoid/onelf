@@ -246,6 +246,13 @@ pub struct BundleOptions {
     pub vulkan: bool,
     pub wayland: bool,
     pub gtk: bool,
+    /// Suppress a framework even when auto-detection or an explicit flag
+    /// would otherwise enable it. Opt-out wins over both.
+    pub no_gl: bool,
+    pub no_dri: bool,
+    pub no_vulkan: bool,
+    pub no_wayland: bool,
+    pub no_gtk: bool,
     pub strip: bool,
     pub strict_libc: bool,
     pub scan_dlopen: bool,
@@ -289,40 +296,52 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     // Auto-detect frameworks from the input binaries' DT_NEEDED entries.
     // User-provided flags are OR'd with detected flags so explicit opt-ins win
-    // but the tool does the right thing when the user passes nothing.
+    // but the tool does the right thing when the user passes nothing. A matching
+    // no_* opt-out always wins, so a user can drop a framework that detection or
+    // an explicit flag would otherwise pull in (e.g. a GUI-capable binary that
+    // they only ship as a TUI).
     let detected = detect_frameworks(&opts.directory, opts.target.as_deref());
-    let want_gl = opts.gl || detected.gl;
-    let want_dri = opts.dri || detected.dri;
-    let want_vulkan = opts.vulkan || detected.vulkan;
-    let want_wayland = opts.wayland || detected.wayland;
-    let want_gtk = opts.gtk || detected.gtk;
+    let want_gl = (opts.gl || detected.gl) && !opts.no_gl;
+    let want_dri = (opts.dri || detected.dri) && !opts.no_dri;
+    let want_vulkan = (opts.vulkan || detected.vulkan) && !opts.no_vulkan;
+    let want_wayland = (opts.wayland || detected.wayland) && !opts.no_wayland;
+    let want_gtk = (opts.gtk || detected.gtk) && !opts.no_gtk;
 
-    if (detected.gl || detected.dri || detected.vulkan || detected.wayland || detected.gtk)
-        && (!opts.gl || !opts.dri || !opts.vulkan || !opts.wayland || !opts.gtk)
-    {
-        let mut parts = Vec::new();
-        if detected.gl && !opts.gl {
-            parts.push("gl");
-        }
-        if detected.dri && !opts.dri {
-            parts.push("dri");
-        }
-        if detected.vulkan && !opts.vulkan {
-            parts.push("vulkan");
-        }
-        if detected.wayland && !opts.wayland {
-            parts.push("wayland");
-        }
-        if detected.gtk && !opts.gtk {
-            parts.push("gtk");
-        }
-        if !parts.is_empty() {
-            eprintln!(
-                "  {} auto-enabled: {}",
-                color::bold("Frameworks:"),
-                parts.join(", ")
-            );
-        }
+    // Report frameworks detection turned on that the user did not request,
+    // and frameworks the user explicitly suppressed, so the outcome is visible.
+    let auto: Vec<&str> = [
+        (detected.gl && !opts.gl && want_gl, "gl"),
+        (detected.dri && !opts.dri && want_dri, "dri"),
+        (detected.vulkan && !opts.vulkan && want_vulkan, "vulkan"),
+        (detected.wayland && !opts.wayland && want_wayland, "wayland"),
+        (detected.gtk && !opts.gtk && want_gtk, "gtk"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !auto.is_empty() {
+        eprintln!(
+            "  {} auto-enabled: {}",
+            color::bold("Frameworks:"),
+            auto.join(", ")
+        );
+    }
+    let suppressed: Vec<&str> = [
+        (detected.gl && opts.no_gl, "gl"),
+        (detected.dri && opts.no_dri, "dri"),
+        (detected.vulkan && opts.no_vulkan, "vulkan"),
+        (detected.wayland && opts.no_wayland, "wayland"),
+        (detected.gtk && opts.no_gtk, "gtk"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !suppressed.is_empty() {
+        eprintln!(
+            "  {} suppressed: {}",
+            color::bold("Frameworks:"),
+            suppressed.join(", ")
+        );
     }
 
     // Bundle GPU assets first so DRI driver .so files are present when
@@ -496,12 +515,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         std::os::unix::fs::PermissionsExt::from_mode(perms | 0o200),
                     );
                 }
-                tally_origin_runpath(
-                    &path,
-                    &mut rewritten,
-                    &mut unguaranteed,
-                    &mut self_extract,
-                );
+                tally_origin_runpath(&path, &mut rewritten, &mut unguaranteed, &mut self_extract);
                 let _ = scrub_nix_store_paths(&path);
                 let _ = strip_absolute_needed(&path);
                 if needs_chmod {
@@ -1103,55 +1117,84 @@ fn inspect_soname_for_frameworks(soname: &str, flags: &mut FrameworkFlags) {
     }
 }
 
-/// Walk the byte buffer looking for null-terminated library names that
-/// would make us enable a framework bundler. Only matches on well-known
-/// soname prefixes to avoid false positives from arbitrary strings in
-/// the binary.
+/// Walk the byte buffer looking for library names that would make us
+/// enable a framework bundler. Only matches on well-known soname stems
+/// to avoid false positives from arbitrary strings in the binary.
 ///
-/// Requires the match to start at a NUL boundary (preceded by `0x00` or
-/// at offset 0). This avoids false positives from:
-/// - Rust's string-merging optimization which packs string literals
-///   together without NUL separators (e.g. `glWaitSynclibEGL.so.1...`)
-/// - Error messages embedding soname-like text (e.g. `"Library
-///   libwayland-client.so could not be loaded."`)
+/// A match must be a *versioned* soname — `lib<name>.so.<digit>...` — to
+/// flag a framework. We deliberately do not require a NUL boundary before
+/// the match: Rust's string-merging optimization packs string literals
+/// together without NUL separators, so genuine dlopen sonames in Rust
+/// binaries (e.g. the wgpu/khronos-egl/wayland-backend strings in
+/// `amdgpu_top`) appear mid-blob like `...eglWaitSynclibEGL.so.1libEGL.so...`.
+/// Requiring the version suffix is precise enough to keep those while still
+/// rejecting:
+/// - Unversioned soname text in prose (e.g. `"Library libwayland-client.so
+///   could not be loaded."` — the `.so` is followed by a space, not `.N`).
+/// - The bare `.so` fallback strings dlopen loaders carry alongside the
+///   versioned form; the versioned sibling next to them is what we flag.
 fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
-    const PREFIXES: &[&[u8]] = &[
-        b"libGL.so",
-        b"libEGL.so",
+    // Library name stems (without the `.so` suffix). `libGL` is a prefix of
+    // `libGLESv`/`libOpenGL`, but `versioned_soname_at` reconstructs the full
+    // token and `inspect_soname_for_frameworks` classifies it correctly.
+    const STEMS: &[&[u8]] = &[
+        b"libGL",
+        b"libEGL",
         b"libGLESv",
-        b"libOpenGL.so",
-        b"libgbm.so",
-        b"libvulkan.so",
-        b"libwayland-client.so",
-        b"libwayland-egl.so",
-        b"libwayland-cursor.so",
-        b"libwayland-server.so",
-        b"libdecor-0.so",
-        b"libgtk-3.so",
-        b"libgtk-4.so",
+        b"libOpenGL",
+        b"libgbm",
+        b"libvulkan",
+        b"libwayland-client",
+        b"libwayland-egl",
+        b"libwayland-cursor",
+        b"libwayland-server",
+        b"libdecor-0",
+        b"libgtk-3",
+        b"libgtk-4",
     ];
-    let needles: Vec<&[u8]> = PREFIXES.iter().copied().collect();
-    let max_len = needles.iter().map(|n| n.len()).max().unwrap_or(0);
     let mut i = 0;
-    while i + max_len <= bytes.len() {
-        // Cheap gate: must start with 'l' to be any of our sonames.
+    while i < bytes.len() {
+        // Cheap gate: every stem starts with 'l'.
         if bytes[i] != b'l' {
             i += 1;
             continue;
         }
-        for needle in &needles {
-            if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == *needle {
-                if i > 0 && bytes[i - 1] != 0 {
-                    break;
-                }
-                if let Ok(soname) = std::str::from_utf8(&bytes[i..i + needle.len()]) {
-                    inspect_soname_for_frameworks(soname, flags);
-                }
-                break;
-            }
+        if STEMS.iter().any(|stem| bytes[i..].starts_with(stem))
+            && let Some(soname) = versioned_soname_at(bytes, i)
+        {
+            inspect_soname_for_frameworks(&soname, flags);
         }
         i += 1;
     }
+}
+
+/// Validate that the bytes at `start` form a versioned soname and return it.
+///
+/// Consumes soname name characters, then requires a literal `.so` followed by
+/// at least one `.<digit>` version component (`.so.1`, `.so.1.2`, ...). Returns
+/// the `lib<name>.so.<version>` token on success, or `None` if the shape does
+/// not match (unversioned `.so`, prose, or merged-string junk).
+fn versioned_soname_at(bytes: &[u8], start: usize) -> Option<String> {
+    let mut j = start;
+    while j < bytes.len()
+        && matches!(bytes[j], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
+    {
+        j += 1;
+    }
+    if !bytes[j..].starts_with(b".so") {
+        return None;
+    }
+    j += 3;
+    // Require `.` then a digit to start the version (rejects `.so` + space/letter).
+    if j + 1 >= bytes.len() || bytes[j] != b'.' || !bytes[j + 1].is_ascii_digit() {
+        return None;
+    }
+    while j < bytes.len() && (bytes[j] == b'.' || bytes[j].is_ascii_digit()) {
+        j += 1;
+    }
+    std::str::from_utf8(&bytes[start..j])
+        .ok()
+        .map(str::to_string)
 }
 
 /// Sonames that applications commonly dlopen at runtime. Absence from DT_NEEDED
@@ -1571,9 +1614,7 @@ fn has_self_extract_trailer(data: &[u8]) -> bool {
     // word after it (so check at offsets -16 and -24). Modern Bun
     // (>=1.3.12) uses a `.bun` ELF section instead and is unaffected.
     const BUN_TRAILER: &[u8] = b"\n---- Bun! ----\n";
-    if data.len() >= BUN_TRAILER.len()
-        && data.ends_with(BUN_TRAILER)
-    {
+    if data.len() >= BUN_TRAILER.len() && data.ends_with(BUN_TRAILER) {
         return true;
     }
     if data.len() >= BUN_TRAILER.len() + 8
@@ -2000,10 +2041,7 @@ fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<EnvNeededOut
     if need_write {
         fs::create_dir_all(lib_dest)?;
         fs::write(&dest, blob)?;
-        let _ = fs::set_permissions(
-            &dest,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        );
+        let _ = fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(0o755));
     }
 
     let Some(patchelf) = which_patchelf() else {
@@ -3499,4 +3537,76 @@ fn collect_nix_store_paths() -> Vec<String> {
     }
 
     store_paths.into_iter().collect()
+}
+
+#[cfg(test)]
+mod framework_scan_tests {
+    use super::*;
+
+    fn scan(bytes: &[u8]) -> FrameworkFlags {
+        let mut flags = FrameworkFlags::default();
+        scan_framework_strings(bytes, &mut flags);
+        flags
+    }
+
+    #[test]
+    fn detects_versioned_soname_merged_without_nul_separators() {
+        // Rust string merging packs literals together (no NUL between them),
+        // exactly as seen in amdgpu_top's dlopen strings.
+        let blob = b"eglWaitSynclibEGL.so.1libEGL.so";
+        let flags = scan(blob);
+        assert!(
+            flags.gl,
+            "versioned libEGL.so.1 inside a merged blob should flag gl"
+        );
+    }
+
+    #[test]
+    fn detects_versioned_wayland_in_merged_blob() {
+        let blob = b"some junklibwayland-client.so.0libwayland-client.so";
+        let flags = scan(blob);
+        assert!(flags.wayland);
+    }
+
+    #[test]
+    fn ignores_unversioned_soname_in_prose() {
+        // Error messages embed the bare `.so` form, which we must not flag.
+        let blob = b"Library libwayland-client.so could not be loaded.";
+        let flags = scan(blob);
+        assert!(
+            !flags.wayland,
+            "unversioned soname in prose must not flag wayland"
+        );
+    }
+
+    #[test]
+    fn ignores_bare_soname_without_version() {
+        let blob = b"\0libvulkan.so\0";
+        let flags = scan(blob);
+        assert!(
+            !flags.vulkan,
+            "bare libvulkan.so without a version must not flag"
+        );
+    }
+
+    #[test]
+    fn detects_nul_terminated_versioned_soname() {
+        let blob = b"\0libvulkan.so.1\0";
+        let flags = scan(blob);
+        assert!(flags.vulkan);
+    }
+
+    #[test]
+    fn classifies_glesv_stem_with_inner_version() {
+        let blob = b"\0libGLESv2.so.2\0";
+        let flags = scan(blob);
+        assert!(flags.gl, "libGLESv2.so.2 should flag gl");
+    }
+
+    #[test]
+    fn gtk_versioned_soname() {
+        let blob = b"prefixlibgtk-3.so.0suffix";
+        let flags = scan(blob);
+        assert!(flags.gtk);
+    }
 }

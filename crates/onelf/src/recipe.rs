@@ -156,6 +156,17 @@ pub struct Bundle {
     pub wayland: bool,
     #[serde(default)]
     pub gtk: bool,
+    /// Opt out of a framework even when auto-detection would enable it.
+    #[serde(default)]
+    pub no_gl: bool,
+    #[serde(default)]
+    pub no_dri: bool,
+    #[serde(default)]
+    pub no_vulkan: bool,
+    #[serde(default)]
+    pub no_wayland: bool,
+    #[serde(default)]
+    pub no_gtk: bool,
     #[serde(default)]
     pub strip: bool,
     #[serde(default)]

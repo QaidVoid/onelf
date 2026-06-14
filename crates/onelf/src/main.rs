@@ -296,6 +296,26 @@ enum Commands {
         #[arg(long)]
         gtk: bool,
 
+        /// Do not bundle Mesa GL/EGL/GBM libraries even if auto-detected
+        #[arg(long)]
+        no_gl: bool,
+
+        /// Do not bundle DRI drivers even if auto-detected
+        #[arg(long)]
+        no_dri: bool,
+
+        /// Do not bundle Vulkan ICD drivers even if auto-detected
+        #[arg(long)]
+        no_vulkan: bool,
+
+        /// Do not bundle Wayland client libraries even if auto-detected
+        #[arg(long)]
+        no_wayland: bool,
+
+        /// Do not bundle GSettings schemas even if auto-detected
+        #[arg(long)]
+        no_gtk: bool,
+
         /// Strip debug symbols from copied libraries
         #[arg(long)]
         strip: bool,
@@ -479,6 +499,11 @@ fn main() {
             vulkan,
             wayland,
             gtk,
+            no_gl,
+            no_dri,
+            no_vulkan,
+            no_wayland,
+            no_gtk,
             strip,
             strict_libc,
             scan_dlopen,
@@ -498,6 +523,11 @@ fn main() {
                 vulkan,
                 wayland,
                 gtk,
+                no_gl,
+                no_dri,
+                no_vulkan,
+                no_wayland,
+                no_gtk,
                 strip,
                 strict_libc,
                 scan_dlopen,
@@ -546,6 +576,11 @@ fn run_build(
             vulkan: recipe.bundle.vulkan,
             wayland: recipe.bundle.wayland,
             gtk: recipe.bundle.gtk,
+            no_gl: recipe.bundle.no_gl,
+            no_dri: recipe.bundle.no_dri,
+            no_vulkan: recipe.bundle.no_vulkan,
+            no_wayland: recipe.bundle.no_wayland,
+            no_gtk: recipe.bundle.no_gtk,
             strip: recipe.bundle.strip,
             strict_libc: recipe.bundle.strict_libc,
             scan_dlopen: recipe.bundle.scan_dlopen,

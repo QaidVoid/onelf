@@ -90,13 +90,32 @@ only `dlopen`'d at runtime (Blender loading `libwayland-cursor.so` after
 checking `$XDG_SESSION_TYPE`, for example) get picked up too with no
 `DT_NEEDED` entry required.
 
+Detection only flags a framework when it finds a properly versioned soname
+such as `libEGL.so.1` or `libwayland-client.so.0`. This keeps Rust binaries
+honest. Their string tables merge literals together without NUL separators,
+so a real dlopen soname shows up glued to its neighbours like
+`...eglWaitSynclibEGL.so.1libEGL.so...`. The version suffix is what tells a
+genuine soname apart from prose like `"Library libwayland-client.so could
+not be loaded."`.
+
 You can still force any of these explicitly:
 
 ```bash
 onelf bundle-libs ./myapp --gl --vulkan --wayland --gtk
 ```
 
-Auto-detected frameworks are printed so you know what was enabled.
+You can also opt out of a framework that detection or an explicit flag would
+otherwise pull in. This matters for a binary built with optional GUI support
+that you only ship as a TUI. `amdgpu_top`, for example, links the wgpu and
+wayland stacks even though its default mode is a terminal UI:
+
+```bash
+onelf bundle-libs ./amdgpu_top --no-gl --no-wayland
+```
+
+The `--no-*` opt-out always wins over both auto-detection and the matching
+`--*` flag. Auto-enabled and suppressed frameworks are both printed so you
+know what was decided.
 
 ## Extra library search paths
 
@@ -188,4 +207,6 @@ The granular framework flags:
 | `--gtk` | GSettings schemas under `share/glib-2.0/schemas` |
 
 These are normally enabled automatically. Pass them manually to force-on
-when auto-detection misses something.
+when auto-detection misses something. Each has a `--no-*` counterpart
+(`--no-gl`, `--no-dri`, `--no-vulkan`, `--no-wayland`, `--no-gtk`) that
+forces-off, overriding both auto-detection and the matching `--*` flag.
