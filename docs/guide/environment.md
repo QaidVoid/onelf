@@ -95,21 +95,21 @@ exported via `LD_LIBRARY_PATH` or `[env]` is lost across that
 `clearenv()` + `execve()`, because the runtime is no longer in the
 loop on the re-exec.
 
-onelf makes this survive by moving the guarantee into the ELF itself,
-not the environment:
+onelf makes this survive without a baked rpath, by keeping a
+self-locating interposer resident across the re-exec:
 
-- **Libraries**: `bundle-libs` bakes an `$ORIGIN/../lib` `DT_RUNPATH`
-  into binaries, so bundled libs resolve relative to the binary's own
-  location on every exec. Executables that could not get one (no
-  in-place slot and no `patchelf`, or self-extract binaries) are
-  reported at pack time — they fall back to `LD_LIBRARY_PATH` and are
-  not re-exec-safe.
-- **`[env]` and `preload`**: a tiny freestanding `onelf-env`
-  constructor is bundled into `lib/` and injected as a `DT_NEEDED` of
-  the entrypoint. Because `DT_NEEDED` lives in the ELF and is resolved
-  via the `$ORIGIN` RUNPATH above, it loads on *every* exec; its
-  constructor re-applies `.onelf/env` and `.onelf/preload` before
-  `main()`, no matter how the app cleared the environment.
+- **The `onelf-env` constructor**: a tiny freestanding object bundled
+  into `lib/` and injected as a `DT_NEEDED` of the entrypoint. On every
+  exec it self-locates the package root from `/proc/self/maps` (never
+  the environment) and re-applies `.onelf/env` and `.onelf/preload`
+  before `main()`, no matter how the app cleared the environment.
+- **Libraries**: the same object interposes the exec family
+  (`execve`, `posix_spawn`, ...). When the app re-execs a bundled
+  target it re-injects an env-independent `LD_LIBRARY_PATH` (from
+  `.onelf/libpath`) and `LD_PRELOAD`; when it execs a host binary it
+  strips them so the bundled libc never leaks. Combined with the
+  launcher's `--library-path` on first launch, bundled libs resolve
+  with no `DT_RPATH` baked into any ELF.
 
 The `onelf-env` injection requires `patchelf` at pack time (set
 `ONELF_PATCHELF` to override its location) and a prebuilt `onelf-env`

@@ -95,6 +95,7 @@ onelf bundle-libs DIRECTORY [options]
 | `--strict-libc` | `false` | Skip wrong-family libc libs |
 | `--scan-dlopen` | `false` | Scan binary strings for common dlopen sonames |
 | `--dlopen SONAME` | | Extra sonames for `--scan-dlopen` (comma/repeat) |
+| `--apprun` | `false` | Emit a standalone `AppRun` launcher (plus `.onelf/` metadata) so the unpacked AppDir runs directly without a baked rpath. Not needed when the AppDir will be packed |
 
 ## `onelf info`
 

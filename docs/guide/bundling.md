@@ -14,12 +14,14 @@ With no flags, this:
 1. Scans every ELF file under `./myapp/` for `DT_NEEDED` entries.
 2. Resolves each soname via ldconfig (or the NixOS store, when detected).
 3. Copies the resolved `.so` files into `./myapp/lib/`.
-4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to
-   `$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib`, so the
-   bundled binaries find their libs relative to their own location
-   without needing `LD_LIBRARY_PATH`. For binaries without an existing
-   slot, `bundle-libs` falls back to `patchelf --set-rpath` (when
-   patchelf is in `PATH`) to add a fresh entry.
+4. Demotes any existing `DT_RPATH` on a bundled ELF to `DT_RUNPATH`
+   in place. onelf does not bake an `$ORIGIN` rpath: at runtime the
+   launcher passes `--library-path` to the bundled interpreter and the
+   `onelf-env` interposer keeps an env-independent `LD_LIBRARY_PATH` in
+   place across re-execs. Demoting `DT_RPATH` (which is searched before
+   `LD_LIBRARY_PATH` and propagates to `dlopen`) ensures an upstream
+   absolute rpath can never shadow the bundle. No `patchelf` rpath
+   rewriting is involved.
 5. Injects an AT_EXECFN bootstrap into each bundled executable. At
    runtime, the bootstrap reads `AT_EXECFN`, computes the bundled
    interpreter path relative to the binary's own location, and jumps
@@ -41,8 +43,9 @@ special handling. `bundle-libs` detects them automatically and:
 - Skips bootstrap injection. The bootstrap appends bytes to the
   binary, which would clobber the trailer and break payload
   detection.
-- Skips `patchelf --set-rpath` for binaries lacking a DT_RUNPATH
-  slot. patchelf can grow the file.
+- The `onelf-env` interposer kernel-loads these (via their patched
+  PT_INTERP) rather than running them through the interpreter as a
+  program, so `/proc/self/exe` stays pointed at the binary.
 
 At runtime, the onelf-rt arranges for the kernel to handle PT_INTERP
 directly. In FUSE and tmpfs modes, it bind-mounts the bundled linker
@@ -55,6 +58,25 @@ embedded JS bundle.
 Bun 1.3.12 and newer uses a dedicated `.bun` ELF section instead of
 the end-of-file trailer. Those binaries are unaffected by file-end
 appending and get normal bootstrap injection treatment.
+
+## Running an unpacked AppDir (`--apprun`)
+
+Because onelf bakes no rpath, a bundled binary run directly as
+`./myapp/bin/app` can't find its libraries on its own. Pass `--apprun`
+to emit a self-contained launcher:
+
+```bash
+onelf bundle-libs ./myapp --apprun --target bin/app
+./myapp/AppRun            # launches bin/app with the bundle's libs
+```
+
+`--apprun` writes an `AppRun` launcher at the AppDir root plus the
+`.onelf/` metadata it reads (`libpath`, `interp`, and `command` when a
+`--target` is given). The launcher drives the bundled interpreter with
+`--library-path`, exactly like a packed `.onelf`. If no `--target` was
+given, pass the entrypoint as the first argument: `./myapp/AppRun
+bin/app`. You don't need `--apprun` when you're going to `onelf pack`
+the AppDir; the packed binary is its own launcher.
 
 ## Starting from a bare binary
 
