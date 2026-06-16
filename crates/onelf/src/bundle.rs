@@ -258,6 +258,11 @@ pub struct BundleOptions {
     pub scan_dlopen: bool,
     /// Additional sonames added to the dlopen scan allow-list.
     pub dlopen_extra: Vec<String>,
+    /// When `Some`, emit a standalone `AppRun` launcher (these onelf-rt bytes)
+    /// plus the `.onelf/` metadata so the AppDir runs directly without a baked
+    /// rpath. `None` leaves the AppDir launcher-less (the usual case when the
+    /// AppDir will be packed into a `.onelf`).
+    pub apprun_runtime: Option<&'static [u8]>,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -913,7 +918,63 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
+    if !opts.dry_run
+        && let Some(runtime) = opts.apprun_runtime
+        && let Err(e) = emit_apprun(opts, runtime)
+    {
+        eprintln!("{} AppRun emission failed: {e}", color::bold_red("warning:"));
+    }
+
     Ok(())
+}
+
+/// Emit a standalone `AppRun` launcher plus the `.onelf/` metadata it reads
+/// (`libpath`, `interp`, and `command` when the entrypoint is known) so the
+/// AppDir runs directly without a baked rpath.
+fn emit_apprun(opts: &BundleOptions, runtime: &[u8]) -> io::Result<()> {
+    let dir = &opts.directory;
+    let meta = dir.join(".onelf");
+    fs::create_dir_all(&meta)?;
+
+    // Library search path: the directory libs were copied into.
+    fs::write(meta.join("libpath"), opts.lib_dir.to_string_lossy().as_bytes())?;
+
+    // Bundled interpreter: find an ELF's PT_INTERP basename among the bundled
+    // files so the launcher can drive it via userland-execve.
+    let lib_dest = dir.join(&opts.lib_dir);
+    if let Some(rel) = find_bundled_interp_rel(dir, &lib_dest) {
+        fs::write(meta.join("interp"), rel.as_bytes())?;
+    }
+
+    // Entrypoint: record it when we analyzed a specific target, so `AppRun`
+    // needs no argument. Otherwise the launcher takes the target as argv[1].
+    if let Some(target) = &opts.target {
+        let rel = target.strip_prefix(dir).unwrap_or(target);
+        fs::write(meta.join("command"), rel.to_string_lossy().as_bytes())?;
+    }
+
+    let apprun = dir.join("AppRun");
+    fs::write(&apprun, runtime)?;
+    fs::set_permissions(&apprun, PermissionsExt::from_mode(0o755))?;
+    eprintln!("{} AppRun launcher", color::bold("Wrote"));
+    Ok(())
+}
+
+/// Find a bundled interpreter's package-relative path by matching the
+/// PT_INTERP basename of an ELF in the AppDir against a file in `lib_dest`.
+fn find_bundled_interp_rel(dir: &Path, lib_dest: &Path) -> Option<String> {
+    let interp_name = find_elf_files(dir)
+        .iter()
+        .find_map(|f| parse_interp(f))
+        .and_then(|i| Path::new(&i).file_name().map(|n| n.to_owned()))?;
+    let candidate = lib_dest.join(&interp_name);
+    if candidate.is_file() {
+        return candidate
+            .strip_prefix(dir)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    None
 }
 
 fn find_elf_files(dir: &Path) -> Vec<PathBuf> {

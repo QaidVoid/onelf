@@ -1,3 +1,4 @@
+mod appdir;
 mod cache;
 mod env;
 mod ephemeral;
@@ -40,7 +41,11 @@ fn main() {
     let mut pkg = match loader::load() {
         Ok(p) => p,
         Err(e) => {
+            // No embedded payload: we may be a bare `AppRun` launcher sitting
+            // in an unpacked AppDir. Try that before giving up.
+            let ae = appdir::run(exe_dir, argv0, &exec_path, &args[1..]).unwrap_err();
             eprintln!("onelf-rt: failed to load package: {e}");
+            eprintln!("onelf-rt: appdir mode: {ae}");
             std::process::exit(1);
         }
     };

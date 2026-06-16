@@ -337,6 +337,12 @@ enum Commands {
         /// strings to be bundled.
         #[arg(long, value_delimiter = ',')]
         dlopen: Vec<String>,
+
+        /// Emit a standalone AppRun launcher (plus .onelf/ metadata) so the
+        /// AppDir runs directly without a baked rpath. Not needed when the
+        /// AppDir will be packed into a .onelf.
+        #[arg(long)]
+        apprun: bool,
     },
 }
 
@@ -508,6 +514,7 @@ fn main() {
             strict_libc,
             scan_dlopen,
             dlopen,
+            apprun,
         } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
             bundle::bundle_libs(&bundle::BundleOptions {
                 directory,
@@ -532,6 +539,7 @@ fn main() {
                 strict_libc,
                 scan_dlopen,
                 dlopen_extra: dlopen,
+                apprun_runtime: if apprun { Some(RUNTIME_BINARY_SLIM) } else { None },
             })
         }),
     };
@@ -585,6 +593,7 @@ fn run_build(
             strict_libc: recipe.bundle.strict_libc,
             scan_dlopen: recipe.bundle.scan_dlopen,
             dlopen_extra: recipe.bundle.dlopen.clone(),
+            apprun_runtime: None,
         })?;
     }
 
