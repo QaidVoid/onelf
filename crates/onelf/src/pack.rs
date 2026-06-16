@@ -341,6 +341,28 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
     }
 
+    // Write library directories as .onelf/libpath (one package-relative dir
+    // per line). The onelf-env constructor reads this to rebuild an
+    // env-independent LD_LIBRARY_PATH for bundled children it execs, which is
+    // what lets onelf resolve bundled libs without a baked $ORIGIN rpath.
+    if !lib_dirs.is_empty() {
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+            });
+        }
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/libpath"),
+            content: lib_dirs.join("\n").into_bytes(),
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
+    }
+
     // Write custom env vars as .onelf/env (KEY=VALUE per line).
     //
     // By default the package's own bin/ is prepended to PATH, applied
