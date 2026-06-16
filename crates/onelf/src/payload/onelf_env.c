@@ -130,6 +130,7 @@ static i64 scopy(char *dst, u64 cap, const char *src, u64 n) {
 
 static char g_maps[65536];
 static char g_root[4096];
+static char g_self[4096];
 
 /* Marker whose address falls inside this object's executable mapping. */
 static void onelf_env_init(void);
@@ -211,6 +212,7 @@ static int find_root(void) {
         i64 fd = sys_openat(probe);
         if (fd >= 0) {
             sys_close((int)fd);
+            scopy(g_self, sizeof(g_self), so, so_len);
             return scopy(g_root, sizeof(g_root), cand, cl) >= 0;
         }
         /* Probe "<cand>/.onelf/preload" too (env may be absent). */
@@ -221,6 +223,7 @@ static int find_root(void) {
             i64 fd2 = sys_openat(probe);
             if (fd2 >= 0) {
                 sys_close((int)fd2);
+                scopy(g_self, sizeof(g_self), so, so_len);
                 return scopy(g_root, sizeof(g_root), cand, cl) >= 0;
             }
         }
@@ -379,6 +382,339 @@ static void apply_preload(void) {
         if (!expand(lib, sizeof(lib), s, (u64)(e - s))) continue;
         dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
     }
+}
+
+/* ---- exec-family interposition ------------------------------------- */
+/*
+ * Re-establish the bundle library path for every child the application
+ * execs, env-independently, so onelf needs no baked rpath. For a bundled
+ * ELF target we re-inject LD_LIBRARY_PATH (from .onelf/libpath) and
+ * LD_PRELOAD (this object) and then perform the real exec unchanged, so the
+ * kernel loads the target via its own PT_INTERP and /proc/self/exe stays
+ * correct. For a host binary we strip LD_LIBRARY_PATH / LD_PRELOAD / ONELF_*
+ * so the bundled libc never leaks. These symbols interpose libc's because
+ * this object is the entrypoint's first DT_NEEDED, and the interposer
+ * survives clearenv() because it self-locates the package root from
+ * /proc/self/maps rather than the environment.
+ */
+
+extern void *dlsym(void *handle, const char *name);
+extern int *__errno_location(void);
+extern char **environ;
+#define RTLD_NEXT ((void *)-1L)
+#define ONELF_AT_FDCWD (-100)
+
+#if defined(__x86_64__)
+#define NR_EXECVE 59
+#define NR_GETCWD 79
+#define NR_READLINKAT 267
+static inline i64 sys_execve(const char *p, char *const *a, char *const *e) {
+    return sys3(NR_EXECVE, (i64)p, (i64)a, (i64)e);
+}
+static inline i64 sys_getcwd(char *b, u64 n) { return sys3(NR_GETCWD, (i64)b, (i64)n, 0); }
+static inline i64 sys_readlinkat(const char *p, char *b, u64 n) {
+    return sys4(NR_READLINKAT, ONELF_AT_FDCWD, (i64)p, (i64)b, (i64)n);
+}
+#elif defined(__aarch64__)
+#define NR_EXECVE 221
+#define NR_GETCWD 17
+#define NR_READLINKAT 78
+static inline i64 sys_execve(const char *p, char *const *a, char *const *e) {
+    return svc4(NR_EXECVE, (i64)p, (i64)a, (i64)e, 0);
+}
+static inline i64 sys_getcwd(char *b, u64 n) { return svc4(NR_GETCWD, (i64)b, (i64)n, 0, 0); }
+static inline i64 sys_readlinkat(const char *p, char *b, u64 n) {
+    return svc4(NR_READLINKAT, ONELF_AT_FDCWD, (i64)p, (i64)b, (i64)n);
+}
+#endif
+
+static int ensure_root(void) {
+    if (g_root[0] == 0) find_root();
+    return g_root[0] != 0;
+}
+
+static int sstarts(const char *s, const char *pfx) {
+    while (*pfx) {
+        if (*s != *pfx) return 0;
+        s++;
+        pfx++;
+    }
+    return 1;
+}
+
+/* Real exec via raw syscall (our exported execve interposes libc's, so a
+ * normal call would recurse). Only returns on failure. */
+static int real_execve(const char *p, char *const *a, char *const *e) {
+    i64 r = sys_execve(p, a, e);
+    *__errno_location() = (int)(-r);
+    return -1;
+}
+
+static int head4(const char *path, u8 *b) {
+    i64 fd = sys_openat(path);
+    if (fd < 0) return 0;
+    i64 r = sys_read((int)fd, b, 4);
+    sys_close((int)fd);
+    return r >= 4;
+}
+
+static int is_elf_file(const char *path) {
+    u8 b[4];
+    return head4(path, b) && b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F';
+}
+
+static int abspath(const char *path, char *out, u64 cap) {
+    if (path[0] == '/') return scopy(out, cap, path, slen(path)) >= 0;
+    char cwd[4096];
+    if (sys_getcwd(cwd, sizeof(cwd)) < 0) return 0;
+    u64 cl = slen(cwd), pl = slen(path);
+    if (cl + 1 + pl + 1 > cap) return 0;
+    for (u64 i = 0; i < cl; i++) out[i] = cwd[i];
+    out[cl] = '/';
+    for (u64 i = 0; i <= pl; i++) out[cl + 1 + i] = path[i];
+    return 1;
+}
+
+/* Resolve one symlink level so /proc/self/exe (and similar) classify by
+ * their real location, not the symlink path. */
+static void resolve_target(const char *path, char *out, u64 cap) {
+    char link[4096];
+    i64 n = sys_readlinkat(path, link, sizeof(link) - 1);
+    if (n > 0) {
+        link[n] = 0;
+        if (link[0] == '/') {
+            scopy(out, cap, link, (u64)n);
+            return;
+        }
+        /* relative link target: resolve against the directory of `path`. */
+        u64 pl = slen(path);
+        while (pl > 0 && path[pl - 1] != '/') pl--;
+        if (pl + (u64)n + 1 <= cap) {
+            for (u64 i = 0; i < pl; i++) out[i] = path[i];
+            for (u64 i = 0; i <= (u64)n; i++) out[pl + i] = link[i];
+            return;
+        }
+    }
+    scopy(out, cap, path, slen(path));
+}
+
+static int is_bundled(const char *path) {
+    char resolved[4096];
+    resolve_target(path, resolved, sizeof(resolved));
+    char ab[4096];
+    if (!abspath(resolved, ab, sizeof(ab))) return 0;
+    if (!sstarts(ab, g_root)) return 0;
+    u64 rl = slen(g_root);
+    return ab[rl] == '/' || ab[rl] == 0;
+}
+
+/* Join g_root + "/" + suffix into out. */
+static int root_join(const char *suffix, char *out, u64 cap) {
+    u64 rl = slen(g_root), sl = slen(suffix);
+    if (rl + 1 + sl + 1 > cap) return 0;
+    u64 o = 0;
+    for (u64 i = 0; i < rl; i++) out[o++] = g_root[i];
+    out[o++] = '/';
+    for (u64 i = 0; i <= sl; i++) out[o + i] = suffix[i];
+    return 1;
+}
+
+/* Colon-joined absolute library path from .onelf/libpath (one rel dir per
+ * line). Empty string if the file is absent. */
+static void build_libpath(char *out, u64 cap) {
+    out[0] = 0;
+    char p[4096];
+    if (!root_join(".onelf/libpath", p, sizeof(p))) return;
+    char buf[8192];
+    i64 n = read_file(p, buf, sizeof(buf));
+    if (n <= 0) return;
+    u64 o = 0;
+    u64 rl = slen(g_root);
+    const char *cur = buf, *end = buf + n;
+    while (cur < end) {
+        const char *ls = cur, *le = cur;
+        while (le < end && *le != '\n') le++;
+        cur = (le < end) ? le + 1 : end;
+        const char *s = ls, *e = le;
+        trim(&s, &e);
+        if (s >= e) continue;
+        u64 entry = rl + 1 + (u64)(e - s);
+        if (o + (o ? 1 : 0) + entry + 1 > cap) break;
+        if (o) out[o++] = ':';
+        for (u64 i = 0; i < rl; i++) out[o++] = g_root[i];
+        out[o++] = '/';
+        for (const char *q = s; q < e; q++) out[o++] = *q;
+    }
+    out[o] = 0;
+}
+
+/* Build the child environment. Bundled: drop inherited LD_LIBRARY_PATH /
+ * LD_PRELOAD and append the bundle's. Host: also drop ONELF_*. */
+static int build_env(char *const *envp, int bundled, char **nenv, int cap,
+                     char *ld_entry, const char *lib, char *pre_entry) {
+    int have_lib = lib && lib[0];
+    int ne = 0;
+    for (char *const *e = envp; e && *e; e++) {
+        const char *kv = *e;
+        int is_lib = sstarts(kv, "LD_LIBRARY_PATH=");
+        int is_pre = sstarts(kv, "LD_PRELOAD=");
+        int drop;
+        if (bundled) {
+            /* Always re-add LD_PRELOAD; replace LD_LIBRARY_PATH only when we
+             * have a derived path, else keep the inherited one as a fallback. */
+            drop = is_pre || (is_lib && have_lib);
+        } else {
+            drop = is_pre || is_lib || sstarts(kv, "ONELF_");
+        }
+        if (drop) continue;
+        if (ne < cap - 3) nenv[ne++] = (char *)kv;
+    }
+    if (bundled) {
+        if (lib && lib[0]) {
+            const char *k = "LD_LIBRARY_PATH=";
+            u64 o = 0;
+            while (k[o]) { ld_entry[o] = k[o]; o++; }
+            u64 j = 0;
+            while (lib[j]) ld_entry[o++] = lib[j++];
+            ld_entry[o] = 0;
+            nenv[ne++] = ld_entry;
+        }
+        const char *k2 = "LD_PRELOAD=";
+        u64 o = 0;
+        while (k2[o]) { pre_entry[o] = k2[o]; o++; }
+        u64 j = 0;
+        while (g_self[j]) pre_entry[o++] = g_self[j++];
+        pre_entry[o] = 0;
+        nenv[ne++] = pre_entry;
+    }
+    nenv[ne] = 0;
+    return ne;
+}
+
+/* Resolve `file` against PATH (from envp, then getenv) into out. */
+static int path_search(const char *file, char *const *envp, char *out, u64 cap) {
+    for (const char *s = file; *s; s++)
+        if (*s == '/') return scopy(out, cap, file, slen(file)) >= 0;
+    const char *path = 0;
+    for (char *const *e = envp; e && *e; e++)
+        if (sstarts(*e, "PATH=")) { path = *e + 5; break; }
+    if (!path) path = getenv("PATH");
+    if (!path) path = "/usr/bin:/bin";
+    u64 fl = slen(file);
+    const char *p = path;
+    while (*p) {
+        const char *q = p;
+        while (*q && *q != ':') q++;
+        u64 dl = (u64)(q - p);
+        u64 o = 0;
+        if (dl == 0) {
+            if (1 + 1 + fl + 1 > cap) goto next;
+            out[o++] = '.';
+        } else {
+            if (dl + 1 + fl + 1 > cap) goto next;
+            for (u64 i = 0; i < dl; i++) out[o++] = p[i];
+        }
+        out[o++] = '/';
+        for (u64 i = 0; i <= fl; i++) out[o + i] = file[i];
+        {
+            i64 fd = sys_openat(out);
+            if (fd >= 0) { sys_close((int)fd); return 1; }
+        }
+    next:
+        p = (*q == ':') ? q + 1 : q;
+    }
+    return 0;
+}
+
+/* Core routing shared by the exec*() wrappers. Re-inject (bundled) or strip
+ * (host) the bundle env, then exec the target unchanged. Only returns on
+ * failure. */
+static int route_exec(const char *path, char *const *argv, char *const *envp) {
+    if (!ensure_root() || !path || !argv || !is_elf_file(path))
+        return real_execve(path, argv, envp);
+
+    int bundled = is_bundled(path);
+
+    char ld_entry[16400];
+    char pre_entry[4200];
+    char lib[16384];
+    build_libpath(lib, sizeof(lib));
+
+    char *nenv[2048];
+    build_env(envp, bundled, nenv, 2048, ld_entry, lib, pre_entry);
+
+    return real_execve(path, argv, nenv);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    return route_exec(path, argv, envp);
+}
+
+int execv(const char *path, char *const argv[]) {
+    return route_exec(path, argv, environ);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[]) {
+    if (!file) return real_execve(file, argv, envp);
+    char resolved[4096];
+    if (!path_search(file, envp, resolved, sizeof(resolved))) {
+        *__errno_location() = 2; /* ENOENT */
+        return -1;
+    }
+    return route_exec(resolved, argv, envp);
+}
+
+int execvp(const char *file, char *const argv[]) {
+    return execvpe(file, argv, environ);
+}
+
+typedef int (*pspawn_fn)(int *, const char *, const void *, const void *,
+                         char *const *, char *const *);
+
+static int route_spawn(int is_p, int *pid, const char *path, const void *fa,
+                       const void *attr, char *const argv[], char *const envp[],
+                       pspawn_fn real) {
+    if (!ensure_root() || !path || !argv) return real(pid, path, fa, attr, argv, envp);
+
+    char target[4096];
+    if (is_p) {
+        if (!path_search(path, envp, target, sizeof(target)))
+            return real(pid, path, fa, attr, argv, envp);
+    } else {
+        if (scopy(target, sizeof(target), path, slen(path)) < 0)
+            return real(pid, path, fa, attr, argv, envp);
+    }
+
+    if (!is_elf_file(target)) return real(pid, path, fa, attr, argv, envp);
+
+    int bundled = is_bundled(target);
+
+    char ld_entry[16400];
+    char pre_entry[4200];
+    char lib[16384];
+    build_libpath(lib, sizeof(lib));
+    char *nenv[2048];
+    build_env(envp, bundled, nenv, 2048, ld_entry, lib, pre_entry);
+
+    /* Spawn the original path (kernel loads via its PT_INTERP); only the
+     * environment is adjusted. */
+    return real(pid, path, fa, attr, argv, nenv);
+}
+
+static pspawn_fn g_real_spawn, g_real_spawnp;
+
+int posix_spawn(int *pid, const char *path, const void *fa, const void *attr,
+                char *const argv[], char *const envp[]) {
+    if (!g_real_spawn) g_real_spawn = (pspawn_fn)dlsym(RTLD_NEXT, "posix_spawn");
+    if (!g_real_spawn) { *__errno_location() = 38; return -1; } /* ENOSYS */
+    return route_spawn(0, pid, path, fa, attr, argv, envp, g_real_spawn);
+}
+
+int posix_spawnp(int *pid, const char *file, const void *fa, const void *attr,
+                 char *const argv[], char *const envp[]) {
+    if (!g_real_spawnp) g_real_spawnp = (pspawn_fn)dlsym(RTLD_NEXT, "posix_spawnp");
+    if (!g_real_spawnp) { *__errno_location() = 38; return -1; }
+    return route_spawn(1, pid, file, fa, attr, argv, envp, g_real_spawnp);
 }
 
 static void onelf_env_init(void) {
