@@ -27,7 +27,8 @@ miniflux-onelf/
 │   ├── miniflux-wrapper      # orchestrator shell script (entrypoint)
 │   ├── postgres              # postgres server binary
 │   ├── initdb, pg_ctl, pg_isready, psql, createdb, createuser
-├── lib/                      # bundle-libs fills this in (libs + extensions + loader)
+├── lib/                      # bundle-libs fills this in (shared libs + loader)
+│   └── postgresql/           # postgres extensions (.so), at the host's pkglibdir leaf
 └── share/
     └── postgresql/           # SQL bootstrap files, tsearch dicts, timezonesets
 ```
@@ -73,15 +74,25 @@ ship broken references.
 ## Bundling SQL bootstrap + extensions
 
 PostgreSQL computes its own `sharedir` and `pkglibdir` at runtime,
-relative to the server binary. Put extensions directly in `lib/`
-(flat, not a `lib/postgresql/` subdir) and the SQL bootstrap files
-under `share/postgresql/`:
+relative to the server binary, using the build-time path *relationship*
+between `bindir` and `pkglibdir`. So the extensions have to land in the
+AppDir at the same relative position the host's postgres uses, or
+`CREATE FUNCTION ... '$libdir/...'` fails at init with
+`could not access file "dict_snowball"`. That relationship is distro
+specific: on Debian `pkglibdir` is effectively a sibling of `bindir`'s
+lib, while on Arch and Alpine it is a `postgresql` (or `postgresql<ver>`)
+subdirectory of the lib dir. Derive the right target instead of hardcoding
+it. Build on the same machine whose `pg_config` describes the `postgres`
+binary you are bundling:
 
 ```bash
 # Extensions: the .so plugins postgres dlopens for CREATE EXTENSION,
-# initdb's tsearch setup, etc.
-mkdir -p miniflux-onelf/lib
-cp -rL "$PG_LIB"/. miniflux-onelf/lib/
+# initdb's tsearch setup, etc. Place them where the bundled postgres
+# will compute $libdir: the pkglibdir path relative to its own binary.
+REL=$(realpath -m --relative-to="$PG_BIN" "$PG_LIB")   # e.g. ../lib/postgresql
+DEST=$(realpath -m "miniflux-onelf/bin/$REL")          # e.g. .../lib/postgresql
+mkdir -p "$DEST"
+cp -rL "$PG_LIB"/. "$DEST"/
 
 # SQL files, tsearch stopwords, timezonesets, pg_hba.conf.sample, ...
 mkdir -p miniflux-onelf/share
@@ -89,6 +100,11 @@ cp -rL "$PG_SHARE" miniflux-onelf/share/postgresql
 
 chmod -R u+w miniflux-onelf/share miniflux-onelf/lib
 ```
+
+`bundle-libs` then resolves the extensions' own shared-library
+dependencies into `lib/` and bakes an `$ORIGIN` rpath into each, so an
+extension under `lib/postgresql/` still finds the bundled libraries one
+level up.
 
 Why `cp -rL` and not `cp -r`: if the source tree contains symlinks
 that point outside the copied subtree (for example, into a different
@@ -116,9 +132,9 @@ mkdir -p "$DATA_ROOT" "$PGSOCK"
 [ -d "$PGDATA" ] && chmod 700 "$PGDATA" 2>/dev/null || true
 
 export PGSHAREDIR="$PGSHARE"
-# Intentionally NOT exporting LD_LIBRARY_PATH. Every bundled ELF has
-# DT_RUNPATH=$ORIGIN/../lib patched in by bundle-libs, so the bundled
-# loader finds transitive libs via the binary's own location. Exporting
+# Intentionally NOT exporting LD_LIBRARY_PATH. Every bundled executable
+# has DT_RPATH=$ORIGIN/../lib baked in by bundle-libs, so the loader
+# finds transitive libs via the binary's own location. Exporting
 # LD_LIBRARY_PATH would leak the bundle lib dir into every child
 # postgres spawns - including /bin/sh via popen(3) - which crashes on
 # systems whose host glibc version differs from the bundle's.
@@ -218,17 +234,22 @@ level = 19
 
 ```bash
 cd miniflux-onelf
-onelf bundle-libs .      # resolves libs, rewrites RUNPATH, injects bootstrap
+onelf bundle-libs .      # resolves libs, bakes $ORIGIN rpath, injects bootstrap
 onelf build              # produces miniflux.onelf
 ```
 
 The `bundle-libs` pass prints something like:
 
 ```
-Copied 32 libraries (61.6 MB) to ./lib
-Rewrote RUNPATH to $ORIGIN/../lib in 194 binaries
-Injected AT_EXECFN bootstrap into 9 binaries
+Copied 43 libraries (232.5 MB) to ./lib
+Baked $ORIGIN/../lib rpath into 112 binaries
+Injected onelf-env (re-exec-safe .onelf/env) into 7 binaries
+Injected AT_EXECFN bootstrap into 7 binaries
 ```
+
+The rpath count covers every bundled ELF (executables, shared libraries,
+and the postgres extensions); the `onelf-env` and bootstrap counts cover
+the executables.
 
 `onelf build` prints the final size and the number of compressed
 payload bytes.
@@ -267,12 +288,16 @@ Environment overrides:
   suspiciously small (tens of KB instead of megabytes) it's the
   wrapper: look next to it for a hidden sibling (`.initdb-wrapped`,
   `initdb.real`, or similar) and copy that instead.
-- **Flatten extensions into `lib/`**. PostgreSQL's `pkglibdir` at
-  runtime is "the `pkglibdir` leaf, relative to the exec'd binary's
-  directory". With `bin/postgres` at the AppDir root, `pkglibdir`
-  becomes `<mount>/lib/`, so `dict_snowball.so`, `plpgsql.so`, and
-  every other extension `.so` has to live directly in `lib/`, not in
-  a `lib/postgresql/` subdirectory.
+- **Match the extension directory to the host's `pkglibdir`**.
+  PostgreSQL computes `$libdir` at runtime by applying the build-time
+  `bindir`-to-`pkglibdir` relative path to its own binary's location.
+  With `bin/postgres` at the AppDir root and `pkglibdir` a `postgresql`
+  subdir of the host's lib dir (Arch, Alpine), `$libdir` resolves to
+  `<mount>/lib/postgresql/`, so `dict_snowball.so`, `plpgsql.so`, and
+  every other extension `.so` must live there, not flat in `lib/`. The
+  `realpath --relative-to` recipe above derives the right subdirectory
+  for any distro. If init dies with `could not access file
+  "dict_snowball"`, the extensions are in the wrong place.
 - **`share/postgresql/` must contain real files**, not symlinks.
   `cp -rL` dereferences everything.
 - **tzdata and locales come from the host**. The paths postgres
