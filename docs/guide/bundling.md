@@ -14,14 +14,24 @@ With no flags, this:
 1. Scans every ELF file under `./myapp/` for `DT_NEEDED` entries.
 2. Resolves each soname via ldconfig (or the NixOS store, when detected).
 3. Copies the resolved `.so` files into `./myapp/lib/`.
-4. Demotes any existing `DT_RPATH` on a bundled ELF to `DT_RUNPATH`
-   in place. onelf does not bake an `$ORIGIN` rpath: at runtime the
-   launcher passes `--library-path` to the bundled interpreter and the
-   `onelf-env` interposer keeps an env-independent `LD_LIBRARY_PATH` in
-   place across re-execs. Demoting `DT_RPATH` (which is searched before
-   `LD_LIBRARY_PATH` and propagates to `dlopen`) ensures an upstream
-   absolute rpath can never shadow the bundle. No `patchelf` rpath
-   rewriting is involved.
+4. Bakes a relative `DT_RPATH` of `$ORIGIN/../lib` into each bundled
+   executable, so it finds its bundled libraries from its own on-disk
+   location with no reliance on `LD_LIBRARY_PATH`. This is what lets a
+   bundled binary work when it is invoked outside onelf's launcher, for
+   example by a wrapper shell script that execs it through the host
+   `/bin/sh` (see the [miniflux example](./examples/miniflux)).
+   `DT_RPATH` (not `DT_RUNPATH`) is used on executables because it
+   propagates to the whole dependency chain, so a bundled library's own
+   dependencies resolve via the executable's `$ORIGIN` without every
+   library needing its own rpath. The relative `$ORIGIN` form never
+   leaks into child processes the way `LD_LIBRARY_PATH` does, and
+   onelf-rt's `--library-path` is still consulted first on the launcher
+   path (it resolves to the same bundle directory). Bundled libraries
+   are not given a fresh rpath; any absolute `DT_RPATH` they ship is
+   demoted to `DT_RUNPATH` so it can't outrank the bundle. Adding the
+   rpath uses `patchelf` (set `ONELF_PATCHELF` to override its location);
+   when it is missing, packing warns and the affected executables resolve
+   their libs only through the launcher.
 5. Injects an AT_EXECFN bootstrap into each bundled executable. At
    runtime, the bootstrap reads `AT_EXECFN`, computes the bundled
    interpreter path relative to the binary's own location, and jumps
@@ -61,9 +71,11 @@ appending and get normal bootstrap injection treatment.
 
 ## Running an unpacked AppDir (`--apprun`)
 
-Because onelf bakes no rpath, a bundled binary run directly as
-`./myapp/bin/app` can't find its libraries on its own. Pass `--apprun`
-to emit a self-contained launcher:
+With the baked `$ORIGIN/../lib` rpath, a bundled binary run directly as
+`./myapp/bin/app` finds its libraries on a host whose libc matches the
+bundle. To run an unpacked AppDir through the *bundled* dynamic linker
+instead (the cross-libc case, e.g. a glibc bundle on a musl host), pass
+`--apprun` to emit a self-contained launcher:
 
 ```bash
 onelf bundle-libs ./myapp --apprun --target bin/app

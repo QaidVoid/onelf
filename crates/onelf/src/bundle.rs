@@ -507,8 +507,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         if !opts.dry_run {
             let lib_dest = opts.directory.join(&opts.lib_dir);
             let mut rewritten = 0usize;
-            let mut unguaranteed: Vec<PathBuf> = Vec::new();
-            let mut self_extract: Vec<PathBuf> = Vec::new();
+            let mut unguaranteed = Vec::new();
+            let mut self_extract = Vec::new();
             for path in find_elf_files(&opts.directory) {
                 let perms = fs::metadata(&path)
                     .map(|m| m.permissions().mode())
@@ -532,8 +532,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
             if rewritten > 0 {
                 eprintln!(
-                    "{} RUNPATH to $ORIGIN/../lib in {} binaries",
-                    color::bold("Rewrote"),
+                    "{} $ORIGIN/../lib rpath into {} binaries",
+                    color::bold("Baked"),
                     rewritten
                 );
             }
@@ -699,11 +699,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &dest,
                         std::os::unix::fs::PermissionsExt::from_mode(0o755),
                     );
-                    // Strip hardcoded RPATH/RUNPATH so the bundled lib uses
-                    // LD_LIBRARY_PATH (set by the runtime) instead of absolute paths
+                    // Bundled library: neutralize any absolute DT_RPATH so it
+                    // can't outrank the bundle. The covering executable's
+                    // $ORIGIN DT_RPATH resolves this lib's own deps.
                     if let Err(e) = set_origin_runpath(&dest) {
                         eprintln!(
-                            "  {} failed to rewrite RUNPATH of {}: {e}",
+                            "  {} failed to rewrite rpath of {}: {e}",
                             color::bold_red("warning:"),
                             soname
                         );
@@ -853,10 +854,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Hardcoded absolute paths (e.g. /nix/store/...) won't exist on the
     // target system; LD_LIBRARY_PATH (set by the runtime) is used instead.
     if !opts.dry_run {
-        let mut rewritten = 0usize;
         let mut scrubbed = 0usize;
-        let mut unguaranteed: Vec<PathBuf> = Vec::new();
-        let mut self_extract: Vec<PathBuf> = Vec::new();
+        let mut rewritten = 0usize;
+        let mut unguaranteed = Vec::new();
+        let mut self_extract = Vec::new();
         for path in find_elf_files(&opts.directory) {
             let perms = fs::metadata(&path)
                 .map(|m| m.permissions().mode())
@@ -883,11 +884,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
         if rewritten > 0 {
             eprintln!(
-                "{} RUNPATH to $ORIGIN/../lib in {} binaries",
-                color::bold("Rewrote"),
+                "{} $ORIGIN/../lib rpath into {} binaries",
+                color::bold("Baked"),
                 rewritten
             );
         }
+        report_unguaranteed_runpath(&unguaranteed, &self_extract);
         if scrubbed > 0 {
             eprintln!(
                 "{} /nix/store paths in {} binaries",
@@ -895,7 +897,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 scrubbed
             );
         }
-        report_unguaranteed_runpath(&unguaranteed, &self_extract);
     }
 
     // Patch PT_INTERP of every ELF with a bundled loader. This is what
@@ -1432,150 +1433,82 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Rewrite RPATH/RUNPATH to `$ORIGIN/../lib` so the bundled ELF finds its
-/// transitive libraries via its own on-disk location, never via
-/// `LD_LIBRARY_PATH`. That matters because `LD_LIBRARY_PATH` is a
-/// per-process env variable that gets inherited into host binaries the
-/// app may spawn (for example, `postgres` uses `popen(3)` which execs
-/// `/bin/sh` - a host binary linked against the host's glibc). If we
-/// left our bundle dir on `LD_LIBRARY_PATH`, the host shell would load
-/// our newer `libc.so.6` against its own older `ld-linux.so.2` and
-/// crash with a null deref in the loader. Using `$ORIGIN/../lib` keeps
-/// the bundle's library search scoped to the bundled ELF itself.
-///
-/// First tries in-place patching of an existing DT_RPATH/DT_RUNPATH
-/// slot. If the binary has no slot or it's too small for our string
-/// (e.g. Bun, Go, Zig outputs), falls back to `patchelf --set-rpath`
-/// when available.
-///
-/// The outcome matters for re-exec safety: an executable that ends up
-/// without a baked-in `$ORIGIN` RUNPATH can only find its bundled libs
-/// via `LD_LIBRARY_PATH`, which is wiped when the app re-execs itself in
-/// a sandbox (`clearenv()` + `execve`). The caller surfaces those so the
-/// package isn't silently fragile.
+/// Outcome of baking an `$ORIGIN` rpath into a bundled ELF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunpathOutcome {
-    /// `$ORIGIN` RUNPATH is baked into the ELF (in-place or via patchelf).
+    /// A relative `$ORIGIN/../lib` `DT_RPATH` is baked in (in-place or via
+    /// patchelf), so the binary finds its bundled libs from its own location.
     Set,
-    /// No RUNPATH needed: static binary, bare lib, or no DT_NEEDED.
+    /// No rpath needed: static binary, bare lib, the loader, or no DT_NEEDED.
+    /// Bundled libraries land here after their absolute rpath is neutralized;
+    /// they resolve transitively through the executable's `DT_RPATH`.
     NotNeeded,
-    /// Executable with deps but RUNPATH could not be guaranteed (no
-    /// in-place slot and patchelf missing or failed). Relies on
-    /// `LD_LIBRARY_PATH`; not sandbox-re-exec-safe.
+    /// Executable with deps but the rpath could not be baked (no in-place slot
+    /// and patchelf is missing or failed). Resolves only via `--library-path`
+    /// or `LD_LIBRARY_PATH`, so it breaks when invoked outside the launcher.
     Unguaranteed,
-    /// Executable with a self-extract trailer: patchelf would clobber
-    /// the trailer, so RUNPATH can't be added. Known limitation.
+    /// Self-extracting executable (e.g. pre-1.3.12 Bun): patchelf would grow
+    /// the file and clobber the trailer, so the rpath can't be baked.
     SelfExtract,
 }
 
+/// Bake a relative `DT_RPATH` of `$ORIGIN/../lib` into a bundled ELF so it
+/// locates its bundled libraries from its own on-disk position, with no
+/// reliance on `LD_LIBRARY_PATH`. This is what lets a bundled binary work when
+/// it is invoked outside onelf's launcher, for example by a wrapper shell
+/// script that execs it through the host `/bin/sh` (the miniflux pattern).
+///
+/// Applied to every bundled ELF with dependencies, executables and shared
+/// libraries alike. Each then finds its own direct dependencies in `lib/`
+/// (where `$ORIGIN/../lib` resolves for both a `bin/` executable and a `lib/`
+/// library), so the whole dependency graph resolves within the bundle without
+/// relying on `DT_RPATH` transitivity (which glibc does not apply reliably to
+/// a library's own children). `--set-rpath` overwrites any rpath the file
+/// shipped, so an upstream absolute rpath can never outrank the bundle.
+///
+/// `DT_RPATH` (not `DT_RUNPATH`, via `--force-rpath`) is used for uniformity
+/// with the dependency-graph model. The relative `$ORIGIN` form never leaks
+/// into child processes the way `LD_LIBRARY_PATH` does, and onelf-rt's
+/// `--library-path` still resolves to the same bundle directory on the
+/// launcher path.
+///
+/// patchelf is the reliable path; an in-place rewrite of an existing rpath
+/// slot is the fallback when patchelf is absent or the file is self-extracting
+/// (where growing it would clobber the trailer).
 fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
-    // Cover binaries at depth 1 (e.g. bin/foo), 2 (libexec/podman/x),
-    // and 3 (share/pkg/helpers/y). Nonexistent entries are silently
-    // ignored by the dynamic loader, so this is safe to apply
-    // uniformly without knowing where each ELF sits.
+    // $ORIGIN/../lib resolves to lib/ from a bin/ executable and to lib/
+    // itself from a lib/ library. The deeper entries cover executables nested
+    // under libexec/ or share/. Nonexistent entries are ignored by the loader.
     const NEW: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
     let new_bytes = NEW.as_bytes();
+
     let data = fs::read(path)?;
-
-    // Self-extracting binaries (e.g. pre-1.3.12 Bun) have a trailer at
-    // the end of the file. patchelf can grow the file when adding a
-    // missing DT_RUNPATH, which would invalidate the trailer. The
-    // in-place rewrite is safe (same file size), so we still attempt
-    // that, but we skip the patchelf fallback for these binaries.
     let is_self_extract = has_self_extract_trailer(&data);
-
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // Only meaningful for binaries with dynamic dependencies. A bottom-
-    // of-stack lib like libc.so.6 or the dynamic loader has no DT_NEEDED
-    // entries and doesn't need DT_RUNPATH itself.
     let has_needed = !elf.libraries.is_empty();
-    // PT_INTERP marks an executable; pure shared libraries lack it. We
-    // only warn / fall back to patchelf for executables, since libs
-    // typically resolve their deps via the executable's DT_RUNPATH.
-    // glibc's libc.so.6 (and ld.so) carry PT_INTERP but are libraries,
-    // distinguished by a DT_SONAME; exclude anything with a SONAME so
-    // they aren't mis-flagged as un-RUNPATH'd app executables.
-    let has_soname = elf.soname.is_some();
-    let is_executable = !has_soname
-        && elf
-            .program_headers
-            .iter()
-            .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
-
-    // Find .dynstr section file offset
-    let dynstr_offset = elf
-        .section_headers
-        .iter()
-        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| sh.sh_offset as usize);
-
-    let dynamic_present = elf.dynamic.is_some();
-    let mut in_place_done = false;
-
-    if let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) {
-        let mut modified = data.clone();
-        for dyn_entry in &dynamic.dyns {
-            if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
-                || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
-            {
-                let file_pos = dynstr_offset + dyn_entry.d_val as usize;
-                if file_pos >= modified.len() {
-                    continue;
-                }
-                let mut end = file_pos;
-                while end < modified.len() && modified[end] != 0 {
-                    end += 1;
-                }
-                while end < modified.len() && modified[end] == 0 {
-                    end += 1;
-                }
-                let slot_size = end - file_pos;
-                if new_bytes.len() + 1 > slot_size {
-                    // Slot too small; will fall back to patchelf below.
-                    continue;
-                }
-                modified[file_pos..file_pos + new_bytes.len()].copy_from_slice(new_bytes);
-                for i in new_bytes.len()..slot_size {
-                    modified[file_pos + i] = 0;
-                }
-                in_place_done = true;
-            }
-        }
-        if in_place_done {
-            fs::write(path, &modified)?;
-            return Ok(RunpathOutcome::Set);
-        }
-    }
-
-    drop(elf);
-
-    if !dynamic_present || !has_needed {
-        // Nothing depends on libs (static binary, libc.so itself, the
-        // dynamic loader, etc.). DT_RUNPATH wouldn't help here.
-        return Ok(RunpathOutcome::NotNeeded);
-    }
-
-    if !is_executable {
-        // Shared libraries usually resolve their deps via the
-        // executable's DT_RUNPATH (transitive search). Skip patchelf
-        // and the noisy warning for bare libs.
+    if elf.dynamic.is_none() || !has_needed {
+        // Static binary, the loader, anything with no DT_NEEDED: nothing to
+        // resolve, so no rpath helps.
         return Ok(RunpathOutcome::NotNeeded);
     }
 
     if is_self_extract {
-        // Don't risk patchelf growing the file and clobbering the
-        // self-extract trailer. The runtime still sets LD_LIBRARY_PATH
-        // as a fallback for these binaries.
+        // patchelf could grow the file and clobber the trailer. The in-place
+        // rewrite is size-preserving, so try it, but never fall to patchelf.
+        if let Some(o) = rewrite_origin_rpath_in_place(&data, &elf, new_bytes, path)? {
+            return Ok(o);
+        }
         return Ok(RunpathOutcome::SelfExtract);
     }
 
-    // No usable in-place slot. Fall back to patchelf, which can
-    // either resize an existing slot or add a fresh DT_RUNPATH by
-    // growing the file's string table.
+    // patchelf is the reliable path. `--force-rpath --set-rpath` writes a fresh
+    // DT_RPATH, overwriting any rpath the file shipped. Prefer it over the
+    // in-place rewrite, which can only act when a slot already exists.
     if let Some(patchelf) = which_patchelf() {
-        let status = std::process::Command::new(&patchelf)
+        drop(elf);
+        let out = std::process::Command::new(&patchelf)
             .arg("--force-rpath")
             .arg("--set-rpath")
             .arg(NEW)
@@ -1583,16 +1516,16 @@ fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output();
-        match status {
-            Ok(o) if o.status.success() => return Ok(RunpathOutcome::Set),
+        return match out {
+            Ok(o) if o.status.success() => Ok(RunpathOutcome::Set),
             Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
                 eprintln!(
                     "  {} patchelf failed for {}: {}",
                     color::bold_red("warning:"),
                     path.display(),
-                    stderr.trim()
+                    String::from_utf8_lossy(&o.stderr).trim()
                 );
+                Ok(RunpathOutcome::Unguaranteed)
             }
             Err(e) => {
                 eprintln!(
@@ -1600,19 +1533,94 @@ fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
                     color::bold_red("warning:"),
                     path.display(),
                 );
+                Ok(RunpathOutcome::Unguaranteed)
             }
-        }
+        };
     }
-    // No patchelf available and no in-place slot. The runtime still sets
-    // LD_LIBRARY_PATH as a fallback for the initial launch, but it won't
-    // survive a sandboxed re-exec. The caller reports this.
+
+    // No patchelf: best-effort in-place rewrite of an existing slot.
+    if let Some(o) = rewrite_origin_rpath_in_place(&data, &elf, new_bytes, path)? {
+        return Ok(o);
+    }
     Ok(RunpathOutcome::Unguaranteed)
 }
 
-/// Apply `set_origin_runpath` and fold the outcome into the running
-/// tallies. `set` counts binaries that got a baked-in RUNPATH;
-/// `unguaranteed` / `self_extract` collect executables that did not, so
-/// the caller can warn that they aren't sandbox-re-exec-safe.
+/// Rewrite an existing `DT_RPATH`/`DT_RUNPATH` slot to `$ORIGIN/../lib` and
+/// force its tag to `DT_RPATH`, in place (size-preserving). Returns `Some(Set)`
+/// when a slot was rewritten, `None` when no slot fit (caller falls back to
+/// patchelf). Writes the file only on success.
+fn rewrite_origin_rpath_in_place(
+    data: &[u8],
+    elf: &goblin::elf::Elf,
+    new_bytes: &[u8],
+    path: &Path,
+) -> io::Result<Option<RunpathOutcome>> {
+    let Some(dynamic) = elf.dynamic.as_ref() else {
+        return Ok(None);
+    };
+    let dynstr_off = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
+        .map(|sh| sh.sh_offset as usize);
+    let dyn_off = elf
+        .section_headers
+        .iter()
+        .find(|sh| sh.sh_type == goblin::elf::section_header::SHT_DYNAMIC)
+        .map(|sh| sh.sh_offset as usize)
+        .or_else(|| {
+            elf.program_headers
+                .iter()
+                .find(|p| p.p_type == goblin::elf::program_header::PT_DYNAMIC)
+                .map(|p| p.p_offset as usize)
+        });
+    let (Some(dynstr_off), Some(dyn_off)) = (dynstr_off, dyn_off) else {
+        return Ok(None);
+    };
+    let entsize = if elf.is_64 { 16 } else { 8 };
+    let rpath_tag = goblin::elf::dynamic::DT_RPATH;
+    let mut modified = data.to_vec();
+    let mut done = false;
+    for (i, dyn_entry) in dynamic.dyns.iter().enumerate() {
+        if dyn_entry.d_tag != rpath_tag && dyn_entry.d_tag != goblin::elf::dynamic::DT_RUNPATH {
+            continue;
+        }
+        let spos = dynstr_off + dyn_entry.d_val as usize;
+        if spos >= modified.len() {
+            continue;
+        }
+        let mut end = spos;
+        while end < modified.len() && modified[end] != 0 {
+            end += 1;
+        }
+        while end < modified.len() && modified[end] == 0 {
+            end += 1;
+        }
+        if new_bytes.len() + 1 > end - spos {
+            continue; // slot too small
+        }
+        modified[spos..spos + new_bytes.len()].copy_from_slice(new_bytes);
+        for b in &mut modified[spos + new_bytes.len()..end] {
+            *b = 0;
+        }
+        let toff = dyn_off + i * entsize;
+        if toff + entsize <= modified.len() {
+            if elf.is_64 {
+                modified[toff..toff + 8].copy_from_slice(&rpath_tag.to_le_bytes());
+            } else {
+                modified[toff..toff + 4].copy_from_slice(&(rpath_tag as u32).to_le_bytes());
+            }
+        }
+        done = true;
+    }
+    if done {
+        fs::write(path, &modified)?;
+        return Ok(Some(RunpathOutcome::Set));
+    }
+    Ok(None)
+}
+
+/// Apply [`set_origin_runpath`] and fold the outcome into the running tallies.
 fn tally_origin_runpath(
     path: &Path,
     set: &mut usize,
@@ -1627,14 +1635,12 @@ fn tally_origin_runpath(
     }
 }
 
-/// Warn that the listed executables could not get a baked-in `$ORIGIN`
-/// RUNPATH and therefore won't survive a sandboxed re-exec. Printed once
-/// per bundling pass; empty input prints nothing.
+/// Warn about executables that could not get a baked-in `$ORIGIN` rpath and so
+/// only resolve their bundled libs through the launcher's `--library-path`.
 fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract: &[PathBuf]) {
     if !unguaranteed.is_empty() {
         eprintln!(
-            "{} {} executable(s) have no baked-in $ORIGIN RUNPATH and rely \
-             on LD_LIBRARY_PATH:",
+            "{} {} executable(s) have no baked-in $ORIGIN rpath:",
             color::bold_red("warning:"),
             unguaranteed.len()
         );
@@ -1642,25 +1648,21 @@ fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract: &[PathBuf
             eprintln!("  - {}", p.display());
         }
         eprintln!(
-            "  These break if the app re-execs itself in a sandbox \
-             (clearenv). Install `patchelf` (or set ONELF_PATCHELF) and \
-             repack to make them re-exec-safe."
+            "  These resolve bundled libs only through the launcher and break \
+             if invoked directly (e.g. from a wrapper script). Install \
+             `patchelf` (or set ONELF_PATCHELF) and repack."
         );
     }
     if !self_extract.is_empty() {
         eprintln!(
-            "{} {} self-extracting executable(s) can't take a baked-in \
-             RUNPATH (would clobber the embedded payload):",
+            "{} {} self-extracting executable(s) can't take a baked-in rpath \
+             (would clobber the embedded payload):",
             color::bold_red("warning:"),
             self_extract.len()
         );
         for p in self_extract {
             eprintln!("  - {}", p.display());
         }
-        eprintln!(
-            "  These rely on the runtime's LD_LIBRARY_PATH and are not \
-             sandbox-re-exec-safe."
-        );
     }
 }
 
@@ -2109,6 +2111,10 @@ fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<EnvNeededOut
         return Ok(EnvNeededOutcome::NoPatchelf);
     };
     let out = std::process::Command::new(&patchelf)
+        // Preserve any DT_RPATH set_origin_runpath baked. Without this,
+        // patchelf rewrites it to DT_RUNPATH, which (unlike DT_RPATH) does
+        // not propagate to a bundled library's own transitive dependencies.
+        .arg("--force-rpath")
         .arg("--add-needed")
         .arg(crate::payload::ONELF_ENV_SONAME)
         .arg(path)
@@ -2182,9 +2188,9 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
             );
         }
         // Make .onelf/env + .onelf/preload re-exec-safe by injecting the
-        // onelf-env constructor as a DT_NEEDED (resolved via the
-        // $ORIGIN RUNPATH set earlier). Done before bootstrap injection
-        // so patchelf sees a normal ELF.
+        // onelf-env constructor as a DT_NEEDED (resolved via the $ORIGIN
+        // DT_RPATH set earlier). Done before bootstrap injection so patchelf
+        // sees a normal ELF.
         match add_onelf_env_needed(&path, lib_dest) {
             Ok(EnvNeededOutcome::Added) => env_added += 1,
             Ok(EnvNeededOutcome::AlreadyPresent) => {}

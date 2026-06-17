@@ -65,5 +65,5 @@ See [Portable Directories](../guide/portable-dirs) for the full story.
 
 | Variable | Effect |
 |----------|--------|
-| `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to inject the `onelf-env` constructor as a `DT_NEEDED` on the entrypoint. Falls back to looking up `patchelf` in `PATH`. onelf no longer bakes any rpath. |
+| `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to bake the `$ORIGIN/../lib` `DT_RPATH` into bundled executables and to inject the `onelf-env` constructor as a `DT_NEEDED`. Falls back to looking up `patchelf` in `PATH`. |
 | `SOURCE_DATE_EPOCH` | Clamp file mtimes for reproducible output. See [Reproducible Builds](../guide/reproducible). |
