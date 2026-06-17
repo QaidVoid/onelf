@@ -27,7 +27,8 @@ miniflux-onelf/
 │   ├── miniflux-wrapper      # orchestrator shell script (entrypoint)
 │   ├── postgres              # postgres server binary
 │   ├── initdb, pg_ctl, pg_isready, psql, createdb, createuser
-├── lib/                      # bundle-libs fills this in (libs + extensions + loader)
+├── lib/                      # bundle-libs fills this in (shared libs + loader)
+│   └── postgresql/           # postgres extensions (.so), at the host's pkglibdir leaf
 └── share/
     └── postgresql/           # SQL bootstrap files, tsearch dicts, timezonesets
 ```
@@ -73,15 +74,25 @@ ship broken references.
 ## Bundling SQL bootstrap + extensions
 
 PostgreSQL computes its own `sharedir` and `pkglibdir` at runtime,
-relative to the server binary. Put extensions directly in `lib/`
-(flat, not a `lib/postgresql/` subdir) and the SQL bootstrap files
-under `share/postgresql/`:
+relative to the server binary, using the build-time path *relationship*
+between `bindir` and `pkglibdir`. So the extensions have to land in the
+AppDir at the same relative position the host's postgres uses, or
+`CREATE FUNCTION ... '$libdir/...'` fails at init with
+`could not access file "dict_snowball"`. That relationship is distro
+specific: on Debian `pkglibdir` is effectively a sibling of `bindir`'s
+lib, while on Arch and Alpine it is a `postgresql` (or `postgresql<ver>`)
+subdirectory of the lib dir. Derive the right target instead of hardcoding
+it. Build on the same machine whose `pg_config` describes the `postgres`
+binary you are bundling:
 
 ```bash
 # Extensions: the .so plugins postgres dlopens for CREATE EXTENSION,
-# initdb's tsearch setup, etc.
-mkdir -p miniflux-onelf/lib
-cp -rL "$PG_LIB"/. miniflux-onelf/lib/
+# initdb's tsearch setup, etc. Place them where the bundled postgres
+# will compute $libdir: the pkglibdir path relative to its own binary.
+REL=$(realpath -m --relative-to="$PG_BIN" "$PG_LIB")   # e.g. ../lib/postgresql
+DEST=$(realpath -m "miniflux-onelf/bin/$REL")          # e.g. .../lib/postgresql
+mkdir -p "$DEST"
+cp -rL "$PG_LIB"/. "$DEST"/
 
 # SQL files, tsearch stopwords, timezonesets, pg_hba.conf.sample, ...
 mkdir -p miniflux-onelf/share
@@ -95,6 +106,11 @@ that point outside the copied subtree (for example, into a different
 install prefix, a Nix store path, or a Debian alternatives dir),
 `cp -r` preserves them as-is. The resulting AppDir then ships broken
 links. `-L` dereferences every symlink to its current contents.
+
+`bundle-libs` then resolves each extension's own shared-library
+dependencies into `lib/` and bakes a multi-level `$ORIGIN` RUNPATH
+into every bundled ELF, so an extension under `lib/postgresql/` still
+finds the bundled libraries one level up at `lib/`.
 
 ## The wrapper script
 
@@ -267,12 +283,16 @@ Environment overrides:
   suspiciously small (tens of KB instead of megabytes) it's the
   wrapper: look next to it for a hidden sibling (`.initdb-wrapped`,
   `initdb.real`, or similar) and copy that instead.
-- **Flatten extensions into `lib/`**. PostgreSQL's `pkglibdir` at
-  runtime is "the `pkglibdir` leaf, relative to the exec'd binary's
-  directory". With `bin/postgres` at the AppDir root, `pkglibdir`
-  becomes `<mount>/lib/`, so `dict_snowball.so`, `plpgsql.so`, and
-  every other extension `.so` has to live directly in `lib/`, not in
-  a `lib/postgresql/` subdirectory.
+- **Match the extension directory to the host's `pkglibdir`**.
+  PostgreSQL computes `$libdir` at runtime by applying the build-time
+  `bindir`-to-`pkglibdir` relative path to its own binary's location.
+  With `bin/postgres` at the AppDir root and `pkglibdir` a `postgresql`
+  subdir of the host's lib dir (Arch, Alpine), `$libdir` resolves to
+  `<mount>/lib/postgresql/`, so `dict_snowball.so`, `plpgsql.so`, and
+  every other extension `.so` must live there, not flat in `lib/`. The
+  `realpath --relative-to` recipe above derives the right subdirectory
+  for any distro. If init dies with `could not access file
+  "dict_snowball"`, the extensions are in the wrong place.
 - **`share/postgresql/` must contain real files**, not symlinks.
   `cp -rL` dereferences everything.
 - **tzdata and locales come from the host**. The paths postgres
