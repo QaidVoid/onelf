@@ -11,17 +11,28 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use onelf_format::EntryKind;
+use onelf_format::{EntryKind, symlink_target_within_root};
 
 use crate::info::read_footer_and_manifest;
 
-pub fn extract(binary: &Path, output: Option<&Path>, files: &[String]) -> io::Result<()> {
+/// Mask attacker-controlled mode bits unless the caller opts in to
+/// preserving the full mode (setuid/setgid/sticky). Off by default.
+fn mode_bits(mode: u32, preserve_mode: bool) -> u32 {
+    if preserve_mode { mode } else { mode & 0o777 }
+}
+
+pub fn extract(
+    binary: &Path,
+    output: Option<&Path>,
+    files: &[String],
+    preserve_mode: bool,
+) -> io::Result<()> {
     if files.is_empty() {
         let output_dir = output.unwrap_or(Path::new("onelf_extracted"));
-        return extract_all(binary, output_dir);
+        return extract_all(binary, output_dir, preserve_mode);
     }
 
-    extract_selective(binary, output, files)
+    extract_selective(binary, output, files, preserve_mode)
 }
 
 pub(crate) fn decompress_entry(
@@ -66,7 +77,33 @@ pub(crate) fn decompress_entry(
     Ok(result)
 }
 
-fn extract_selective(binary: &Path, output: Option<&Path>, files: &[String]) -> io::Result<()> {
+/// Decompress an entry and verify its bytes against the recorded BLAKE3
+/// `content_hash` before returning, so extraction never writes tampered
+/// or corrupt content to disk or stdout. `decompress_entry` itself stays
+/// unverified because `verify` needs to decompress-then-report every
+/// mismatch rather than fail fast.
+fn decompress_verified(
+    file: &mut File,
+    footer: &onelf_format::Footer,
+    entry: &onelf_format::Entry,
+    dict: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    let data = decompress_entry(file, footer, entry, dict)?;
+    if blake3::hash(&data).as_bytes() != &entry.content_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "content hash mismatch (tampered or corrupt package)",
+        ));
+    }
+    Ok(data)
+}
+
+fn extract_selective(
+    binary: &Path,
+    output: Option<&Path>,
+    files: &[String],
+    preserve_mode: bool,
+) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(binary)?;
     let mut file = File::open(binary)?;
 
@@ -114,7 +151,7 @@ fn extract_selective(binary: &Path, output: Option<&Path>, files: &[String]) -> 
         }
         let (idx, _) = &matched[0];
         let entry = &manifest.entries[*idx];
-        let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
+        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
         io::stdout().write_all(&data)?;
         return Ok(());
     }
@@ -123,35 +160,43 @@ fn extract_selective(binary: &Path, output: Option<&Path>, files: &[String]) -> 
     if matched.len() == 1 && files.len() == 1 {
         let (idx, _) = &matched[0];
         let entry = &manifest.entries[*idx];
-        let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
+        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
 
         if let Some(out) = output {
             if out.is_dir() {
                 // Output is existing directory — extract preserving relative path
-                let rel_path = &matched[0].1;
-                let target = out.join(rel_path);
+                let rel_path = manifest.validated_entry_path(*idx)?;
+                let target = out.join(&rel_path);
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&target, &data)?;
-                fs::set_permissions(&target, fs::Permissions::from_mode(entry.mode))?;
+                fs::set_permissions(
+                    &target,
+                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+                )?;
             } else {
                 // Output is a file path — write directly
                 if let Some(parent) = out.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(out, &data)?;
-                fs::set_permissions(out, fs::Permissions::from_mode(entry.mode))?;
+                fs::set_permissions(
+                    out,
+                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+                )?;
             }
         } else {
             // No output specified — extract to current dir preserving relative path
-            let rel_path = &matched[0].1;
-            let target = Path::new(rel_path);
+            let target = manifest.validated_entry_path(*idx)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(target, &data)?;
-            fs::set_permissions(target, fs::Permissions::from_mode(entry.mode))?;
+            fs::write(&target, &data)?;
+            fs::set_permissions(
+                &target,
+                fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+            )?;
         }
         return Ok(());
     }
@@ -160,21 +205,25 @@ fn extract_selective(binary: &Path, output: Option<&Path>, files: &[String]) -> 
     let output_dir = output.unwrap_or(Path::new("onelf_extracted"));
     fs::create_dir_all(output_dir)?;
 
-    for (idx, rel_path) in &matched {
+    for (idx, _) in &matched {
         let entry = &manifest.entries[*idx];
-        let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
-        let target = output_dir.join(rel_path);
+        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
+        let rel_path = manifest.validated_entry_path(*idx)?;
+        let target = output_dir.join(&rel_path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, &data)?;
-        fs::set_permissions(&target, fs::Permissions::from_mode(entry.mode))?;
+        fs::set_permissions(
+            &target,
+            fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+        )?;
     }
 
     Ok(())
 }
 
-fn extract_all(binary: &Path, output_dir: &Path) -> io::Result<()> {
+fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(binary)?;
 
     let mut file = File::open(binary)?;
@@ -205,38 +254,62 @@ fn extract_all(binary: &Path, output_dir: &Path) -> io::Result<()> {
 
     fs::create_dir_all(output_dir)?;
 
+    // First pass: dirs and files (before symlinks, so no file is ever
+    // written through a symlink pointing outside the tree).
     for (i, entry) in manifest.entries.iter().enumerate() {
-        let rel_path = manifest.entry_path(i);
-        if rel_path.is_empty() {
+        let rel_path = manifest.validated_entry_path(i)?;
+        if rel_path.as_os_str().is_empty() {
             continue;
         }
-
         let target = output_dir.join(&rel_path);
 
         match entry.kind {
             EntryKind::Dir => {
                 fs::create_dir_all(&target)?;
-                fs::set_permissions(&target, fs::Permissions::from_mode(entry.mode))?;
+                fs::set_permissions(
+                    &target,
+                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+                )?;
             }
             EntryKind::File => {
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
 
-                let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
+                let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
 
                 fs::write(&target, &data)?;
-                fs::set_permissions(&target, fs::Permissions::from_mode(entry.mode))?;
+                fs::set_permissions(
+                    &target,
+                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+                )?;
                 pb.inc(1);
             }
-            EntryKind::Symlink => {
-                let link_target = manifest.get_string(entry.symlink_target);
-                if target.exists() || target.symlink_metadata().is_ok() {
-                    fs::remove_file(&target)?;
-                }
-                std::os::unix::fs::symlink(link_target, &target)?;
-            }
+            EntryKind::Symlink => {}
         }
+    }
+
+    // Second pass: symlinks last; refuse any target that escapes the tree.
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != EntryKind::Symlink {
+            continue;
+        }
+        let rel_path = manifest.validated_entry_path(i)?;
+        if rel_path.as_os_str().is_empty() {
+            continue;
+        }
+        let link_target = manifest.get_string(entry.symlink_target);
+        if !symlink_target_within_root(&rel_path, link_target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("symlink target escapes output dir: {}", rel_path.display()),
+            ));
+        }
+        let target = output_dir.join(&rel_path);
+        if target.symlink_metadata().is_ok() {
+            fs::remove_file(&target)?;
+        }
+        std::os::unix::fs::symlink(link_target, &target)?;
     }
 
     pb.finish_with_message("Extraction complete");

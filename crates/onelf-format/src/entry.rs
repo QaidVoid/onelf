@@ -193,7 +193,12 @@ impl Entry {
         let num_blocks = u32::from_le_bytes(buf[57..61].try_into().unwrap());
         let symlink_target = u32::from_le_bytes(buf[61..65].try_into().unwrap());
 
-        let mut blocks = Vec::with_capacity(num_blocks as usize);
+        // Cap the speculative allocation so a crafted `num_blocks` cannot
+        // request gigabytes before the reader hits EOF. The loop still
+        // reads exactly `num_blocks` blocks (growing as needed) and fails
+        // cleanly via `read_exact` when the input is short.
+        let cap = (num_blocks as usize).min(4096);
+        let mut blocks = Vec::with_capacity(cap);
         for _ in 0..num_blocks {
             blocks.push(Block::read_from(r)?);
         }

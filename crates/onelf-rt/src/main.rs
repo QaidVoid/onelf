@@ -94,6 +94,7 @@ fn main() {
     let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible();
 
     let target_blocks = pkg.manifest.entries[ep_target_entry].blocks.clone();
+    let target_hash = pkg.manifest.entries[ep_target_entry].content_hash;
 
     let ep_args_str = pkg
         .manifest
@@ -118,13 +119,18 @@ fn main() {
 
     // Memfd mode: single static binary, no libs needed
     if force == Some("memfd") || (force.is_none() && ep_memfd) {
-        if let Ok(data) = loader::read_payload_blocks(
+        // Verify the memfd payload against the entrypoint's content hash
+        // so an in-memory exec never runs unverified bytes.
+        let verified = loader::read_payload_blocks(
             &mut pkg.file,
             pkg.footer.payload_offset,
             &target_blocks,
             pkg.dict.as_deref(),
             pkg.footer.is_stored(),
-        ) {
+        )
+        .ok()
+        .filter(|d| blake3::hash(d).as_bytes() == &target_hash);
+        if let Some(data) = verified {
             let lib_paths_str = pkg.manifest.lib_dirs().join(":");
             // memfd mode: target is the memfd data itself (an ELF we
             // just read). Pass a non-empty marker so setup_env treats

@@ -599,6 +599,7 @@ dependencies = [
 name = "onelf-rt"
 version = "0.2.8"
 dependencies = [
+ "blake3",
  "onelf-format",
  "rustix",
  "userland-execve",

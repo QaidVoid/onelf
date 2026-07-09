@@ -1,7 +1,52 @@
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read, Write};
+use std::path::PathBuf;
 
-use crate::entry::{Entry, EntryPoint};
+use crate::entry::{ENTRY_HEADER_SIZE, ENTRYPOINT_SIZE, Entry, EntryPoint};
+
+/// Returns true if `name` is a single safe path component: non-empty,
+/// not `.` or `..`, and free of `/` and NUL. Used to reject entry names
+/// that would let a crafted package escape the extraction root.
+pub fn is_safe_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// Lexically check that a symlink placed at `link_rel` (a relative path
+/// under the extraction root) with `target` still resolves inside the
+/// root. Absolute targets and targets that walk above the root are
+/// rejected. Purely lexical, so it cannot be defeated by filesystem
+/// races. Shared by the runtime and the packer's extractor.
+pub fn symlink_target_within_root(link_rel: &std::path::Path, target: &str) -> bool {
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    if target.is_empty() {
+        return false;
+    }
+    let tpath = std::path::Path::new(target);
+    if tpath.is_absolute() {
+        return false;
+    }
+    let mut stack: Vec<OsString> = Vec::new();
+    let mut walk = |path: &std::path::Path| -> bool {
+        for c in path.components() {
+            match c {
+                Component::Normal(s) => stack.push(s.to_os_string()),
+                Component::ParentDir => {
+                    if stack.pop().is_none() {
+                        return false;
+                    }
+                }
+                Component::CurDir => {}
+                _ => return false,
+            }
+        }
+        true
+    };
+    // Begin at the directory containing the symlink, then apply target.
+    let parent_ok = link_rel.parent().map(&mut walk).unwrap_or(true);
+    parent_ok && walk(tpath)
+}
 
 pub const MANIFEST_HEADER_SIZE: usize = 2 + 4 + 4 + 2 + 2 + 2 + 2 + 32; // 50 bytes
 
@@ -90,6 +135,7 @@ impl Manifest {
     }
 
     pub fn deserialize(data: &[u8]) -> io::Result<Self> {
+        let total = data.len();
         let mut cursor = Cursor::new(data);
         let header = ManifestHeader::read_from(&mut cursor)?;
 
@@ -100,33 +146,93 @@ impl Manifest {
             ));
         }
 
-        let mut entrypoints = Vec::with_capacity(header.entrypoint_count as usize);
+        // Clamp every speculative allocation to what the input can back,
+        // so an oversized count in the header cannot request huge memory
+        // before `read_exact` fails on the truncated data.
+        let remaining = |c: &Cursor<&[u8]>| total.saturating_sub(c.position() as usize);
+
+        let ep_cap = (header.entrypoint_count as usize).min(remaining(&cursor) / ENTRYPOINT_SIZE);
+        let mut entrypoints = Vec::with_capacity(ep_cap);
         for _ in 0..header.entrypoint_count {
             entrypoints.push(EntryPoint::read_from(&mut cursor)?);
         }
 
-        let mut entries = Vec::with_capacity(header.entry_count as usize);
+        let entry_cap = (header.entry_count as usize).min(remaining(&cursor) / ENTRY_HEADER_SIZE);
+        let mut entries = Vec::with_capacity(entry_cap);
         for _ in 0..header.entry_count {
             entries.push(Entry::read_from(&mut cursor)?);
         }
 
-        let mut lib_dir_offsets = Vec::with_capacity(header.lib_dir_count as usize);
+        let ld_cap = (header.lib_dir_count as usize).min(remaining(&cursor) / 4);
+        let mut lib_dir_offsets = Vec::with_capacity(ld_cap);
         for _ in 0..header.lib_dir_count {
             let mut offset_buf = [0u8; 4];
             cursor.read_exact(&mut offset_buf)?;
             lib_dir_offsets.push(u32::from_le_bytes(offset_buf));
         }
 
-        let mut string_table = vec![0u8; header.string_table_size as usize];
+        let st_size = header.string_table_size as usize;
+        if st_size > remaining(&cursor) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "string table size exceeds remaining input",
+            ));
+        }
+        let mut string_table = vec![0u8; st_size];
         cursor.read_exact(&mut string_table)?;
 
-        Ok(Manifest {
+        let manifest = Manifest {
             header,
             entrypoints,
             entries,
             lib_dir_offsets,
             string_table,
-        })
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate every cross-reference (parent, target_entry,
+    /// default_entrypoint, string offsets) against its range. Rejects a
+    /// crafted manifest before any consumer indexes it directly.
+    fn validate(&self) -> io::Result<()> {
+        let n = self.entries.len();
+        let st = self.string_table.len() as u32;
+        let bad = |msg: &'static str| io::Error::new(io::ErrorKind::InvalidData, msg);
+
+        for e in &self.entries {
+            if e.parent != u32::MAX && e.parent as usize >= n {
+                return Err(bad("entry parent index out of range"));
+            }
+            if e.name > st {
+                return Err(bad("entry name offset out of range"));
+            }
+            if e.symlink_target > st {
+                return Err(bad("entry symlink_target offset out of range"));
+            }
+        }
+        for ep in &self.entrypoints {
+            if ep.target_entry as usize >= n {
+                return Err(bad("entrypoint target_entry out of range"));
+            }
+            if ep.name > st || ep.args > st {
+                return Err(bad("entrypoint string offset out of range"));
+            }
+        }
+        if !self.entrypoints.is_empty()
+            && self.header.default_entrypoint as usize >= self.entrypoints.len()
+        {
+            return Err(bad("default_entrypoint out of range"));
+        }
+        for &off in &self.lib_dir_offsets {
+            if off > st {
+                return Err(bad("lib_dir offset out of range"));
+            }
+        }
+        if self.header.name_offset as u32 > st {
+            return Err(bad("name_offset out of range"));
+        }
+        Ok(())
     }
 
     /// Returns the package name, or empty string if unset.
@@ -148,12 +254,11 @@ impl Manifest {
 
     pub fn get_string(&self, offset: u32) -> &str {
         let start = offset as usize;
-        let end = self.string_table[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| start + p)
-            .unwrap_or(self.string_table.len());
-        std::str::from_utf8(&self.string_table[start..end]).unwrap_or("")
+        let Some(tail) = self.string_table.get(start..) else {
+            return "";
+        };
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        std::str::from_utf8(&tail[..end]).unwrap_or("")
     }
 
     /// Check if a top-level directory with the given name exists
@@ -176,12 +281,18 @@ impl Manifest {
         String::new()
     }
 
-    /// Reconstruct the full path for an entry by walking parent chain
+    /// Reconstruct the full path for an entry by walking parent chain.
+    ///
+    /// The walk is bounded to the number of entries, so a crafted parent
+    /// cycle terminates instead of looping forever, and an out-of-range
+    /// parent index stops the walk instead of panicking.
     pub fn entry_path(&self, index: usize) -> String {
         let mut parts = Vec::new();
         let mut idx = index;
-        loop {
-            let entry = &self.entries[idx];
+        for _ in 0..=self.entries.len() {
+            let Some(entry) = self.entries.get(idx) else {
+                break;
+            };
             let name = self.get_string(entry.name);
             if name.is_empty() {
                 break;
@@ -194,6 +305,183 @@ impl Manifest {
         }
         parts.reverse();
         parts.join("/")
+    }
+
+    /// Like [`Manifest::entry_path`], but validates every component is a
+    /// safe single path segment (no `..`, no absolute or embedded `/`,
+    /// no NUL) and returns a relative [`PathBuf`]. Callers extracting to
+    /// disk MUST use this and confirm the joined path stays under the
+    /// target root. Errors on an unsafe component or out-of-range parent.
+    pub fn validated_entry_path(&self, index: usize) -> io::Result<PathBuf> {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut idx = index;
+        for _ in 0..=self.entries.len() {
+            let entry = self.entries.get(idx).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "entry parent index out of range",
+                )
+            })?;
+            let name = self.get_string(entry.name);
+            if name.is_empty() {
+                break;
+            }
+            if !is_safe_component(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsafe path component: {name:?}"),
+                ));
+            }
+            parts.push(name);
+            if entry.parent == u32::MAX {
+                break;
+            }
+            idx = entry.parent as usize;
+        }
+        parts.reverse();
+        let mut path = PathBuf::new();
+        for part in parts {
+            path.push(part);
+        }
+        Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry::{Entry, EntryKind};
+
+    fn entry(name: u32, parent: u32) -> Entry {
+        Entry {
+            kind: EntryKind::Dir,
+            parent,
+            name,
+            mode: 0o755,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+            content_hash: [0u8; 32],
+            num_blocks: 0,
+            blocks: Vec::new(),
+            symlink_target: 0,
+        }
+    }
+
+    fn manifest(entries: Vec<Entry>, string_table: Vec<u8>) -> Manifest {
+        Manifest {
+            header: ManifestHeader {
+                version: 1,
+                entry_count: entries.len() as u32,
+                string_table_size: string_table.len() as u32,
+                entrypoint_count: 0,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [0u8; 32],
+            },
+            entrypoints: Vec::new(),
+            entries,
+            lib_dir_offsets: Vec::new(),
+            string_table,
+        }
+    }
+
+    #[test]
+    fn roundtrip_valid_manifest() {
+        // string table: "\0a\0b\0" -> "a" at 1, "b" at 3
+        let st = b"\0a\0b\0".to_vec();
+        let m = manifest(vec![entry(1, u32::MAX), entry(3, 0)], st);
+        let bytes = m.serialize().unwrap();
+        let back = Manifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.entry_path(1), "a/b");
+        assert_eq!(back.get_string(3), "b");
+    }
+
+    #[test]
+    fn get_string_out_of_range_returns_empty() {
+        let m = manifest(vec![entry(0, u32::MAX)], b"\0".to_vec());
+        assert_eq!(m.get_string(9999), "");
+    }
+
+    #[test]
+    fn oversized_entry_count_errors_without_panic() {
+        let m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        let mut bytes = m.serialize().unwrap();
+        // entry_count lives at header offset 2..6.
+        bytes[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Manifest::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn oversized_string_table_errors() {
+        let m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        let mut bytes = m.serialize().unwrap();
+        // string_table_size lives at header offset 6..10.
+        bytes[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Manifest::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn out_of_range_parent_rejected_at_deserialize() {
+        let m = manifest(vec![entry(1, 5)], b"\0a\0".to_vec());
+        let bytes = m.serialize().unwrap();
+        assert!(Manifest::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn parent_cycle_terminates() {
+        // entries 0 and 1 point at each other; entry_path must not hang.
+        let st = b"\0a\0b\0".to_vec();
+        let m = manifest(vec![entry(1, 1), entry(3, 0)], st);
+        let path = m.entry_path(0);
+        assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn unsafe_component_rejected() {
+        // name ".." at offset 1.
+        let m = manifest(vec![entry(1, u32::MAX)], b"\0..\0".to_vec());
+        assert!(m.validated_entry_path(0).is_err());
+    }
+
+    #[test]
+    fn safe_component_accepted() {
+        let m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        assert_eq!(m.validated_entry_path(0).unwrap().to_str(), Some("a"));
+    }
+
+    #[test]
+    fn is_safe_component_rules() {
+        assert!(is_safe_component("lib"));
+        assert!(!is_safe_component(""));
+        assert!(!is_safe_component("."));
+        assert!(!is_safe_component(".."));
+        assert!(!is_safe_component("a/b"));
+        assert!(!is_safe_component("a\0b"));
+    }
+
+    #[test]
+    fn symlink_within_root_rules() {
+        use std::path::Path;
+        // Relative target that stays inside the root.
+        assert!(symlink_target_within_root(
+            Path::new("bin/app"),
+            "../lib/x.so"
+        ));
+        assert!(symlink_target_within_root(Path::new("a/b/c"), "d"));
+        // Absolute targets are refused.
+        assert!(!symlink_target_within_root(
+            Path::new("bin/app"),
+            "/etc/passwd"
+        ));
+        // Walking above the root is refused.
+        assert!(!symlink_target_within_root(
+            Path::new("bin/app"),
+            "../../etc/passwd"
+        ));
+        assert!(!symlink_target_within_root(Path::new("top"), "../escape"));
+        // Empty target is refused.
+        assert!(!symlink_target_within_root(Path::new("x"), ""));
     }
 }
 

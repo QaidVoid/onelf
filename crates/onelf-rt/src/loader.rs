@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use onelf_format::{FOOTER_SIZE, Footer, Manifest};
+use onelf_format::{Entry, FOOTER_SIZE, Footer, Manifest};
 
 pub struct PackageData {
     pub footer: Footer,
@@ -32,6 +32,23 @@ pub fn load() -> io::Result<PackageData> {
     file.read_exact(&mut footer_buf)?;
     let footer = Footer::from_bytes(&footer_buf)?;
 
+    // Validate every region the footer points at against the real file
+    // size before trusting any offset/size taken from it. Guards both
+    // out-of-bounds reads and overflow in offset+size arithmetic.
+    let in_bounds = |off: u64, len: u64| off.checked_add(len).is_some_and(|e| e <= file_size);
+    if !in_bounds(footer.manifest_offset, footer.manifest_compressed) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest region out of bounds",
+        ));
+    }
+    if !in_bounds(footer.payload_offset, footer.payload_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload region out of bounds",
+        ));
+    }
+
     // Read and decompress manifest
     file.seek(SeekFrom::Start(footer.manifest_offset))?;
     let mut manifest_compressed = vec![0u8; footer.manifest_compressed as usize];
@@ -51,6 +68,12 @@ pub fn load() -> io::Result<PackageData> {
 
     // Read dictionary if present
     let dict = if footer.flags.contains(onelf_format::Flags::HAS_DICT) && footer.dict_size > 0 {
+        if !in_bounds(footer.dict_offset, footer.dict_size as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dictionary region out of bounds",
+            ));
+        }
         file.seek(SeekFrom::Start(footer.dict_offset))?;
         let mut dict_buf = vec![0u8; footer.dict_size as usize];
         file.read_exact(&mut dict_buf)?;
@@ -76,7 +99,10 @@ pub fn read_payload_entry(
     dict: Option<&[u8]>,
     stored: bool,
 ) -> io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(payload_offset + entry_offset))?;
+    let abs = payload_offset
+        .checked_add(entry_offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload offset overflow"))?;
+    file.seek(SeekFrom::Start(abs))?;
     let mut buf = vec![0u8; compressed_size as usize];
     file.read_exact(&mut buf)?;
 
@@ -100,6 +126,33 @@ pub fn read_payload_entry(
     Ok(data)
 }
 
+/// Read and reassemble an entry's payload, then verify it against the
+/// entry's recorded BLAKE3 `content_hash` before returning. A mismatch
+/// (tampered or corrupt package, or a poisoned content-addressable store
+/// slot) is a hard error, so unverified bytes never reach execution,
+/// hardlinking, memfd loading, or FUSE.
+pub fn read_verified_entry(
+    file: &mut File,
+    footer: &Footer,
+    entry: &Entry,
+    dict: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    let data = read_payload_blocks(
+        file,
+        footer.payload_offset,
+        &entry.blocks,
+        dict,
+        footer.is_stored(),
+    )?;
+    if blake3::hash(&data).as_bytes() != &entry.content_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "onelf: content hash mismatch (tampered or corrupt package)",
+        ));
+    }
+    Ok(data)
+}
+
 pub fn read_payload_blocks(
     file: &mut File,
     payload_offset: u64,
@@ -110,7 +163,10 @@ pub fn read_payload_blocks(
     let mut result = Vec::new();
 
     for block in blocks {
-        file.seek(SeekFrom::Start(payload_offset + block.payload_offset))?;
+        let abs = payload_offset
+            .checked_add(block.payload_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload offset overflow"))?;
+        file.seek(SeekFrom::Start(abs))?;
         let mut buf = vec![0u8; block.compressed_size as usize];
         file.read_exact(&mut buf)?;
 

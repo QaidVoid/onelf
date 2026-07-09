@@ -181,6 +181,11 @@ enum Commands {
         /// Extract only specific files by path (repeatable)
         #[arg(long)]
         file: Vec<String>,
+
+        /// Preserve full mode bits including setuid/setgid/sticky.
+        /// Unsafe for untrusted packages; off by default (masked to 0o777).
+        #[arg(long)]
+        preserve_mode: bool,
     },
 
     /// Extract icon from a packed binary
@@ -462,7 +467,8 @@ fn main() {
             binary,
             output,
             file,
-        } => extract::extract(&binary, output.as_deref(), &file),
+            preserve_mode,
+        } => extract::extract(&binary, output.as_deref(), &file, preserve_mode),
         Commands::Icon {
             binary,
             entrypoint,
