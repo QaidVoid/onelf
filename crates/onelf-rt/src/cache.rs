@@ -38,12 +38,16 @@ fn file_hashes_to(path: &Path, expected: &[u8; 32]) -> bool {
     hasher.finalize().as_bytes() == expected
 }
 
-fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
+/// Resolve the persistent cache root. Prefers `$XDG_CACHE_HOME`, then
+/// `~/.cache` (both already user-private). Only when neither is set does it
+/// fall back to the `0700` per-uid private dir; if even that is unavailable
+/// it returns `None` so the caller refuses rather than using shared `/tmp`.
+fn cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("onelf")
+        .or_else(crate::paths::private_dir)?;
+    Some(base.join("onelf"))
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -114,7 +118,12 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
 }
 
 pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
-    let base = cache_dir();
+    let base = cache_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "onelf: no safe cache directory (set HOME or XDG_RUNTIME_DIR)",
+        )
+    })?;
     let package_id = hex(&pkg.manifest.header.package_id);
     let pkg_dir = base.join("pkg").join(&package_id);
     let cas_dir = base.join("cas");
@@ -141,15 +150,28 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
     }
 
     fs::create_dir_all(&cas_dir)?;
-    fs::create_dir_all(&pkg_dir)?;
+    let pkg_parent = base.join("pkg");
+    fs::create_dir_all(&pkg_parent)?;
 
-    // Extract files to CAS and build hardlink farm
-    extract_to_cas(pkg, &cas_dir, &pkg_dir)?;
+    // Extract into a per-package temp dir, then atomically rename it to
+    // pkg_dir. The lock-free fast path gates on pkg_dir existing, so a
+    // concurrent run never observes a half-populated tree: the completed
+    // directory appears in a single step. A stale temp from a crashed
+    // extraction is removed first, and any failure removes the temp so
+    // the next run re-extracts rather than reusing a partial tree.
+    let tmp_dir = pkg_parent.join(format!(".{package_id}.tmp"));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
 
-    // Bundle-libs patches PT_INTERP to a relative path like
-    // `lib/ld-linux-x86-64.so.2`. That resolves against the process
-    // CWD at kernel exec time, which is fine for the entrypoint we
-    // launch (the runtime chdirs to pkg_dir first) but breaks for
+    if let Err(e) = extract_to_cas(pkg, &cas_dir, &tmp_dir) {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp_dir, &pkg_dir) {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+
     // Record metadata
     touch_meta(&meta_dir, &package_id);
 
@@ -315,7 +337,9 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
 
         let name = entry.file_name();
         let id = name.to_string_lossy();
-        if id == current_pkg_id {
+        // Never remove the current package, nor any package a concurrent
+        // process is actively running (its lock is held).
+        if id == current_pkg_id || package_is_locked(base, &id) {
             continue;
         }
 
@@ -334,7 +358,21 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
     }
 }
 
-pub fn base_dir() -> PathBuf {
+/// True if another process holds the exclusive lock for `id` (i.e. the
+/// package is actively running). A non-blocking exclusive `flock` that
+/// would block means the package is in use and must not be GC'd.
+fn package_is_locked(base: &Path, id: &str) -> bool {
+    let lock_path = base.join("lock").join(id);
+    let Ok(f) = fs::File::open(&lock_path) else {
+        return false; // no lock file -> not currently running
+    };
+    match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => false, // acquired -> nobody else holds it
+        Err(_) => true,  // would block -> held by a running process
+    }
+}
+
+pub fn base_dir() -> Option<PathBuf> {
     cache_dir()
 }
 
@@ -358,5 +396,38 @@ mod tests {
         assert!(!file_hashes_to(&path, &good_hash));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_skips_locked_and_removes_idle() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("onelf-gc-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for sub in ["pkg", "meta", "lock"] {
+            fs::create_dir_all(base.join(sub)).unwrap();
+        }
+
+        // Two packages, both over-age (mtime pinned to the epoch).
+        let old = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        for id in ["locked", "idle"] {
+            fs::create_dir_all(base.join("pkg").join(id)).unwrap();
+            fs::write(base.join("pkg").join(id).join("f"), b"x").unwrap();
+            fs::File::create(base.join("lock").join(id)).unwrap();
+            let m = fs::File::create(base.join("meta").join(id)).unwrap();
+            m.set_times(old).unwrap();
+            let _ = fs::set_permissions(base.join("meta").join(id), PermissionsExt::from_mode(0o644));
+        }
+
+        // Hold the "locked" package's lock, as a running process would.
+        let held = fs::File::open(base.join("lock").join("locked")).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        auto_gc(&base, 0, "none");
+
+        assert!(base.join("pkg").join("locked").exists(), "running package must survive GC");
+        assert!(!base.join("pkg").join("idle").exists(), "idle over-age package must be removed");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

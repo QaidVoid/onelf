@@ -191,7 +191,16 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
     // across invocations from the same cache. Hashing by content would
     // be more correct but require reading the whole file.
     let hash = simple_hash(canonical_linker.to_string_lossy().as_bytes());
-    let link_path = PathBuf::from(format!("/tmp/onelf-ld-{hash:08x}.so"));
+    // Place the symlink inside our 0700 uid-owned private dir so no other
+    // user can pre-create or tamper with it. Security comes from the owned
+    // directory, not from an unpredictable name.
+    let base = crate::paths::private_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "onelf: no private runtime dir for interp symlink",
+        )
+    })?;
+    let link_path = base.join(format!("onelf-ld-{hash:08x}.so"));
 
     // Create or refresh the symlink (idempotent).
     let needs_create = match fs::read_link(&link_path) {
@@ -201,7 +210,7 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
     if needs_create {
         // Atomic update: create at a temp path, then rename. Avoids a
         // window where the symlink doesn't exist for concurrent runs.
-        let tmp = PathBuf::from(format!("/tmp/onelf-ld-{hash:08x}.tmp"));
+        let tmp = base.join(format!("onelf-ld-{hash:08x}.tmp"));
         let _ = fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&canonical_linker, &tmp)?;
         fs::rename(&tmp, &link_path)?;

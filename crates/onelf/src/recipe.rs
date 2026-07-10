@@ -140,6 +140,9 @@ fn default_level() -> i32 {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Update {
     pub url: String,
+    /// Path to a file with the raw 32-byte Ed25519 public key used to
+    /// verify signed self-updates.
+    pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]

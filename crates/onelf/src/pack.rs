@@ -44,6 +44,9 @@ pub struct PackOptions {
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
     pub update_url: Option<String>,
+    /// Raw Ed25519 public key bytes embedded as `.onelf/update-key`; the
+    /// runtime requires it (and a valid signature) before self-updating.
+    pub update_key: Option<Vec<u8>>,
     pub exclude: Vec<String>,
     /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
     pub package_info: Option<String>,
@@ -279,6 +282,25 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         files.push(CollectedFile {
             rel_path: PathBuf::from(".onelf/update-url"),
             content: url.as_bytes().to_vec(),
+            mode: 0o644,
+            mtime_secs: inject_mtime,
+            mtime_nsec: 0,
+        });
+    }
+
+    // Inject .onelf/update-key (raw Ed25519 public key) if provided.
+    if let Some(ref key) = opts.update_key {
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: inject_mtime,
+                mtime_nsec: 0,
+            });
+        }
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/update-key"),
+            content: key.clone(),
             mode: 0o644,
             mtime_secs: inject_mtime,
             mtime_nsec: 0,

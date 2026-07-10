@@ -96,10 +96,13 @@ fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBu
         .collect::<String>();
     let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
 
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = match crate::paths::private_dir() {
+        Some(b) => b,
+        None => {
+            eprintln!("onelf-rt: fuse: no private runtime dir available");
+            return None;
+        }
+    };
 
     let mountpoint = base.join(&dir_name);
 
