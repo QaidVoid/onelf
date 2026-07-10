@@ -197,6 +197,201 @@ fn preload_list_is_emitted() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Extraction masks setuid/setgid/sticky bits by default, and
+/// `--preserve-mode` opts back in. Guards against a hostile package
+/// shipping a setuid file that survives extraction.
+#[test]
+fn extract_masks_mode_bits_by_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = workdir("mode");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let suid = app.join("bin/suid");
+    std::fs::write(&suid, b"x").unwrap();
+    // 04755: setuid + rwxr-xr-x.
+    std::fs::set_permissions(&suid, std::fs::Permissions::from_mode(0o4755)).unwrap();
+
+    let pkg = td.join("m.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Default extraction: setuid bit stripped.
+    let out = td.join("out");
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "extract: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mode = std::fs::metadata(out.join("bin/suid"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o755,
+        "setuid bit must be stripped by default"
+    );
+
+    // --preserve-mode: setuid bit kept.
+    let out2 = td.join("out2");
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "--output",
+            out2.to_str().unwrap(),
+            "--preserve-mode",
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "extract --preserve-mode: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mode = std::fs::metadata(out2.join("bin/suid"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o4755, "--preserve-mode must keep setuid");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A packed symlink whose target escapes the tree must be refused at
+/// extraction, and nothing may be written outside the output dir.
+#[test]
+fn extract_refuses_escaping_symlink() {
+    let td = workdir("evil-link");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    // Symlink in the source tree that points outside the package.
+    std::os::unix::fs::symlink("../../../../etc/passwd", app.join("bin/evil")).unwrap();
+
+    let pkg = td.join("e.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let out = td.join("out");
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        !o.status.success(),
+        "extraction of an escaping symlink must fail; stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // The escaping symlink must not have been created.
+    assert!(
+        out.join("bin/evil").symlink_metadata().is_err(),
+        "escaping symlink was materialized"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A corrupted manifest must produce a clean error, never a panic, from
+/// the inspection commands that parse untrusted files.
+#[test]
+fn malformed_manifest_errors_cleanly() {
+    let td = workdir("malformed");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+
+    let pkg = td.join("bad.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Locate the manifest region via the footer and corrupt bytes inside
+    // it (leaving the footer magic intact), so the parse/decompress
+    // genuinely fails rather than possibly hitting the payload.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let flen = bytes.len();
+    let mut footer_buf = [0u8; onelf_format::FOOTER_SIZE];
+    footer_buf.copy_from_slice(&bytes[flen - onelf_format::FOOTER_SIZE..]);
+    let footer = onelf_format::Footer::from_bytes(&footer_buf).expect("valid footer");
+    let start = footer.manifest_offset as usize;
+    let end = (start + footer.manifest_compressed as usize).min(flen);
+    assert!(start < end, "manifest region should be non-empty");
+    for b in &mut bytes[start..end] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&pkg, &bytes).unwrap();
+
+    let o = run_onelf(&["info", pkg.to_str().unwrap()], None);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "info panicked on a corrupt package: {stderr}"
+    );
+    assert!(
+        !o.status.success(),
+        "info must fail on a corrupt manifest; stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The headline B2 test: with an entrypoint that gets the onelf-env
 /// DT_NEEDED, `[env]` must survive the app clearing its environment and
 /// re-execing itself (the sandbox scenario).

@@ -122,6 +122,9 @@ pub struct FuseState<'a> {
     stored: bool,
     children: Vec<Vec<u64>>,
     cache: BlockCache,
+    /// Per-inode verdict of whole-entry BLAKE3 verification, computed
+    /// lazily on first read so no served bytes are ever unverified.
+    verified: HashMap<u64, bool>,
 }
 
 impl<'a> FuseState<'a> {
@@ -141,7 +144,30 @@ impl<'a> FuseState<'a> {
             stored,
             children,
             cache: BlockCache::new(),
+            verified: HashMap::new(),
         }
+    }
+
+    /// Verify the whole entry's decompressed content against its recorded
+    /// BLAKE3 hash, once per inode. Serving any slice of an unverified
+    /// file is refused. Returns the cached verdict on subsequent reads.
+    fn verify_entry(&mut self, inode: u64, entry_idx: usize) -> bool {
+        if let Some(&ok) = self.verified.get(&inode) {
+            return ok;
+        }
+        let entry = &self.manifest.entries[entry_idx];
+        let ok = match loader::read_payload_blocks(
+            self.file,
+            self.payload_offset,
+            &entry.blocks,
+            self.dict,
+            self.stored,
+        ) {
+            Ok(data) => blake3::hash(&data).as_bytes() == &entry.content_hash,
+            Err(_) => false,
+        };
+        self.verified.insert(inode, ok);
+        ok
     }
 
     pub fn run_loop(&mut self, fuse_fd: &impl AsFd, death_pipe: &impl AsFd, buf: &mut [u8]) {
@@ -235,12 +261,24 @@ impl<'a> FuseState<'a> {
             return;
         }
 
-        let entry = &self.manifest.entries[entry_idx];
-        if entry.blocks.is_empty() {
+        {
+            let entry = &self.manifest.entries[entry_idx];
+            if entry.blocks.is_empty() {
+                let r = reply_err(header, -libc_eio());
+                let _ = rustix::io::write(fuse_fd, &r);
+                return;
+            }
+        }
+
+        // Refuse to serve any bytes of a file whose content does not
+        // match its recorded hash.
+        if !self.verify_entry(inode, entry_idx) {
             let r = reply_err(header, -libc_eio());
             let _ = rustix::io::write(fuse_fd, &r);
             return;
         }
+
+        let entry = &self.manifest.entries[entry_idx];
 
         let offset = read_in.offset as usize;
         let size = read_in.size as usize;
@@ -256,13 +294,13 @@ impl<'a> FuseState<'a> {
         if use_stack {
             for (i, block) in entry.blocks.iter().enumerate() {
                 offsets_stack[i] = total_size;
-                total_size += block.original_size as usize;
+                total_size = total_size.saturating_add(block.original_size as usize);
             }
         } else {
             offsets_heap.reserve(num_blocks);
             for block in &entry.blocks {
                 offsets_heap.push(total_size);
-                total_size += block.original_size as usize;
+                total_size = total_size.saturating_add(block.original_size as usize);
             }
         }
         let block_offsets: &[usize] = if use_stack {
@@ -295,7 +333,8 @@ impl<'a> FuseState<'a> {
         let mut needed_heap = Vec::new();
         let mut needed_len = 0;
         for (block_idx, &block_start) in block_offsets.iter().enumerate() {
-            let block_end = block_start + entry.blocks[block_idx].original_size as usize;
+            let block_end =
+                block_start.saturating_add(entry.blocks[block_idx].original_size as usize);
             if offset < block_end && end > block_start {
                 if use_stack {
                     needed_stack[needed_len] = block_idx;
@@ -355,41 +394,62 @@ impl<'a> FuseState<'a> {
             }
         }
 
-        // Zero-copy response: writev directly from cached blocks
-        let out_header = FuseOutHeader {
-            len: (OUT_HEADER_SIZE + read_len) as u32,
-            error: 0,
-            unique: header.unique,
-        };
-        let hdr_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &out_header as *const FuseOutHeader as *const u8,
-                OUT_HEADER_SIZE,
-            )
-        };
-
+        // Zero-copy response: writev directly from cached blocks. Every
+        // slice is clamped to the block's real decompressed length, and
+        // the header length is derived from what is actually written, so
+        // a block whose true size differs from its claimed `original_size`
+        // can never drive an out-of-bounds slice.
         if needed_blocks.len() == 1 {
             // Fast path: single block (most common)
             let block_idx = needed_blocks[0];
             let block_data = self.cache.get_block(inode, block_idx).unwrap();
-            let data_start = offset - block_offsets[block_idx];
+            let data_start = (offset - block_offsets[block_idx]).min(block_data.len());
+            let data_end = data_start.saturating_add(read_len).min(block_data.len());
+            let payload = &block_data[data_start..data_end];
+            let out_header = FuseOutHeader {
+                len: (OUT_HEADER_SIZE + payload.len()) as u32,
+                error: 0,
+                unique: header.unique,
+            };
+            let hdr_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &out_header as *const FuseOutHeader as *const u8,
+                    OUT_HEADER_SIZE,
+                )
+            };
             let _ = rustix::io::writev(
                 fuse_fd,
-                &[
-                    io::IoSlice::new(hdr_bytes),
-                    io::IoSlice::new(&block_data[data_start..data_start + read_len]),
-                ],
+                &[io::IoSlice::new(hdr_bytes), io::IoSlice::new(payload)],
             );
         } else {
-            // Multi-block: gather slices
-            let mut slices = Vec::with_capacity(needed_blocks.len() + 1);
-            slices.push(io::IoSlice::new(hdr_bytes));
+            // Multi-block: gather clamped slices.
+            let mut payloads: Vec<&[u8]> = Vec::with_capacity(needed_blocks.len());
+            let mut total = 0usize;
             for &block_idx in needed_blocks {
                 let block_data = self.cache.get_block(inode, block_idx).unwrap();
                 let block_start = block_offsets[block_idx];
-                let slice_start = offset.max(block_start) - block_start;
-                let slice_end = end.min(block_start + block_data.len()) - block_start;
-                slices.push(io::IoSlice::new(&block_data[slice_start..slice_end]));
+                let slice_start = (offset.max(block_start) - block_start).min(block_data.len());
+                let slice_end =
+                    (end.min(block_start + block_data.len()) - block_start).min(block_data.len());
+                let payload = &block_data[slice_start..slice_end];
+                total += payload.len();
+                payloads.push(payload);
+            }
+            let out_header = FuseOutHeader {
+                len: (OUT_HEADER_SIZE + total) as u32,
+                error: 0,
+                unique: header.unique,
+            };
+            let hdr_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &out_header as *const FuseOutHeader as *const u8,
+                    OUT_HEADER_SIZE,
+                )
+            };
+            let mut slices = Vec::with_capacity(payloads.len() + 1);
+            slices.push(io::IoSlice::new(hdr_bytes));
+            for p in &payloads {
+                slices.push(io::IoSlice::new(p));
             }
             let _ = rustix::io::writev(fuse_fd, &slices);
         }

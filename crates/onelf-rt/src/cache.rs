@@ -5,13 +5,38 @@
 //! BLAKE3 hash and hardlinked into the package directory.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use onelf_format::EntryKind;
+use onelf_format::{EntryKind, symlink_target_within_root};
 
 use crate::loader::{self, PackageData};
+
+/// Monotonic counter making CAS temp-file names unique within a process;
+/// combined with the pid it is unique across concurrent extractions.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Returns true if the file at `path` hashes to `expected`. Reads the
+/// file incrementally so verifying a large CAS entry uses bounded memory.
+/// Used to decide whether an existing CAS entry can be trusted for reuse
+/// or has been poisoned/corrupted and must be re-extracted.
+fn file_hashes_to(path: &Path, expected: &[u8; 32]) -> bool {
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        };
+    }
+    hasher.finalize().as_bytes() == expected
+}
 
 fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
@@ -34,45 +59,47 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
     // Dirs first
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind == EntryKind::Dir {
-            let path = manifest.entry_path(i);
-            if !path.is_empty() {
-                fs::create_dir_all(target_dir.join(&path))?;
+            let rel = manifest.validated_entry_path(i)?;
+            if rel.as_os_str().is_empty() {
+                continue;
             }
+            fs::create_dir_all(target_dir.join(&rel))?;
         }
     }
 
-    // Files
+    // Files (before symlinks, so no file is written through a symlink).
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind != EntryKind::File {
             continue;
         }
-        let rel_path = manifest.entry_path(i);
-        let out_path = target_dir.join(&rel_path);
+        let rel = manifest.validated_entry_path(i)?;
+        let out_path = target_dir.join(&rel);
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let data = loader::read_payload_blocks(
-            &mut pkg.file,
-            pkg.footer.payload_offset,
-            &entry.blocks,
-            pkg.dict.as_deref(),
-            pkg.footer.is_stored(),
-        )?;
+        let data =
+            loader::read_verified_entry(&mut pkg.file, &pkg.footer, entry, pkg.dict.as_deref())?;
 
         let mut f = fs::File::create(&out_path)?;
         f.write_all(&data)?;
-        f.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+        f.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
     }
 
-    // Symlinks
+    // Symlinks last; refuse any target that escapes the root.
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind != EntryKind::Symlink {
             continue;
         }
-        let rel_path = manifest.entry_path(i);
-        let link_path = target_dir.join(&rel_path);
+        let rel = manifest.validated_entry_path(i)?;
         let target = manifest.get_string(entry.symlink_target);
+        if !symlink_target_within_root(&rel, target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "onelf: symlink target escapes package root",
+            ));
+        }
+        let link_path = target_dir.join(&rel);
 
         if let Some(parent) = link_path.parent() {
             fs::create_dir_all(parent)?;
@@ -154,10 +181,11 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
     // First pass: create directories
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind == EntryKind::Dir {
-            let path = manifest.entry_path(i);
-            if !path.is_empty() {
-                fs::create_dir_all(pkg_dir.join(&path))?;
+            let rel = manifest.validated_entry_path(i)?;
+            if rel.as_os_str().is_empty() {
+                continue;
             }
+            fs::create_dir_all(pkg_dir.join(&rel))?;
         }
     }
 
@@ -167,36 +195,55 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
             continue;
         }
 
+        // Validate the link path before any I/O so a hostile name is
+        // rejected before it can create directories.
+        let rel = manifest.validated_entry_path(i)?;
+
         let hash_hex = hex(&entry.content_hash);
         let shard = &hash_hex[..2];
         let cas_shard_dir = cas_dir.join(shard);
         let cas_path = cas_shard_dir.join(&hash_hex);
 
-        // Check if already in CAS (dedup)
-        if !cas_path.exists() {
+        // Reuse an existing CAS entry only if its bytes actually hash to
+        // the requested value. A slot whose content does not verify was
+        // poisoned or corrupted (the CAS is shared across packages), so
+        // re-extract over it instead of trusting it.
+        let reuse = cas_path.exists() && file_hashes_to(&cas_path, &entry.content_hash);
+        if !reuse {
             fs::create_dir_all(&cas_shard_dir)?;
 
-            let data = loader::read_payload_blocks(
+            // read_verified_entry hashes the decompressed bytes against
+            // entry.content_hash, so the CAS filename (derived from that
+            // hash) is only ever populated with verified content.
+            let data = loader::read_verified_entry(
                 &mut pkg.file,
-                pkg.footer.payload_offset,
-                &entry.blocks,
+                &pkg.footer,
+                entry,
                 pkg.dict.as_deref(),
-                pkg.footer.is_stored(),
             )?;
 
-            // Atomic write: temp file then rename
-            let tmp_path = cas_shard_dir.join(format!(".{hash_hex}.tmp"));
-            {
+            // Atomic write: unique temp file then rename. A per-process
+            // pid+sequence name avoids two concurrent extractions of the
+            // same content hash (the CAS is shared across packages)
+            // clobbering each other's in-progress temp file.
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path =
+                cas_shard_dir.join(format!(".{hash_hex}.{}.{seq}.tmp", std::process::id()));
+            let write = (|| -> io::Result<()> {
                 let mut f = fs::File::create(&tmp_path)?;
                 f.write_all(&data)?;
-                f.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+                f.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
+                Ok(())
+            })();
+            if let Err(e) = write {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
             }
             fs::rename(&tmp_path, &cas_path)?;
         }
 
         // Hardlink into pkg dir (avoids readlink issues with symlinks)
-        let rel_path = manifest.entry_path(i);
-        let link_path = pkg_dir.join(&rel_path);
+        let link_path = pkg_dir.join(&rel);
 
         if let Some(parent) = link_path.parent() {
             fs::create_dir_all(parent)?;
@@ -208,15 +255,21 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
         fs::hard_link(&cas_path, &link_path)?;
     }
 
-    // Third pass: create symlinks
+    // Third pass: create symlinks last; refuse targets escaping the root.
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind != EntryKind::Symlink {
             continue;
         }
 
-        let rel_path = manifest.entry_path(i);
-        let link_path = pkg_dir.join(&rel_path);
+        let rel = manifest.validated_entry_path(i)?;
         let target = manifest.get_string(entry.symlink_target);
+        if !symlink_target_within_root(&rel, target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "onelf: symlink target escapes package root",
+            ));
+        }
+        let link_path = pkg_dir.join(&rel);
 
         if let Some(parent) = link_path.parent() {
             fs::create_dir_all(parent)?;
@@ -283,4 +336,27 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
 
 pub fn base_dir() -> PathBuf {
     cache_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_hashes_to_detects_poisoning() {
+        let dir = std::env::temp_dir().join(format!("onelf-cas-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+
+        let good = b"the real library bytes";
+        fs::write(&path, good).unwrap();
+        let good_hash = *blake3::hash(good).as_bytes();
+        assert!(file_hashes_to(&path, &good_hash));
+
+        // A poisoned slot (wrong bytes for the expected hash) is rejected.
+        fs::write(&path, b"malicious replacement").unwrap();
+        assert!(!file_hashes_to(&path, &good_hash));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

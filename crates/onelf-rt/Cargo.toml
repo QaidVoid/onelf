@@ -12,6 +12,7 @@ update = ["dep:zsync-rs"]
 
 [dependencies]
 onelf-format = { workspace = true }
+blake3 = { workspace = true }
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 userland-execve = "0.2"
 zstd = { version = "0.13", default-features = false }
