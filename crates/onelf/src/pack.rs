@@ -47,6 +47,9 @@ pub struct PackOptions {
     pub exclude: Vec<String>,
     /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
     pub package_info: Option<String>,
+    /// Pin every entry's mtime to this Unix timestamp (nsec 0) for fully
+    /// reproducible output independent of filesystem timestamps.
+    pub mtime: Option<u64>,
     /// Custom environment variables to set before exec (KEY=VALUE pairs).
     pub env: Vec<(String, String)>,
     /// Libraries to dlopen on every exec, written to `.onelf/preload` and
@@ -227,7 +230,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
 
         let symlink_meta = fs::symlink_metadata(&abs_path)?;
-        let (mtime_secs, mtime_nsec) = get_mtime(&symlink_meta);
+        let (mtime_secs, mtime_nsec) = get_mtime(&symlink_meta, opts.mtime);
         let mode = symlink_meta.permissions().mode();
 
         if symlink_meta.is_symlink() {
@@ -258,13 +261,18 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
     }
 
+    // Injected .onelf metadata is synthetic (no filesystem mtime), so
+    // honor an explicit `--mtime` pin for it too; otherwise keep 0 so it
+    // stays stable across runs.
+    let inject_mtime = opts.mtime.unwrap_or(0);
+
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
         if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),
                 mode: 0o755,
-                mtime_secs: 0,
+                mtime_secs: inject_mtime,
                 mtime_nsec: 0,
             });
         }
@@ -272,7 +280,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             rel_path: PathBuf::from(".onelf/update-url"),
             content: url.as_bytes().to_vec(),
             mode: 0o644,
-            mtime_secs: 0,
+            mtime_secs: inject_mtime,
             mtime_nsec: 0,
         });
     }
@@ -283,7 +291,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),
                 mode: 0o755,
-                mtime_secs: 0,
+                mtime_secs: inject_mtime,
                 mtime_nsec: 0,
             });
         }
@@ -291,7 +299,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             rel_path: PathBuf::from(".onelf/package-info.toml"),
             content: info.as_bytes().to_vec(),
             mode: 0o644,
-            mtime_secs: 0,
+            mtime_secs: inject_mtime,
             mtime_nsec: 0,
         });
     }
@@ -327,7 +335,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 dirs.push(CollectedDir {
                     rel_path: PathBuf::from(".onelf"),
                     mode: 0o755,
-                    mtime_secs: 0,
+                    mtime_secs: inject_mtime,
                     mtime_nsec: 0,
                 });
             }
@@ -335,7 +343,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 rel_path: PathBuf::from(".onelf/interp"),
                 content: bundled_rel.into_bytes(),
                 mode: 0o644,
-                mtime_secs: 0,
+                mtime_secs: inject_mtime,
                 mtime_nsec: 0,
             });
         }
@@ -368,7 +376,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),
                 mode: 0o755,
-                mtime_secs: 0,
+                mtime_secs: inject_mtime,
                 mtime_nsec: 0,
             });
         }
@@ -376,7 +384,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             rel_path: PathBuf::from(".onelf/env"),
             content: env_lines.join("\n").into_bytes(),
             mode: 0o644,
-            mtime_secs: 0,
+            mtime_secs: inject_mtime,
             mtime_nsec: 0,
         });
     }
@@ -388,7 +396,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),
                 mode: 0o755,
-                mtime_secs: 0,
+                mtime_secs: inject_mtime,
                 mtime_nsec: 0,
             });
         }
@@ -397,7 +405,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             rel_path: PathBuf::from(".onelf/preload"),
             content: content.into_bytes(),
             mode: 0o644,
-            mtime_secs: 0,
+            mtime_secs: inject_mtime,
             mtime_nsec: 0,
         });
     }
@@ -847,23 +855,31 @@ fn bold(s: &str) -> String {
     }
 }
 
-fn get_mtime(meta: &fs::Metadata) -> (u64, u32) {
+fn get_mtime(meta: &fs::Metadata, pin: Option<u64>) -> (u64, u32) {
+    // An explicit `--mtime` / `[package] mtime` pin overrides everything:
+    // every entry gets the same timestamp, so output no longer depends on
+    // filesystem mtimes at all.
+    if let Some(ts) = pin {
+        return (ts, 0);
+    }
+
     let raw = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0));
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Reproducible-builds convention: if SOURCE_DATE_EPOCH is set, clamp
     // mtimes to it. Older files keep their original mtime; newer ones are
-    // pinned to the epoch. Subsecond precision is dropped entirely.
+    // pinned to the epoch.
     if let Some(epoch) = source_date_epoch() {
-        let clamped = raw.0.min(epoch);
-        return (clamped, 0);
+        return (raw.min(epoch), 0);
     }
 
-    raw
+    // Nanosecond precision is always dropped so two checkouts of the same
+    // content differ only by whole-second mtimes (further pinnable above).
+    (raw, 0)
 }
 
 fn source_date_epoch() -> Option<u64> {

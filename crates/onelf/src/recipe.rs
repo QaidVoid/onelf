@@ -26,7 +26,7 @@
 //! gl = true
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use onelf_format::WorkingDir;
@@ -45,8 +45,12 @@ pub struct Recipe {
     pub bundle: Bundle,
     /// Custom environment variables set before exec. Values support
     /// `${ONELF_DIR}` which expands to the package root at runtime.
+    /// Deserialized from the `[env]` TOML table into a `BTreeMap` so the
+    /// emitted `.onelf/env` order is deterministic (sorted by key) across
+    /// runs. Order carries no runtime meaning: each `KEY=VALUE` is applied
+    /// independently and values expand against the live environment.
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: BTreeMap<String, String>,
     /// Libraries dlopen'd on every exec by the bundled onelf-env
     /// constructor. Paths support `${ONELF_DIR}`. Survives sandboxed
     /// re-exec (DT_NEEDED + $ORIGIN RUNPATH), unlike `LD_PRELOAD`.
@@ -66,6 +70,9 @@ pub struct Package {
     pub memfd: Option<bool>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Pin every entry's mtime to this Unix timestamp for reproducible
+    /// output. Overrides filesystem mtimes and `SOURCE_DATE_EPOCH`.
+    pub mtime: Option<u64>,
     pub version: Option<String>,
     pub description: Option<String>,
     pub license: Option<String>,
