@@ -203,6 +203,7 @@ fn copy_prefixed_libs(
                 if strip {
                     strip_debug(&dest_path);
                 }
+                normalize_mtime(&dest_path);
             }
             copied += 1;
             total_bytes += size;
@@ -694,6 +695,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &dest,
                         std::os::unix::fs::PermissionsExt::from_mode(0o755),
                     );
+                    normalize_mtime(&dest);
                     // Strip hardcoded RPATH/RUNPATH so the bundled lib uses
                     // LD_LIBRARY_PATH (set by the runtime) instead of absolute paths
                     if let Err(e) = set_origin_runpath(&dest) {
@@ -916,9 +918,23 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     Ok(())
 }
 
+/// Pin a bundled file's mtime so repeated `bundle-libs` runs produce
+/// metadata-identical trees (`fs::copy` otherwise stamps "now"). Honors
+/// `SOURCE_DATE_EPOCH`, else the Unix epoch. Best-effort: errors ignored.
+fn normalize_mtime(path: &Path) {
+    let secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t));
+    }
+}
+
 fn find_elf_files(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if !path.is_file() {
@@ -2190,7 +2206,7 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
 
 fn find_existing_libs(dir: &Path) -> HashSet<String> {
     let mut libs = HashSet::new();
-    for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         let Some(name) = path.file_name() else {
@@ -2304,7 +2320,11 @@ fn scan_nix_store_libs() -> HashMap<String, Vec<PathBuf>> {
     );
 
     for lib_dir in &lib_dirs {
-        for entry in jwalk::WalkDir::new(lib_dir).max_depth(3).skip_hidden(false) {
+        for entry in jwalk::WalkDir::new(lib_dir)
+            .max_depth(3)
+            .skip_hidden(false)
+            .sort(true)
+        {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
                 continue;
@@ -2370,6 +2390,7 @@ fn expand_nix_cache(
         for entry in jwalk::WalkDir::new(&lib_dir)
             .max_depth(3)
             .skip_hidden(false)
+            .sort(true)
         {
             let Ok(entry) = entry else { continue };
             if !entry.file_type().is_file() {
@@ -2414,9 +2435,13 @@ fn locate_lib(
         }
     }
 
-    // 2. ldconfig cache
+    // 2. ldconfig cache. Sort candidates so the first acceptable match is
+    // stable when several store paths ship the same soname (the cache is
+    // filled from unordered HashSet + walk order).
     if let Some(paths) = ldconfig_cache.get(soname) {
-        for path in paths {
+        let mut sorted: Vec<&PathBuf> = paths.iter().collect();
+        sorted.sort();
+        for path in sorted {
             if path.exists() && acceptable(path) {
                 return Some(path.clone());
             }
@@ -2446,11 +2471,16 @@ fn locate_lib(
         }
     }
 
-    // 5. NixOS fallback: scan /nix/store/*/lib/ directly
+    // 5. NixOS fallback: scan /nix/store/*/lib/ directly. Sort the store
+    // entries (and subdirs) so that when multiple store paths provide the
+    // same soname, the chosen copy is deterministic rather than dependent
+    // on read_dir order.
     if Path::new("/nix/store").is_dir() {
         if let Ok(entries) = fs::read_dir("/nix/store") {
-            for entry in entries.filter_map(Result::ok) {
-                let lib_dir = entry.path().join("lib");
+            let mut dirs: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+            dirs.sort();
+            for dir in dirs {
+                let lib_dir = dir.join("lib");
                 // Check lib/<soname> directly
                 let candidate = lib_dir.join(soname);
                 if candidate.exists() && acceptable(&candidate) {
@@ -2458,12 +2488,16 @@ fn locate_lib(
                 }
                 // Also check one level of subdirs (e.g. lib/pulseaudio/)
                 if let Ok(subdirs) = fs::read_dir(&lib_dir) {
-                    for subdir in subdirs.filter_map(Result::ok) {
-                        if subdir.file_type().map_or(false, |t| t.is_dir()) {
-                            let candidate = subdir.path().join(soname);
-                            if candidate.exists() && acceptable(&candidate) {
-                                return Some(candidate);
-                            }
+                    let mut subs: Vec<PathBuf> = subdirs
+                        .filter_map(Result::ok)
+                        .filter(|s| s.file_type().is_ok_and(|t| t.is_dir()))
+                        .map(|s| s.path())
+                        .collect();
+                    subs.sort();
+                    for subdir in subs {
+                        let candidate = subdir.join(soname);
+                        if candidate.exists() && acceptable(&candidate) {
+                            return Some(candidate);
                         }
                     }
                 }
@@ -2916,6 +2950,7 @@ fn copy_so_dir(
                 if strip {
                     strip_debug(&dest_path);
                 }
+                normalize_mtime(&dest_path);
             }
             copied += 1;
             total_bytes += size;
@@ -3314,18 +3349,32 @@ fn find_glib_compile_schemas() -> PathBuf {
         }
     }
 
-    // NixOS: search store for glib-*-dev/bin/glib-compile-schemas
+    // NixOS: search store for glib-*-dev/bin/glib-compile-schemas. Pick
+    // the highest version deterministically (parsed from the store name)
+    // instead of whichever read_dir surfaces first.
     if Path::new("/nix/store").is_dir() {
         if let Ok(entries) = fs::read_dir("/nix/store") {
+            let mut candidates: Vec<(Vec<u32>, PathBuf)> = Vec::new();
             for entry in entries.filter_map(Result::ok) {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.contains("glib-") && name.ends_with("-dev") {
                     let candidate = entry.path().join("bin/glib-compile-schemas");
                     if candidate.is_file() {
-                        return candidate;
+                        let version = name
+                            .rsplit_once("glib-")
+                            .and_then(|(_, rest)| rest.strip_suffix("-dev"))
+                            .map(|v| v.split('.').filter_map(|p| p.parse().ok()).collect())
+                            .unwrap_or_default();
+                        candidates.push((version, candidate));
                     }
                 }
+            }
+            // Sort by (version, path); the last is the highest version with
+            // a stable path tiebreak.
+            candidates.sort();
+            if let Some((_, path)) = candidates.pop() {
+                return path;
             }
         }
     }
@@ -3421,10 +3470,12 @@ fn copy_vendor_json(
                     if !dry_run {
                         fs::create_dir_all(lib_dest)?;
                         let dest_so = lib_dest.join(&so_name);
-                        if !dest_so.exists() {
-                            fs::copy(&resolved, &dest_so)?;
-                            let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
-                        }
+                        // Overwrite unconditionally (like every other copy
+                        // path) so a stale driver .so from a previous run
+                        // isn't paired with a freshly-written JSON manifest.
+                        fs::copy(&resolved, &dest_so)?;
+                        let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
+                        normalize_mtime(&dest_so);
                     }
                     total_bytes += so_size;
                 }
@@ -3519,6 +3570,7 @@ fn copy_data_dir(src: &Path, dest: &Path, dry_run: bool) -> io::Result<u64> {
             ensure_writable(&dest_path);
             fs::copy(&path, &dest_path)?;
             let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o644));
+            normalize_mtime(&dest_path);
         }
         count += 1;
     }
@@ -3550,7 +3602,11 @@ fn collect_nix_store_paths() -> Vec<String> {
         }
     }
 
-    store_paths.into_iter().collect()
+    // Sort so callers that pick a first match over duplicate sonames are
+    // deterministic regardless of HashSet iteration order.
+    let mut result: Vec<String> = store_paths.into_iter().collect();
+    result.sort();
+    result
 }
 
 #[cfg(test)]

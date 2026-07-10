@@ -440,7 +440,7 @@ fn host_driver_paths() -> Vec<String> {
 /// non-lib roots. Mirrors the heuristic in pack.rs's auto_detect_lib_dirs.
 fn detect_lib_dirs(dir: &Path) -> Vec<PathBuf> {
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
-    for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
             continue;

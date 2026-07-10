@@ -98,6 +98,11 @@ enum Commands {
         /// (repeatable). Survives sandboxed re-exec, unlike LD_PRELOAD.
         #[arg(long)]
         preload: Vec<String>,
+
+        /// Pin every entry's mtime to this Unix timestamp for fully
+        /// reproducible output, independent of filesystem timestamps.
+        #[arg(long)]
+        mtime: Option<u64>,
     },
 
     /// Scaffold a starter onelf.toml
@@ -392,6 +397,7 @@ fn main() {
             update_url,
             exclude,
             preload,
+            mtime,
         } => {
             let memfd_opt = if no_memfd {
                 Some(false)
@@ -428,6 +434,7 @@ fn main() {
                     update_url: update_url.clone(),
                     exclude,
                     package_info: None,
+                    mtime,
                     env: Vec::new(),
                     preload,
                 },
@@ -659,6 +666,7 @@ fn run_build(
             update_url,
             exclude: recipe.package.exclude,
             package_info,
+            mtime: recipe.package.mtime,
             env: recipe.env.into_iter().collect(),
             preload: recipe.preload,
         },

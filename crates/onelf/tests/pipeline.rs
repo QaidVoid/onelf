@@ -392,6 +392,94 @@ fn malformed_manifest_errors_cleanly() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Packing the same tree twice, in separate invocations with a fixed
+/// `SOURCE_DATE_EPOCH` and a multi-key `[env]` (whose order previously
+/// came from a randomized HashMap), must yield byte-identical output.
+///
+/// Uses a real ELF that links `libm`, so the run exercises the *bundler*
+/// determinism paths too (library resolution, copies, mtime normalization,
+/// onelf-env injection), not just packer-side ordering. Soft-skips when no
+/// C compiler is available.
+#[test]
+fn build_is_byte_deterministic() {
+    // Compile once to decide whether the toolchain is present; the closure
+    // below recompiles per build so each runs from an independent tree.
+    {
+        let probe = workdir("det-probe");
+        let ok = cc_libm(&probe.join("p.c"), &probe.join("p"));
+        let _ = std::fs::remove_dir_all(&probe);
+        if !ok {
+            return; // documented soft-skip: no C compiler
+        }
+    }
+
+    let build = |tag: &str| -> Vec<u8> {
+        let td = workdir(tag);
+        let app = td.join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        assert!(
+            cc_libm(&td.join("prog.c"), &app.join("bin/prog")),
+            "compiler vanished mid-test"
+        );
+        // [env] keys in deliberately non-sorted order to exercise ordering.
+        write(
+            &app.join("onelf.toml"),
+            "[package]\nname=\"det\"\ncommand=\"bin/prog\"\n\n\
+             [env]\nZULU=\"1\"\nALPHA=\"2\"\nMIKE=\"3\"\n",
+        );
+        let mut c = Command::new(onelf());
+        c.arg("build")
+            .current_dir(&app)
+            .env("SOURCE_DATE_EPOCH", "1700000000");
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        let o = c.output().expect("spawn onelf build");
+        assert!(
+            o.status.success(),
+            "build: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let bytes = std::fs::read(app.join("det.onelf")).expect("output package");
+        let _ = std::fs::remove_dir_all(&td);
+        bytes
+    };
+
+    let a = build("det-a");
+    let b = build("det-b");
+    assert_eq!(
+        a, b,
+        "two builds of the same tree must be byte-identical (len {} vs {})",
+        a.len(),
+        b.len()
+    );
+}
+
+/// Compile a small ELF that links `libm` (so the packaged binary has real
+/// shared-library dependencies). Returns false if no compiler is present.
+fn cc_libm(src: &Path, out: &Path) -> bool {
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        return false;
+    };
+    write(
+        src,
+        "#include <math.h>\n#include <stdio.h>\n\
+         int main(){printf(\"%f\\n\", sqrt(2.0));return 0;}\n",
+    );
+    Command::new(compiler)
+        .args(["-O0", "-o"])
+        .arg(out)
+        .arg(src)
+        .arg("-lm")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// The headline B2 test: with an entrypoint that gets the onelf-env
 /// DT_NEEDED, `[env]` must survive the app clearing its environment and
 /// re-execing itself (the sandbox scenario).
