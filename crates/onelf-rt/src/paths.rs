@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
 /// Current real uid.
 fn uid() -> u32 {
@@ -42,11 +42,11 @@ pub fn private_dir() -> Option<PathBuf> {
     }
 
     let p = PathBuf::from(format!("/tmp/onelf-{}", uid()));
-    match std::fs::create_dir(&p) {
-        // Freshly created by us: tighten to 0700 (safe, it is a real dir).
-        Ok(()) => {
-            let _ = std::fs::set_permissions(&p, PermissionsExt::from_mode(0o700));
-        }
+    // Create with mode 0700 atomically via mkdir(2) so there is never a
+    // window where the directory is group/other-accessible. umask can only
+    // clear bits, so the result is never looser than 0700.
+    match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+        Ok(()) => {}
         // Pre-existing: do NOT chmod (could be a symlink); verify below.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return None,
@@ -58,6 +58,7 @@ pub fn private_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn prefers_safe_xdg_runtime_dir() {

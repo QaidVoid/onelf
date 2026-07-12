@@ -61,8 +61,19 @@ fn verify_detached(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 /// closed: any fetch/parse/verify problem is an error so the binary is
 /// never installed unverified.
 fn verify_update_signature(path: &Path, url: &str, pubkey: &[u8]) -> Result<(), String> {
-    let sig_url = format!("{url}.sig");
-    let sig = ureq::get(&sig_url)
+    let sig_url = detached_sig_url(url);
+    // A hardened agent for the signature fetch: HTTPS only (no downgrade),
+    // no redirects (a redirect is a hard error, not a silent 3xx body), and
+    // a bounded timeout so a stalled server cannot hang the update.
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .max_redirects_will_error(true)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let sig = agent
+        .get(&sig_url)
         .call()
         .map_err(|e| format!("fetch signature: {e}"))?
         .body_mut()
@@ -74,6 +85,15 @@ fn verify_update_signature(path: &Path, url: &str, pubkey: &[u8]) -> Result<(), 
     } else {
         Err("signature does not verify against the embedded key".to_string())
     }
+}
+
+/// Build the detached-signature URL by appending `.sig` to the path
+/// component, before any query string or fragment. `https://h/a?t=1`
+/// becomes `https://h/a.sig?t=1`, preserving query-bearing update URLs.
+fn detached_sig_url(url: &str) -> String {
+    let split = url.find(['?', '#']).unwrap_or(url.len());
+    let (path, rest) = url.split_at(split);
+    format!("{path}.sig{rest}")
 }
 
 fn check(self_path: &Path, url: &str) -> i32 {
@@ -211,7 +231,11 @@ mod tests {
         // A good signature over the exact bytes verifies.
         assert!(verify_detached(pk, msg, sig.as_ref()));
         // A single tampered byte fails.
-        assert!(!verify_detached(pk, b"assembled update binary byteX", sig.as_ref()));
+        assert!(!verify_detached(
+            pk,
+            b"assembled update binary byteX",
+            sig.as_ref()
+        ));
         // A different key fails.
         let other = KeyPair::from_seed(Seed::new([9u8; 32]));
         assert!(!verify_detached(other.pk.as_ref(), msg, sig.as_ref()));
@@ -224,7 +248,13 @@ mod tests {
     fn non_https_url_is_refused_before_any_request() {
         // A plaintext URL is rejected up front (exit 2) with no network.
         let path = std::path::Path::new("/proc/self/exe");
-        assert_eq!(super::run(super::UpdateFlag::Check, path, "http://x/app", &[]), 2);
-        assert_eq!(super::run(super::UpdateFlag::Apply, path, "ftp://x/app", &[]), 2);
+        assert_eq!(
+            super::run(super::UpdateFlag::Check, path, "http://x/app", &[]),
+            2
+        );
+        assert_eq!(
+            super::run(super::UpdateFlag::Apply, path, "ftp://x/app", &[]),
+            2
+        );
     }
 }

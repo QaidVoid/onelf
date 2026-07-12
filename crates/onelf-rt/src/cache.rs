@@ -43,9 +43,21 @@ fn file_hashes_to(path: &Path, expected: &[u8; 32]) -> bool {
 /// fall back to the `0700` per-uid private dir; if even that is unavailable
 /// it returns `None` so the caller refuses rather than using shared `/tmp`.
 fn cache_dir() -> Option<PathBuf> {
+    // Only absolute env-derived roots are trusted. An empty or relative
+    // XDG_CACHE_HOME/HOME would resolve against the current directory (an
+    // attacker-influenced location), so it is ignored and the private
+    // per-uid dir is used instead.
+    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
+        let p = PathBuf::from(v);
+        p.is_absolute().then_some(p)
+    };
     let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .and_then(abs)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(abs)
+                .map(|h| h.join(".cache"))
+        })
         .or_else(crate::paths::private_dir)?;
     Some(base.join("onelf"))
 }
@@ -117,7 +129,23 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
     Ok(())
 }
 
-pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
+/// Open the per-package lock file leaving the descriptor inheritable (no
+/// `CLOEXEC`) so the shared lock taken by [`ensure_extracted`] survives the
+/// exec into the target and keeps a concurrent process's GC from deleting a
+/// package that is still in use.
+fn open_lock_inheritable(path: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(path, OFlags::CREATE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)?;
+    Ok(fs::File::from(fd))
+}
+
+/// Extract `pkg` into the cache and return its directory together with a
+/// shared lock guard. The guard must be kept alive through exec: while any
+/// process holds it, GC cannot acquire the exclusive lock and therefore
+/// cannot remove the package.
+pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)> {
+    use rustix::fs::FlockOperation;
+
     let base = cache_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -130,23 +158,31 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
     let lock_dir = base.join("lock");
     let meta_dir = base.join("meta");
 
-    // Fast path: already extracted
-    if pkg_dir.exists() {
-        touch_meta(&meta_dir, &package_id);
-        return Ok(pkg_dir);
-    }
-
-    // Take lock
+    // Establish the package lock up front. The lock is held as *shared* for
+    // the whole run so multiple instances coexist while still blocking GC.
     fs::create_dir_all(&lock_dir)?;
     let lock_path = lock_dir.join(&package_id);
-    let lock_file = fs::File::create(&lock_path)?;
-    rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flock: {e}")))?;
+    let lock_file = open_lock_inheritable(&lock_path)?;
 
-    // Double-check after acquiring lock
+    let flock =
+        |op| rustix::fs::flock(&lock_file, op).map_err(|e| io::Error::other(format!("flock: {e}")));
+
+    // Fast path: already extracted. Hold a shared lock and return.
     if pkg_dir.exists() {
+        flock(FlockOperation::LockShared)?;
         touch_meta(&meta_dir, &package_id);
-        return Ok(pkg_dir);
+        return Ok((pkg_dir, lock_file));
+    }
+
+    // Extraction needs the exclusive lock so two processes never populate
+    // the same package concurrently.
+    flock(FlockOperation::LockExclusive)?;
+
+    // Double-check after acquiring lock; downgrade to shared and return.
+    if pkg_dir.exists() {
+        flock(FlockOperation::LockShared)?;
+        touch_meta(&meta_dir, &package_id);
+        return Ok((pkg_dir, lock_file));
     }
 
     fs::create_dir_all(&cas_dir)?;
@@ -175,8 +211,10 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<PathBuf> {
     // Record metadata
     touch_meta(&meta_dir, &package_id);
 
-    // Lock released when lock_file goes out of scope
-    Ok(pkg_dir)
+    // Downgrade the exclusive extraction lock to the shared run lock that
+    // is held (through exec) for the lifetime of this instance.
+    flock(FlockOperation::LockShared)?;
+    Ok((pkg_dir, lock_file))
 }
 
 fn walk_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
@@ -314,7 +352,9 @@ fn touch_meta(meta_dir: &Path, package_id: &str) {
 pub fn remove_package(base: &Path, package_id: &str) {
     let _ = fs::remove_dir_all(base.join("pkg").join(package_id));
     let _ = fs::remove_file(base.join("meta").join(package_id));
-    let _ = fs::remove_file(base.join("lock").join(package_id));
+    // The lock file is intentionally kept: the flock protocol keys mutual
+    // exclusion on its inode, so unlinking it would let a concurrent run
+    // create a fresh inode and defeat the lock.
 }
 
 pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
@@ -337,9 +377,8 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
 
         let name = entry.file_name();
         let id = name.to_string_lossy();
-        // Never remove the current package, nor any package a concurrent
-        // process is actively running (its lock is held).
-        if id == current_pkg_id || package_is_locked(base, &id) {
+        // Never remove the current package.
+        if id == current_pkg_id {
             continue;
         }
 
@@ -351,25 +390,30 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
             Err(_) => continue,
         };
 
-        if now.saturating_sub(mtime) > max_age_secs {
-            remove_package(base, &id);
+        if now.saturating_sub(mtime) > max_age_secs && try_remove_locked(base, &id) {
             removed += 1;
         }
     }
 }
 
-/// True if another process holds the exclusive lock for `id` (i.e. the
-/// package is actively running). A non-blocking exclusive `flock` that
-/// would block means the package is in use and must not be GC'd.
-fn package_is_locked(base: &Path, id: &str) -> bool {
+/// Acquire the exclusive lock for `id` and, while holding it, remove the
+/// package. A running instance holds a shared lock, so the non-blocking
+/// exclusive acquisition fails and the package is left untouched. The lock
+/// is held across [`remove_package`] so a run cannot start mid-deletion.
+/// Returns true if the package was removed.
+fn try_remove_locked(base: &Path, id: &str) -> bool {
     let lock_path = base.join("lock").join(id);
     let Ok(f) = fs::File::open(&lock_path) else {
-        return false; // no lock file -> not currently running
+        // No lock file means the package was never run under this protocol;
+        // it is safe to remove.
+        remove_package(base, id);
+        return true;
     };
-    match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => false, // acquired -> nobody else holds it
-        Err(_) => true,  // would block -> held by a running process
+    if rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        return false; // held by a running process
     }
+    remove_package(base, id);
+    true
 }
 
 pub fn base_dir() -> Option<PathBuf> {
@@ -416,7 +460,8 @@ mod tests {
             fs::File::create(base.join("lock").join(id)).unwrap();
             let m = fs::File::create(base.join("meta").join(id)).unwrap();
             m.set_times(old).unwrap();
-            let _ = fs::set_permissions(base.join("meta").join(id), PermissionsExt::from_mode(0o644));
+            let _ =
+                fs::set_permissions(base.join("meta").join(id), PermissionsExt::from_mode(0o644));
         }
 
         // Hold the "locked" package's lock, as a running process would.
@@ -425,8 +470,14 @@ mod tests {
 
         auto_gc(&base, 0, "none");
 
-        assert!(base.join("pkg").join("locked").exists(), "running package must survive GC");
-        assert!(!base.join("pkg").join("idle").exists(), "idle over-age package must be removed");
+        assert!(
+            base.join("pkg").join("locked").exists(),
+            "running package must survive GC"
+        );
+        assert!(
+            !base.join("pkg").join("idle").exists(),
+            "idle over-age package must be removed"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

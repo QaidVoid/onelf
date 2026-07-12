@@ -427,35 +427,35 @@ fn main() {
             match update_key {
                 Err(e) => Err(e),
                 Ok(update_key) => pack::pack(
-                &pack::PackOptions {
-                    directory,
-                    output,
-                    command,
-                    name,
-                    entrypoints,
-                    default_entrypoint,
-                    lib_dirs: lib_dir,
-                    level,
-                    use_dict: dict,
-                    no_compress,
-                    memfd: memfd_opt,
-                    working_dir: wd,
-                    update_url: update_url.clone(),
-                    update_key,
-                    exclude,
-                    package_info: None,
-                    mtime,
-                    env: Vec::new(),
-                    preload,
-                },
-                // Pick the runtime: slim (~700KB) by default; the
-                // update-capable runtime (~2MB) only when the user actually
-                // configures self-updates.
-                if update_url.is_some() {
-                    RUNTIME_BINARY_UPDATE
-                } else {
-                    RUNTIME_BINARY_SLIM
-                },
+                    &pack::PackOptions {
+                        directory,
+                        output,
+                        command,
+                        name,
+                        entrypoints,
+                        default_entrypoint,
+                        lib_dirs: lib_dir,
+                        level,
+                        use_dict: dict,
+                        no_compress,
+                        memfd: memfd_opt,
+                        working_dir: wd,
+                        update_url: update_url.clone(),
+                        update_key,
+                        exclude,
+                        package_info: None,
+                        mtime,
+                        env: Vec::new(),
+                        preload,
+                    },
+                    // Pick the runtime: slim (~700KB) by default; the
+                    // update-capable runtime (~2MB) only when the user actually
+                    // configures self-updates.
+                    if update_url.is_some() {
+                        RUNTIME_BINARY_UPDATE
+                    } else {
+                        RUNTIME_BINARY_SLIM
+                    },
                 ),
             }
         }
@@ -656,6 +656,7 @@ fn run_build(
         .update
         .as_ref()
         .and_then(|u| u.key.clone())
+        .map(|k| if k.is_absolute() { k } else { dir.join(k) })
         .map(std::fs::read)
         .transpose()?;
     let runtime: &[u8] = if update_url.is_some() {

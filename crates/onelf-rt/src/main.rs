@@ -212,8 +212,11 @@ fn main() {
         }
     }
 
-    // Persistent cache extraction mode (final fallback)
-    let pkg_dir = match cache::ensure_extracted(&mut pkg) {
+    // Persistent cache extraction mode (final fallback). The lock guard is
+    // held (through exec, its fd is left inheritable) for the lifetime of
+    // this instance so a concurrent process's GC cannot delete the package
+    // while it is still in use.
+    let (pkg_dir, _lock_guard) = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("onelf-rt: extraction failed: {e}");

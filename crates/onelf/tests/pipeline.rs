@@ -448,7 +448,8 @@ fn build_is_byte_deterministic() {
     let a = build("det-a");
     let b = build("det-b");
     assert_eq!(
-        a, b,
+        a,
+        b,
         "two builds of the same tree must be byte-identical (len {} vs {})",
         a.len(),
         b.len()
@@ -476,7 +477,11 @@ fn corrupt_manifest_checksum_fails_to_run() {
         ],
         None,
     );
-    assert!(o.status.success(), "pack: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 
     // Footer is the last 76 bytes; manifest_checksum sits at footer offset
     // 64..68, i.e. bytes [len-12 .. len-8]. Flip them, leaving the end
@@ -493,10 +498,14 @@ fn corrupt_manifest_checksum_fails_to_run() {
         .env("HOME", td.to_str().unwrap())
         .output()
         .expect("run corrupt package");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "a corrupt-checksum package must not run; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "a corrupt-checksum package must not run; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("manifest checksum mismatch"),
+        "failure must come from the checksum gate, not an unrelated error; stderr: {stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&td);

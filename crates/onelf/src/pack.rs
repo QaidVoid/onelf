@@ -269,6 +269,20 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // stays stable across runs.
     let inject_mtime = opts.mtime.unwrap_or(0);
 
+    // `.onelf/` is reserved for injected metadata. Reject any packaged
+    // entry that collides so injected files are never shadowed by, or
+    // silently duplicated alongside, source content.
+    let reserved = Path::new(".onelf");
+    if let Some(f) = files.iter().find(|f| f.rel_path.starts_with(reserved)) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "source contains reserved path {}; the .onelf/ namespace is injected by onelf",
+                f.rel_path.display()
+            ),
+        ));
+    }
+
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
         if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
@@ -290,6 +304,15 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Inject .onelf/update-key (raw Ed25519 public key) if provided.
     if let Some(ref key) = opts.update_key {
+        if key.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "update key must be a 32-byte Ed25519 public key, got {} bytes",
+                    key.len()
+                ),
+            ));
+        }
         if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
             dirs.push(CollectedDir {
                 rel_path: PathBuf::from(".onelf"),

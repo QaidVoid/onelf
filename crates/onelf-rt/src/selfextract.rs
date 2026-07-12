@@ -175,13 +175,16 @@ pub fn bind_mount_interp(binary: &Path, bundled_linker: &Path) -> io::Result<Pat
 }
 
 /// Fallback for environments without a private mount namespace (cache
-/// mode): create a short `/tmp` symlink to the bundled linker, then
-/// in-place patch the binary's PT_INTERP to that symlink.
+/// mode): create a short symlink to the bundled linker inside the `0700`
+/// per-uid private dir, then in-place patch the binary's PT_INTERP to it.
 ///
-/// The symlink path is deterministic from the linker's content hash so
-/// multiple invocations share a single symlink. The patched PT_INTERP
-/// must fit in the existing slot (`/tmp/onelf-ld-<8hex>.so` is 22 bytes
-/// — comfortably under the typical 28-byte slot of `/lib64/ld-linux-...`).
+/// The symlink path is deterministic from the linker's path hash so
+/// multiple invocations share a single symlink. The name is kept short
+/// (`ld-<8hex>`) so the rewritten PT_INTERP fits the original slot: e.g.
+/// `/tmp/onelf-<uid>/ld-<8hex>` is 27 bytes, within a glibc
+/// `/lib64/ld-linux-x86-64.so.2` slot. When it does not fit,
+/// [`patch_pt_interp_in_place`] fails and the caller falls back to
+/// explicit linker invocation.
 ///
 /// On success, returns the symlink path that PT_INTERP now points at.
 pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBuf> {
@@ -200,7 +203,7 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
             "onelf: no private runtime dir for interp symlink",
         )
     })?;
-    let link_path = base.join(format!("onelf-ld-{hash:08x}.so"));
+    let link_path = base.join(format!("ld-{hash:08x}"));
 
     // Create or refresh the symlink (idempotent).
     let needs_create = match fs::read_link(&link_path) {
@@ -210,7 +213,7 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
     if needs_create {
         // Atomic update: create at a temp path, then rename. Avoids a
         // window where the symlink doesn't exist for concurrent runs.
-        let tmp = base.join(format!("onelf-ld-{hash:08x}.tmp"));
+        let tmp = base.join(format!("ld-{hash:08x}.tmp"));
         let _ = fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&canonical_linker, &tmp)?;
         fs::rename(&tmp, &link_path)?;
