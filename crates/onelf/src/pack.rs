@@ -270,15 +270,22 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let inject_mtime = opts.mtime.unwrap_or(0);
 
     // `.onelf/` is reserved for injected metadata. Reject any packaged
-    // entry that collides so injected files are never shadowed by, or
-    // silently duplicated alongside, source content.
+    // entry (file, directory, or symlink) that collides so injected
+    // metadata is never shadowed by, or silently duplicated alongside,
+    // source content.
     let reserved = Path::new(".onelf");
-    if let Some(f) = files.iter().find(|f| f.rel_path.starts_with(reserved)) {
+    let collision = files
+        .iter()
+        .map(|f| &f.rel_path)
+        .chain(dirs.iter().map(|d| &d.rel_path))
+        .chain(symlinks.iter().map(|s| &s.rel_path))
+        .find(|p| p.starts_with(reserved));
+    if let Some(p) = collision {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
                 "source contains reserved path {}; the .onelf/ namespace is injected by onelf",
-                f.rel_path.display()
+                p.display()
             ),
         ));
     }

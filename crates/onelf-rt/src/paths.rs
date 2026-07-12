@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 /// Current real uid.
 fn uid() -> u32 {
@@ -23,6 +23,32 @@ fn is_safe_owned_dir(path: &Path) -> bool {
         return false;
     };
     md.is_dir() && md.uid() == uid() && (md.mode() & 0o077) == 0
+}
+
+/// Ensure `dir` is a `0700`, current-uid-owned real directory, creating it
+/// atomically (mode `0700` via `mkdir(2)`) when absent. Returns false if it
+/// exists as a symlink or another user's directory (never chmod'd through);
+/// a real directory we own but with loose permissions is tightened in place.
+/// Intended for establishing a private leaf under an already-trusted base.
+pub(crate) fn ensure_safe_dir(dir: &Path) -> bool {
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    // Pre-existing: only ever chmod a real directory we own (verified via
+    // symlink_metadata), never a symlink or someone else's directory.
+    if let Ok(md) = std::fs::symlink_metadata(dir)
+        && md.is_dir()
+        && md.uid() == uid()
+        && md.mode() & 0o077 != 0
+    {
+        let _ = std::fs::set_permissions(dir, PermissionsExt::from_mode(0o700));
+    }
+    is_safe_owned_dir(dir)
 }
 
 /// Return a `0700`, current-uid-owned scratch base directory, or `None`
@@ -58,7 +84,6 @@ pub fn private_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn prefers_safe_xdg_runtime_dir() {

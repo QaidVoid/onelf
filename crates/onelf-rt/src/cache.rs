@@ -59,7 +59,12 @@ fn cache_dir() -> Option<PathBuf> {
                 .map(|h| h.join(".cache"))
         })
         .or_else(crate::paths::private_dir)?;
-    Some(base.join("onelf"))
+    // Atomically establish the onelf child as a 0700, non-symlink,
+    // uid-owned directory, rejecting a pre-planted symlink or another
+    // user's directory. Fail closed (None) rather than use an untrusted
+    // path; the caller then refuses instead of extracting into it.
+    let onelf = base.join("onelf");
+    crate::paths::ensure_safe_dir(&onelf).then_some(onelf)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -158,62 +163,66 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     let lock_dir = base.join("lock");
     let meta_dir = base.join("meta");
 
-    // Establish the package lock up front. The lock is held as *shared* for
-    // the whole run so multiple instances coexist while still blocking GC.
+    // Take the shared "in-use" lock *before* checking for the package.
+    // Locking first closes the race where a concurrent GC removes pkg_dir
+    // between the existence check and the lock: while we hold the shared
+    // lock, GC cannot acquire the exclusive lock it needs to remove the
+    // package. The fd is inheritable so the lock survives exec.
     fs::create_dir_all(&lock_dir)?;
     let lock_path = lock_dir.join(&package_id);
     let lock_file = open_lock_inheritable(&lock_path)?;
+    rustix::fs::flock(&lock_file, FlockOperation::LockShared)
+        .map_err(|e| io::Error::other(format!("flock: {e}")))?;
 
-    let flock =
-        |op| rustix::fs::flock(&lock_file, op).map_err(|e| io::Error::other(format!("flock: {e}")));
-
-    // Fast path: already extracted. Hold a shared lock and return.
+    // Fast path: already extracted (and now pinned by our shared lock).
     if pkg_dir.exists() {
-        flock(FlockOperation::LockShared)?;
         touch_meta(&meta_dir, &package_id);
         return Ok((pkg_dir, lock_file));
     }
 
-    // Extraction needs the exclusive lock so two processes never populate
-    // the same package concurrently.
-    flock(FlockOperation::LockExclusive)?;
+    // Not extracted yet. Serialize extraction on a *separate* mutex so a
+    // second runner waits only for extraction to finish, not for the first
+    // instance's whole lifetime: the shared in-use lock is held through
+    // exec, so reusing it as the extraction lock would block later waiters
+    // until the extractor exits.
+    let extract_path = lock_dir.join(format!("{package_id}.extract"));
+    let extract_lock = fs::File::create(&extract_path)?;
+    rustix::fs::flock(&extract_lock, FlockOperation::LockExclusive)
+        .map_err(|e| io::Error::other(format!("flock: {e}")))?;
 
-    // Double-check after acquiring lock; downgrade to shared and return.
-    if pkg_dir.exists() {
-        flock(FlockOperation::LockShared)?;
-        touch_meta(&meta_dir, &package_id);
-        return Ok((pkg_dir, lock_file));
-    }
+    // Another runner may have extracted while we waited on the mutex. We
+    // still hold the shared in-use lock, so a freshly extracted dir cannot
+    // be GC'd from under us.
+    if !pkg_dir.exists() {
+        fs::create_dir_all(&cas_dir)?;
+        let pkg_parent = base.join("pkg");
+        fs::create_dir_all(&pkg_parent)?;
 
-    fs::create_dir_all(&cas_dir)?;
-    let pkg_parent = base.join("pkg");
-    fs::create_dir_all(&pkg_parent)?;
-
-    // Extract into a per-package temp dir, then atomically rename it to
-    // pkg_dir. The lock-free fast path gates on pkg_dir existing, so a
-    // concurrent run never observes a half-populated tree: the completed
-    // directory appears in a single step. A stale temp from a crashed
-    // extraction is removed first, and any failure removes the temp so
-    // the next run re-extracts rather than reusing a partial tree.
-    let tmp_dir = pkg_parent.join(format!(".{package_id}.tmp"));
-    let _ = fs::remove_dir_all(&tmp_dir);
-    fs::create_dir_all(&tmp_dir)?;
-
-    if let Err(e) = extract_to_cas(pkg, &cas_dir, &tmp_dir) {
+        // Extract into a per-package temp dir, then atomically rename it to
+        // pkg_dir. The fast path gates on pkg_dir existing, so a concurrent
+        // run never observes a half-populated tree: the completed directory
+        // appears in a single step. A stale temp from a crashed extraction
+        // is removed first, and any failure removes the temp so the next
+        // run re-extracts rather than reusing a partial tree.
+        let tmp_dir = pkg_parent.join(format!(".{package_id}.tmp"));
         let _ = fs::remove_dir_all(&tmp_dir);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&tmp_dir, &pkg_dir) {
-        let _ = fs::remove_dir_all(&tmp_dir);
-        return Err(e);
+        fs::create_dir_all(&tmp_dir)?;
+
+        if let Err(e) = extract_to_cas(pkg, &cas_dir, &tmp_dir) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&tmp_dir, &pkg_dir) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
     }
 
-    // Record metadata
     touch_meta(&meta_dir, &package_id);
 
-    // Downgrade the exclusive extraction lock to the shared run lock that
-    // is held (through exec) for the lifetime of this instance.
-    flock(FlockOperation::LockShared)?;
+    // Release the extraction mutex; the shared in-use lock stays held
+    // (through exec) for the lifetime of this instance.
+    drop(extract_lock);
     Ok((pkg_dir, lock_file))
 }
 
@@ -403,11 +412,17 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
 /// Returns true if the package was removed.
 fn try_remove_locked(base: &Path, id: &str) -> bool {
     let lock_path = base.join("lock").join(id);
-    let Ok(f) = fs::File::open(&lock_path) else {
-        // No lock file means the package was never run under this protocol;
-        // it is safe to remove.
-        remove_package(base, id);
-        return true;
+    let f = match fs::File::open(&lock_path) {
+        Ok(f) => f,
+        // A missing lock file means the package was never run under this
+        // protocol, so it is safe to remove. Any other open failure
+        // (permissions, fd exhaustion) means we cannot prove it is idle,
+        // so skip it rather than risk deleting an in-use package.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            remove_package(base, id);
+            return true;
+        }
+        Err(_) => return false,
     };
     if rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
         return false; // held by a running process
