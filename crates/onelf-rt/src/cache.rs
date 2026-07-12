@@ -158,10 +158,18 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
         )
     })?;
     let package_id = hex(&pkg.manifest.header.package_id);
-    let pkg_dir = base.join("pkg").join(&package_id);
+    let pkg_parent = base.join("pkg");
+    let pkg_dir = pkg_parent.join(&package_id);
     let cas_dir = base.join("cas");
     let lock_dir = base.join("lock");
     let meta_dir = base.join("meta");
+    // Completion marker, written only after a full extraction and rename.
+    // pkg_dir existing is not proof of completeness: an older onelf release
+    // extracted in place, so an interrupted run could leave a partial
+    // pkg_dir behind. Gating cache hits on the marker forces such trees to
+    // be re-extracted instead of executed.
+    let ready_path = pkg_parent.join(format!(".{package_id}.ready"));
+    let is_complete = || pkg_dir.exists() && ready_path.exists();
 
     // Take the shared "in-use" lock *before* checking for the package.
     // Locking first closes the race where a concurrent GC removes pkg_dir
@@ -174,8 +182,8 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     rustix::fs::flock(&lock_file, FlockOperation::LockShared)
         .map_err(|e| io::Error::other(format!("flock: {e}")))?;
 
-    // Fast path: already extracted (and now pinned by our shared lock).
-    if pkg_dir.exists() {
+    // Fast path: fully extracted (marker present) and pinned by our lock.
+    if is_complete() {
         touch_meta(&meta_dir, &package_id);
         return Ok((pkg_dir, lock_file));
     }
@@ -190,20 +198,23 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     rustix::fs::flock(&extract_lock, FlockOperation::LockExclusive)
         .map_err(|e| io::Error::other(format!("flock: {e}")))?;
 
-    // Another runner may have extracted while we waited on the mutex. We
-    // still hold the shared in-use lock, so a freshly extracted dir cannot
-    // be GC'd from under us.
-    if !pkg_dir.exists() {
+    // Another runner may have completed extraction while we waited on the
+    // mutex. We still hold the shared in-use lock, so a freshly extracted
+    // dir cannot be GC'd from under us.
+    if !is_complete() {
         fs::create_dir_all(&cas_dir)?;
-        let pkg_parent = base.join("pkg");
         fs::create_dir_all(&pkg_parent)?;
 
+        // Clear any stale or partial pkg_dir (an interrupted run, or an
+        // in-place tree from an older release) so the atomic rename below
+        // has a clean target and never merges onto leftover files.
+        let _ = fs::remove_dir_all(&pkg_dir);
+        let _ = fs::remove_file(&ready_path);
+
         // Extract into a per-package temp dir, then atomically rename it to
-        // pkg_dir. The fast path gates on pkg_dir existing, so a concurrent
-        // run never observes a half-populated tree: the completed directory
-        // appears in a single step. A stale temp from a crashed extraction
-        // is removed first, and any failure removes the temp so the next
-        // run re-extracts rather than reusing a partial tree.
+        // pkg_dir. A stale temp from a crashed extraction is removed first,
+        // and any failure removes the temp so the next run re-extracts
+        // rather than reusing a partial tree.
         let tmp_dir = pkg_parent.join(format!(".{package_id}.tmp"));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
@@ -214,6 +225,14 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
         }
         if let Err(e) = fs::rename(&tmp_dir, &pkg_dir) {
             let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+
+        // Publish the completion marker only once the tree is fully in
+        // place. If this fails the tree would be re-extracted every run, so
+        // treat it as an extraction failure and roll back.
+        if let Err(e) = fs::File::create(&ready_path) {
+            let _ = fs::remove_dir_all(&pkg_dir);
             return Err(e);
         }
     }
@@ -359,6 +378,9 @@ fn touch_meta(meta_dir: &Path, package_id: &str) {
 }
 
 pub fn remove_package(base: &Path, package_id: &str) {
+    // Retire the completion marker before the tree so a concurrent reader
+    // never sees the marker without its pkg_dir.
+    let _ = fs::remove_file(base.join("pkg").join(format!(".{package_id}.ready")));
     let _ = fs::remove_dir_all(base.join("pkg").join(package_id));
     let _ = fs::remove_file(base.join("meta").join(package_id));
     // The lock file is intentionally kept: the flock protocol keys mutual

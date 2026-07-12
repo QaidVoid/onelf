@@ -79,11 +79,66 @@ fn verify_update_signature(path: &Path, url: &str, pubkey: &[u8]) -> Result<(), 
         .body_mut()
         .read_to_vec()
         .map_err(|e| format!("read signature: {e}"))?;
-    let data = std::fs::read(path).map_err(|e| format!("read assembled binary: {e}"))?;
-    if verify_detached(pubkey, &data, &sig) {
+    // Map the assembled binary read-only instead of reading it onto the
+    // heap: it can be hundreds of MB and the kernel already has the pages
+    // cached from the assembly write. The mapping stays alive through the
+    // verify call and is unmapped on drop.
+    let map = Mmap::open(path).map_err(|e| format!("map assembled binary: {e}"))?;
+    if verify_detached(pubkey, map.as_slice(), &sig) {
         Ok(())
     } else {
         Err("signature does not verify against the embedded key".to_string())
+    }
+}
+
+/// A read-only memory map, unmapped on drop. Used to verify a large
+/// assembled update binary without copying it onto the heap.
+struct Mmap {
+    ptr: *mut core::ffi::c_void,
+    len: usize,
+}
+
+impl Mmap {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(Mmap {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+            });
+        }
+        // SAFETY: a fresh mapping of `len` bytes from a valid fd at offset 0.
+        let ptr = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                len,
+                rustix::mm::ProtFlags::READ,
+                rustix::mm::MapFlags::PRIVATE,
+                &file,
+                0,
+            )?
+        };
+        Ok(Mmap { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr`/`len` describe a live read-only mapping owned by self.
+        unsafe { core::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            // SAFETY: unmapping the region this Mmap created and still owns.
+            unsafe {
+                let _ = rustix::mm::munmap(self.ptr, self.len);
+            }
+        }
     }
 }
 
@@ -242,6 +297,27 @@ mod tests {
         // Malformed inputs fail rather than panic.
         assert!(!verify_detached(&[0u8; 5], msg, sig.as_ref()));
         assert!(!verify_detached(pk, msg, &[0u8; 5]));
+    }
+
+    #[test]
+    fn mmap_maps_file_contents_and_handles_empty() {
+        use super::Mmap;
+        let dir = std::env::temp_dir().join(format!("onelf-mmap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let f = dir.join("blob");
+        let bytes: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        std::fs::write(&f, &bytes).unwrap();
+        let map = Mmap::open(&f).unwrap();
+        assert_eq!(map.as_slice(), &bytes[..]);
+        drop(map);
+
+        // Empty files map to an empty slice without touching mmap.
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(Mmap::open(&empty).unwrap().as_slice().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
