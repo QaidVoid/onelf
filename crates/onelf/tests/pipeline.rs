@@ -448,11 +448,67 @@ fn build_is_byte_deterministic() {
     let a = build("det-a");
     let b = build("det-b");
     assert_eq!(
-        a, b,
+        a,
+        b,
         "two builds of the same tree must be byte-identical (len {} vs {})",
         a.len(),
         b.len()
     );
+}
+
+/// A package whose footer manifest-checksum is corrupted must fail to run
+/// (the runtime verifies XXH32 over the manifest before deserializing).
+#[test]
+fn corrupt_manifest_checksum_fails_to_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = workdir("checksum");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+
+    let pkg = td.join("c.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Footer is the last 76 bytes; manifest_checksum sits at footer offset
+    // 64..68, i.e. bytes [len-12 .. len-8]. Flip them, leaving the end
+    // magic (last 8 bytes) intact so the footer still parses.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let n = bytes.len();
+    for b in &mut bytes[n - 12..n - 8] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&pkg, &bytes).unwrap();
+    std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new(&pkg)
+        .env("HOME", td.to_str().unwrap())
+        .output()
+        .expect("run corrupt package");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a corrupt-checksum package must not run; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("manifest checksum mismatch"),
+        "failure must come from the checksum gate, not an unrelated error; stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// Compile a small ELF that links `libm` (so the packaged binary has real

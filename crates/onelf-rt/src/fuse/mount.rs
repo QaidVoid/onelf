@@ -111,9 +111,10 @@ pub fn fuse_unmount_direct(mountpoint: &Path) {
 /// on empty dirs and fails atomically on non-empty ones, so this is safe
 /// even if another onelf instance is concurrently setting up its own dir.
 pub fn sweep_stale_mountpoints() {
-    let base = match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(v) => std::path::PathBuf::from(v),
-        Err(_) => std::path::PathBuf::from("/tmp"),
+    // Only sweep our own 0700 per-uid base, never shared /tmp (where a
+    // rmdir could touch another user's planted `onelf-*` dir).
+    let Some(base) = crate::paths::private_dir() else {
+        return;
     };
     let Ok(entries) = std::fs::read_dir(&base) else {
         return;

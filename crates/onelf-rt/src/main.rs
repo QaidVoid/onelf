@@ -8,6 +8,7 @@ mod loader;
 mod memfd;
 mod metadata;
 mod multicall;
+mod paths;
 mod portable;
 mod selfextract;
 mod ulexec;
@@ -82,11 +83,21 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // Self-update requires an embedded signing public key. A package
+        // with a URL but no key is refused rather than installing bytes
+        // that cannot be verified.
+        let Some(key_bytes) = read_package_file(&mut pkg, ".onelf/update-key") else {
+            eprintln!(
+                "onelf-rt: self-update disabled: package has an update URL but no \
+                 signing key (repack with --update-key)"
+            );
+            std::process::exit(1);
+        };
         let Some(self_path) = update::self_path() else {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
             std::process::exit(1);
         };
-        std::process::exit(update::run(flag, &self_path, &url));
+        std::process::exit(update::run(flag, &self_path, &url, &key_bytes));
     }
 
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
@@ -201,8 +212,11 @@ fn main() {
         }
     }
 
-    // Persistent cache extraction mode (final fallback)
-    let pkg_dir = match cache::ensure_extracted(&mut pkg) {
+    // Persistent cache extraction mode (final fallback). The lock guard is
+    // held (through exec, its fd is left inheritable) for the lifetime of
+    // this instance so a concurrent process's GC cannot delete the package
+    // while it is still in use.
+    let (pkg_dir, _lock_guard) = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("onelf-rt: extraction failed: {e}");
@@ -211,15 +225,16 @@ fn main() {
     };
 
     let package_id = cache::hex(&pkg.manifest.header.package_id);
-    let cache_base = cache::base_dir();
 
-    // Auto-GC: prune stale cache entries
+    // Auto-GC: prune stale cache entries (best-effort; skip if no cache base)
     let gc_max_age = std::env::var("ONELF_GC_MAX_AGE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
     if gc_max_age > 0 {
-        cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
+        if let Some(cache_base) = cache::base_dir() {
+            cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
+        }
     }
 
     let target_path_str = pkg.manifest.entry_path(ep_target_entry);

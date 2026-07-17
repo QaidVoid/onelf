@@ -90,6 +90,11 @@ enum Commands {
         #[arg(long)]
         update_url: Option<String>,
 
+        /// Path to a file holding the raw 32-byte Ed25519 public key used
+        /// to verify signed self-updates (stored in .onelf/update-key)
+        #[arg(long)]
+        update_key: Option<PathBuf>,
+
         /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
         #[arg(long)]
         exclude: Vec<String>,
@@ -395,6 +400,7 @@ fn main() {
             no_memfd,
             working_dir,
             update_url,
+            update_key,
             exclude,
             preload,
             mtime,
@@ -417,36 +423,41 @@ fn main() {
                 .into_iter()
                 .map(|(n, p)| (n, p, Vec::new()))
                 .collect();
-            pack::pack(
-                &pack::PackOptions {
-                    directory,
-                    output,
-                    command,
-                    name,
-                    entrypoints,
-                    default_entrypoint,
-                    lib_dirs: lib_dir,
-                    level,
-                    use_dict: dict,
-                    no_compress,
-                    memfd: memfd_opt,
-                    working_dir: wd,
-                    update_url: update_url.clone(),
-                    exclude,
-                    package_info: None,
-                    mtime,
-                    env: Vec::new(),
-                    preload,
-                },
-                // Pick the runtime: slim (~700KB) by default; the
-                // update-capable runtime (~2MB) only when the user actually
-                // configures self-updates.
-                if update_url.is_some() {
-                    RUNTIME_BINARY_UPDATE
-                } else {
-                    RUNTIME_BINARY_SLIM
-                },
-            )
+            let update_key = update_key.as_deref().map(std::fs::read).transpose();
+            match update_key {
+                Err(e) => Err(e),
+                Ok(update_key) => pack::pack(
+                    &pack::PackOptions {
+                        directory,
+                        output,
+                        command,
+                        name,
+                        entrypoints,
+                        default_entrypoint,
+                        lib_dirs: lib_dir,
+                        level,
+                        use_dict: dict,
+                        no_compress,
+                        memfd: memfd_opt,
+                        working_dir: wd,
+                        update_url: update_url.clone(),
+                        update_key,
+                        exclude,
+                        package_info: None,
+                        mtime,
+                        env: Vec::new(),
+                        preload,
+                    },
+                    // Pick the runtime: slim (~700KB) by default; the
+                    // update-capable runtime (~2MB) only when the user actually
+                    // configures self-updates.
+                    if update_url.is_some() {
+                        RUNTIME_BINARY_UPDATE
+                    } else {
+                        RUNTIME_BINARY_SLIM
+                    },
+                ),
+            }
         }
         Commands::Init {
             output,
@@ -641,6 +652,13 @@ fn run_build(
         .unwrap_or_else(|| vec!["auto".to_string()]);
 
     let update_url = recipe.update.as_ref().map(|u| u.url.clone());
+    let update_key = recipe
+        .update
+        .as_ref()
+        .and_then(|u| u.key.clone())
+        .map(|k| if k.is_absolute() { k } else { dir.join(k) })
+        .map(std::fs::read)
+        .transpose()?;
     let runtime: &[u8] = if update_url.is_some() {
         RUNTIME_BINARY_UPDATE
     } else {
@@ -664,6 +682,7 @@ fn run_build(
             memfd: recipe.package.memfd,
             working_dir: recipe.package.working_dir.into(),
             update_url,
+            update_key,
             exclude: recipe.package.exclude,
             package_info,
             mtime: recipe.package.mtime,

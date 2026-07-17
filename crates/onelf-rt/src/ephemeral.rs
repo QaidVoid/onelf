@@ -22,11 +22,7 @@ fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBu
         .collect();
     let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
 
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-
+    let base = crate::paths::private_dir()?;
     let path = base.join(dir_name);
     std::fs::create_dir_all(&path).ok()?;
     Some(path)

@@ -44,6 +44,9 @@ pub struct PackOptions {
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
     pub update_url: Option<String>,
+    /// Raw Ed25519 public key bytes embedded as `.onelf/update-key`; the
+    /// runtime requires it (and a valid signature) before self-updating.
+    pub update_key: Option<Vec<u8>>,
     pub exclude: Vec<String>,
     /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
     pub package_info: Option<String>,
@@ -266,6 +269,27 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // stays stable across runs.
     let inject_mtime = opts.mtime.unwrap_or(0);
 
+    // `.onelf/` is reserved for injected metadata. Reject any packaged
+    // entry (file, directory, or symlink) that collides so injected
+    // metadata is never shadowed by, or silently duplicated alongside,
+    // source content.
+    let reserved = Path::new(".onelf");
+    let collision = files
+        .iter()
+        .map(|f| &f.rel_path)
+        .chain(dirs.iter().map(|d| &d.rel_path))
+        .chain(symlinks.iter().map(|s| &s.rel_path))
+        .find(|p| p.starts_with(reserved));
+    if let Some(p) = collision {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "source contains reserved path {}; the .onelf/ namespace is injected by onelf",
+                p.display()
+            ),
+        ));
+    }
+
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
         if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
@@ -279,6 +303,34 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         files.push(CollectedFile {
             rel_path: PathBuf::from(".onelf/update-url"),
             content: url.as_bytes().to_vec(),
+            mode: 0o644,
+            mtime_secs: inject_mtime,
+            mtime_nsec: 0,
+        });
+    }
+
+    // Inject .onelf/update-key (raw Ed25519 public key) if provided.
+    if let Some(ref key) = opts.update_key {
+        if key.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "update key must be a 32-byte Ed25519 public key, got {} bytes",
+                    key.len()
+                ),
+            ));
+        }
+        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+            dirs.push(CollectedDir {
+                rel_path: PathBuf::from(".onelf"),
+                mode: 0o755,
+                mtime_secs: inject_mtime,
+                mtime_nsec: 0,
+            });
+        }
+        files.push(CollectedFile {
+            rel_path: PathBuf::from(".onelf/update-key"),
+            content: key.clone(),
             mode: 0o644,
             mtime_secs: inject_mtime,
             mtime_nsec: 0,
