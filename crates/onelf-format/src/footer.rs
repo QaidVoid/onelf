@@ -25,17 +25,18 @@
 //! 60     4        Dictionary size (u32)
 //! 64     4        Manifest checksum (xxh32)
 //! 68     8        End magic: "FLENONE\x00"
-//!//!
+//! ```
+//!
 //! # Example
 //!
-//! no_run
+//! ```ignore
 //! use onelf_format::Footer;
 //!
 //! let footer = Footer {
 //!     format_version: 1,
 //!     // ... other fields
 //! };
-//!
+//! ```
 
 use std::io::{self, Read, Write};
 
@@ -76,7 +77,8 @@ pub struct Footer {
     pub dict_offset: u64,
     /// Size of the zstd dictionary in bytes, or 0 if absent.
     pub dict_size: u32,
-    /// xxHash32 checksum of the compressed manifest for integrity verification.
+    /// xxHash32 checksum of the *uncompressed* manifest bytes, verified
+    /// before the manifest is trusted.
     pub manifest_checksum: [u8; 4],
 }
 
@@ -132,7 +134,7 @@ impl Footer {
         }
 
         let flags_raw = u16::from_le_bytes(buf[10..12].try_into().unwrap());
-        let flags = Flags::from_bits_truncate(flags_raw);
+        let flags = Flags::from_bits_retain(flags_raw);
 
         Ok(Footer {
             format_version,
@@ -146,5 +148,60 @@ impl Footer {
             dict_size: u32::from_le_bytes(buf[60..64].try_into().unwrap()),
             manifest_checksum: buf[64..68].try_into().unwrap(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Footer {
+        Footer {
+            format_version: 1,
+            flags: Flags::HAS_DICT | Flags::STORED,
+            manifest_offset: 0x1122,
+            manifest_compressed: 0x33,
+            manifest_original: 0x44,
+            payload_offset: 0x55,
+            payload_size: 0x66,
+            dict_offset: 0x77,
+            dict_size: 0x88,
+            manifest_checksum: [1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn footer_roundtrips() {
+        let f = sample();
+        let mut buf = Vec::new();
+        f.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), FOOTER_SIZE);
+        let back = Footer::from_bytes(&buf.try_into().unwrap()).unwrap();
+        assert_eq!(back.format_version, f.format_version);
+        assert_eq!(back.flags, f.flags);
+        assert_eq!(back.manifest_offset, f.manifest_offset);
+        assert_eq!(back.dict_size, f.dict_size);
+        assert_eq!(back.manifest_checksum, f.manifest_checksum);
+    }
+
+    #[test]
+    fn malformed_footers_error_without_panic() {
+        let mut buf = Vec::new();
+        sample().write_to(&mut buf).unwrap();
+
+        // Bad start magic.
+        let mut bad = buf.clone();
+        bad[0] ^= 0xff;
+        assert!(Footer::from_bytes(&bad.clone().try_into().unwrap()).is_err());
+
+        // Bad end magic.
+        let mut bad = buf.clone();
+        bad[68] ^= 0xff;
+        assert!(Footer::from_bytes(&bad.clone().try_into().unwrap()).is_err());
+
+        // Unsupported version.
+        let mut bad = buf.clone();
+        bad[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert!(Footer::from_bytes(&bad.try_into().unwrap()).is_err());
     }
 }

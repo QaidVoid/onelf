@@ -9,24 +9,10 @@
 //! Trade-off vs. FUSE: the whole package sits in RAM (vs. on-demand).
 //! Fine for AppImage-scale bundles, use FUSE for very large packages.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::fuse::mount;
 use crate::loader::PackageData;
-
-fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBuf> {
-    let name_prefix: String = package_name.chars().take(6).collect();
-    let hash_suffix: String = package_id[0..4]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
-
-    let base = crate::paths::private_dir()?;
-    let path = base.join(dir_name);
-    std::fs::create_dir_all(&path).ok()?;
-    Some(path)
-}
 
 /// Compute the tmpfs size needed to hold the extracted package.
 /// Adds 25% headroom for filesystem overhead, minimum 8 MB.
@@ -58,10 +44,12 @@ pub fn execute_tmpfs(
     // Tidy up empty mountpoint dirs left behind by previous runs.
     mount::sweep_stale_mountpoints();
 
-    let mountpoint = match create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id) {
-        Some(m) => m,
-        None => return false,
-    };
+    let mountpoint =
+        match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
+        {
+            Some(m) => m,
+            None => return false,
+        };
 
     // Enter private user+mount namespace.
     if let Err(e) = mount::enter_namespace() {

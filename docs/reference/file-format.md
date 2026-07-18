@@ -91,16 +91,19 @@ Compressed with zstd. After decompression:
 
 Represents a file, directory, or symlink. Fields:
 
-```
-parent:       u32 (index into entries, 0xFFFFFFFF for top-level)
-mode:         u32 (unix mode bits)
-mtime_secs:   u64
-mtime_nsec:   u32
-name:         u32 (string_table offset)
-kind:         u8 (0=dir, 1=file, 2=symlink)
-content_hash: [u8; 32] (BLAKE3 of concatenated block contents; zero for non-files)
-symlink_target: u32 (string_table offset; 0 unless kind == symlink)
-blocks: Vec<Block>  (file content block refs; empty for non-files)
+Fields are serialized in this order (65-byte header, then the blocks):
+
+```text
+kind:           u8        (0=dir, 1=file, 2=symlink)
+parent:         u32       (index into entries, 0xFFFFFFFF for top-level)
+name:           u32       (string_table offset)
+mode:           u32       (unix mode bits)
+mtime_secs:     u64
+mtime_nsec:     u32
+content_hash:   [u8; 32]  (BLAKE3 of concatenated block contents; zero for non-files)
+num_blocks:     u32       (count of block refs that follow; derived from blocks.len())
+symlink_target: u32       (string_table offset; 0 unless kind == symlink)
+blocks:         [Block; num_blocks]  (file content block refs; empty for non-files)
 ```
 
 Each `Block` is `(payload_offset: u64, compressed_size: u64, original_size: u64)`.

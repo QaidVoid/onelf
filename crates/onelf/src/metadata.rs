@@ -5,7 +5,7 @@
 //! - Desktop files resolved as `{name}.desktop`, `default.desktop`
 
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 use onelf_format::{EntryKind, Manifest};
@@ -73,14 +73,7 @@ fn extract_metadata(
     let entry = &manifest.entries[entry_idx];
     let mut file = File::open(binary)?;
 
-    let dict = if footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut dict_buf = vec![0u8; footer.dict_size as usize];
-        io::Read::read_exact(&mut file, &mut dict_buf)?;
-        Some(dict_buf)
-    } else {
-        None
-    };
+    let dict = crate::info::read_dict(&mut file, &footer)?;
 
     let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
 

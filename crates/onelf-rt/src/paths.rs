@@ -81,6 +81,23 @@ pub fn private_dir() -> Option<PathBuf> {
     is_safe_owned_dir(&p).then_some(p)
 }
 
+/// Create a per-package mountpoint / extraction directory under the private
+/// runtime dir, named `onelf-<name prefix>-<id prefix>`. Shared by the FUSE
+/// and ephemeral tmpfs modes; returns `None` if no private dir is available
+/// or the directory cannot be created.
+pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBuf> {
+    let name_prefix: String = package_name.chars().take(6).collect();
+    let hash_suffix = crate::cache::hex(&package_id[0..4]);
+    let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
+
+    let path = private_dir()?.join(dir_name);
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        eprintln!("onelf-rt: cannot create {}: {e}", path.display());
+        return None;
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

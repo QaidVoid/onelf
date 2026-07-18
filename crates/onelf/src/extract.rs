@@ -123,14 +123,7 @@ fn extract_selective(
     let (footer, manifest) = read_footer_and_manifest(binary)?;
     let mut file = File::open(binary)?;
 
-    let dict = if footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut dict_buf = vec![0u8; footer.dict_size as usize];
-        file.read_exact(&mut dict_buf)?;
-        Some(dict_buf)
-    } else {
-        None
-    };
+    let dict = crate::info::read_dict(&mut file, &footer)?;
 
     // Find matching entries
     let matched: Vec<(usize, String)> = manifest
@@ -245,14 +238,7 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
     let mut file = File::open(binary)?;
 
     // Read dictionary if present
-    let dict = if footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut dict_buf = vec![0u8; footer.dict_size as usize];
-        file.read_exact(&mut dict_buf)?;
-        Some(dict_buf)
-    } else {
-        None
-    };
+    let dict = crate::info::read_dict(&mut file, &footer)?;
 
     let file_count = manifest
         .entries

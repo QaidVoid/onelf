@@ -617,14 +617,6 @@ name = "onelf-format"
 version = "0.2.8"
 
 [[package]]
-name = "onelf-preload"
-version = "0.2.8"
-dependencies = [
- "libc",
- "userland-execve",
-]
-
-[[package]]
 name = "onelf-rt"
 version = "0.2.8"
 dependencies = [

@@ -123,7 +123,7 @@ impl EntryPoint {
             target_entry: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             args: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
             working_dir: WorkingDir::try_from(buf[12])?,
-            flags: EntryPointFlags::from_bits_truncate(buf[13]),
+            flags: EntryPointFlags::from_bits_retain(buf[13]),
         })
     }
 
@@ -148,9 +148,8 @@ pub struct Entry {
     pub mtime_nsec: u32,
     /// BLAKE3 hash of the file content (files only).
     pub content_hash: [u8; 32],
-    /// Number of compressed payload blocks (files only).
-    pub num_blocks: u32,
     /// Compressed payload blocks containing this file's data (files only).
+    /// The serialized block count is derived from `blocks.len()`.
     pub blocks: Vec<Block>,
     /// Offset into the string table for the symlink target path (symlinks only).
     pub symlink_target: u32,
@@ -170,7 +169,9 @@ impl Entry {
         w.write_all(&self.mtime_secs.to_le_bytes())?;
         w.write_all(&self.mtime_nsec.to_le_bytes())?;
         w.write_all(&self.content_hash)?;
-        w.write_all(&self.num_blocks.to_le_bytes())?;
+        // Block count is derived from the vec so it can never disagree with
+        // the blocks that follow.
+        w.write_all(&(self.blocks.len() as u32).to_le_bytes())?;
         w.write_all(&self.symlink_target.to_le_bytes())?;
         for block in &self.blocks {
             block.write_to(w)?;
@@ -211,7 +212,6 @@ impl Entry {
             mtime_secs,
             mtime_nsec,
             content_hash,
-            num_blocks,
             blocks,
             symlink_target,
         })

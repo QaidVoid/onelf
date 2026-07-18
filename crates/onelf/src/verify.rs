@@ -6,7 +6,7 @@
 //! mismatch. Returns non-zero exit code when any entry fails.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 
 use onelf_format::EntryKind;
@@ -18,14 +18,7 @@ pub fn verify(binary: &Path) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(binary)?;
     let mut file = File::open(binary)?;
 
-    let dict = if footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut buf = vec![0u8; footer.dict_size as usize];
-        file.read_exact(&mut buf)?;
-        Some(buf)
-    } else {
-        None
-    };
+    let dict = crate::info::read_dict(&mut file, &footer)?;
 
     let file_entries: Vec<(usize, String)> = manifest
         .entries

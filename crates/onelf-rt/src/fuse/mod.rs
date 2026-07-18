@@ -88,34 +88,6 @@ fn install_signal_handlers() {
     }
 }
 
-fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<PathBuf> {
-    let name_prefix: String = package_name.chars().take(6).collect();
-    let hash_suffix = &package_id[0..4]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
-
-    let base = match crate::paths::private_dir() {
-        Some(b) => b,
-        None => {
-            eprintln!("onelf-rt: fuse: no private runtime dir available");
-            return None;
-        }
-    };
-
-    let mountpoint = base.join(&dir_name);
-
-    if let Err(e) = std::fs::create_dir_all(&mountpoint) {
-        eprintln!(
-            "onelf-rt: fuse: cannot create {}: {e}",
-            mountpoint.display()
-        );
-        return None;
-    }
-    Some(mountpoint)
-}
-
 /// Check if a path is currently a mountpoint by reading /proc/self/mountinfo.
 /// This avoids stat/exists calls that can hang on dead FUSE mounts.
 fn is_mountpoint(path: &Path) -> bool {
@@ -241,10 +213,12 @@ pub fn execute_fuse(
     // Tidy up empty mountpoint dirs left behind by previous runs.
     mount::sweep_stale_mountpoints();
 
-    let mountpoint = match create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id) {
-        Some(m) => m,
-        None => return false,
-    };
+    let mountpoint =
+        match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
+        {
+            Some(m) => m,
+            None => return false,
+        };
 
     // If already mounted by another instance, reuse it — just exec directly.
     // (Only reachable via the fusermount3 path; namespace mounts are private.)

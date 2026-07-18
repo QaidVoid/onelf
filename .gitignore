@@ -1,2 +1,5 @@
 /target
+# Build intermediates produced by crates/onelf/src/payload/Makefile
+# (`make clean` removes `*.o *.elf`).
 crates/onelf/src/payload/*.o
+crates/onelf/src/payload/*.elf
