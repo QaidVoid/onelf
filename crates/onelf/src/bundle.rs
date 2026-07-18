@@ -4,6 +4,21 @@
 //! resolves them via ldconfig cache, standard paths, or NixOS store
 //! scanning, and copies them into a lib directory for self-contained
 //! packaging.
+//!
+//! # External tools and trust boundary
+//!
+//! Bundling shells out to a few host tools: `ldconfig` (read the library
+//! cache), `patchelf` (rewrite RUNPATH when no in-place slot fits),
+//! `strip` (drop debug info from copied libraries), `nix-store` (walk Nix
+//! closures), and `glib-compile-schemas` (compile GSettings schemas). Every
+//! invocation is built as an explicit argument vector via [`Command`] with
+//! no shell, so file names and paths are never subject to shell word
+//! splitting or metacharacter interpretation. These tools run over the
+//! *developer's own* build inputs (the app tree being packaged and the
+//! host's libraries), i.e. trusted input at package-build time, not over
+//! attacker-controlled package contents at runtime. Absolute tool paths
+//! used as fallbacks (`/sbin/ldconfig`, `/usr/sbin/ldconfig`) are fixed
+//! constants, not derived from any input.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -143,6 +158,14 @@ fn build_lib_search_dirs(
     dirs
 }
 
+/// True if `dest` already resolves to the same on-disk file as the
+/// already-canonicalized `src`. Copying a file onto itself with `fs::copy`
+/// truncates it, which can happen once an expanded `$ORIGIN` search dir is
+/// the bundle's own lib dir on a second pass.
+fn is_same_file(src: &Path, dest: &Path) -> bool {
+    fs::canonicalize(dest).map(|c| c == src).unwrap_or(false)
+}
+
 /// Copy libraries matching any of `prefixes` (prefix match on filename) from
 /// `search_dirs` into `dest`. Resolves symlinks, deduplicates by filename,
 /// and filters by ELF class. Returns (files_copied, total_bytes).
@@ -151,6 +174,8 @@ fn copy_prefixed_libs(
     prefixes: &[&str],
     dest: &Path,
     target_class: Option<u8>,
+    target_machine: Option<u16>,
+    excludes: &[&str],
     dry_run: bool,
     strip: bool,
 ) -> io::Result<(usize, u64)> {
@@ -175,7 +200,7 @@ fn copy_prefixed_libs(
             if !prefixes.iter().any(|p| name.starts_with(p)) {
                 continue;
             }
-            if !seen.insert(name.clone()) {
+            if is_excluded(&name, excludes) || seen.contains(&name) {
                 continue;
             }
             let resolved = fs::canonicalize(&path).unwrap_or(path.clone());
@@ -187,6 +212,15 @@ fn copy_prefixed_libs(
                     continue;
                 }
             }
+            if let Some(tm) = target_machine {
+                if read_elf_machine(&resolved) != Some(tm) {
+                    continue;
+                }
+            }
+            // Record the soname as handled only after every filter passed, so
+            // a wrong-arch or dangling copy in an earlier directory never
+            // shadows the correct library in a later one.
+            seen.insert(name.clone());
             let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
             eprintln!(
                 "  {} <- {} ({})",
@@ -197,13 +231,23 @@ fn copy_prefixed_libs(
             if !dry_run {
                 fs::create_dir_all(dest)?;
                 let dest_path = dest.join(&name);
-                ensure_writable(&dest_path);
-                fs::copy(&resolved, &dest_path)?;
-                let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
-                if strip {
-                    strip_debug(&dest_path);
+                // Copying onto an existing alias symlink writes through it and
+                // corrupts the alias target; drop the symlink first.
+                if dest_path.is_symlink() {
+                    let _ = fs::remove_file(&dest_path);
                 }
-                normalize_mtime(&dest_path);
+                // Skip copying a file onto itself (an $ORIGIN search dir that
+                // resolved to the bundle's own lib dir): fs::copy would
+                // truncate it. The library is already in place.
+                if !is_same_file(&resolved, &dest_path) {
+                    ensure_writable(&dest_path);
+                    fs::copy(&resolved, &dest_path)?;
+                    let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
+                    if strip {
+                        strip_debug(&dest_path);
+                    }
+                    normalize_mtime(&dest_path);
+                }
             }
             copied += 1;
             total_bytes += size;
@@ -345,13 +389,32 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         );
     }
 
-    // Bundle GPU assets first so DRI driver .so files are present when
-    // find_elf_files runs, letting the main loop resolve their transitive deps.
+    // Built here (before the framework bundlers) so `--exclude` applies to
+    // the GL/GPU/Wayland copy helpers too, not only the primary walk below.
+    let excludes: Vec<&str> = DEFAULT_EXCLUDES
+        .iter()
+        .copied()
+        .chain(opts.exclude.iter().map(|s| s.as_str()))
+        .collect();
+
+    // Resolve the target binaries once (respecting --target) and derive the
+    // architecture up front, so the framework bundlers below key off the
+    // app's real class/machine rather than whatever ELF find_map first hits
+    // in a directory that may contain stray or cross-arch files.
+    let target_elfs = resolve_target_elfs(opts)?;
+    let target_class = target_elfs.iter().find_map(|f| read_elf_class(f));
+    let target_machine = target_elfs.iter().find_map(|f| read_elf_machine(f));
+
+    // Bundle GPU assets first so DRI driver .so files are present when the
+    // dependency walk below runs, letting it resolve their transitive deps.
     if want_gl || want_dri || want_vulkan {
         bundle_gpu(
             &opts.directory,
             &opts.lib_dir,
             &opts.search_path,
+            &excludes,
+            target_class,
+            target_machine,
             opts.dry_run,
             opts.strip,
             want_gl,
@@ -365,6 +428,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             &opts.directory,
             &opts.lib_dir,
             &opts.search_path,
+            &excludes,
+            target_class,
+            target_machine,
             opts.dry_run,
             opts.strip,
         )?;
@@ -374,25 +440,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         bundle_gtk_data(&opts.directory, opts.dry_run)?;
     }
 
-    let excludes: Vec<&str> = DEFAULT_EXCLUDES
-        .iter()
-        .copied()
-        .chain(opts.exclude.iter().map(|s| s.as_str()))
-        .collect();
-
-    let elf_files = if let Some(ref target) = opts.target {
-        let path = if target.is_absolute() {
-            target.clone()
-        } else {
-            opts.directory.join(target)
-        };
-        if !path.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{}: not a file", path.display()),
-            ));
-        }
-        vec![path]
+    // Re-scan after the GPU/Wayland copy so freshly-bundled libraries are
+    // walked for their own transitive dependencies (they did not exist when
+    // the target set was resolved above). An explicit --target keeps the
+    // walk scoped to that one binary.
+    let elf_files = if opts.target.is_some() {
+        target_elfs
     } else {
         find_elf_files(&opts.directory)
     };
@@ -490,8 +543,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Filter excluded
     needed_by.retain(|soname, _| !is_excluded(soname, &excludes));
 
-    // Filter libs already present in the directory tree
-    let existing = find_existing_libs(&opts.directory);
+    // Filter libs already present in the directory tree. Stale stub loaders
+    // are deleted only in the non-dry-run path so they get re-resolved.
+    let (existing, stubs) = find_existing_libs(&opts.directory);
+    if !opts.dry_run {
+        for stub in &stubs {
+            // Fail if a stub can't be removed: leaving it in place would ship
+            // a loader that runs nowhere, so bundling must not continue.
+            fs::remove_file(stub).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("removing stub loader {}: {e}", stub.display()),
+                )
+            })?;
+        }
+    }
     needed_by.retain(|soname, _| !existing.contains(soname));
 
     if needed_by.is_empty() {
@@ -550,8 +616,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         return Ok(());
     }
 
-    // Determine target ELF class (32-bit vs 64-bit) from the input binaries
-    let target_class = elf_files.iter().find_map(|f| read_elf_class(f));
+    // target_class / target_machine were derived up front (before the
+    // framework bundlers) from the --target-respecting set and are reused
+    // here so the dependency walk resolves against the same architecture.
 
     // Determine target libc family from PT_INTERP. Used to skip spurious
     // cross-libc transitive dependencies (e.g. libgcc_s on a glibc host pulls
@@ -582,8 +649,25 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
     if Path::new("/nix/store").is_dir() {
-        for lib_name in find_existing_libs(&lib_dest) {
-            if let Some(src) = locate_lib(&lib_name, &ldconfig_cache, &search_paths, target_class) {
+        let (bundled, stubs) = find_existing_libs(&lib_dest);
+        if !opts.dry_run {
+            for stub in &stubs {
+                fs::remove_file(stub).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("removing stub loader {}: {e}", stub.display()),
+                    )
+                })?;
+            }
+        }
+        for lib_name in bundled {
+            if let Some(src) = locate_lib(
+                &lib_name,
+                &ldconfig_cache,
+                &search_paths,
+                target_class,
+                target_machine,
+            ) {
                 let resolved = fs::canonicalize(&src).unwrap_or(src);
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
             }
@@ -606,7 +690,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .cloned()
             .unwrap_or_else(|| "?".into());
 
-        match locate_lib(&soname, &ldconfig_cache, &search_paths, target_class) {
+        match locate_lib(
+            &soname,
+            &ldconfig_cache,
+            &search_paths,
+            target_class,
+            target_machine,
+        ) {
             Some(src) => {
                 let resolved = fs::canonicalize(&src).unwrap_or(src.clone());
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
@@ -689,6 +779,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 );
                 if !opts.dry_run {
                     fs::create_dir_all(&lib_dest)?;
+                    // Copying onto an existing alias symlink corrupts the
+                    // alias target; drop the symlink first.
+                    if dest.is_symlink() {
+                        let _ = fs::remove_file(&dest);
+                    }
                     ensure_writable(&dest);
                     fs::copy(&resolved, &dest)?;
                     let _ = fs::set_permissions(
@@ -929,6 +1024,27 @@ fn normalize_mtime(path: &Path) {
     let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
     if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
         let _ = f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t));
+    }
+}
+
+/// Resolve the set of target binaries to bundle: just `--target` when set
+/// (validated to exist), otherwise every ELF found under the app directory.
+fn resolve_target_elfs(opts: &BundleOptions) -> io::Result<Vec<PathBuf>> {
+    if let Some(ref target) = opts.target {
+        let path = if target.is_absolute() {
+            target.clone()
+        } else {
+            opts.directory.join(target)
+        };
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}: not a file", path.display()),
+            ));
+        }
+        Ok(vec![path])
+    } else {
+        Ok(find_elf_files(&opts.directory))
     }
 }
 
@@ -1372,6 +1488,29 @@ fn libc_family_of_soname(soname: &str) -> Option<LibcFamily> {
 }
 
 /// Parse RPATH and RUNPATH entries from an ELF binary.
+/// Expand a single runpath entry, resolving `$ORIGIN` / `${ORIGIN}` to the
+/// ELF's parent directory (the exact relative shape Nix and vendor binaries
+/// emit). Non-`$ORIGIN` entries pass through unchanged.
+fn expand_runpath_entry(entry: &str, origin: &Path) -> PathBuf {
+    if let Some(rest) = entry.strip_prefix("${ORIGIN}") {
+        origin.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = entry.strip_prefix("$ORIGIN") {
+        origin.join(rest.trim_start_matches('/'))
+    } else {
+        PathBuf::from(entry)
+    }
+}
+
+/// Split colon-separated runpath strings into their component directories,
+/// expand `$ORIGIN` relative to `origin`, and keep only those that exist.
+fn resolve_runpath_dirs<'a>(raw: impl Iterator<Item = &'a str>, origin: &Path) -> Vec<PathBuf> {
+    raw.flat_map(|s| s.split(':'))
+        .filter(|s| !s.is_empty())
+        .map(|entry| expand_runpath_entry(entry, origin))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
 fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
     let Ok(data) = fs::read(path) else {
         return Vec::new();
@@ -1379,12 +1518,17 @@ fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
     let Ok(elf) = goblin::elf::Elf::parse(&data) else {
         return Vec::new();
     };
-    elf.runpaths
-        .iter()
-        .chain(elf.rpaths.iter())
-        .map(|s| PathBuf::from(s))
-        .filter(|p| p.is_absolute() && p.is_dir())
-        .collect()
+    // The ELF's own directory, for `$ORIGIN` expansion.
+    let origin = path.parent().unwrap_or_else(|| Path::new("."));
+    // The dynamic loader ignores DT_RPATH when DT_RUNPATH is present, so
+    // match that precedence rather than chaining both (which could pull a
+    // library from a dir the loader would never search).
+    let raw = if !elf.runpaths.is_empty() {
+        &elf.runpaths
+    } else {
+        &elf.rpaths
+    };
+    resolve_runpath_dirs(raw.iter().copied(), origin)
 }
 
 /// Rewrite RPATH/RUNPATH to `$ORIGIN/../lib` so the bundled ELF finds its
@@ -1467,7 +1611,12 @@ fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
         .map(|sh| sh.sh_offset as usize);
 
     let dynamic_present = elf.dynamic.is_some();
-    let mut in_place_done = false;
+    // Track per-slot outcome: the in-place rewrite is trustworthy only when
+    // *every* present DT_RPATH/DT_RUNPATH slot was rewritten. Rewriting some
+    // and skipping a too-small one would leave a stale runpath behind, so in
+    // that case we fall through to patchelf, which resets the runpath whole.
+    let mut slots_total = 0usize;
+    let mut slots_rewritten = 0usize;
 
     if let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) {
         let mut modified = data.clone();
@@ -1475,6 +1624,7 @@ fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
             if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
                 || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
             {
+                slots_total += 1;
                 let file_pos = dynstr_offset + dyn_entry.d_val as usize;
                 if file_pos >= modified.len() {
                     continue;
@@ -1495,10 +1645,10 @@ fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
                 for i in new_bytes.len()..slot_size {
                     modified[file_pos + i] = 0;
                 }
-                in_place_done = true;
+                slots_rewritten += 1;
             }
         }
-        if in_place_done {
+        if slots_total > 0 && slots_rewritten == slots_total {
             fs::write(path, &modified)?;
             return Ok(RunpathOutcome::Set);
         }
@@ -1871,6 +2021,14 @@ fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
 /// vector, computes the interpreter path relative to the binary's own
 /// location (not CWD), mmaps the interpreter, and jumps to its entry.
 ///
+/// Page alignment for the injected bootstrap `PT_LOAD` segment. aarch64
+/// kernels may use a 4K, 16K, or 64K page size and the target host can
+/// differ from the build host, so `0x10000` is used there (valid under every
+/// aarch64 page size); x86-64 keeps 4K.
+fn bootstrap_page_align(is_aarch64: bool) -> u64 {
+    if is_aarch64 { 0x10000 } else { 0x1000 }
+}
+
 /// Returns Ok(true) if injected, Ok(false) if the binary has no
 /// PT_INTERP (static, shared lib, or already injected).
 fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
@@ -1922,7 +2080,9 @@ fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Result<bool> {
         .max()
         .unwrap_or(0);
 
-    let page_size: u64 = 4096;
+    // The same value drives new_vaddr, the file-offset padding, and p_align,
+    // so the kernel's `p_offset % p_align == p_vaddr % p_align` rule holds.
+    let page_size: u64 = bootstrap_page_align(is_aarch64);
     let new_vaddr = (highest_vend + page_size - 1) & !(page_size - 1);
     let orig_entry = elf.header.e_entry;
     let e_phoff = elf.header.e_phoff as usize;
@@ -2204,8 +2364,13 @@ fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<usize> {
     Ok(injected)
 }
 
-fn find_existing_libs(dir: &Path) -> HashSet<String> {
+/// Scan `dir` for existing shared libraries. Returns the set of sonames
+/// found and, separately, the paths of any NixOS stub loaders. The scan
+/// never deletes: the caller removes stubs only in the non-dry-run copy
+/// phase so `--dry-run` stays side-effect free.
+fn find_existing_libs(dir: &Path) -> (HashSet<String>, Vec<PathBuf>) {
     let mut libs = HashSet::new();
+    let mut stubs = Vec::new();
     for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -2217,16 +2382,16 @@ fn find_existing_libs(dir: &Path) -> HashSet<String> {
             continue;
         }
         // A previous run may have copied NixOS's stub loader into the
-        // bundle. Treat it as absent so it gets replaced with a real
-        // loader on this pass; otherwise the stale stub would persist
-        // forever.
+        // bundle. Report it (rather than delete it here) so the caller can
+        // replace it with a real loader in the copy phase; the soname is
+        // treated as absent so it gets re-resolved.
         if is_nix_stub_ld(&path) {
-            let _ = fs::remove_file(&path);
+            stubs.push(path.clone());
             continue;
         }
         libs.insert(name.into_owned());
     }
-    libs
+    (libs, stubs)
 }
 
 fn build_lib_cache() -> HashMap<String, Vec<PathBuf>> {
@@ -2245,7 +2410,13 @@ fn build_lib_cache() -> HashMap<String, Vec<PathBuf>> {
 
 fn parse_ldconfig_cache() -> HashMap<String, Vec<PathBuf>> {
     let mut cache: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let Ok(output) = Command::new("ldconfig").arg("-p").output() else {
+    // `ldconfig` lives in /sbin (and /usr/sbin) on Debian, which is off a
+    // non-root user's PATH. Try the bare name first (honoring PATH), then
+    // the sbin locations, so non-root Debian runs still read the cache.
+    let output = ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"]
+        .into_iter()
+        .find_map(|prog| Command::new(prog).arg("-p").output().ok());
+    let Some(output) = output else {
         return cache;
     };
     // Lines like: "	libX11.so.6 (libc6,x86-64) => /usr/lib/libX11.so.6"
@@ -2270,13 +2441,12 @@ fn scan_nix_store_libs() -> HashMap<String, Vec<PathBuf>> {
     let mut cache: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut store_paths: HashSet<String> = HashSet::new();
 
-    // Collect store paths from multiple roots
-    let roots: Vec<&str> = vec![
-        "/run/current-system",
-        "~/.nix-profile",
-        "/etc/profiles/per-user",
-    ];
+    // Collect store paths from multiple roots. `/etc/profiles/per-user` is
+    // a plain parent directory (not a store path), so its per-user profile
+    // subdirectories are enumerated and queried individually below.
+    let roots: Vec<&str> = vec!["/run/current-system", "~/.nix-profile"];
 
+    let mut query_paths: Vec<PathBuf> = Vec::new();
     for root in &roots {
         let expanded = if root.starts_with('~') {
             if let Ok(home) = std::env::var("HOME") {
@@ -2287,15 +2457,20 @@ fn scan_nix_store_libs() -> HashMap<String, Vec<PathBuf>> {
         } else {
             root.to_string()
         };
-
-        if !Path::new(&expanded).exists() {
-            continue;
+        if Path::new(&expanded).exists() {
+            query_paths.push(PathBuf::from(expanded));
         }
+    }
+    if let Ok(entries) = fs::read_dir("/etc/profiles/per-user") {
+        for entry in entries.flatten() {
+            query_paths.push(entry.path());
+        }
+    }
 
-        let Ok(output) = Command::new("nix-store").args(["-qR", &expanded]).output() else {
+    for qp in &query_paths {
+        let Ok(output) = Command::new("nix-store").arg("-qR").arg(qp).output() else {
             continue;
         };
-
         if output.status.success() {
             for line in output.stdout.lines().map_while(Result::ok) {
                 store_paths.insert(line.trim().to_string());
@@ -2415,6 +2590,7 @@ fn locate_lib(
     ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
     search_paths: &[PathBuf],
     target_class: Option<u8>,
+    target_machine: Option<u16>,
 ) -> Option<PathBuf> {
     let class_matches = |path: &Path| -> bool {
         match target_class {
@@ -2422,10 +2598,18 @@ fn locate_lib(
             None => true,
         }
     };
+    let machine_matches = |path: &Path| -> bool {
+        match target_machine {
+            Some(tm) => read_elf_machine(path) == Some(tm),
+            None => true,
+        }
+    };
     // Reject NixOS's stub loader anywhere it surfaces. It exists on disk
     // but refuses to actually load foreign binaries, so bundling it would
-    // produce a package that runs nowhere.
-    let acceptable = |path: &Path| class_matches(path) && !is_nix_stub_ld(path);
+    // produce a package that runs nowhere. Also reject a wrong-architecture
+    // library from a multiarch or cross sysroot.
+    let acceptable =
+        |path: &Path| class_matches(path) && machine_matches(path) && !is_nix_stub_ld(path);
 
     // 1. --search-path directories (user-provided: highest priority)
     for dir in search_paths {
@@ -2517,13 +2701,24 @@ fn locate_lib(
 ///    case where a previous bundle copied the stub into the AppDir itself,
 ///    so canonicalize no longer points at the nix store).
 fn is_nix_stub_ld(path: &Path) -> bool {
+    // Only a dynamic-loader-shaped file can be a stub loader. Reject any
+    // non-`ld-*` filename up front, before the canonicalize shortcut, so a
+    // path that merely contains "stub-ld" (or the phrase in its content)
+    // can never be misclassified and, at the call site, deleted.
+    let is_loader_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("ld-"));
+    if !is_loader_name {
+        return false;
+    }
     if let Ok(real) = fs::canonicalize(path) {
         if real.to_string_lossy().contains("stub-ld") {
             return true;
         }
     }
     // Real glibc ld-linux is >100 KB; the stub is ~35 KB. Cheap filter
-    // before hashing through the file content.
+    // before reading the file content.
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
@@ -2533,6 +2728,9 @@ fn is_nix_stub_ld(path: &Path) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return false;
     };
+    if bytes.len() < 4 || bytes[..4] != *b"\x7fELF" {
+        return false;
+    }
     bytes
         .windows(b"NixOS cannot run".len())
         .any(|w| w == b"NixOS cannot run")
@@ -2567,6 +2765,9 @@ fn bundle_gpu(
     directory: &Path,
     lib_dir: &Path,
     extra_search: &[PathBuf],
+    excludes: &[&str],
+    target_class: Option<u8>,
+    target_machine: Option<u16>,
     dry_run: bool,
     strip: bool,
     include_gl: bool,
@@ -2575,11 +2776,9 @@ fn bundle_gpu(
 ) -> io::Result<()> {
     eprintln!("{} GPU drivers...", color::bold("Bundling"));
 
+    // The target class/machine are passed in from the --target-respecting
+    // scan; only RPATH dirs are collected from the on-disk binaries here.
     let elf_files = find_elf_files(directory);
-
-    // Determine target ELF class and machine type from existing binaries
-    let target_class = elf_files.iter().find_map(|f| read_elf_class(f));
-    let target_machine = elf_files.iter().find_map(|f| read_elf_machine(f));
 
     // Collect RPATH dirs from the app binaries. These point to the exact
     // library versions the app was built against. On NixOS this ensures we
@@ -2714,6 +2913,8 @@ fn bundle_gpu(
             &all_gl,
             &lib_dest,
             target_class,
+            target_machine,
+            excludes,
             dry_run,
             strip,
         )?;
@@ -2738,7 +2939,9 @@ fn bundle_gpu(
             &dri_dirs,
             &dri_dest,
             target_class,
+            target_machine,
             dri_filter,
+            excludes,
             dry_run,
             strip,
         )?;
@@ -2758,7 +2961,16 @@ fn bundle_gpu(
     let mut gbm_count = 0;
     if include_gl {
         let gbm_dest = lib_dest.join("gbm");
-        let (count, bytes) = copy_so_dir(&gbm_dirs, &gbm_dest, target_class, None, dry_run, strip)?;
+        let (count, bytes) = copy_so_dir(
+            &gbm_dirs,
+            &gbm_dest,
+            target_class,
+            target_machine,
+            None,
+            excludes,
+            dry_run,
+            strip,
+        )?;
         gbm_count = count;
         gpu_total_bytes += bytes;
         if count > 0 {
@@ -2775,8 +2987,16 @@ fn bundle_gpu(
     let mut egl_count = 0;
     if include_gl {
         let egl_dest = directory.join("share/glvnd/egl_vendor.d");
-        let (count, bytes) =
-            copy_vendor_json(&egl_dirs, &egl_dest, &lib_dest, target_class, None, dry_run)?;
+        let (count, bytes) = copy_vendor_json(
+            &egl_dirs,
+            &egl_dest,
+            &lib_dest,
+            target_class,
+            target_machine,
+            None,
+            excludes,
+            dry_run,
+        )?;
         egl_count = count;
         gpu_total_bytes += bytes;
         if count > 0 {
@@ -2799,7 +3019,9 @@ fn bundle_gpu(
             &vk_dest,
             &lib_dest,
             target_class,
+            target_machine,
             vk_filter,
+            excludes,
             dry_run,
         )?;
         vk_count = count;
@@ -2892,7 +3114,9 @@ fn copy_so_dir(
     src_dirs: &[PathBuf],
     dest: &Path,
     target_class: Option<u8>,
+    target_machine: Option<u16>,
     name_filter: Option<&[&str]>,
+    excludes: &[&str],
     dry_run: bool,
     strip: bool,
 ) -> io::Result<(usize, u64)> {
@@ -2923,16 +3147,24 @@ fn copy_so_dir(
                     continue;
                 }
             }
-            // Skip if we already have this filename from an earlier directory
-            if !seen.insert(name.clone()) {
+            if is_excluded(&name, excludes) || seen.contains(&name) {
                 continue;
             }
-            // ELF class filter
+            // ELF class + machine filters
             if let Some(tc) = target_class {
                 if read_elf_class(&path) != Some(tc) {
                     continue;
                 }
             }
+            if let Some(tm) = target_machine {
+                if read_elf_machine(&path) != Some(tm) {
+                    continue;
+                }
+            }
+            // Record the soname as handled only after every filter passed, so
+            // a wrong-arch or dangling copy in an earlier directory never
+            // shadows the correct library in a later one.
+            seen.insert(name.clone());
             let resolved = fs::canonicalize(&path).unwrap_or(path.clone());
             let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
             eprintln!(
@@ -2944,13 +3176,23 @@ fn copy_so_dir(
             if !dry_run {
                 fs::create_dir_all(dest)?;
                 let dest_path = dest.join(&name);
-                ensure_writable(&dest_path);
-                fs::copy(&resolved, &dest_path)?;
-                let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
-                if strip {
-                    strip_debug(&dest_path);
+                // Copying onto an existing alias symlink corrupts the alias
+                // target; drop the symlink first.
+                if dest_path.is_symlink() {
+                    let _ = fs::remove_file(&dest_path);
                 }
-                normalize_mtime(&dest_path);
+                // Skip copying a file onto itself (an $ORIGIN search dir that
+                // resolved to the bundle's own lib dir); fs::copy would
+                // truncate it.
+                if !is_same_file(&resolved, &dest_path) {
+                    ensure_writable(&dest_path);
+                    fs::copy(&resolved, &dest_path)?;
+                    let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
+                    if strip {
+                        strip_debug(&dest_path);
+                    }
+                    normalize_mtime(&dest_path);
+                }
             }
             copied += 1;
             total_bytes += size;
@@ -3087,13 +3329,17 @@ fn bundle_wayland(
     directory: &Path,
     lib_dir: &Path,
     extra_search: &[PathBuf],
+    excludes: &[&str],
+    target_class: Option<u8>,
+    target_machine: Option<u16>,
     dry_run: bool,
     strip: bool,
 ) -> io::Result<()> {
     eprintln!("{} Wayland libraries...", color::bold("Bundling"));
 
+    // Target class/machine are passed in; only search dirs come from the
+    // on-disk binaries here.
     let elf_files = find_elf_files(directory);
-    let target_class = elf_files.iter().find_map(|f| read_elf_class(f));
 
     let nix_paths = if Path::new("/nix/store").is_dir() {
         collect_nix_store_paths()
@@ -3109,6 +3355,8 @@ fn bundle_wayland(
         WAYLAND_LIB_PREFIXES,
         &lib_dest,
         target_class,
+        target_machine,
+        excludes,
         dry_run,
         strip,
     )?;
@@ -3133,7 +3381,9 @@ fn bundle_wayland(
         &plugin_dirs,
         &plugin_dest,
         target_class,
+        target_machine,
         None,
+        excludes,
         dry_run,
         strip,
     )?;
@@ -3392,7 +3642,9 @@ fn copy_vendor_json(
     json_dest: &Path,
     lib_dest: &Path,
     target_class: Option<u8>,
+    target_machine: Option<u16>,
     driver_filter: Option<&[&str]>,
+    excludes: &[&str],
     dry_run: bool,
 ) -> io::Result<(usize, u64)> {
     let mut copied = 0usize;
@@ -3416,7 +3668,9 @@ fn copy_vendor_json(
             if !name.ends_with(".json") {
                 continue;
             }
-            if !seen.insert(name.clone()) {
+            // Dedup check only; the name is recorded as handled below, once
+            // the entry has passed its filters and is actually copied.
+            if seen.contains(&name) {
                 continue;
             }
 
@@ -3454,9 +3708,19 @@ fn copy_vendor_json(
                     continue;
                 }
 
+                // Honor user --exclude patterns for the driver soname.
+                if is_excluded(&so_name, excludes) {
+                    continue;
+                }
+
                 if resolved.is_file() {
                     if let Some(tc) = target_class
                         && read_elf_class(&resolved) != Some(tc)
+                    {
+                        continue;
+                    }
+                    if let Some(tm) = target_machine
+                        && read_elf_machine(&resolved) != Some(tm)
                     {
                         continue;
                     }
@@ -3470,17 +3734,28 @@ fn copy_vendor_json(
                     if !dry_run {
                         fs::create_dir_all(lib_dest)?;
                         let dest_so = lib_dest.join(&so_name);
+                        if dest_so.is_symlink() {
+                            let _ = fs::remove_file(&dest_so);
+                        }
                         // Overwrite unconditionally (like every other copy
                         // path) so a stale driver .so from a previous run
-                        // isn't paired with a freshly-written JSON manifest.
-                        fs::copy(&resolved, &dest_so)?;
-                        let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
-                        normalize_mtime(&dest_so);
+                        // isn't paired with a freshly-written JSON manifest,
+                        // but never copy the file onto itself (an $ORIGIN dir
+                        // that resolved to the bundle's own lib dir).
+                        if !is_same_file(&resolved, &dest_so) {
+                            fs::copy(&resolved, &dest_so)?;
+                            let _ = fs::set_permissions(&dest_so, PermissionsExt::from_mode(0o755));
+                            normalize_mtime(&dest_so);
+                        }
                     }
                     total_bytes += so_size;
                 }
             }
 
+            // Recorded as handled only now that every filter has passed, so a
+            // wrong-arch or excluded config in an earlier directory never
+            // shadows a valid same-named one later.
+            seen.insert(name.clone());
             eprintln!("  {} <- {}", color::bold_green(&name), path.display());
             if !dry_run {
                 fs::create_dir_all(json_dest)?;
@@ -3581,18 +3856,23 @@ fn copy_data_dir(src: &Path, dest: &Path, dry_run: bool) -> io::Result<u64> {
 fn collect_nix_store_paths() -> Vec<String> {
     let mut store_paths: HashSet<String> = HashSet::new();
 
-    let roots: &[&str] = &["/run/current-system", "/etc/profiles/per-user"];
+    let mut query_paths: Vec<PathBuf> = vec![PathBuf::from("/run/current-system")];
+    if let Ok(home) = std::env::var("HOME") {
+        query_paths.push(PathBuf::from(format!("{home}/.nix-profile")));
+    }
+    // `/etc/profiles/per-user` is a parent directory, not a store path;
+    // query each per-user profile subdirectory individually.
+    if let Ok(entries) = fs::read_dir("/etc/profiles/per-user") {
+        for entry in entries.flatten() {
+            query_paths.push(entry.path());
+        }
+    }
 
-    // Also try ~/.nix-profile
-    let home_profile = std::env::var("HOME")
-        .ok()
-        .map(|h| format!("{h}/.nix-profile"));
-
-    for root in roots.iter().copied().chain(home_profile.as_deref()) {
-        if !Path::new(root).exists() {
+    for qp in &query_paths {
+        if !qp.exists() {
             continue;
         }
-        let Ok(output) = Command::new("nix-store").args(["-qR", root]).output() else {
+        let Ok(output) = Command::new("nix-store").arg("-qR").arg(qp).output() else {
             continue;
         };
         if output.status.success() {
@@ -3678,5 +3958,213 @@ mod framework_scan_tests {
         let blob = b"prefixlibgtk-3.so.0suffix";
         let flags = scan(blob);
         assert!(flags.gtk);
+    }
+}
+
+#[cfg(test)]
+mod correctness_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onelf-bundle-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Minimal ELF-shaped bytes: magic + EI_CLASS + e_machine, enough for
+    /// `read_elf_class` / `read_elf_machine` to classify.
+    fn fake_elf(class: u8, machine: u16) -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = class;
+        v[18..20].copy_from_slice(&machine.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn nix_stub_matcher_requires_loader_shape() {
+        let d = tmp("stub");
+        let mut stub = b"\x7fELF".to_vec();
+        stub.extend_from_slice(b" ... NixOS cannot run this binary ... ");
+        let stub_path = d.join("ld-linux-x86-64.so.2");
+        fs::write(&stub_path, &stub).unwrap();
+        assert!(is_nix_stub_ld(&stub_path));
+
+        // Benign data file containing the phrase but not loader-shaped.
+        let benign = d.join("notes.txt");
+        fs::write(&benign, b"the NixOS cannot run message appears here").unwrap();
+        assert!(!is_nix_stub_ld(&benign));
+
+        // `ld-*` name but no ELF magic.
+        let noelf = d.join("ld-fake.so");
+        fs::write(&noelf, b"NixOS cannot run").unwrap();
+        assert!(!is_nix_stub_ld(&noelf));
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_existing_libs_reports_stubs_without_deleting() {
+        let d = tmp("dryscan");
+        let mut stub = b"\x7fELF".to_vec();
+        stub.extend_from_slice(b" NixOS cannot run ");
+        let stub_path = d.join("ld-linux-x86-64.so.2");
+        fs::write(&stub_path, &stub).unwrap();
+        fs::write(d.join("libfoo.so.1"), fake_elf(2, 62)).unwrap();
+
+        let (libs, stubs) = find_existing_libs(&d);
+        assert!(stub_path.exists(), "the scan must not delete the stub");
+        assert!(stubs.iter().any(|p| p == &stub_path));
+        assert!(libs.contains("libfoo.so.1"));
+        assert!(!libs.contains("ld-linux-x86-64.so.2"));
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn runpath_entry_expands_origin() {
+        let origin = Path::new("/app/bin");
+        assert_eq!(
+            expand_runpath_entry("$ORIGIN/../lib", origin),
+            PathBuf::from("/app/bin/../lib")
+        );
+        assert_eq!(
+            expand_runpath_entry("${ORIGIN}/lib", origin),
+            PathBuf::from("/app/bin/lib")
+        );
+        assert_eq!(
+            expand_runpath_entry("/usr/lib", origin),
+            PathBuf::from("/usr/lib")
+        );
+    }
+
+    #[test]
+    fn runpath_splits_colons_and_resolves_origin() {
+        let d = tmp("rpath");
+        fs::create_dir_all(d.join("a/lib")).unwrap();
+        fs::create_dir_all(d.join("a/lib64")).unwrap();
+        fs::create_dir_all(d.join("a/bin")).unwrap();
+
+        // Colon list: both existing dirs resolve.
+        let list = format!(
+            "{}:{}",
+            d.join("a/lib").display(),
+            d.join("a/lib64").display()
+        );
+        let dirs = resolve_runpath_dirs(std::iter::once(list.as_str()), Path::new("/"));
+        assert!(dirs.contains(&d.join("a/lib")));
+        assert!(dirs.contains(&d.join("a/lib64")));
+
+        // `$ORIGIN` relative to the ELF's own dir resolves to a real dir.
+        let origin = d.join("a/bin");
+        let dirs = resolve_runpath_dirs(std::iter::once("$ORIGIN/../lib"), &origin);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            fs::canonicalize(&dirs[0]).unwrap(),
+            fs::canonicalize(d.join("a/lib")).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_dedupes_after_filters_and_honors_arch_and_excludes() {
+        let d = tmp("copy");
+        let dir1 = d.join("dir1");
+        let dir2 = d.join("dir2");
+        let dest = d.join("dest");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+
+        // dir1 (searched first) has a DANGLING symlink for the soname.
+        std::os::unix::fs::symlink(d.join("nonexistent"), dir1.join("libGL.so.1")).unwrap();
+        // dir2 has the valid x86-64 library, plus a wrong-arch (aarch64) one.
+        fs::write(dir2.join("libGL.so.1"), fake_elf(2, 62)).unwrap();
+        fs::write(dir2.join("libwrong.so"), fake_elf(2, 183)).unwrap();
+
+        let (copied, _) = copy_prefixed_libs(
+            &[dir1.clone(), dir2.clone()],
+            &["libGL", "libwrong"],
+            &dest,
+            Some(2),  // ELFCLASS64
+            Some(62), // EM_X86_64
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            dest.join("libGL.so.1").is_file(),
+            "the valid libGL must not be shadowed by the earlier dangling one"
+        );
+        assert!(
+            !dest.join("libwrong.so").exists(),
+            "a wrong-arch library must be rejected"
+        );
+        assert_eq!(copied, 1);
+
+        // With an exclude for the soname, nothing is copied.
+        let dest2 = d.join("dest2");
+        let (copied2, _) = copy_prefixed_libs(
+            &[dir2.clone()],
+            &["libGL"],
+            &dest2,
+            Some(2),
+            Some(62),
+            &["libGL"],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(copied2, 0, "an excluded soname must not be copied");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bootstrap_alignment_is_16k_safe_on_aarch64() {
+        assert_eq!(bootstrap_page_align(true), 0x10000);
+        assert_eq!(bootstrap_page_align(false), 0x1000);
+
+        // The injected segment's file offset and vaddr are aligned to the
+        // same value, so `p_offset % p_align == p_vaddr % p_align` holds
+        // under any aarch64 page size (4K / 16K / 64K).
+        let align = bootstrap_page_align(true);
+        for (vend, len) in [(0x1234u64, 0x5678u64), (0, 1), (0xffff, 0x10001)] {
+            let new_vaddr = (vend + align - 1) & !(align - 1);
+            let file_off = (len + align - 1) & !(align - 1);
+            for page in [0x1000u64, 0x4000, 0x10000] {
+                assert_eq!(new_vaddr % page, file_off % page);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_does_not_truncate_a_file_onto_itself() {
+        let d = tmp("selfcopy");
+        // The search dir IS the destination dir, as an expanded `$ORIGIN`
+        // runpath resolves to the bundle's own lib dir on a second pass.
+        fs::write(d.join("libself.so.1"), fake_elf(2, 62)).unwrap();
+        let before = fs::read(d.join("libself.so.1")).unwrap();
+        assert!(!before.is_empty());
+
+        let (_copied, _) = copy_prefixed_libs(
+            &[d.clone()],
+            &["libself"],
+            &d, // dest == search dir
+            Some(2),
+            Some(62),
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The file must be intact, not truncated to zero by `fs::copy(x, x)`.
+        let after = fs::read(d.join("libself.so.1")).unwrap();
+        assert_eq!(before, after, "a self-copy must not truncate the file");
+
+        let _ = fs::remove_dir_all(&d);
     }
 }
