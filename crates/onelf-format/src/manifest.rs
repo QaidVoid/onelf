@@ -350,7 +350,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::{Entry, EntryKind};
+    use crate::entry::{Block, Entry, EntryKind};
 
     fn entry(name: u32, parent: u32) -> Entry {
         Entry {
@@ -361,7 +361,6 @@ mod tests {
             mtime_secs: 0,
             mtime_nsec: 0,
             content_hash: [0u8; 32],
-            num_blocks: 0,
             blocks: Vec::new(),
             symlink_target: 0,
         }
@@ -395,6 +394,35 @@ mod tests {
         let back = Manifest::deserialize(&bytes).unwrap();
         assert_eq!(back.entry_path(1), "a/b");
         assert_eq!(back.get_string(3), "b");
+    }
+
+    #[test]
+    fn file_entry_with_blocks_roundtrips_byte_identical() {
+        // A File entry carrying two payload blocks. The serialized block
+        // count is derived from `blocks.len()` now that `num_blocks` is gone;
+        // this asserts the derivation and a byte-identical re-serialize.
+        let mut file = entry(1, u32::MAX);
+        file.kind = EntryKind::File;
+        file.blocks = vec![
+            Block {
+                payload_offset: 0,
+                compressed_size: 10,
+                original_size: 20,
+            },
+            Block {
+                payload_offset: 10,
+                compressed_size: 5,
+                original_size: 8,
+            },
+        ];
+        let m = manifest(vec![file], b"\0a\0".to_vec());
+
+        let bytes = m.serialize().unwrap();
+        let back = Manifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.entries[0].blocks.len(), 2);
+        assert_eq!(back.entries[0].blocks[1].original_size, 8);
+        // Re-serializing the decoded manifest must reproduce the exact bytes.
+        assert_eq!(back.serialize().unwrap(), bytes);
     }
 
     #[test]

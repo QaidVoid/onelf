@@ -27,13 +27,6 @@ pub fn build_dictionary(samples: &[Vec<u8>], dict_size: usize) -> io::Result<Vec
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
-pub fn compress_with_dict(data: &[u8], level: i32, dict: &[u8]) -> io::Result<Vec<u8>> {
-    let mut compressor = zstd::bulk::Compressor::with_dictionary(level, dict)?;
-    compressor
-        .compress(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-}
-
 /// Chunk `data` into `BLOCK_SIZE` pieces without compressing. Used by
 /// store mode (`--no-compress`): the runtime reads these bytes directly,
 /// so `data.len() == original_size` for every block. Produces the same
@@ -104,15 +97,24 @@ pub fn compress_in_blocks(
     let mut blocks = Vec::new();
     let mut offset = 0;
 
+    // Build the dictionary-backed compressor once (digesting the dictionary
+    // into its CDict a single time) and reuse it for every block, rather
+    // than reconstructing it per block.
+    let mut dict_compressor = match dict {
+        Some(d) => Some(zstd::bulk::Compressor::with_dictionary(level, d)?),
+        None => None,
+    };
+
     while offset < data.len() {
         let chunk_end = (offset + BLOCK_SIZE as usize).min(data.len());
         let chunk = &data[offset..chunk_end];
         let original_size = chunk.len() as u64;
 
-        let compressed = if let Some(d) = dict {
-            compress_with_dict(chunk, level, d)?
-        } else {
-            compress(chunk, level)?
+        let compressed = match dict_compressor.as_mut() {
+            Some(c) => c
+                .compress(chunk)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+            None => compress(chunk, level)?,
         };
 
         blocks.push(CompressedBlock {

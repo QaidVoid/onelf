@@ -64,7 +64,7 @@ pub fn info(path: &Path) -> io::Result<()> {
     );
     println!();
 
-    if let Some(info) = read_package_info(path, &manifest)? {
+    if let Some(info) = read_package_info(path, &footer, &manifest)? {
         println!("Metadata:");
         for line in info.lines() {
             println!("  {line}");
@@ -120,6 +120,19 @@ pub fn info(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Read the optional zstd dictionary described by `footer` from `reader`,
+/// or `None` when the package carries no dictionary. Shared by every command
+/// that decompresses payload entries.
+pub fn read_dict<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<Option<Vec<u8>>> {
+    if footer.dict_size == 0 {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(footer.dict_offset))?;
+    let mut buf = vec![0u8; footer.dict_size as usize];
+    reader.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
 pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -131,7 +144,7 @@ pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
         ));
     }
 
-    // Read footer from last 80 bytes
+    // Read the footer from the last FOOTER_SIZE (76) bytes.
     file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
     let mut footer_buf = [0u8; FOOTER_SIZE];
     file.read_exact(&mut footer_buf)?;
@@ -170,7 +183,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn read_package_info(path: &Path, manifest: &Manifest) -> io::Result<Option<String>> {
+fn read_package_info(
+    path: &Path,
+    footer: &Footer,
+    manifest: &Manifest,
+) -> io::Result<Option<String>> {
     use crate::extract::decompress_entry;
 
     let idx = (0..manifest.entries.len()).find(|&i| {
@@ -179,22 +196,11 @@ fn read_package_info(path: &Path, manifest: &Manifest) -> io::Result<Option<Stri
     });
     let Some(idx) = idx else { return Ok(None) };
 
+    // The footer is already parsed by the caller; just reopen for the payload.
     let mut file = File::open(path)?;
-    file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
-    let mut footer_buf = [0u8; FOOTER_SIZE];
-    file.read_exact(&mut footer_buf)?;
-    let footer = Footer::from_bytes(&footer_buf)?;
+    let dict = read_dict(&mut file, footer)?;
 
-    let dict = if footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut buf = vec![0u8; footer.dict_size as usize];
-        file.read_exact(&mut buf)?;
-        Some(buf)
-    } else {
-        None
-    };
-
-    let data = decompress_entry(&mut file, &footer, &manifest.entries[idx], dict.as_deref())?;
+    let data = decompress_entry(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
     let text = String::from_utf8(data).unwrap_or_default();
     Ok(Some(text))
 }

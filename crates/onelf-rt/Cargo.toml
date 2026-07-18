@@ -14,9 +14,9 @@ update = ["dep:zsync-rs", "dep:ed25519-compact", "dep:ureq"]
 onelf-format = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
-rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
-userland-execve = "0.2"
-zstd = { version = "0.13", default-features = false }
+rustix = { workspace = true }
+userland-execve = { workspace = true }
+zstd = { workspace = true }
 zsync-rs = { version = "0.1", optional = true }
 # Update-only: verify-only Ed25519 for signed self-update, and ureq to
 # fetch the detached signature. Kept out of the slim runtime.

@@ -719,8 +719,27 @@ fn build_package_info(pkg: &recipe::Package) -> Option<String> {
     }
 }
 
+/// Quote `s` as a TOML basic string, escaping backslash, double quote, and
+/// control characters (per the TOML spec) so a value containing a newline or
+/// other control char cannot produce a malformed `.onelf/package-info.toml`.
 fn toml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`

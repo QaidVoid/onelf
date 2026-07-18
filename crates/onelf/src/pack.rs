@@ -188,6 +188,34 @@ fn utf8_str(p: &Path) -> io::Result<&str> {
     })
 }
 
+/// Inject a synthetic `.onelf/*` metadata file, creating the `.onelf`
+/// directory entry once if it is not already present. `rel_path` is the
+/// full package-relative path (e.g. `.onelf/env`); both the directory and
+/// the file are stamped with `mtime` for reproducible output.
+fn inject_onelf_file(
+    dirs: &mut Vec<CollectedDir>,
+    files: &mut Vec<CollectedFile>,
+    rel_path: &str,
+    content: Vec<u8>,
+    mtime: u64,
+) {
+    if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
+        dirs.push(CollectedDir {
+            rel_path: PathBuf::from(".onelf"),
+            mode: 0o755,
+            mtime_secs: mtime,
+            mtime_nsec: 0,
+        });
+    }
+    files.push(CollectedFile {
+        rel_path: PathBuf::from(rel_path),
+        content,
+        mode: 0o644,
+        mtime_secs: mtime,
+        mtime_nsec: 0,
+    });
+}
+
 pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let dir = opts.directory.canonicalize()?;
 
@@ -314,21 +342,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
-        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-            dirs.push(CollectedDir {
-                rel_path: PathBuf::from(".onelf"),
-                mode: 0o755,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
-        }
-        files.push(CollectedFile {
-            rel_path: PathBuf::from(".onelf/update-url"),
-            content: url.as_bytes().to_vec(),
-            mode: 0o644,
-            mtime_secs: inject_mtime,
-            mtime_nsec: 0,
-        });
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/update-url",
+            url.as_bytes().to_vec(),
+            inject_mtime,
+        );
     }
 
     // Inject .onelf/update-key (raw Ed25519 public key) if provided.
@@ -342,40 +362,24 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 ),
             ));
         }
-        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-            dirs.push(CollectedDir {
-                rel_path: PathBuf::from(".onelf"),
-                mode: 0o755,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
-        }
-        files.push(CollectedFile {
-            rel_path: PathBuf::from(".onelf/update-key"),
-            content: key.clone(),
-            mode: 0o644,
-            mtime_secs: inject_mtime,
-            mtime_nsec: 0,
-        });
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/update-key",
+            key.clone(),
+            inject_mtime,
+        );
     }
 
     // Inject .onelf/package-info.toml if requested
     if let Some(ref info) = opts.package_info {
-        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-            dirs.push(CollectedDir {
-                rel_path: PathBuf::from(".onelf"),
-                mode: 0o755,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
-        }
-        files.push(CollectedFile {
-            rel_path: PathBuf::from(".onelf/package-info.toml"),
-            content: info.as_bytes().to_vec(),
-            mode: 0o644,
-            mtime_secs: inject_mtime,
-            mtime_nsec: 0,
-        });
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/package-info.toml",
+            info.as_bytes().to_vec(),
+            inject_mtime,
+        );
     }
 
     let package_name = opts
@@ -405,21 +409,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         });
 
         if let Some(bundled_rel) = bundled_relpath {
-            if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-                dirs.push(CollectedDir {
-                    rel_path: PathBuf::from(".onelf"),
-                    mode: 0o755,
-                    mtime_secs: inject_mtime,
-                    mtime_nsec: 0,
-                });
-            }
-            files.push(CollectedFile {
-                rel_path: PathBuf::from(".onelf/interp"),
-                content: bundled_rel.into_bytes(),
-                mode: 0o644,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
+            inject_onelf_file(
+                &mut dirs,
+                &mut files,
+                ".onelf/interp",
+                bundled_rel.into_bytes(),
+                inject_mtime,
+            );
         }
     }
 
@@ -446,42 +442,25 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         for (k, v) in &opts.env {
             env_lines.push(format!("{k}={v}"));
         }
-        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-            dirs.push(CollectedDir {
-                rel_path: PathBuf::from(".onelf"),
-                mode: 0o755,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
-        }
-        files.push(CollectedFile {
-            rel_path: PathBuf::from(".onelf/env"),
-            content: env_lines.join("\n").into_bytes(),
-            mode: 0o644,
-            mtime_secs: inject_mtime,
-            mtime_nsec: 0,
-        });
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/env",
+            env_lines.join("\n").into_bytes(),
+            inject_mtime,
+        );
     }
 
     // Write preload library list as .onelf/preload (one path per line),
     // applied by the bundled onelf-env constructor.
     if !opts.preload.is_empty() {
-        if !dirs.iter().any(|d| d.rel_path == Path::new(".onelf")) {
-            dirs.push(CollectedDir {
-                rel_path: PathBuf::from(".onelf"),
-                mode: 0o755,
-                mtime_secs: inject_mtime,
-                mtime_nsec: 0,
-            });
-        }
-        let content = opts.preload.join("\n");
-        files.push(CollectedFile {
-            rel_path: PathBuf::from(".onelf/preload"),
-            content: content.into_bytes(),
-            mode: 0o644,
-            mtime_secs: inject_mtime,
-            mtime_nsec: 0,
-        });
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/preload",
+            opts.preload.join("\n").into_bytes(),
+            inject_mtime,
+        );
     }
 
     pb.finish_with_message(format!(
@@ -589,7 +568,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         mtime_secs: 0,
         mtime_nsec: 0,
         content_hash: [0; 32],
-        num_blocks: 0,
         blocks: Vec::new(),
         symlink_target: 0,
     });
@@ -613,7 +591,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             mtime_secs: d.mtime_secs,
             mtime_nsec: d.mtime_nsec,
             content_hash: [0; 32],
-            num_blocks: 0,
             blocks: Vec::new(),
             symlink_target: 0,
         });
@@ -622,7 +599,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Compute payload layout - blocks are laid out sequentially
     let mut payload_offset: u64 = 0;
-    let mut file_entry_indices: Vec<u32> = Vec::new();
 
     for cf in &compressed_files {
         let name_str = utf8_file_name(&cf.rel_path)?;
@@ -654,12 +630,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             mtime_secs: cf.mtime_secs,
             mtime_nsec: cf.mtime_nsec,
             content_hash: cf.content_hash,
-            num_blocks: blocks.len() as u32,
             blocks,
             symlink_target: 0,
         });
         path_to_index.insert(cf.rel_path.clone(), idx);
-        file_entry_indices.push(idx);
     }
 
     for sl in &symlinks {
@@ -677,7 +651,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             mtime_secs: sl.mtime_secs,
             mtime_nsec: sl.mtime_nsec,
             content_hash: [0; 32],
-            num_blocks: 0,
             blocks: Vec::new(),
             symlink_target: target,
         });

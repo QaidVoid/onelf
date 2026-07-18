@@ -28,7 +28,10 @@ macro_rules! bitflags {
                 self.bits
             }
 
-            pub const fn from_bits_truncate(bits: $T) -> Self {
+            /// Wrap raw bits, retaining every bit (including bits with no
+            /// defined flag). Named to match its behavior; it does not mask
+            /// to known flags the way real `from_bits_truncate` would.
+            pub const fn from_bits_retain(bits: $T) -> Self {
                 Self { bits }
             }
 
