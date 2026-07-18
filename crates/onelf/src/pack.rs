@@ -166,6 +166,28 @@ fn check_libgl_conflicts(directory: &Path, lib_dirs: &mut Vec<String>) {
     }
 }
 
+/// The final path component of `p` as UTF-8, or a descriptive error on a
+/// non-UTF-8 name (the string table stores UTF-8, so packing must reject
+/// such names rather than panic).
+fn utf8_file_name(p: &Path) -> io::Result<&str> {
+    p.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-UTF-8 file name: {}", p.display()),
+        )
+    })
+}
+
+/// `p` as a UTF-8 string, or a descriptive error on non-UTF-8 input.
+fn utf8_str(p: &Path) -> io::Result<&str> {
+    p.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-UTF-8 path: {}", p.display()),
+        )
+    })
+}
+
 pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let dir = opts.directory.canonicalize()?;
 
@@ -512,30 +534,28 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     let compressed_files: Vec<CompressedFile> = files
         .par_iter()
-        .map(|f| {
+        .map(|f| -> io::Result<CompressedFile> {
             let content_hash: [u8; 32] = *blake3::hash(&f.content).as_bytes();
 
             let blocks = if opts.no_compress {
                 compress::store_in_blocks(&f.content)
-            } else if let Some(ref d) = dict {
-                compress::compress_in_blocks(&f.content, opts.level, Some(d))
-                    .expect("compression failed")
             } else {
-                compress::compress_in_blocks(&f.content, opts.level, None)
-                    .expect("compression failed")
+                compress::compress_in_blocks(&f.content, opts.level, dict.as_deref()).map_err(
+                    |e| io::Error::other(format!("compress {}: {e}", f.rel_path.display())),
+                )?
             };
 
             pb.inc(1);
-            CompressedFile {
+            Ok(CompressedFile {
                 rel_path: f.rel_path.clone(),
                 blocks,
                 content_hash,
                 mode: f.mode,
                 mtime_secs: f.mtime_secs,
                 mtime_nsec: f.mtime_nsec,
-            }
+            })
         })
-        .collect();
+        .collect::<io::Result<Vec<_>>>()?;
 
     pb.finish_with_message(if opts.no_compress {
         "Files stored (uncompressed)"
@@ -550,8 +570,17 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut path_to_index: HashMap<PathBuf, u32> = HashMap::new();
     let mut entries: Vec<Entry> = Vec::new();
 
-    // Add root entry
+    // Add the root entry name ("") at offset 0, then the package name next
+    // so its offset stays small and fits the `u16` header field however
+    // large the rest of the string table grows (REVIEW §5.1). Offset 0 is
+    // also the "unset" sentinel, so a non-empty name never lands there.
     let root_name = strings.add("");
+    let name_offset = u16::try_from(strings.add(package_name)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "package name offset exceeds u16 (string table too large)",
+        )
+    })?;
     entries.push(Entry {
         kind: EntryKind::Dir,
         parent: u32::MAX,
@@ -571,7 +600,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     sorted_dirs.sort_by_key(|d| d.rel_path.components().count());
 
     for d in &sorted_dirs {
-        let name_str = d.rel_path.file_name().unwrap().to_str().unwrap();
+        let name_str = utf8_file_name(&d.rel_path)?;
         let name = strings.add(name_str);
         let parent_path = d.rel_path.parent().unwrap_or(Path::new(""));
         let parent = *path_to_index.get(parent_path).unwrap_or(&0);
@@ -596,7 +625,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut file_entry_indices: Vec<u32> = Vec::new();
 
     for cf in &compressed_files {
-        let name_str = cf.rel_path.file_name().unwrap().to_str().unwrap();
+        let name_str = utf8_file_name(&cf.rel_path)?;
         let name = strings.add(name_str);
         let parent_path = cf.rel_path.parent().unwrap_or(Path::new(""));
         let parent = *path_to_index.get(parent_path).unwrap_or(&0);
@@ -634,9 +663,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     }
 
     for sl in &symlinks {
-        let name_str = sl.rel_path.file_name().unwrap().to_str().unwrap();
+        let name_str = utf8_file_name(&sl.rel_path)?;
         let name = strings.add(name_str);
-        let target_str = sl.target.to_str().unwrap();
+        let target_str = utf8_str(&sl.target)?;
         let target = strings.add(target_str);
         let parent_path = sl.rel_path.parent().unwrap_or(Path::new(""));
         let parent = *path_to_index.get(parent_path).unwrap_or(&0);
@@ -672,21 +701,49 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         .or_else(|| command_path.file_name().and_then(|n| n.to_str()))
         .unwrap_or("main");
 
+    // When `default_entrypoint` names a declared `[[entrypoint]]`, the
+    // default launch must use that entrypoint's path and args, not the
+    // package command's, and the tuple must not also be appended below as a
+    // second entrypoint with the same name (REVIEW §5.4).
+    let default_decl = opts
+        .default_entrypoint
+        .as_deref()
+        .and_then(|dn| opts.entrypoints.iter().find(|(n, _, _)| n == dn));
+
     let ep_name = strings.add(default_name);
     let empty_args = strings.add("");
 
-    // Memfd eligibility: explicit --memfd=true/false overrides auto-detect.
-    // Auto: the entrypoint is eligible if it has no DT_NEEDED dependencies,
-    // which means it's either static-musl/-glibc or a non-ELF script.
+    let (ep0_target_idx, ep0_target_path) = match default_decl {
+        Some((_, path, _)) => {
+            let p = PathBuf::from(path);
+            let idx = *path_to_index.get(&p).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("entrypoint path '{}' not found in directory", path),
+                )
+            })?;
+            (idx, p)
+        }
+        None => (command_entry_idx, command_path.clone()),
+    };
+    let ep0_args = match default_decl {
+        Some((_, _, args)) if !args.is_empty() => strings.add(&args.join("\x1f")),
+        _ => empty_args,
+    };
+
+    // Memfd eligibility is evaluated against the entrypoint's real target.
+    // Explicit --memfd=true/false overrides auto-detect. Auto: eligible if
+    // the target has no DT_NEEDED dependencies (static musl/glibc or a
+    // non-ELF script).
     let memfd_flag = match opts.memfd {
         Some(true) => EntryPointFlags::MEMFD_ELIGIBLE,
         Some(false) => EntryPointFlags::empty(),
         None => {
-            let command_content = files
+            let target_content = files
                 .iter()
-                .find(|f| f.rel_path == command_path)
+                .find(|f| f.rel_path == ep0_target_path)
                 .map(|f| f.content.as_slice());
-            if command_content.is_some_and(elf_has_no_deps) {
+            if target_content.is_some_and(elf_has_no_deps) {
                 EntryPointFlags::MEMFD_ELIGIBLE
             } else {
                 EntryPointFlags::empty()
@@ -696,14 +753,18 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     entrypoints.push(EntryPoint {
         name: ep_name,
-        target_entry: command_entry_idx,
-        args: empty_args,
+        target_entry: ep0_target_idx,
+        args: ep0_args,
         working_dir: opts.working_dir,
         flags: memfd_flag,
     });
 
-    // Additional entrypoints
+    // Additional entrypoints (skip the tuple already emitted as the default
+    // above so its name is not duplicated).
     for (name, path, args) in &opts.entrypoints {
+        if opts.default_entrypoint.as_deref() == Some(name.as_str()) {
+            continue;
+        }
         let ep_path = PathBuf::from(path);
         let ep_entry_idx = *path_to_index.get(&ep_path).ok_or_else(|| {
             io::Error::new(
@@ -725,9 +786,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             flags: EntryPointFlags::empty(),
         });
     }
-
-    // Add package name to string table
-    let name_offset = strings.add(package_name) as u16;
 
     // Add lib dirs to string table
     let lib_dir_offsets: Vec<u32> = lib_dirs.iter().map(|d| strings.add(d)).collect();
@@ -1017,4 +1075,120 @@ fn elf_interp(data: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onelf-pack-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A minimal, reproducible PackOptions for tests.
+    fn base_opts(dir: &Path, out: &Path, command: &str) -> PackOptions {
+        PackOptions {
+            directory: dir.to_path_buf(),
+            output: out.to_path_buf(),
+            command: command.to_string(),
+            name: None,
+            entrypoints: Vec::new(),
+            default_entrypoint: None,
+            lib_dirs: Vec::new(),
+            level: 3,
+            use_dict: false,
+            no_compress: false,
+            memfd: Some(false),
+            working_dir: WorkingDir::Inherit,
+            update_url: None,
+            update_key: None,
+            exclude: Vec::new(),
+            package_info: None,
+            mtime: Some(0),
+            env: Vec::new(),
+            preload: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn name_round_trips_past_64kib_string_table() {
+        let dir = tmpdir("name64k");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        // Push the string table well past 64 KiB with many long unique names
+        // so a name added *last* would wrap the u16 offset.
+        let pad = "n".repeat(210);
+        for i in 0..400 {
+            fs::write(app.join(format!("file_{i:04}_{pad}")), b"x").unwrap();
+        }
+
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+        opts.name = Some("round-trip-name".to_string());
+        pack(&opts, b"stub-runtime").unwrap();
+
+        let (_footer, manifest) = crate::info::read_footer_and_manifest(&out).unwrap();
+        assert!(
+            manifest.string_table.len() > 0x1_0000,
+            "test must exceed a 64 KiB string table, got {}",
+            manifest.string_table.len()
+        );
+        assert_eq!(manifest.name(), "round-trip-name");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_entrypoint_uses_declared_path_and_args_without_duplicate() {
+        let dir = tmpdir("default-ep");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/a"), b"#!/bin/sh\necho a\n").unwrap();
+        fs::write(app.join("bin/b"), b"#!/bin/sh\necho b\n").unwrap();
+
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/a");
+        opts.entrypoints = vec![(
+            "b".to_string(),
+            "bin/b".to_string(),
+            vec!["--flag".to_string(), "x".to_string()],
+        )];
+        opts.default_entrypoint = Some("b".to_string());
+        pack(&opts, b"stub-runtime").unwrap();
+
+        let (_footer, manifest) = crate::info::read_footer_and_manifest(&out).unwrap();
+        // Exactly one entrypoint (no duplicate "b").
+        assert_eq!(manifest.entrypoints.len(), 1);
+        let ep = &manifest.entrypoints[0];
+        assert_eq!(manifest.get_string(ep.name), "b");
+        // The default targets bin/b with its declared args, not bin/a/empty.
+        assert_eq!(manifest.entry_path(ep.target_entry as usize), "bin/b");
+        assert_eq!(manifest.get_string(ep.args), "--flag\x1fx");
+        assert_eq!(manifest.header.default_entrypoint, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_file_name_errors_instead_of_panicking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmpdir("nonutf8");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad-\xff\xfe-name");
+        fs::write(app.join(bad), b"x").unwrap();
+
+        let out = dir.join("pkg.onelf");
+        let opts = base_opts(&app, &out, "bin/run");
+        let err = pack(&opts, b"stub-runtime").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

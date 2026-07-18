@@ -37,14 +37,13 @@ pub fn cache_list() -> io::Result<()> {
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|d| {
-                        format!(
-                            "{}s ago",
-                            SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                                - d.as_secs()
-                        )
+                        // saturating_sub so a future mtime reports 0 instead
+                        // of underflowing to a huge age (REVIEW §5.9).
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        format!("{}s ago", now.saturating_sub(d.as_secs()))
                     })
                     .unwrap_or_else(|| "unknown".into())
             } else {

@@ -214,13 +214,34 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
         ),
         _ => std::io::Error::new(e.kind(), format!("{}: {e}", path.display())),
     })?;
-    let text = expand_env(&raw);
-    toml::from_str(&text).map_err(|e| {
+    // Parse first, then expand `${VAR}` inside string *values* only. Doing
+    // it after the structure is fixed means an expanded value containing a
+    // quote or newline can never introduce new recipe keys (REVIEW §3.3).
+    let mut value: toml::Value = toml::from_str(&raw).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })?;
+    expand_value(&mut value);
+    value.try_into().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{}: {e}", path.display()),
         )
     })
+}
+
+/// Recursively expand `${VAR}` references in every string value of a parsed
+/// TOML document. Keys are left untouched, so expansion can only ever change
+/// values, never the document structure.
+fn expand_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => *s = expand_env(s),
+        toml::Value::Array(a) => a.iter_mut().for_each(expand_value),
+        toml::Value::Table(t) => t.iter_mut().for_each(|(_, v)| expand_value(v)),
+        _ => {}
+    }
 }
 
 /// Resolve a recipe file from a user-supplied spec:
@@ -261,14 +282,18 @@ pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
 /// (onelf-rt / the onelf-env constructor) expands `${PATH}` against the
 /// live process environment — i.e. prepend instead of replace.
 pub fn expand_env(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
+    // Accumulate raw bytes: the input is UTF-8 and every spliced fragment
+    // (env values and preserved source slices) is UTF-8, so the result is
+    // valid UTF-8. This avoids the `bytes[i] as char` path that mangled
+    // multi-byte sequences into mojibake (REVIEW §3.3).
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
         // `$$` -> literal `$` (escape; defers any following `{VAR}` to
         // runtime since the `${` pattern is no longer present).
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
-            out.push('$');
+            out.push(b'$');
             i += 2;
             continue;
         }
@@ -276,20 +301,18 @@ pub fn expand_env(s: &str) -> String {
             if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}') {
                 let name = std::str::from_utf8(&bytes[i + 2..i + 2 + end]).unwrap_or("");
                 match std::env::var(name) {
-                    Ok(val) => out.push_str(&val),
-                    Err(_) => {
-                        // Preserve unset variables for runtime expansion
-                        out.push_str(&s[i..i + 3 + end]);
-                    }
+                    Ok(val) => out.extend_from_slice(val.as_bytes()),
+                    // Preserve unset variables for runtime expansion.
+                    Err(_) => out.extend_from_slice(&bytes[i..i + 3 + end]),
                 }
                 i += 3 + end;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 #[cfg(test)]
@@ -321,4 +344,21 @@ mod expand_tests {
             "${ONELF_THIS_IS_NOT_SET_4f3a}"
         );
     }
+
+    #[test]
+    fn expand_preserves_non_ascii() {
+        // Non-ASCII in the literal (non-`${}`) parts must be copied
+        // byte-for-byte; the old `bytes[i] as char` path mangled multi-byte
+        // UTF-8 into mojibake. No process-env mutation needed: an unset
+        // `${VAR}` is preserved verbatim, so the surrounding text carries
+        // the assertion.
+        assert_eq!(
+            expand_env("café ☕ Ω ${ONELF_UNSET_9q}"),
+            "café ☕ Ω ${ONELF_UNSET_9q}"
+        );
+    }
 }
+// The `${VAR}` injection-safety regression is covered by an integration
+// test (`recipe_expansion_cannot_inject_keys` in tests/pipeline.rs), which
+// sets the variable on a child process rather than mutating this process's
+// environment.
