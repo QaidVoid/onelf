@@ -6,9 +6,9 @@
 //! - Stdout extraction: pipes a single file to stdout (`-o -`)
 
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use onelf_format::{EntryKind, symlink_target_within_root};
@@ -56,20 +56,36 @@ pub(crate) fn decompress_entry(
             continue;
         }
 
+        // Both paths cap the output at `original_size`, so a malformed or
+        // hostile block cannot expand without bound (zstd-bomb), and the
+        // exact-length check below rejects any block that does not
+        // reproduce its recorded size.
+        let cap = block.original_size as usize;
         let decompressed = if let Some(d) = dict {
-            let cursor = Cursor::new(&compressed);
-            let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
-            let mut block_result = Vec::with_capacity(block.original_size as usize);
-            decoder.read_to_end(&mut block_result)?;
-            block_result
+            let mut dec = zstd::bulk::Decompressor::with_dictionary(d)?;
+            dec.decompress(&compressed, cap).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("decompression failed: {e}"),
+                )
+            })?
         } else {
-            zstd::bulk::decompress(&compressed, block.original_size as usize).map_err(|e| {
+            zstd::bulk::decompress(&compressed, cap).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("decompression failed: {e}"),
                 )
             })?
         };
+        if decompressed.len() != cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "decompressed block size {} != expected {cap}",
+                    decompressed.len()
+                ),
+            ));
+        }
 
         result.extend_from_slice(&decompressed);
     }
@@ -254,6 +270,11 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
 
     fs::create_dir_all(output_dir)?;
 
+    // Directory modes are applied in a final pass (deepest-first) rather
+    // than at creation: a read-only directory (e.g. 0555) would otherwise
+    // reject writes of its own children (REVIEW §5.6).
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     // First pass: dirs and files (before symlinks, so no file is ever
     // written through a symlink pointing outside the tree).
     for (i, entry) in manifest.entries.iter().enumerate() {
@@ -266,10 +287,15 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
         match entry.kind {
             EntryKind::Dir => {
                 fs::create_dir_all(&target)?;
-                fs::set_permissions(
-                    &target,
-                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
-                )?;
+                // The directory may already exist with a restrictive mode
+                // (e.g. a prior extraction left it 0555). Ensure it is
+                // owner-writable and traversable now so its children can be
+                // written; the recorded mode is applied in the final pass.
+                let mode = fs::metadata(&target)?.permissions().mode();
+                if mode & 0o700 != 0o700 {
+                    fs::set_permissions(&target, fs::Permissions::from_mode(mode | 0o700))?;
+                }
+                dir_modes.push((target, mode_bits(entry.mode, preserve_mode)));
             }
             EntryKind::File => {
                 if let Some(parent) = target.parent() {
@@ -310,6 +336,13 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
             fs::remove_file(&target)?;
         }
         std::os::unix::fs::symlink(link_target, &target)?;
+    }
+
+    // Final pass: apply directory modes deepest-first, so tightening a
+    // parent's permissions never blocks setting a child's.
+    dir_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    for (dir, mode) in &dir_modes {
+        fs::set_permissions(dir, fs::Permissions::from_mode(*mode))?;
     }
 
     pb.finish_with_message("Extraction complete");

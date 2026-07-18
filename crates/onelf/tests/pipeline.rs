@@ -752,3 +752,175 @@ int main(void) {{
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A read-only (0555) directory in the source tree must not break
+/// extraction of its children (REVIEW §5.6): directory modes are applied
+/// deepest-first after files are written.
+#[test]
+fn readonly_directory_children_still_extract() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = workdir("ro-dir");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(&app.join("ro/data.txt"), "payload\n");
+    // Mark the directory read-only + execute (0555): its child must still
+    // extract even though the dir itself forbids writes.
+    std::fs::set_permissions(app.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let pkg = td.join("ro.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let out = td.join("out");
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "extract: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let got = std::fs::read_to_string(out.join("ro/data.txt")).expect("child under 0555 dir");
+    assert_eq!(got, "payload\n");
+    // The recorded directory mode is still applied.
+    let mode = std::fs::metadata(out.join("ro"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o555,
+        "directory mode must be applied after extraction"
+    );
+
+    // Re-extract into the SAME output dir: `out/ro` now pre-exists as 0555,
+    // and extraction must still rewrite its children instead of failing
+    // with EACCES.
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "re-extract into a pre-existing read-only dir: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let got = std::fs::read_to_string(out.join("ro/data.txt")).expect("child re-extracted");
+    assert_eq!(got, "payload\n");
+
+    // Restore writable perms on both the source and output read-only dirs so
+    // remove_dir_all can delete their children; otherwise `td` leaks.
+    for ro in [app.join("ro"), out.join("ro")] {
+        let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755));
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The `.onelf/` namespace is reserved for injected metadata, so a source
+/// tree that already contains such a path is rejected rather than silently
+/// producing a duplicate entry.
+#[test]
+fn source_onelf_path_is_rejected() {
+    let td = workdir("reserved");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(&app.join(".onelf/env"), "FOO=bar\n");
+
+    let pkg = td.join("r.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        !o.status.success(),
+        "packing a reserved .onelf/ path must fail"
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains(".onelf"),
+        "error should name the reserved path; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Recipe `${VAR}` expansion runs after the TOML is parsed, so an env value
+/// containing a quote and newline cannot inject a new recipe key. The
+/// variable is set on the child process only, never on this test process.
+#[test]
+fn recipe_expansion_cannot_inject_keys() {
+    let td = workdir("recipe-inj");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run.sh\"\ndescription = \"${ONELF_INJ}\"\n\n[bundle]\nskip = true\n",
+    );
+
+    let pkg = td.join("i.onelf");
+    // Spliced into raw TOML before parsing, this would close the string and
+    // open a `name` key. Post-parse expansion keeps it as one value.
+    let payload = "evil\"\nname = \"HACKED";
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            pkg.to_str().unwrap(),
+        ])
+        .env("ONELF_INJ", payload)
+        .output()
+        .expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "build: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let o = run_onelf(&["info", pkg.to_str().unwrap()], None);
+    let info = String::from_utf8_lossy(&o.stdout);
+    // If expansion happened before parse, the value would have split into a
+    // separate `name` key and the description would be just "evil"; the
+    // marker only survives inside the description when expansion is
+    // post-parse.
+    assert!(
+        info.contains("HACKED"),
+        "injected marker must survive as a literal description value:\n{info}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
