@@ -22,70 +22,68 @@ pub fn read_elf_interp(path: &Path) -> Option<String> {
     parse_elf_interp(&buf)
 }
 
-fn parse_elf_interp(data: &[u8]) -> Option<String> {
+/// Locate the PT_INTERP program header in `data` (which must contain the ELF
+/// header and program-header table) and return the interpreter string's
+/// `(file offset, size-in-file)`. Little-endian 32- and 64-bit ELF; every
+/// read is bounds-checked against `data`. The interp bytes themselves may lie
+/// beyond `data` (the caller reads them, possibly re-reading the file).
+pub(crate) fn pt_interp_slot(data: &[u8]) -> Option<(usize, usize)> {
     if data.len() < 64 || data[0..4] != *b"\x7fELF" {
         return None;
     }
-
     let class = data[4];
-
     let (e_phoff, e_phentsize, e_phnum) = match class {
-        2 => {
-            let e_phoff = u64::from_le_bytes(data[32..40].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[54..56].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[56..58].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
-        1 => {
-            let e_phoff = u32::from_le_bytes(data[28..32].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[42..44].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[44..46].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
+        2 => (
+            u64::from_le_bytes(data.get(32..40)?.try_into().ok()?) as usize,
+            u16::from_le_bytes(data.get(54..56)?.try_into().ok()?) as usize,
+            u16::from_le_bytes(data.get(56..58)?.try_into().ok()?) as usize,
+        ),
+        1 => (
+            u32::from_le_bytes(data.get(28..32)?.try_into().ok()?) as usize,
+            u16::from_le_bytes(data.get(42..44)?.try_into().ok()?) as usize,
+            u16::from_le_bytes(data.get(44..46)?.try_into().ok()?) as usize,
+        ),
         _ => return None,
     };
-
+    // Each program-header entry must be large enough to hold the fields we
+    // read below (p_offset / p_filesz); reject malformed tables up front.
+    let min_phentsize = if class == 2 { 56 } else { 32 };
+    if e_phentsize < min_phentsize {
+        return None;
+    }
     for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + e_phentsize > data.len() {
+        let off = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let end = off.checked_add(e_phentsize)?;
+        if end > data.len() {
             break;
         }
-
-        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+        let p_type = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
         if p_type != 3 {
             continue;
         }
-
-        let (p_offset, p_filesz) = match class {
-            2 => {
-                let p_offset =
-                    u64::from_le_bytes(data[off + 8..off + 16].try_into().ok()?) as usize;
-                let p_filesz =
-                    u64::from_le_bytes(data[off + 32..off + 40].try_into().ok()?) as usize;
-                (p_offset, p_filesz)
-            }
-            1 => {
-                let p_offset = u32::from_le_bytes(data[off + 4..off + 8].try_into().ok()?) as usize;
-                let p_filesz =
-                    u32::from_le_bytes(data[off + 16..off + 20].try_into().ok()?) as usize;
-                (p_offset, p_filesz)
-            }
-            _ => return None,
+        return match class {
+            2 => Some((
+                u64::from_le_bytes(data.get(off + 8..off + 16)?.try_into().ok()?) as usize,
+                u64::from_le_bytes(data.get(off + 32..off + 40)?.try_into().ok()?) as usize,
+            )),
+            1 => Some((
+                u32::from_le_bytes(data.get(off + 4..off + 8)?.try_into().ok()?) as usize,
+                u32::from_le_bytes(data.get(off + 16..off + 20)?.try_into().ok()?) as usize,
+            )),
+            _ => None,
         };
-
-        if p_offset + p_filesz > data.len() {
-            return None;
-        }
-
-        let interp = &data[p_offset..p_offset + p_filesz];
-        let interp = match interp.iter().position(|&b| b == 0) {
-            Some(pos) => &interp[..pos],
-            None => interp,
-        };
-        return std::str::from_utf8(interp).ok().map(String::from);
     }
-
     None
+}
+
+fn parse_elf_interp(data: &[u8]) -> Option<String> {
+    let (p_offset, p_filesz) = pt_interp_slot(data)?;
+    let interp = data.get(p_offset..p_offset.checked_add(p_filesz)?)?;
+    let interp = match interp.iter().position(|&b| b == 0) {
+        Some(pos) => &interp[..pos],
+        None => interp,
+    };
+    std::str::from_utf8(interp).ok().map(String::from)
 }
 
 /// Check if we should use userland-execve for this target.
@@ -284,4 +282,49 @@ pub fn build_exec_command(
 /// Parse the bundled interpreter relative path from `.onelf/interp` metadata.
 pub fn parse_bundled_interp_rel(interp_data: &[u8]) -> Option<&str> {
     std::str::from_utf8(interp_data).ok()?.lines().next()
+}
+
+#[cfg(test)]
+mod interp_tests {
+    use super::*;
+
+    fn elf64_with_interp(interp: &str) -> Vec<u8> {
+        let phoff = 64usize;
+        let phentsize = 56usize;
+        let interp_off = phoff + phentsize;
+        let mut v = vec![0u8; interp_off + interp.len() + 1];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELFCLASS64
+        v[32..40].copy_from_slice(&(phoff as u64).to_le_bytes());
+        v[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes());
+        v[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        v[phoff..phoff + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        v[phoff + 8..phoff + 16].copy_from_slice(&(interp_off as u64).to_le_bytes());
+        v[phoff + 32..phoff + 40].copy_from_slice(&((interp.len() + 1) as u64).to_le_bytes());
+        v[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
+        v
+    }
+
+    #[test]
+    fn slot_and_parse_agree() {
+        let name = "/lib64/ld-linux-x86-64.so.2";
+        let elf = elf64_with_interp(name);
+        let (off, sz) = pt_interp_slot(&elf).expect("slot");
+        assert_eq!(off, 120);
+        assert_eq!(sz, name.len() + 1);
+        assert_eq!(parse_elf_interp(&elf).as_deref(), Some(name));
+    }
+
+    #[test]
+    fn malformed_returns_none_without_panic() {
+        assert!(pt_interp_slot(b"not an elf").is_none());
+        assert!(pt_interp_slot(&[]).is_none());
+        // ELF magic but an out-of-bounds program-header table.
+        let mut short = vec![0u8; 64];
+        short[0..4].copy_from_slice(b"\x7fELF");
+        short[4] = 2;
+        short[56..58].copy_from_slice(&9999u16.to_le_bytes());
+        short[32..40].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(pt_interp_slot(&short).is_none());
+    }
 }

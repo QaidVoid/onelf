@@ -71,46 +71,33 @@ fn read_pt_interp(binary: &Path) -> io::Result<String> {
     let n = file.read(&mut data)?;
     data.truncate(n);
 
-    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ELF"));
-    }
-    if data[4] != 2 {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "not 64-bit ELF"));
-    }
+    let (p_offset, p_filesz) = crate::interp::pt_interp_slot(&data)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no PT_INTERP entry"))?;
 
-    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
-    let e_phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap()) as usize;
-    let e_phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
-
-    for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + e_phentsize > data.len() {
-            break;
-        }
-        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        if p_type != 3 {
-            continue;
-        }
-        let p_offset = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap()) as usize;
-        let p_filesz = u64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap()) as usize;
-
-        // PT_INTERP may point past the first 8KB; re-read if needed.
-        if p_offset + p_filesz > data.len() {
-            file.seek(SeekFrom::Start(p_offset as u64))?;
-            let mut buf = vec![0u8; p_filesz];
-            file.read_exact(&mut buf)?;
-            let s = std::str::from_utf8(strip_nul(&buf))
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PT_INTERP not UTF-8"))?;
-            return Ok(s.to_string());
-        }
-        let s = std::str::from_utf8(strip_nul(&data[p_offset..p_offset + p_filesz]))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PT_INTERP not UTF-8"))?;
-        return Ok(s.to_string());
+    // PT_INTERP is a path string; reject absurd sizes so a malformed ELF
+    // can't force a huge allocation or an overflowing slot computation.
+    if p_filesz > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PT_INTERP length exceeds PATH_MAX",
+        ));
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no PT_INTERP entry",
-    ))
+    let slot_end = p_offset
+        .checked_add(p_filesz)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PT_INTERP slot overflow"))?;
+
+    // The interp string may point past the first 8KB; re-read if needed.
+    let buf = if slot_end > data.len() {
+        file.seek(SeekFrom::Start(p_offset as u64))?;
+        let mut b = vec![0u8; p_filesz];
+        file.read_exact(&mut b)?;
+        b
+    } else {
+        data[p_offset..slot_end].to_vec()
+    };
+    let s = std::str::from_utf8(strip_nul(&buf))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PT_INTERP not UTF-8"))?;
+    Ok(s.to_string())
 }
 
 fn strip_nul(buf: &[u8]) -> &[u8] {
@@ -231,77 +218,52 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
 /// the same so any self-extract trailer at the end is preserved).
 fn patch_pt_interp_in_place(binary: &Path, new_interp: &str) -> io::Result<()> {
     let mut data = fs::read(binary)?;
-    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not an ELF"));
-    }
-    if data[4] != 2 {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "not 64-bit ELF"));
-    }
-
-    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
-    let e_phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap()) as usize;
-    let e_phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
+    let (p_offset, p_filesz) = crate::interp::pt_interp_slot(&data)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no PT_INTERP entry"))?;
+    let slot_end = p_offset
+        .checked_add(p_filesz)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "PT_INTERP slot overflow"))?;
 
     let new_bytes = new_interp.as_bytes();
+    if new_bytes.len() + 1 > p_filesz {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "new PT_INTERP ({} bytes) doesn't fit in slot ({} bytes)",
+                new_bytes.len() + 1,
+                p_filesz
+            ),
+        ));
+    }
+    if slot_end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PT_INTERP slot extends past file",
+        ));
+    }
 
-    for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + e_phentsize > data.len() {
-            break;
-        }
-        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        if p_type != 3 {
-            // PT_INTERP = 3
-            continue;
-        }
-        let p_offset = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap()) as usize;
-        let p_filesz = u64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap()) as usize;
-
-        if new_bytes.len() + 1 > p_filesz {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "new PT_INTERP ({} bytes) doesn't fit in slot ({} bytes)",
-                    new_bytes.len() + 1,
-                    p_filesz
-                ),
-            ));
-        }
-        if p_offset + p_filesz > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "PT_INTERP slot extends past file",
-            ));
-        }
-
-        // No-op if already patched to the same value.
-        let current_end = (p_offset..p_offset + p_filesz)
-            .find(|&i| data[i] == 0)
-            .unwrap_or(p_offset + p_filesz);
-        if &data[p_offset..current_end] == new_bytes {
-            return Ok(());
-        }
-
-        data[p_offset..p_offset + new_bytes.len()].copy_from_slice(new_bytes);
-        for j in (p_offset + new_bytes.len())..(p_offset + p_filesz) {
-            data[j] = 0;
-        }
-
-        // Break any hardlink to CAS by writing through a temp + rename.
-        let tmp = binary.with_extension("interp-patch");
-        fs::write(&tmp, &data)?;
-        let _ = fs::set_permissions(
-            &tmp,
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        );
-        fs::rename(&tmp, binary)?;
+    // No-op if already patched to the same value.
+    let current_end = (p_offset..slot_end)
+        .find(|&i| data[i] == 0)
+        .unwrap_or(slot_end);
+    if &data[p_offset..current_end] == new_bytes {
         return Ok(());
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no PT_INTERP entry",
-    ))
+    data[p_offset..p_offset + new_bytes.len()].copy_from_slice(new_bytes);
+    for j in (p_offset + new_bytes.len())..slot_end {
+        data[j] = 0;
+    }
+
+    // Break any hardlink to CAS by writing through a temp + rename.
+    let tmp = binary.with_extension("interp-patch");
+    fs::write(&tmp, &data)?;
+    let _ = fs::set_permissions(
+        &tmp,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    );
+    fs::rename(&tmp, binary)?;
+    Ok(())
 }
 
 /// FNV-1a 32-bit hash for naming.
