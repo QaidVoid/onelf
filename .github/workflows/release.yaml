@@ -50,7 +50,9 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.build.TARGET }}
-          components: rust-src
+          # llvm-tools provides rust-objcopy, used by build.rs to flatten the
+          # bootstrap payload for this runner's architecture.
+          components: rust-src, llvm-tools
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.build.TARGET }}

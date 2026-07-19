@@ -1,0 +1,30 @@
+# Freestanding onelf payloads, compiled per target by `onelf`'s build.rs:
+#   * the `onelf-bootstrap` bin  -> flat relative-interpreter binary
+#   * the `onelf_env` cdylib     -> `-nostdlib` env constructor (libonelf-env.so)
+# The two need different link flags, so build.rs builds each target with its
+# own cargo invocation. Excluded from the workspace: both are `no_std` and only
+# build for a bare target.
+[package]
+name = "onelf-payloads"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "onelf_env"
+crate-type = ["cdylib"]
+path = "src/env.rs"
+
+[[bin]]
+name = "onelf-bootstrap"
+path = "src/bootstrap.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = "s"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

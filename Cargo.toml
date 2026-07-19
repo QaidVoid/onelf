@@ -6,6 +6,10 @@ members = [
   "crates/onelf-rt"
 ]
 default-members = ["crates/onelf"]
+# Freestanding no_std/no_main payloads, built per-target by onelf's build.rs.
+exclude = [
+  "crates/onelf-payloads"
+]
 
 [workspace.package]
 version = "0.2.8"
