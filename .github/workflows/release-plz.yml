@@ -20,10 +20,23 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: x86_64-unknown-linux-musl
+          # llvm-tools provides rust-objcopy for the payload build below.
+          components: llvm-tools
       - name: Install musl tools
         run: sudo apt-get install -y musl-tools
       - name: Build onelf-rt
         run: cargo build --release --target x86_64-unknown-linux-musl -p onelf-rt
+      # cargo publish packages only the `onelf` crate, without the sibling
+      # `onelf-payloads`, so its verify build can't build the payloads. Build
+      # them here (from the full checkout) and hand them over via
+      # ONELF_PAYLOAD_DIR, mirroring the ONELF_RT_PATH bypass.
+      - name: Build payloads for publish
+        run: |
+          export ONELF_RT_PATH="$PWD/target/x86_64-unknown-linux-musl/release/onelf-rt"
+          cargo build --release -p onelf
+          mkdir -p "$PWD/payloads"
+          find target/release/build -name 'bootstrap_*.bin' -exec cp {} "$PWD/payloads/" \;
+          find target/release/build -name 'onelf_env_*.so' -exec cp {} "$PWD/payloads/" \;
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
@@ -32,6 +45,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           ONELF_RT_PATH: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/onelf-rt
+          ONELF_PAYLOAD_DIR: ${{ github.workspace }}/payloads
 
   release-plz-pr:
     name: Release-plz PR

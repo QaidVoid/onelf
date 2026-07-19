@@ -733,10 +733,19 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     let e_phentsize = elf.header.e_phentsize as usize;
     drop(elf);
 
-    let code = if is_x86_64 {
-        payload::BOOTSTRAP_X86_64
+    let e_machine = if is_x86_64 {
+        goblin::elf::header::EM_X86_64
     } else {
-        payload::BOOTSTRAP_AARCH64
+        goblin::elf::header::EM_AARCH64
+    };
+    let Some(code) = payload::bootstrap_blob(e_machine) else {
+        eprintln!(
+            "  {} onelf was built without the bootstrap payload for this target's \
+             architecture; skipping relative-interp injection for {}",
+            color::bold_red("warning:"),
+            path.display()
+        );
+        return Ok(false);
     };
     let rel_bytes = rel_interp.as_bytes();
 
