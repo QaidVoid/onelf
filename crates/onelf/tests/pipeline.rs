@@ -924,3 +924,67 @@ fn recipe_expansion_cannot_inject_keys() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// The documented user asset dirs `.onelf/icons/` and `.onelf/desktop/`
+/// are accepted from source and round-trip through `icon`/`desktop`,
+/// while the rest of the `.onelf/` namespace stays reserved.
+#[test]
+fn source_onelf_assets_are_accepted() {
+    let td = workdir("assets");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(&app.join(".onelf/icons/default.png"), "PNGDATA");
+    write(
+        &app.join(".onelf/desktop/default.desktop"),
+        "[Desktop Entry]\nName=App\nExec=run.sh\n",
+    );
+
+    let pkg = td.join("a.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            "--command",
+            "bin/run.sh",
+            "--output",
+            pkg.to_str().unwrap(),
+            app.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "packing .onelf/icons and .onelf/desktop must succeed; got: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let icon_out = td.join("out.png");
+    let i = run_onelf(
+        &[
+            "icon",
+            pkg.to_str().unwrap(),
+            "-o",
+            icon_out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(i.status.success(), "icon extract failed");
+    assert_eq!(std::fs::read(&icon_out).unwrap(), b"PNGDATA");
+
+    let desk_out = td.join("out.desktop");
+    let d = run_onelf(
+        &[
+            "desktop",
+            pkg.to_str().unwrap(),
+            "-o",
+            desk_out.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(d.status.success(), "desktop extract failed");
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(&desk_out).unwrap()).contains("Name=App"),
+        "extracted desktop file should carry the source content"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}

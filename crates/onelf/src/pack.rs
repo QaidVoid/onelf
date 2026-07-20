@@ -319,17 +319,24 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // stays stable across runs.
     let inject_mtime = opts.mtime.unwrap_or(0);
 
-    // `.onelf/` is reserved for injected metadata. Reject any packaged
-    // entry (file, directory, or symlink) that collides so injected
-    // metadata is never shadowed by, or silently duplicated alongside,
-    // source content.
+    // `.onelf/` is reserved for injected metadata, except for the
+    // documented user-provided asset dirs `.onelf/icons/` and
+    // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`). The
+    // bare `.onelf` directory is allowed as their parent. Any other
+    // collision is rejected so injected metadata is never shadowed by, or
+    // silently duplicated alongside, source content.
     let reserved = Path::new(".onelf");
     let collision = files
         .iter()
         .map(|f| &f.rel_path)
         .chain(dirs.iter().map(|d| &d.rel_path))
         .chain(symlinks.iter().map(|s| &s.rel_path))
-        .find(|p| p.starts_with(reserved));
+        .find(|p| {
+            p.starts_with(reserved)
+                && p.as_path() != reserved
+                && !p.starts_with(".onelf/icons")
+                && !p.starts_with(".onelf/desktop")
+        });
     if let Some(p) = collision {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
