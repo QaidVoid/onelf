@@ -8,6 +8,7 @@
 /// Flat bootstrap binary for the relative-interpreter technique, one per arch.
 pub const BOOTSTRAP_X86_64: &[u8] = include_bytes!(env!("ONELF_BOOTSTRAP_X86_64"));
 pub const BOOTSTRAP_AARCH64: &[u8] = include_bytes!(env!("ONELF_BOOTSTRAP_AARCH64"));
+pub const BOOTSTRAP_I686: &[u8] = include_bytes!(env!("ONELF_BOOTSTRAP_I686"));
 
 /// Freestanding onelf-env constructor shared objects, one per arch.
 ///
@@ -19,6 +20,7 @@ pub const BOOTSTRAP_AARCH64: &[u8] = include_bytes!(env!("ONELF_BOOTSTRAP_AARCH6
 /// so a stale or wrong-arch blob is never injected.
 pub const ONELF_ENV_X86_64: &[u8] = include_bytes!(env!("ONELF_ENV_X86_64"));
 pub const ONELF_ENV_AARCH64: &[u8] = include_bytes!(env!("ONELF_ENV_AARCH64"));
+pub const ONELF_ENV_I686: &[u8] = include_bytes!(env!("ONELF_ENV_I686"));
 
 /// Soname / bundled filename of the onelf-env constructor library.
 pub const ONELF_ENV_SONAME: &str = "libonelf-env.so";
@@ -28,9 +30,11 @@ pub const ONELF_ENV_SONAME: &str = "libonelf-env.so";
 /// e.g. the non-native arch of a single-arch build). The relative-interpreter
 /// injection is skipped for such targets.
 pub fn bootstrap_blob(e_machine: u16) -> Option<&'static [u8]> {
+    const EM_386: u16 = 3;
     const EM_X86_64: u16 = 62;
     const EM_AARCH64: u16 = 183;
     let blob = match e_machine {
+        EM_386 => BOOTSTRAP_I686,
         EM_X86_64 => BOOTSTRAP_X86_64,
         EM_AARCH64 => BOOTSTRAP_AARCH64,
         _ => return None,
@@ -43,14 +47,16 @@ pub fn bootstrap_blob(e_machine: u16) -> Option<&'static [u8]> {
 /// validated as an ELF object of the requested machine so an empty or
 /// stale placeholder never gets injected.
 pub fn onelf_env_blob(e_machine: u16) -> Option<&'static [u8]> {
+    const EM_386: u16 = 3;
     const EM_X86_64: u16 = 62;
     const EM_AARCH64: u16 = 183;
     let blob = match e_machine {
+        EM_386 => ONELF_ENV_I686,
         EM_X86_64 => ONELF_ENV_X86_64,
         EM_AARCH64 => ONELF_ENV_AARCH64,
         _ => return None,
     };
-    // ELF magic + 64-bit + machine field (e_machine at offset 18).
+    // ELF magic + machine field (e_machine at offset 18).
     if blob.len() < 20 || &blob[0..4] != b"\x7fELF" {
         return None;
     }
@@ -64,6 +70,12 @@ pub fn onelf_env_blob(e_machine: u16) -> Option<&'static [u8]> {
 // x86_64: `lea XX(%rip), %rsi` at offset 0x0a, displacement at 0x0d, RIP at 0x11.
 pub const X86_64_METADATA_LEA_DISP_OFFSET: usize = 0x0d;
 pub const X86_64_METADATA_LEA_RIP: usize = 0x11;
+
+// i686: `pop ecx` at 0x0c gives that address; `add ecx, imm32` (81 c1) at
+// 0x0d reaches the metadata. The packer sets imm32 (at 0x0f) to
+// `metadata_offset - 0x0c`.
+pub const I686_METADATA_ADD_PC: usize = 0x0c;
+pub const I686_METADATA_ADD_DISP_OFFSET: usize = 0x0f;
 
 // aarch64: `adr x1, _onelf_metadata` at offset 0x10.
 // Encodes a 21-bit signed PC-relative offset in the instruction word.
@@ -150,5 +162,25 @@ mod tests {
         assert_eq!(AARCH64_METADATA_ADR_OFFSET, 0x10);
         let insn = u32::from_le_bytes(b[0x10..0x14].try_into().unwrap());
         assert_eq!(insn & 0x9f00_001f, 0x1000_0001, "adr x1 opcode moved");
+    }
+
+    #[test]
+    fn i686_bootstrap_add_at_expected_offset() {
+        const EM_386: u16 = 3;
+        let Some(b) = bootstrap_blob(EM_386) else {
+            return;
+        };
+        // Preamble: mov ebp,esp; mov esi,edx; and esp,-16; call +0; then
+        // `pop ecx` at 0x0c and `add ecx, imm32` (81 c1) at 0x0d.
+        assert_eq!(
+            &b[0x00..0x0c],
+            &[
+                0x89, 0xe5, 0x89, 0xd6, 0x83, 0xe4, 0xf0, 0xe8, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+        assert_eq!(b[0x0c], 0x59, "pop ecx moved");
+        assert_eq!(&b[0x0d..0x0f], &[0x81, 0xc1], "add ecx,imm32 moved");
+        assert_eq!(I686_METADATA_ADD_PC, 0x0c);
+        assert_eq!(I686_METADATA_ADD_DISP_OFFSET, 0x0f);
     }
 }

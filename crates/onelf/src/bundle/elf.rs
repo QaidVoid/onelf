@@ -723,12 +723,23 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    if elf.header.e_ident[4] != 2 || elf.header.e_ident[5] != 1 {
-        return Ok(false); // 64-bit little-endian only
+    if elf.header.e_ident[5] != 1 {
+        return Ok(false); // little-endian only
     }
+    let is64 = match elf.header.e_ident[4] {
+        1 => false,
+        2 => true,
+        _ => return Ok(false),
+    };
     let is_x86_64 = elf.header.e_machine == goblin::elf::header::EM_X86_64;
     let is_aarch64 = elf.header.e_machine == goblin::elf::header::EM_AARCH64;
-    if !is_x86_64 && !is_aarch64 {
+    let is_i686 = elf.header.e_machine == goblin::elf::header::EM_386;
+    if !is_x86_64 && !is_aarch64 && !is_i686 {
+        return Ok(false);
+    }
+    // The bootstrap layout is width-specific; require the ELF class to match the
+    // machine (i686 => 32-bit; x86_64 / aarch64 => 64-bit).
+    if is_i686 == is64 {
         return Ok(false);
     }
 
@@ -756,13 +767,9 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     let orig_entry = elf.header.e_entry;
     let e_phoff = elf.header.e_phoff as usize;
     let e_phentsize = elf.header.e_phentsize as usize;
+    let e_machine = elf.header.e_machine;
     drop(elf);
 
-    let e_machine = if is_x86_64 {
-        goblin::elf::header::EM_X86_64
-    } else {
-        goblin::elf::header::EM_AARCH64
-    };
     let Some(code) = payload::bootstrap_blob(e_machine) else {
         eprintln!(
             "  {} onelf was built without the bootstrap payload for this target's \
@@ -774,7 +781,8 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     };
     let rel_bytes = rel_interp.as_bytes();
 
-    // Build: [code] [padding to 8-byte align] [orig_entry u64] [path_len u16] [path NUL]
+    // Build: [code] [padding to 8-byte align] [entry_delta] [path_len u16] [path NUL].
+    // entry_delta is pointer-width (i64 on 64-bit ELF, i32 on 32-bit).
     let mut blob = Vec::with_capacity(code.len() + 64);
     blob.extend_from_slice(code);
     while blob.len() % 8 != 0 {
@@ -782,7 +790,11 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     }
     let metadata_offset = blob.len();
     let entry_delta = (orig_entry as i64) - (new_vaddr as i64);
-    blob.extend_from_slice(&entry_delta.to_le_bytes());
+    if is64 {
+        blob.extend_from_slice(&entry_delta.to_le_bytes());
+    } else {
+        blob.extend_from_slice(&(entry_delta as i32).to_le_bytes());
+    }
     blob.extend_from_slice(&(rel_bytes.len() as u16).to_le_bytes());
     blob.extend_from_slice(rel_bytes);
     blob.push(0);
@@ -793,8 +805,13 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
         blob[payload::X86_64_METADATA_LEA_DISP_OFFSET
             ..payload::X86_64_METADATA_LEA_DISP_OFFSET + 4]
             .copy_from_slice(&disp.to_le_bytes());
-    } else {
+    } else if is_aarch64 {
         payload::patch_aarch64_adr(&mut blob, metadata_offset);
+    } else {
+        // i686: `add ecx, imm32` reaches the metadata from the popped PC.
+        let disp = (metadata_offset as i32) - (payload::I686_METADATA_ADD_PC as i32);
+        blob[payload::I686_METADATA_ADD_DISP_OFFSET..payload::I686_METADATA_ADD_DISP_OFFSET + 4]
+            .copy_from_slice(&disp.to_le_bytes());
     }
 
     let mut modified = data;
@@ -814,17 +831,34 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
     // segment is first, the base is too high and original segments at
     // lower vaddrs fall outside the reserved region.
     let phdr_off = e_phoff + phdr_idx * e_phentsize;
-    modified[phdr_off..phdr_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-    modified[phdr_off + 4..phdr_off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
-    modified[phdr_off + 8..phdr_off + 16].copy_from_slice(&file_offset.to_le_bytes());
-    modified[phdr_off + 16..phdr_off + 24].copy_from_slice(&new_vaddr.to_le_bytes());
-    modified[phdr_off + 24..phdr_off + 32].copy_from_slice(&new_vaddr.to_le_bytes());
-    modified[phdr_off + 32..phdr_off + 40].copy_from_slice(&blob_len.to_le_bytes());
-    modified[phdr_off + 40..phdr_off + 48].copy_from_slice(&blob_len.to_le_bytes());
-    modified[phdr_off + 48..phdr_off + 56].copy_from_slice(&page_size.to_le_bytes());
+    if is64 {
+        // Elf64_Phdr: type, flags, offset, vaddr, paddr, filesz, memsz, align.
+        modified[phdr_off..phdr_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        modified[phdr_off + 4..phdr_off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        modified[phdr_off + 8..phdr_off + 16].copy_from_slice(&file_offset.to_le_bytes());
+        modified[phdr_off + 16..phdr_off + 24].copy_from_slice(&new_vaddr.to_le_bytes());
+        modified[phdr_off + 24..phdr_off + 32].copy_from_slice(&new_vaddr.to_le_bytes());
+        modified[phdr_off + 32..phdr_off + 40].copy_from_slice(&blob_len.to_le_bytes());
+        modified[phdr_off + 40..phdr_off + 48].copy_from_slice(&blob_len.to_le_bytes());
+        modified[phdr_off + 48..phdr_off + 56].copy_from_slice(&page_size.to_le_bytes());
+    } else {
+        // Elf32_Phdr: type, offset, vaddr, paddr, filesz, memsz, flags, align
+        // (p_flags sits after p_memsz, unlike Elf64_Phdr).
+        modified[phdr_off..phdr_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        modified[phdr_off + 4..phdr_off + 8].copy_from_slice(&(file_offset as u32).to_le_bytes());
+        modified[phdr_off + 8..phdr_off + 12].copy_from_slice(&(new_vaddr as u32).to_le_bytes());
+        modified[phdr_off + 12..phdr_off + 16].copy_from_slice(&(new_vaddr as u32).to_le_bytes());
+        modified[phdr_off + 16..phdr_off + 20].copy_from_slice(&(blob_len as u32).to_le_bytes());
+        modified[phdr_off + 20..phdr_off + 24].copy_from_slice(&(blob_len as u32).to_le_bytes());
+        modified[phdr_off + 24..phdr_off + 28].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        modified[phdr_off + 28..phdr_off + 32].copy_from_slice(&(page_size as u32).to_le_bytes());
+    }
 
     // Swap our phdr entry with the last one so original PT_LOADs come first.
-    let e_phnum = u16::from_le_bytes(modified[56..58].try_into().unwrap()) as usize;
+    // e_phnum lives at file offset 56 (Elf64) / 44 (Elf32).
+    let e_phnum_off = if is64 { 56 } else { 44 };
+    let e_phnum =
+        u16::from_le_bytes(modified[e_phnum_off..e_phnum_off + 2].try_into().unwrap()) as usize;
     let last_phdr_off = e_phoff + (e_phnum - 1) * e_phentsize;
     if phdr_off != last_phdr_off {
         let mut tmp = vec![0u8; e_phentsize];
@@ -833,8 +867,12 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
         modified[last_phdr_off..last_phdr_off + e_phentsize].copy_from_slice(&tmp);
     }
 
-    // Rewrite e_entry
-    modified[24..32].copy_from_slice(&new_vaddr.to_le_bytes());
+    // Rewrite e_entry (8 bytes at 24 on Elf64, 4 bytes at 24 on Elf32).
+    if is64 {
+        modified[24..32].copy_from_slice(&new_vaddr.to_le_bytes());
+    } else {
+        modified[24..28].copy_from_slice(&(new_vaddr as u32).to_le_bytes());
+    }
 
     fs::write(path, &modified)?;
     Ok(true)
@@ -863,8 +901,8 @@ pub(crate) enum EnvNeededOutcome {
 /// doesn't disturb the added DT_NEEDED).
 pub(crate) fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<EnvNeededOutcome> {
     let data = fs::read(path)?;
-    if data.len() < 20 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
-        return Ok(EnvNeededOutcome::Skipped); // not a 64-bit ELF
+    if data.len() < 20 || &data[0..4] != b"\x7fELF" || (data[4] != 1 && data[4] != 2) {
+        return Ok(EnvNeededOutcome::Skipped); // not a 32- or 64-bit ELF
     }
     // Binaries with an embedded payload (Bun-compiled: EOF trailer pre-1.3.12,
     // `.bun` section >=1.3.12) break if patchelf rewrites them. Leave them

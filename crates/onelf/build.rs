@@ -10,6 +10,8 @@ fn musl_target() -> String {
             "x86_64".to_string()
         }
     });
+    // rustc reports 32-bit x86 as `x86`; the musl triple uses `i686`.
+    let arch = if arch == "x86" { "i686" } else { &arch };
     format!("{arch}-unknown-linux-musl")
 }
 
@@ -225,6 +227,10 @@ const PAYLOADS: &[Payload] = &[
         arch: "aarch64",
         triple: "aarch64-unknown-linux-gnu",
     },
+    Payload {
+        arch: "i686",
+        triple: "i686-unknown-linux-gnu",
+    },
 ];
 
 /// Build (or collect) the freestanding bootstrap + env payloads and emit
@@ -245,6 +251,7 @@ fn build_payloads() {
     println!("cargo:rerun-if-env-changed=ONELF_PAYLOAD_ALL");
     println!("cargo:rerun-if-env-changed=ONELF_PAYLOAD_CC_X86_64");
     println!("cargo:rerun-if-env-changed=ONELF_PAYLOAD_CC_AARCH64");
+    println!("cargo:rerun-if-env-changed=ONELF_PAYLOAD_CC_I686");
     println!("cargo:rerun-if-env-changed=ONELF_OBJCOPY");
 
     // Escape hatch for toolchain-less builds (cargo publish / install, or CI
@@ -272,6 +279,12 @@ fn build_payloads() {
 
     let target_arch =
         env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+    // rustc's target_arch for 32-bit x86 is `x86`; PAYLOADS keys it as `i686`.
+    let target_arch = if target_arch == "x86" {
+        "i686".to_string()
+    } else {
+        target_arch
+    };
     let build_all = env::var("ONELF_PAYLOAD_ALL").is_ok();
 
     let cargo = PathBuf::from(env::var("CARGO").unwrap());
@@ -520,6 +533,11 @@ fn payload_cc(arch: &str) -> Option<String> {
             "/opt/bootlin/aarch64-glibc/bin/aarch64-linux-gcc",
             "/opt/bootlin/aarch64-musl/bin/aarch64-linux-gcc",
             "aarch64-linux-gnu-gcc",
+        ],
+        "i686" => &[
+            "/opt/bootlin/x86-i686-glibc/bin/i686-linux-gcc",
+            "/opt/bootlin/x86-i686-musl/bin/i686-linux-gcc",
+            "i686-linux-gnu-gcc",
         ],
         _ => return None,
     };
