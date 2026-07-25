@@ -40,6 +40,20 @@ fn find_musl_gcc(target: &str) -> Option<String> {
         }
     }
 
+    // Bootlin prebuilt musl toolchains under /opt/bootlin (bin/<arch>-linux-gcc).
+    let bootlin_dir = match arch {
+        "x86_64" => Some("x86-64-musl"),
+        "aarch64" => Some("aarch64-musl"),
+        "i686" => Some("x86-i686-musl"),
+        _ => None,
+    };
+    if let Some(dir) = bootlin_dir {
+        let p = format!("/opt/bootlin/{dir}/bin/{arch}-linux-gcc");
+        if Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+
     // Search in /nix/store for musl-gcc (NixOS)
     if let Ok(entries) = std::fs::read_dir("/nix/store") {
         for entry in entries.flatten() {

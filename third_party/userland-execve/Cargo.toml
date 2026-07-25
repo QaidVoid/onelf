@@ -1,0 +1,15 @@
+[package]
+name = "userland-execve"
+version = "0.2.0"
+edition = "2021"
+description = "An implementation of execve() in user space"
+license = "MIT"
+repository = "https://github.com/io12/userland-execve-rust"
+readme = "README.md"
+
+# Vendored fork of userland-execve 0.2.0 with 32-bit x86 (i686) support added
+# to run.rs. Applied via [patch.crates-io] in the workspace root.
+
+[dependencies]
+goblin = { version = "0.8.0", default-features = false, features = ["elf32", "elf64", "endian_fd"] }
+nix = { version = "0.27.1", default-features = false, features = ["mman", "feature", "user"] }

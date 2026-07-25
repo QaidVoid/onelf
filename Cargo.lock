@@ -1001,8 +1001,6 @@ dependencies = [
 [[package]]
 name = "userland-execve"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea5394ca2e759920eefe2b20fc111d6e612cc2d71a47f9449745f93af88b61ba"
 dependencies = [
  "goblin 0.8.2",
  "nix",

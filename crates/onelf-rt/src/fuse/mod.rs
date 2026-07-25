@@ -41,6 +41,19 @@ core::arch::global_asm!(
     "svc #0",
 );
 
+// i386 Linux also requires SA_RESTORER. Without SA_SIGINFO the kernel builds
+// the legacy (non-rt) sigframe, so the restorer pops the signal number and
+// calls sigreturn (not rt_sigreturn).
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    ".global __onelf_signal_restorer",
+    ".type __onelf_signal_restorer, @function",
+    "__onelf_signal_restorer:",
+    "pop eax",      // discard the signal number pushed on the legacy frame
+    "mov eax, 119", // __NR_sigreturn
+    "int 0x80",
+);
+
 unsafe extern "C" {
     fn __onelf_signal_restorer();
 }

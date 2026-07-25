@@ -8,8 +8,13 @@ members = [
 default-members = ["crates/onelf"]
 # Freestanding no_std/no_main payloads, built per-target by onelf's build.rs.
 exclude = [
-  "crates/onelf-payloads"
+  "crates/onelf-payloads",
+  "third_party/userland-execve"
 ]
+
+[patch.crates-io]
+# Fork of userland-execve 0.2.0 that adds i686 (32-bit x86) support to run.rs.
+userland-execve = { path = "third_party/userland-execve" }
 
 [workspace.package]
 version = "0.2.8"
