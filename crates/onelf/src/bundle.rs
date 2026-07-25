@@ -274,6 +274,16 @@ pub struct BundleOptions {
 
 /// Strip debug symbols from a shared library (best-effort).
 fn strip_debug(path: &Path) {
+    // Stripping a Bun-compiled binary makes it lose its embedded module graph
+    // and fall back to the bare `bun` CLI (the `.bun` section survives, but
+    // strip perturbs what the runtime payload check relies on). Leave such
+    // binaries untouched, same as the RUNPATH / DT_NEEDED / bootstrap steps.
+    if fs::read(path)
+        .map(|d| has_embedded_payload(&d))
+        .unwrap_or(false)
+    {
+        return;
+    }
     match Command::new("strip")
         .arg("--strip-unneeded")
         .arg(path)
