@@ -184,12 +184,13 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
     let new_bytes = NEW.as_bytes();
     let data = fs::read(path)?;
 
-    // Self-extracting binaries (e.g. pre-1.3.12 Bun) have a trailer at
-    // the end of the file. patchelf can grow the file when adding a
-    // missing DT_RUNPATH, which would invalidate the trailer. The
-    // in-place rewrite is safe (same file size), so we still attempt
+    // Binaries with an embedded payload (pre-1.3.12 Bun via an EOF trailer,
+    // >=1.3.12 Bun via a `.bun` section) must not be structurally rewritten:
+    // patchelf grows the file and reshuffles the program headers, clobbering
+    // the trailer or perturbing the layout the runtime payload lookup depends
+    // on. The in-place rewrite is safe (same file size), so we still attempt
     // that, but we skip the patchelf fallback for these binaries.
-    let is_self_extract = has_self_extract_trailer(&data);
+    let is_self_extract = has_embedded_payload(&data);
 
     let elf = goblin::elf::Elf::parse(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -419,10 +420,11 @@ pub(crate) fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract
 ///
 /// Currently detects: pre-1.3.12 Bun (`bun build --compile`) binaries
 /// which end with `\n---- Bun! ----\n` followed by an 8-byte length.
+/// Bun >=1.3.12 dropped the trailer for a `.bun` section; that case is
+/// covered by [`has_bun_section`].
 pub(crate) fn has_self_extract_trailer(data: &[u8]) -> bool {
     // Bun's trailer is 16 bytes; pre-1.3.12 also has an 8-byte length
-    // word after it (so check at offsets -16 and -24). Modern Bun
-    // (>=1.3.12) uses a `.bun` ELF section instead and is unaffected.
+    // word after it (so check at offsets -16 and -24).
     const BUN_TRAILER: &[u8] = b"\n---- Bun! ----\n";
     if data.len() >= BUN_TRAILER.len() && data.ends_with(BUN_TRAILER) {
         return true;
@@ -433,6 +435,29 @@ pub(crate) fn has_self_extract_trailer(data: &[u8]) -> bool {
         return true;
     }
     false
+}
+
+/// Detect Bun >=1.3.12 `bun build --compile` binaries, which embed the module
+/// graph in a `.bun` ELF section (commit 66f7c41, released in 1.3.12) and
+/// locate it at runtime by parsing their own program headers. Any structural
+/// rewrite (a second patchelf pass, a bootstrap PT_LOAD) reshuffles that
+/// layout and makes the lookup dereference unmapped memory, so these are left
+/// untouched like self-extract binaries.
+pub(crate) fn has_bun_section(data: &[u8]) -> bool {
+    let Ok(elf) = goblin::elf::Elf::parse(data) else {
+        return false;
+    };
+    elf.section_headers
+        .iter()
+        .any(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".bun"))
+}
+
+/// True for binaries whose embedded payload would break if the ELF layout were
+/// rewritten: pre-1.3.12 Bun (EOF trailer) and >=1.3.12 Bun (`.bun` section).
+/// Such binaries skip the RUNPATH / DT_NEEDED / bootstrap edits and rely on
+/// runtime-set env (`LD_LIBRARY_PATH`) instead.
+pub(crate) fn has_embedded_payload(data: &[u8]) -> bool {
+    has_self_extract_trailer(data) || has_bun_section(data)
 }
 
 /// Locate patchelf in PATH (or ONELF_PATCHELF override).
@@ -681,15 +706,15 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
 
     let data = fs::read(path)?;
 
-    // Skip self-extracting binaries that store metadata at file end.
-    // Appending the bootstrap PT_LOAD here would clobber their trailer
-    // and break payload detection (e.g. pre-1.3.12 Bun-compiled
-    // binaries). For these, the runtime sets LD_LIBRARY_PATH and the
-    // kernel exec resolves PT_INTERP normally.
-    if has_self_extract_trailer(&data) {
+    // Skip binaries with an embedded payload. Pre-1.3.12 Bun stores metadata
+    // at the file end, so appending a bootstrap PT_LOAD would clobber the
+    // trailer; >=1.3.12 Bun locates a `.bun` section by parsing its own
+    // program headers, so rewriting them makes the lookup fault. For these the
+    // runtime sets LD_LIBRARY_PATH and the kernel resolves PT_INTERP normally.
+    if has_embedded_payload(&data) {
         eprintln!(
-            "  note: {} appears to be a self-extracting binary \
-             (Bun-compiled or similar); skipping bootstrap injection",
+            "  note: {} appears to be a Bun-compiled or self-extracting \
+             binary; skipping bootstrap injection",
             path.display(),
         );
         return Ok(false);
@@ -841,8 +866,10 @@ pub(crate) fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<E
     if data.len() < 20 || &data[0..4] != b"\x7fELF" || data[4] != 2 {
         return Ok(EnvNeededOutcome::Skipped); // not a 64-bit ELF
     }
-    // patchelf would grow a self-extract binary and clobber its trailer.
-    if has_self_extract_trailer(&data) {
+    // Binaries with an embedded payload (Bun-compiled: EOF trailer pre-1.3.12,
+    // `.bun` section >=1.3.12) break if patchelf rewrites them. Leave them
+    // untouched; env is applied at runtime instead.
+    if has_embedded_payload(&data) {
         return Ok(EnvNeededOutcome::Skipped);
     }
     let e_machine = u16::from_le_bytes([data[18], data[19]]);
@@ -1020,4 +1047,75 @@ pub(crate) fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<u
         );
     }
     Ok(injected)
+}
+
+#[cfg(test)]
+mod embedded_payload_tests {
+    use super::*;
+
+    /// Minimal 64-bit ELF whose only named section is `.bun`, mimicking a
+    /// Bun >=1.3.12 `--compile` binary for detection purposes.
+    fn elf_with_bun_section() -> Vec<u8> {
+        let shstrtab = b"\0.bun\0.shstrtab\0";
+        let mut f = vec![0u8; 64 + shstrtab.len()];
+        f[0..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2; // ELFCLASS64
+        f[5] = 1; // ELFDATA2LSB
+        f[6] = 1; // EV_CURRENT
+        f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        f[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        f[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        f[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+
+        let shstr_off = 64u64;
+        f[64..64 + shstrtab.len()].copy_from_slice(shstrtab);
+        while f.len() % 8 != 0 {
+            f.push(0);
+        }
+        let sh_off = f.len() as u64;
+        f[40..48].copy_from_slice(&sh_off.to_le_bytes()); // e_shoff
+        f[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+
+        let mut sh = |name: u32, typ: u32, off: u64, size: u64| {
+            let mut e = vec![0u8; 64];
+            e[0..4].copy_from_slice(&name.to_le_bytes());
+            e[4..8].copy_from_slice(&typ.to_le_bytes());
+            e[24..32].copy_from_slice(&off.to_le_bytes());
+            e[32..40].copy_from_slice(&size.to_le_bytes());
+            f.extend_from_slice(&e);
+        };
+        sh(0, 0, 0, 0); // SHT_NULL
+        sh(1, 1, 0, 0); // .bun -> SHT_PROGBITS
+        sh(6, 3, shstr_off, shstrtab.len() as u64); // .shstrtab -> SHT_STRTAB
+        f
+    }
+
+    #[test]
+    fn detects_bun_section_binary() {
+        let f = elf_with_bun_section();
+        assert!(has_bun_section(&f));
+        assert!(!has_self_extract_trailer(&f));
+        assert!(has_embedded_payload(&f));
+    }
+
+    #[test]
+    fn detects_pre_1_3_12_trailer() {
+        let mut f = vec![0u8; 64];
+        f.extend_from_slice(b"\n---- Bun! ----\n");
+        assert!(has_self_extract_trailer(&f));
+        assert!(has_embedded_payload(&f));
+    }
+
+    #[test]
+    fn plain_elf_is_not_embedded_payload() {
+        let mut f = vec![0u8; 64];
+        f[0..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2;
+        f[5] = 1;
+        assert!(!has_bun_section(&f));
+        assert!(!has_self_extract_trailer(&f));
+        assert!(!has_embedded_payload(&f));
+    }
 }
