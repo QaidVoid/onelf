@@ -1,4 +1,14 @@
 
+## [0.3.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.2.8...onelf-format-v0.3.0) - 2026-07-26
+
+### 🐛 Bug Fixes
+
+- Verify payload hashes and validate extraction paths ([#21](https://github.com/QaidVoid/onelf/pull/21)) - ([d4a2930](https://github.com/QaidVoid/onelf/commit/d4a2930684699aaedce5d98d49fe14d3ed8d825a))
+
+### 🚜 Refactor
+
+- Doc hygiene, internal dedup, remove onelf-preload ([#26](https://github.com/QaidVoid/onelf/pull/26)) - ([7b64f8e](https://github.com/QaidVoid/onelf/commit/7b64f8eb2c81ac5afeb2c207c60f9cd9dcd93d0f))
+
 
 
 ## [0.2.6](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.2.5...onelf-format-v0.2.6) - 2026-05-19
