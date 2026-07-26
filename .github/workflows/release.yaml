@@ -32,6 +32,11 @@ jobs:
               RUNNER: ubuntu-24.04-arm,
               TARGET: aarch64-unknown-linux-musl,
             }
+          - {
+              NAME: i686-linux,
+              RUNNER: ubuntu-latest,
+              TARGET: i686-unknown-linux-musl,
+            }
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,6 +50,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools b3sum
+          # i686 has no apt musl gcc; the glibc cross gcc drives the static
+          # musl link and compiles the freestanding payloads.
+          if [ "${{ matrix.build.TARGET }}" = "i686-unknown-linux-musl" ]; then
+            sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -54,7 +64,20 @@ jobs:
           # bootstrap payload for this runner's architecture.
           components: rust-src, llvm-tools
 
+      # The payloads build for the `-gnu` triple, which is the host on the
+      # x86_64/aarch64 runners but not for the i686 target, so add it there.
+      - name: Add i686 payload target
+        if: matrix.build.TARGET == 'i686-unknown-linux-musl'
+        run: rustup target add i686-unknown-linux-gnu
+
       - name: Build
+        # These are only consulted when building for i686-unknown-linux-musl
+        # (runtime linker + CC) and i686 payloads, so they are inert on the
+        # other targets.
+        env:
+          CC_i686_unknown_linux_musl: i686-linux-gnu-gcc
+          CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER: i686-linux-gnu-gcc
+          ONELF_PAYLOAD_CC_I686: i686-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.build.TARGET }}
 
       - name: Prepare release assets
