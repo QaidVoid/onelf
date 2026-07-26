@@ -1,4 +1,27 @@
 
+## [0.3.0](https://github.com/QaidVoid/onelf/compare/0.2.8...0.3.0) - 2026-07-26
+
+### ⛰️  Features
+
+- *(i686)* Add 32-bit x86 target and native runtime support ([#29](https://github.com/QaidVoid/onelf/pull/29)) - ([4eed307](https://github.com/QaidVoid/onelf/commit/4eed307d40a0f7465c7b815103f36f11462f7305))
+- *(pack)* Accept .onelf/icons and .onelf/desktop assets - ([23b3842](https://github.com/QaidVoid/onelf/commit/23b3842b33de7347ebcfa384a7782cfd13b94d2a))
+- Port bootstrap and env payloads to no_std Rust ([#28](https://github.com/QaidVoid/onelf/pull/28)) - ([acb6035](https://github.com/QaidVoid/onelf/commit/acb6035966db68a11df7b95d6fe382a303874ec2))
+- Harden runtime dirs, cache, and self-update ([#23](https://github.com/QaidVoid/onelf/pull/23)) - ([d3a53b9](https://github.com/QaidVoid/onelf/commit/d3a53b981b28120afbdfaa6dbc19b79339499105))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Don't strip Bun embedded-payload binaries - ([f0ac369](https://github.com/QaidVoid/onelf/commit/f0ac369e98c5d9c68dfb875226e2ed447d8330f1))
+- *(bundle)* Skip ELF rewrites for Bun .bun-section binaries - ([07c0434](https://github.com/QaidVoid/onelf/commit/07c04343a84a6b03339c34ddf4ba8928533ab304))
+- Bundler correctness for dry-run, runpaths, arch, aarch64 ([#25](https://github.com/QaidVoid/onelf/pull/25)) - ([53c6f10](https://github.com/QaidVoid/onelf/commit/53c6f1098f7310d19e54f315aec5339f4ad7ff12))
+- Packer correctness for name, entrypoint, recipe, extract ([#24](https://github.com/QaidVoid/onelf/pull/24)) - ([18456d0](https://github.com/QaidVoid/onelf/commit/18456d0f2b9e416013d8d14472cd69d29f619bad))
+- Make packing and bundling output deterministic ([#22](https://github.com/QaidVoid/onelf/pull/22)) - ([2e46a8d](https://github.com/QaidVoid/onelf/commit/2e46a8d0cff03d3dbcc82e3aba77c73b8c5b78ff))
+- Verify payload hashes and validate extraction paths ([#21](https://github.com/QaidVoid/onelf/pull/21)) - ([d4a2930](https://github.com/QaidVoid/onelf/commit/d4a2930684699aaedce5d98d49fe14d3ed8d825a))
+
+### 🚜 Refactor
+
+- Dedup runtime resolvers and split bundle.rs modules ([#27](https://github.com/QaidVoid/onelf/pull/27)) - ([d7f81c1](https://github.com/QaidVoid/onelf/commit/d7f81c113db0d7a736dfe95138e551b8086edc13))
+- Doc hygiene, internal dedup, remove onelf-preload ([#26](https://github.com/QaidVoid/onelf/pull/26)) - ([7b64f8e](https://github.com/QaidVoid/onelf/commit/7b64f8eb2c81ac5afeb2c207c60f9cd9dcd93d0f))
+
 ## [0.2.8](https://github.com/QaidVoid/onelf/compare/0.2.7...0.2.8) - 2026-06-14
 
 ### ⛰️  Features

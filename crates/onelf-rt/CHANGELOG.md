@@ -1,4 +1,20 @@
 
+## [0.3.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.8...onelf-rt-v0.3.0) - 2026-07-26
+
+### ⛰️  Features
+
+- *(i686)* Add 32-bit x86 target and native runtime support ([#29](https://github.com/QaidVoid/onelf/pull/29)) - ([4eed307](https://github.com/QaidVoid/onelf/commit/4eed307d40a0f7465c7b815103f36f11462f7305))
+- Harden runtime dirs, cache, and self-update ([#23](https://github.com/QaidVoid/onelf/pull/23)) - ([d3a53b9](https://github.com/QaidVoid/onelf/commit/d3a53b981b28120afbdfaa6dbc19b79339499105))
+
+### 🐛 Bug Fixes
+
+- Verify payload hashes and validate extraction paths ([#21](https://github.com/QaidVoid/onelf/pull/21)) - ([d4a2930](https://github.com/QaidVoid/onelf/commit/d4a2930684699aaedce5d98d49fe14d3ed8d825a))
+
+### 🚜 Refactor
+
+- Dedup runtime resolvers and split bundle.rs modules ([#27](https://github.com/QaidVoid/onelf/pull/27)) - ([d7f81c1](https://github.com/QaidVoid/onelf/commit/d7f81c113db0d7a736dfe95138e551b8086edc13))
+- Doc hygiene, internal dedup, remove onelf-preload ([#26](https://github.com/QaidVoid/onelf/pull/26)) - ([7b64f8e](https://github.com/QaidVoid/onelf/commit/7b64f8eb2c81ac5afeb2c207c60f9cd9dcd93d0f))
+
 
 
 ## [0.2.6](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.5...onelf-rt-v0.2.6) - 2026-05-19
