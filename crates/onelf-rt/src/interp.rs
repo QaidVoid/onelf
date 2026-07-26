@@ -5,21 +5,41 @@
 //! back to a bundled interpreter from the package's lib directories.
 //!
 //! Two execution modes:
-//! 1. userland-execve: Maps interpreter directly, bypasses kernel loader (preferred)
+//! 1. userland-exec: Maps interpreter directly, bypasses kernel loader (preferred)
 //! 2. Command-based: Invokes interpreter via --argv0 (fallback for non-ELF entrypoints)
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Read the PT_INTERP (ELF interpreter path) from a binary file.
-/// Only reads the first 8KB — enough for ELF headers and the interp string.
+///
+/// The initial 8 KB read covers the ELF header and program-header table for
+/// the slot lookup; the interp string itself is then read at its own file
+/// offset, which may be far into the file (e.g. after `patchelf` relocates
+/// `.interp`), so it is not limited to the first 8 KB.
 pub fn read_elf_interp(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 8192];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
-    parse_elf_interp(&buf)
+    let mut head = vec![0u8; 8192];
+    let n = file.read(&mut head).ok()?;
+    head.truncate(n);
+    let (p_offset, p_filesz) = pt_interp_slot(&head)?;
+
+    // Fast path: the interp string is already within the header window.
+    if let Some(s) = head.get(p_offset..p_offset.checked_add(p_filesz)?) {
+        return interp_from_bytes(s);
+    }
+    // Otherwise read it at its file offset.
+    file.seek(SeekFrom::Start(p_offset as u64)).ok()?;
+    let mut buf = vec![0u8; p_filesz];
+    file.read_exact(&mut buf).ok()?;
+    interp_from_bytes(&buf)
+}
+
+/// Trim at the first NUL and decode as UTF-8.
+fn interp_from_bytes(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).ok().map(String::from)
 }
 
 /// Locate the PT_INTERP program header in `data` (which must contain the ELF
@@ -76,25 +96,24 @@ pub(crate) fn pt_interp_slot(data: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// In-buffer variant of [`read_elf_interp`], used by tests that build a
+/// synthetic ELF in memory.
+#[cfg(test)]
 fn parse_elf_interp(data: &[u8]) -> Option<String> {
     let (p_offset, p_filesz) = pt_interp_slot(data)?;
     let interp = data.get(p_offset..p_offset.checked_add(p_filesz)?)?;
-    let interp = match interp.iter().position(|&b| b == 0) {
-        Some(pos) => &interp[..pos],
-        None => interp,
-    };
-    std::str::from_utf8(interp).ok().map(String::from)
+    interp_from_bytes(interp)
 }
 
-/// Check if we should use userland-execve for this target.
+/// Check if we should use userland-exec for this target.
 ///
 /// Returns the bundled interpreter path if:
 /// - Target is a PIE ELF binary (ET_DYN)
 /// - Bundled interpreter exists
-/// - userland-execve is supported on this platform
+/// - userland-exec is supported on this platform
 ///
 /// Non-PIE ELFs (ET_EXEC) go through the command-based fallback instead
-/// because userland-execve can't relocate them.
+/// because userland-exec can't relocate them.
 pub fn should_use_userland_exec(
     target: &Path,
     pkg_root: &Path,
@@ -120,7 +139,7 @@ pub fn should_use_userland_exec(
     }
 
     // Self-extracting binaries (e.g. pre-1.3.12 Bun) need /proc/self/exe
-    // to resolve to the binary itself. userland-execve doesn't update
+    // to resolve to the binary itself. userland-exec doesn't update
     // /proc/self/exe, so we route these through the kernel-exec path
     // (see build_exec_command's self-extract handling).
     if crate::selfextract::has_self_extract_trailer(target) {
@@ -148,7 +167,7 @@ fn is_pie(path: &Path) -> bool {
     e_type == 3
 }
 
-/// Execute an ELF binary using userland-execve with bundled interpreter.
+/// Execute an ELF binary using userland-exec with bundled interpreter.
 ///
 /// `lib_path` is passed to the linker via `--library-path` instead of via
 /// the inherited `LD_LIBRARY_PATH` env var, so bundled libs aren't visible

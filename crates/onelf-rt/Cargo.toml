@@ -15,7 +15,7 @@ onelf-format = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 rustix = { workspace = true }
-userland-execve = { workspace = true }
+goblin = { workspace = true }
 zstd = { workspace = true }
 zsync-rs = { version = "0.1", optional = true }
 # Update-only: verify-only Ed25519 for signed self-update, and ureq to

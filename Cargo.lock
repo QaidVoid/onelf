@@ -407,17 +407,6 @@ dependencies = [
 
 [[package]]
 name = "goblin"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b363a30c165f666402fe6a3024d3bec7ebc898f96a4a23bd1c99f8dbf3f4f47"
-dependencies = [
- "log",
- "plain",
- "scroll",
-]
-
-[[package]]
-name = "goblin"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daa0a64d21a7eb230583b4c5f4e23b7e4e57974f96620f42a7e75e08ae66d745"
@@ -573,17 +562,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nix"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,7 +579,7 @@ version = "0.2.8"
 dependencies = [
  "blake3",
  "clap",
- "goblin 0.9.3",
+ "goblin",
  "indicatif",
  "jwalk",
  "onelf-format",
@@ -622,10 +600,10 @@ version = "0.2.8"
 dependencies = [
  "blake3",
  "ed25519-compact",
+ "goblin",
  "onelf-format",
  "rustix",
  "ureq",
- "userland-execve",
  "xxhash-rust",
  "zstd",
  "zsync-rs",
@@ -996,14 +974,6 @@ dependencies = [
  "http",
  "httparse",
  "log",
-]
-
-[[package]]
-name = "userland-execve"
-version = "0.2.0"
-dependencies = [
- "goblin 0.8.2",
- "nix",
 ]
 
 [[package]]

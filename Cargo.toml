@@ -8,13 +8,8 @@ members = [
 default-members = ["crates/onelf"]
 # Freestanding no_std/no_main payloads, built per-target by onelf's build.rs.
 exclude = [
-  "crates/onelf-payloads",
-  "third_party/userland-execve"
+  "crates/onelf-payloads"
 ]
-
-[patch.crates-io]
-# Fork of userland-execve 0.2.0 that adds i686 (32-bit x86) support to run.rs.
-userland-execve = { path = "third_party/userland-execve" }
 
 [workspace.package]
 version = "0.2.8"
@@ -40,6 +35,5 @@ rayon = "1.11"
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-userland-execve = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = { version = "0.13", default-features = false }
