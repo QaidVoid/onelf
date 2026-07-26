@@ -18,11 +18,12 @@
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
-use rustix::mm::{MapFlags, ProtFlags, mmap, mmap_anonymous};
+use rustix::mm::{MapFlags, MprotectFlags, ProtFlags, mmap, mmap_anonymous, mprotect};
 
 // Auxiliary-vector tags we read or override for the loaded image.
 const AT_NULL: usize = 0;
@@ -68,6 +69,7 @@ unsafe fn enter(sp: usize, entry: usize) -> ! {
             "br {entry}",
             sp = in(reg) sp,
             entry = in(reg) entry,
+            in("x0") 0usize,
             options(noreturn),
         )
     }
@@ -189,6 +191,17 @@ fn load(path: &Path, page: usize) -> Loaded {
         let file_end = addr + align + filesz;
         unsafe {
             std::ptr::write_bytes(file_end as *mut u8, 0, round_up(file_end) - file_end);
+        }
+        // Drop the temporary WRITE bit from non-writable segments (mapped +WRITE
+        // only so the tail could be zeroed) so the loader's text stays W^X.
+        if !prot.contains(ProtFlags::WRITE) {
+            let _ = unsafe {
+                mprotect(
+                    addr as *mut _,
+                    round_up(align + filesz),
+                    MprotectFlags::from_bits_truncate(prot.bits()),
+                )
+            };
         }
     }
 
@@ -346,8 +359,15 @@ pub fn exec_with_interp(
         argv.push(CString::new(arg.as_str()).unwrap());
     }
 
-    let env: Vec<CString> = std::env::vars()
-        .map(|(k, v)| CString::new(format!("{k}={v}")).unwrap())
+    // Forward the environment verbatim, including non-UTF-8 names/values, which
+    // `std::env::vars()` would panic on.
+    let env: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut pair = k.into_vec();
+            pair.push(b'=');
+            pair.extend_from_slice(&v.into_vec());
+            CString::new(pair).ok()
+        })
         .collect();
 
     let auxv = read_auxv();

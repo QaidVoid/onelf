@@ -19,14 +19,28 @@ use std::process::Command;
 /// offset, which may be far into the file (e.g. after `patchelf` relocates
 /// `.interp`), so it is not limited to the first 8 KB.
 pub fn read_elf_interp(path: &Path) -> Option<String> {
+    // An interpreter path is a short string (bounded by PATH_MAX); reject
+    // implausibly large or out-of-file entries before allocating the fallback
+    // buffer, so a corrupt ELF can't drive a huge allocation.
+    const MAX_INTERP: usize = 4096;
+
     let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
     let mut head = vec![0u8; 8192];
     let n = file.read(&mut head).ok()?;
     head.truncate(n);
     let (p_offset, p_filesz) = pt_interp_slot(&head)?;
 
+    if p_filesz == 0 || p_filesz > MAX_INTERP {
+        return None;
+    }
+    let end = p_offset.checked_add(p_filesz)?;
+    if end as u64 > file_len {
+        return None;
+    }
+
     // Fast path: the interp string is already within the header window.
-    if let Some(s) = head.get(p_offset..p_offset.checked_add(p_filesz)?) {
+    if let Some(s) = head.get(p_offset..end) {
         return interp_from_bytes(s);
     }
     // Otherwise read it at its file offset.

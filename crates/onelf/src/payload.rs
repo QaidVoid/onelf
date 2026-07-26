@@ -103,6 +103,7 @@ pub fn patch_aarch64_adr(blob: &mut [u8], target_offset: usize) {
 mod tests {
     use super::*;
 
+    const EM_386: u16 = 3;
     const EM_X86_64: u16 = 62;
     const EM_AARCH64: u16 = 183;
 
@@ -110,7 +111,7 @@ mod tests {
     fn built_env_blobs_are_valid_elf_for_their_machine() {
         // Single-arch builds only embed the native arch (the other is an empty
         // placeholder -> None); validate whichever arches were built.
-        for em in [EM_X86_64, EM_AARCH64] {
+        for em in [EM_386, EM_X86_64, EM_AARCH64] {
             if let Some(blob) = onelf_env_blob(em) {
                 assert_eq!(&blob[0..4], b"\x7fELF");
                 assert_eq!(u16::from_le_bytes([blob[18], blob[19]]), em);
@@ -166,7 +167,6 @@ mod tests {
 
     #[test]
     fn i686_bootstrap_add_at_expected_offset() {
-        const EM_386: u16 = 3;
         let Some(b) = bootstrap_blob(EM_386) else {
             return;
         };

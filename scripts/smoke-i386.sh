@@ -56,8 +56,8 @@ LD_LIBRARY_PATH="$SYSLIB" "$ONELF" bundle-libs "$WORK/appdir" --from-binary "$WO
 "$ONELF" pack --command bin/app --output "$WORK/app.onelf" "$WORK/appdir" >/dev/null
 
 # The package's outer executable must itself be a 32-bit i386 ELF.
-readelf -hW "$WORK/app.onelf" 2>/dev/null | grep -q "Intel 80386" \
-    || fail "packed executable is not a 32-bit i386 ELF"
+hdr="$(readelf -hW "$WORK/app.onelf" 2>/dev/null || true)"
+[[ "$hdr" == *"Intel 80386"* ]] || fail "packed executable is not a 32-bit i386 ELF"
 
 echo ">> running the native i686 package in $IMAGE"
 dev=()
@@ -66,6 +66,8 @@ out="$(podman run --rm --platform linux/386 "${dev[@]}" \
     -v "$WORK":/work:ro -w /work -e HOME=/tmp "$IMAGE" /work/app.onelf 2>&1 || true)"
 echo "$out" | sed 's/^/   /'
 
-echo "$out" | grep -q "ONELF_I386_SMOKE_OK" \
-    && { echo "PASS: native i686 package ran on $IMAGE"; exit 0; }
+if [[ "$out" == *ONELF_I386_SMOKE_OK* ]]; then
+    echo "PASS: native i686 package ran on $IMAGE"
+    exit 0
+fi
 fail "expected ONELF_I386_SMOKE_OK in output"
