@@ -396,7 +396,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Detect bundled ELF interpreter for cross-libc portability.
     // When a matching interpreter is bundled (e.g. via bundle-libs), record its
-    // relative path in .onelf/interp so the runtime can use userland-execve with
+    // relative path in .onelf/interp so the runtime can use userland-exec with
     // the bundled interpreter instead of the system one.
     {
         let original_interp = files.iter().find_map(|f| elf_interp(&f.content));

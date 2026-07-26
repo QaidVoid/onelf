@@ -90,6 +90,38 @@ mod sys {
     }
 }
 
+#[cfg(target_arch = "x86")]
+mod sys {
+    use core::arch::asm;
+
+    // On x86-32 both `ebx` (PIC base) and `esi` are reserved by LLVM and can't
+    // be named. Keeping to ebx/ecx/edx covers 3-arg syscalls; the first arg is
+    // swapped through ebx around `int 0x80` (which preserves ecx/edx).
+    unsafe fn sys3(nr: i32, a: i32, b: i32, c: i32) -> i32 {
+        let ret;
+        asm!(
+            "xchg {a}, ebx",
+            "int 0x80",
+            "xchg {a}, ebx",
+            a = inout(reg) a => _,
+            inlateout("eax") nr => ret,
+            in("ecx") b, in("edx") c,
+        );
+        ret
+    }
+    pub unsafe fn openat_rdonly(path: *const u8) -> i64 {
+        // open (not openat): env.rs only opens absolute paths, so AT_FDCWD is
+        // unneeded, and open takes 3 args (no esi).
+        sys3(5, path as i32, 0, 0) as i64 // open(path, O_RDONLY, 0)
+    }
+    pub unsafe fn read(fd: i32, buf: *mut u8, n: u64) -> i64 {
+        sys3(3, fd, buf as i32, n as i32) as i64
+    }
+    pub unsafe fn close(fd: i32) -> i64 {
+        sys3(6, fd, 0, 0) as i64
+    }
+}
+
 // ---- static scratch buffers (constructor runs single-threaded) ------------
 
 const MAPS_CAP: usize = 65536;
@@ -326,7 +358,11 @@ unsafe fn find_root() -> bool {
             }
             break;
         }
-        line = if *maps.add(eol) == b'\n' { eol + 1 } else { eol };
+        line = if *maps.add(eol) == b'\n' {
+            eol + 1
+        } else {
+            eol
+        };
     }
     if !found || so_len == 0 {
         return false;

@@ -35,6 +35,5 @@ rayon = "1.11"
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-userland-execve = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = { version = "0.13", default-features = false }
