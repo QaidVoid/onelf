@@ -307,8 +307,23 @@ pub fn build_exec_command(
         }
     }
 
+    // Nothing above claimed this binary, so no linker invocation of ours
+    // carries --library-path for it. A bootstrap-injected binary reaches the
+    // bundled libraries through the RPATH the packer wrote, so only the host
+    // paths are named here: those are what the bundled linker cannot find on
+    // its own, and unlike our own libc they do no harm to anything the app
+    // goes on to run.
     let mut cmd = Command::new(target);
     cmd.arg0(argv0).args(args);
+
+    let host_only: Vec<&str> = lib_path
+        .split(':')
+        .filter(|dir| !dir.is_empty() && !Path::new(dir).starts_with(pkg_root))
+        .collect();
+    if !host_only.is_empty() {
+        cmd.env("LD_LIBRARY_PATH", host_only.join(":"));
+    }
+
     cmd
 }
 

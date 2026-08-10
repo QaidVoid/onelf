@@ -85,16 +85,12 @@ pub fn setup_env(
             }
             lib_path = parts.join(":");
 
-            // Set LD_LIBRARY_PATH as a fallback. Ideally we'd only pass
-            // bundled paths via --library-path on the linker invocation
-            // (which avoids polluting child processes), but onelf's
-            // AT_EXECFN bootstrap doesn't drive a linker invocation and
-            // doesn't pass --library-path itself, so binaries with
-            // bootstrap injected rely on LD_LIBRARY_PATH. The trade-off:
-            // it gets inherited by every child process the app spawns.
-            unsafe {
-                env::set_var("LD_LIBRARY_PATH", &lib_path);
-            }
+            // LD_LIBRARY_PATH is deliberately not set here. The paths go to
+            // the linker as --library-path, on the one invocation that needs
+            // them, so nothing the app spawns inherits them. Only the
+            // bootstrap path, which drives no linker invocation of its own,
+            // still sets the variable, and it does so on that command alone
+            // (see interp::build_exec_command).
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
             // contains a dri/ subdirectory (both use the same paths)
