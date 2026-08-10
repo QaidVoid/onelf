@@ -1,4 +1,10 @@
 
+## [0.3.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.0...onelf-rt-v0.3.1) - 2026-08-10
+
+### 🐛 Bug Fixes
+
+- *(rt)* Keep the bundled libraries out of the app's children ([#31](https://github.com/QaidVoid/onelf/pull/31)) - ([1e5385e](https://github.com/QaidVoid/onelf/commit/1e5385e0ba3567a944ac144814b42f39f69106a6))
+
 ## [0.3.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.2.8...onelf-rt-v0.3.0) - 2026-07-26
 
 ### ⛰️  Features
