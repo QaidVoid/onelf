@@ -59,6 +59,10 @@ pub struct PackOptions {
     /// applied by the bundled onelf-env constructor. `${ONELF_DIR}`
     /// expands to the package root at runtime.
     pub preload: Vec<String>,
+    /// Whether the app runs setuid binaries, written as `.onelf/needs-setuid`
+    /// and read by the runtime before it picks how to unpack itself. Keeps the
+    /// app out of a user namespace, where a setuid bit does nothing.
+    pub needs_setuid: bool,
 }
 
 struct CollectedFile {
@@ -466,6 +470,19 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             &mut files,
             ".onelf/preload",
             opts.preload.join("\n").into_bytes(),
+            inject_mtime,
+        );
+    }
+
+    // The file being there is the whole message, so it carries nothing. The
+    // runtime looks for it before choosing how to unpack, which is earlier
+    // than anything can be read out of the package proper.
+    if opts.needs_setuid {
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/needs-setuid",
+            Vec::new(),
             inject_mtime,
         );
     }
@@ -1091,6 +1108,7 @@ mod tests {
             mtime: Some(0),
             env: Vec::new(),
             preload: Vec::new(),
+            needs_setuid: false,
         }
     }
 

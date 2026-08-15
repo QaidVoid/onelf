@@ -175,6 +175,12 @@ fn main() {
     // Read custom environment variables from recipe [env] section
     let env_data = read_package_file(&mut pkg, ".onelf/env");
 
+    // The app runs setuid binaries, so it has to stay in the namespace it
+    // was started in. That rules out the two modes that make one of their
+    // own, leaving fusermount3 and, failing that, extraction. The file's
+    // presence is the whole message; it holds nothing.
+    let needs_setuid = read_package_file(&mut pkg, ".onelf/needs-setuid").is_some();
+
     // FUSE mode: mount package as filesystem (default for non-memfd)
     if force != Some("cache") && force != Some("tmpfs") {
         fuse::execute_fuse(
@@ -185,6 +191,7 @@ fn main() {
             &final_args,
             interp_data.as_deref(),
             env_data.as_deref(),
+            needs_setuid,
         );
         // Only reaches here if FUSE fell back
         if force == Some("fuse") {
@@ -196,7 +203,7 @@ fn main() {
     // Ephemeral tmpfs mode: private namespace + tmpfs + extract. Invisible
     // to the host, no persistent on-disk artifacts. Preferred over cache
     // mode whenever user namespaces are available.
-    if force != Some("cache") {
+    if force != Some("cache") && !needs_setuid {
         ephemeral::execute_tmpfs(
             &mut pkg,
             ep_idx,

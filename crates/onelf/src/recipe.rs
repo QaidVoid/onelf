@@ -77,6 +77,15 @@ pub struct Package {
     pub description: Option<String>,
     pub license: Option<String>,
     pub homepage: Option<String>,
+    /// Whether the app runs setuid binaries, such as an app that installs
+    /// packages through `sudo` or `pkexec`.
+    ///
+    /// A setuid bit means nothing inside a user namespace the caller made
+    /// itself: the owning uid is unmapped, so the file reads as `nobody` and
+    /// the binary refuses. Saying so here keeps the app out of a namespace,
+    /// at the cost of the modes that need one.
+    #[serde(default)]
+    pub needs_setuid: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]

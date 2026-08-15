@@ -104,6 +104,11 @@ enum Commands {
         #[arg(long)]
         preload: Vec<String>,
 
+        /// The app runs setuid binaries such as sudo or pkexec, so keep it
+        /// out of a user namespace, where a setuid bit does nothing.
+        #[arg(long)]
+        needs_setuid: bool,
+
         /// Pin every entry's mtime to this Unix timestamp for fully
         /// reproducible output, independent of filesystem timestamps.
         #[arg(long)]
@@ -403,6 +408,7 @@ fn main() {
             update_key,
             exclude,
             preload,
+            needs_setuid,
             mtime,
         } => {
             let memfd_opt = if no_memfd {
@@ -447,6 +453,7 @@ fn main() {
                         mtime,
                         env: Vec::new(),
                         preload,
+                        needs_setuid,
                     },
                     // Pick the runtime: slim (~700KB) by default; the
                     // update-capable runtime (~2MB) only when the user actually
@@ -688,6 +695,7 @@ fn run_build(
             mtime: recipe.package.mtime,
             env: recipe.env.into_iter().collect(),
             preload: recipe.preload,
+            needs_setuid: recipe.package.needs_setuid,
         },
         runtime,
     )

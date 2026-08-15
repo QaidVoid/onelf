@@ -220,6 +220,7 @@ pub fn execute_fuse(
     args: &[String],
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
+    needs_setuid: bool,
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
@@ -263,14 +264,22 @@ pub fn execute_fuse(
     // build their own nested user namespace, and setuid bits do not
     // survive a CLONE_NEWUSER unshare. Staying in the host userns
     // keeps those helpers working.
-    let skip_namespace = std::env::var_os("ONELF_FUSE_NO_NAMESPACE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    //
+    // A package built with `needs-setuid` asks for the same thing for its own
+    // reason: it runs sudo or pkexec, and a setuid bit does nothing inside a
+    // namespace we made ourselves.
+    let skip_namespace = needs_setuid
+        || std::env::var_os("ONELF_FUSE_NO_NAMESPACE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
 
     let ns_result = if skip_namespace {
-        Err(std::io::Error::other(
-            "ONELF_FUSE_NO_NAMESPACE set; using fusermount3",
-        ))
+        let why = if needs_setuid {
+            "package needs setuid; using fusermount3"
+        } else {
+            "ONELF_FUSE_NO_NAMESPACE set; using fusermount3"
+        };
+        Err(std::io::Error::other(why))
     } else {
         mount::fuse_mount_unshare(&mountpoint)
     };
@@ -279,8 +288,13 @@ pub fn execute_fuse(
         Ok(fd) => (fd, true),
         Err(ns_err) => {
             if !mount::fusermount3_available() {
-                eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
-                eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
+                // Expected where the package asked to stay in the host's
+                // namespace: without fusermount3 there is no way to mount
+                // outside one, so extraction takes over. Not a failure.
+                if !needs_setuid {
+                    eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
+                    eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
+                }
                 let _ = std::fs::remove_dir(&mountpoint);
                 return false;
             }
