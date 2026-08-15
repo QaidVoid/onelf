@@ -1,4 +1,10 @@
 
+## [0.3.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.1...onelf-rt-v0.3.2) - 2026-08-15
+
+### ⛰️  Features
+
+- *(pack)* Let a package say it runs setuid binaries - ([37e7c92](https://github.com/QaidVoid/onelf/commit/37e7c92a3e5a249364399ecbef789a5c3c7ecf13))
+
 ## [0.3.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.0...onelf-rt-v0.3.1) - 2026-08-10
 
 ### 🐛 Bug Fixes
