@@ -212,12 +212,14 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
             .iter()
             .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
 
-    // Find .dynstr section file offset
-    let dynstr_offset = elf
+    // Find the .dynstr section's file range. The end matters: the slot scan
+    // below counts trailing NULs, and without a bound it runs off the end of
+    // the string table into whatever section follows.
+    let dynstr_range = elf
         .section_headers
         .iter()
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| sh.sh_offset as usize);
+        .map(|sh| (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
 
     let dynamic_present = elf.dynamic.is_some();
     // Track per-slot outcome: the in-place rewrite is trustworthy only when
@@ -227,22 +229,23 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
     let mut slots_total = 0usize;
     let mut slots_rewritten = 0usize;
 
-    if let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) {
+    if let (Some((dynstr_offset, dynstr_end)), Some(dynamic)) = (dynstr_range, &elf.dynamic) {
         let mut modified = data.clone();
+        let limit = dynstr_end.min(modified.len());
         for dyn_entry in &dynamic.dyns {
             if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
                 || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
             {
                 slots_total += 1;
                 let file_pos = dynstr_offset + dyn_entry.d_val as usize;
-                if file_pos >= modified.len() {
+                if file_pos >= limit {
                     continue;
                 }
                 let mut end = file_pos;
-                while end < modified.len() && modified[end] != 0 {
+                while end < limit && modified[end] != 0 {
                     end += 1;
                 }
-                while end < modified.len() && modified[end] == 0 {
+                while end < limit && modified[end] == 0 {
                     end += 1;
                 }
                 let slot_size = end - file_pos;
@@ -1155,5 +1158,133 @@ mod embedded_payload_tests {
         assert!(!has_bun_section(&f));
         assert!(!has_self_extract_trailer(&f));
         assert!(!has_embedded_payload(&f));
+    }
+}
+
+#[cfg(test)]
+mod runpath_tests {
+    use super::*;
+
+    /// Byte the guard region after `.dynstr` is filled with. A real binary
+    /// keeps a section there (`.gnu.version`, in the case that surfaced
+    /// this), so anything the rewrite writes past the string table lands
+    /// on data the loader still reads.
+    const GUARD: u8 = 0xAA;
+    const GUARD_LEN: usize = 32;
+
+    /// Minimal 64-bit ELF with a PT_DYNAMIC segment carrying one DT_RUNPATH
+    /// slot. `runpath` is the only string in `.dynstr`, so its NUL is the
+    /// section's last byte and the guard region begins immediately after.
+    /// Returns the file bytes and the guard's offset.
+    fn elf_with_runpath(runpath: &[u8]) -> (Vec<u8>, usize) {
+        const SHSTRTAB: &[u8] = b"\0.dynstr\0.shstrtab\0";
+        let mut dynstr = vec![0u8];
+        dynstr.extend_from_slice(runpath);
+        dynstr.push(0);
+
+        let mut f = vec![0u8; 64];
+        f[0..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2; // ELFCLASS64
+        f[5] = 1; // ELFDATA2LSB
+        f[6] = 1; // EV_CURRENT
+        f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        f[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        f[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        f[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        f[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        f[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+
+        let ph_off = f.len();
+        f.extend_from_slice(&[0u8; 56]);
+
+        let dynstr_off = f.len() as u64;
+        f.extend_from_slice(&dynstr);
+        let guard_off = f.len();
+        f.extend_from_slice(&[GUARD; GUARD_LEN]);
+
+        while f.len() % 8 != 0 {
+            f.push(0);
+        }
+        let dyn_off = f.len() as u64;
+        for (tag, val) in [(goblin::elf::dynamic::DT_RUNPATH, 1u64), (0, 0)] {
+            f.extend_from_slice(&tag.to_le_bytes());
+            f.extend_from_slice(&val.to_le_bytes());
+        }
+        let dyn_size = f.len() as u64 - dyn_off;
+        f[ph_off..ph_off + 4].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        f[ph_off + 8..ph_off + 16].copy_from_slice(&dyn_off.to_le_bytes());
+        f[ph_off + 16..ph_off + 24].copy_from_slice(&dyn_off.to_le_bytes());
+        f[ph_off + 32..ph_off + 40].copy_from_slice(&dyn_size.to_le_bytes());
+        f[ph_off + 40..ph_off + 48].copy_from_slice(&dyn_size.to_le_bytes());
+
+        let shstr_off = f.len() as u64;
+        f.extend_from_slice(SHSTRTAB);
+        while f.len() % 8 != 0 {
+            f.push(0);
+        }
+        let sh_off = f.len() as u64;
+        f[40..48].copy_from_slice(&sh_off.to_le_bytes());
+
+        let mut sh = |name: u32, typ: u32, off: u64, size: u64| {
+            let mut e = vec![0u8; 64];
+            e[0..4].copy_from_slice(&name.to_le_bytes());
+            e[4..8].copy_from_slice(&typ.to_le_bytes());
+            e[24..32].copy_from_slice(&off.to_le_bytes());
+            e[32..40].copy_from_slice(&size.to_le_bytes());
+            f.extend_from_slice(&e);
+        };
+        sh(0, 0, 0, 0); // SHT_NULL
+        sh(1, 3, dynstr_off, dynstr.len() as u64); // .dynstr -> SHT_STRTAB
+        sh(9, 3, shstr_off, SHSTRTAB.len() as u64); // .shstrtab -> SHT_STRTAB
+
+        (f, guard_off)
+    }
+
+    /// Write `bytes` to a fresh file, run `set_origin_runpath` on it, and
+    /// return what the function left on disk.
+    fn rewrite(tag: &str, bytes: &[u8]) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!("onelf-runpath-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.so");
+        fs::write(&path, bytes).unwrap();
+        set_origin_runpath(&path).unwrap();
+        let out = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn short_slot_leaves_the_next_section_alone() {
+        let (bytes, guard_off) = elf_with_runpath(b"/usr/lib/tinysparql-3.0");
+        let out = rewrite("short", &bytes);
+        assert_eq!(out.len(), bytes.len());
+        assert!(
+            out[guard_off..guard_off + GUARD_LEN]
+                .iter()
+                .all(|&b| b == GUARD)
+        );
+        assert_eq!(&out[..guard_off], &bytes[..guard_off]);
+    }
+
+    #[test]
+    fn large_enough_slot_is_rewritten_in_place() {
+        let (bytes, guard_off) = elf_with_runpath(&vec![b'x'; 80]);
+        let out = rewrite("large", &bytes);
+        assert_eq!(out.len(), bytes.len());
+        assert!(
+            out[guard_off..guard_off + GUARD_LEN]
+                .iter()
+                .all(|&b| b == GUARD)
+        );
+        let written = &out[guard_off - 81..guard_off - 81 + 53];
+        assert_eq!(
+            written,
+            b"$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib"
+        );
     }
 }
