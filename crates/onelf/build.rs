@@ -2,6 +2,26 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Resolve `name` against `PATH`, or take it as given when it already names a
+/// path. Stands in for shelling out to `which`, which minimal build images
+/// (the pkgforge Arch container, most `-slim` bases) don't ship.
+fn which(name: &str) -> Option<PathBuf> {
+    let named = Path::new(name);
+    if named.components().count() > 1 {
+        return is_executable(named).then(|| named.to_path_buf());
+    }
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(p))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn musl_target() -> String {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| {
         if cfg!(target_arch = "aarch64") {
@@ -30,13 +50,8 @@ fn find_musl_gcc(target: &str) -> Option<String> {
     let arch = target.split('-').next().unwrap_or("x86_64");
     let names = [format!("{arch}-linux-musl-gcc"), "musl-gcc".to_string()];
     for name in &names {
-        if let Ok(output) = Command::new("which").arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Some(path);
-                }
-            }
+        if let Some(path) = which(name) {
+            return Some(path.to_string_lossy().into_owned());
         }
     }
 
@@ -556,16 +571,8 @@ fn payload_cc(arch: &str) -> Option<String> {
         _ => return None,
     };
     for name in names {
-        if Path::new(name).exists() {
-            return Some((*name).to_string());
-        }
-        if let Ok(out) = Command::new("which").arg(name).output() {
-            if out.status.success() {
-                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Some(p);
-                }
-            }
+        if let Some(p) = which(name) {
+            return Some(p.to_string_lossy().into_owned());
         }
     }
     None
@@ -590,13 +597,8 @@ fn find_rust_objcopy() -> PathBuf {
         }
     }
     for name in ["rust-objcopy", "llvm-objcopy"] {
-        if let Ok(out) = Command::new("which").arg(name).output() {
-            if out.status.success() {
-                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return PathBuf::from(p);
-                }
-            }
+        if let Some(p) = which(name) {
+            return p;
         }
     }
     panic!("llvm-objcopy not found; run `rustup component add llvm-tools` or set ONELF_OBJCOPY");
