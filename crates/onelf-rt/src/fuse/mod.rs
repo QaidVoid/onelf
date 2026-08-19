@@ -229,15 +229,17 @@ pub fn execute_fuse(
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
-    // Tidy up empty mountpoint dirs left behind by previous runs.
-    mount::sweep_stale_mountpoints();
+    crate::paths::sweep_stale_mountpoints();
 
-    let mountpoint =
+    // Held by the parent, which serves the filesystem and outlives the
+    // child, so no concurrent sweep can reclaim the directory.
+    let claim =
         match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
         {
             Some(m) => m,
             None => return false,
         };
+    let mountpoint = claim.path().to_path_buf();
 
     // If already mounted by another instance, reuse it and exec directly.
     // (Only reachable via the fusermount3 path; namespace mounts are private.)

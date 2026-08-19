@@ -13,6 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use onelf_format::{EntryKind, symlink_target_within_root};
 
 use crate::loader::{self, PackageData};
+// Opens the per-package lock without CLOEXEC, so the shared lock taken by
+// `ensure_extracted` survives the exec into the target and keeps a concurrent
+// process's GC from deleting a package that is still in use.
+use crate::paths::open_lock_inheritable;
+
+use onelf_format::cache_layout as layout;
 
 /// Monotonic counter making CAS temp-file names unique within a process;
 /// combined with the pid it is unique across concurrent extractions.
@@ -38,33 +44,15 @@ fn file_hashes_to(path: &Path, expected: &[u8; 32]) -> bool {
     hasher.finalize().as_bytes() == expected
 }
 
-/// Resolve the persistent cache root. Prefers `$XDG_CACHE_HOME`, then
-/// `~/.cache` (both already user-private). Only when neither is set does it
-/// fall back to the `0700` per-uid private dir; if even that is unavailable
-/// it returns `None` so the caller refuses rather than using shared `/tmp`.
+/// Resolve the persistent cache root, or `None` when no safe location can
+/// be established, in which case the caller refuses rather than extracting
+/// into an untrusted path. The rules live in `onelf_format::cache_layout` so
+/// the packer CLI applies exactly the same ones.
 fn cache_dir() -> Option<PathBuf> {
-    // Only absolute env-derived roots are trusted. An empty or relative
-    // XDG_CACHE_HOME/HOME would resolve against the current directory (an
-    // attacker-influenced location), so it is ignored and the private
-    // per-uid dir is used instead.
-    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
-        let p = PathBuf::from(v);
-        p.is_absolute().then_some(p)
-    };
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .and_then(abs)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(abs)
-                .map(|h| h.join(".cache"))
-        })
-        .or_else(crate::paths::private_dir)?;
-    // Atomically establish the onelf child as a 0700, non-symlink,
-    // uid-owned directory, rejecting a pre-planted symlink or another
-    // user's directory. Fail closed (None) rather than use an untrusted
-    // path; the caller then refuses instead of extracting into it.
-    let onelf = base.join("onelf");
-    crate::paths::ensure_safe_dir(&onelf).then_some(onelf)
+    onelf_format::cache_layout::resolve_root(
+        rustix::process::getuid().as_raw(),
+        crate::paths::private_dir(),
+    )
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -134,16 +122,6 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
     Ok(())
 }
 
-/// Open the per-package lock file leaving the descriptor inheritable (no
-/// `CLOEXEC`) so the shared lock taken by [`ensure_extracted`] survives the
-/// exec into the target and keeps a concurrent process's GC from deleting a
-/// package that is still in use.
-fn open_lock_inheritable(path: &Path) -> io::Result<fs::File> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(path, OFlags::CREATE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)?;
-    Ok(fs::File::from(fd))
-}
-
 /// Extract `pkg` into the cache and return its directory together with a
 /// shared lock guard. The guard must be kept alive through exec: while any
 /// process holds it, GC cannot acquire the exclusive lock and therefore
@@ -168,7 +146,7 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     // extracted in place, so an interrupted run could leave a partial
     // pkg_dir behind. Gating cache hits on the marker forces such trees to
     // be re-extracted instead of executed.
-    let ready_path = pkg_parent.join(format!(".{package_id}.ready"));
+    let ready_path = layout::ready_marker(&base, &package_id);
     let is_complete = || pkg_dir.exists() && ready_path.exists();
 
     // Take the shared "in-use" lock *before* checking for the package.
@@ -177,7 +155,7 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     // lock, GC cannot acquire the exclusive lock it needs to remove the
     // package. The fd is inheritable so the lock survives exec.
     fs::create_dir_all(&lock_dir)?;
-    let lock_path = lock_dir.join(&package_id);
+    let lock_path = layout::lock_path(&base, &package_id);
     let lock_file = open_lock_inheritable(&lock_path)?;
     rustix::fs::flock(&lock_file, FlockOperation::LockShared)
         .map_err(|e| io::Error::other(format!("flock: {e}")))?;
@@ -193,7 +171,7 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     // instance's whole lifetime: the shared in-use lock is held through
     // exec, so reusing it as the extraction lock would block later waiters
     // until the extractor exits.
-    let extract_path = lock_dir.join(format!("{package_id}.extract"));
+    let extract_path = layout::extract_lock_path(&base, &package_id);
     let extract_lock = fs::File::create(&extract_path)?;
     rustix::fs::flock(&extract_lock, FlockOperation::LockExclusive)
         .map_err(|e| io::Error::other(format!("flock: {e}")))?;
@@ -219,10 +197,15 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
 
+        let cas_lock = open_lock_inheritable(&layout::cas_lock_path(&base))?;
+        rustix::fs::flock(&cas_lock, FlockOperation::LockShared)
+            .map_err(|e| io::Error::other(format!("flock: {e}")))?;
+
         if let Err(e) = extract_to_cas(pkg, &cas_dir, &tmp_dir) {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
         }
+        drop(cas_lock);
         if let Err(e) = fs::rename(&tmp_dir, &pkg_dir) {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
@@ -362,12 +345,55 @@ fn touch_meta(meta_dir: &Path, package_id: &str) {
 pub fn remove_package(base: &Path, package_id: &str) {
     // Retire the completion marker before the tree so a concurrent reader
     // never sees the marker without its pkg_dir.
-    let _ = fs::remove_file(base.join("pkg").join(format!(".{package_id}.ready")));
-    let _ = fs::remove_dir_all(base.join("pkg").join(package_id));
-    let _ = fs::remove_file(base.join("meta").join(package_id));
-    // The lock file is intentionally kept: the flock protocol keys mutual
-    // exclusion on its inode, so unlinking it would let a concurrent run
-    // create a fresh inode and defeat the lock.
+    let _ = fs::remove_file(layout::ready_marker(base, package_id));
+    let _ = fs::remove_dir_all(layout::pkg_dir(base, package_id));
+    let _ = fs::remove_file(layout::meta_path(base, package_id));
+    let _ = fs::remove_file(layout::extract_lock_path(base, package_id));
+    // The in-use lock file is intentionally kept: the flock protocol keys
+    // mutual exclusion on its inode, so unlinking it would let a concurrent
+    // run create a fresh inode and defeat the lock.
+}
+
+/// Remove content blobs that no package directory hardlinks any more, and
+/// return the number of bytes reclaimed.
+///
+/// [`extract_to_cas`] populates a package by hardlinking each blob out of the
+/// store, so the filesystem's own link count *is* the reference count: a blob
+/// reachable only through the store itself has `nlink == 1`. That makes
+/// collection correct without a side index, and it stays correct because the
+/// store and the package directories are always on one filesystem (both are
+/// children of the single resolved cache root, and a cross-device hardlink
+/// would already have failed at extraction time).
+pub fn collect_cas(base: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(lock) = open_lock_inheritable(&layout::cas_lock_path(base)) else {
+        return 0;
+    };
+    if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        return 0;
+    }
+
+    let Ok(shards) = fs::read_dir(base.join("cas")) else {
+        return 0;
+    };
+    let mut reclaimed = 0u64;
+    for shard in shards.flatten() {
+        let Ok(blobs) = fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for blob in blobs.flatten() {
+            let Ok(md) = blob.metadata() else { continue };
+            if !md.is_file() || md.nlink() > 1 {
+                continue;
+            }
+            let len = md.len();
+            if fs::remove_file(blob.path()).is_ok() {
+                reclaimed += len;
+            }
+        }
+    }
+    reclaimed
 }
 
 pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
@@ -407,6 +433,10 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
             removed += 1;
         }
     }
+
+    if removed > 0 {
+        collect_cas(base);
+    }
 }
 
 /// Acquire the exclusive lock for `id` and, while holding it, remove the
@@ -415,7 +445,7 @@ pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
 /// is held across [`remove_package`] so a run cannot start mid-deletion.
 /// Returns true if the package was removed.
 fn try_remove_locked(base: &Path, id: &str) -> bool {
-    let lock_path = base.join("lock").join(id);
+    let lock_path = layout::lock_path(base, id);
     let f = match fs::File::open(&lock_path) {
         Ok(f) => f,
         // A missing lock file means the package was never run under this
@@ -459,6 +489,47 @@ mod tests {
         assert!(!file_hashes_to(&path, &good_hash));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The store is reference-counted by the filesystem: a blob hardlinked
+    /// into a package tree must survive, an unreferenced one is reclaimed,
+    /// and nothing is touched while an extraction holds the store lock.
+    #[test]
+    fn collect_cas_respects_links_and_the_store_lock() {
+        use rustix::fs::FlockOperation;
+
+        let base = std::env::temp_dir().join(format!("onelf-cas-gc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let shard = base.join("cas/ab");
+        let pkg = base.join("pkg/somepkg");
+        fs::create_dir_all(&shard).unwrap();
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(base.join("lock")).unwrap();
+
+        // Referenced by a package tree: must survive on link count alone.
+        let linked = shard.join("aaaa");
+        fs::write(&linked, b"still in use").unwrap();
+        fs::hard_link(&linked, pkg.join("f")).unwrap();
+
+        // Unreferenced: collectable.
+        let orphan = shard.join("bbbb");
+        fs::write(&orphan, b"nobody wants me").unwrap();
+
+        // While an extraction holds the store lock shared, link counts are
+        // not yet trustworthy, so collection must decline entirely.
+        let extracting = open_lock_inheritable(&layout::cas_lock_path(&base)).unwrap();
+        rustix::fs::flock(&extracting, FlockOperation::LockShared).unwrap();
+        assert_eq!(collect_cas(&base), 0, "must not collect mid-extraction");
+        assert!(orphan.exists(), "an orphan is spared while extraction runs");
+        drop(extracting);
+
+        // With the store quiescent, link counts decide.
+        let reclaimed = collect_cas(&base);
+        assert!(linked.exists(), "a hardlinked blob must survive");
+        assert!(!orphan.exists(), "an unreferenced blob is reclaimed");
+        assert_eq!(reclaimed, b"nobody wants me".len() as u64);
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

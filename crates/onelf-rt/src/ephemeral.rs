@@ -41,15 +41,17 @@ pub fn execute_tmpfs(
 ) -> bool {
     use std::os::unix::process::CommandExt;
 
-    // Tidy up empty mountpoint dirs left behind by previous runs.
-    mount::sweep_stale_mountpoints();
+    crate::paths::sweep_stale_mountpoints();
 
-    let mountpoint =
+    // Held through the exec below, so a concurrently starting instance
+    // cannot reclaim this directory while the app is using it.
+    let claim =
         match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
         {
             Some(m) => m,
             None => return false,
         };
+    let mountpoint = claim.path().to_path_buf();
 
     // Enter private user+mount namespace.
     if let Err(e) = mount::enter_namespace() {

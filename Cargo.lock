@@ -584,6 +584,7 @@ dependencies = [
  "jwalk",
  "onelf-format",
  "rayon",
+ "rustix",
  "serde",
  "toml",
  "xxhash-rust",
