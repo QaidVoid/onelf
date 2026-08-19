@@ -173,6 +173,129 @@ pub(crate) enum RunpathOutcome {
     /// Executable with a self-extract trailer: patchelf would clobber
     /// the trailer, so RUNPATH can't be added. Known limitation.
     SelfExtract,
+    /// No usable in-place slot; the caller must invoke patchelf once its
+    /// own edits to the image have been written back.
+    NeedsPatchelf,
+}
+
+/// RUNPATH string written into every bundled binary.
+///
+/// Covers binaries at depth 1 (`bin/foo`), 2 (`libexec/podman/x`), and 3
+/// (`share/pkg/helpers/y`). Entries that do not exist are ignored by the
+/// loader, so one list serves every depth.
+const ORIGIN_RUNPATH: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
+
+/// Rewrite RUNPATH within `data`, reporting what the caller still owes.
+///
+/// Returns [`RunpathOutcome::NeedsPatchelf`] when no in-place slot is big
+/// enough, since patchelf has to run against the file rather than the image.
+fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<RunpathOutcome> {
+    let new_bytes = ORIGIN_RUNPATH.as_bytes();
+    let is_self_extract = has_embedded_payload(data);
+
+    let elf = match goblin::elf::Elf::parse(data) {
+        Ok(e) => e,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+    };
+    let has_needed = !elf.libraries.is_empty();
+    let has_soname = elf.soname.is_some();
+    let is_executable = !has_soname
+        && elf
+            .program_headers
+            .iter()
+            .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
+    let dynstr_range = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
+        .map(|sh| (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
+    let dynamic_present = elf.dynamic.is_some();
+
+    let mut slots: Vec<usize> = Vec::new();
+    if let (Some((dynstr_offset, _)), Some(dynamic)) = (dynstr_range, &elf.dynamic) {
+        for d in &dynamic.dyns {
+            if d.d_tag == goblin::elf::dynamic::DT_RPATH
+                || d.d_tag == goblin::elf::dynamic::DT_RUNPATH
+            {
+                slots.push(dynstr_offset + d.d_val as usize);
+            }
+        }
+    }
+    let dynstr_end = dynstr_range.map(|(_, e)| e).unwrap_or(0);
+    drop(elf);
+
+    let mut rewritten = 0usize;
+    let total = slots.len();
+    let limit = dynstr_end.min(data.len());
+    for file_pos in slots {
+        if file_pos >= limit {
+            continue;
+        }
+        let mut end = file_pos;
+        while end < limit && data[end] != 0 {
+            end += 1;
+        }
+        while end < limit && data[end] == 0 {
+            end += 1;
+        }
+        let slot_size = end - file_pos;
+        if new_bytes.len() + 1 > slot_size {
+            continue;
+        }
+        data[file_pos..file_pos + new_bytes.len()].copy_from_slice(new_bytes);
+        for b in &mut data[file_pos + new_bytes.len()..file_pos + slot_size] {
+            *b = 0;
+        }
+        rewritten += 1;
+    }
+    if total > 0 && rewritten == total {
+        return Ok(RunpathOutcome::Set);
+    }
+
+    if !dynamic_present || !has_needed || !is_executable {
+        return Ok(RunpathOutcome::NotNeeded);
+    }
+    if is_self_extract {
+        return Ok(RunpathOutcome::SelfExtract);
+    }
+    let _ = path;
+    Ok(RunpathOutcome::NeedsPatchelf)
+}
+
+/// Run `patchelf --set-rpath` against `path`, reporting whether the RUNPATH
+/// ended up guaranteed.
+fn run_patchelf_rpath(path: &Path, patchelf: Option<&Path>) -> RunpathOutcome {
+    let Some(patchelf) = patchelf else {
+        return RunpathOutcome::Unguaranteed;
+    };
+    match std::process::Command::new(patchelf)
+        .arg("--force-rpath")
+        .arg("--set-rpath")
+        .arg(ORIGIN_RUNPATH)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => RunpathOutcome::Set,
+        Ok(o) => {
+            eprintln!(
+                "  {} patchelf failed for {}: {}",
+                color::bold_red("warning:"),
+                path.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            RunpathOutcome::Unguaranteed
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} could not run patchelf for {}: {e}",
+                color::bold_red("warning:"),
+                path.display(),
+            );
+            RunpathOutcome::Unguaranteed
+        }
+    }
 }
 
 pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
@@ -335,6 +458,10 @@ pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Ve
     let mut scrubbed = 0usize;
     let mut unguaranteed: Vec<PathBuf> = Vec::new();
     let mut self_extract: Vec<PathBuf> = Vec::new();
+    // Resolved once: the lookup walks PATH, and running it per binary per
+    // transformation is pure overhead on a tree with thousands of them.
+    let patchelf = which_patchelf();
+
     for path in find_elf_files(directory) {
         let perms = fs::metadata(&path)
             .map(|m| m.permissions().mode())
@@ -343,17 +470,22 @@ pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Ve
         if needs_chmod {
             let _ = fs::set_permissions(&path, PermissionsExt::from_mode(perms | 0o200));
         }
-        tally_origin_runpath(&path, &mut rewritten, &mut unguaranteed, &mut self_extract);
-        let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let _ = scrub_nix_store_paths(&path);
-        let _ = strip_absolute_needed(&path);
-        let after = fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if before.is_some() && before != after {
-            scrubbed += 1;
+
+        if let Ok((outcome, did_scrub)) = finalize_one(&path, patchelf.as_deref()) {
+            match outcome {
+                RunpathOutcome::Set => rewritten += 1,
+                RunpathOutcome::Unguaranteed => unguaranteed.push(path.clone()),
+                RunpathOutcome::SelfExtract => self_extract.push(path.clone()),
+                // finalize_one resolves this before returning.
+                RunpathOutcome::NotNeeded | RunpathOutcome::NeedsPatchelf => {}
+            }
+            if did_scrub {
+                scrubbed += 1;
+            }
         }
-        // Re-pin the mtime: the RUNPATH/scrub/strip writes above stamped
-        // "now", undoing the copy step's normalization. Without this a
-        // second bundle-libs run yields a metadata-different tree.
+
+        // Re-pin the mtime: the writes above stamped "now", undoing the copy
+        // step's normalization, and a second run would then differ.
         normalize_mtime(&path);
         if needs_chmod {
             let _ = fs::set_permissions(&path, PermissionsExt::from_mode(perms));
@@ -362,22 +494,30 @@ pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Ve
     (rewritten, scrubbed, unguaranteed, self_extract)
 }
 
-/// Apply `set_origin_runpath` and fold the outcome into the running
-/// tallies. `set` counts binaries that got a baked-in RUNPATH;
-/// `unguaranteed` / `self_extract` collect executables that did not, so
-/// the caller can warn that they aren't sandbox-re-exec-safe.
-pub(crate) fn tally_origin_runpath(
-    path: &Path,
-    set: &mut usize,
-    unguaranteed: &mut Vec<PathBuf>,
-    self_extract: &mut Vec<PathBuf>,
-) {
-    match set_origin_runpath(path) {
-        Ok(RunpathOutcome::Set) => *set += 1,
-        Ok(RunpathOutcome::Unguaranteed) => unguaranteed.push(path.to_path_buf()),
-        Ok(RunpathOutcome::SelfExtract) => self_extract.push(path.to_path_buf()),
-        Ok(RunpathOutcome::NotNeeded) | Err(_) => {}
+/// Apply every in-place rewrite to one binary with a single read and a
+/// single write.
+///
+/// The three transformations are all equal-length edits on the same image,
+/// so running them as separate read-modify-write cycles read and wrote each
+/// binary three times over. Returns the RUNPATH outcome and whether any
+/// scrubbing changed the image.
+fn finalize_one(path: &Path, patchelf: Option<&Path>) -> io::Result<(RunpathOutcome, bool)> {
+    let mut data = fs::read(path)?;
+
+    let outcome = rewrite_origin_runpath_in(&mut data, path)?;
+    let scrubbed = scrub_nix_store_paths_in(&mut data);
+    let stripped = strip_absolute_needed_in(&mut data);
+
+    if outcome == RunpathOutcome::Set || scrubbed || stripped {
+        fs::write(path, &data)?;
     }
+
+    // patchelf owns the file itself, so it can only run after ours is
+    // written back.
+    if outcome == RunpathOutcome::NeedsPatchelf {
+        return Ok((run_patchelf_rpath(path, patchelf), scrubbed));
+    }
+    Ok((outcome, scrubbed))
 }
 
 /// Warn that the listed executables could not get a baked-in `$ORIGIN`
@@ -496,26 +636,23 @@ pub(crate) fn which_patchelf() -> Option<PathBuf> {
 /// Operates in place: writes the new basename over the old string and
 /// NUL-pads the rest of the slot. The old slot is always longer than
 /// the new basename, so this never needs to grow the string table.
-pub(crate) fn strip_absolute_needed(path: &Path) -> io::Result<()> {
-    let data = fs::read(path)?;
-    let elf = goblin::elf::Elf::parse(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
+/// [`strip_absolute_needed`] against an in-memory image. Returns whether
+/// anything changed, so a caller batching several rewrites can decide once
+/// whether the file needs writing back.
+pub(crate) fn strip_absolute_needed_in(modified: &mut [u8]) -> bool {
+    let Ok(elf) = goblin::elf::Elf::parse(modified) else {
+        return false;
+    };
     let dynstr_offset = elf
         .section_headers
         .iter()
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
         .map(|sh| sh.sh_offset as usize);
-    let Some(dynstr_offset) = dynstr_offset else {
-        return Ok(());
-    };
-    let Some(dynamic) = &elf.dynamic else {
-        return Ok(());
+    let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) else {
+        return false;
     };
 
-    let mut modified = data;
-    let mut changed = false;
-
+    let mut edits: Vec<(usize, usize, usize)> = Vec::new();
     for dyn_entry in &dynamic.dyns {
         if dyn_entry.d_tag != goblin::elf::dynamic::DT_NEEDED {
             continue;
@@ -524,14 +661,12 @@ pub(crate) fn strip_absolute_needed(path: &Path) -> io::Result<()> {
         if file_pos >= modified.len() || modified[file_pos] != b'/' {
             continue;
         }
-        // Read the current (absolute) path from the string table.
         let mut end = file_pos;
         while end < modified.len() && modified[end] != 0 {
             end += 1;
         }
-        let original = &modified[file_pos..end];
         let slot_size = end - file_pos;
-
+        let original = &modified[file_pos..end];
         let basename_start = match original.iter().rposition(|&b| b == b'/') {
             Some(p) => p + 1,
             None => 0,
@@ -540,19 +675,21 @@ pub(crate) fn strip_absolute_needed(path: &Path) -> io::Result<()> {
         if basename_len == 0 || basename_len >= slot_size {
             continue;
         }
+        edits.push((file_pos, basename_start, slot_size));
+    }
+    drop(elf);
 
-        let basename: Vec<u8> = original[basename_start..].to_vec();
-        modified[file_pos..file_pos + basename_len].copy_from_slice(&basename);
-        for i in basename_len..slot_size {
-            modified[file_pos + i] = 0;
+    let changed = !edits.is_empty();
+    for (file_pos, basename_start, slot_size) in edits {
+        let basename: Vec<u8> = modified[file_pos + basename_start..file_pos + slot_size].to_vec();
+        let basename: Vec<u8> = basename.into_iter().take_while(|&b| b != 0).collect();
+        let len = basename.len();
+        modified[file_pos..file_pos + len].copy_from_slice(&basename);
+        for b in &mut modified[file_pos + len..file_pos + slot_size] {
+            *b = 0;
         }
-        changed = true;
     }
-
-    if changed {
-        fs::write(path, &modified)?;
-    }
-    Ok(())
+    changed
 }
 
 pub(crate) fn is_excluded(soname: &str, excludes: &[&str]) -> bool {
@@ -632,16 +769,13 @@ pub(crate) fn scrub_loader_paths(path: &Path) -> io::Result<()> {
 /// target the suffix (e.g. `/share/zoneinfo`, `/bin/locale`) and walk
 /// back to the nearest NUL to find the start of the whole path
 /// string.
-pub(crate) fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
-    let mut data = fs::read(path)?;
+/// [`scrub_nix_store_paths`] against an in-memory image.
+pub(crate) fn scrub_nix_store_paths_in(data: &mut [u8]) -> bool {
     let mut changed = false;
-
-    // (suffix to find, replacement path, friendly name)
     let rewrites: &[(&[u8], &[u8])] = &[
         (b"/share/zoneinfo", b"/usr/share/zoneinfo"),
         (b"/bin/locale", b"/usr/bin/locale"),
     ];
-
     for (suffix, replacement) in rewrites {
         let mut i = 0;
         while i + suffix.len() <= data.len() {
@@ -649,25 +783,19 @@ pub(crate) fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
                 i += 1;
                 continue;
             }
-            // Walk back to find the start of this C string.
             let mut start = i;
             while start > 0 && data[start - 1] != 0 {
                 start -= 1;
             }
-            // Only touch strings rooted in /nix/store/.
             if start + 11 > data.len() || &data[start..start + 11] != b"/nix/store/" {
                 i += suffix.len();
                 continue;
             }
-            // Find end of string: walk forward to the NUL.
             let mut end = i + suffix.len();
             while end < data.len() && data[end] != 0 {
                 end += 1;
             }
-            let slot = end - start;
-            if replacement.len() + 1 > slot {
-                // Shouldn't happen for these specific replacements,
-                // but guard just in case.
+            if replacement.len() + 1 > end - start {
                 i = end;
                 continue;
             }
@@ -679,11 +807,7 @@ pub(crate) fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
             i = end;
         }
     }
-
-    if changed {
-        fs::write(path, &data)?;
-    }
-    Ok(())
+    changed
 }
 
 /// Inject the AT_EXECFN bootstrap into a single ELF binary.
