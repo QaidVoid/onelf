@@ -269,30 +269,30 @@ pub(crate) fn locate_lib(
     // entries (and subdirs) so that when multiple store paths provide the
     // same soname, the chosen copy is deterministic rather than dependent
     // on read_dir order.
-    if Path::new("/nix/store").is_dir() {
-        if let Ok(entries) = fs::read_dir("/nix/store") {
-            let mut dirs: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
-            dirs.sort();
-            for dir in dirs {
-                let lib_dir = dir.join("lib");
-                // Check lib/<soname> directly
-                let candidate = lib_dir.join(soname);
-                if candidate.exists() && acceptable(&candidate) {
-                    return Some(candidate);
-                }
-                // Also check one level of subdirs (e.g. lib/pulseaudio/)
-                if let Ok(subdirs) = fs::read_dir(&lib_dir) {
-                    let mut subs: Vec<PathBuf> = subdirs
-                        .filter_map(Result::ok)
-                        .filter(|s| s.file_type().is_ok_and(|t| t.is_dir()))
-                        .map(|s| s.path())
-                        .collect();
-                    subs.sort();
-                    for subdir in subs {
-                        let candidate = subdir.join(soname);
-                        if candidate.exists() && acceptable(&candidate) {
-                            return Some(candidate);
-                        }
+    if Path::new("/nix/store").is_dir()
+        && let Ok(entries) = fs::read_dir("/nix/store")
+    {
+        let mut dirs: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let lib_dir = dir.join("lib");
+            // Check lib/<soname> directly
+            let candidate = lib_dir.join(soname);
+            if candidate.exists() && acceptable(&candidate) {
+                return Some(candidate);
+            }
+            // Also check one level of subdirs (e.g. lib/pulseaudio/)
+            if let Ok(subdirs) = fs::read_dir(&lib_dir) {
+                let mut subs: Vec<PathBuf> = subdirs
+                    .filter_map(Result::ok)
+                    .filter(|s| s.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|s| s.path())
+                    .collect();
+                subs.sort();
+                for subdir in subs {
+                    let candidate = subdir.join(soname);
+                    if candidate.exists() && acceptable(&candidate) {
+                        return Some(candidate);
                     }
                 }
             }
@@ -322,10 +322,10 @@ pub(crate) fn is_nix_stub_ld(path: &Path) -> bool {
     if !is_loader_name {
         return false;
     }
-    if let Ok(real) = fs::canonicalize(path) {
-        if real.to_string_lossy().contains("stub-ld") {
-            return true;
-        }
+    if let Ok(real) = fs::canonicalize(path)
+        && real.to_string_lossy().contains("stub-ld")
+    {
+        return true;
     }
     // Real glibc ld-linux is >100 KB; the stub is ~35 KB. Cheap filter
     // before reading the file content.

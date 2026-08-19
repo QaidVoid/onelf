@@ -225,7 +225,7 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
     })?;
     // Parse first, then expand `${VAR}` inside string *values* only. Doing
     // it after the structure is fixed means an expanded value containing a
-    // quote or newline can never introduce new recipe keys (REVIEW §3.3).
+    // quote or newline can never introduce new recipe keys.
     let mut value: toml::Value = toml::from_str(&raw).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -256,7 +256,7 @@ fn expand_value(value: &mut toml::Value) {
 /// Resolve a recipe file from a user-supplied spec:
 /// - If `spec` is a directory, use `<spec>/onelf.toml`.
 /// - If `spec` is a file with a `.toml` extension, use it.
-/// - Otherwise error — the input isn't something this tool can read as a recipe.
+/// - Otherwise error, since the input is not something this tool can read.
 pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
     if spec.is_dir() {
         return Ok(spec.join("onelf.toml"));
@@ -289,13 +289,13 @@ pub fn resolve(spec: &Path) -> std::io::Result<PathBuf> {
 /// reference to **runtime**, e.g. `PATH = "${ONELF_DIR}/bin:$${PATH}"`
 /// reaches `.onelf/env` as `${ONELF_DIR}/bin:${PATH}` and the runtime
 /// (onelf-rt / the onelf-env constructor) expands `${PATH}` against the
-/// live process environment — i.e. prepend instead of replace.
+/// live process environment, so it prepends instead of replacing.
 pub fn expand_env(s: &str) -> String {
     let bytes = s.as_bytes();
     // Accumulate raw bytes: the input is UTF-8 and every spliced fragment
     // (env values and preserved source slices) is UTF-8, so the result is
     // valid UTF-8. This avoids the `bytes[i] as char` path that mangled
-    // multi-byte sequences into mojibake (REVIEW §3.3).
+    // multi-byte sequences into mojibake.
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -306,17 +306,19 @@ pub fn expand_env(s: &str) -> String {
             i += 2;
             continue;
         }
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            if let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}') {
-                let name = std::str::from_utf8(&bytes[i + 2..i + 2 + end]).unwrap_or("");
-                match std::env::var(name) {
-                    Ok(val) => out.extend_from_slice(val.as_bytes()),
-                    // Preserve unset variables for runtime expansion.
-                    Err(_) => out.extend_from_slice(&bytes[i..i + 3 + end]),
-                }
-                i += 3 + end;
-                continue;
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'{'
+            && let Some(end) = bytes[i + 2..].iter().position(|&b| b == b'}')
+        {
+            let name = std::str::from_utf8(&bytes[i + 2..i + 2 + end]).unwrap_or("");
+            match std::env::var(name) {
+                Ok(val) => out.extend_from_slice(val.as_bytes()),
+                // Preserve unset variables for runtime expansion.
+                Err(_) => out.extend_from_slice(&bytes[i..i + 3 + end]),
             }
+            i += 3 + end;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;

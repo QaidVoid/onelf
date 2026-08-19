@@ -144,9 +144,7 @@ pub fn should_use_userland_exec(
         return None;
     }
 
-    if read_elf_interp(target).is_none() {
-        return None;
-    }
+    read_elf_interp(target)?;
 
     if !is_pie(target) {
         return None;

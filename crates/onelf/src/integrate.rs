@@ -254,10 +254,10 @@ fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -
         } else if line.starts_with("TryExec=") {
             *line = format!("TryExec={quoted}");
             has_tryexec = true;
-        } else if line.starts_with("Icon=") {
-            if let Some(name) = icon_name {
-                *line = format!("Icon={name}");
-            }
+        } else if line.starts_with("Icon=")
+            && let Some(name) = icon_name
+        {
+            *line = format!("Icon={name}");
         }
     }
 
@@ -314,7 +314,7 @@ fn remove_icons(hicolor: &Path, int_name: &str) -> io::Result<bool> {
     let mut removed = false;
 
     for entry in entries.flatten() {
-        if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
         let apps_dir = entry.path().join("apps");

@@ -1,0 +1,60 @@
+name: onelf ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no `RUSTFLAGS: -D warnings`. Cargo applies RUSTFLAGS to
+  # dependencies as well, so a warning in a crate we do not own would fail
+  # the build. The deny lives on the clippy invocation, which scopes it to
+  # this workspace.
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # musl-tools supplies the musl gcc that build.rs needs to link the
+      # embedded runtime. patchelf and fuse3 are what the pipeline tests
+      # exercise; without them those tests silently take their skip paths
+      # and stop covering the re-exec and FUSE behaviour.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools patchelf fuse3
+
+      # Stable, not nightly: the workspace has no nightly features, and a
+      # lint gate that moves under the repository is worse than no gate.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          # llvm-tools provides rust-objcopy, which build.rs uses to flatten
+          # the bootstrap payload.
+          components: rustfmt, clippy, llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked

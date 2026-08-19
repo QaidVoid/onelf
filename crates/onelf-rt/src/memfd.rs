@@ -13,7 +13,7 @@ use rustix::fs::MemfdFlags;
 
 pub fn execute_memfd(data: &[u8], argv0: &str, args: &[String]) -> io::Result<()> {
     let fd = rustix::fs::memfd_create(c"onelf", MemfdFlags::empty())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("memfd_create: {e}")))?;
+        .map_err(|e| io::Error::other(format!("memfd_create: {e}")))?;
 
     let mut file = std::fs::File::from(fd);
     file.write_all(data)?;
@@ -23,8 +23,5 @@ pub fn execute_memfd(data: &[u8], argv0: &str, args: &[String]) -> io::Result<()
 
     let err = Command::new(&fd_path).arg0(argv0).args(args).exec();
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("exec failed: {err}"),
-    ))
+    Err(io::Error::other(format!("exec failed: {err}")))
 }

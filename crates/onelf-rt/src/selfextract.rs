@@ -12,7 +12,7 @@
 //!
 //! Two strategies (tried in order):
 //!
-//! 1. **Bind-mount** (FUSE/tmpfs modes only — they have a private mount
+//! 1. **Bind-mount** (FUSE/tmpfs modes only, since they have a private mount
 //!    namespace): bind-mount the bundled linker over the binary's
 //!    existing PT_INTERP path (e.g. `/lib64/ld-linux-x86-64.so.2`).
 //!    Invisible outside the namespace, no host pollution.
@@ -251,9 +251,7 @@ fn patch_pt_interp_in_place(binary: &Path, new_interp: &str) -> io::Result<()> {
     }
 
     data[p_offset..p_offset + new_bytes.len()].copy_from_slice(new_bytes);
-    for j in (p_offset + new_bytes.len())..slot_end {
-        data[j] = 0;
-    }
+    data[p_offset + new_bytes.len()..slot_end].fill(0);
 
     // Break any hardlink to CAS by writing through a temp + rename.
     let tmp = binary.with_extension("interp-patch");

@@ -22,7 +22,7 @@ fn tmpfs_size_for(pkg: &PackageData) -> u64 {
         .entries
         .iter()
         .flat_map(|e| e.blocks.iter())
-        .map(|b| u64::from(b.original_size))
+        .map(|b| b.original_size)
         .sum();
     let with_overhead = content_size + content_size / 4;
     with_overhead.max(8 * 1024 * 1024)

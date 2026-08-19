@@ -245,24 +245,6 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
     Ok((pkg_dir, lock_file))
 }
 
-fn walk_files(dir: &Path, f: &mut dyn FnMut(&Path)) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            walk_files(&path, f);
-        } else if meta.is_file() {
-            f(&path);
-        }
-    }
-}
-
 fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::Result<()> {
     let manifest = &pkg.manifest;
 

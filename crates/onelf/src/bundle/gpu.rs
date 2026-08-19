@@ -31,6 +31,9 @@ const EGL_SEARCH_PATHS: &[&str] = &["/usr/share/glvnd/egl_vendor.d"];
 const VK_SEARCH_PATHS: &[&str] = &["/etc/vulkan/icd.d", "/usr/share/vulkan/icd.d"];
 
 /// Bundle GPU drivers and vendor configs so OpenGL/Vulkan/EGL apps work portably.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bundle_gpu(
     directory: &Path,
     lib_dir: &Path,
@@ -381,6 +384,9 @@ pub(crate) fn bundle_gpu(
 /// Copy `.so` files from source directories into `dest`, filtering by ELF class
 /// and optionally by an architecture-specific name allowlist.
 /// Returns (files_copied, total_bytes).
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 fn copy_so_dir(
     src_dirs: &[PathBuf],
     dest: &Path,
@@ -454,7 +460,7 @@ fn remove_conflicting_gl_libs(directory: &Path, lib_dest: &Path, dry_run: bool) 
         // lib_dest may not exist yet; build an absolute path manually
         fs::canonicalize(directory)
             .unwrap_or_else(|_| directory.to_path_buf())
-            .join(&lib_dest.strip_prefix(directory).unwrap_or(lib_dest))
+            .join(lib_dest.strip_prefix(directory).unwrap_or(lib_dest))
     });
 
     let mut to_remove: Vec<PathBuf> = Vec::new();
@@ -490,7 +496,7 @@ fn collect_gl_conflicts(dir: &Path, lib_dest_canon: &Path, out: &mut Vec<PathBuf
         let is_symlink = path.is_symlink();
 
         if path.is_dir() && !is_symlink {
-            // Always recurse — even into lib_dest so we catch its subdirectories
+            // Always recurse, even into lib_dest, to catch its subdirectories
             collect_gl_conflicts(&path, lib_dest_canon, out);
             continue;
         }
@@ -530,6 +536,9 @@ const WAYLAND_LIB_PREFIXES: &[&str] = &[
 ];
 
 /// Bundle Wayland client libraries and libdecor plugins.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bundle_wayland(
     directory: &Path,
     lib_dir: &Path,
@@ -650,13 +659,13 @@ pub(crate) fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()>
             }
             // NixOS layout: share/gsettings-schemas/<pkg>/glib-2.0/schemas/
             let gs_dir = p.join("share/gsettings-schemas");
-            if gs_dir.is_dir() {
-                if let Ok(entries) = fs::read_dir(&gs_dir) {
-                    for entry in entries.filter_map(Result::ok) {
-                        let schemas = entry.path().join("glib-2.0/schemas");
-                        if schemas.is_dir() && !schema_dirs.contains(&schemas) {
-                            schema_dirs.push(schemas);
-                        }
+            if gs_dir.is_dir()
+                && let Ok(entries) = fs::read_dir(&gs_dir)
+            {
+                for entry in entries.filter_map(Result::ok) {
+                    let schemas = entry.path().join("glib-2.0/schemas");
+                    if schemas.is_dir() && !schema_dirs.contains(&schemas) {
+                        schema_dirs.push(schemas);
                     }
                 }
             }
@@ -671,13 +680,13 @@ pub(crate) fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()>
                 schema_dirs.push(schemas);
             }
             let gs_dir = PathBuf::from(dir).join("gsettings-schemas");
-            if gs_dir.is_dir() {
-                if let Ok(entries) = fs::read_dir(&gs_dir) {
-                    for entry in entries.filter_map(Result::ok) {
-                        let schemas = entry.path().join("glib-2.0/schemas");
-                        if schemas.is_dir() && !schema_dirs.contains(&schemas) {
-                            schema_dirs.push(schemas);
-                        }
+            if gs_dir.is_dir()
+                && let Ok(entries) = fs::read_dir(&gs_dir)
+            {
+                for entry in entries.filter_map(Result::ok) {
+                    let schemas = entry.path().join("glib-2.0/schemas");
+                    if schemas.is_dir() && !schema_dirs.contains(&schemas) {
+                        schema_dirs.push(schemas);
                     }
                 }
             }
@@ -803,46 +812,46 @@ pub(crate) fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()>
 /// not be in PATH, so we search the nix store.
 fn find_glib_compile_schemas() -> PathBuf {
     // Try PATH first
-    if let Ok(output) = Command::new("which").arg("glib-compile-schemas").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return PathBuf::from(path);
-            }
+    if let Ok(output) = Command::new("which").arg("glib-compile-schemas").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return PathBuf::from(path);
         }
     }
 
     // NixOS: search store for glib-*-dev/bin/glib-compile-schemas. Pick
     // the highest version deterministically (parsed from the store name)
     // instead of whichever read_dir surfaces first.
-    if Path::new("/nix/store").is_dir() {
-        if let Ok(entries) = fs::read_dir("/nix/store") {
-            let mut candidates: Vec<(Vec<u32>, PathBuf)> = Vec::new();
-            for entry in entries.filter_map(Result::ok) {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.contains("glib-") && name.ends_with("-dev") {
-                    let candidate = entry.path().join("bin/glib-compile-schemas");
-                    if candidate.is_file() {
-                        let version = name
-                            .rsplit_once("glib-")
-                            .and_then(|(_, rest)| rest.strip_suffix("-dev"))
-                            .map(|v| v.split('.').filter_map(|p| p.parse().ok()).collect())
-                            .unwrap_or_default();
-                        candidates.push((version, candidate));
-                    }
+    if Path::new("/nix/store").is_dir()
+        && let Ok(entries) = fs::read_dir("/nix/store")
+    {
+        let mut candidates: Vec<(Vec<u32>, PathBuf)> = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains("glib-") && name.ends_with("-dev") {
+                let candidate = entry.path().join("bin/glib-compile-schemas");
+                if candidate.is_file() {
+                    let version = name
+                        .rsplit_once("glib-")
+                        .and_then(|(_, rest)| rest.strip_suffix("-dev"))
+                        .map(|v| v.split('.').filter_map(|p| p.parse().ok()).collect())
+                        .unwrap_or_default();
+                    candidates.push((version, candidate));
                 }
             }
-            // Sort by (version, path); the last is the highest version with
-            // a stable path tiebreak.
-            candidates.sort();
-            if let Some((_, path)) = candidates.pop() {
-                return path;
-            }
+        }
+        // Sort by (version, path); the last is the highest version with
+        // a stable path tiebreak.
+        candidates.sort();
+        if let Some((_, path)) = candidates.pop() {
+            return path;
         }
     }
 
-    // Fallback — let Command::new fail with a clear error
+    // Fallback: let Command::new fail with a clear error
     PathBuf::from("glib-compile-schemas")
 }
 
@@ -850,6 +859,9 @@ fn find_glib_compile_schemas() -> PathBuf {
 /// filename-only and copying the referenced `.so` into `lib_dest`.
 /// When `driver_filter` is Some, only copies configs whose library matches
 /// the architecture-specific allowlist.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 fn copy_vendor_json(
     src_dirs: &[PathBuf],
     json_dest: &Path,

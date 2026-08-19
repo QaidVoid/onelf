@@ -51,7 +51,7 @@ pub fn enter_namespace() -> io::Result<()> {
 /// The caller must invoke this BEFORE forking the FUSE server; forked
 /// children inherit the mount namespace and see the mount automatically.
 /// When the last process in the user namespace exits, the kernel tears
-/// the mount down — no cleanup code needed.
+/// the mount down, so no cleanup code is needed.
 pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
     enter_namespace()?;
 
@@ -148,7 +148,7 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
         SocketFlags::CLOEXEC,
         None,
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("socketpair: {e}")))?;
+    .map_err(|e| io::Error::other(format!("socketpair: {e}")))?;
 
     let child_fd = sock_child.as_raw_fd();
 
@@ -160,10 +160,9 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
             .pre_exec(move || {
                 // Clear CLOEXEC so fusermount3 inherits this fd
                 let fd = BorrowedFd::borrow_raw(child_fd);
-                let flags = rustix::io::fcntl_getfd(fd)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let flags = rustix::io::fcntl_getfd(fd).map_err(io::Error::other)?;
                 rustix::io::fcntl_setfd(fd, flags.difference(FdFlags::CLOEXEC))
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 Ok(())
             })
             .status()
@@ -174,10 +173,9 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
     drop(sock_child);
 
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("fusermount3 exited with {status}"),
-        ));
+        return Err(io::Error::other(format!(
+            "fusermount3 exited with {status}"
+        )));
     }
 
     // Receive the /dev/fuse fd via SCM_RIGHTS
@@ -187,20 +185,17 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
     let iov = io::IoSliceMut::new(&mut iov_buf);
 
     let _msg = recvmsg(&sock_parent, &mut [iov], &mut ancillary, RecvFlags::empty())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recvmsg: {e}")))?;
+        .map_err(|e| io::Error::other(format!("recvmsg: {e}")))?;
 
     for msg in ancillary.drain() {
-        if let RecvAncillaryMessage::ScmRights(fds) = msg {
-            for fd in fds {
-                return Ok(fd);
-            }
+        if let RecvAncillaryMessage::ScmRights(mut fds) = msg
+            && let Some(fd) = fds.next()
+        {
+            return Ok(fd);
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "fusermount3 did not send /dev/fuse fd",
-    ))
+    Err(io::Error::other("fusermount3 did not send /dev/fuse fd"))
 }
 
 /// Unmount a FUSE filesystem via fusermount3 -u.

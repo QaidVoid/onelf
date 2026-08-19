@@ -106,6 +106,9 @@ pub struct FuseAttr {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+// Answered from the header alone; kept so this module mirrors the
+// kernel's wire layout completely.
+#[allow(dead_code)]
 pub struct FuseGetAttrIn {
     pub getattr_flags: u32,
     pub dummy: u32,
@@ -135,6 +138,9 @@ pub struct FuseEntryOut {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+// Answered from the header alone; kept so this module mirrors the
+// kernel's wire layout completely.
+#[allow(dead_code)]
 pub struct FuseOpenIn {
     pub flags: u32,
     pub open_flags: u32,
@@ -162,6 +168,9 @@ pub struct FuseReadIn {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+// Answered from the header alone; kept so this module mirrors the
+// kernel's wire layout completely.
+#[allow(dead_code)]
 pub struct FuseAccessIn {
     pub mask: u32,
     pub padding: u32,

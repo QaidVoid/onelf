@@ -180,6 +180,8 @@ fn main() {
     println!("cargo:rustc-env=ONELF_RT_UPDATE_PATH={}", full.display());
 }
 
+// Threads one nested-build invocation; a parameter object would be used once.
+#[allow(clippy::too_many_arguments)]
 fn build_rt(
     cargo: &PathBuf,
     rt_dir: &PathBuf,
@@ -403,10 +405,10 @@ fn payload_rustflags(mut flags: Vec<String>) -> Vec<String> {
     if let Ok(home) = env::var("CARGO_HOME") {
         flags.push(format!("--remap-path-prefix={home}=/cargo"));
     }
-    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {
-        if let Some(ws) = PathBuf::from(&dir).parent().and_then(|p| p.parent()) {
-            flags.push(format!("--remap-path-prefix={}=/src", ws.display()));
-        }
+    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR")
+        && let Some(ws) = PathBuf::from(&dir).parent().and_then(|p| p.parent())
+    {
+        flags.push(format!("--remap-path-prefix={}=/src", ws.display()));
     }
     flags
 }
@@ -483,10 +485,17 @@ fn build_env(cargo: &Path, payloads_dir: &Path, out_dir: &Path, p: &Payload, cc:
 
 /// Whether to strip `key` from the nested payload build's environment. Clears
 /// the per-build Cargo/rustc context the parent injects (CARGO_MANIFEST_DIR,
-/// CARGO_PKG_*, CARGO_CFG_*, CARGO_FEATURE_*, CARGO_ENCODED_RUSTFLAGS, …) so it
-/// can't mis-configure the nested build, but keeps global toolchain/registry
-/// config (CARGO_HOME, CARGO_NET_*, registry settings, RUSTC + wrappers) and
-/// any `*_LINKER` override, which the nested build should inherit.
+/// CARGO_PKG_*, CARGO_CFG_*, CARGO_FEATURE_*, CARGO_ENCODED_RUSTFLAGS, and so
+/// on) so it can't mis-configure the nested build, but keeps global
+/// toolchain/registry config (CARGO_HOME, CARGO_NET_*, registry settings,
+/// RUSTC and RUSTC_WRAPPER) and any `*_LINKER` override.
+///
+/// RUSTC_WORKSPACE_WRAPPER is deliberately NOT kept. It is how `cargo clippy`
+/// injects clippy-driver for the crates it considers workspace members, and
+/// the payloads crate is excluded from the workspace precisely because it is a
+/// freestanding build with different rules. Letting it through would make
+/// linting the outer workspace lint this crate too, and under `-D warnings`
+/// that turns a lint into a build-script failure.
 fn should_clear_for_nested(key: &str) -> bool {
     if !(key.starts_with("CARGO") || key.starts_with("RUSTC")) {
         return false;
@@ -494,10 +503,8 @@ fn should_clear_for_nested(key: &str) -> bool {
     if key.ends_with("_LINKER") {
         return false;
     }
-    !matches!(
-        key,
-        "CARGO_HOME" | "RUSTC" | "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER"
-    ) && !key.starts_with("CARGO_NET")
+    !matches!(key, "CARGO_HOME" | "RUSTC" | "RUSTC_WRAPPER")
+        && !key.starts_with("CARGO_NET")
         && !key.starts_with("CARGO_REGISTR")
 }
 
@@ -583,17 +590,17 @@ fn find_rust_objcopy() -> PathBuf {
     if let Ok(p) = env::var("ONELF_OBJCOPY") {
         return PathBuf::from(p);
     }
-    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output() {
-        if out.status.success() {
-            let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let host = env::var("HOST").unwrap_or_default();
-            let cand = PathBuf::from(&sysroot)
-                .join("lib/rustlib")
-                .join(&host)
-                .join("bin/llvm-objcopy");
-            if cand.exists() {
-                return cand;
-            }
+    if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output()
+        && out.status.success()
+    {
+        let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let host = env::var("HOST").unwrap_or_default();
+        let cand = PathBuf::from(&sysroot)
+            .join("lib/rustlib")
+            .join(&host)
+            .join("bin/llvm-objcopy");
+        if cand.exists() {
+            return cand;
         }
     }
     for name in ["rust-objcopy", "llvm-objcopy"] {

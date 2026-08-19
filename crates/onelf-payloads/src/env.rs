@@ -319,7 +319,7 @@ unsafe fn trim(base: *const u8, mut s: usize, mut e: usize) -> (usize, usize) {
 /// Find the package root: the nearest parent dir of this object containing a
 /// `.onelf/`. Writes it into `G_ROOT`, returns true on success.
 unsafe fn find_root() -> bool {
-    let self_addr = onelf_env_init as usize as u64;
+    let self_addr = onelf_env_init as *const () as usize as u64;
 
     let maps = &raw mut G_MAPS as *mut u8;
     let n = read_file(b"/proc/self/maps\0".as_ptr(), maps, MAPS_CAP - 1);

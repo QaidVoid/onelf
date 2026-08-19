@@ -38,7 +38,7 @@ pub fn cache_list() -> io::Result<()> {
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .map(|d| {
                         // saturating_sub so a future mtime reports 0 instead
-                        // of underflowing to a huge age (REVIEW §5.9).
+                        // of underflowing to a huge age.
                         let now = SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .unwrap()
@@ -108,16 +108,16 @@ pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
     for entry in fs::read_dir(&meta_dir)? {
         let entry = entry?;
         let modified = entry.metadata()?.modified()?;
-        if let Ok(age) = now.duration_since(modified) {
-            if age > max_age {
-                let name = entry.file_name();
-                let pkg = pkg_dir.join(&name);
-                if pkg.exists() {
-                    fs::remove_dir_all(&pkg)?;
-                }
-                fs::remove_file(entry.path())?;
-                removed += 1;
+        if let Ok(age) = now.duration_since(modified)
+            && age > max_age
+        {
+            let name = entry.file_name();
+            let pkg = pkg_dir.join(&name);
+            if pkg.exists() {
+                fs::remove_dir_all(&pkg)?;
             }
+            fs::remove_file(entry.path())?;
+            removed += 1;
         }
     }
 

@@ -288,7 +288,7 @@ fn make_stack(
 
     // Pad the string region so the final `argc` (the returned sp) is 16-aligned.
     let fixed_words = auxv.len() * 2 + (env.len() + 1) + (args.len() + 1) + 1;
-    while (b.rev.len() + fixed_words * word) % 16 != 0 {
+    while !(b.rev.len() + fixed_words * word).is_multiple_of(16) {
         b.rev.push(0);
     }
 

@@ -14,8 +14,8 @@ pub fn list(path: &Path) -> io::Result<()> {
     let (_footer, manifest) = read_footer_and_manifest(path)?;
 
     println!(
-        "{:<10} {:<7} {:<12} {:<12} {:<66} {}",
-        "MODE", "TYPE", "ORIGINAL", "COMPRESSED", "HASH", "PATH"
+        "{:<10} {:<7} {:<12} {:<12} {:<66} PATH",
+        "MODE", "TYPE", "ORIGINAL", "COMPRESSED", "HASH"
     );
     println!("{}", "-".repeat(120));
 

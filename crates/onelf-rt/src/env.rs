@@ -231,7 +231,7 @@ pub fn setup_env(
             for dir in &icd_dirs {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for e in entries.filter_map(|e| e.ok()) {
-                        if e.path().extension().map_or(false, |ext| ext == "json") {
+                        if e.path().extension().is_some_and(|ext| ext == "json") {
                             all_files.push(e.path().to_string_lossy().into_owned());
                         }
                     }
@@ -264,7 +264,7 @@ fn is_elf_file(path: &str) -> bool {
 /// package's `LD_LIBRARY_PATH` so the bundled loader can locate host-
 /// provided GPU userspace drivers (libcuda, libvulkan, libGL, libva)
 /// without picking up host libraries that would clash with the bundle's
-/// own copies — those come first in the search path.
+/// own copies, which come first in the search path.
 fn host_driver_paths() -> Vec<String> {
     // NixOS exposes all GPU userspace drivers under /run/opengl-driver,
     // populated from the active nixpkgs `hardware.graphics` closure.
@@ -324,25 +324,27 @@ fn expand_env_value(val: &str, onelf_dir: &str) -> String {
     let b = val.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
-            if let Some(end) = b[i + 2..].iter().position(|&c| c == b'}') {
-                let token = &val[i + 2..i + 2 + end];
-                let (name, default) = match token.split_once(":-") {
-                    Some((n, d)) => (n, Some(d)),
-                    None => (token, None),
-                };
-                let resolved = if name == "ONELF_DIR" {
-                    Some(onelf_dir.to_string())
-                } else {
-                    env::var(name).ok()
-                };
-                match resolved {
-                    Some(ref v) if !v.is_empty() => out.push_str(v),
-                    _ => out.push_str(default.unwrap_or("")),
-                }
-                i += 3 + end;
-                continue;
+        if b[i] == b'$'
+            && i + 1 < b.len()
+            && b[i + 1] == b'{'
+            && let Some(end) = b[i + 2..].iter().position(|&c| c == b'}')
+        {
+            let token = &val[i + 2..i + 2 + end];
+            let (name, default) = match token.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (token, None),
+            };
+            let resolved = if name == "ONELF_DIR" {
+                Some(onelf_dir.to_string())
+            } else {
+                env::var(name).ok()
+            };
+            match resolved {
+                Some(ref v) if !v.is_empty() => out.push_str(v),
+                _ => out.push_str(default.unwrap_or("")),
             }
+            i += 3 + end;
+            continue;
         }
         let ch = val[i..].chars().next().unwrap();
         out.push(ch);

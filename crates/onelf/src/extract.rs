@@ -148,7 +148,7 @@ fn extract_selective(
         ));
     }
 
-    let to_stdout = output.map_or(false, |p| p.as_os_str() == "-");
+    let to_stdout = output.is_some_and(|p| p.as_os_str() == "-");
 
     // Single file to stdout
     if to_stdout {
@@ -173,7 +173,7 @@ fn extract_selective(
 
         if let Some(out) = output {
             if out.is_dir() {
-                // Output is existing directory — extract preserving relative path
+                // Output is an existing directory: preserve the relative path
                 let rel_path = manifest.validated_entry_path(*idx)?;
                 let target = out.join(&rel_path);
                 if let Some(parent) = target.parent() {
@@ -185,7 +185,7 @@ fn extract_selective(
                     fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
                 )?;
             } else {
-                // Output is a file path — write directly
+                // Output is a file path: write directly
                 if let Some(parent) = out.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -196,7 +196,7 @@ fn extract_selective(
                 )?;
             }
         } else {
-            // No output specified — extract to current dir preserving relative path
+            // No output specified: extract to the current dir, keeping the path
             let target = manifest.validated_entry_path(*idx)?;
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
@@ -210,7 +210,7 @@ fn extract_selective(
         return Ok(());
     }
 
-    // Multiple files — extract to directory preserving relative paths
+    // Multiple files: extract to a directory, keeping relative paths
     let output_dir = output.unwrap_or(Path::new("onelf_extracted"));
     fs::create_dir_all(output_dir)?;
 
@@ -258,7 +258,7 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
 
     // Directory modes are applied in a final pass (deepest-first) rather
     // than at creation: a read-only directory (e.g. 0555) would otherwise
-    // reject writes of its own children (REVIEW §5.6).
+    // reject writes of its own children.
     let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
 
     // First pass: dirs and files (before symlinks, so no file is ever

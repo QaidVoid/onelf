@@ -12,10 +12,10 @@ use onelf_format::Manifest;
 /// Resolve which entrypoint index to use.
 pub fn resolve_entrypoint(manifest: &Manifest, argv0: &str) -> usize {
     // 1. Check env override
-    if let Ok(name) = std::env::var("ONELF_ENTRYPOINT") {
-        if let Some(idx) = find_entrypoint_by_name(manifest, &name) {
-            return idx;
-        }
+    if let Ok(name) = std::env::var("ONELF_ENTRYPOINT")
+        && let Some(idx) = find_entrypoint_by_name(manifest, &name)
+    {
+        return idx;
     }
 
     // 2. Match basename(argv[0])

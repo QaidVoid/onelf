@@ -656,7 +656,7 @@ pub(crate) fn scrub_nix_store_paths(path: &Path) -> io::Result<()> {
             }
             // Only touch strings rooted in /nix/store/.
             if start + 11 > data.len() || &data[start..start + 11] != b"/nix/store/" {
-                i = i + suffix.len();
+                i += suffix.len();
                 continue;
             }
             // Find end of string: walk forward to the NUL.
@@ -919,14 +919,10 @@ pub(crate) fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<E
     };
 
     // Skip if this binary already lists the constructor (idempotent).
-    if let Ok(elf) = goblin::elf::Elf::parse(&data) {
-        if elf
-            .libraries
-            .iter()
-            .any(|l| *l == crate::payload::ONELF_ENV_SONAME)
-        {
-            return Ok(EnvNeededOutcome::AlreadyPresent);
-        }
+    if let Ok(elf) = goblin::elf::Elf::parse(&data)
+        && elf.libraries.contains(&crate::payload::ONELF_ENV_SONAME)
+    {
+        return Ok(EnvNeededOutcome::AlreadyPresent);
     }
 
     // Stage the blob into lib/ (write once; idempotent across binaries).
@@ -1112,7 +1108,7 @@ mod embedded_payload_tests {
 
         let shstr_off = 64u64;
         f[64..64 + shstrtab.len()].copy_from_slice(shstrtab);
-        while f.len() % 8 != 0 {
+        while !f.len().is_multiple_of(8) {
             f.push(0);
         }
         let sh_off = f.len() as u64;
@@ -1206,7 +1202,7 @@ mod runpath_tests {
         let guard_off = f.len();
         f.extend_from_slice(&[GUARD; GUARD_LEN]);
 
-        while f.len() % 8 != 0 {
+        while !f.len().is_multiple_of(8) {
             f.push(0);
         }
         let dyn_off = f.len() as u64;
@@ -1223,7 +1219,7 @@ mod runpath_tests {
 
         let shstr_off = f.len() as u64;
         f.extend_from_slice(SHSTRTAB);
-        while f.len() % 8 != 0 {
+        while !f.len().is_multiple_of(8) {
             f.push(0);
         }
         let sh_off = f.len() as u64;
@@ -1273,7 +1269,7 @@ mod runpath_tests {
 
     #[test]
     fn large_enough_slot_is_rewritten_in_place() {
-        let (bytes, guard_off) = elf_with_runpath(&vec![b'x'; 80]);
+        let (bytes, guard_off) = elf_with_runpath(&[b'x'; 80]);
         let out = rewrite("large", &bytes);
         assert_eq!(out.len(), bytes.len());
         assert!(

@@ -56,7 +56,7 @@ fn make_attr(inode: u64, entry: &onelf_format::entry::Entry, manifest: &Manifest
     FuseAttr {
         ino: inode,
         size,
-        blocks: (size + 511) / 512,
+        blocks: size.div_ceil(512),
         atime: entry.mtime_secs,
         mtime: entry.mtime_secs,
         ctime: entry.mtime_secs,
@@ -100,12 +100,12 @@ impl BlockCache {
     }
 
     fn maybe_clear(&mut self) {
-        if let Some(last) = self.last_access {
-            if last.elapsed().as_secs() >= CACHE_IDLE_SECS {
-                self.data.clear();
-                self.data.shrink_to_fit();
-                self.last_access = None;
-            }
+        if let Some(last) = self.last_access
+            && last.elapsed().as_secs() >= CACHE_IDLE_SECS
+        {
+            self.data.clear();
+            self.data.shrink_to_fit();
+            self.last_access = None;
         }
     }
 
@@ -284,7 +284,7 @@ impl<'a> FuseState<'a> {
         let size = read_in.size as usize;
         let num_blocks = entry.blocks.len();
 
-        // Build block offset map — stack-allocated for files <=32 blocks (8MB @ 256KB)
+        // Build block offset map, stack-allocated for files <=32 blocks (8MB @ 256KB)
         const MAX_STACK: usize = 32;
         let use_stack = num_blocks <= MAX_STACK;
         let mut offsets_stack = [0usize; MAX_STACK];
@@ -788,7 +788,7 @@ fn handle_statfs(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
         .entries
         .iter()
         .map(|e| e.blocks.iter().map(|b| b.original_size).sum::<u64>())
-        .map(|size| (size + 511) / 512)
+        .map(|size| size.div_ceil(512))
         .sum();
 
     let statfs = FuseStatfsOut {

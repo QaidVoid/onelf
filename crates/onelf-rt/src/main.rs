@@ -157,11 +157,11 @@ fn main() {
             );
             portable::setup_portable(exe_dir, exe_name);
 
-            if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args) {
-                if force == Some("memfd") {
-                    eprintln!("onelf-rt: memfd execution failed: {e}");
-                    std::process::exit(1);
-                }
+            if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args)
+                && force == Some("memfd")
+            {
+                eprintln!("onelf-rt: memfd execution failed: {e}");
+                std::process::exit(1);
             }
         } else if force == Some("memfd") {
             eprintln!("onelf-rt: failed to read payload for memfd");
@@ -238,10 +238,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
-    if gc_max_age > 0 {
-        if let Some(cache_base) = cache::base_dir() {
-            cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
-        }
+    if gc_max_age > 0
+        && let Some(cache_base) = cache::base_dir()
+    {
+        cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
     }
 
     let target_path_str = pkg.manifest.entry_path(ep_target_entry);

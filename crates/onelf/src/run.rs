@@ -225,7 +225,7 @@ fn resolve_entrypoint(
 ) -> io::Result<(String, String, Vec<String>, WorkingDir)> {
     let working_dir: WorkingDir = recipe
         .as_ref()
-        .map(|r| r.package.working_dir.clone().into())
+        .map(|r| r.package.working_dir.into())
         .unwrap_or(WorkingDir::Inherit);
 
     if let Some(cmd) = command_override {

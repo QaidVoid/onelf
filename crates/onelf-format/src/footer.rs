@@ -112,13 +112,13 @@ impl Footer {
     }
 
     pub fn from_bytes(buf: &[u8; FOOTER_SIZE]) -> io::Result<Self> {
-        if &buf[0..8] != &MAGIC {
+        if buf[0..8] != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid onelf magic",
             ));
         }
-        if &buf[68..76] != &END_MAGIC {
+        if buf[68..76] != END_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid onelf end magic",

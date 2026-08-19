@@ -157,7 +157,7 @@ PATH = "${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}"
 ```
 
 so bundled helpers resolve even when the app or a sandbox clears
-`PATH`. (glibc's `_CS_PATH` fallback — `/bin:/usr/bin` — only applies
+`PATH`. (glibc's `_CS_PATH` fallback of `/bin:/usr/bin` only applies
 when `PATH` is *unset*; the moment onelf sets `PATH` it no longer
 kicks in, so the `:-/usr/bin:/bin` default substitutes it explicitly
 when the inherited `PATH` is empty, instead of leaving a dangling
@@ -167,7 +167,7 @@ default is then skipped); use `PATH = "$${PATH}"` to opt out of the
 
 These variables are **re-exec-safe**: a small `onelf-env` constructor
 is bundled into `lib/` and injected as a `DT_NEEDED` of the entrypoint,
-so `.onelf/env` is re-applied on every exec — including after an app
+so `.onelf/env` is re-applied on every exec, including after an app
 re-execs itself in a sandbox that calls `clearenv()` (Chromium/Electron
 zygotes, Steam, bwrap, etc.). This requires `patchelf` at pack time;
 without it the values are only set for the first launch. See

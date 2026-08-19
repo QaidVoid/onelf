@@ -81,9 +81,9 @@ QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 `${ONELF_DIR}` and `$${VAR}` (escaped, expanded against the **live**
 environment at runtime, with POSIX `${VAR:-word}` defaults) let values
 prepend instead of replace. `PATH` defaults to
-`${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}` — the package's `bin/` is
+`${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}`, so the package's `bin/` is
 always on `PATH` (re-exec-safe), falling back to `/usr/bin:/bin` when
-the inherited PATH is empty — unless `[env]` sets `PATH` itself.
+the inherited PATH is empty, unless `[env]` sets `PATH` itself.
 
 See [Recipe File](./recipe#env) for details.
 
@@ -102,7 +102,7 @@ not the environment:
   into binaries, so bundled libs resolve relative to the binary's own
   location on every exec. Executables that could not get one (no
   in-place slot and no `patchelf`, or self-extract binaries) are
-  reported at pack time — they fall back to `LD_LIBRARY_PATH` and are
+  reported at pack time. They fall back to `LD_LIBRARY_PATH` and are
   not re-exec-safe.
 - **`[env]` and `preload`**: a tiny freestanding `onelf-env`
   constructor is bundled into `lib/` and injected as a `DT_NEEDED` of

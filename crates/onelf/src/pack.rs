@@ -261,7 +261,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut symlinks: Vec<CollectedSymlink> = Vec::new();
 
     for entry in WalkDir::new(&dir).skip_hidden(false).sort(true) {
-        let entry = entry.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let entry = entry.map_err(io::Error::other)?;
         let abs_path = entry.path();
         let rel_path = abs_path.strip_prefix(&dir).unwrap().to_path_buf();
 
@@ -396,7 +396,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let package_name = opts
         .name
         .as_deref()
-        .unwrap_or_else(|| opts.command.split('/').last().unwrap_or("app"));
+        .unwrap_or_else(|| opts.command.split('/').next_back().unwrap_or("app"));
 
     // Detect bundled ELF interpreter for cross-libc portability.
     // When a matching interpreter is bundled (e.g. via bundle-libs), record its
@@ -575,7 +575,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Add the root entry name ("") at offset 0, then the package name next
     // so its offset stays small and fits the `u16` header field however
-    // large the rest of the string table grows (REVIEW §5.1). Offset 0 is
+    // large the rest of the string table grows. Offset 0 is
     // also the "unset" sentinel, so a non-empty name never lands there.
     let root_name = strings.add("");
     let name_offset = u16::try_from(strings.add(package_name)).map_err(|_| {
@@ -701,7 +701,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // When `default_entrypoint` names a declared `[[entrypoint]]`, the
     // default launch must use that entrypoint's path and args, not the
     // package command's, and the tuple must not also be appended below as a
-    // second entrypoint with the same name (REVIEW §5.4).
+    // second entrypoint with the same name.
     let default_decl = opts
         .default_entrypoint
         .as_deref()

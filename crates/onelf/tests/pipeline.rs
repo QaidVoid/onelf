@@ -30,10 +30,10 @@ fn have(cmd: &str) -> bool {
 
 /// `patchelf` location: `ONELF_PATCHELF`, then `PATH`. `None` if absent.
 fn patchelf() -> Option<String> {
-    if let Ok(p) = std::env::var("ONELF_PATCHELF") {
-        if Path::new(&p).is_file() {
-            return Some(p);
-        }
+    if let Ok(p) = std::env::var("ONELF_PATCHELF")
+        && Path::new(&p).is_file()
+    {
+        return Some(p);
     }
     have("patchelf").then(|| "patchelf".to_string())
 }
@@ -49,6 +49,28 @@ fn workdir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Point a packed binary at per-test scratch for its private runtime state
+/// and its extraction cache.
+///
+/// Without this every test shares `/tmp/onelf-<uid>` and `~/.cache/onelf`,
+/// so concurrently running tests contend over one set of mountpoints and one
+/// content store. `XDG_RUNTIME_DIR` is only honoured when it is `0700` and
+/// owned by us, so the mode is set explicitly rather than left to the umask.
+///
+/// Call this after any `env_clear`, or it will be wiped again.
+fn isolate(cmd: &mut Command, td: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let run = td.join("xdg-run");
+    let cache = td.join("xdg-cache");
+    for d in [&run, &cache] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, PermissionsExt::from_mode(0o700)).unwrap();
+    }
+    cmd.env("XDG_RUNTIME_DIR", &run)
+        .env("XDG_CACHE_HOME", &cache);
 }
 
 fn write(path: &Path, content: &str) {
@@ -494,10 +516,10 @@ fn corrupt_manifest_checksum_fails_to_run() {
     std::fs::write(&pkg, &bytes).unwrap();
     std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let out = Command::new(&pkg)
-        .env("HOME", td.to_str().unwrap())
-        .output()
-        .expect("run corrupt package");
+    let mut run = Command::new(&pkg);
+    run.env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run.output().expect("run corrupt package");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -599,12 +621,12 @@ int main(int argc, char **argv) {{
     assert!(pkg.is_file(), "no package produced\n{log}");
 
     // Run the package with an intentionally minimal environment.
-    let st = Command::new(&pkg)
-        .env_clear()
+    let mut run = Command::new(&pkg);
+    run.env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("HOME", td.to_str().unwrap())
-        .status()
-        .expect("run package");
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let st = run.status().expect("run package");
 
     if patchelf().is_some() {
         // Full guarantee: the constructor re-applies .onelf/env after
@@ -698,12 +720,12 @@ int main(void) {{
     );
 
     let pkg = app.join("defpath.onelf");
-    let st = Command::new(&pkg)
-        .env_clear()
+    let mut run = Command::new(&pkg);
+    run.env_clear()
         .env("HOME", "/xyzhome")
-        .env("PATH", "/sentinel/dir")
-        .status()
-        .expect("run package");
+        .env("PATH", "/sentinel/dir");
+    isolate(&mut run, &td);
+    let st = run.status().expect("run package");
     assert!(st.success());
 
     let r = std::fs::read_to_string(&result).expect("result file");
@@ -729,11 +751,10 @@ int main(void) {{
     // Run again with NO PATH at all (sandbox/clearenv shape): the
     // `${PATH:-/usr/bin:/bin}` default must fall back to system dirs,
     // with NO dangling empty element, and the helper still resolves.
-    let st = Command::new(&pkg)
-        .env_clear()
-        .env("HOME", td.to_str().unwrap())
-        .status()
-        .expect("run package (empty PATH)");
+    let mut run = Command::new(&pkg);
+    run.env_clear().env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let st = run.status().expect("run package (empty PATH)");
     assert!(st.success());
     let r = std::fs::read_to_string(&result).expect("result file");
     let path_line = r.lines().find(|l| l.starts_with("PATH=")).unwrap_or("");
@@ -754,7 +775,7 @@ int main(void) {{
 }
 
 /// A read-only (0555) directory in the source tree must not break
-/// extraction of its children (REVIEW §5.6): directory modes are applied
+/// extraction of its children: directory modes are applied
 /// deepest-first after files are written.
 #[test]
 fn readonly_directory_children_still_extract() {

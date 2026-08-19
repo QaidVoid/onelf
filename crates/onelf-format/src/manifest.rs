@@ -544,7 +544,16 @@ impl StringTableBuilder {
         self.data
     }
 
+    /// Current size of the table in bytes, which is also the offset the
+    /// next distinct string will be added at.
     pub fn len(&self) -> u32 {
         self.data.len() as u32
+    }
+
+    /// True before any string has been added. A table that has had even
+    /// the empty string added is non-empty, since each entry contributes
+    /// its terminating NUL.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }

@@ -94,11 +94,11 @@ fn set_portable_dir(dir: &Path, env_var: &str, default_subpath: Option<&str>) {
         if let Ok(current) = env::var(env_var) {
             // SAFETY: single-threaded at this point (before exec)
             unsafe { env::set_var(&real_var, current) };
-        } else if let Some(default) = default_subpath {
-            if let Ok(home) = env::var("HOME") {
-                let default_dir = PathBuf::from(home).join(default);
-                unsafe { env::set_var(&real_var, default_dir) };
-            }
+        } else if let Some(default) = default_subpath
+            && let Ok(home) = env::var("HOME")
+        {
+            let default_dir = PathBuf::from(home).join(default);
+            unsafe { env::set_var(&real_var, default_dir) };
         }
     }
 

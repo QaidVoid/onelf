@@ -135,7 +135,7 @@ Each `KEY = "VALUE"` pair becomes an env var set before `exec`.
 tmpfs, or cache dir). Other `${VAR}` expand at **recipe-load** time
 against the packer's environment; `$$` is an escape for a literal `$`,
 so `$${VAR}` reaches the package as `${VAR}` and expands against the
-**live** environment at runtime — use this to prepend instead of
+**live** environment at runtime. Use this to prepend instead of
 replace. POSIX `${VAR:-word}` is supported (use `word` if `VAR` is
 unset or empty).
 

@@ -64,12 +64,11 @@ unsafe extern "C" fn signal_handler(sig: core::ffi::c_int) {
     }
     // Forward other signals to child
     let pid = CHILD_PID.load(Ordering::Relaxed);
-    if pid > 0 {
-        if let Some(pid) = Pid::from_raw(pid) {
-            if let Some(signal) = Signal::from_named_raw(sig) {
-                let _ = kill_process(pid, signal);
-            }
-        }
+    if pid > 0
+        && let Some(pid) = Pid::from_raw(pid)
+        && let Some(signal) = Signal::from_named_raw(sig)
+    {
+        let _ = kill_process(pid, signal);
     }
 }
 
@@ -118,7 +117,10 @@ fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Execute directly from an existing FUSE mount (another instance is serving).
-/// This process becomes the child — no fork/FUSE loop needed.
+/// This process becomes the child, so no fork or FUSE loop is needed.
+// Threads the launch context straight to the exec call; grouping it
+// would add a type used at one call site.
+#[allow(clippy::too_many_arguments)]
 fn exec_from_mount(
     pkg: &mut PackageData,
     ep_idx: usize,
@@ -212,6 +214,9 @@ fn cleanup_mountpoint(mountpoint: &Path, used_namespace: bool) {
 ///
 /// On success, exits the process with the child's exit code (never returns).
 /// Returns `false` if FUSE is unavailable and caller should fall back.
+// Threads the launch context straight to the exec call; grouping it
+// would add a type used at one call site.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_fuse(
     pkg: &mut PackageData,
     ep_idx: usize,
@@ -234,7 +239,7 @@ pub fn execute_fuse(
             None => return false,
         };
 
-    // If already mounted by another instance, reuse it — just exec directly.
+    // If already mounted by another instance, reuse it and exec directly.
     // (Only reachable via the fusermount3 path; namespace mounts are private.)
     if is_mountpoint(&mountpoint) {
         if mountpoint.read_dir().is_ok() {
@@ -409,7 +414,7 @@ pub fn execute_fuse(
             // Close write end in parent -- only child holds it now
             drop(pipe_write);
 
-            CHILD_PID.store(child_pid.as_raw_nonzero().get() as i32, Ordering::Relaxed);
+            CHILD_PID.store(child_pid.as_raw_nonzero().get(), Ordering::Relaxed);
             install_signal_handlers();
 
             let mut state = fs::FuseState::new(

@@ -116,6 +116,9 @@ fn is_same_file(src: &Path, dest: &Path) -> bool {
 /// wrong-arch or dangling earlier copy never shadows a valid later one),
 /// removes an alias symlink at the destination before copying, and never
 /// copies a file onto itself. Returns `(files_copied, total_bytes)`.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 fn copy_libs(
     search_dirs: &[PathBuf],
     dest: &Path,
@@ -154,15 +157,15 @@ fn copy_libs(
             if !resolved.is_file() {
                 continue;
             }
-            if let Some(tc) = target_class {
-                if read_elf_class(&resolved) != Some(tc) {
-                    continue;
-                }
+            if let Some(tc) = target_class
+                && read_elf_class(&resolved) != Some(tc)
+            {
+                continue;
             }
-            if let Some(tm) = target_machine {
-                if read_elf_machine(&resolved) != Some(tm) {
-                    continue;
-                }
+            if let Some(tm) = target_machine
+                && read_elf_machine(&resolved) != Some(tm)
+            {
+                continue;
             }
             seen.insert(name.clone());
             let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
@@ -201,6 +204,9 @@ fn copy_libs(
 }
 
 /// Copy libraries whose file name starts with any of `prefixes`.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
 fn copy_prefixed_libs(
     search_dirs: &[PathBuf],
     prefixes: &[&str],
@@ -469,12 +475,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // stub loader (notably NixOS) have a PT_INTERP path that exists
         // but won't actually run foreign binaries, so the runtime needs
         // a real loader in the bundle to sidestep the stub.
-        if let Some(interp) = parse_interp(path) {
-            if let Some(name) = Path::new(&interp).file_name().and_then(|n| n.to_str()) {
-                needed_by
-                    .entry(name.to_string())
-                    .or_insert_with(|| format!("{requirer} (PT_INTERP)"));
-            }
+        if let Some(interp) = parse_interp(path)
+            && let Some(name) = Path::new(&interp).file_name().and_then(|n| n.to_str())
+        {
+            needed_by
+                .entry(name.to_string())
+                .or_insert_with(|| format!("{requirer} (PT_INTERP)"));
         }
         // Collect RPATH/RUNPATH directories from input binaries
         for dir in parse_rpaths(path) {
@@ -699,33 +705,33 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let content_hash: Option<[u8; 32]> = fs::read(&resolved)
                     .ok()
                     .map(|bytes| blake3::hash(&bytes).into());
-                if let Some(hash) = content_hash {
-                    if let Some(existing_name) = bundled_by_hash.get(&hash).cloned() {
-                        eprintln!(
-                            "  {} {} -> {} (alias for {}, {})",
-                            color::bold_green("Linked"),
-                            soname,
-                            existing_name,
-                            color::cyan(&requirer),
-                            color::dim(&format_size(size))
-                        );
-                        if !opts.dry_run {
-                            fs::create_dir_all(&lib_dest)?;
-                            let dest = lib_dest.join(&soname);
-                            if dest.exists() || dest.is_symlink() {
-                                let _ = fs::remove_file(&dest);
-                            }
-                            if let Err(e) = std::os::unix::fs::symlink(&existing_name, &dest) {
-                                eprintln!(
-                                    "  {} failed to symlink {} -> {}: {e}",
-                                    color::bold_red("warning:"),
-                                    soname,
-                                    existing_name
-                                );
-                            }
+                if let Some(hash) = content_hash
+                    && let Some(existing_name) = bundled_by_hash.get(&hash).cloned()
+                {
+                    eprintln!(
+                        "  {} {} -> {} (alias for {}, {})",
+                        color::bold_green("Linked"),
+                        soname,
+                        existing_name,
+                        color::cyan(&requirer),
+                        color::dim(&format_size(size))
+                    );
+                    if !opts.dry_run {
+                        fs::create_dir_all(&lib_dest)?;
+                        let dest = lib_dest.join(&soname);
+                        if dest.exists() || dest.is_symlink() {
+                            let _ = fs::remove_file(&dest);
                         }
-                        continue;
+                        if let Err(e) = std::os::unix::fs::symlink(&existing_name, &dest) {
+                            eprintln!(
+                                "  {} failed to symlink {} -> {}: {e}",
+                                color::bold_red("warning:"),
+                                soname,
+                                existing_name
+                            );
+                        }
                     }
+                    continue;
                 }
 
                 eprintln!(
@@ -764,14 +770,14 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     // real files (e.g. /nix/store/.../glibc/etc/ld.so.cache);
                     // on someone else's system they're dead paths at best and
                     // wrong-content paths at worst. Scrub before shipping.
-                    if is_dynamic_loader(&soname) {
-                        if let Err(e) = scrub_loader_paths(&dest) {
-                            eprintln!(
-                                "  {} failed to scrub loader paths in {}: {e}",
-                                color::bold_red("warning:"),
-                                soname
-                            );
-                        }
+                    if is_dynamic_loader(&soname)
+                        && let Err(e) = scrub_loader_paths(&dest)
+                    {
+                        eprintln!(
+                            "  {} failed to scrub loader paths in {}: {e}",
+                            color::bold_red("warning:"),
+                            soname
+                        );
                     }
                     if opts.strip {
                         strip_debug(&dest);
@@ -1170,7 +1176,7 @@ fn inspect_soname_for_frameworks(soname: &str, flags: &mut FrameworkFlags) {
 /// enable a framework bundler. Only matches on well-known soname stems
 /// to avoid false positives from arbitrary strings in the binary.
 ///
-/// A match must be a *versioned* soname — `lib<name>.so.<digit>...` — to
+/// A match must be a *versioned* soname, `lib<name>.so.<digit>...`, to
 /// flag a framework. We deliberately do not require a NUL boundary before
 /// the match: Rust's string-merging optimization packs string literals
 /// together without NUL separators, so genuine dlopen sonames in Rust
@@ -1179,7 +1185,7 @@ fn inspect_soname_for_frameworks(soname: &str, flags: &mut FrameworkFlags) {
 /// Requiring the version suffix is precise enough to keep those while still
 /// rejecting:
 /// - Unversioned soname text in prose (e.g. `"Library libwayland-client.so
-///   could not be loaded."` — the `.so` is followed by a space, not `.N`).
+///   could not be loaded."`, where the `.so` is followed by a space).
 /// - The bare `.so` fallback strings dlopen loaders carry alongside the
 ///   versioned form; the versioned sibling next to them is what we flag.
 fn scan_framework_strings(bytes: &[u8], flags: &mut FrameworkFlags) {
@@ -1305,15 +1311,14 @@ fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
             if start.is_none() {
                 start = Some(i);
             }
-        } else if let Some(s) = start.take() {
-            if i - s >= 5 {
-                if let Ok(text) = std::str::from_utf8(&data[s..i]) {
-                    let match_builtin = DLOPEN_CANDIDATES.iter().any(|c| *c == text);
-                    let match_extra = extra.iter().any(|c| c == text);
-                    if (match_builtin || match_extra) && !found.iter().any(|x| x == text) {
-                        found.push(text.to_string());
-                    }
-                }
+        } else if let Some(s) = start.take()
+            && i - s >= 5
+            && let Ok(text) = std::str::from_utf8(&data[s..i])
+        {
+            let match_builtin = DLOPEN_CANDIDATES.contains(&text);
+            let match_extra = extra.iter().any(|c| c == text);
+            if (match_builtin || match_extra) && !found.iter().any(|x| x == text) {
+                found.push(text.to_string());
             }
         }
     }
@@ -1538,7 +1543,7 @@ mod correctness_tests {
         // With an exclude for the soname, nothing is copied.
         let dest2 = d.join("dest2");
         let (copied2, _) = copy_prefixed_libs(
-            &[dir2.clone()],
+            std::slice::from_ref(&dir2),
             &["libGL"],
             &dest2,
             Some(2),
@@ -1581,7 +1586,7 @@ mod correctness_tests {
         assert!(!before.is_empty());
 
         let (_copied, _) = copy_prefixed_libs(
-            &[d.clone()],
+            std::slice::from_ref(&d),
             &["libself"],
             &d, // dest == search dir
             Some(2),
