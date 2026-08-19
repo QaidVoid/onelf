@@ -97,6 +97,18 @@ struct CollectedSymlink {
     mtime_nsec: u32,
 }
 
+/// Package-relative path the default entrypoint launches.
+///
+/// A recipe may point the default at a declared `[[entrypoint]]` rather than
+/// at the package command, and the two can name different binaries.
+fn default_entrypoint_path(opts: &PackOptions) -> PathBuf {
+    opts.default_entrypoint
+        .as_deref()
+        .and_then(|name| opts.entrypoints.iter().find(|(n, _, _)| n == name))
+        .map(|(_, path, _)| PathBuf::from(path))
+        .unwrap_or_else(|| PathBuf::from(&opts.command))
+}
+
 fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
     let mut lib_dirs = Vec::new();
     let Ok(canonical) = directory.canonicalize() else {
@@ -403,7 +415,19 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // relative path in .onelf/interp so the runtime can use userland-exec with
     // the bundled interpreter instead of the system one.
     {
-        let original_interp = files.iter().find_map(|f| elf_interp(&f.content));
+        // Read the interpreter off the entrypoint itself. Taking whichever
+        // ELF the walk reaches first can pick up a helper binary built
+        // against a different libc and record its loader instead.
+        //
+        // A bundled entrypoint often has no PT_INTERP left, because the
+        // bootstrap injection repurposed it, and then nothing is recorded.
+        // That is correct: the runtime only consults this file for targets
+        // that still carry an interpreter.
+        let entry_target = default_entrypoint_path(opts);
+        let original_interp = files
+            .iter()
+            .find(|f| f.rel_path == entry_target)
+            .and_then(|f| elf_interp(&f.content));
         let bundled_relpath = original_interp.as_ref().and_then(|interp| {
             let interp_name = Path::new(interp).file_name()?.to_str()?;
             let match_name = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some(interp_name);
@@ -667,6 +691,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         let target = strings.add(target_str);
         let parent_path = sl.rel_path.parent().unwrap_or(Path::new(""));
         let parent = *path_to_index.get(parent_path).unwrap_or(&0);
+        let idx = entries.len() as u32;
         entries.push(Entry {
             kind: EntryKind::Symlink,
             parent,
@@ -678,6 +703,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             blocks: Vec::new(),
             symlink_target: target,
         });
+        // Registered like files and directories so an entrypoint may target
+        // a symlink, which is how an AppDir usually exposes its launcher.
+        path_to_index.insert(sl.rel_path.clone(), idx);
     }
 
     // Build entrypoints
@@ -691,6 +719,21 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             format!("command path '{}' not found in directory", opts.command),
         )
     })?;
+
+    // Two entrypoints answering to one name would leave which of them runs
+    // up to resolution order, so the ambiguity is refused at pack time.
+    if let Some(dup) = opts
+        .entrypoints
+        .iter()
+        .enumerate()
+        .find(|(i, (n, _, _))| opts.entrypoints[..*i].iter().any(|(m, _, _)| m == n))
+        .map(|(_, (n, _, _))| n)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("duplicate entrypoint name '{dup}'"),
+        ));
+    }
 
     let default_name = opts
         .default_entrypoint
@@ -706,6 +749,18 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         .default_entrypoint
         .as_deref()
         .and_then(|dn| opts.entrypoints.iter().find(|(n, _, _)| n == dn));
+
+    // A default naming no declared entrypoint used to fall back to the
+    // package command under the typed name, silently producing something the
+    // recipe never described.
+    if let Some(name) = opts.default_entrypoint.as_deref()
+        && default_decl.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("default entrypoint '{name}' matches no declared entrypoint"),
+        ));
+    }
 
     let ep_name = strings.add(default_name);
     let empty_args = strings.add("");

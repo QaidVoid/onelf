@@ -653,6 +653,156 @@ int main(int argc, char **argv) {{
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// An AppDir usually exposes its launcher as a symlink, so an entrypoint
+/// must be able to target one. Symlinks used to be left out of the path
+/// index, which reported the launcher as missing from its own directory.
+#[test]
+fn entrypoint_may_target_a_symlink() {
+    let td = workdir("symlink-ep");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/real"), "#!/bin/sh\necho ran\n");
+    std::fs::set_permissions(
+        app.join("bin/real"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("real", app.join("bin/launch")).unwrap();
+
+    let out = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args(["--command", "bin/launch", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "packing a symlink entrypoint must succeed:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.is_file());
+
+    // Packing is only half of it: the runtime has to resolve the symlink
+    // entry to its target and execute through it.
+    let mut run = Command::new(&out);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let r = run.output().expect("run symlink-entrypoint package");
+    assert!(
+        r.status.success(),
+        "running through a symlink entrypoint failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "ran");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A default entrypoint naming nothing declared, or two entrypoints sharing
+/// a name, both used to be accepted and silently reinterpreted.
+#[test]
+fn ambiguous_entrypoints_are_refused() {
+    let td = workdir("ep-validate");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/a"), "#!/bin/sh\n");
+    write(&app.join("bin/b"), "#!/bin/sh\n");
+
+    let pack = |extra: &[&str]| {
+        Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o"])
+            .arg(td.join("out.onelf"))
+            .args(["--command", "bin/a", "--mtime", "0"])
+            .args(extra)
+            .output()
+            .expect("spawn onelf pack")
+    };
+
+    let o = pack(&["--entrypoint", "x=bin/a", "--default-entrypoint", "typo"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "an unmatched default must fail");
+    assert!(
+        err.contains("typo"),
+        "the message must name the value: {err}"
+    );
+
+    let o = pack(&["--entrypoint", "dup=bin/a", "--entrypoint", "dup=bin/b"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "a duplicate name must fail");
+    assert!(
+        err.contains("dup"),
+        "the message must name the value: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A packed app that launches another packed app must not hand it a mode.
+/// The runtime reads `ONELF_MODE` as a directive and never falls back when
+/// one is set, so reporting the chosen mode under that same name made a
+/// memfd parent abort any child that was not itself memfd-eligible.
+#[test]
+fn nested_packages_do_not_inherit_a_forced_mode() {
+    let td = workdir("nested");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("show.c");
+    write(
+        &src,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    const char *forced = getenv("ONELF_MODE");
+    const char *active = getenv("ONELF_ACTIVE_MODE");
+    printf("forced=[%s] active=[%s]\n", forced ? forced : "", active ? active : "");
+    return 0;
+}
+"#,
+    );
+    if !cc(&src, &app.join("bin/show")) {
+        return;
+    }
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname=\"nested\"\ncommand=\"bin/show\"\n",
+    );
+
+    let mut c = Command::new(onelf());
+    c.arg("build").current_dir(&app);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let pkg = app.join("nested.onelf");
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run.output().expect("run package");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("forced=[]"),
+        "the child must not see a forced mode: {stdout}"
+    );
+    assert!(
+        !stdout.contains("active=[]"),
+        "the active mode must still be reported: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Default behaviour: the package's own bin/ is prepended to PATH
 /// (re-exec-safe), and `[env]` values expand against the *live*
 /// environment at runtime (so `$${HOME}` defers to runtime, and the

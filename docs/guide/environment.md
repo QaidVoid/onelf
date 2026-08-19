@@ -8,7 +8,7 @@ entrypoint. Packaged apps can read these to discover their own context.
 | Variable | Value | Example |
 |----------|-------|---------|
 | `ONELF_DIR` | Mount/extract root | `/run/user/1000/onelf-myapp-ab12cd34` |
-| `ONELF_MODE` | Active mode | `fuse`, `tmpfs`, `memfd`, `cache`, `dev` |
+| `ONELF_ACTIVE_MODE` | Active mode | `fuse`, `tmpfs`, `memfd`, `cache`, `dev` |
 | `ONELF_ARGV0` | Original argv[0] | `myapp` |
 | `ONELF_EXEC` | Path to the packed binary | `/home/alice/bin/myapp.onelf` |
 | `ONELF_ENTRYPOINT` | Active entrypoint name | `myapp-daemon` |

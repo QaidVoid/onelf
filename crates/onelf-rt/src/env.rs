@@ -43,7 +43,7 @@ pub fn setup_env(
         env::set_var("ONELF_EXEC", exec_path);
         env::set_var("ONELF_ENTRYPOINT", entrypoint_name);
         env::set_var("ONELF_LAUNCH_DIR", &launch_dir);
-        env::set_var("ONELF_MODE", mode);
+        env::set_var("ONELF_ACTIVE_MODE", mode);
     }
 
     if onelf_dir.is_empty() {
@@ -259,31 +259,11 @@ fn is_elf_file(path: &str) -> bool {
     matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
-/// Return the host's driver / system library directories that exist on
-/// this system, in descending priority order. These are appended to the
-/// package's `LD_LIBRARY_PATH` so the bundled loader can locate host-
-/// provided GPU userspace drivers (libcuda, libvulkan, libGL, libva)
-/// without picking up host libraries that would clash with the bundle's
-/// own copies, which come first in the search path.
+/// Host driver directories for the architecture this runtime was built
+/// for, appended after the bundle's own libraries so a bundled copy always
+/// wins while host-provided GPU drivers stay reachable.
 fn host_driver_paths() -> Vec<String> {
-    // NixOS exposes all GPU userspace drivers under /run/opengl-driver,
-    // populated from the active nixpkgs `hardware.graphics` closure.
-    // On other distros, drivers live in the standard multiarch or lib64
-    // paths alongside the rest of the system's runtime libraries.
-    const CANDIDATES: &[&str] = &[
-        "/run/opengl-driver/lib",
-        "/run/opengl-driver-32/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib64",
-        "/usr/lib",
-        "/lib/x86_64-linux-gnu",
-        "/lib64",
-    ];
-    CANDIDATES
-        .iter()
-        .filter(|p| Path::new(p).is_dir())
-        .map(|s| (*s).to_string())
-        .collect()
+    onelf_format::drivers::host_driver_paths(std::env::consts::ARCH)
 }
 
 /// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find

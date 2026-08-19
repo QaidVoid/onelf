@@ -109,7 +109,7 @@ pub fn run(
     }
 
     cmd.env("ONELF_DIR", &dir);
-    cmd.env("ONELF_MODE", "dev");
+    cmd.env("ONELF_ACTIVE_MODE", "dev");
     cmd.env("ONELF_ARGV0", &ep_name);
     cmd.env("ONELF_EXEC", &target);
     cmd.env("ONELF_ENTRYPOINT", &ep_name);
@@ -416,24 +416,10 @@ fn is_elf_file_at(path: &Path) -> bool {
     matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
-/// Host driver / system library directories to append to LD_LIBRARY_PATH.
-/// See `onelf-rt`'s `env.rs` for rationale; kept in sync here so `onelf run`
-/// gets the same driver discovery behavior as packed runs.
+/// Host driver directories to append to `LD_LIBRARY_PATH`, shared with the
+/// packed runtime so a dev-mode run resolves them identically.
 fn host_driver_paths() -> Vec<String> {
-    const CANDIDATES: &[&str] = &[
-        "/run/opengl-driver/lib",
-        "/run/opengl-driver-32/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib64",
-        "/usr/lib",
-        "/lib/x86_64-linux-gnu",
-        "/lib64",
-    ];
-    CANDIDATES
-        .iter()
-        .filter(|p| Path::new(p).is_dir())
-        .map(|s| (*s).to_string())
-        .collect()
+    onelf_format::drivers::host_driver_paths(std::env::consts::ARCH)
 }
 
 /// Find subdirectories of `dir` that contain `.so*` files, skipping obvious

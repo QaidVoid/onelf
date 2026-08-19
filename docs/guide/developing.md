@@ -69,7 +69,7 @@ onelf run --entrypoint myapp-daemon -- --port 8080
 
 Same as a real packed run, minus the mount:
 
-- `ONELF_DIR`, `ONELF_MODE=dev`, `ONELF_ARGV0`, etc.
+- `ONELF_DIR`, `ONELF_ACTIVE_MODE=dev`, `ONELF_ARGV0`, etc.
 - `LD_LIBRARY_PATH` prepended with the AppDir's lib directories
 - `XDG_DATA_DIRS` prepended with `share/`
 - `LIBGL_DRIVERS_PATH`, `LIBVA_DRIVERS_PATH`, `GBM_BACKENDS_PATH`

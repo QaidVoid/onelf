@@ -28,6 +28,29 @@ fn tmpfs_size_for(pkg: &PackageData) -> u64 {
     with_overhead.max(8 * 1024 * 1024)
 }
 
+/// Whether `needed` bytes plausibly fit in memory, read from `MemAvailable`.
+///
+/// A tmpfs lives in RAM, so a package larger than what is available would
+/// mount fine and then fail partway through extraction. Checking first keeps
+/// that failure on the recoverable side of the namespace boundary, where the
+/// caller can still fall back to on-disk extraction. An unreadable or
+/// unparseable `meminfo` is treated as "no objection", leaving behaviour
+/// unchanged on kernels that do not report it.
+fn fits_in_memory(needed: u64) -> bool {
+    let Ok(info) = std::fs::read_to_string("/proc/meminfo") else {
+        return true;
+    };
+    let available_kb = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok());
+    match available_kb {
+        Some(kb) => needed <= kb.saturating_mul(1024),
+        None => true,
+    }
+}
+
 /// Execute the package in an ephemeral tmpfs mount. Never returns on success.
 /// Returns `false` if setup fails and the caller should fall back further.
 pub fn execute_tmpfs(
@@ -53,25 +76,32 @@ pub fn execute_tmpfs(
         };
     let mountpoint = claim.path().to_path_buf();
 
-    // Enter private user+mount namespace.
+    let size = tmpfs_size_for(pkg);
+    if !fits_in_memory(size) {
+        let _ = std::fs::remove_dir(&mountpoint);
+        return false;
+    }
+
+    // Unsharing is the point of no return: the caller's fallback to cache
+    // mode would otherwise run inside a user namespace it never asked for,
+    // which is exactly what `needs-setuid` exists to avoid. Everything that
+    // can fail and still be recovered from happens above this line; past it,
+    // a failure is terminal.
     if let Err(e) = mount::enter_namespace() {
         eprintln!("onelf-rt: tmpfs: enter_namespace failed: {e}");
         let _ = std::fs::remove_dir(&mountpoint);
         return false;
     }
 
-    // Mount a sized tmpfs at the mountpoint.
-    let size = tmpfs_size_for(pkg);
     if let Err(e) = mount::mount_tmpfs(&mountpoint, size) {
         eprintln!("onelf-rt: tmpfs: mount failed: {e}");
         let _ = std::fs::remove_dir(&mountpoint);
-        return false;
+        std::process::exit(1);
     }
 
-    // Extract everything directly into the tmpfs.
     if let Err(e) = crate::cache::extract_direct(pkg, &mountpoint) {
         eprintln!("onelf-rt: tmpfs: extract failed: {e}");
-        return false;
+        std::process::exit(1);
     }
 
     // Resolve entrypoint and set up environment.

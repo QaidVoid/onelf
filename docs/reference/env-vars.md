@@ -7,7 +7,7 @@ Reference for all environment variables onelf reads or sets.
 | Variable | Value |
 |----------|-------|
 | `ONELF_DIR` | Absolute path to the package root (FUSE mount, tmpfs, or cache dir). Empty string in `memfd` mode. |
-| `ONELF_MODE` | `memfd`, `fuse`, `tmpfs`, `cache`, or `dev` (set by `onelf run`) |
+| `ONELF_ACTIVE_MODE` | `memfd`, `fuse`, `tmpfs`, `cache`, or `dev` (set by `onelf run`) |
 | `ONELF_ARGV0` | Original `argv[0]` before multicall resolution |
 | `ONELF_EXEC` | Absolute path to the packed binary |
 | `ONELF_ENTRYPOINT` | Resolved entrypoint name |
@@ -39,7 +39,7 @@ var gets inherited by child processes the app spawns.
 
 | Variable | Effect |
 |----------|--------|
-| `ONELF_MODE` | Force a specific execution mode. On failure the runtime errors instead of falling back. |
+| `ONELF_MODE` | Force a specific execution mode. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` fallback path even when user namespaces are available. Useful for debugging mount visibility. |
 | `XDG_RUNTIME_DIR` | Where to create mountpoint dirs (falls back to `/tmp`) |
