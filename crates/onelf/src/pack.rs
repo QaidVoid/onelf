@@ -1066,67 +1066,19 @@ fn elf_has_no_deps(data: &[u8]) -> bool {
     }
 }
 
-/// Parse PT_INTERP from ELF data, returning the interpreter path.
+/// Interpreter path recorded in `data`'s `PT_INTERP`, if it has one.
+///
+/// Shares the runtime's bounds-checked program-header walk rather than
+/// keeping a second, unchecked copy of the same parse.
 fn elf_interp(data: &[u8]) -> Option<String> {
-    if data.len() < 64 || data[0..4] != *b"\x7fELF" {
-        return None;
-    }
-
-    let class = data[4];
-    let (e_phoff, e_phentsize, e_phnum) = match class {
-        2 => {
-            let e_phoff = u64::from_le_bytes(data[32..40].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[54..56].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[56..58].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
-        1 => {
-            let e_phoff = u32::from_le_bytes(data[28..32].try_into().ok()?) as usize;
-            let e_phentsize = u16::from_le_bytes(data[42..44].try_into().ok()?) as usize;
-            let e_phnum = u16::from_le_bytes(data[44..46].try_into().ok()?) as usize;
-            (e_phoff, e_phentsize, e_phnum)
-        }
-        _ => return None,
+    let (offset, size) = onelf_format::elf::pt_interp_slot(data)?;
+    let end = offset.checked_add(size)?;
+    let raw = data.get(offset..end)?;
+    let text = match raw.iter().position(|&b| b == 0) {
+        Some(nul) => &raw[..nul],
+        None => raw,
     };
-
-    for i in 0..e_phnum {
-        let off = e_phoff + i * e_phentsize;
-        if off + e_phentsize > data.len() {
-            break;
-        }
-
-        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
-        if p_type != 3 {
-            continue;
-        }
-
-        let (p_offset, p_filesz) = match class {
-            2 => {
-                let o = u64::from_le_bytes(data[off + 8..off + 16].try_into().ok()?) as usize;
-                let s = u64::from_le_bytes(data[off + 32..off + 40].try_into().ok()?) as usize;
-                (o, s)
-            }
-            1 => {
-                let o = u32::from_le_bytes(data[off + 4..off + 8].try_into().ok()?) as usize;
-                let s = u32::from_le_bytes(data[off + 16..off + 20].try_into().ok()?) as usize;
-                (o, s)
-            }
-            _ => return None,
-        };
-
-        if p_offset + p_filesz > data.len() {
-            return None;
-        }
-
-        let interp = &data[p_offset..p_offset + p_filesz];
-        let interp = match interp.iter().position(|&b| b == 0) {
-            Some(pos) => &interp[..pos],
-            None => interp,
-        };
-        return std::str::from_utf8(interp).ok().map(String::from);
-    }
-
-    None
+    std::str::from_utf8(text).ok().map(String::from)
 }
 
 #[cfg(test)]

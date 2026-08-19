@@ -71,7 +71,7 @@ fn read_pt_interp(binary: &Path) -> io::Result<String> {
     let n = file.read(&mut data)?;
     data.truncate(n);
 
-    let (p_offset, p_filesz) = crate::interp::pt_interp_slot(&data)
+    let (p_offset, p_filesz) = onelf_format::elf::pt_interp_slot(&data)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no PT_INTERP entry"))?;
 
     // PT_INTERP is a path string; reject absurd sizes so a malformed ELF
@@ -218,7 +218,7 @@ pub fn symlink_interp(binary: &Path, bundled_linker: &Path) -> io::Result<PathBu
 /// the same so any self-extract trailer at the end is preserved).
 fn patch_pt_interp_in_place(binary: &Path, new_interp: &str) -> io::Result<()> {
     let mut data = fs::read(binary)?;
-    let (p_offset, p_filesz) = crate::interp::pt_interp_slot(&data)
+    let (p_offset, p_filesz) = onelf_format::elf::pt_interp_slot(&data)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no PT_INTERP entry"))?;
     let slot_end = p_offset
         .checked_add(p_filesz)

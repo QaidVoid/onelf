@@ -65,10 +65,9 @@ pub fn handle_metadata_flags(args: &[String], pkg: &mut PackageData, ep_name: &s
     let entry = &pkg.manifest.entries[idx];
     match crate::loader::read_payload_blocks(
         &mut pkg.file,
-        pkg.footer.payload_offset,
+        &pkg.footer,
         &entry.blocks,
         pkg.dict.as_deref(),
-        pkg.footer.is_stored(),
     ) {
         Ok(data) => {
             if let Err(e) = io::stdout().write_all(&data) {

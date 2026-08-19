@@ -44,10 +44,9 @@ pub(crate) fn decompress_entry(
     let mut result = Vec::new();
 
     for block in &entry.blocks {
-        file.seek(SeekFrom::Start(
-            footer.payload_offset + block.payload_offset,
-        ))?;
-        let mut compressed = vec![0u8; block.compressed_size as usize];
+        let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
+        file.seek(SeekFrom::Start(abs))?;
+        let mut compressed = vec![0u8; len];
         file.read_exact(&mut compressed)?;
 
         // Store mode: bytes are the file content verbatim, no zstd.
@@ -60,7 +59,7 @@ pub(crate) fn decompress_entry(
         // hostile block cannot expand without bound (zstd-bomb), and the
         // exact-length check below rejects any block that does not
         // reproduce its recorded size.
-        let cap = block.original_size as usize;
+        let cap = onelf_format::reader::block_original_size(block)?;
         let decompressed = if let Some(d) = dict {
             let mut dec = zstd::bulk::Decompressor::with_dictionary(d)?;
             dec.decompress(&compressed, cap).map_err(|e| {

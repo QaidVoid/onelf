@@ -12,13 +12,7 @@ use crate::metadata::{resolve_desktop, resolve_icon};
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
-    crate::loader::read_payload_blocks(
-        &mut pkg.file,
-        pkg.footer.payload_offset,
-        &blocks,
-        pkg.dict.as_deref(),
-        pkg.footer.is_stored(),
-    )
+    crate::loader::read_payload_blocks(&mut pkg.file, &pkg.footer, &blocks, pkg.dict.as_deref())
 }
 
 fn xdg_data_home() -> Option<PathBuf> {

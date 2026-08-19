@@ -99,35 +99,32 @@ pub fn load() -> io::Result<PackageData> {
     })
 }
 
+/// Read and decompress a single payload block.
 pub fn read_payload_entry(
     file: &mut File,
-    payload_offset: u64,
-    entry_offset: u64,
-    compressed_size: u64,
-    original_size: u64,
+    footer: &Footer,
+    block: &onelf_format::Block,
     dict: Option<&[u8]>,
-    stored: bool,
 ) -> io::Result<Vec<u8>> {
-    let abs = payload_offset
-        .checked_add(entry_offset)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload offset overflow"))?;
+    let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
     file.seek(SeekFrom::Start(abs))?;
-    let mut buf = vec![0u8; compressed_size as usize];
+    let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
 
     // Store mode: bytes are the file content verbatim, no zstd.
-    if stored {
+    if footer.is_stored() {
         return Ok(buf);
     }
+    let original = onelf_format::reader::block_original_size(block)?;
 
     let data = if let Some(d) = dict {
         let cursor = Cursor::new(&buf);
         let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
-        let mut result = Vec::with_capacity(original_size as usize);
+        let mut result = Vec::with_capacity(original);
         decoder.read_to_end(&mut result)?;
         result
     } else {
-        zstd::bulk::decompress(&buf, original_size as usize).map_err(|e| {
+        zstd::bulk::decompress(&buf, original).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
         })?
     };
@@ -146,13 +143,7 @@ pub fn read_verified_entry(
     entry: &Entry,
     dict: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
-    let data = read_payload_blocks(
-        file,
-        footer.payload_offset,
-        &entry.blocks,
-        dict,
-        footer.is_stored(),
-    )?;
+    let data = read_payload_blocks(file, footer, &entry.blocks, dict)?;
     if blake3::hash(&data).as_bytes() != &entry.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -162,37 +153,36 @@ pub fn read_verified_entry(
     Ok(data)
 }
 
+/// Read and concatenate every block of an entry.
 pub fn read_payload_blocks(
     file: &mut File,
-    payload_offset: u64,
+    footer: &Footer,
     blocks: &[onelf_format::Block],
     dict: Option<&[u8]>,
-    stored: bool,
 ) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();
 
     for block in blocks {
-        let abs = payload_offset
-            .checked_add(block.payload_offset)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload offset overflow"))?;
+        let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
         file.seek(SeekFrom::Start(abs))?;
-        let mut buf = vec![0u8; block.compressed_size as usize];
+        let mut buf = vec![0u8; len];
         file.read_exact(&mut buf)?;
 
         // Store mode: bytes are the file content verbatim, no zstd.
-        if stored {
+        if footer.is_stored() {
             result.extend_from_slice(&buf);
             continue;
         }
+        let original = onelf_format::reader::block_original_size(block)?;
 
         let decompressed = if let Some(d) = dict {
             let cursor = Cursor::new(&buf);
             let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
-            let mut block_result = Vec::with_capacity(block.original_size as usize);
+            let mut block_result = Vec::with_capacity(original);
             decoder.read_to_end(&mut block_result)?;
             block_result
         } else {
-            zstd::bulk::decompress(&buf, block.original_size as usize).map_err(|e| {
+            zstd::bulk::decompress(&buf, original).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
             })?
         };

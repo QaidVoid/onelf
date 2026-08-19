@@ -133,6 +133,30 @@ pub fn read_dict<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<
     Ok(Some(buf))
 }
 
+/// Read and verify the manifest `footer` describes, from an already
+/// bounds-checked file.
+fn read_manifest<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<Manifest> {
+    reader.seek(SeekFrom::Start(footer.manifest_offset))?;
+    let mut compressed = vec![0u8; footer.manifest_compressed as usize];
+    reader.read_exact(&mut compressed)?;
+
+    let bytes =
+        zstd::bulk::decompress(&compressed, footer.manifest_original as usize).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest decompression failed: {e}"),
+            )
+        })?;
+
+    if xxhash_rust::xxh32::xxh32(&bytes, 0).to_le_bytes() != footer.manifest_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest checksum mismatch",
+        ));
+    }
+    Manifest::deserialize(&bytes)
+}
+
 pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -144,38 +168,16 @@ pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
         ));
     }
 
-    // Read the footer from the last FOOTER_SIZE (76) bytes.
     file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
     let mut footer_buf = [0u8; FOOTER_SIZE];
     file.read_exact(&mut footer_buf)?;
     let footer = Footer::from_bytes(&footer_buf)?;
 
-    // Read and decompress manifest
-    file.seek(SeekFrom::Start(footer.manifest_offset))?;
-    let mut manifest_compressed = vec![0u8; footer.manifest_compressed as usize];
-    file.read_exact(&mut manifest_compressed)?;
+    // Every size below comes from the footer, so nothing may be allocated or
+    // seeked to before the regions are checked against the real file.
+    onelf_format::reader::validate_footer(&footer, file_size)?;
 
-    let manifest_bytes =
-        zstd::bulk::decompress(&manifest_compressed, footer.manifest_original as usize).map_err(
-            |e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("manifest decompression failed: {e}"),
-                )
-            },
-        )?;
-
-    // Verify checksum
-    let checksum = xxhash_rust::xxh32::xxh32(&manifest_bytes, 0).to_le_bytes();
-    if checksum != footer.manifest_checksum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "manifest checksum mismatch",
-        ));
-    }
-
-    let manifest = Manifest::deserialize(&manifest_bytes)?;
-
+    let manifest = read_manifest(&mut file, &footer)?;
     Ok((footer, manifest))
 }
 

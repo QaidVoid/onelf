@@ -136,10 +136,9 @@ fn main() {
         // so an in-memory exec never runs unverified bytes.
         let verified = loader::read_payload_blocks(
             &mut pkg.file,
-            pkg.footer.payload_offset,
+            &pkg.footer,
             &target_blocks,
             pkg.dict.as_deref(),
-            pkg.footer.is_stored(),
         )
         .ok()
         .filter(|d| blake3::hash(d).as_bytes() == &target_hash);
@@ -321,10 +320,9 @@ fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8
     })?;
     loader::read_payload_blocks(
         &mut pkg.file,
-        pkg.footer.payload_offset,
+        &pkg.footer,
         &pkg.manifest.entries[idx].blocks,
         pkg.dict.as_deref(),
-        pkg.footer.is_stored(),
     )
     .ok()
 }

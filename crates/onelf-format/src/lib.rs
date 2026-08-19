@@ -5,9 +5,11 @@ mod macros;
 
 pub mod cache_layout;
 pub mod drivers;
+pub mod elf;
 pub mod entry;
 pub mod footer;
 pub mod manifest;
+pub mod reader;
 
 pub use entry::{Block, Entry, EntryKind, EntryPoint, EntryPointFlags, WorkingDir};
 pub use footer::{END_MAGIC, FOOTER_SIZE, Flags, Footer, MAGIC};

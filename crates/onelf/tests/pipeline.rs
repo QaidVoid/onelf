@@ -653,6 +653,68 @@ int main(int argc, char **argv) {{
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Every inspection command parses whatever file it is handed, so a footer
+/// claiming regions the file cannot back must produce an error rather than
+/// an allocation sized by the claim.
+#[test]
+fn crafted_footer_is_refused_by_every_reader() {
+    let td = workdir("crafted");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\n");
+
+    let good = td.join("good.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", good.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    // The footer sits in the last 76 bytes; manifest_compressed is 8 bytes
+    // at offset 20 within it.
+    let mut bytes = std::fs::read(&good).unwrap();
+    let footer_at = bytes.len() - 76;
+    bytes[footer_at + 20..footer_at + 28].copy_from_slice(&u64::MAX.to_le_bytes());
+    let bad = td.join("bad.onelf");
+    std::fs::write(&bad, &bytes).unwrap();
+
+    for cmd in ["info", "list", "verify"] {
+        let o = Command::new(onelf())
+            .arg(cmd)
+            .arg(&bad)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn onelf {cmd}: {e}"));
+        // A clean exit code, not a signal: sizing an allocation from the
+        // crafted field used to abort the process instead of reporting.
+        assert_eq!(
+            o.status.code(),
+            Some(1),
+            "`onelf {cmd}` must exit with an error, not die on a bad alloc"
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("out of bounds"),
+            "`onelf {cmd}` must name the bounds failure, got: {err}"
+        );
+    }
+
+    let o = Command::new(onelf())
+        .args(["extract"])
+        .arg(&bad)
+        .args(["-o"])
+        .arg(td.join("out"))
+        .output()
+        .expect("spawn onelf extract");
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "extract must exit with an error, not die on a bad alloc"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// An AppDir usually exposes its launcher as a symlink, so an entrypoint
 /// must be able to target one. Symlinks used to be left out of the path
 /// index, which reported the launcher as missing from its own directory.

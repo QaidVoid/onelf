@@ -117,9 +117,8 @@ impl BlockCache {
 pub struct FuseState<'a> {
     manifest: &'a Manifest,
     file: &'a mut File,
-    payload_offset: u64,
+    footer: &'a onelf_format::Footer,
     dict: Option<&'a [u8]>,
-    stored: bool,
     children: Vec<Vec<u64>>,
     cache: BlockCache,
     /// Per-inode verdict of whole-entry BLAKE3 verification, computed
@@ -131,17 +130,15 @@ impl<'a> FuseState<'a> {
     pub fn new(
         manifest: &'a Manifest,
         file: &'a mut File,
-        payload_offset: u64,
+        footer: &'a onelf_format::Footer,
         dict: Option<&'a [u8]>,
-        stored: bool,
     ) -> Self {
         let children = build_children(manifest);
         Self {
             manifest,
             file,
-            payload_offset,
+            footer,
             dict,
-            stored,
             children,
             cache: BlockCache::new(),
             verified: HashMap::new(),
@@ -156,13 +153,8 @@ impl<'a> FuseState<'a> {
             return ok;
         }
         let entry = &self.manifest.entries[entry_idx];
-        let ok = match loader::read_payload_blocks(
-            self.file,
-            self.payload_offset,
-            &entry.blocks,
-            self.dict,
-            self.stored,
-        ) {
+        let ok = match loader::read_payload_blocks(self.file, self.footer, &entry.blocks, self.dict)
+        {
             Ok(data) => blake3::hash(&data).as_bytes() == &entry.content_hash,
             Err(_) => false,
         };
@@ -356,15 +348,7 @@ impl<'a> FuseState<'a> {
                 continue;
             }
             let block = &entry.blocks[block_idx];
-            match loader::read_payload_entry(
-                self.file,
-                self.payload_offset,
-                block.payload_offset,
-                block.compressed_size,
-                block.original_size,
-                self.dict,
-                self.stored,
-            ) {
+            match loader::read_payload_entry(self.file, self.footer, block, self.dict) {
                 Ok(data) => {
                     self.cache.insert_block(inode, block_idx, data);
                 }
@@ -381,16 +365,8 @@ impl<'a> FuseState<'a> {
             let next = last_needed + 1;
             if next < num_blocks && self.cache.get_block(inode, next).is_none() {
                 let block = &entry.blocks[next];
-                let _ = loader::read_payload_entry(
-                    self.file,
-                    self.payload_offset,
-                    block.payload_offset,
-                    block.compressed_size,
-                    block.original_size,
-                    self.dict,
-                    self.stored,
-                )
-                .map(|data| self.cache.insert_block(inode, next, data));
+                let _ = loader::read_payload_entry(self.file, self.footer, block, self.dict)
+                    .map(|data| self.cache.insert_block(inode, next, data));
             }
         }
 
