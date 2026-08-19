@@ -73,6 +73,27 @@ fn isolate(cmd: &mut Command, td: &Path) {
         .env("XDG_CACHE_HOME", &cache);
 }
 
+/// Execute a packed binary, retrying briefly while the kernel reports the
+/// file as busy.
+///
+/// A test writes a package and immediately execs it while sibling tests are
+/// forking `onelf` subprocesses. A child forked between the write's `open`
+/// and its `exec` inherits the writable descriptor, and Linux refuses to
+/// execute a file that anyone holds open for writing. The window is short,
+/// so a bounded retry is enough.
+fn run_package(cmd: &mut Command) -> std::process::Output {
+    for _ in 0..100 {
+        match cmd.output() {
+            Ok(out) => return out,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("run package: {e}"),
+        }
+    }
+    panic!("package remained busy after repeated attempts")
+}
+
 fn write(path: &Path, content: &str) {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).unwrap();
@@ -519,7 +540,7 @@ fn corrupt_manifest_checksum_fails_to_run() {
     let mut run = Command::new(&pkg);
     run.env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let out = run.output().expect("run corrupt package");
+    let out = run_package(&mut run);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -626,7 +647,7 @@ int main(int argc, char **argv) {{
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let st = run.status().expect("run package");
+    let st = run_package(&mut run).status;
 
     if patchelf().is_some() {
         // Full guarantee: the constructor re-applies .onelf/env after
@@ -649,6 +670,119 @@ int main(int argc, char **argv) {{
             "expected a fail-loud patchelf warning:\n{log}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Identical content is compressed and stored once, and every path that
+/// shares it still extracts correctly.
+#[test]
+fn identical_content_is_stored_once() {
+    let td = workdir("dedup");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\n");
+
+    // Content that does not compress to nothing, so the payload figure
+    // reflects whether it was stored once or ten times.
+    let body: Vec<u8> = (0..2_000_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    for i in 0..10 {
+        std::fs::write(app.join(format!("copy_{i}.bin")), &body).unwrap();
+    }
+    std::fs::write(app.join("unique.bin"), b"only once").unwrap();
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--level", "1"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The payload is what dedup affects; the embedded runtime dominates
+    // total file size and would mask the difference.
+    let info = Command::new(onelf())
+        .arg("info")
+        .arg(&pkg)
+        .output()
+        .expect("spawn onelf info");
+    let text = String::from_utf8_lossy(&info.stdout);
+    let payload: u64 = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Size:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("could not read payload size from:\n{text}"));
+
+    // Ten copies of a 2 MB body stored separately would exceed 20 MB.
+    assert!(
+        payload < 6_000_000,
+        "duplicate content was not shared: payload is {payload} bytes"
+    );
+
+    let out = td.join("x");
+    let o = Command::new(onelf())
+        .args(["extract"])
+        .arg(&pkg)
+        .args(["-o"])
+        .arg(&out)
+        .output()
+        .expect("spawn onelf extract");
+    assert!(o.status.success(), "extract failed");
+    for i in 0..10 {
+        let got = std::fs::read(out.join(format!("copy_{i}.bin"))).unwrap();
+        assert_eq!(got, body, "copy_{i} must round-trip");
+    }
+    assert_eq!(std::fs::read(out.join("unique.bin")).unwrap(), b"only once");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Packing must not hold the whole tree, so a chunk budget far below the
+/// tree size has to produce exactly the same bytes as one big chunk.
+#[test]
+fn chunk_budget_does_not_change_output() {
+    let td = workdir("chunked");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\n");
+    for i in 0..12 {
+        let body: Vec<u8> = (0..300_000u32)
+            .map(|v| (v.wrapping_add(i) % 251) as u8)
+            .collect();
+        std::fs::write(app.join(format!("f{i:02}.bin")), &body).unwrap();
+    }
+
+    let pack_with = |budget: &str, out: &Path| {
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0", "--level", "3"])
+            .env("ONELF_PACK_CHUNK_BYTES", budget)
+            .output()
+            .expect("spawn onelf pack");
+        assert!(
+            o.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+
+    let small = td.join("small.onelf");
+    let big = td.join("big.onelf");
+    pack_with("65536", &small);
+    pack_with("999999999", &big);
+
+    assert_eq!(
+        std::fs::read(&small).unwrap(),
+        std::fs::read(&big).unwrap(),
+        "the chunk budget is a memory bound, not a format choice"
+    );
 
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -705,7 +839,7 @@ fn a_tampered_block_is_refused_but_neighbours_still_read() {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let out = run.output().expect("run tampered package");
+    let out = run_package(&mut run);
 
     // However the runtime unpacks it, the altered bytes must never reach
     // the caller: either the read fails or extraction refuses outright.
@@ -817,7 +951,7 @@ fn entrypoint_may_target_a_symlink() {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let r = run.output().expect("run symlink-entrypoint package");
+    let r = run_package(&mut run);
     assert!(
         r.status.success(),
         "running through a symlink entrypoint failed: {}",
@@ -916,7 +1050,7 @@ int main(void) {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let out = run.output().expect("run package");
+    let out = run_package(&mut run);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(
@@ -1003,7 +1137,7 @@ int main(void) {{
         .env("HOME", "/xyzhome")
         .env("PATH", "/sentinel/dir");
     isolate(&mut run, &td);
-    let st = run.status().expect("run package");
+    let st = run_package(&mut run).status;
     assert!(st.success());
 
     let r = std::fs::read_to_string(&result).expect("result file");
@@ -1032,7 +1166,7 @@ int main(void) {{
     let mut run = Command::new(&pkg);
     run.env_clear().env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let st = run.status().expect("run package (empty PATH)");
+    let st = run_package(&mut run).status;
     assert!(st.success());
     let r = std::fs::read_to_string(&result).expect("result file");
     let path_line = r.lines().find(|l| l.starts_with("PATH=")).unwrap_or("");

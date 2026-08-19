@@ -9,6 +9,7 @@
 //! 6. Writes the final binary: `[runtime ELF][manifest][payload][dict?][footer]`
 
 use crate::bundle::format_size;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -65,9 +66,33 @@ pub struct PackOptions {
     pub needs_setuid: bool,
 }
 
+/// Where a file's bytes come from when they are finally needed.
+///
+/// Holding every file's content in memory made peak usage a multiple of the
+/// input tree, which capped the packer well below the sizes it is meant for.
+/// Real files are read during the content pass and dropped again; only the
+/// synthetic `.onelf/*` metadata, which is small and has no file behind it,
+/// is carried in memory.
+enum FileSource {
+    Disk(PathBuf),
+    Memory(Vec<u8>),
+}
+
+impl FileSource {
+    fn read(&self) -> io::Result<Cow<'_, [u8]>> {
+        match self {
+            FileSource::Disk(path) => Ok(Cow::Owned(fs::read(path)?)),
+            FileSource::Memory(bytes) => Ok(Cow::Borrowed(bytes)),
+        }
+    }
+}
+
 struct CollectedFile {
     rel_path: PathBuf,
-    content: Vec<u8>,
+    source: FileSource,
+    /// Size in bytes, recorded during the metadata walk so the content pass
+    /// can bound how much it loads without stat-ing again.
+    size: u64,
     mode: u32,
     mtime_secs: u64,
     mtime_nsec: u32,
@@ -75,7 +100,7 @@ struct CollectedFile {
 
 struct CompressedFile {
     rel_path: PathBuf,
-    blocks: Vec<compress::CompressedBlock>,
+    blocks: Vec<onelf_format::Block>,
     content_hash: [u8; 32],
     mode: u32,
     mtime_secs: u64,
@@ -107,6 +132,84 @@ fn default_entrypoint_path(opts: &PackOptions) -> PathBuf {
         .and_then(|name| opts.entrypoints.iter().find(|(n, _, _)| n == name))
         .map(|(_, path, _)| PathBuf::from(path))
         .unwrap_or_else(|| PathBuf::from(&opts.command))
+}
+
+/// Bytes of file content held in flight during compression.
+///
+/// This is what bounds the packer independently of tree size. Counting files
+/// instead of bytes does not: a chunk of 64 files is most of a tree that has
+/// 82 of them, so the whole thing ends up resident anyway.
+///
+/// Peak usage is roughly this budget plus the compressed output of the same
+/// chunk. Override with `ONELF_PACK_CHUNK_BYTES`.
+fn compression_budget() -> u64 {
+    const DEFAULT: u64 = 64 * 1024 * 1024;
+    std::env::var("ONELF_PACK_CHUNK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Split `files` into runs whose total size stays within `budget`.
+///
+/// A file larger than the budget forms a run of its own rather than being
+/// skipped, since it still has to be compressed. Order is preserved, so
+/// payload offsets remain a function of the sorted walk.
+fn size_bounded_chunks(files: &[CollectedFile], budget: u64) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for (i, f) in files.iter().enumerate() {
+        if i > start && acc + f.size > budget {
+            runs.push((start, i));
+            start = i;
+            acc = 0;
+        }
+        acc += f.size;
+    }
+    if start < files.len() {
+        runs.push((start, files.len()));
+    }
+    runs
+}
+
+/// Total bytes of sample fed to dictionary training.
+///
+/// zstd's guidance is roughly 100x the dictionary size, and the dictionary is
+/// capped at 1 MiB, so this is already generous. Sampling matters because the
+/// previous implementation copied every file twice: once to build the sample
+/// list and again to flatten it.
+const DICT_SAMPLE_BUDGET: usize = 100 * 1024 * 1024;
+
+/// Per-file cap on the sample, so one huge file cannot crowd out the variety
+/// that makes a dictionary useful.
+const DICT_SAMPLE_PER_FILE: usize = 1024 * 1024;
+
+/// Train a zstd dictionary from a bounded, deterministic sample.
+///
+/// Files are taken in the walk's sorted order until the budget is spent, so
+/// the same tree always trains the same dictionary and output stays
+/// reproducible.
+fn build_dictionary_sampled(files: &[CollectedFile], dict_size: usize) -> io::Result<Vec<u8>> {
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0usize;
+    for f in files {
+        if total >= DICT_SAMPLE_BUDGET {
+            break;
+        }
+        let content = f.source.read()?;
+        if content.is_empty() {
+            continue;
+        }
+        let take = content.len().min(DICT_SAMPLE_PER_FILE);
+        samples.push(content[..take].to_vec());
+        total += take;
+    }
+    if samples.len() < 2 {
+        return Err(io::Error::other("not enough sample data"));
+    }
+    compress::build_dictionary(&samples, dict_size)
 }
 
 fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
@@ -223,9 +326,11 @@ fn inject_onelf_file(
             mtime_nsec: 0,
         });
     }
+    let size = content.len() as u64;
     files.push(CollectedFile {
         rel_path: PathBuf::from(rel_path),
-        content,
+        source: FileSource::Memory(content),
+        size,
         mode: 0o644,
         mtime_secs: mtime,
         mtime_nsec: 0,
@@ -319,10 +424,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 mtime_nsec,
             });
         } else if symlink_meta.is_file() {
-            let content = fs::read(&abs_path)?;
             files.push(CollectedFile {
                 rel_path,
-                content,
+                source: FileSource::Disk(abs_path.clone()),
+                size: symlink_meta.len(),
                 mode,
                 mtime_secs,
                 mtime_nsec,
@@ -427,7 +532,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         let original_interp = files
             .iter()
             .find(|f| f.rel_path == entry_target)
-            .and_then(|f| elf_interp(&f.content));
+            .and_then(|f| f.source.read().ok())
+            .and_then(|c| elf_interp(&c));
         let bundled_relpath = original_interp.as_ref().and_then(|interp| {
             let interp_name = Path::new(interp).file_name()?.to_str()?;
             let match_name = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some(interp_name);
@@ -518,8 +624,14 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         symlinks.len()
     ));
 
-    // Optionally build dictionary (needs enough sample data)
-    let total_content_size: usize = files.iter().map(|f| f.content.len()).sum();
+    let total_content_size: u64 = files
+        .iter()
+        .map(|f| match &f.source {
+            FileSource::Disk(p) => fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            FileSource::Memory(b) => b.len() as u64,
+        })
+        .sum();
+
     let dict = if opts.no_compress {
         // Store mode writes raw bytes; a dictionary would be unused.
         if opts.use_dict {
@@ -529,9 +641,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     } else if opts.use_dict && files.len() > 1 && total_content_size > 4096 {
         let pb = ProgressBar::new_spinner();
         pb.set_message("Building dictionary...");
-        let samples: Vec<Vec<u8>> = files.iter().map(|f| f.content.clone()).collect();
-        let dict_size = 1_048_576.min(total_content_size / 2);
-        match compress::build_dictionary(&samples, dict_size) {
+        let dict_size = 1_048_576.min(total_content_size as usize / 2);
+        match build_dictionary_sampled(&files, dict_size) {
             Ok(dict) => {
                 pb.finish_with_message("Dictionary built");
                 Some(dict)
@@ -545,7 +656,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         None
     };
 
-    // Compress files in parallel
+    // Compress in bounded chunks, streaming each file's blocks out to a temp
+    // payload as they are produced. Holding the whole tree, or the whole
+    // compressed payload, made peak memory a multiple of the input size.
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -559,30 +672,81 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         "Compressing files..."
     });
 
-    let compressed_files: Vec<CompressedFile> = files
-        .par_iter()
-        .map(|f| -> io::Result<CompressedFile> {
-            let content_hash: [u8; 32] = *blake3::hash(&f.content).as_bytes();
+    let payload_tmp_path = opts.output.with_extension("onelf-payload.tmp");
+    let mut payload_tmp = BufWriter::new(File::create(&payload_tmp_path)?);
+    let mut payload_offset: u64 = 0;
+    let mut compressed_files: Vec<CompressedFile> = Vec::with_capacity(files.len());
+    // Identical content is written once and shared, so a tree with repeated
+    // files pays for them once rather than per path.
+    let mut seen: HashMap<[u8; 32], Vec<onelf_format::Block>> = HashMap::new();
+    let mut deduped_bytes: u64 = 0;
 
-            let blocks = if opts.no_compress {
-                compress::store_in_blocks(&f.content)
-            } else {
-                compress::compress_in_blocks(&f.content, opts.level, dict.as_deref()).map_err(
-                    |e| io::Error::other(format!("compress {}: {e}", f.rel_path.display())),
-                )?
-            };
+    let result = (|| -> io::Result<()> {
+        for (from, to) in size_bounded_chunks(&files, compression_budget()) {
+            let chunk = &files[from..to];
+            let done: Vec<(usize, [u8; 32], Vec<compress::CompressedBlock>)> = chunk
+                .par_iter()
+                .enumerate()
+                .map(|(i, f)| -> io::Result<_> {
+                    let content = f.source.read()?;
+                    let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
+                    let blocks = if opts.no_compress {
+                        compress::store_in_blocks(&content)
+                    } else {
+                        compress::compress_in_blocks(&content, opts.level, dict.as_deref())
+                            .map_err(|e| {
+                                io::Error::other(format!("compress {}: {e}", f.rel_path.display()))
+                            })?
+                    };
+                    pb.inc(1);
+                    Ok((i, hash, blocks))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
 
-            pb.inc(1);
-            Ok(CompressedFile {
-                rel_path: f.rel_path.clone(),
-                blocks,
-                content_hash,
-                mode: f.mode,
-                mtime_secs: f.mtime_secs,
-                mtime_nsec: f.mtime_nsec,
-            })
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+            // Written back in chunk order, so payload offsets stay a
+            // function of the sorted input and output remains reproducible.
+            let mut done = done;
+            done.sort_by_key(|(i, _, _)| *i);
+            for (i, content_hash, raw) in done {
+                let f = &chunk[i];
+                let blocks = match seen.get(&content_hash) {
+                    Some(shared) => {
+                        deduped_bytes += raw.iter().map(|b| b.data.len() as u64).sum::<u64>();
+                        shared.clone()
+                    }
+                    None => {
+                        let mut blocks = Vec::with_capacity(raw.len());
+                        for b in &raw {
+                            payload_tmp.write_all(&b.data)?;
+                            blocks.push(onelf_format::Block {
+                                payload_offset,
+                                compressed_size: b.data.len() as u64,
+                                original_size: b.original_size,
+                                content_hash: b.content_hash,
+                            });
+                            payload_offset += b.data.len() as u64;
+                        }
+                        seen.insert(content_hash, blocks.clone());
+                        blocks
+                    }
+                };
+                compressed_files.push(CompressedFile {
+                    rel_path: f.rel_path.clone(),
+                    blocks,
+                    content_hash,
+                    mode: f.mode,
+                    mtime_secs: f.mtime_secs,
+                    mtime_nsec: f.mtime_nsec,
+                });
+            }
+        }
+        payload_tmp.flush()
+    })();
+    drop(payload_tmp);
+    if let Err(e) = result {
+        let _ = fs::remove_file(&payload_tmp_path);
+        return Err(e);
+    }
 
     pb.finish_with_message(if opts.no_compress {
         "Files stored (uncompressed)"
@@ -645,31 +809,15 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         path_to_index.insert(d.rel_path.clone(), idx);
     }
 
-    // Compute payload layout - blocks are laid out sequentially
-    let mut payload_offset: u64 = 0;
-
+    // Block offsets were assigned as the payload was streamed out, so the
+    // entries only have to carry them.
     for cf in &compressed_files {
         let name_str = utf8_file_name(&cf.rel_path)?;
         let name = strings.add(name_str);
         let parent_path = cf.rel_path.parent().unwrap_or(Path::new(""));
         let parent = *path_to_index.get(parent_path).unwrap_or(&0);
         let idx = entries.len() as u32;
-
-        // Convert compressed blocks to onelf_format::Block with payload offsets
-        let blocks: Vec<onelf_format::Block> = cf
-            .blocks
-            .iter()
-            .map(|b| {
-                let block = onelf_format::Block {
-                    payload_offset,
-                    compressed_size: b.data.len() as u64,
-                    original_size: b.original_size,
-                    content_hash: b.content_hash,
-                };
-                payload_offset += b.data.len() as u64;
-                block
-            })
-            .collect();
+        let blocks = cf.blocks.clone();
 
         entries.push(Entry {
             kind: EntryKind::File,
@@ -795,8 +943,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             let target_content = files
                 .iter()
                 .find(|f| f.rel_path == ep0_target_path)
-                .map(|f| f.content.as_slice());
-            if target_content.is_some_and(elf_has_no_deps) {
+                .and_then(|f| f.source.read().ok());
+            if target_content.as_deref().is_some_and(elf_has_no_deps) {
                 EntryPointFlags::MEMFD_ELIGIBLE
             } else {
                 EntryPointFlags::empty()
@@ -877,10 +1025,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let manifest_checksum = xxhash_rust::xxh32::xxh32(&manifest_bytes, 0).to_le_bytes();
 
     // Compute total payload size
-    let total_payload: u64 = compressed_files
-        .iter()
-        .map(|f| f.blocks.iter().map(|b| b.data.len() as u64).sum::<u64>())
-        .sum();
+    // What was actually written, which after dedup is less than the sum of
+    // every entry's blocks.
+    let total_payload: u64 = payload_offset;
 
     // Build flags
     let mut flags = Flags::empty();
@@ -939,12 +1086,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     w.write_all(&runtime_patched)?;
     // [Manifest (compressed)]
     w.write_all(&manifest_compressed)?;
-    // [Payload (concatenated compressed blocks)]
-    for cf in &compressed_files {
-        for block in &cf.blocks {
-            w.write_all(&block.data)?;
-        }
-    }
+    // [Payload], streamed back from the temp file rather than held in memory
+    let mut payload_src = File::open(&payload_tmp_path)?;
+    io::copy(&mut payload_src, &mut w)?;
+    drop(payload_src);
     // [Dictionary (optional)]
     if let Some(ref d) = dict {
         w.write_all(d)?;
@@ -954,6 +1099,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     w.flush()?;
     drop(w);
+    let _ = fs::remove_file(&payload_tmp_path);
 
     // Make output executable
     let perms = fs::Permissions::from_mode(0o755);
@@ -964,7 +1110,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     pb.finish_with_message(format!("Written to {}", opts.output.display()));
 
     // Summary
-    let total_input = total_content_size as u64;
+    let total_input = total_content_size;
     let file_count = compressed_files.len();
     let dir_count = sorted_dirs.len();
     let symlink_count = symlinks.len();
@@ -978,6 +1124,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         symlink_count
     );
     eprintln!("  {} {}", bold("Content:"), format_size(total_input));
+    if deduped_bytes > 0 {
+        eprintln!(
+            "  {}   {} saved by sharing identical content",
+            bold("Dedup:"),
+            format_size(deduped_bytes)
+        );
+    }
     if opts.no_compress {
         eprintln!(
             "  {} {} (stored, uncompressed)",
