@@ -10,6 +10,9 @@ pub const BLOCK_SIZE: u64 = 256 * 1024;
 pub struct CompressedBlock {
     pub data: Vec<u8>,
     pub original_size: u64,
+    /// BLAKE3 of the block's decompressed bytes, so a reader can verify
+    /// this block alone rather than reassembling the whole entry.
+    pub content_hash: [u8; 32],
 }
 
 pub fn compress(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
@@ -41,6 +44,7 @@ pub fn store_in_blocks(data: &[u8]) -> Vec<CompressedBlock> {
         blocks.push(CompressedBlock {
             data: chunk.to_vec(),
             original_size: chunk.len() as u64,
+            content_hash: *blake3::hash(chunk).as_bytes(),
         });
 
         offset = chunk_end;
@@ -78,6 +82,7 @@ pub fn compress_in_blocks(
         blocks.push(CompressedBlock {
             data: compressed,
             original_size,
+            content_hash: *blake3::hash(chunk).as_bytes(),
         });
 
         offset = chunk_end;

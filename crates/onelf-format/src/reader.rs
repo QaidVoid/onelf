@@ -76,24 +76,27 @@ pub fn block_extent(footer: &Footer, block: &Block) -> io::Result<(u64, usize)> 
     Ok((abs, len))
 }
 
-/// Decompressed size of `block`, rejected when it claims to expand further
-/// than any real content would.
+/// Decompressed size of `block`, rejected when it exceeds any plausible
+/// block size.
 ///
 /// Both zstd and the dictionary path size their output buffer from this, so
-/// an unchecked value is an allocation an attacker chooses.
+/// an unchecked value is an allocation an attacker chooses. The bound is
+/// deliberately absolute rather than a compression ratio: real content
+/// reaches extreme ratios, a run of zeroes compressing by four orders of
+/// magnitude, and a ratio test rejects those legitimate packages.
 pub fn block_original_size(block: &Block) -> io::Result<usize> {
-    if block.compressed_size > 0
-        && block.original_size / block.compressed_size > MAX_BLOCK_EXPANSION
-    {
-        return Err(invalid("block expands implausibly"));
+    if block.original_size > MAX_BLOCK_ORIGINAL {
+        return Err(invalid("block decompresses to an implausible size"));
     }
     usize::try_from(block.original_size)
         .map_err(|_| invalid("block larger than this address space"))
 }
 
-/// Ceiling on a single block's compression ratio. zstd tops out far below
-/// this even on pathological input, so exceeding it means a crafted header.
-const MAX_BLOCK_EXPANSION: u64 = 4096;
+/// Ceiling on one block's decompressed size. The packer emits 256 KiB
+/// blocks, so this sits three orders of magnitude above anything real; it
+/// exists only to bound the allocation. zstd then rejects any block whose
+/// actual output does not match what the header claimed.
+const MAX_BLOCK_ORIGINAL: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -120,6 +123,7 @@ mod tests {
             payload_offset: offset,
             compressed_size: compressed,
             original_size: original,
+            content_hash: [0u8; 32],
         }
     }
 
@@ -175,10 +179,21 @@ mod tests {
     }
 
     #[test]
-    fn absurd_block_expansion_is_rejected() {
+    fn absurd_block_size_is_rejected() {
         assert!(block_original_size(&block(0, 10, 40)).is_ok());
         assert!(block_original_size(&block(0, 1, u64::MAX)).is_err());
         // A stored block reports equal sizes and must stay acceptable.
         assert!(block_original_size(&block(0, 4096, 4096)).is_ok());
+    }
+
+    /// Real content reaches extreme compression ratios: a 256 KiB run of
+    /// zeroes lands near 30 bytes, roughly 9000:1. A ratio-based bound
+    /// rejected exactly such a package, so the shape is pinned here.
+    #[test]
+    fn extreme_but_real_compression_ratios_are_accepted() {
+        let compressed = 30u64;
+        let original = 256 * 1024u64;
+        assert!(original / compressed > 4096, "fixture must be extreme");
+        assert!(block_original_size(&block(0, compressed, original)).is_ok());
     }
 }

@@ -99,7 +99,14 @@ pub fn load() -> io::Result<PackageData> {
     })
 }
 
-/// Read and decompress a single payload block.
+/// Read and decompress a single payload block, verifying it against its
+/// recorded hash before returning.
+///
+/// This is what lets the FUSE server serve a slice of a large file without
+/// reassembling all of it: the check is per block, so memory stays
+/// proportional to the read rather than to the entry. Blocks from a
+/// version-1 manifest carry no hash, and the caller falls back to the
+/// whole-entry check for those.
 pub fn read_payload_entry(
     file: &mut File,
     footer: &Footer,
@@ -128,6 +135,13 @@ pub fn read_payload_entry(
             io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
         })?
     };
+
+    if block.has_content_hash() && blake3::hash(&data).as_bytes() != &block.content_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "onelf: block hash mismatch (tampered or corrupt package)",
+        ));
+    }
 
     Ok(data)
 }

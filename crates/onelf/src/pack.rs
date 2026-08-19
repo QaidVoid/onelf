@@ -664,6 +664,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                     payload_offset,
                     compressed_size: b.data.len() as u64,
                     original_size: b.original_size,
+                    content_hash: b.content_hash,
                 };
                 payload_offset += b.data.len() as u64;
                 block
@@ -847,7 +848,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Build manifest and compute package_id
     let manifest = Manifest {
         header: ManifestHeader {
-            version: 1,
+            version: onelf_format::manifest::MANIFEST_VERSION,
             entry_count: entries.len() as u32,
             string_table_size: string_table.len() as u32,
             entrypoint_count: entrypoints.len() as u16,

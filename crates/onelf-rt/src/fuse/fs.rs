@@ -4,7 +4,7 @@
 //! against the in-memory manifest. File reads decompress payload blocks on
 //! demand with a per-inode block cache and sequential prefetch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;
@@ -65,8 +65,8 @@ fn make_attr(inode: u64, entry: &onelf_format::entry::Entry, manifest: &Manifest
         ctimensec: entry.mtime_nsec,
         mode,
         nlink,
-        uid: 0,
-        gid: 0,
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
         rdev: 0,
         blksize: 4096,
         flags: 0,
@@ -75,17 +75,47 @@ fn make_attr(inode: u64, entry: &onelf_format::entry::Entry, manifest: &Manifest
 
 const CACHE_IDLE_SECS: u64 = 2;
 
+/// Default ceiling on decompressed blocks held in memory.
+///
+/// At the packer's 256 KiB block size this is 128 blocks, far more than the
+/// one-block-ahead prefetch needs, while keeping the server itself from
+/// becoming the memory problem it exists to avoid.
+const DEFAULT_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Read the cache ceiling from `ONELF_FUSE_CACHE_BYTES`, falling back to
+/// [`DEFAULT_CACHE_BUDGET`] when unset or unparseable.
+fn cache_budget() -> usize {
+    std::env::var("ONELF_FUSE_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_CACHE_BUDGET)
+}
+
 type BlockKey = (u64, usize); // (inode, block_index)
 
+/// Decompressed blocks held for reuse, bounded by total bytes.
+///
+/// A sustained sequential read never goes idle, so clearing on an idle timer
+/// alone let the whole file accumulate here. The byte budget is the real
+/// bound; the idle clear is kept because it returns memory to the OS when an
+/// app goes quiet, which a budget alone does not do.
 struct BlockCache {
     data: HashMap<BlockKey, Vec<u8>>,
+    /// Insertion order, oldest first, used to pick an eviction victim.
+    order: VecDeque<BlockKey>,
+    bytes: usize,
+    budget: usize,
     last_access: Option<Instant>,
 }
 
 impl BlockCache {
-    fn new() -> Self {
+    fn new(budget: usize) -> Self {
         Self {
             data: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            budget,
             last_access: None,
         }
     }
@@ -96,7 +126,25 @@ impl BlockCache {
 
     fn insert_block(&mut self, inode: u64, block_index: usize, content: Vec<u8>) {
         self.last_access = Some(Instant::now());
-        self.data.insert((inode, block_index), content);
+        let key = (inode, block_index);
+        if let Some(old) = self.data.remove(&key) {
+            self.bytes -= old.len();
+            self.order.retain(|k| *k != key);
+        }
+        // Evict oldest-first until the newcomer fits. A block larger than the
+        // whole budget still goes in, because refusing it would mean the read
+        // it belongs to could never be served.
+        while self.bytes + content.len() > self.budget {
+            let Some(victim) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = self.data.remove(&victim) {
+                self.bytes -= dropped.len();
+            }
+        }
+        self.bytes += content.len();
+        self.order.push_back(key);
+        self.data.insert(key, content);
     }
 
     fn maybe_clear(&mut self) {
@@ -105,6 +153,8 @@ impl BlockCache {
         {
             self.data.clear();
             self.data.shrink_to_fit();
+            self.order.clear();
+            self.bytes = 0;
             self.last_access = None;
         }
     }
@@ -121,8 +171,8 @@ pub struct FuseState<'a> {
     dict: Option<&'a [u8]>,
     children: Vec<Vec<u64>>,
     cache: BlockCache,
-    /// Per-inode verdict of whole-entry BLAKE3 verification, computed
-    /// lazily on first read so no served bytes are ever unverified.
+    /// Per-inode verdict of whole-entry verification, used only for
+    /// version-1 manifests whose blocks carry no hash of their own.
     verified: HashMap<u64, bool>,
 }
 
@@ -140,19 +190,27 @@ impl<'a> FuseState<'a> {
             footer,
             dict,
             children,
-            cache: BlockCache::new(),
+            cache: BlockCache::new(cache_budget()),
             verified: HashMap::new(),
         }
     }
 
-    /// Verify the whole entry's decompressed content against its recorded
-    /// BLAKE3 hash, once per inode. Serving any slice of an unverified
-    /// file is refused. Returns the cached verdict on subsequent reads.
+    /// Confirm the entry may be served, for manifests that predate
+    /// per-block hashes.
+    ///
+    /// Version 1 offers only a whole-entry hash, so honouring "never serve
+    /// unverified bytes" means reassembling the entry once and remembering
+    /// the verdict. That costs the size of the largest file, which is why
+    /// version 2 records a hash per block; entries carrying one skip this
+    /// entirely and are checked as each block is decompressed.
     fn verify_entry(&mut self, inode: u64, entry_idx: usize) -> bool {
+        let entry = &self.manifest.entries[entry_idx];
+        if entry.blocks.iter().all(|b| b.has_content_hash()) {
+            return true;
+        }
         if let Some(&ok) = self.verified.get(&inode) {
             return ok;
         }
-        let entry = &self.manifest.entries[entry_idx];
         let ok = match loader::read_payload_blocks(self.file, self.footer, &entry.blocks, self.dict)
         {
             Ok(data) => blake3::hash(&data).as_bytes() == &entry.content_hash,
@@ -606,6 +664,9 @@ fn handle_readdir(
     };
 
     let inode = header.nodeid;
+    if inode == 0 {
+        return reply_err(header, -libc_enoent());
+    }
     let entry_idx = inode_to_entry(inode);
     if entry_idx >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
@@ -669,6 +730,9 @@ fn handle_readdirplus(
     };
 
     let inode = header.nodeid;
+    if inode == 0 {
+        return reply_err(header, -libc_enoent());
+    }
     let entry_idx = inode_to_entry(inode);
     if entry_idx >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
@@ -835,4 +899,62 @@ fn libc_eisdir() -> i32 {
 }
 fn libc_enotdir() -> i32 {
     20
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(n: usize) -> Vec<u8> {
+        vec![0u8; n]
+    }
+
+    /// A sustained read never goes idle, so the byte budget is the only
+    /// thing standing between a large file and the whole of it in memory.
+    #[test]
+    fn cache_evicts_to_stay_within_budget() {
+        let mut c = BlockCache::new(300);
+        for i in 0..10 {
+            c.insert_block(1, i, block(100));
+            assert!(
+                c.bytes <= 300,
+                "budget exceeded after {} inserts: {}",
+                i + 1,
+                c.bytes
+            );
+        }
+        // Oldest go first, so the most recent inserts survive.
+        assert!(c.get_block(1, 9).is_some());
+        assert!(c.get_block(1, 0).is_none());
+    }
+
+    #[test]
+    fn reinserting_a_block_does_not_double_count() {
+        let mut c = BlockCache::new(1000);
+        c.insert_block(1, 0, block(100));
+        c.insert_block(1, 0, block(100));
+        assert_eq!(c.bytes, 100);
+        assert_eq!(c.order.len(), 1);
+    }
+
+    /// Refusing an oversized block would make the read it belongs to
+    /// unservable, so it is admitted even though it breaches the budget.
+    #[test]
+    fn a_block_larger_than_the_budget_is_still_served() {
+        let mut c = BlockCache::new(50);
+        c.insert_block(1, 0, block(500));
+        assert!(c.get_block(1, 0).is_some());
+    }
+
+    #[test]
+    fn idle_clear_releases_everything() {
+        let mut c = BlockCache::new(1000);
+        c.insert_block(1, 0, block(100));
+        assert!(c.is_active());
+        c.last_access = Some(Instant::now() - std::time::Duration::from_secs(CACHE_IDLE_SECS + 1));
+        c.maybe_clear();
+        assert_eq!(c.bytes, 0);
+        assert!(!c.is_active());
+        assert!(c.get_block(1, 0).is_none());
+    }
 }

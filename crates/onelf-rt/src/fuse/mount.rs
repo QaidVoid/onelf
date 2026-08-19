@@ -64,10 +64,11 @@ pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
         .open("/dev/fuse")?
         .into();
 
-    // rootmode=040000 = S_IFDIR; allow_other lets the child process (running
-    // as the same uid inside the ns) access the mount through the inode.
+    // rootmode=040000 = S_IFDIR. `default_permissions` has the kernel
+    // enforce the modes the package recorded, matching the fusermount3 path
+    // so an owner-only file behaves the same under either mount strategy.
     let data = format!(
-        "fd={},rootmode=40000,user_id={real_uid},group_id={real_gid}",
+        "fd={},rootmode=40000,user_id={real_uid},group_id={real_gid},default_permissions",
         fuse_fd.as_raw_fd()
     );
     let data_c = std::ffi::CString::new(data).unwrap();

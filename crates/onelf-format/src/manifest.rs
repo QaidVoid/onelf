@@ -48,6 +48,14 @@ pub fn symlink_target_within_root(link_rel: &std::path::Path, target: &str) -> b
     parent_ok && walk(tpath)
 }
 
+/// Manifest version this build writes.
+///
+/// Version 2 added a BLAKE3 per payload block, so a reader can verify what
+/// it serves without reassembling the whole entry. Version 1 remains
+/// readable; entries from it carry no per-block hash and fall back to the
+/// whole-entry check.
+pub const MANIFEST_VERSION: u16 = 2;
+
 pub const MANIFEST_HEADER_SIZE: usize = 2 + 4 + 4 + 2 + 2 + 2 + 2 + 32; // 50 bytes
 
 #[derive(Debug, Clone)]
@@ -118,9 +126,20 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Serialize at [`MANIFEST_VERSION`].
+    ///
+    /// The version field is written from the constant rather than from
+    /// `header`, because the body is always laid out in the current format.
+    /// Trusting a caller-supplied version would let the header advertise
+    /// version 1 while the blocks carry a version 2 hash, which a reader
+    /// would then decode at the wrong width.
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.header.write_to(&mut buf)?;
+        let header = ManifestHeader {
+            version: MANIFEST_VERSION,
+            ..self.header.clone()
+        };
+        header.write_to(&mut buf)?;
         for ep in &self.entrypoints {
             ep.write_to(&mut buf)?;
         }
@@ -139,12 +158,13 @@ impl Manifest {
         let mut cursor = Cursor::new(data);
         let header = ManifestHeader::read_from(&mut cursor)?;
 
-        if header.version != 1 {
+        if header.version == 0 || header.version > MANIFEST_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported manifest version: {}", header.version),
             ));
         }
+        let version = header.version;
 
         // Clamp every speculative allocation to what the input can back,
         // so an oversized count in the header cannot request huge memory
@@ -160,7 +180,7 @@ impl Manifest {
         let entry_cap = (header.entry_count as usize).min(remaining(&cursor) / ENTRY_HEADER_SIZE);
         let mut entries = Vec::with_capacity(entry_cap);
         for _ in 0..header.entry_count {
-            entries.push(Entry::read_from(&mut cursor)?);
+            entries.push(Entry::read_from(&mut cursor, version)?);
         }
 
         let ld_cap = (header.lib_dir_count as usize).min(remaining(&cursor) / 4);
@@ -408,11 +428,13 @@ mod tests {
                 payload_offset: 0,
                 compressed_size: 10,
                 original_size: 20,
+                content_hash: [0u8; 32],
             },
             Block {
                 payload_offset: 10,
                 compressed_size: 5,
                 original_size: 8,
+                content_hash: [0u8; 32],
             },
         ];
         let m = manifest(vec![file], b"\0a\0".to_vec());
@@ -423,6 +445,73 @@ mod tests {
         assert_eq!(back.entries[0].blocks[1].original_size, 8);
         // Re-serializing the decoded manifest must reproduce the exact bytes.
         assert_eq!(back.serialize().unwrap(), bytes);
+    }
+
+    /// Version 1 laid blocks out 24 bytes wide with no per-block hash.
+    /// Packages already published in that format must keep decoding, and
+    /// their blocks must report that they carry no hash.
+    #[test]
+    fn version_one_blocks_still_decode() {
+        let mut file = entry(1, u32::MAX);
+        file.kind = EntryKind::File;
+        file.blocks = vec![Block {
+            payload_offset: 7,
+            compressed_size: 11,
+            original_size: 13,
+            content_hash: [0u8; 32],
+        }];
+        let m = manifest(vec![file], b"\0a\0".to_vec());
+
+        // Hand-assemble the v1 encoding: the current writer only emits v2.
+        let mut bytes = Vec::new();
+        let mut header = m.header.clone();
+        header.version = 1;
+        header.write_to(&mut bytes).unwrap();
+        let e = &m.entries[0];
+        bytes.push(e.kind as u8);
+        bytes.extend_from_slice(&e.parent.to_le_bytes());
+        bytes.extend_from_slice(&e.name.to_le_bytes());
+        bytes.extend_from_slice(&e.mode.to_le_bytes());
+        bytes.extend_from_slice(&e.mtime_secs.to_le_bytes());
+        bytes.extend_from_slice(&e.mtime_nsec.to_le_bytes());
+        bytes.extend_from_slice(&e.content_hash);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&e.symlink_target.to_le_bytes());
+        let b = &e.blocks[0];
+        bytes.extend_from_slice(&b.payload_offset.to_le_bytes());
+        bytes.extend_from_slice(&b.compressed_size.to_le_bytes());
+        bytes.extend_from_slice(&b.original_size.to_le_bytes());
+        bytes.extend_from_slice(&m.string_table);
+
+        let back = Manifest::deserialize(&bytes).expect("version 1 must decode");
+        assert_eq!(back.header.version, 1);
+        let block = &back.entries[0].blocks[0];
+        assert_eq!(block.payload_offset, 7);
+        assert_eq!(block.compressed_size, 11);
+        assert_eq!(block.original_size, 13);
+        assert!(!block.has_content_hash(), "v1 carries no per-block hash");
+    }
+
+    #[test]
+    fn future_versions_are_refused() {
+        let m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        let mut bytes = m.serialize().unwrap();
+        bytes[0..2].copy_from_slice(&(MANIFEST_VERSION + 1).to_le_bytes());
+        assert!(Manifest::deserialize(&bytes).is_err());
+        bytes[0..2].copy_from_slice(&0u16.to_le_bytes());
+        assert!(Manifest::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn serialize_always_writes_the_current_version() {
+        let mut m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        m.header.version = 1;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            MANIFEST_VERSION,
+            "the body is written in the current format, so the header must say so"
+        );
     }
 
     #[test]

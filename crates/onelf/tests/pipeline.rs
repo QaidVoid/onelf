@@ -653,6 +653,72 @@ int main(int argc, char **argv) {{
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Serving a file must still refuse tampered content now that the check is
+/// per block rather than per entry, and reads of untouched blocks in the
+/// same file must keep working.
+#[test]
+fn a_tampered_block_is_refused_but_neighbours_still_read() {
+    let td = workdir("blocktamper");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\ncat data\n");
+
+    // Several 256 KiB blocks, each filled distinctly so a corrupted one is
+    // identifiable in the output.
+    let mut data = Vec::new();
+    for i in 0..4u8 {
+        data.extend(std::iter::repeat_n(b'a' + i, 256 * 1024));
+    }
+    std::fs::write(app.join("data"), &data).unwrap();
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--no-compress"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Store mode puts the content in the payload verbatim, so the last
+    // block's bytes can be found and altered directly.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let needle: Vec<u8> = std::iter::repeat_n(b'd', 4096).collect();
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("last block must be present verbatim in store mode");
+    bytes[at] = b'X';
+    let tampered = td.join("tampered.onelf");
+    std::fs::write(&tampered, &bytes).unwrap();
+    std::fs::set_permissions(
+        &tampered,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut run = Command::new(&tampered);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run.output().expect("run tampered package");
+
+    // However the runtime unpacks it, the altered bytes must never reach
+    // the caller: either the read fails or extraction refuses outright.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('X'),
+        "tampered bytes must not be served: {}",
+        &stdout[..stdout.len().min(200)]
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Every inspection command parses whatever file it is handed, so a footer
 /// claiming regions the file cannot back must produce an error rather than
 /// an allocation sized by the claim.

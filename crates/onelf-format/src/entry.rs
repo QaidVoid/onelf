@@ -63,27 +63,53 @@ pub struct Block {
     pub compressed_size: u64,
     /// Size of the block before compression.
     pub original_size: u64,
+    /// BLAKE3 of this block's *decompressed* bytes.
+    ///
+    /// Hashing the decompressed form is what lets a random-access reader
+    /// verify one block without reassembling the whole entry, which is the
+    /// difference between serving a byte of a large file and buffering all
+    /// of it. Zero on manifests written before version 2, where the only
+    /// available check is the whole-entry hash on [`Entry`].
+    pub content_hash: [u8; 32],
 }
 
-pub const BLOCK_SIZE: usize = 24;
+/// Serialized width of a block, as written by the current format version.
+pub const BLOCK_SIZE: usize = 56;
+
+/// Serialized width in manifest version 1, which carried no per-block hash.
+pub const BLOCK_SIZE_V1: usize = 24;
 
 impl Block {
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_all(&self.payload_offset.to_le_bytes())?;
         w.write_all(&self.compressed_size.to_le_bytes())?;
         w.write_all(&self.original_size.to_le_bytes())?;
+        w.write_all(&self.content_hash)?;
         Ok(())
     }
 
-    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+    /// Read one block as written by manifest `version`.
+    pub fn read_from<R: Read>(r: &mut R, version: u16) -> io::Result<Self> {
         let mut buf = [0u8; BLOCK_SIZE];
-        r.read_exact(&mut buf)?;
+        let width = if version >= 2 {
+            BLOCK_SIZE
+        } else {
+            BLOCK_SIZE_V1
+        };
+        r.read_exact(&mut buf[..width])?;
 
         Ok(Block {
             payload_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             compressed_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             original_size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            // Left zero for version 1, where it means "no per-block check".
+            content_hash: buf[24..56].try_into().unwrap(),
         })
+    }
+
+    /// Whether this block carries a usable per-block hash.
+    pub fn has_content_hash(&self) -> bool {
+        self.content_hash != [0u8; 32]
     }
 }
 
@@ -179,7 +205,8 @@ impl Entry {
         Ok(())
     }
 
-    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+    /// Read one entry as written by manifest `version`.
+    pub fn read_from<R: Read>(r: &mut R, version: u16) -> io::Result<Self> {
         let mut buf = [0u8; ENTRY_HEADER_SIZE];
         r.read_exact(&mut buf)?;
 
@@ -201,7 +228,7 @@ impl Entry {
         let cap = (num_blocks as usize).min(4096);
         let mut blocks = Vec::with_capacity(cap);
         for _ in 0..num_blocks {
-            blocks.push(Block::read_from(r)?);
+            blocks.push(Block::read_from(r, version)?);
         }
 
         Ok(Entry {
