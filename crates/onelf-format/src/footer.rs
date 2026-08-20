@@ -54,6 +54,12 @@ bitflags! {
         /// equals `original_size` for every block; the runtime reads
         /// payload bytes directly without decompression.
         const STORED         = 1 << 3;
+        /// The package records an update URL but carries no updater, so
+        /// it is updated by something else (a package manager, a
+        /// deployment system). Set only for that case, which leaves every
+        /// package built before this flag existed correctly describing
+        /// itself as carrying an embedded updater.
+        const EXTERNAL_UPDATER = 1 << 4;
     }
 }
 
