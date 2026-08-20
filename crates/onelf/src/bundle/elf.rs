@@ -500,6 +500,50 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
     Ok(RunpathOutcome::Unguaranteed)
 }
 
+/// Sonames a bundled object needs that no bundled file provides.
+///
+/// Anything listed here is resolved from the host at runtime. That is not
+/// a missing file error: the loader falls back to its built-in directory
+/// list, finds the host's copy, and loads it into a process already
+/// holding the bundled libc. A glibc that disagrees with the bundled one
+/// is exactly the mismatch that crashes, and nothing reports it, because
+/// on the packer's machine the host copy is the right one.
+///
+/// The dynamic loader is excluded: it is named through PT_INTERP rather
+/// than DT_NEEDED, and is handled separately.
+pub(crate) fn audit_unbundled_needs(directory: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in jwalk::WalkDir::new(directory).sort(true) {
+        let Ok(entry) = entry else { continue };
+        if let Some(name) = entry.file_name().to_str() {
+            provided.insert(name.to_string());
+        }
+    }
+
+    let mut findings: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for path in find_elf_files(directory) {
+        let Ok(needed) = parse_needed(&path) else {
+            continue;
+        };
+        let mut missing: Vec<String> = needed
+            .into_iter()
+            .filter(|soname| {
+                let bare = Path::new(soname)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(soname);
+                !provided.contains(bare) && !is_dynamic_loader(bare)
+            })
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            findings.push((path, missing));
+        }
+    }
+    findings
+}
+
 /// Finalize every ELF in `directory` for portability: rewrite RUNPATH to
 /// `$ORIGIN/../lib`, scrub `/nix/store` paths, and strip absolute DT_NEEDED
 /// entries, temporarily granting owner-write to read-only files. Returns
@@ -574,6 +618,50 @@ fn finalize_one(path: &Path, patchelf: Option<&Path>) -> io::Result<(RunpathOutc
 /// Warn that the listed executables could not get a baked-in `$ORIGIN`
 /// RUNPATH and therefore won't survive a sandboxed re-exec. Printed once
 /// per bundling pass; empty input prints nothing.
+/// Report libraries that will be resolved from the host at runtime.
+///
+/// Worth a warning rather than an error: bundling GL, DRI, Vulkan and NSS
+/// from the host is deliberate and common, so some entries here are
+/// expected. The point is that the publisher gets to see the list on the
+/// machine where it still resolves correctly, instead of a user finding
+/// out through a mismatched libc.
+pub(crate) fn report_unbundled_needs(findings: &[(PathBuf, Vec<String>)]) {
+    if findings.is_empty() {
+        return;
+    }
+    let mut sonames: Vec<&str> = findings
+        .iter()
+        .flat_map(|(_, libs)| libs.iter().map(|s| s.as_str()))
+        .collect();
+    sonames.sort();
+    sonames.dedup();
+
+    eprintln!(
+        "{} {} librar(ies) are not in the bundle and will come from the host:",
+        color::bold_red("warning:"),
+        sonames.len()
+    );
+    for soname in &sonames {
+        let by: Vec<String> = findings
+            .iter()
+            .filter(|(_, libs)| libs.iter().any(|l| l == soname))
+            .filter_map(|(p, _)| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .take(3)
+            .collect();
+        eprintln!("  - {soname} (needed by {})", by.join(", "));
+    }
+    eprintln!(
+        "  The loader falls back to the host's own library directories for \
+         these, so a host copy built against a different libc is loaded \
+         alongside the bundled one. Add them with --search-path, or accept \
+         them if they are meant to come from the host (GL, DRI, Vulkan, NSS)."
+    );
+}
+
 pub(crate) fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract: &[PathBuf]) {
     if !unguaranteed.is_empty() {
         eprintln!(

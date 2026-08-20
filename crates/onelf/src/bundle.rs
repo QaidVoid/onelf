@@ -594,6 +594,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     color::bold_red("warning:"),
                 ),
             }
+            // After injection, so the audit sees the final DT_NEEDED set.
+            report_unbundled_needs(&audit_unbundled_needs(&opts.directory));
         }
         return Ok(());
     }
@@ -1003,6 +1005,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 color::bold_red("warning:"),
             ),
         }
+        // After injection, so the audit sees the final DT_NEEDED set.
+        report_unbundled_needs(&audit_unbundled_needs(&opts.directory));
     }
 
     Ok(())

@@ -1405,6 +1405,60 @@ fn packing_does_not_hold_the_whole_tree() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A library the bundle does not provide is resolved from the host at
+/// runtime, silently, into a process already holding the bundled libc.
+///
+/// That is the mismatch that crashes, and the publisher is the only one
+/// positioned to notice, because on the packer's machine the host copy is
+/// the correct one. So bundling must say which libraries will come from
+/// the host.
+#[test]
+fn bundling_reports_libraries_it_did_not_bundle() {
+    let td = workdir("hostleak");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("m.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"MAIN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/main")) {
+        return; // no compiler: documented soft-skip
+    }
+
+    // A complete bundle has nothing to report.
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .output()
+        .expect("spawn bundle-libs");
+    assert!(o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("not in the bundle"),
+        "a complete bundle must not warn: {err}"
+    );
+
+    // Excluding a real dependency is the same situation a dlopen-only or
+    // unresolvable library produces, and must be named.
+    let app2 = td.join("app2");
+    std::fs::create_dir_all(app2.join("bin")).unwrap();
+    std::fs::copy(app.join("bin/main"), app2.join("bin/main")).unwrap();
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app2.to_str().unwrap()])
+        .args(["--exclude", "libc.so.6"])
+        .output()
+        .expect("spawn bundle-libs");
+    assert!(o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("not in the bundle") && err.contains("libc.so.6"),
+        "an excluded dependency must be named as host-resolved: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// FUSE must stream an entry, not buffer it.
 ///
 /// The proof is an address-space limit well below the entry size: if any
