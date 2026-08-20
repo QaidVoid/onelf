@@ -66,6 +66,43 @@ For the accidental ones, point `--search-path` at a directory holding the
 library and repack. A library reached only through `dlopen` will not
 appear in `DT_NEEDED` at all, so `--scan-dlopen` is what finds those.
 
+### Withholding the host directories
+
+A package that needs nothing from the host is better off without those
+directories entirely, and by default it does not get them. `pack` decides
+from the bundle's contents: if nothing references a GPU driver stack, the
+host's directories are left off the search path.
+
+The effect is that a missing library fails honestly:
+
+```
+error while loading shared libraries: libm.so.6: cannot open shared object file
+```
+
+rather than loading the host's copy next to your bundled libc and
+crashing later, somewhere else, on a machine you do not have.
+
+Override it when the guess is wrong:
+
+```bash
+onelf pack app -o app.onelf --command bin/app --host-libs always
+```
+
+| Mode | Meaning |
+|------|---------|
+| `auto` (default) | Expose them only if the bundle references a driver stack |
+| `always` | Always expose them |
+| `never` | Never expose them |
+
+or as `host-libs` under `[package]` in a recipe.
+
+Detection is deliberately generous, because a wrong "no" breaks an app
+that works while a wrong "yes" only leaves the previous behaviour in
+place. It matches driver sonames anywhere in the bundle's binaries, not
+just in `DT_NEEDED`, since drivers are reached through `dlopen`. Reach for
+`always` if your app loads a host library under a name it does not
+mention, such as one built at runtime from parts.
+
 ## Self-extracting binaries (Bun, etc.)
 
 Some binaries embed their payload at the end of the file. The most
