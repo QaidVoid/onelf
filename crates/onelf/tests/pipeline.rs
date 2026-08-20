@@ -1074,6 +1074,116 @@ fn has_dynamic_tag(bytes: &[u8], tag: u64) -> bool {
     false
 }
 
+/// A package that names an update URL but carries no signing key must
+/// refuse to update, and must not reach the network to find that out.
+#[test]
+fn self_update_refuses_without_a_signing_key() {
+    let td = workdir("nokey");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho APP\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("nokey.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        // A host that cannot resolve, so a request would say so distinctly.
+        .args(["--update-url", "https://onelf.invalid/app.zsync"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    for flag in ["--onelf-update", "--onelf-check-update"] {
+        let mut run = Command::new(&pkg);
+        run.arg(flag)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("no signing key"),
+            "{flag} must refuse an unsigned package, got: {err}"
+        );
+        assert!(
+            !err.contains("resolve") && !err.contains("dns") && !err.contains("connect"),
+            "{flag} must refuse before reaching the network, got: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Several instances starting at once must each get a complete package.
+///
+/// Extraction publishes through a rename and a completion marker, so a
+/// second runner either waits or sees a finished tree, never a partial one.
+#[test]
+fn concurrent_first_runs_never_see_a_partial_package() {
+    let td = workdir("race");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncat \"$ONELF_DIR/payload.bin\" | wc -c\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    // Big enough that extraction takes long enough for the runs to overlap.
+    let payload: Vec<u8> = (0..8_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(app.join("payload.bin"), &payload).unwrap();
+
+    let pkg = td.join("race.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--level", "1"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let mut kids = Vec::new();
+    for _ in 0..6 {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache");
+        // One cache for the whole test, so the six contend over one extraction.
+        isolate(&mut run, &td);
+        run.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match run.spawn() {
+            Ok(c) => kids.push(c),
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
+            Err(e) => panic!("spawn package: {e}"),
+        }
+    }
+
+    let expected = format!("{}", payload.len());
+    for (i, kid) in kids.into_iter().enumerate() {
+        let out = kid.wait_with_output().expect("wait");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "run {i} failed: {stderr}");
+        assert_eq!(
+            stdout.trim(),
+            expected,
+            "run {i} saw an incomplete payload: {stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// With no safe cache root available, every cache subcommand must refuse
 /// rather than fall back to a shared world-writable path. `onelf cache
 /// clear` in particular used to be able to `remove_dir_all` `/tmp/onelf`.
