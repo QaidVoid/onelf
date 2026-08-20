@@ -28,6 +28,55 @@ fn have(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this machine can actually mount a FUSE filesystem.
+///
+/// `fusermount3` being installed says nothing about whether mounting is
+/// permitted. CI runners commonly ship the binary and still refuse the
+/// mount, and the runtime's preferred path does not use the helper at all:
+/// it unshares a mount namespace, which a hardened kernel can deny on its
+/// own terms. Both have to be tried to know, so this packs a package and
+/// runs it, once, forcing FUSE so a fallback to another mode cannot make
+/// an unavailable mount look available.
+fn fuse_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let td = workdir("fuseprobe");
+        let app = td.join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        write(&app.join("bin/run"), "#!/bin/sh\necho FUSE_OK\n");
+        std::fs::set_permissions(
+            app.join("bin/run"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+
+        let pkg = td.join("probe.onelf");
+        let packed = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let ok = packed && {
+            let mut run = Command::new(&pkg);
+            run.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", td.to_str().unwrap())
+                .env("ONELF_MODE", "fuse");
+            isolate(&mut run, &td);
+            let out = run_package(&mut run);
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("FUSE_OK")
+        };
+
+        if !ok {
+            eprintln!("skip: FUSE is not mountable here, as with cc and patchelf");
+        }
+        let _ = std::fs::remove_dir_all(&td);
+        ok
+    })
+}
+
 /// `patchelf` location: `ONELF_PATCHELF`, then `PATH`. `None` if absent.
 fn patchelf() -> Option<String> {
     if let Ok(p) = std::env::var("ONELF_PATCHELF")
@@ -802,7 +851,7 @@ fn chunk_budget_does_not_change_output() {
 /// judged the owner as "other" and a `0700` binary would not run.
 #[test]
 fn owner_only_modes_work_under_fuse() {
-    if !have("fusermount3") {
+    if !fuse_available() {
         return; // documented soft-skip, as with cc and patchelf
     }
     let td = workdir("ownermode");
@@ -1578,7 +1627,7 @@ fn a_package_that_uses_a_driver_stack_keeps_the_host_lib_dirs() {
 /// second rather than a large fixture.
 #[test]
 fn a_large_entry_reads_under_an_address_space_limit() {
-    if !have("fusermount3") {
+    if !fuse_available() {
         return; // documented soft-skip, as with cc and patchelf
     }
     let td = workdir("fusemem");
