@@ -1311,6 +1311,100 @@ fn info_reports_no_update_section_without_update_metadata() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Peak RSS of a child process, sampled while it runs.
+///
+/// `VmHWM` is monotonic, so polling can only ever under-report. That
+/// matters for a test: under-sampling makes an assertion pass, never
+/// fail, so this cannot produce a spurious failure.
+fn peak_rss_kb(cmd: &mut Command) -> (std::process::ExitStatus, u64) {
+    let mut child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let mut peak = 0u64;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in s.lines() {
+                if let Some(v) = line.strip_prefix("VmHWM:")
+                    && let Some(kb) = v.split_whitespace().next()
+                    && let Ok(kb) = kb.parse::<u64>()
+                {
+                    peak = peak.max(kb);
+                }
+            }
+        }
+        match child.try_wait().expect("wait") {
+            Some(status) => return (status, peak),
+            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+}
+
+/// The packer must not hold the tree it is packing.
+///
+/// Compression is chunked by bytes rather than by file count, so peak
+/// memory tracks the chunk budget and not the input size. Guards a real
+/// regression: taking the tree as one chunk took 2102 MB on a 2 GB tree
+/// before this was fixed.
+///
+/// A tree of zeros keeps the fixture cheap (0.1 s to write, packing to
+/// under 1 MB) while still making the packer move 400 MB of content.
+#[test]
+fn packing_does_not_hold_the_whole_tree() {
+    let td = workdir("packmem");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho PACKED\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    const FILES: usize = 40;
+    const PER_FILE: usize = 10 << 20;
+    const TREE_BYTES: u64 = (FILES * PER_FILE) as u64;
+    {
+        use std::io::Write as _;
+        let chunk = vec![0u8; 1 << 20];
+        for i in 0..FILES {
+            let f = std::fs::File::create(app.join(format!("data/f{i:03}.bin"))).unwrap();
+            let mut w = std::io::BufWriter::new(f);
+            for _ in 0..(PER_FILE / chunk.len()) {
+                w.write_all(&chunk).unwrap();
+            }
+            w.flush().unwrap();
+        }
+    }
+
+    let pkg = td.join("big.onelf");
+    let mut cmd = Command::new(onelf());
+    cmd.args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--level", "1"]);
+    let (status, peak) = peak_rss_kb(&mut cmd);
+    assert!(status.success(), "pack failed");
+
+    // Half the tree. Measured peak is around 90 MB against a 400 MB tree,
+    // and holding the tree as one chunk measures 318 MB, so this sits
+    // clear of both. Peak plateaus rather than scaling with core count
+    // (47 MB at 2 threads, 102 MB at 8, 92 MB at 16), so the margin does
+    // not depend on the machine.
+    let limit_kb = TREE_BYTES / 1024 / 2;
+    assert!(
+        peak < limit_kb,
+        "packing a {} MB tree peaked at {} MB, over the {} MB ceiling; \
+         the packer is holding too much of the tree at once",
+        TREE_BYTES / 1024 / 1024,
+        peak / 1024,
+        limit_kb / 1024
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// FUSE must stream an entry, not buffer it.
 ///
 /// The proof is an address-space limit well below the entry size: if any
