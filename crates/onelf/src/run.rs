@@ -29,6 +29,7 @@ fn bundle_from_recipe(dir: &Path, r: &recipe::Recipe) -> io::Result<()> {
     bundle::bundle_libs(&bundle::BundleOptions {
         directory: dir.to_path_buf(),
         target: None,
+        primary: Some(PathBuf::from(&r.package.command)),
         lib_dir: PathBuf::from("lib"),
         exclude: r.bundle.exclude.clone(),
         include: r.bundle.include.clone(),

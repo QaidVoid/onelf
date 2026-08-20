@@ -256,7 +256,15 @@ const STANDARD_LIB_PATHS: &[&str] = &[
 
 pub struct BundleOptions {
     pub directory: PathBuf,
+    /// Restricts *which* binaries are scanned for dependencies.
     pub target: Option<PathBuf>,
+    /// Decides *what* is bundled: the architecture and libc family every
+    /// candidate is filtered against.
+    ///
+    /// Distinct from `target`, which only narrows the scan. Without this the
+    /// family came from whichever path sorted first, so one musl helper in a
+    /// glibc tree silently dropped the entrypoint's own loader.
+    pub primary: Option<PathBuf>,
     pub lib_dir: PathBuf,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
@@ -337,8 +345,18 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // the framework bundlers below, and keys them off the app's real
     // class/machine rather than whatever ELF find_map first hits.
     let target_elfs = resolve_target_elfs(opts)?;
-    let target_class = target_elfs.iter().find_map(|f| read_elf_class(f));
-    let target_machine = target_elfs.iter().find_map(|f| read_elf_machine(f));
+    // The primary binary decides, when the caller named one. Otherwise fall
+    // back to the first ELF in the sorted walk, which is what a bare
+    // `bundle-libs` on an unlabelled directory has always done.
+    let primary = resolve_primary(opts);
+    let target_class = primary
+        .as_deref()
+        .and_then(read_elf_class)
+        .or_else(|| target_elfs.iter().find_map(|f| read_elf_class(f)));
+    let target_machine = primary
+        .as_deref()
+        .and_then(read_elf_machine)
+        .or_else(|| target_elfs.iter().find_map(|f| read_elf_machine(f)));
 
     let detected = detect_frameworks(&target_elfs);
     let want_gl = (opts.gl || detected.gl) && !opts.no_gl;
@@ -587,9 +605,49 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Determine target libc family from PT_INTERP. Used to skip spurious
     // cross-libc transitive dependencies (e.g. libgcc_s on a glibc host pulls
     // in libc.so.6 + ld-linux, which can't be used by a musl-linked binary).
-    let target_libc = elf_files
-        .iter()
-        .find_map(|f| parse_interp(f).as_deref().and_then(libc_family_from_interp));
+    let target_libc = primary
+        .as_deref()
+        .and_then(parse_interp)
+        .as_deref()
+        .and_then(libc_family_from_interp)
+        .or_else(|| {
+            elf_files
+                .iter()
+                .find_map(|f| parse_interp(f).as_deref().and_then(libc_family_from_interp))
+        });
+
+    // A tree spanning two libc families has its minority dependencies
+    // filtered out below. Say which family won, so that is a decision the
+    // packager can see rather than a silent narrowing.
+    if let Some(chosen) = target_libc {
+        let others: Vec<&PathBuf> = elf_files
+            .iter()
+            .filter(|f| {
+                parse_interp(f)
+                    .as_deref()
+                    .and_then(libc_family_from_interp)
+                    .is_some_and(|fam| fam != chosen)
+            })
+            .collect();
+        if !others.is_empty() {
+            eprintln!(
+                "  {} tree mixes libc families; bundling for {:?}{}",
+                color::bold("Note:"),
+                chosen,
+                primary
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix(&opts.directory).ok())
+                    .map(|p| format!(" (from {})", p.display()))
+                    .unwrap_or_default()
+            );
+            for f in others.iter().take(5) {
+                eprintln!(
+                    "    other family: {}",
+                    f.strip_prefix(&opts.directory).unwrap_or(f).display()
+                );
+            }
+        }
+    }
 
     // Drop sonames from the initial queue that belong to the wrong libc family.
     if let Some(target) = target_libc {
@@ -983,6 +1041,21 @@ fn resolve_target_elfs(opts: &BundleOptions) -> io::Result<Vec<PathBuf>> {
     } else {
         Ok(find_elf_files(&opts.directory))
     }
+}
+
+/// Absolute path of the binary that decides architecture and libc family.
+///
+/// `--target` implies it, since scoping the scan to one binary also states
+/// which one matters. Returns `None` when nothing designates one, leaving
+/// the caller to fall back to the first ELF found.
+fn resolve_primary(opts: &BundleOptions) -> Option<PathBuf> {
+    let named = opts.primary.as_ref().or(opts.target.as_ref())?;
+    let path = if named.is_absolute() {
+        named.clone()
+    } else {
+        opts.directory.join(named)
+    };
+    path.is_file().then_some(path)
 }
 
 fn find_elf_files(dir: &Path) -> Vec<PathBuf> {

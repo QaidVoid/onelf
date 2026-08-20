@@ -542,6 +542,7 @@ fn main() {
         } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
             bundle::bundle_libs(&bundle::BundleOptions {
                 directory,
+                primary: target.clone(),
                 target,
                 lib_dir,
                 exclude,
@@ -596,6 +597,7 @@ fn run_build(
         bundle::bundle_libs(&bundle::BundleOptions {
             directory: dir.clone(),
             target: None,
+            primary: Some(PathBuf::from(&recipe.package.command)),
             lib_dir: PathBuf::from("lib"),
             exclude: recipe.bundle.exclude.clone(),
             include: recipe.bundle.include.clone(),

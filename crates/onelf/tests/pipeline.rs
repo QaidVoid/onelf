@@ -787,6 +787,207 @@ fn chunk_budget_does_not_change_output() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Owner-only modes must survive the round trip on both mount strategies.
+///
+/// FUSE attributes used to claim root ownership while the mount was
+/// registered to the real uid, so with `default_permissions` the kernel
+/// judged the owner as "other" and a `0700` binary would not run.
+#[test]
+fn owner_only_modes_work_under_fuse() {
+    if !have("fusermount3") {
+        return; // documented soft-skip, as with cc and patchelf
+    }
+    let td = workdir("ownermode");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncat \"$ONELF_DIR/secret.txt\"\n\"$ONELF_DIR/bin/owner_only\"\n",
+    );
+    write(
+        &app.join("bin/owner_only"),
+        "#!/bin/sh\necho OWNER_ONLY_RAN\n",
+    );
+    write(&app.join("secret.txt"), "SECRET_CONTENT\n");
+    let chmod = |rel: &str, mode: u32| {
+        std::fs::set_permissions(
+            app.join(rel),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(mode),
+        )
+        .unwrap()
+    };
+    chmod("bin/run", 0o755);
+    chmod("bin/owner_only", 0o700);
+    chmod("secret.txt", 0o600);
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    // Both strategies: the private namespace mount, and the fusermount3
+    // helper that `ONELF_FUSE_NO_NAMESPACE` forces.
+    for forced in [false, true] {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "fuse");
+        if forced {
+            run.env("ONELF_FUSE_NO_NAMESPACE", "1");
+        }
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let which = if forced { "fusermount3" } else { "namespace" };
+        assert!(
+            stdout.contains("SECRET_CONTENT"),
+            "0600 file unreadable on the {which} mount: {stderr}"
+        );
+        assert!(
+            stdout.contains("OWNER_ONLY_RAN"),
+            "0700 binary not executable on the {which} mount: {stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A helper built against another libc must not decide what gets bundled.
+///
+/// Architecture and libc came from whichever path sorted first, so adding a
+/// musl helper to a glibc tree made the bundler drop the entrypoint's own
+/// loader and bundle nothing, leaving a package that only ran where glibc
+/// already existed.
+#[test]
+fn a_foreign_libc_helper_does_not_hijack_bundling() {
+    let td = workdir("mixedlibc");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("m.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"MAIN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/main")) {
+        return; // no compiler: documented soft-skip
+    }
+
+    // A real, parseable ELF that claims a musl interpreter, made by
+    // rewriting the interp string of a copy. Sorts before `main`, which is
+    // what used to give it the casting vote.
+    let mut bytes = std::fs::read(app.join("bin/main")).unwrap();
+    let musl = b"/lib/ld-musl-x86_64.so.1\0";
+    let glibc = b"/lib64/ld-linux-x86-64.so.2\0";
+    let Some(at) = bytes
+        .windows(glibc.len())
+        .position(|w| w == glibc.as_slice())
+    else {
+        return; // unexpected host interpreter; nothing to rewrite
+    };
+    bytes[at..at + musl.len()].copy_from_slice(musl);
+    for b in &mut bytes[at + musl.len()..at + glibc.len()] {
+        *b = 0;
+    }
+    std::fs::write(app.join("bin/helper"), &bytes).unwrap();
+
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname=\"mixedlibc\"\ncommand=\"bin/main\"\n",
+    );
+
+    let mut c = Command::new(onelf());
+    c.arg("build").current_dir(&app);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf build");
+    let log = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "build failed:\n{log}");
+
+    // The entrypoint's own loader has to be there, or the package only
+    // runs where its libc already exists.
+    let lib = app.join("lib");
+    let bundled: Vec<String> = std::fs::read_dir(&lib)
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        bundled.iter().any(|n| n.starts_with("ld-linux")),
+        "the entrypoint's loader must be bundled, got: {bundled:?}\n{log}"
+    );
+    assert!(
+        log.contains("mixes libc families"),
+        "a mixed tree must say which family won:\n{log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A partially downloaded package must report why rather than abort. Two
+/// shapes matter: the footer missing entirely, and a footer that survived
+/// while the body it describes did not.
+#[test]
+fn truncated_packages_report_rather_than_abort() {
+    let td = workdir("truncated");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\n");
+    let filler: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(app.join("data.bin"), &filler).unwrap();
+
+    let full = td.join("full.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", full.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    let bytes = std::fs::read(&full).unwrap();
+
+    // Cut short: the footer lives at the end, so it goes with the tail.
+    let headless = td.join("headless.onelf");
+    std::fs::write(&headless, &bytes[..bytes.len() / 2]).unwrap();
+
+    // Footer preserved over a shortened body, so the regions it names can
+    // no longer be backed by the file.
+    let gutted = td.join("gutted.onelf");
+    let mut g = bytes[..bytes.len() / 2].to_vec();
+    g.extend_from_slice(&bytes[bytes.len() - 76..]);
+    std::fs::write(&gutted, &g).unwrap();
+
+    for pkg in [&headless, &gutted] {
+        for cmd in ["info", "list", "verify"] {
+            let o = Command::new(onelf())
+                .arg(cmd)
+                .arg(pkg)
+                .output()
+                .unwrap_or_else(|e| panic!("spawn onelf {cmd}: {e}"));
+            assert_eq!(
+                o.status.code(),
+                Some(1),
+                "`onelf {cmd}` on {} must exit with an error, not die",
+                pkg.display()
+            );
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(
+                err.contains("magic") || err.contains("out of bounds"),
+                "`onelf {cmd}` must say what is wrong, got: {err}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Serving a file must still refuse tampered content now that the check is
 /// per block rather than per entry, and reads of untouched blocks in the
 /// same file must keep working.
