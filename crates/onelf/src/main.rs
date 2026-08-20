@@ -11,6 +11,7 @@ mod pack;
 mod payload;
 mod recipe;
 mod run;
+mod sign;
 mod verify;
 
 use std::os::unix::fs::PermissionsExt;
@@ -251,6 +252,30 @@ enum Commands {
         entrypoint: Option<String>,
     },
 
+    /// Manage signing keys for self-update
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+
+    /// Sign a package so its self-update can be verified
+    ///
+    /// Writes the detached Ed25519 signature the runtime fetches from the
+    /// update URL with `.sig` appended. Sign after every step that changes
+    /// the packaged bytes, or the signature covers a stale revision.
+    Sign {
+        /// Path to the packaged binary to sign
+        binary: PathBuf,
+
+        /// Secret key file from `onelf key new` (64 raw bytes)
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// Where to write the signature (default: <BINARY>.sig)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+
     /// Manage the onelf cache
     Cache {
         #[command(subcommand)]
@@ -357,6 +382,34 @@ enum Commands {
         /// strings to be bundled.
         #[arg(long, value_delimiter = ',')]
         dlopen: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Generate a keypair for signing self-updates
+    ///
+    /// The public key is written as the 32 raw bytes `pack --update-key`
+    /// embeds, so it needs no conversion. The secret key is owner-only.
+    New {
+        /// Where to write the secret key
+        #[arg(long, value_name = "PATH", default_value = "onelf.key")]
+        secret: PathBuf,
+
+        /// Where to write the public key
+        #[arg(long, value_name = "PATH", default_value = "onelf.pub")]
+        public: PathBuf,
+    },
+
+    /// Write the public key belonging to an existing secret key
+    Show {
+        /// Secret key file to derive from
+        #[arg(long, value_name = "PATH")]
+        secret: PathBuf,
+
+        /// Where to write the public key (default: stdout)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -510,6 +563,51 @@ fn main() {
         Commands::Unintegrate { binary, entrypoint } => {
             integrate::unintegrate(&binary, entrypoint.as_deref())
         }
+        Commands::Key { action } => match action {
+            KeyAction::New { secret, public } => sign::generate(&public, &secret).map(|()| {
+                println!("Secret key: {} (keep private)", secret.display());
+                println!("Public key: {}", public.display());
+                println!(
+                    "Pack with: onelf pack ... --update-key {}",
+                    public.display()
+                );
+            }),
+            KeyAction::Show { secret, output } => {
+                sign::public_key_of(&secret).and_then(|pk| match output {
+                    Some(path) => std::fs::write(&path, pk),
+                    None => std::io::Write::write_all(&mut std::io::stdout(), &pk),
+                })
+            }
+        },
+        Commands::Sign {
+            binary,
+            key,
+            output,
+        } => sign::sign(&binary, &key, output.as_deref()).map(|signed| {
+            match signed.matched {
+                sign::KeyMatch::Matches => {
+                    println!("Signed with the key this package embeds.");
+                }
+                sign::KeyMatch::NoEmbeddedKey => {
+                    eprintln!(
+                        "warning: {} embeds no update key, so it cannot self-update. \
+                         Repack with --update-key to make this signature useful.",
+                        binary.display()
+                    );
+                }
+                sign::KeyMatch::NotAPackage => {
+                    eprintln!(
+                        "warning: {} is not an onelf package, so the signing key could \
+                         not be checked against it.",
+                        binary.display()
+                    );
+                }
+            }
+            println!("Signature: {}", signed.path.display());
+            if let Some(url) = signed.sig_url {
+                println!("Publish it at: {url}");
+            }
+        }),
         Commands::Cache { action } => match action {
             CacheAction::List => cache::cache_list(),
             CacheAction::Clear => cache::cache_clear(),

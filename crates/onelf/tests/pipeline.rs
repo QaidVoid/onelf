@@ -1074,6 +1074,104 @@ fn has_dynamic_tag(bytes: &[u8], tag: u64) -> bool {
     false
 }
 
+/// The signing tooling and the runtime's verifier must agree on the
+/// encodings, since both are raw fixed-width decodes with no negotiation.
+///
+/// This closes the publish loop end to end: generate a key, embed it at
+/// pack time, sign the package, then read the key back out of the package
+/// and verify the detached signature exactly as the runtime does.
+#[test]
+fn a_signature_verifies_against_the_key_the_package_embeds() {
+    let td = workdir("signloop");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho SIGNED\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let secret = td.join("k.key");
+    let public = td.join("k.pub");
+    let o = Command::new(onelf())
+        .args(["key", "new"])
+        .arg("--secret")
+        .arg(&secret)
+        .arg("--public")
+        .arg(&public)
+        .output()
+        .expect("spawn onelf key new");
+    assert!(o.status.success(), "key new failed");
+
+    let pkg = td.join("signed.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/signed.onelf.zsync"])
+        .arg("--update-key")
+        .arg(&public)
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "pack failed");
+
+    let o = Command::new(onelf())
+        .arg("sign")
+        .arg(&pkg)
+        .arg("--key")
+        .arg(&secret)
+        .output()
+        .expect("spawn onelf sign");
+    assert!(
+        o.status.success(),
+        "sign failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The runtime reads the key out of the package, not off disk, so the
+    // check has to come from the package too.
+    // With a single --file, extract writes that file's bytes to -o directly.
+    let out = td.join("embedded-key");
+    let o = Command::new(onelf())
+        .arg("extract")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&out)
+        .args(["--file", ".onelf/update-key"])
+        .output()
+        .expect("spawn onelf extract");
+    assert!(
+        o.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let embedded = std::fs::read(&out).expect("embedded key");
+    assert_eq!(embedded, std::fs::read(&public).unwrap());
+
+    // Named for the update URL, not the binary: the runtime appends
+    // `.sig` to the zsync URL it was given, so that is the only name it
+    // ever requests.
+    let sig_bytes = std::fs::read(td.join("signed.onelf.zsync.sig")).expect("signature");
+    let pk = ed25519_compact::PublicKey::from_slice(&embedded).expect("32-byte public key");
+    let sig = ed25519_compact::Signature::from_slice(&sig_bytes).expect("64-byte signature");
+    assert!(
+        pk.verify(std::fs::read(&pkg).unwrap(), &sig).is_ok(),
+        "the runtime's decoders must accept what the signer produced"
+    );
+
+    // A published file that changed after signing must stop verifying.
+    let mut tampered = std::fs::read(&pkg).unwrap();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xff;
+    assert!(
+        pk.verify(&tampered, &sig).is_err(),
+        "a signature must not cover a modified package"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package that names an update URL but carries no signing key must
 /// refuse to update, and must not reach the network to find that out.
 #[test]

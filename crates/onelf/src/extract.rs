@@ -97,7 +97,7 @@ pub(crate) fn decompress_entry(
 /// or corrupt content to disk or stdout. `decompress_entry` itself stays
 /// unverified because `verify` needs to decompress-then-report every
 /// mismatch rather than fail fast.
-fn decompress_verified(
+pub(crate) fn decompress_verified(
     file: &mut File,
     footer: &onelf_format::Footer,
     entry: &onelf_format::Entry,

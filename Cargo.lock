@@ -579,6 +579,7 @@ version = "0.3.2"
 dependencies = [
  "blake3",
  "clap",
+ "ed25519-compact",
  "goblin",
  "indicatif",
  "jwalk",
