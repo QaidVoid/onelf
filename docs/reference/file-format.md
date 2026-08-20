@@ -35,7 +35,7 @@ manifest, payload, and dictionary begin.
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
 | 8 | 2 | format_version | `1` |
-| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`; other bits reserved |
+| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
 | 28 | 8 | manifest_original | Uncompressed manifest size |
@@ -68,7 +68,7 @@ Compressed with zstd. After decompression:
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 2 | manifest_version (currently 1) |
+| 0 | 2 | manifest_version (currently 2) |
 | 2 | 4 | entry_count |
 | 6 | 4 | string_table_size |
 | 10 | 2 | entrypoint_count |
@@ -106,7 +106,20 @@ symlink_target: u32       (string_table offset; 0 unless kind == symlink)
 blocks:         [Block; num_blocks]  (file content block refs; empty for non-files)
 ```
 
-Each `Block` is `(payload_offset: u64, compressed_size: u64, original_size: u64)`.
+Each `Block` is 56 bytes:
+
+```
+payload_offset:  u64
+compressed_size: u64
+original_size:   u64
+content_hash:    [u8; 32]   (BLAKE3 of this block's decompressed bytes)
+```
+
+`content_hash` arrived with manifest version 2. It lets a reader verify a
+single block without reassembling the entry, which is what allows a large
+file to be served a byte at a time rather than buffered whole. In a
+version 1 manifest the field is absent and a `Block` is 24 bytes, leaving
+the whole-entry hash as the only check.
 
 ## Payload
 
@@ -152,11 +165,26 @@ Then the manifest tells you how to read entrypoints, files, etc.
   corruption of the manifest itself.
 - **BLAKE3** over each file's concatenated content bytes is stored in
   the entry. `onelf verify` recomputes and compares.
+- **BLAKE3** over each block's decompressed bytes is stored alongside the
+  block from manifest version 2 onward. This is what a random-access
+  reader checks, so a single byte can be served and verified without
+  reassembling the file it came from.
 - The **package_id** (BLAKE3 of the manifest) uniquely identifies the
   package and drives cache-mode directory names.
 
 ## Format compatibility
 
-The footer's `format_version` field currently must be `1`. Older
-runtimes will refuse to read newer formats with a clear error. When a
-future version bumps the manifest, older tools will need an update.
+The footer's `format_version` must be `1`. It has not moved.
+
+The manifest version has. Readers accept `1` and `2` and reject anything
+higher with a clear error, so a package written by an older onelf still
+runs. The only difference between the two is the `content_hash` on each
+block, so a version 1 manifest has 24-byte blocks and falls back to the
+whole-entry hash for verification.
+
+Footer flags are decoded with `from_bits_retain`, so a bit a reader does
+not recognise is kept and ignored rather than treated as corruption. That
+is what lets a flag be added without invalidating existing packages, and
+why the two most recent ones are set only for the new behaviour: a
+package written before they existed reads as "embedded updater, host
+library directories exposed", which is what it was built expecting.
