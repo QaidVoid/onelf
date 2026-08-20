@@ -218,5 +218,13 @@ without the code.
 - Compromising your server is not enough to push a malicious update,
   since the attacker would also need the signing key. Compromising the
   signing key is enough, so treat it accordingly.
-- Serve everything over HTTPS. The runtime enforces this for its own
-  requests and will not follow redirects.
+- Serve everything over HTTPS. The runtime enforces this for every
+  request the update makes, so no redirect can downgrade the transfer to
+  cleartext. The signature fetch follows no redirects at all; the
+  download follows them, since publishing behind a redirecting CDN is
+  ordinary and HTTPS plus the signature check keeps it safe.
+- Certificates are checked against the machine's own trust store rather
+  than a set of roots compiled into the binary. A host that terminates
+  TLS at a corporate proxy can update, provided that proxy's CA is
+  installed the usual way. A host with no trust store at all cannot
+  verify anything, and the update fails closed.
