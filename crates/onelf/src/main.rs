@@ -96,6 +96,13 @@ enum Commands {
         #[arg(long)]
         update_key: Option<PathBuf>,
 
+        /// Record the update URL but do not embed the updater, linking the
+        /// slim runtime instead. Saves about 1.3 MB per package. For
+        /// packages updated by a package manager or deployment system,
+        /// where the package must not replace itself.
+        #[arg(long)]
+        no_embed_updater: bool,
+
         /// Exclude files matching glob patterns (repeatable, e.g. "*.a", "__pycache__")
         #[arg(long)]
         exclude: Vec<String>,
@@ -459,6 +466,7 @@ fn main() {
             working_dir,
             update_url,
             update_key,
+            no_embed_updater,
             exclude,
             preload,
             needs_setuid,
@@ -482,6 +490,12 @@ fn main() {
                 .into_iter()
                 .map(|(n, p)| (n, p, Vec::new()))
                 .collect();
+            if no_embed_updater && update_url.is_none() {
+                eprintln!(
+                    "warning: --no-embed-updater has no effect without --update-url; \
+                     the slim runtime is already used when no update URL is set"
+                );
+            }
             let update_key = update_key.as_deref().map(std::fs::read).transpose();
             match update_key {
                 Err(e) => Err(e),
@@ -500,6 +514,7 @@ fn main() {
                         memfd: memfd_opt,
                         working_dir: wd,
                         update_url: update_url.clone(),
+                        embed_updater: !no_embed_updater,
                         update_key,
                         exclude,
                         package_info: None,
@@ -511,7 +526,7 @@ fn main() {
                     // Pick the runtime: slim (~700KB) by default; the
                     // update-capable runtime (~2MB) only when the user actually
                     // configures self-updates.
-                    if update_url.is_some() {
+                    if update_url.is_some() && !no_embed_updater {
                         RUNTIME_BINARY_UPDATE
                     } else {
                         RUNTIME_BINARY_SLIM
@@ -766,7 +781,8 @@ fn run_build(
         .map(|k| if k.is_absolute() { k } else { dir.join(k) })
         .map(std::fs::read)
         .transpose()?;
-    let runtime: &[u8] = if update_url.is_some() {
+    let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
+    let runtime: &[u8] = if update_url.is_some() && embed_updater {
         RUNTIME_BINARY_UPDATE
     } else {
         RUNTIME_BINARY_SLIM
@@ -789,6 +805,7 @@ fn run_build(
             memfd: recipe.package.memfd,
             working_dir: recipe.package.working_dir.into(),
             update_url,
+            embed_updater,
             update_key,
             exclude: recipe.package.exclude,
             package_info,

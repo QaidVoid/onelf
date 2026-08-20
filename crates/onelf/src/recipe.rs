@@ -152,6 +152,10 @@ pub struct Update {
     /// Path to a file with the raw 32-byte Ed25519 public key used to
     /// verify signed self-updates.
     pub key: Option<PathBuf>,
+    /// Embed the update-capable runtime. Defaults to true. False records
+    /// the URL and key but links the slim runtime, for packages updated
+    /// by a package manager rather than by themselves.
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

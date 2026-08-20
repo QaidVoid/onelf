@@ -1172,6 +1172,145 @@ fn a_signature_verifies_against_the_key_the_package_embeds() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Recording where a package updates from and embedding an updater are
+/// separate decisions. A package manager needs the first without paying
+/// for the second, and must not have the package replace itself.
+#[test]
+fn an_update_url_can_be_recorded_without_embedding_an_updater() {
+    let td = workdir("extupd");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho EXT\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    const URL: &str = "https://onelf.invalid/app.onelf.zsync";
+    let pack_one = |out: &Path, external: bool| {
+        let mut cmd = Command::new(onelf());
+        cmd.args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"])
+            .args(["--update-url", URL]);
+        if external {
+            cmd.arg("--no-embed-updater");
+        }
+        let o = cmd.output().expect("spawn onelf pack");
+        assert!(
+            o.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+
+    let embedded = td.join("embedded.onelf");
+    let external = td.join("external.onelf");
+    pack_one(&embedded, false);
+    pack_one(&external, true);
+
+    // The default must not have quietly changed: an update URL alone
+    // still embeds the updater, so existing builds are unaffected.
+    let embedded_len = std::fs::metadata(&embedded).unwrap().len();
+    let external_len = std::fs::metadata(&external).unwrap().len();
+    assert!(
+        embedded_len > external_len + 1_000_000,
+        "the external build should drop the updater: {embedded_len} vs {external_len}"
+    );
+
+    // Both must record the same URL, since external tooling reads it.
+    for pkg in [&embedded, &external] {
+        let out = td.join("url.txt");
+        let o = Command::new(onelf())
+            .arg("extract")
+            .arg(pkg)
+            .arg("-o")
+            .arg(&out)
+            .args(["--file", ".onelf/update-url"])
+            .output()
+            .expect("spawn onelf extract");
+        assert!(o.status.success(), "extract failed for {}", pkg.display());
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), URL);
+    }
+
+    // And `info` must report it, since that is the supported way for an
+    // external updater to find where the package comes from.
+    for (pkg, expected) in [(&embedded, "embedded"), (&external, "external")] {
+        let o = Command::new(onelf())
+            .arg("info")
+            .arg(pkg)
+            .output()
+            .expect("spawn onelf info");
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        assert!(stdout.contains(URL), "info must report the update URL");
+        let line = stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with("Updater:"))
+            .unwrap_or_else(|| panic!("info must report the updater for {}", pkg.display()));
+        assert!(
+            line.contains(expected),
+            "expected {expected} updater, got: {line}"
+        );
+    }
+
+    // The externally-updated package must still run, and must not act on
+    // an update flag.
+    let mut run = Command::new(&external);
+    run.arg("--onelf-update")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("download") && !combined.contains("update available"),
+        "an externally-updated package must not try to update: {combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package with no update metadata must report none, rather than
+/// printing an empty or placeholder value.
+#[test]
+fn info_reports_no_update_section_without_update_metadata() {
+    let td = workdir("noupd");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho PLAIN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("plain.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let o = Command::new(onelf())
+        .arg("info")
+        .arg(&pkg)
+        .output()
+        .expect("spawn onelf info");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        !stdout.contains("Update:"),
+        "a package with no update metadata must not report an update section: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package that names an update URL but carries no signing key must
 /// refuse to update, and must not reach the network to find that out.
 #[test]

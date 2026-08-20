@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use onelf_format::{EntryKind, FOOTER_SIZE, Footer, Manifest};
+use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, Manifest};
 
 pub fn info(path: &Path) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(path)?;
@@ -69,6 +69,28 @@ pub fn info(path: &Path) -> io::Result<()> {
         for line in info.lines() {
             println!("  {line}");
         }
+        println!();
+    }
+
+    if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {
+        let has_key =
+            read_metadata_string(path, &footer, &manifest, ".onelf/update-key")?.is_some();
+        println!("Update:");
+        println!("  URL:          {url}");
+        println!(
+            "  Signing key:  {}",
+            if has_key { "embedded" } else { "none" }
+        );
+        println!(
+            "  Updater:      {}",
+            if footer.flags.contains(Flags::EXTERNAL_UPDATER) {
+                "external (this package does not update itself)"
+            } else if has_key {
+                "embedded"
+            } else {
+                "embedded, but disabled without a signing key"
+            }
+        );
         println!();
     }
 
@@ -183,6 +205,26 @@ pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Read a small `.onelf/` metadata file as text, if the package has it.
+fn read_metadata_string(
+    path: &Path,
+    footer: &Footer,
+    manifest: &Manifest,
+    entry_path: &str,
+) -> io::Result<Option<String>> {
+    use crate::extract::decompress_entry;
+
+    let idx = (0..manifest.entries.len()).find(|&i| {
+        manifest.entries[i].kind == EntryKind::File && manifest.entry_path(i) == entry_path
+    });
+    let Some(idx) = idx else { return Ok(None) };
+
+    let mut file = File::open(path)?;
+    let dict = read_dict(&mut file, footer)?;
+    let data = decompress_entry(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
+    Ok(Some(String::from_utf8_lossy(&data).trim().to_string()))
 }
 
 fn read_package_info(

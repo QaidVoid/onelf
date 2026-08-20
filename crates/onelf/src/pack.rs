@@ -45,6 +45,10 @@ pub struct PackOptions {
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
     pub update_url: Option<String>,
+    /// Embed the update-capable runtime when `update_url` is set. False
+    /// records the update metadata but links the slim runtime, for
+    /// packages updated by a package manager rather than by themselves.
+    pub embed_updater: bool,
     /// Raw Ed25519 public key bytes embedded as `.onelf/update-key`; the
     /// runtime requires it (and a valid signature) before self-updating.
     pub update_key: Option<Vec<u8>>,
@@ -1040,6 +1044,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.no_compress {
         flags |= Flags::STORED;
     }
+    if opts.update_url.is_some() && !opts.embed_updater {
+        flags |= Flags::EXTERNAL_UPDATER;
+    }
 
     // Write the output file
     let pb = ProgressBar::new_spinner();
@@ -1263,6 +1270,7 @@ mod tests {
             memfd: Some(false),
             working_dir: WorkingDir::Inherit,
             update_url: None,
+            embed_updater: true,
             update_key: None,
             exclude: Vec::new(),
             package_info: None,
