@@ -11,6 +11,7 @@
 //! the lib path is passed via `--library-path` on a single linker
 //! invocation.
 
+use crate::loader::PackageData;
 use std::env;
 use std::path::Path;
 
@@ -22,6 +23,21 @@ use std::path::Path;
 /// and pointing it at our bundled libs would mix two glibcs in one
 /// process. Scripts that need bundled libs must export `LD_LIBRARY_PATH`
 /// themselves before execing bundled binaries.
+/// Whether the host's library directories should join the search path.
+///
+/// Packages that need nothing from the host opt out at pack time. Those
+/// directories hold the whole system's libraries, so leaving them out is
+/// what stops a soname missing from the bundle being satisfied by a host
+/// copy built against a different libc.
+pub fn expose_host_libs(pkg: &PackageData) -> bool {
+    !pkg.footer
+        .flags
+        .contains(onelf_format::Flags::NO_HOST_LIB_DIRS)
+}
+
+// Describes a single exec; every argument is distinct and a parameter
+// object would be built at each of the five call sites and read once.
+#[allow(clippy::too_many_arguments)]
 pub fn setup_env(
     onelf_dir: &str,
     argv0: &str,
@@ -30,6 +46,7 @@ pub fn setup_env(
     mode: &str,
     lib_subpath: &str,
     target_path: &str,
+    expose_host_libs: bool,
 ) -> String {
     let launch_dir = env::current_dir()
         .ok()
@@ -79,9 +96,15 @@ pub fn setup_env(
             if !existing.is_empty() {
                 parts.push(existing);
             }
-            let host_paths = host_driver_paths();
-            if !host_paths.is_empty() {
-                parts.push(host_paths.join(":"));
+            // Skipped when the package declared it needs nothing from the
+            // host: these are whole system library directories, so leaving
+            // them out is what keeps a missing soname from being satisfied
+            // by a host copy built against a different libc.
+            if expose_host_libs {
+                let host_paths = host_driver_paths();
+                if !host_paths.is_empty() {
+                    parts.push(host_paths.join(":"));
+                }
             }
             lib_path = parts.join(":");
 

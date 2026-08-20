@@ -133,6 +133,7 @@ pub fn execute_tmpfs(
         "tmpfs",
         &lib_paths_str,
         target_path_s,
+        crate::env::expose_host_libs(pkg),
     );
     if let Some(data) = env_data {
         crate::env::apply_custom_env(data, &mountpoint_str);

@@ -130,6 +130,14 @@ fn main() {
     let forced_mode = std::env::var("ONELF_MODE").ok();
     let force = forced_mode.as_deref();
 
+    // Whether the host's library directories join the search path. Packages
+    // that need nothing from the host opt out at pack time, which is what
+    // stops a soname missing from the bundle being satisfied by a host copy.
+    let expose_host_libs = !pkg
+        .footer
+        .flags
+        .contains(onelf_format::Flags::NO_HOST_LIB_DIRS);
+
     // Memfd mode: single static binary, no libs needed
     if force == Some("memfd") || (force.is_none() && ep_memfd) {
         // Verify the memfd payload against the entrypoint's content hash
@@ -155,6 +163,7 @@ fn main() {
                 "memfd",
                 &lib_paths_str,
                 "/proc/self/fd/0",
+                expose_host_libs,
             );
             portable::setup_portable(exe_dir, exe_name);
 
@@ -267,6 +276,7 @@ fn main() {
         "cache",
         &lib_paths_str,
         target_path_s,
+        expose_host_libs,
     );
     if let Some(data) = &env_data {
         env::apply_custom_env(data, pkg_dir_str);

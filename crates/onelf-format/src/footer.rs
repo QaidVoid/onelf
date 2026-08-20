@@ -60,6 +60,17 @@ bitflags! {
         /// package built before this flag existed correctly describing
         /// itself as carrying an embedded updater.
         const EXTERNAL_UPDATER = 1 << 4;
+        /// Do not put the host's library directories on the search path.
+        ///
+        /// The runtime adds them so host GPU drivers stay reachable, but
+        /// they hold the whole system's libraries, so any soname the
+        /// bundle is missing is silently satisfied from the host and
+        /// loaded next to the bundled libc. Set for packages that need
+        /// nothing from the host.
+        ///
+        /// Polarity is deliberate: unset means "expose", so every package
+        /// built before this flag existed keeps its behaviour.
+        const NO_HOST_LIB_DIRS = 1 << 5;
     }
 }
 
