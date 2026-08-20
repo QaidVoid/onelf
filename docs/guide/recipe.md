@@ -100,9 +100,14 @@ entrypoint automatically.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | none | zsync control file URL |
+| `key` | path | none | 32-byte Ed25519 public key; required for self-update |
+| `embed` | bool | `true` | Embed the updater. `false` records the URL for an external updater |
 
-Setting `[update]` automatically selects the update-capable runtime
-(~2 MB larger than the default slim runtime).
+Setting `[update]` selects the update-capable runtime, which is 1.36 MB
+larger than the slim runtime. Self-update also needs `key`: without it
+the runtime refuses to update. Set `embed = false` to keep the metadata
+and the slim runtime, for packages a package manager updates. See
+[Self-Update](./self-update).
 
 ### `[bundle]`
 

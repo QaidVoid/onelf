@@ -43,8 +43,10 @@ with a URL but no key cannot self-update: the runtime reports that
 self-update is disabled and does not contact the server.
 
 When `[update]` is present, onelf links the larger update-capable
-runtime (about 1.3 MB extra for the HTTPS / zsync code). Without it,
-the slim runtime is used and `--onelf-update` is unrecognized.
+runtime (1.36 MB extra for the HTTPS, zsync and signature code). Without
+it, the slim runtime is used and `--onelf-update` is unrecognized. If
+something else updates the package, keep the metadata and drop that code
+with `embed = false`, described below.
 
 The URL must be `https://`. A plain-HTTP URL is rejected before any
 request is made.
@@ -93,6 +95,46 @@ installs and runs normally and only its update path is dead.
 crate. The C `zsyncmake` from most distros works too; they produce the
 same format.
 :::
+
+## Updating from outside the package
+
+Recording where a package updates from and embedding an updater are two
+separate choices. By default an update URL brings the update-capable
+runtime with it, which costs 1.36 MB over the slim runtime, making the
+runtime 63% larger.
+
+When something else does the updating, that code is dead weight, and
+worse than dead weight: a self-update replaces a file the package manager
+owns, so its database and the disk stop agreeing about what is installed.
+
+```bash
+onelf pack app -o myapp.onelf --command bin/myapp \
+  --update-url https://releases.example.com/myapp.onelf.zsync \
+  --no-embed-updater
+```
+
+or in a recipe:
+
+```toml
+[update]
+url = "https://releases.example.com/myapp.onelf.zsync"
+embed = false
+```
+
+The package still records the URL and the signing key, so an external
+updater reads them the same way. It just carries no update code, and the
+update flags do nothing. Read the metadata with `onelf info`:
+
+```
+Update:
+  URL:          https://releases.example.com/myapp.onelf.zsync
+  Signing key:  embedded
+  Updater:      external (this package does not update itself)
+```
+
+Signing still applies. An external updater that verifies the signature
+gets the same guarantee the embedded one does, using the key from the
+package and the `.sig` from the server.
 
 ## User-side commands
 
@@ -155,12 +197,15 @@ or commit it.
 
 ## Size tradeoff
 
-| Runtime | Size | Self-update |
-|---------|------|-------------|
-| slim | ~700 KB | no |
-| update | ~2 MB | yes |
+| Runtime | Size | Self-update | Records an update URL |
+|---------|------|-------------|----------------------|
+| slim | 807 KB | no | no |
+| slim, `embed = false` | 807 KB | no | yes |
+| update | 2.17 MB | yes | yes |
 
-Pick update only if you actually want self-update. The default is slim.
+The default is slim. Take the update runtime only if the package should
+update itself; if something else does, the middle row keeps the metadata
+without the code.
 
 ## Security considerations
 

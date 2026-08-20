@@ -70,6 +70,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
 | `--update-url URL` | | zsync URL; enables update runtime |
 | `--update-key PATH` | | 32-byte Ed25519 public key; required for self-update |
+| `--no-embed-updater` | `false` | Record the update URL without embedding the updater (saves 1.36 MB) |
 | `--exclude GLOB` | | Exclude paths matching glob (repeatable) |
 
 ## `onelf bundle-libs`
