@@ -180,10 +180,15 @@ pub(crate) enum RunpathOutcome {
 
 /// RUNPATH string written into every bundled binary.
 ///
-/// Covers binaries at depth 1 (`bin/foo`), 2 (`libexec/podman/x`), and 3
-/// (`share/pkg/helpers/y`). Entries that do not exist are ignored by the
-/// loader, so one list serves every depth.
-const ORIGIN_RUNPATH: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
+/// Covers a binary sitting at the package root (`blender`), and at depth 1
+/// (`bin/foo`), 2 (`libexec/podman/x`), and 3 (`share/pkg/helpers/y`).
+/// Entries that do not exist are ignored by the loader, so one list serves
+/// every depth.
+///
+/// The root case matters: an application whose executable is the top-level
+/// file, which is how Blender and similar redistributables ship, resolves
+/// `$ORIGIN/../lib` to a directory above the package and finds nothing.
+const ORIGIN_RUNPATH: &str = "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
 
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes.
 ///
@@ -211,16 +216,32 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
         .map(|sh| (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
     let dynamic_present = elf.dynamic.is_some();
 
+    // File offset of the dynamic array, so a DT_RUNPATH tag can be rewritten
+    // to DT_RPATH in place.
+    let dyn_offset = elf
+        .program_headers
+        .iter()
+        .find(|p| p.p_type == goblin::elf::program_header::PT_DYNAMIC)
+        .map(|p| p.p_offset as usize);
+    let dyn_entry_size = if elf.is_64 { 16 } else { 8 };
+
     let mut slots: Vec<usize> = Vec::new();
+    let mut runpath_tags: Vec<usize> = Vec::new();
     if let (Some((dynstr_offset, _)), Some(dynamic)) = (dynstr_range, &elf.dynamic) {
-        for d in &dynamic.dyns {
+        for (i, d) in dynamic.dyns.iter().enumerate() {
             if d.d_tag == goblin::elf::dynamic::DT_RPATH
                 || d.d_tag == goblin::elf::dynamic::DT_RUNPATH
             {
                 slots.push(dynstr_offset + d.d_val as usize);
+                if d.d_tag == goblin::elf::dynamic::DT_RUNPATH
+                    && let Some(base) = dyn_offset
+                {
+                    runpath_tags.push(base + i * dyn_entry_size);
+                }
             }
         }
     }
+    let is_64 = elf.is_64;
     let dynstr_end = dynstr_range.map(|(_, e)| e).unwrap_or(0);
     drop(elf);
 
@@ -248,11 +269,46 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
         }
         rewritten += 1;
     }
+    // Retag every `DT_RUNPATH` as `DT_RPATH`, whether or not its string was
+    // rewritten above.
+    //
+    // The loader does not consult `DT_RUNPATH` when resolving a dependency's
+    // own dependencies, and an object carrying one is also barred from
+    // inheriting its parent's path. So one `DT_RUNPATH` anywhere in the
+    // bundle strands that object: on the packaging host the system copies
+    // hide it, elsewhere the chain fails to load. `DT_RPATH` is inherited,
+    // which lets a single entry on the executable serve the whole tree and
+    // lets a library whose slot was too small fall back to it.
+    for at in runpath_tags {
+        let width = if is_64 { 8 } else { 4 };
+        if at + width <= data.len() {
+            let tag = goblin::elf::dynamic::DT_RPATH;
+            if is_64 {
+                data[at..at + 8].copy_from_slice(&tag.to_le_bytes());
+            } else {
+                data[at..at + 4].copy_from_slice(&(tag as u32).to_le_bytes());
+            }
+        }
+    }
+
     if total > 0 && rewritten == total {
         return Ok(RunpathOutcome::Set);
     }
+    // A slot too small to hold the new string keeps its old contents, but is
+    // now an RPATH, so the executable's entry still covers it.
+    if total > 0 && !is_executable {
+        return Ok(RunpathOutcome::Set);
+    }
 
-    if !dynamic_present || !has_needed || !is_executable {
+    // Nothing to resolve: a static binary, or a bottom-of-stack library
+    // like libc itself, which has no DT_NEEDED of its own.
+    if !dynamic_present || !has_needed {
+        return Ok(RunpathOutcome::NotNeeded);
+    }
+    // A library with no slot of its own resolves through the executable's
+    // `DT_RPATH`, which the loader inherits down the dependency chain. Only
+    // executables are worth growing a file for.
+    if !is_executable {
         return Ok(RunpathOutcome::NotNeeded);
     }
     if is_self_extract {
@@ -299,12 +355,7 @@ fn run_patchelf_rpath(path: &Path, patchelf: Option<&Path>) -> RunpathOutcome {
 }
 
 pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
-    // Cover binaries at depth 1 (e.g. bin/foo), 2 (libexec/podman/x),
-    // and 3 (share/pkg/helpers/y). Nonexistent entries are silently
-    // ignored by the dynamic loader, so this is safe to apply
-    // uniformly without knowing where each ELF sits.
-    const NEW: &str = "$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
-    let new_bytes = NEW.as_bytes();
+    let new_bytes = ORIGIN_RUNPATH.as_bytes();
     let data = fs::read(path)?;
 
     // Binaries with an embedded payload (pre-1.3.12 Bun via an EOF trailer,
@@ -418,7 +469,7 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
         let status = std::process::Command::new(&patchelf)
             .arg("--force-rpath")
             .arg("--set-rpath")
-            .arg(NEW)
+            .arg(ORIGIN_RUNPATH)
             .arg(path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -1401,10 +1452,7 @@ mod runpath_tests {
                 .iter()
                 .all(|&b| b == GUARD)
         );
-        let written = &out[guard_off - 81..guard_off - 81 + 53];
-        assert_eq!(
-            written,
-            b"$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib"
-        );
+        let written = &out[guard_off - 81..guard_off - 81 + ORIGIN_RUNPATH.len()];
+        assert_eq!(written, ORIGIN_RUNPATH.as_bytes());
     }
 }
