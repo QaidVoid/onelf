@@ -56,6 +56,27 @@ sha256sum a.onelf b.onelf
 # Hashes should be identical.
 ```
 
+## The onelf binary itself
+
+Everything above concerns the package you produce. The `onelf` binary also
+embeds a runtime, and that runtime is built reproducibly too: the same
+source, the same toolchain and a fixed `SOURCE_DATE_EPOCH` give a
+byte-identical runtime, and therefore byte-identical packages.
+
+Build paths do not leak into it. The runtime is compiled with the cargo
+registry, your home directory, the workspace root and the rustc sysroot
+all remapped to stable placeholders, so a checkout at a different path or
+a different `CARGO_HOME` still produces the same bytes.
+
+The toolchain is part of the input. A different rust version compiles
+different code, so pin the rust toolchain alongside everything else if you
+need one machine to reproduce another's bytes.
+
+To skip the runtime build entirely, point `ONELF_RT_PATH` at a runtime you
+built earlier. It is checked for ELF magic and for a machine type matching
+the target being built, so a stale or foreign artifact fails the build
+rather than being silently embedded.
+
 ## Known sources of non-determinism you might introduce
 
 - Different compiler versions between builds (the bundled binaries differ).
