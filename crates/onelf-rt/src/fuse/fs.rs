@@ -124,23 +124,40 @@ impl BlockCache {
         self.data.get(&(inode, block_index)).map(|v| v.as_slice())
     }
 
-    fn insert_block(&mut self, inode: u64, block_index: usize, content: Vec<u8>) {
+    /// Insert a block, evicting older ones to stay within budget.
+    ///
+    /// `pinned` names blocks of `inode` that the read in progress will read
+    /// back, and which therefore must survive regardless of the budget.
+    /// Without that, a read spanning more blocks than the budget holds, or a
+    /// prefetch landing on a full cache, evicts a block that is about to be
+    /// borrowed.
+    fn insert_block(&mut self, inode: u64, block_index: usize, content: Vec<u8>, pinned: &[usize]) {
         self.last_access = Some(Instant::now());
         let key = (inode, block_index);
         if let Some(old) = self.data.remove(&key) {
             self.bytes -= old.len();
             self.order.retain(|k| *k != key);
         }
-        // Evict oldest-first until the newcomer fits. A block larger than the
-        // whole budget still goes in, because refusing it would mean the read
-        // it belongs to could never be served.
+        // Evict oldest-first until the newcomer fits, skipping anything the
+        // caller pinned. A block larger than the whole budget still goes in,
+        // because refusing it would leave its read unservable.
+        let mut skipped: Vec<BlockKey> = Vec::new();
         while self.bytes + content.len() > self.budget {
             let Some(victim) = self.order.pop_front() else {
                 break;
             };
+            if victim.0 == inode && pinned.contains(&victim.1) {
+                skipped.push(victim);
+                continue;
+            }
             if let Some(dropped) = self.data.remove(&victim) {
                 self.bytes -= dropped.len();
             }
+        }
+        // Pinned blocks keep their place at the front, so they are the first
+        // to go once the read that needed them is done.
+        for k in skipped.into_iter().rev() {
+            self.order.push_front(k);
         }
         self.bytes += content.len();
         self.order.push_back(key);
@@ -408,7 +425,8 @@ impl<'a> FuseState<'a> {
             let block = &entry.blocks[block_idx];
             match loader::read_payload_entry(self.file, self.footer, block, self.dict) {
                 Ok(data) => {
-                    self.cache.insert_block(inode, block_idx, data);
+                    self.cache
+                        .insert_block(inode, block_idx, data, needed_blocks);
                 }
                 Err(_) => {
                     let r = reply_err(header, -libc_eio());
@@ -424,7 +442,7 @@ impl<'a> FuseState<'a> {
             if next < num_blocks && self.cache.get_block(inode, next).is_none() {
                 let block = &entry.blocks[next];
                 let _ = loader::read_payload_entry(self.file, self.footer, block, self.dict)
-                    .map(|data| self.cache.insert_block(inode, next, data));
+                    .map(|data| self.cache.insert_block(inode, next, data, needed_blocks));
             }
         }
 
@@ -436,7 +454,11 @@ impl<'a> FuseState<'a> {
         if needed_blocks.len() == 1 {
             // Fast path: single block (most common)
             let block_idx = needed_blocks[0];
-            let block_data = self.cache.get_block(inode, block_idx).unwrap();
+            let Some(block_data) = self.cache.get_block(inode, block_idx) else {
+                let r = reply_err(header, -libc_eio());
+                let _ = rustix::io::write(fuse_fd, &r);
+                return;
+            };
             let data_start = (offset - block_offsets[block_idx]).min(block_data.len());
             let data_end = data_start.saturating_add(read_len).min(block_data.len());
             let payload = &block_data[data_start..data_end];
@@ -460,7 +482,11 @@ impl<'a> FuseState<'a> {
             let mut payloads: Vec<&[u8]> = Vec::with_capacity(needed_blocks.len());
             let mut total = 0usize;
             for &block_idx in needed_blocks {
-                let block_data = self.cache.get_block(inode, block_idx).unwrap();
+                let Some(block_data) = self.cache.get_block(inode, block_idx) else {
+                    let r = reply_err(header, -libc_eio());
+                    let _ = rustix::io::write(fuse_fd, &r);
+                    return;
+                };
                 let block_start = block_offsets[block_idx];
                 let slice_start = (offset.max(block_start) - block_start).min(block_data.len());
                 let slice_end =
@@ -915,7 +941,7 @@ mod tests {
     fn cache_evicts_to_stay_within_budget() {
         let mut c = BlockCache::new(300);
         for i in 0..10 {
-            c.insert_block(1, i, block(100));
+            c.insert_block(1, i, block(100), &[]);
             assert!(
                 c.bytes <= 300,
                 "budget exceeded after {} inserts: {}",
@@ -931,8 +957,8 @@ mod tests {
     #[test]
     fn reinserting_a_block_does_not_double_count() {
         let mut c = BlockCache::new(1000);
-        c.insert_block(1, 0, block(100));
-        c.insert_block(1, 0, block(100));
+        c.insert_block(1, 0, block(100), &[]);
+        c.insert_block(1, 0, block(100), &[]);
         assert_eq!(c.bytes, 100);
         assert_eq!(c.order.len(), 1);
     }
@@ -942,14 +968,42 @@ mod tests {
     #[test]
     fn a_block_larger_than_the_budget_is_still_served() {
         let mut c = BlockCache::new(50);
-        c.insert_block(1, 0, block(500));
+        c.insert_block(1, 0, block(500), &[]);
         assert!(c.get_block(1, 0).is_some());
+    }
+
+    /// A read spanning more blocks than the budget holds must still be
+    /// servable: evicting one of its own blocks mid-read left the gather
+    /// borrowing a block that was no longer there.
+    #[test]
+    fn pinned_blocks_survive_eviction() {
+        let mut c = BlockCache::new(250);
+        let needed = [0usize, 1, 2, 3, 4];
+        for i in needed {
+            c.insert_block(1, i, block(100), &needed);
+        }
+        for i in needed {
+            assert!(
+                c.get_block(1, i).is_some(),
+                "block {i} was needed by the read in progress"
+            );
+        }
+
+        // A prefetch on a full cache must not take one either.
+        c.insert_block(1, 5, block(100), &needed);
+        for i in needed {
+            assert!(c.get_block(1, i).is_some(), "prefetch evicted block {i}");
+        }
+
+        // Once nothing is pinned, the budget is enforced again.
+        c.insert_block(2, 0, block(100), &[]);
+        assert!(c.bytes <= 600, "unpinned inserts must still evict");
     }
 
     #[test]
     fn idle_clear_releases_everything() {
         let mut c = BlockCache::new(1000);
-        c.insert_block(1, 0, block(100));
+        c.insert_block(1, 0, block(100), &[]);
         assert!(c.is_active());
         c.last_access = Some(Instant::now() - std::time::Duration::from_secs(CACHE_IDLE_SECS + 1));
         c.maybe_clear();
