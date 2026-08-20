@@ -66,6 +66,9 @@ pub struct Package {
     pub output: Option<PathBuf>,
     #[serde(default)]
     pub working_dir: WorkingDirSpec,
+    /// Whether the host's library directories join the runtime search path.
+    /// `auto` (the default) decides from the bundle's contents.
+    pub host_libs: Option<HostLibsSpec>,
     /// Mark the default entrypoint memfd-eligible (overrides auto-detect).
     pub memfd: Option<bool>,
     #[serde(default)]
@@ -143,6 +146,25 @@ impl Default for Compression {
 
 fn default_level() -> i32 {
     12
+}
+
+/// Recipe spelling of the host library directory policy.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostLibsSpec {
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<HostLibsSpec> for crate::pack::HostLibs {
+    fn from(v: HostLibsSpec) -> Self {
+        match v {
+            HostLibsSpec::Auto => crate::pack::HostLibs::Auto,
+            HostLibsSpec::Always => crate::pack::HostLibs::Always,
+            HostLibsSpec::Never => crate::pack::HostLibs::Never,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

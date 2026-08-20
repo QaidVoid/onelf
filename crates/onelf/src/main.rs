@@ -96,6 +96,14 @@ enum Commands {
         #[arg(long)]
         update_key: Option<PathBuf>,
 
+        /// Whether the host's library directories join the runtime search
+        /// path. They exist so host GPU drivers stay reachable, but they
+        /// hold every system library, so anything missing from the bundle
+        /// is silently taken from the host. `auto` decides from the
+        /// bundle's contents.
+        #[arg(long, value_name = "MODE", default_value = "auto")]
+        host_libs: HostLibsArg,
+
         /// Record the update URL but do not embed the updater, linking the
         /// slim runtime instead. Saves about 1.3 MB per package. For
         /// packages updated by a package manager or deployment system,
@@ -434,6 +442,26 @@ enum CacheAction {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum HostLibsArg {
+    /// Decide from the bundle's contents
+    Auto,
+    /// Always expose the host's library directories
+    Always,
+    /// Never expose them
+    Never,
+}
+
+impl From<HostLibsArg> for pack::HostLibs {
+    fn from(v: HostLibsArg) -> Self {
+        match v {
+            HostLibsArg::Auto => pack::HostLibs::Auto,
+            HostLibsArg::Always => pack::HostLibs::Always,
+            HostLibsArg::Never => pack::HostLibs::Never,
+        }
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum WorkingDirArg {
     Inherit,
@@ -467,6 +495,7 @@ fn main() {
             update_url,
             update_key,
             no_embed_updater,
+            host_libs,
             exclude,
             preload,
             needs_setuid,
@@ -513,6 +542,7 @@ fn main() {
                         no_compress,
                         memfd: memfd_opt,
                         working_dir: wd,
+                        host_libs: host_libs.into(),
                         update_url: update_url.clone(),
                         embed_updater: !no_embed_updater,
                         update_key,
@@ -804,6 +834,11 @@ fn run_build(
             no_compress: recipe.compression.store,
             memfd: recipe.package.memfd,
             working_dir: recipe.package.working_dir.into(),
+            host_libs: recipe
+                .package
+                .host_libs
+                .map(Into::into)
+                .unwrap_or(pack::HostLibs::Auto),
             update_url,
             embed_updater,
             update_key,

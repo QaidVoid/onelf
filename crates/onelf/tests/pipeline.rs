@@ -60,6 +60,14 @@ fn workdir(tag: &str) -> PathBuf {
 /// owned by us, so the mode is set explicitly rather than left to the umask.
 ///
 /// Call this after any `env_clear`, or it will be wiped again.
+/// True when the packed footer carries `bit`.
+fn has_footer_flag(pkg: &Path, bit: u16) -> bool {
+    let data = std::fs::read(pkg).expect("read package");
+    let footer = &data[data.len() - 76..];
+    let flags = u16::from_le_bytes([footer[10], footer[11]]);
+    flags & bit != 0
+}
+
 fn isolate(cmd: &mut Command, td: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1454,6 +1462,109 @@ fn bundling_reports_libraries_it_did_not_bundle() {
     assert!(
         err.contains("not in the bundle") && err.contains("libc.so.6"),
         "an excluded dependency must be named as host-resolved: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The host's library directories are on the search path so GPU drivers
+/// stay reachable, but they hold every system library, so a package that
+/// needs nothing from the host should not have them.
+#[test]
+fn a_package_needing_nothing_from_the_host_does_not_get_its_lib_dirs() {
+    let td = workdir("hostlibs");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("m.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"MAIN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/main")) {
+        return; // no compiler: documented soft-skip
+    }
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .output()
+        .expect("spawn bundle-libs");
+    assert!(o.status.success());
+
+    let pack_as = |name: &str, mode: Option<&str>| {
+        let out = td.join(name);
+        let mut cmd = Command::new(onelf());
+        cmd.args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args(["--command", "bin/main", "--mtime", "0"]);
+        if let Some(m) = mode {
+            cmd.args(["--host-libs", m]);
+        }
+        let o = cmd.output().expect("spawn onelf pack");
+        assert!(
+            o.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        out
+    };
+
+    // A plain CLI app references no driver stack, so `auto` withholds them.
+    let auto = pack_as("auto.onelf", None);
+    assert!(
+        has_footer_flag(&auto, 1 << 5),
+        "auto must withhold host lib dirs from a package that needs none"
+    );
+
+    // And the package still runs.
+    let mut run = Command::new(&auto);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "MAIN");
+
+    // The override is honoured in both directions.
+    assert!(
+        !has_footer_flag(&pack_as("always.onelf", Some("always")), 1 << 5),
+        "--host-libs always must expose them"
+    );
+    assert!(
+        has_footer_flag(&pack_as("never.onelf", Some("never")), 1 << 5),
+        "--host-libs never must withhold them"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package that loads a driver stack keeps the host directories, since
+/// GPU userspace has to come from the host.
+#[test]
+fn a_package_that_uses_a_driver_stack_keeps_the_host_lib_dirs() {
+    let td = workdir("hostlibsgl");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("g.c");
+    // dlopen'd by name, exactly how a real driver stack is reached: the
+    // soname never appears in DT_NEEDED, only as a string in the binary.
+    write(
+        &src,
+        "#include <stdio.h>\nconst char *drv = \"libvulkan.so.1\";\n         int main(void){puts(drv);return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/g")) {
+        return; // no compiler: documented soft-skip
+    }
+
+    let pkg = td.join("gl.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/g", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    assert!(
+        !has_footer_flag(&pkg, 1 << 5),
+        "a package referencing a driver soname must keep the host lib dirs"
     );
 
     let _ = std::fs::remove_dir_all(&td);

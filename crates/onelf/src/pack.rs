@@ -28,6 +28,24 @@ use onelf_format::{
 
 use crate::compress;
 
+/// Whether a package wants the host's library directories on its search
+/// path at runtime.
+///
+/// Those directories hold the whole system's libraries, not just the GPU
+/// drivers they are there for, so exposing them means any soname the
+/// bundle is missing is quietly satisfied by the host's copy. Packages
+/// that need nothing from the host are better off without them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostLibs {
+    /// Decide from the bundle's contents.
+    #[default]
+    Auto,
+    /// Always expose them.
+    Always,
+    /// Never expose them.
+    Never,
+}
+
 pub struct PackOptions {
     pub directory: PathBuf,
     pub output: PathBuf,
@@ -44,6 +62,9 @@ pub struct PackOptions {
     pub no_compress: bool,
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
+    /// Whether the host's library directories join the runtime search
+    /// path. See [`HostLibs`].
+    pub host_libs: HostLibs,
     pub update_url: Option<String>,
     /// Embed the update-capable runtime when `update_url` is set. False
     /// records the update metadata but links the slim runtime, for
@@ -1047,6 +1068,14 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.update_url.is_some() && !opts.embed_updater {
         flags |= Flags::EXTERNAL_UPDATER;
     }
+    let expose_host_libs = match opts.host_libs {
+        HostLibs::Always => true,
+        HostLibs::Never => false,
+        HostLibs::Auto => bundle_needs_host_libs(&opts.directory),
+    };
+    if !expose_host_libs {
+        flags |= Flags::NO_HOST_LIB_DIRS;
+    }
 
     // Write the output file
     let pb = ProgressBar::new_spinner();
@@ -1242,6 +1271,75 @@ fn elf_interp(data: &[u8]) -> Option<String> {
     std::str::from_utf8(text).ok().map(String::from)
 }
 
+/// Whether a tree needs libraries the host must supply.
+///
+/// Deliberately generous. Guessing "no" when the answer is "yes" breaks an
+/// app that works today, while guessing "yes" only leaves the current
+/// behaviour in place, so anything that looks like a host-provided family
+/// counts.
+///
+/// Driver stacks are loaded by `dlopen` at runtime and so never appear in
+/// `DT_NEEDED`. Their sonames are looked for as strings anywhere in the
+/// bundle's ELF files instead.
+fn bundle_needs_host_libs(directory: &Path) -> bool {
+    const DRIVER_FAMILIES: &[&str] = &[
+        "libGL.so",
+        "libGLX.so",
+        "libEGL.so",
+        "libGLdispatch.so",
+        "libOpenGL.so",
+        "libGLESv2.so",
+        "libvulkan.so",
+        "libcuda.so",
+        "libnvidia",
+        "libva.so",
+        "libOpenCL.so",
+        "libdrm",
+        "libgbm.so",
+    ];
+
+    for entry in jwalk::WalkDir::new(directory).sort(true) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if DRIVER_FAMILIES.iter().any(|f| name.contains(f)) {
+            return true;
+        }
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        if !data.starts_with(b"\x7fELF") {
+            continue;
+        }
+        // NSS modules are dlopened by glibc for getpwnam, DNS and friends.
+        // glibc 2.34 folded files and dns into libc.so.6 itself, so a
+        // bundle shipping that or newer needs nothing from the host for
+        // them. An older bundled glibc still does, and the version marker
+        // is the reliable way to tell the two apart: verified that a 2.43
+        // libc carries `GLIBC_2.34` and a 2.31 libc does not.
+        if name == "libc.so.6" && !contains_bytes(&data, b"GLIBC_2.34") {
+            return true;
+        }
+        for family in DRIVER_FAMILIES {
+            if contains_bytes(&data, family.as_bytes()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1367,7 @@ mod tests {
             no_compress: false,
             memfd: Some(false),
             working_dir: WorkingDir::Inherit,
+            host_libs: HostLibs::default(),
             update_url: None,
             embed_updater: true,
             update_key: None,
