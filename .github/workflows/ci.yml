@@ -37,6 +37,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             musl-tools patchelf fuse3
 
+      # Installing fuse3 is not the same as being allowed to mount. The
+      # runtime prefers unsharing a mount namespace, which Ubuntu 24.04
+      # denies to unprivileged users through AppArmor, and falls back to
+      # the fusermount3 helper, which needs the fuse module present. The
+      # tests probe for a real mount and skip themselves when it fails, so
+      # this is what keeps them from skipping silently and leaving FUSE
+      # uncovered. Best effort: a runner that refuses either knob still
+      # runs the rest of the suite.
+      - name: Allow FUSE mounts
+        run: |
+          sudo modprobe fuse || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          ls -l /dev/fuse || true
+
       # Stable, not nightly: the workspace has no nightly features, and a
       # lint gate that moves under the repository is worse than no gate.
       - name: Install Rust toolchain
