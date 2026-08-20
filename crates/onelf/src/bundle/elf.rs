@@ -644,7 +644,7 @@ pub(crate) fn report_unbundled_needs(findings: &[(PathBuf, Vec<String>)]) {
     sonames.dedup();
 
     eprintln!(
-        "{} {} librar(ies) are not in the bundle and will come from the host:",
+        "{} {} librar(ies) are not in the bundle:",
         color::bold_red("warning:"),
         sonames.len()
     );
@@ -662,11 +662,12 @@ pub(crate) fn report_unbundled_needs(findings: &[(PathBuf, Vec<String>)]) {
         eprintln!("  - {soname} (needed by {})", by.join(", "));
     }
     eprintln!(
-        "  The runtime puts the host's library directories on the search \
-         path so GPU drivers stay reachable, so these resolve to the host's \
-         copies and load next to the bundled libc. Add them with \
-         --search-path, or accept them if they are meant to come from the \
-         host (GL, DRI, Vulkan, NSS)."
+        "  These resolve to the host's copies, and load next to the bundled \
+         libc, only for a package that keeps the host's library directories. \
+         Otherwise loading them fails where they are first used. Add them \
+         with --search-path, or leave them if they are meant to come from \
+         the host (GL, DRI, Vulkan, NSS); `pack --host-libs` decides which \
+         of the two happens."
     );
 }
 

@@ -53,9 +53,13 @@ are older or newer.
 So `bundle-libs` reports what it did not bundle:
 
 ```
-warning: 1 librar(ies) are not in the bundle and will come from the host:
+warning: 1 librar(ies) are not in the bundle:
   - libm.so.6 (needed by myapp)
 ```
+
+Whether that is fatal depends on the host library directories below. A
+package that keeps them resolves these from the host; one that does not
+fails where the library is first used.
 
 Some entries are expected. GL, DRI, Vulkan and NSS libraries are meant to
 come from the host, because they have to match the user's drivers and
