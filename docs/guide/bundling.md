@@ -31,6 +31,35 @@ With no flags, this:
    the host's `ld.so.preload`, `ld.so.cache`, or hardcoded fallback
    library dirs.
 
+## Libraries that come from the host
+
+A library the bundle does not provide is not a hard error at runtime. The
+loader falls back to its own built-in directory list, finds the host's
+copy, and loads it into a process that is already holding the bundled
+libc. Two different glibcs then share one process, which is what actually
+crashes.
+
+The symptom is "works on my machine", and that is not a joke about
+testing: on the packer's machine the host copy *is* the matching one, so
+the bundle genuinely works there and fails on a machine whose libraries
+are older or newer.
+
+So `bundle-libs` reports what it did not bundle:
+
+```
+warning: 1 librar(ies) are not in the bundle and will come from the host:
+  - libm.so.6 (needed by myapp)
+```
+
+Some entries are expected. GL, DRI, Vulkan and NSS libraries are meant to
+come from the host, because they have to match the user's drivers and
+system configuration. The warning lists them so you can tell the
+deliberate ones from the accidental ones; nothing fails.
+
+For the accidental ones, point `--search-path` at a directory holding the
+library and repack. A library reached only through `dlopen` will not
+appear in `DT_NEEDED` at all, so `--scan-dlopen` is what finds those.
+
 ## Self-extracting binaries (Bun, etc.)
 
 Some binaries embed their payload at the end of the file. The most
