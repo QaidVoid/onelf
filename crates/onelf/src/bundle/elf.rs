@@ -502,12 +502,19 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
 
 /// Sonames a bundled object needs that no bundled file provides.
 ///
-/// Anything listed here is resolved from the host at runtime. That is not
-/// a missing file error: the loader falls back to its built-in directory
-/// list, finds the host's copy, and loads it into a process already
-/// holding the bundled libc. A glibc that disagrees with the bundled one
-/// is exactly the mismatch that crashes, and nothing reports it, because
-/// on the packer's machine the host copy is the right one.
+/// Anything listed here is resolved from the host at runtime, and not by
+/// accident: the runtime appends the host's library directories to the
+/// search path so GPU drivers stay reachable (`drivers::host_driver_paths`).
+/// Those directories hold the whole system's libraries, not just drivers,
+/// so a soname missing from the bundle is quietly satisfied by the host's
+/// copy and loaded next to the bundled libc. A glibc that disagrees with
+/// the bundled one is exactly the mismatch that crashes, and nothing
+/// reports it, because on the packer's machine the host copy is the right
+/// one.
+///
+/// The loader's own fallbacks are already closed: `scrub_loader_paths`
+/// blanks its compiled-in directories and its `ld.so.cache` path. This is
+/// the one remaining route, and it is one the runtime opens deliberately.
 ///
 /// The dynamic loader is excluded: it is named through PT_INTERP rather
 /// than DT_NEEDED, and is handled separately.
@@ -655,10 +662,11 @@ pub(crate) fn report_unbundled_needs(findings: &[(PathBuf, Vec<String>)]) {
         eprintln!("  - {soname} (needed by {})", by.join(", "));
     }
     eprintln!(
-        "  The loader falls back to the host's own library directories for \
-         these, so a host copy built against a different libc is loaded \
-         alongside the bundled one. Add them with --search-path, or accept \
-         them if they are meant to come from the host (GL, DRI, Vulkan, NSS)."
+        "  The runtime puts the host's library directories on the search \
+         path so GPU drivers stay reachable, so these resolve to the host's \
+         copies and load next to the bundled libc. Add them with \
+         --search-path, or accept them if they are meant to come from the \
+         host (GL, DRI, Vulkan, NSS)."
     );
 }
 

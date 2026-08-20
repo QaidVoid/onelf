@@ -34,10 +34,16 @@ With no flags, this:
 ## Libraries that come from the host
 
 A library the bundle does not provide is not a hard error at runtime. The
-loader falls back to its own built-in directory list, finds the host's
-copy, and loads it into a process that is already holding the bundled
-libc. Two different glibcs then share one process, which is what actually
-crashes.
+runtime appends the host's library directories to the search path so GPU
+drivers stay reachable, and those directories hold the whole system's
+libraries, not just drivers. So a missing soname is quietly satisfied by
+the host's copy and loaded into a process that is already holding the
+bundled libc. Two different glibcs then share one process, which is what
+actually crashes.
+
+The bundled loader's own fallbacks are already closed: its compiled-in
+search directories and its `ld.so.cache` path are both blanked at bundle
+time. The search path above is the deliberate exception.
 
 The symptom is "works on my machine", and that is not a joke about
 testing: on the packer's machine the host copy *is* the matching one, so
