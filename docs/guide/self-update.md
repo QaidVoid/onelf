@@ -4,31 +4,89 @@ onelf integrates [zsync](https://zsync.moria.org.uk/) for delta updates.
 After a user has your app, they can pull updates with one command and the
 runtime downloads only the differing blocks from your hosted binary.
 
+Updates are signed. The runtime verifies a detached Ed25519 signature
+over the fully assembled binary before it replaces anything, and refuses
+to update at all if the package carries no key. Publishing an update
+therefore takes a keypair, and the key has to be embedded when you pack.
+
+## Generate a signing key
+
+```bash
+onelf key new --secret myapp.key --public myapp.pub
+```
+
+The secret key is written owner-only. Keep it out of the repository and
+back it up: replacing it later breaks self-update for every user already
+holding a package built with the old public key, and there is no recovery
+short of a manual re-download.
+
+The public key is 32 raw bytes, exactly the form `--update-key` embeds.
+If you lose your copy of it, re-derive it from the secret:
+
+```bash
+onelf key show --secret myapp.key -o myapp.pub
+```
+
 ## Opt in at pack time
 
-Set `[update] url` in the recipe (or `--update-url` on the CLI). The URL
-should point at the `.zsync` control file you'll host alongside the
-binary.
+Set both the update URL and the public key. The URL should point at the
+`.zsync` control file you'll host alongside the binary.
 
 ```toml
 [update]
 url = "https://releases.example.com/myapp.onelf.zsync"
+key = "myapp.pub"
 ```
+
+On the CLI that is `--update-url` plus `--update-key`. A package built
+with a URL but no key cannot self-update: the runtime reports that
+self-update is disabled and does not contact the server.
 
 When `[update]` is present, onelf links the larger update-capable
 runtime (about 1.3 MB extra for the HTTPS / zsync code). Without it,
 the slim runtime is used and `--onelf-update` is unrecognized.
 
-## Produce the `.zsync` file
+The URL must be `https://`. A plain-HTTP URL is rejected before any
+request is made.
 
-After `onelf build`, generate the zsync control file:
+## Publish
+
+The order matters. The signature covers the binary's exact bytes, so it
+has to be produced after everything that changes them.
 
 ```bash
+# 1. Build the binary.
+onelf build
+
+# 2. Generate the zsync control file. It describes the binary but does
+#    not modify it.
 zsyncmake myapp.onelf -u https://releases.example.com/myapp.onelf
+
+# 3. Sign the finished binary.
+onelf sign myapp.onelf --key myapp.key
 ```
 
-The `-u` URL points at the actual binary (not the `.zsync`). Upload both
-`myapp.onelf` and `myapp.onelf.zsync` to your host.
+`sign` prints where the signature has to go:
+
+```
+Signed with the key this package embeds.
+Signature: myapp.onelf.zsync.sig
+Publish it at: https://releases.example.com/myapp.onelf.zsync.sig
+```
+
+Note the name. The runtime builds the signature URL by appending `.sig`
+to the **update URL**, which names the zsync control file, so the
+signature over `myapp.onelf` is published as `myapp.onelf.zsync.sig`.
+`onelf sign` derives that name from the URL inside the package so you do
+not have to work it out. A signature published under any other name is
+simply never requested, and the update fails closed.
+
+Upload all three: `myapp.onelf`, `myapp.onelf.zsync`, and
+`myapp.onelf.zsync.sig`.
+
+`sign` refuses if the secret does not match the public key embedded in
+the package. That mismatch is otherwise invisible, since such a package
+installs and runs normally and only its update path is dead.
 
 :::info
 `zsyncmake` comes from the [zsync-rs](https://crates.io/crates/zsync-rs)
@@ -46,10 +104,15 @@ same format.
 The update-apply flow:
 
 1. Fetch the `.zsync` control file over HTTPS.
-2. Compare its SHA-1 against the running binary.
+2. Compare it against the running binary.
 3. If different, delta-download the new binary, using the current one
    as a seed (most blocks match, so typical downloads are tiny).
-4. Atomically `rename(2)` the new file over the old one.
+4. Fetch the detached signature and verify it over the assembled binary
+   against the key embedded at pack time.
+5. Only then, atomically `rename(2)` the new file over the old one.
+
+Any failure in step 4 removes the downloaded file and leaves the running
+executable untouched.
 
 Exit codes:
 
@@ -61,6 +124,10 @@ Exit codes:
 
 ## Example CI workflow
 
+Keep the secret key in your CI secret store base64-encoded, since it is
+raw binary, and decode it into a file for the signing step. Never echo it
+or commit it.
+
 ```yaml
 - name: Build
   run: onelf build
@@ -70,11 +137,19 @@ Exit codes:
     cargo install zsync-rs
     zsyncmake myapp.onelf -u https://releases.example.com/myapp.onelf
 
+- name: Sign
+  env:
+    SIGNING_KEY: ${{ secrets.ONELF_SIGNING_KEY }}
+  run: |
+    printf '%s' "$SIGNING_KEY" | base64 -d > signing.key
+    onelf sign myapp.onelf --key signing.key
+    rm -f signing.key
+
 - name: Upload
   uses: svenstaro/upload-release-action@v2
   with:
     repo_token: ${{ secrets.GITHUB_TOKEN }}
-    file: "myapp.onelf{,.zsync}"
+    file: "myapp.onelf{,.zsync,.zsync.sig}"
     file_glob: true
 ```
 
@@ -89,9 +164,14 @@ Pick update only if you actually want self-update. The default is slim.
 
 ## Security considerations
 
-- The update is verified by zsync's SHA-1 at the end of the download.
-- Always serve the `.zsync` and binary over HTTPS.
-- The SHA-1 check catches corruption and accidental mismatches. It's
-  **not** a signature. Anyone able to modify both files on your host can
-  push malicious updates. Consider signed packages (planned) or pinning
-  the binary via external means if that matters.
+- The signature is the security boundary. It is checked over the fully
+  assembled binary, against a key baked into the package at pack time,
+  before anything is installed.
+- zsync's own checksum catches corruption and accidental mismatches
+  during the transfer. It is not a signature and is not what makes the
+  update safe.
+- Compromising your server is not enough to push a malicious update,
+  since the attacker would also need the signing key. Compromising the
+  signing key is enough, so treat it accordingly.
+- Serve everything over HTTPS. The runtime enforces this for its own
+  requests and will not follow redirects.

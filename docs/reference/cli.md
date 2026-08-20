@@ -69,6 +69,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--no-memfd` | | Force memfd eligibility off |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
 | `--update-url URL` | | zsync URL; enables update runtime |
+| `--update-key PATH` | | 32-byte Ed25519 public key; required for self-update |
 | `--exclude GLOB` | | Exclude paths matching glob (repeatable) |
 
 ## `onelf bundle-libs`
@@ -173,6 +174,44 @@ Remove desktop shortcut and icon installed by `integrate`.
 ```
 onelf unintegrate BINARY [--entrypoint NAME]
 ```
+
+## `onelf key`
+
+Manage the Ed25519 keys that sign self-updates.
+
+```
+onelf key new [--secret PATH] [--public PATH]
+onelf key show --secret PATH [-o PATH]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--secret PATH` | `onelf.key` | Secret key file, created owner-only |
+| `--public PATH` | `onelf.pub` | Public key file, 32 raw bytes for `--update-key` |
+| `-o, --output PATH` | stdout | Where `show` writes the public key |
+
+`new` refuses to overwrite an existing key file.
+
+## `onelf sign`
+
+Write the detached signature the runtime verifies before installing an
+update.
+
+```
+onelf sign BINARY --key PATH [-o PATH]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--key PATH` | | Secret key file from `onelf key new` |
+| `-o, --output PATH` | derived from the package's update URL | Signature output path |
+
+The default output name comes from the update URL the package carries,
+because that is the only name the runtime requests: a package whose
+update URL is `app.onelf.zsync` needs its signature at
+`app.onelf.zsync.sig`. Signing refuses when the key does not match the
+one embedded in the package. See
+[Self-Update](../guide/self-update) for the full publish flow.
 
 ## `onelf cache`
 
