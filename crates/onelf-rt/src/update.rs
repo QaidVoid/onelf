@@ -61,7 +61,7 @@ fn verify_detached(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 /// closed: any fetch/parse/verify problem is an error so the binary is
 /// never installed unverified.
 fn verify_update_signature(path: &Path, url: &str, pubkey: &[u8]) -> Result<(), String> {
-    let sig_url = detached_sig_url(url);
+    let sig_url = onelf_format::update::detached_sig_url(url);
     // A hardened agent for the signature fetch: HTTPS only (no downgrade),
     // no redirects (a redirect is a hard error, not a silent 3xx body), and
     // a bounded timeout so a stalled server cannot hang the update.
@@ -140,15 +140,6 @@ impl Drop for Mmap {
             }
         }
     }
-}
-
-/// Build the detached-signature URL by appending `.sig` to the path
-/// component, before any query string or fragment. `https://h/a?t=1`
-/// becomes `https://h/a.sig?t=1`, preserving query-bearing update URLs.
-fn detached_sig_url(url: &str) -> String {
-    let split = url.find(['?', '#']).unwrap_or(url.len());
-    let (path, rest) = url.split_at(split);
-    format!("{path}.sig{rest}")
 }
 
 fn check(self_path: &Path, url: &str) -> i32 {
