@@ -857,6 +857,101 @@ fn owner_only_modes_work_under_fuse() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `onelf cache gc` must leave a package that a running instance still
+/// holds, and reclaim one that nobody does.
+///
+/// The runtime pins a package with a shared lock for its lifetime; the
+/// collector has to prove idleness by taking the exclusive lock rather than
+/// deleting on an age check alone.
+#[test]
+fn cache_gc_spares_a_running_package() {
+    let td = workdir("gclive");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    // Holds the package open long enough for gc to run against it.
+    write(&app.join("bin/run"), "#!/bin/sh\necho STARTED\nsleep 2\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("live.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let cache = td.join("xdg-cache");
+    let runtime_dir = td.join("xdg-run");
+    for d in [&cache, &runtime_dir] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(
+            d,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    let mut live = Command::new(&pkg);
+    live.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("ONELF_MODE", "cache")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match live.spawn() {
+        Ok(c) => c,
+        // Same ETXTBSY window the other tests hit.
+        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
+        Err(e) => panic!("spawn package: {e}"),
+    };
+
+    // Wait for it to announce itself, so the package is extracted and the
+    // shared lock is definitely held.
+    {
+        use std::io::Read;
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 8];
+        let n = out.read(&mut buf).unwrap_or(0);
+        if !String::from_utf8_lossy(&buf[..n]).contains("STARTED") {
+            let mut err = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+            let _ = child.kill();
+            panic!("package did not start (read {n} bytes): {err}");
+        }
+    }
+
+    let gc = |cache: &Path| -> String {
+        let o = Command::new(onelf())
+            .args(["cache", "gc", "--max-age", "0"])
+            .env("XDG_CACHE_HOME", cache)
+            .env("HOME", td.to_str().unwrap())
+            .output()
+            .expect("spawn onelf cache gc");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    let while_running = gc(&cache);
+    assert!(
+        while_running.contains("Skipped 1"),
+        "gc must spare a package a live instance holds, said: {while_running}"
+    );
+
+    let _ = child.wait();
+    let when_idle = gc(&cache);
+    assert!(
+        when_idle.contains("Removed 1"),
+        "gc must reclaim the package once idle, said: {when_idle}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A helper built against another libc must not decide what gets bundled.
 ///
 /// Architecture and libc came from whichever path sorted first, so adding a
