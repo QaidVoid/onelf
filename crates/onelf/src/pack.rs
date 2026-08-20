@@ -1292,6 +1292,13 @@ fn bundle_needs_host_libs(directory: &Path) -> bool {
         "libvulkan.so",
         "libcuda.so",
         "libnvidia",
+        // The compute backends Blender probes alongside CUDA. Measured:
+        // withholding the host directories costs OptiX while leaving CUDA
+        // working, so a miss here is a silent loss of capability rather
+        // than a failure anyone would notice.
+        "libnvoptix",
+        "libamdhip64",
+        "libze_loader",
         "libva.so",
         "libOpenCL.so",
         "libdrm",
@@ -1312,10 +1319,18 @@ fn bundle_needs_host_libs(directory: &Path) -> bool {
         if DRIVER_FAMILIES.iter().any(|f| name.contains(f)) {
             return true;
         }
-        let Ok(data) = std::fs::read(&path) else {
+        // Magic first. A tree like Blender's is mostly Python and data
+        // files, and reading those in full to discover they are not ELF
+        // costs more than the whole rest of this scan.
+        let Ok(mut file) = std::fs::File::open(&path) else {
             continue;
         };
-        if !data.starts_with(b"\x7fELF") {
+        let mut magic = [0u8; 4];
+        if std::io::Read::read_exact(&mut file, &mut magic).is_err() || magic != *b"\x7fELF" {
+            continue;
+        }
+        let mut data = magic.to_vec();
+        if std::io::Read::read_to_end(&mut file, &mut data).is_err() {
             continue;
         }
         // NSS modules are dlopened by glibc for getpwnam, DNS and friends.
@@ -1327,17 +1342,39 @@ fn bundle_needs_host_libs(directory: &Path) -> bool {
         if name == "libc.so.6" && !contains_bytes(&data, b"GLIBC_2.34") {
             return true;
         }
-        for family in DRIVER_FAMILIES {
-            if contains_bytes(&data, family.as_bytes()) {
-                return true;
-            }
+        if DRIVER_FAMILIES
+            .iter()
+            .any(|f| contains_bytes(&data, f.as_bytes()))
+        {
+            return true;
         }
     }
     false
 }
 
+/// Substring search anchored on the first byte.
+///
+/// `windows().any()` compares at every offset. Every needle here starts
+/// with `l` or `G`, which is a small fraction of a binary, so seeking the
+/// first byte and comparing only there does far less work on the hundreds
+/// of megabytes this walks.
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    let mut i = 0;
+    while let Some(off) = haystack[i..].iter().position(|&b| b == first) {
+        let start = i + off;
+        let after = start + 1;
+        if haystack.len() >= after + rest.len() && &haystack[after..after + rest.len()] == rest {
+            return true;
+        }
+        i = after;
+        if i >= haystack.len() {
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
