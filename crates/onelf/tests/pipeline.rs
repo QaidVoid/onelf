@@ -952,6 +952,223 @@ fn cache_gc_spares_a_running_package() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Every bundled object must end up with a search path the loader will
+/// actually inherit, whatever depth the executable sits at.
+///
+/// `DT_RUNPATH` is not consulted for a dependency's own dependencies, and an
+/// object carrying one cannot inherit its parent's either, so a single one
+/// anywhere in the bundle strands whatever hangs below it.
+#[test]
+fn bundled_objects_get_an_inheritable_search_path() {
+    let td = workdir("rpath");
+    let app = td.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+
+    // The executable sits at the package root, the shape that resolves
+    // `$ORIGIN/../lib` to a directory above the package.
+    let src = td.join("m.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"ROOT_OK\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("app")) {
+        return;
+    }
+
+    let mut c = Command::new(onelf());
+    c.args(["bundle-libs", app.to_str().unwrap()]);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    assert!(
+        o.status.success(),
+        "bundle-libs failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Nothing in the tree may keep a DT_RUNPATH, and the executable needs a
+    // path that reaches the library directory beside it.
+    let mut checked = 0usize;
+    let mut objects = vec![app.join("app")];
+    if let Ok(dir) = std::fs::read_dir(app.join("lib")) {
+        objects.extend(dir.filter_map(Result::ok).map(|e| e.path()));
+    }
+    for obj in objects {
+        let Ok(bytes) = std::fs::read(&obj) else {
+            continue;
+        };
+        if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            !has_dynamic_tag(&bytes, DT_RUNPATH),
+            "{} kept a DT_RUNPATH, which nothing below it can inherit",
+            obj.display()
+        );
+    }
+    assert!(checked > 1, "expected the executable and its libraries");
+    assert!(
+        has_dynamic_tag(&std::fs::read(app.join("app")).unwrap(), DT_RPATH),
+        "the executable needs an inheritable search path"
+    );
+
+    let pkg = td.join("root.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "app", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("ROOT_OK"),
+        "a root-level entrypoint must resolve its libraries: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+const DT_RPATH: u64 = 15;
+const DT_RUNPATH: u64 = 29;
+
+/// Whether a 64-bit little-endian ELF carries `tag` in its dynamic section.
+fn has_dynamic_tag(bytes: &[u8], tag: u64) -> bool {
+    if bytes.len() < 64 || bytes[4] != 2 {
+        return false;
+    }
+    let phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        if off + 56 > bytes.len() {
+            break;
+        }
+        // PT_DYNAMIC
+        if u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) != 2 {
+            continue;
+        }
+        let dyn_off = u64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+        let dyn_sz = u64::from_le_bytes(bytes[off + 32..off + 40].try_into().unwrap()) as usize;
+        let mut at = dyn_off;
+        while at + 16 <= bytes.len() && at < dyn_off + dyn_sz {
+            let t = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            if t == 0 {
+                break;
+            }
+            if t == tag {
+                return true;
+            }
+            at += 16;
+        }
+    }
+    false
+}
+
+/// With no safe cache root available, every cache subcommand must refuse
+/// rather than fall back to a shared world-writable path. `onelf cache
+/// clear` in particular used to be able to `remove_dir_all` `/tmp/onelf`.
+#[test]
+fn cache_commands_refuse_without_a_safe_root() {
+    let td = workdir("nosafe");
+    for sub in [
+        vec!["cache", "list"],
+        vec!["cache", "gc", "--max-age", "0"],
+        vec!["cache", "clear"],
+    ] {
+        let o = Command::new(onelf())
+            .args(&sub)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap_or_else(|e| panic!("spawn onelf {sub:?}: {e}"));
+        assert_eq!(
+            o.status.code(),
+            Some(1),
+            "`onelf {}` must refuse without a safe root",
+            sub.join(" ")
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("no safe cache directory"),
+            "`onelf {}` must say why, got: {err}",
+            sub.join(" ")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The recorded interpreter must come from the entrypoint, not from
+/// whichever ELF the sorted walk reaches first. `bin/helper` sorts before
+/// `bin/main`, which is what used to give it the casting vote.
+#[test]
+fn recorded_interpreter_comes_from_the_entrypoint() {
+    let td = workdir("interp");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+
+    let src = td.join("m.c");
+    write(&src, "int main(void){return 0;}\n");
+    if !cc(&src, &app.join("bin/main")) {
+        return;
+    }
+    let mut bytes = std::fs::read(app.join("bin/main")).unwrap();
+    let glibc = b"/lib64/ld-linux-x86-64.so.2\0";
+    let musl = b"/lib/ld-musl-x86_64.so.1\0";
+    let Some(at) = bytes
+        .windows(glibc.len())
+        .position(|w| w == glibc.as_slice())
+    else {
+        return; // unexpected host interpreter
+    };
+    bytes[at..at + musl.len()].copy_from_slice(musl);
+    for b in &mut bytes[at + musl.len()..at + glibc.len()] {
+        *b = 0;
+    }
+    std::fs::write(app.join("bin/helper"), &bytes).unwrap();
+
+    // Both loaders present, so picking the wrong entrypoint records the
+    // wrong one rather than recording nothing.
+    write(&app.join("lib/ld-linux-x86-64.so.2"), "not a real loader\n");
+    write(&app.join("lib/ld-musl-x86_64.so.1"), "not a real loader\n");
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/main", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let o = Command::new(onelf())
+        .args(["extract"])
+        .arg(&pkg)
+        .args(["-o", "-", "--file", ".onelf/interp"])
+        .output()
+        .expect("spawn onelf extract");
+    let recorded = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    assert_eq!(
+        recorded, "lib/ld-linux-x86-64.so.2",
+        "the entrypoint is glibc, so its loader is the one to record"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A helper built against another libc must not decide what gets bundled.
 ///
 /// Architecture and libc came from whichever path sorted first, so adding a
