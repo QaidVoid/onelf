@@ -1421,7 +1421,9 @@ fn a_large_entry_reads_under_an_address_space_limit() {
     std::fs::create_dir_all(app.join("bin")).unwrap();
     write(
         &app.join("bin/run"),
-        "#!/bin/sh\nwc -c < \"$ONELF_DIR/big.bin\"\n",
+        // `cat` into `wc`, deliberately: `wc -c < file` fstats the file
+        // and never reads a byte, so it would pass without touching FUSE.
+        "#!/bin/sh\ncat \"$ONELF_DIR/big.bin\" | wc -c\n",
     );
     std::fs::set_permissions(
         app.join("bin/run"),
