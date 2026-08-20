@@ -1311,6 +1311,90 @@ fn info_reports_no_update_section_without_update_metadata() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// FUSE must stream an entry, not buffer it.
+///
+/// The proof is an address-space limit well below the entry size: if any
+/// stage held the whole entry, the allocation would fail. A 300 MB entry
+/// of zeros packs to under 1 MB, so this costs the suite a fraction of a
+/// second rather than a large fixture.
+#[test]
+fn a_large_entry_reads_under_an_address_space_limit() {
+    if !have("fusermount3") {
+        return; // documented soft-skip, as with cc and patchelf
+    }
+    let td = workdir("fusemem");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\nwc -c < \"$ONELF_DIR/big.bin\"\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    // Written in chunks so the test process does not hold it either.
+    const ENTRY_BYTES: usize = 300_000_000;
+    {
+        use std::io::Write as _;
+        let f = std::fs::File::create(app.join("big.bin")).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        let chunk = vec![0u8; 1 << 20];
+        let mut written = 0;
+        while written < ENTRY_BYTES {
+            let n = chunk.len().min(ENTRY_BYTES - written);
+            w.write_all(&chunk[..n]).unwrap();
+            written += n;
+        }
+        w.flush().unwrap();
+    }
+
+    let pkg = td.join("big.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--level", "1"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // 128 MiB of address space against a 300 MB entry. Buffering the
+    // entry, or decompressing it whole, cannot fit.
+    const AS_LIMIT_KB: usize = 128 * 1024;
+    let mut run = Command::new("/bin/sh");
+    run.arg("-c")
+        .arg(format!(
+            "ulimit -v {AS_LIMIT_KB}; exec {}",
+            pkg.to_str().unwrap()
+        ))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+
+    assert!(
+        out.status.success(),
+        "reading under a {} MiB limit failed: {}",
+        AS_LIMIT_KB / 1024,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        ENTRY_BYTES.to_string(),
+        "the whole entry must be readable: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package that names an update URL but carries no signing key must
 /// refuse to update, and must not reach the network to find that out.
 #[test]
