@@ -62,16 +62,9 @@ fn verify_detached(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 /// never installed unverified.
 fn verify_update_signature(path: &Path, url: &str, pubkey: &[u8]) -> Result<(), String> {
     let sig_url = onelf_format::update::detached_sig_url(url);
-    // A hardened agent for the signature fetch: HTTPS only (no downgrade),
-    // no redirects (a redirect is a hard error, not a silent 3xx body), and
-    // a bounded timeout so a stalled server cannot hang the update.
-    let agent = ureq::Agent::config_builder()
-        .https_only(true)
-        .max_redirects(0)
-        .max_redirects_will_error(true)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .new_agent();
+    // No redirects for the signature: a 3xx here is a hard error rather
+    // than a silently substituted body.
+    let agent = hardened_agent(0);
     let sig = agent
         .get(&sig_url)
         .call()
@@ -181,13 +174,14 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8]) -> i32 {
     let tmp_path = self_path.with_extension("onelf-update.tmp");
     eprintln!("onelf-rt: downloading update to {}", tmp_path.display());
 
-    let mut assembly = match ZsyncAssembly::from_url(url, &tmp_path) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("onelf-rt: init assembly: {e}");
-            return 2;
-        }
-    };
+    let mut assembly =
+        match ZsyncAssembly::from_url_with_client(url, &tmp_path, update_http_client()) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("onelf-rt: init assembly: {e}");
+                return 2;
+            }
+        };
 
     // Seed from our own file: most blocks usually match.
     if let Err(e) = assembly.submit_source_file(self_path) {
@@ -241,9 +235,43 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8]) -> i32 {
     0
 }
 
+/// The transport policy for every request the update makes.
+///
+/// HTTPS only, so no redirect can downgrade the transfer to cleartext, and
+/// a bounded timeout so a stalled server cannot hang the update. Trust
+/// comes from the platform's own store rather than a set of roots compiled
+/// into this binary, which is what lets a host that terminates TLS at a
+/// corporate proxy update at all, and what makes the update path testable
+/// against a locally issued certificate.
+///
+/// `redirects` is the allowance for this request. The download follows
+/// them, since publishing behind a redirecting CDN is ordinary, and HTTPS
+/// only plus the signature check make that safe. The signature fetch
+/// allows none.
+fn hardened_agent(redirects: u32) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(redirects)
+        .max_redirects_will_error(true)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .new_agent()
+}
+
+/// A zsync client carrying the same policy as the rest of the update.
+fn update_http_client() -> zsync_rs::HttpClient {
+    zsync_rs::HttpClient::with_agent(hardened_agent(10))
+}
+
 fn fetch_control(url: &str) -> Result<zsync_rs::ControlFile, String> {
-    let client = zsync_rs::HttpClient::new();
-    client.fetch_control_file(url).map_err(|e| format!("{e}"))
+    update_http_client()
+        .fetch_control_file(url)
+        .map_err(|e| format!("{e}"))
 }
 
 fn sha1_file_hex(path: &Path) -> io::Result<String> {
