@@ -1,4 +1,30 @@
 
+## [0.3.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.2...onelf-rt-v0.3.3) - 2026-08-23
+
+### ⛰️  Features
+
+- *(format)* Verify payload blocks individually - ([a3cc7b7](https://github.com/QaidVoid/onelf/commit/a3cc7b799c76421f11199822a46304eea4c84a4d))
+- *(rt)* Use one hardened transport for self-update - ([27d9d9f](https://github.com/QaidVoid/onelf/commit/27d9d9fda69eaa197decf6e7fbed4caad14d778d))
+- *(rt)* Make the host library dirs opt-out - ([bc2e0bc](https://github.com/QaidVoid/onelf/commit/bc2e0bcb363802f51973eb40d1d5b1d5a70ac78e))
+
+### 🐛 Bug Fixes
+
+- *(rt)* Return from the launcher when the app exits - ([666dd51](https://github.com/QaidVoid/onelf/commit/666dd5161b5704fa6826a76d0f1b6fbb54dc9839))
+- *(rt)* Keep the fuse mount alive for a daemonized process - ([a215aff](https://github.com/QaidVoid/onelf/commit/a215aff9b3e8b50b035572b4e78bf7e5e394c0eb))
+- *(rt)* Keep a read's own blocks from being evicted - ([759a6f8](https://github.com/QaidVoid/onelf/commit/759a6f875b744f5ba0075b780d9763a99a86b64e))
+- *(rt)* Claim mountpoints and reclaim the cache under locks - ([96b67cd](https://github.com/QaidVoid/onelf/commit/96b67cd70bf22b180893563ca2ab46b374606189))
+- Refuse memfd when the entrypoint needs bundled libs - ([8f921cb](https://github.com/QaidVoid/onelf/commit/8f921cbab7ec07f05a7cb2db33927d63d3bd553e))
+- Validate package regions before allocating from them - ([22a3b68](https://github.com/QaidVoid/onelf/commit/22a3b68bee109acb42c6a27110bb73d7b095879b))
+- Honour entrypoint intent and stop forcing nested modes - ([89948d9](https://github.com/QaidVoid/onelf/commit/89948d9ea4bc437ba032ed7433bcef7ded918787))
+
+### 🚜 Refactor
+
+- *(format)* Share the detached signature URL rule - ([a0a8e79](https://github.com/QaidVoid/onelf/commit/a0a8e79735a9218a0bd9b1c2ff3a835d6858f5cf))
+
+### ⚙️ Miscellaneous Tasks
+
+- Add ci gate and clear lint and comment debt - ([17d4c42](https://github.com/QaidVoid/onelf/commit/17d4c424578eef621a8e205a54c99ca82b985613))
+
 ## [0.3.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.1...onelf-rt-v0.3.2) - 2026-08-15
 
 ### ⛰️  Features
