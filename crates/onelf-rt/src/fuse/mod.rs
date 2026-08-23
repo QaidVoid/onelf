@@ -20,6 +20,12 @@ use crate::loader::PackageData;
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
+/// Write end of the pipe the `SIGCHLD` handler writes a byte to, so the event
+/// loop can wait on the launched process exiting rather than only on the death
+/// pipe. `poll` cannot wait on a signal, so the signal has to become readable
+/// data. `-1` means no pipe is installed and the write is skipped.
+static SIGCHLD_PIPE: AtomicI32 = AtomicI32::new(-1);
+
 // Signal restorer -- required because kernel_sigaction bypasses libc.
 // x86_64 Linux requires SA_RESTORER for signal handler return to work.
 // aarch64 Linux handles signal return in the kernel, no restorer needed.
@@ -60,7 +66,17 @@ unsafe extern "C" {
 
 unsafe extern "C" fn signal_handler(sig: core::ffi::c_int) {
     if sig == 17 {
-        return; // SIGCHLD -- nothing to do, pipe detects child exit
+        // SIGCHLD: wake the event loop so it can see the launched process go.
+        // Waiting only for the death pipe means waiting for every descendant,
+        // and a launcher that does not return until a daemon its child started
+        // has finished is a launcher that reports that daemon dead. Writing a
+        // byte is the whole handler, which keeps it async-signal-safe.
+        let fd = SIGCHLD_PIPE.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let _ = rustix::io::write(borrowed, b"c");
+        }
+        return;
     }
     // Forward other signals to child
     let pid = CHILD_PID.load(Ordering::Relaxed);
@@ -458,6 +474,14 @@ pub fn execute_fuse(
             drop(pipe_write);
 
             CHILD_PID.store(child_pid.as_raw_nonzero().get(), Ordering::Relaxed);
+
+            // Installed before the handlers, so a child that exits immediately
+            // still finds somewhere to record it.
+            let sigchld = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok();
+            if let Some((_, w)) = &sigchld {
+                SIGCHLD_PIPE.store(rustix::fd::AsRawFd::as_raw_fd(w), Ordering::Relaxed);
+            }
+
             install_signal_handlers();
 
             let mut state = fs::FuseState::new(
@@ -468,7 +492,12 @@ pub fn execute_fuse(
             );
 
             let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];
-            state.run_loop(&fuse_fd, &pipe_read, &mut fuse_buf);
+            state.run_loop(
+                &fuse_fd,
+                &pipe_read,
+                sigchld.as_ref().map(|(r, _)| r),
+                &mut fuse_buf,
+            );
 
             // Event loop exited -- reap child
             let exit_status = loop {
@@ -514,6 +543,28 @@ pub fn execute_fuse(
                     // does not take down the filesystem a daemon is still
                     // reading from.
                     let _ = rustix::process::setsid();
+                    // Let go of the launcher's standard streams. Holding them
+                    // keeps the write end of whatever pipe the caller set up
+                    // open, so `$(app)`, `app | head` and every other reader
+                    // would block until this server exits rather than until
+                    // the app is done.
+                    if let Ok(null) = rustix::fs::open(
+                        "/dev/null",
+                        rustix::fs::OFlags::RDWR,
+                        rustix::fs::Mode::empty(),
+                    ) {
+                        for target in 0..=2 {
+                            // `dup2` wants to own the descriptor it replaces,
+                            // but 0, 1 and 2 are not ours to close: the dup is
+                            // what puts /dev/null there, and dropping the
+                            // wrapper afterwards would close it again.
+                            use std::os::fd::FromRawFd;
+                            let mut slot = std::mem::ManuallyDrop::new(unsafe {
+                                std::os::fd::OwnedFd::from_raw_fd(target)
+                            });
+                            let _ = rustix::io::dup2(&null, &mut slot);
+                        }
+                    }
                     state.serve_detached(&fuse_fd, &mut fuse_buf, || !mount_in_use(&mountpoint));
                     drop(fuse_fd);
                     cleanup_mountpoint(&mountpoint, used_namespace);

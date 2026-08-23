@@ -2928,3 +2928,75 @@ fn a_daemonized_process_outlives_the_launcher() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// The launcher has to return when the process it started exits, not when the
+/// last thing that process spawned exits.
+///
+/// A caller that starts a daemon does the same thing every time: wait for the
+/// launcher, then look for whatever the daemon was supposed to set up. If the
+/// launcher instead waits for the daemon to finish, that check runs after the
+/// daemon has already gone, and a daemon that started perfectly well is
+/// reported dead.
+#[test]
+fn the_launcher_returns_without_waiting_for_a_daemon() {
+    if !fuse_available() {
+        eprintln!("skip: FUSE is not mountable here");
+        return;
+    }
+    let td = workdir("prompt-return");
+    let app = td.join("app");
+    let src = td.join("p.c");
+    let bin = app.join("bin/p");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+
+    // Forks a background process that outlives the launcher by 5 seconds,
+    // the same shape as a daemon holding a socket open.
+    // Detaches from every inherited descriptor first, exactly as a daemon
+    // does. Holding the launcher's stdout would make the test measure the
+    // harness waiting on a pipe rather than the launcher waiting on a process.
+    write(
+        &src,
+        "#include <unistd.h>\n#include <fcntl.h>\nint main(void){\n\
+         \x20 if (fork() != 0) { _exit(0); }\n\
+         \x20 setsid();\n\
+         \x20 int n = open(\"/dev/null\", O_RDWR);\n\
+         \x20 dup2(n, 0); dup2(n, 1); dup2(n, 2);\n\
+         \x20 for (int fd = 3; fd < 256; fd++) close(fd);\n\
+         \x20 sleep(5);\n\
+         \x20 return 0;\n}\n",
+    );
+    if !cc(&src, &bin) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let pkg = td.join("p.onelf");
+    let out = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/p",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let mut c = Command::new(&pkg);
+    c.env("ONELF_MODE", "fuse");
+    isolate(&mut c, &td);
+    let started = std::time::Instant::now();
+    let run = run_package(&mut c);
+    let waited = started.elapsed();
+
+    assert!(run.status.success(), "launcher failed: {run:?}");
+    assert!(
+        waited < std::time::Duration::from_secs(3),
+        "launcher waited {waited:?} for a background process that sleeps 5s; \
+         it should return as soon as the process it started exits"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}

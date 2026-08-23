@@ -249,7 +249,23 @@ impl<'a> FuseState<'a> {
         ok
     }
 
-    pub fn run_loop(&mut self, fuse_fd: &impl AsFd, death_pipe: &impl AsFd, buf: &mut [u8]) {
+    /// Serve the mount until the launched process is done with it.
+    ///
+    /// Two things end it. `death_pipe` hangs up once every descendant has
+    /// closed the inherited descriptor, which is the cleanest signal but only
+    /// arrives when the whole tree is gone. `child_exit` fires as soon as the
+    /// process that was launched exits, which is what the caller has to return
+    /// on: a launcher that waits for a daemon its child started is a launcher
+    /// that only returns once that daemon has given up, and reports it dead.
+    /// The mount is handed to a background server in that case, so leaving
+    /// here does not take the filesystem with it.
+    pub fn run_loop(
+        &mut self,
+        fuse_fd: &impl AsFd,
+        death_pipe: &impl AsFd,
+        child_exit: Option<&impl AsFd>,
+        buf: &mut [u8],
+    ) {
         use rustix::event::Timespec;
 
         let cache_timeout = Timespec {
@@ -266,10 +282,12 @@ impl<'a> FuseState<'a> {
                 None
             };
 
-            let mut poll_fds = [
-                PollFd::new(fuse_fd, PollFlags::IN),
-                PollFd::new(death_pipe, PollFlags::IN),
-            ];
+            let mut poll_fds = Vec::with_capacity(3);
+            poll_fds.push(PollFd::new(fuse_fd, PollFlags::IN));
+            poll_fds.push(PollFd::new(death_pipe, PollFlags::IN));
+            if let Some(fd) = child_exit {
+                poll_fds.push(PollFd::new(fd, PollFlags::IN));
+            }
             match poll(&mut poll_fds, timeout) {
                 Ok(0) => continue,
                 Ok(_) => {}
@@ -280,6 +298,13 @@ impl<'a> FuseState<'a> {
             if poll_fds[1]
                 .revents()
                 .intersects(PollFlags::HUP | PollFlags::IN)
+            {
+                return;
+            }
+
+            if poll_fds
+                .get(2)
+                .is_some_and(|p| p.revents().intersects(PollFlags::IN | PollFlags::HUP))
             {
                 return;
             }
