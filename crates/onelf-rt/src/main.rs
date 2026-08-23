@@ -140,6 +140,22 @@ fn main() {
 
     // Memfd mode: single static binary, no libs needed
     if force == Some("memfd") || (force.is_none() && ep_memfd) {
+        // Forcing the mode cannot make a linked entrypoint work here. Its
+        // libraries live inside the package and a memfd exec never puts them
+        // on disk, so the loader fails on the first one it cannot find. This
+        // is the last point at which anything can be said about it: `exec` of
+        // a valid ELF succeeds, and the loader's failure happens afterwards,
+        // in a process that is no longer ours.
+        if force == Some("memfd") && !ep_memfd {
+            eprintln!(
+                "onelf-rt: entrypoint '{ep_name}' has shared library \
+                 dependencies, which memfd mode cannot satisfy: the libraries \
+                 exist only inside the package. Unset ONELF_MODE to let the \
+                 runtime pick a mode that can."
+            );
+            std::process::exit(1);
+        }
+
         // Verify the memfd payload against the entrypoint's content hash
         // so an in-memory exec never runs unverified bytes.
         let verified = loader::read_payload_blocks(

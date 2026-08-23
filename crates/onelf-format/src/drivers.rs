@@ -34,7 +34,7 @@ pub fn host_driver_paths(arch: &str) -> Vec<String> {
     // Appended last: these are a completion of the list above, and must not
     // displace the driver closure that has to be searched first.
     for d in cache_dirs() {
-        if !seen.iter().any(|s| *s == d) {
+        if !seen.contains(&d) {
             seen.push(d);
         }
     }

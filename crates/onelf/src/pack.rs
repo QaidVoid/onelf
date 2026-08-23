@@ -9,6 +9,7 @@
 //! 6. Writes the final binary: `[runtime ELF][manifest][payload][dict?][footer]`
 
 use crate::bundle::format_size;
+use crate::payload::ONELF_ENV_SONAME;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -962,14 +963,34 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // the target has no DT_NEEDED dependencies (static musl/glibc or a
     // non-ELF script).
     let memfd_flag = match opts.memfd {
-        Some(true) => EntryPointFlags::MEMFD_ELIGIBLE,
         Some(false) => EntryPointFlags::empty(),
-        None => {
+        requested => {
             let target_content = files
                 .iter()
                 .find(|f| f.rel_path == ep0_target_path)
                 .and_then(|f| f.source.read().ok());
-            if target_content.as_deref().is_some_and(elf_has_no_deps) {
+            // `--memfd` overrides the auto-detect above, but it cannot override
+            // physics: `bundle-libs` links the entrypoint against a library it
+            // puts inside the package, and a memfd exec never puts anything on
+            // disk for the loader to find. Such a package fails for every user,
+            // at every launch, with an error naming a library rather than the
+            // mode that made it unreachable. Refuse to build it.
+            if requested == Some(true)
+                && target_content.as_deref().is_some_and(elf_needs_bundled_lib)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--memfd cannot be used with '{}': it is linked \
+                         against {ONELF_ENV_SONAME}, which exists only inside the \
+                         package, and memfd mode runs the entrypoint without \
+                         extracting anything. Drop --memfd, or pack a target that \
+                         bundle-libs has not processed.",
+                        ep0_target_path.display()
+                    ),
+                ));
+            }
+            if requested == Some(true) || target_content.as_deref().is_some_and(elf_has_no_deps) {
                 EntryPointFlags::MEMFD_ELIGIBLE
             } else {
                 EntryPointFlags::empty()
@@ -1252,6 +1273,22 @@ fn elf_has_no_deps(data: &[u8]) -> bool {
     }
     match goblin::elf::Elf::parse(data) {
         Ok(elf) => elf.libraries.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Whether `data` is linked against a library only the package provides.
+///
+/// `bundle-libs` adds `libonelf-env.so` as a `DT_NEEDED` so the recipe's
+/// environment is reapplied on every exec. It ships inside the package, which
+/// makes the binary unrunnable in any mode that does not put the package on a
+/// filesystem first.
+fn elf_needs_bundled_lib(data: &[u8]) -> bool {
+    if data.len() < 4 || data[0..4] != *b"\x7fELF" {
+        return false;
+    }
+    match goblin::elf::Elf::parse(data) {
+        Ok(elf) => elf.libraries.contains(&ONELF_ENV_SONAME),
         Err(_) => false,
     }
 }

@@ -2675,3 +2675,169 @@ fn source_onelf_assets_are_accepted() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A statically linked entrypoint is what memfd mode is for, and forcing the
+/// mode has to keep working for it. This is the control for the two refusals
+/// below: they must reject the impossible case without taking this with them.
+#[test]
+fn a_static_entrypoint_still_runs_from_a_memfd() {
+    let td = workdir("memfd-static");
+    let app = td.join("app");
+    let src = td.join("hello.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(){puts(\"from-memfd\");return 0;}\n",
+    );
+
+    let bin = app.join("bin/hello");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        eprintln!("skip: no C compiler available");
+        return;
+    };
+    let built = Command::new(compiler)
+        .args(["-O0", "-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !built {
+        eprintln!("skip: no static libc available to link against");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let pkg = td.join("hello.onelf");
+    let out = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/hello",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let mut c = Command::new(&pkg);
+    c.env("ONELF_MODE", "memfd");
+    isolate(&mut c, &td);
+    let run = run_package(&mut c);
+    assert!(
+        run.status.success(),
+        "forced memfd must still run a static entrypoint: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("from-memfd"),
+        "expected the program's own output"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Forcing memfd on an entrypoint that needs bundled libraries has to fail
+/// with a message about the mode. Left alone it execs successfully and the
+/// *loader* fails afterwards, naming a library, in a process onelf no longer
+/// controls, so the mode that caused it is never mentioned.
+#[test]
+fn forcing_memfd_on_a_linked_entrypoint_says_so() {
+    // No "memfd" in the directory name: the failure this guards against
+    // prints the package's own path, so a tag containing "memfd" would
+    // satisfy the assertion below whether or not the guard exists.
+    let td = workdir("forced-mode");
+    let app = td.join("app");
+    let src = td.join("m.c");
+    let bin = app.join("bin/m");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    if !cc_libm(&src, &bin) {
+        eprintln!("skip: no C compiler available");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let pkg = td.join("m.onelf");
+    let out = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/m",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let mut c = Command::new(&pkg);
+    c.env("ONELF_MODE", "memfd");
+    isolate(&mut c, &td);
+    let run = run_package(&mut c);
+    assert!(!run.status.success(), "forced memfd must not succeed here");
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        err.contains("ONELF_MODE") && err.contains("memfd mode cannot satisfy"),
+        "the error has to point at the mode, not at whichever library the \
+         loader happened to miss, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `--memfd` on a bundle-libs entrypoint builds a package that fails for
+/// every user at every launch, because bundle-libs links it against a library
+/// it puts inside the package. Refuse at pack time and write nothing.
+#[test]
+fn packing_refuses_memfd_for_a_bundled_entrypoint() {
+    let Some(_pe) = patchelf() else {
+        eprintln!("skip: patchelf not available");
+        return;
+    };
+    let td = workdir("memfd-pack");
+    let app = td.join("app");
+    let src = td.join("m.c");
+    let bin = app.join("bin/m");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    if !cc_libm(&src, &bin) {
+        eprintln!("skip: no C compiler available");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let bundled = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(bundled.status.success(), "bundle-libs failed: {bundled:?}");
+
+    let pkg = td.join("m.onelf");
+    let out = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/m",
+            "--memfd",
+        ],
+        None,
+    );
+    assert!(!out.status.success(), "pack must refuse --memfd here");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--memfd"),
+        "the error has to name the flag, got: {err}"
+    );
+    assert!(
+        !pkg.exists(),
+        "a package that cannot run must not be left behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
