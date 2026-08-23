@@ -1,4 +1,65 @@
 
+## [0.3.3](https://github.com/QaidVoid/onelf/compare/0.3.2...0.3.3) - 2026-08-23
+
+### ⛰️  Features
+
+- *(bundle)* Report libraries resolved from the host - ([9b08dbd](https://github.com/QaidVoid/onelf/commit/9b08dbd31d200b54b870f23e15280db4eee1b1f6))
+- *(format)* Verify payload blocks individually - ([a3cc7b7](https://github.com/QaidVoid/onelf/commit/a3cc7b799c76421f11199822a46304eea4c84a4d))
+- *(format)* Flag packages updated from outside - ([68d64ef](https://github.com/QaidVoid/onelf/commit/68d64ef071b842bbff5bb5bca2402ab14be8e716))
+- *(pack)* Withhold host lib dirs when nothing needs them - ([49ba57e](https://github.com/QaidVoid/onelf/commit/49ba57e0e3d4698afd2b59e78fe484f7136c7c52))
+- *(pack)* Record an update URL without embedding the updater - ([1325a50](https://github.com/QaidVoid/onelf/commit/1325a50342a97a13fb8d5c4f8b5331aac1ef94b1))
+- *(rt)* Make the host library dirs opt-out - ([bc2e0bc](https://github.com/QaidVoid/onelf/commit/bc2e0bcb363802f51973eb40d1d5b1d5a70ac78e))
+- *(rt)* Use one hardened transport for self-update - ([27d9d9f](https://github.com/QaidVoid/onelf/commit/27d9d9fda69eaa197decf6e7fbed4caad14d778d))
+- *(sign)* Add publisher signing tooling for self-update - ([d04805d](https://github.com/QaidVoid/onelf/commit/d04805d65dc7d87cd5ef8d8b235359e4a2d4fe8c))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* State both outcomes for unbundled libraries - ([0602f95](https://github.com/QaidVoid/onelf/commit/0602f95683863c7ac57337a3c06b1c6d73abe86a))
+- *(bundle)* Make the bundled search path inheritable - ([cad8332](https://github.com/QaidVoid/onelf/commit/cad83321c7856e7e86ad6711e6e8103c419fd0eb))
+- *(bundle)* Pick the libc and arch from the entrypoint - ([6f8e9b5](https://github.com/QaidVoid/onelf/commit/6f8e9b55a8f89b2a8acba18486c5683729cc38a9))
+- *(bundle)* Keep the RUNPATH rewrite inside .dynstr - ([c70176d](https://github.com/QaidVoid/onelf/commit/c70176d56c02a102abdabe6dee9da9eef4f5bb82))
+- *(rt)* Return from the launcher when the app exits - ([666dd51](https://github.com/QaidVoid/onelf/commit/666dd5161b5704fa6826a76d0f1b6fbb54dc9839))
+- *(rt)* Keep the fuse mount alive for a daemonized process - ([a215aff](https://github.com/QaidVoid/onelf/commit/a215aff9b3e8b50b035572b4e78bf7e5e394c0eb))
+- *(rt)* Claim mountpoints and reclaim the cache under locks - ([96b67cd](https://github.com/QaidVoid/onelf/commit/96b67cd70bf22b180893563ca2ab46b374606189))
+- *(rt)* Resolve host libs through the host ld.so.cache - ([2405865](https://github.com/QaidVoid/onelf/commit/2405865ae9459e3c0729a84ac3fdd3de7d00628b))
+- *(rt)* Keep a read's own blocks from being evicted - ([759a6f8](https://github.com/QaidVoid/onelf/commit/759a6f875b744f5ba0075b780d9763a99a86b64e))
+- *(test)* Make the bounded-memory test actually read the entry - ([f39bc4e](https://github.com/QaidVoid/onelf/commit/f39bc4e24f9d45782eb140968de9ab52185d5479))
+- Refuse memfd when the entrypoint needs bundled libs - ([8f921cb](https://github.com/QaidVoid/onelf/commit/8f921cbab7ec07f05a7cb2db33927d63d3bd553e))
+- Validate package regions before allocating from them - ([22a3b68](https://github.com/QaidVoid/onelf/commit/22a3b68bee109acb42c6a27110bb73d7b095879b))
+- Honour entrypoint intent and stop forcing nested modes - ([89948d9](https://github.com/QaidVoid/onelf/commit/89948d9ea4bc437ba032ed7433bcef7ded918787))
+
+### 🚜 Refactor
+
+- *(format)* Share the detached signature URL rule - ([a0a8e79](https://github.com/QaidVoid/onelf/commit/a0a8e79735a9218a0bd9b1c2ff3a835d6858f5cf))
+
+### 📚 Documentation
+
+- Name the real source of host library resolution - ([69f5cdc](https://github.com/QaidVoid/onelf/commit/69f5cdc34f9ffaf55c3bc1d4df2265cdc5def29d))
+
+### ⚡ Performance
+
+- *(bundle)* Finalize each binary in one read and write - ([3bb9faa](https://github.com/QaidVoid/onelf/commit/3bb9faaa4597caa6c294c782b0f1fc29bd0fd8a0))
+- *(pack)* Speed up host-libs detection, add GPU backends - ([c074619](https://github.com/QaidVoid/onelf/commit/c074619a84889834960f54776f590b41ff683d35))
+- *(pack)* Stream file content instead of holding the tree - ([ed43132](https://github.com/QaidVoid/onelf/commit/ed43132810fd5b9f9de87dbfe5c8eef118049ba4))
+
+### 🧪 Testing
+
+- *(fuse)* Prove a large entry streams under a memory cap - ([cc6487e](https://github.com/QaidVoid/onelf/commit/cc6487efba9a7e80e994cdb15ef43445e6b5fd6d))
+- *(pack)* Assert peak memory stays under the tree size - ([f906adb](https://github.com/QaidVoid/onelf/commit/f906adbd668983fa9fb3220e555a6e6135494f4d))
+- Skip FUSE tests when mounting is not permitted - ([ff8be89](https://github.com/QaidVoid/onelf/commit/ff8be89627d015a2d4a3c64c9abc4a9269672b18))
+- Cover unsigned self-update and concurrent extraction - ([d0fca56](https://github.com/QaidVoid/onelf/commit/d0fca56e09e42f92cdb789643d55f2683fedba82))
+- Cover interpreter choice, search paths, and cache refusal - ([5fc169e](https://github.com/QaidVoid/onelf/commit/5fc169e3125ab44f13d1c0cd381bf30e20a9f6d5))
+- Cover truncation, owner-only modes, and live-package gc - ([10a6496](https://github.com/QaidVoid/onelf/commit/10a6496346e514a5233ba102c9afd8e87b424320))
+
+### ⚙️ Miscellaneous Tasks
+
+- Add ci gate and clear lint and comment debt - ([17d4c42](https://github.com/QaidVoid/onelf/commit/17d4c424578eef621a8e205a54c99ca82b985613))
+
+### Build
+
+- Make the embedded runtime reproducible - ([63aa826](https://github.com/QaidVoid/onelf/commit/63aa826b68c78b9dbb707755d7fc4fab45658f9f))
+- Resolve toolchain binaries without which - ([26e8d32](https://github.com/QaidVoid/onelf/commit/26e8d32c7ef59f3ba77c16ad9ac3b4be0e97ec33))
+
 ## [0.3.2](https://github.com/QaidVoid/onelf/compare/0.3.1...0.3.2) - 2026-08-15
 
 ### ⛰️  Features
