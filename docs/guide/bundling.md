@@ -45,6 +45,17 @@ The bundled loader's own fallbacks are already closed: its compiled-in
 search directories and its `ld.so.cache` path are both blanked at bundle
 time. The search path above is the deliberate exception.
 
+That search path is the well-known library directories plus every further
+directory the host's `ld.so.cache` names. onelf reads the cache itself
+rather than letting the loader do it, so the loader stays sealed and the
+decision about what the host may supply stays on onelf's side. Without
+this the list is a guess about where a distribution puts things, and a
+host GPU driver can load while its own dependencies cannot: Gentoo slots
+LLVM under `/usr/lib/llvm/<n>/lib64`, so Mesa's RADV driver resolves, the
+`libLLVM.so.<n>` behind it does not, and Vulkan goes silently missing.
+Cache directories are appended last, so nothing they contain can displace
+a bundled library or the driver closure that has to be searched first.
+
 The symptom is "works on my machine", and that is not a joke about
 testing: on the packer's machine the host copy *is* the matching one, so
 the bundle genuinely works there and fails on a machine whose libraries
