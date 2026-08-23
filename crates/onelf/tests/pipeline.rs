@@ -2841,3 +2841,90 @@ fn packing_refuses_memfd_for_a_bundled_entrypoint() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A process that daemonizes must keep working after the launcher returns.
+///
+/// It forks a background copy, lets the foreground exit, and closes every
+/// descriptor it inherited. That last part hangs up the death pipe the FUSE
+/// mode waits on, so the signal says "finished" while the real work is only
+/// starting. Tearing the filesystem down there leaves the surviving process
+/// blocked on its next read, which looks exactly like the app having hung.
+#[test]
+fn a_daemonized_process_outlives_the_launcher() {
+    if !fuse_available() {
+        eprintln!("skip: FUSE is not mountable here");
+        return;
+    }
+    let td = workdir("daemonize");
+    let app = td.join("app");
+    let src = td.join("d.c");
+    let bin = app.join("bin/d");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+
+    let result = td.join("result");
+    write(&app.join("data.txt"), "payload\n");
+    write(
+        &src,
+        &format!(
+            "#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
+             int main(void){{\n\
+             \x20 if (fork() != 0) {{ _exit(0); }}\n\
+             \x20 setsid();\n\
+             \x20 for (int fd = 3; fd < 256; fd++) close(fd);\n\
+             \x20 sleep(2);\n\
+             \x20 const char *d = getenv(\"ONELF_DIR\");\n\
+             \x20 char p[512];\n\
+             \x20 snprintf(p, sizeof p, \"%s/data.txt\", d ? d : \"/nonexistent\");\n\
+             \x20 FILE *in = fopen(p, \"r\");\n\
+             \x20 FILE *out = fopen(\"{}\", \"w\");\n\
+             \x20 if (out) {{ fprintf(out, in ? \"READ-OK\" : \"READ-FAILED\"); fclose(out); }}\n\
+             \x20 return 0;\n}}\n",
+            result.display()
+        ),
+    );
+    if !cc(&src, &bin) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let pkg = td.join("d.onelf");
+    let out = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/d",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let mut c = Command::new(&pkg);
+    c.env("ONELF_MODE", "fuse");
+    isolate(&mut c, &td);
+    let run = run_package(&mut c);
+    assert!(
+        run.status.success(),
+        "launcher must return promptly and successfully: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // The daemonized process reads the mount two seconds after the launcher
+    // is gone, so this waits past that before deciding.
+    let mut got = String::new();
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Ok(s) = std::fs::read_to_string(&result) {
+            got = s;
+            break;
+        }
+    }
+    assert_eq!(
+        got, "READ-OK",
+        "the daemonized process could not read the package after the launcher exited"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}

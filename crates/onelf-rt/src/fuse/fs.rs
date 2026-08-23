@@ -75,6 +75,18 @@ fn make_attr(inode: u64, entry: &onelf_format::entry::Entry, manifest: &Manifest
 
 const CACHE_IDLE_SECS: u64 = 2;
 
+/// How long a detached server waits before asking, the first time, whether
+/// anything is still using the mount. Long enough for a process that
+/// daemonizes to have forked, short enough that a package nothing held on to
+/// is reclaimed promptly.
+const DETACHED_GRACE_SECS: u64 = 1;
+
+/// How long a detached server waits between later checks. By then something
+/// is using the mount, and the answer only changes when that process exits,
+/// so this trades how promptly the mount is reclaimed against how often the
+/// check runs for nothing.
+const DETACHED_PROBE_SECS: u64 = 5;
+
 /// Default ceiling on decompressed blocks held in memory.
 ///
 /// At the packer's 256 KiB block size this is 128 blocks, far more than the
@@ -276,38 +288,106 @@ impl<'a> FuseState<'a> {
                 continue;
             }
 
-            let n = match rustix::io::read(fuse_fd, &mut *buf) {
-                Ok(n) if n >= IN_HEADER_SIZE => n,
-                Ok(_) => continue,
+            if self.serve_ready(fuse_fd, buf).is_break() {
+                return;
+            }
+        }
+    }
+
+    /// Serve the mount until `is_idle` says nothing is using it any more.
+    ///
+    /// Runs after the death pipe has already hung up. That is not proof the
+    /// package is finished: a process that daemonizes forks a background copy,
+    /// lets the foreground exit, and closes every descriptor it inherited,
+    /// which hangs the pipe up while the real work is still running out of the
+    /// mount. There is no descriptor left to wait on, so the caller supplies
+    /// the liveness test instead.
+    pub fn serve_detached(
+        &mut self,
+        fuse_fd: &impl AsFd,
+        buf: &mut [u8],
+        mut is_idle: impl FnMut() -> bool,
+    ) {
+        use rustix::event::Timespec;
+
+        // The first check comes quickly, so a package that nothing held on to
+        // is reclaimed almost at once. It cannot be immediate: a process that
+        // daemonizes has not necessarily forked yet when the foreground exits,
+        // and asking too early sees nothing and tears the mount down under the
+        // process about to appear. Later checks are spaced out, because by then
+        // something is using the mount and the answer only changes when it goes.
+        let mut wait = Timespec {
+            tv_sec: DETACHED_GRACE_SECS as i64,
+            tv_nsec: 0,
+        };
+
+        loop {
+            self.cache.maybe_clear();
+
+            let mut poll_fds = [PollFd::new(fuse_fd, PollFlags::IN)];
+            let timed_out = match poll(&mut poll_fds, Some(&wait)) {
+                Ok(0) => true,
+                Ok(_) => !poll_fds[0].revents().intersects(PollFlags::IN),
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(rustix::io::Errno::NODEV) => return,
                 Err(_) => return,
             };
 
-            let header: FuseInHeader = unsafe { read_struct(buf, 0).unwrap() };
+            // Nothing asked for anything: the moment to find out whether the
+            // mount still has users.
+            if timed_out {
+                if is_idle() {
+                    return;
+                }
+                wait = Timespec {
+                    tv_sec: DETACHED_PROBE_SECS as i64,
+                    tv_nsec: 0,
+                };
+                continue;
+            }
 
-            if header.opcode == FUSE_DESTROY {
+            if self.serve_ready(fuse_fd, buf).is_break() {
                 return;
             }
-            if header.opcode == FUSE_FORGET || header.opcode == FUSE_BATCH_FORGET {
-                continue;
-            }
-
-            if header.opcode == FUSE_READ {
-                self.handle_read(fuse_fd, &header, &buf[IN_HEADER_SIZE..n]);
-                continue;
-            }
-
-            let response = dispatch(
-                &header,
-                &buf[IN_HEADER_SIZE..n],
-                self.manifest,
-                &self.children,
-            );
-            if !response.is_empty() {
-                let _ = rustix::io::write(fuse_fd, &response);
-            }
         }
+    }
+
+    /// Service one readable FUSE request. `Break` means the connection is
+    /// finished and the caller should stop serving.
+    fn serve_ready(&mut self, fuse_fd: &impl AsFd, buf: &mut [u8]) -> std::ops::ControlFlow<()> {
+        use std::ops::ControlFlow::{Break, Continue};
+
+        let n = match rustix::io::read(fuse_fd, &mut *buf) {
+            Ok(n) if n >= IN_HEADER_SIZE => n,
+            Ok(_) => return Continue(()),
+            Err(rustix::io::Errno::INTR) => return Continue(()),
+            Err(rustix::io::Errno::NODEV) => return Break(()),
+            Err(_) => return Break(()),
+        };
+
+        let header: FuseInHeader = unsafe { read_struct(buf, 0).unwrap() };
+
+        if header.opcode == FUSE_DESTROY {
+            return Break(());
+        }
+        if header.opcode == FUSE_FORGET || header.opcode == FUSE_BATCH_FORGET {
+            return Continue(());
+        }
+
+        if header.opcode == FUSE_READ {
+            self.handle_read(fuse_fd, &header, &buf[IN_HEADER_SIZE..n]);
+            return Continue(());
+        }
+
+        let response = dispatch(
+            &header,
+            &buf[IN_HEADER_SIZE..n],
+            self.manifest,
+            &self.children,
+        );
+        if !response.is_empty() {
+            let _ = rustix::io::write(fuse_fd, &response);
+        }
+        Continue(())
     }
 
     fn handle_read(&mut self, fuse_fd: &impl AsFd, header: &FuseInHeader, body: &[u8]) {

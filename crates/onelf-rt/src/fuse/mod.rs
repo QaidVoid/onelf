@@ -202,6 +202,45 @@ fn exec_from_mount(
     std::process::exit(1);
 }
 
+/// Whether any process other than this one is still running out of `mountpoint`.
+///
+/// The death pipe cannot answer this. A process that daemonizes closes every
+/// descriptor it inherited, so the pipe hangs up while the process is very
+/// much alive and still reading from the mount. `/proc` is the only remaining
+/// witness: a process launched from the package has its executable, and often
+/// its working directory, inside the mount.
+///
+/// Only processes in this PID namespace are visible, which is exactly the set
+/// that could be using a mount private to it. A `/proc` that cannot be read
+/// reports "not in use", leaving the previous teardown behaviour in place
+/// rather than holding a mount forever on a guess.
+fn mount_in_use(mountpoint: &Path) -> bool {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let proc_dir = entry.path();
+        // Unreadable links belong to other users' processes, which cannot be
+        // running out of a mount private to this namespace.
+        for link in ["exe", "cwd", "root"] {
+            if let Ok(target) = std::fs::read_link(proc_dir.join(link))
+                && target.starts_with(mountpoint)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn cleanup_mountpoint(mountpoint: &Path, used_namespace: bool) {
     if used_namespace {
         mount::fuse_unmount_direct(mountpoint);
@@ -452,8 +491,43 @@ pub fn execute_fuse(
                 }
             };
 
-            drop(fuse_fd);
-            cleanup_mountpoint(&mountpoint, used_namespace);
+            // The death pipe hanging up does not mean the package is finished.
+            // An app that daemonizes forks a background copy, lets the
+            // foreground exit, and closes the descriptors it inherited, so the
+            // pipe reports the same thing whether the work ended or moved into
+            // the background. Tearing the filesystem down on that signal alone
+            // leaves the surviving process blocked forever on its next read,
+            // which is indistinguishable from the app having hung.
+            //
+            // So when something is still running out of the mount, the server
+            // moves to a background process of its own and this one exits with
+            // the child's status, keeping the caller's `waitpid` prompt.
+            // Deciding here whether anything still needs the mount does not
+            // work: a process that daemonizes has not necessarily forked by
+            // the time the foreground exits, so the answer is a race, and
+            // losing it tears the filesystem down under the process that was
+            // about to appear. Hand off unconditionally and let the background
+            // server ask once things have settled.
+            let handed_off = match unsafe { kernel_fork() } {
+                Ok(Fork::Child(_)) => {
+                    // Leave the launcher's session so a Ctrl-C aimed at it
+                    // does not take down the filesystem a daemon is still
+                    // reading from.
+                    let _ = rustix::process::setsid();
+                    state.serve_detached(&fuse_fd, &mut fuse_buf, || !mount_in_use(&mountpoint));
+                    drop(fuse_fd);
+                    cleanup_mountpoint(&mountpoint, used_namespace);
+                    std::process::exit(0);
+                }
+                Ok(Fork::ParentOf(_)) => true,
+                // No second process to serve from, so the old behaviour is
+                // all that is left: tear down and let any survivor fail.
+                Err(_) => false,
+            };
+            if !handed_off {
+                drop(fuse_fd);
+                cleanup_mountpoint(&mountpoint, used_namespace);
+            }
 
             if let Some(code) = exit_status.exit_status() {
                 std::process::exit(code)
