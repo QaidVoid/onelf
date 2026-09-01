@@ -66,6 +66,10 @@ enum Commands {
         #[arg(long, default_value = "12")]
         level: i32,
 
+        /// Bytes per payload block, with an optional K/M suffix (4K to 32M)
+        #[arg(long, value_parser = parse_block_size, default_value = "256K")]
+        block_size: u64,
+
         /// Build a shared zstd dictionary
         #[arg(long)]
         dict: bool,
@@ -474,6 +478,33 @@ fn parse_entrypoint(s: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), path.to_string()))
 }
 
+/// Parse a block size in bytes, accepting a K or M suffix.
+fn parse_block_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let (digits, scale) = match t.as_bytes().last() {
+        Some(b'K' | b'k') => (&t[..t.len() - 1], 1024),
+        Some(b'M' | b'm') => (&t[..t.len() - 1], 1024 * 1024),
+        _ => (t, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid block size '{s}': expected a number, optionally K or M"))?;
+    let bytes = n
+        .checked_mul(scale)
+        .ok_or_else(|| format!("block size '{s}' overflows"))?;
+
+    let (min, max) = (compress::MIN_BLOCK_SIZE, compress::MAX_BLOCK_SIZE);
+    if !(min..=max).contains(&bytes) {
+        return Err(format!(
+            "block size {bytes} out of range: expected {}K to {}M",
+            min / 1024,
+            max / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -487,6 +518,7 @@ fn main() {
             default_entrypoint,
             lib_dir,
             level,
+            block_size,
             dict,
             no_compress,
             memfd,
@@ -538,6 +570,7 @@ fn main() {
                         default_entrypoint,
                         lib_dirs: lib_dir,
                         level,
+                        block_size,
                         use_dict: dict,
                         no_compress,
                         memfd: memfd_opt,
@@ -830,6 +863,7 @@ fn run_build(
             default_entrypoint,
             lib_dirs,
             level: recipe.compression.level,
+            block_size: recipe.compression.block_size,
             use_dict: recipe.compression.dict,
             no_compress: recipe.compression.store,
             memfd: recipe.package.memfd,
@@ -930,4 +964,36 @@ fn scaffold_from_binary(
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     eprintln!("Scaffolded {} -> {}", src.display(), dest.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::parse_block_size;
+    use crate::compress::{MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
+
+    #[test]
+    fn accepts_plain_bytes_and_k_m_suffixes() {
+        assert_eq!(parse_block_size("262144").unwrap(), 256 * 1024);
+        assert_eq!(parse_block_size("256K").unwrap(), 256 * 1024);
+        assert_eq!(parse_block_size("256k").unwrap(), 256 * 1024);
+        assert_eq!(parse_block_size("4M").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_block_size(" 1M ").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_sizes_outside_the_supported_range() {
+        assert!(parse_block_size(&(MIN_BLOCK_SIZE - 1).to_string()).is_err());
+        assert!(parse_block_size(&(MAX_BLOCK_SIZE + 1).to_string()).is_err());
+        assert!(parse_block_size("0").is_err());
+    }
+
+    #[test]
+    fn rejects_garbage_rather_than_silently_defaulting() {
+        assert!(parse_block_size("").is_err());
+        assert!(parse_block_size("M").is_err());
+        assert!(parse_block_size("4G").is_err());
+        assert!(parse_block_size("-1M").is_err());
+        // Must error, not wrap to a small block.
+        assert!(parse_block_size("18014398509481985M").is_err());
+    }
 }

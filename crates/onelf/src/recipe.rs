@@ -126,6 +126,9 @@ pub struct Entrypoint {
 pub struct Compression {
     #[serde(default = "default_level")]
     pub level: i32,
+    /// Bytes per payload block. See [`crate::compress::DEFAULT_BLOCK_SIZE`].
+    #[serde(default = "default_block_size")]
+    pub block_size: u64,
     #[serde(default)]
     pub dict: bool,
     /// Store the payload uncompressed (no zstd). Overrides `dict` and
@@ -138,6 +141,7 @@ impl Default for Compression {
     fn default() -> Self {
         Self {
             level: default_level(),
+            block_size: default_block_size(),
             dict: false,
             store: false,
         }
@@ -146,6 +150,10 @@ impl Default for Compression {
 
 fn default_level() -> i32 {
     12
+}
+
+fn default_block_size() -> u64 {
+    crate::compress::DEFAULT_BLOCK_SIZE
 }
 
 /// Recipe spelling of the host library directory policy.

@@ -68,14 +68,23 @@ default unless another entry has `default = true`.
 
 ```toml
 [compression]
-level = 12     # i32, 0..=22, default 12
-dict = false   # bool, default false
-store = false  # bool, default false
+level = 12            # i32, 0..=22, default 12
+block-size = 262144   # u64 bytes, 4 KiB..=32 MiB, default 256 KiB
+dict = false          # bool, default false
+store = false         # bool, default false
 ```
 
 Higher levels pack tighter but are slower. `dict = true` trains a shared
 zstd dictionary across blocks, which helps ratios for packages with many
 small text files.
+
+`block-size` sets how much data each payload block holds. Blocks are
+compressed independently, so the block size is the window zstd gets: a
+package of large, sequentially-read files (shared libraries, game assets)
+packs noticeably smaller at 1 MiB or 4 MiB. It is also the unit the runtime
+decompresses to serve a read, so a package read at random pays for the
+whole block to answer a few bytes. Leave it at the default unless the
+package is big and read front-to-back.
 
 `store = true` writes the payload raw with no zstd at all, trading
 package size for zero decompression at runtime. It overrides `dict` and

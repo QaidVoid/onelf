@@ -89,9 +89,10 @@ const DETACHED_PROBE_SECS: u64 = 5;
 
 /// Default ceiling on decompressed blocks held in memory.
 ///
-/// At the packer's 256 KiB block size this is 128 blocks, far more than the
-/// one-block-ahead prefetch needs, while keeping the server itself from
-/// becoming the memory problem it exists to avoid.
+/// At the packer's default 256 KiB block size this is 128 blocks, far more
+/// than the one-block-ahead prefetch needs, while keeping the server itself
+/// from becoming the memory problem it exists to avoid. The packer caps
+/// `--block-size` at this budget so a single block always fits.
 const DEFAULT_CACHE_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Read the cache ceiling from `ONELF_FUSE_CACHE_BYTES`, falling back to

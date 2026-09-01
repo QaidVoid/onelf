@@ -62,6 +62,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--default-entrypoint NAME` | | Select default entrypoint |
 | `--lib-dir DIR` | `[auto]` | Library dir for `LD_LIBRARY_PATH` (repeatable) |
 | `--level N` | `12` | Zstd compression level (0 to 22) |
+| `--block-size SIZE` | `256K` | Bytes per payload block, `K`/`M` suffix allowed (4K to 32M) |
 | `--dict` | `false` | Train shared zstd dictionary |
 | `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
 | `--preload PATH` | | Library dlopen'd on every exec via onelf-env (repeatable, re-exec-safe) |

@@ -57,6 +57,8 @@ pub struct PackOptions {
     pub default_entrypoint: Option<String>,
     pub lib_dirs: Vec<String>,
     pub level: i32,
+    /// Bytes per payload block. See [`compress::DEFAULT_BLOCK_SIZE`].
+    pub block_size: u64,
     pub use_dict: bool,
     /// Store the payload raw (no zstd). Mutually exclusive with a
     /// dictionary; trades file size for zero decompression at runtime.
@@ -717,12 +719,17 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                     let content = f.source.read()?;
                     let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
                     let blocks = if opts.no_compress {
-                        compress::store_in_blocks(&content)
+                        compress::store_in_blocks(&content, opts.block_size)
                     } else {
-                        compress::compress_in_blocks(&content, opts.level, dict.as_deref())
-                            .map_err(|e| {
-                                io::Error::other(format!("compress {}: {e}", f.rel_path.display()))
-                            })?
+                        compress::compress_in_blocks(
+                            &content,
+                            opts.level,
+                            dict.as_deref(),
+                            opts.block_size,
+                        )
+                        .map_err(|e| {
+                            io::Error::other(format!("compress {}: {e}", f.rel_path.display()))
+                        })?
                     };
                     pb.inc(1);
                     Ok((i, hash, blocks))
@@ -1437,6 +1444,7 @@ mod tests {
             default_entrypoint: None,
             lib_dirs: Vec::new(),
             level: 3,
+            block_size: compress::DEFAULT_BLOCK_SIZE,
             use_dict: false,
             no_compress: false,
             memfd: Some(false),
