@@ -11,7 +11,6 @@
 //! the lib path is passed via `--library-path` on a single linker
 //! invocation.
 
-use crate::loader::PackageData;
 use std::env;
 use std::path::Path;
 
@@ -23,20 +22,8 @@ use std::path::Path;
 /// and pointing it at our bundled libs would mix two glibcs in one
 /// process. Scripts that need bundled libs must export `LD_LIBRARY_PATH`
 /// themselves before execing bundled binaries.
-/// Whether the host's library directories should join the search path.
-///
-/// Packages that need nothing from the host opt out at pack time. Those
-/// directories hold the whole system's libraries, so leaving them out is
-/// what stops a soname missing from the bundle being satisfied by a host
-/// copy built against a different libc.
-pub fn expose_host_libs(pkg: &PackageData) -> bool {
-    !pkg.footer
-        .flags
-        .contains(onelf_format::Flags::NO_HOST_LIB_DIRS)
-}
-
 // Describes a single exec; every argument is distinct and a parameter
-// object would be built at each of the five call sites and read once.
+// object would be built at each call site and read once.
 #[allow(clippy::too_many_arguments)]
 pub fn setup_env(
     onelf_dir: &str,
@@ -46,7 +33,7 @@ pub fn setup_env(
     mode: &str,
     lib_subpath: &str,
     target_path: &str,
-    expose_host_libs: bool,
+    farm: Option<&Path>,
 ) -> String {
     let launch_dir = env::current_dir()
         .ok()
@@ -74,13 +61,12 @@ pub fn setup_env(
     let mut lib_path = String::new();
 
     // Build the library search path for ELF entrypoints. Order:
-    //   <bundled lib dirs> : <existing LD_LIBRARY_PATH> : <host driver/system dirs>
-    // Bundled libs win, but GPU / libGL / libcuda / libvulkan and other
-    // host-provided userspace drivers are still discoverable. Our bundled
-    // ld.so has its baked-in paths scrubbed, so drivers that normally
-    // live in /usr/lib (or /run/opengl-driver/lib on NixOS) have to be
-    // added here explicitly or Cycles/OptiX and similar features won't
-    // find their driver libraries.
+    //   <link farm> : <bundled lib dirs> : <existing LD_LIBRARY_PATH>
+    // The farm holds the host libraries the resolver chose over their
+    // bundled copies, so it has to come first to shadow them. No host
+    // directory is ever placed here: a soname the bundle lacks and the
+    // resolver did not choose must fail by name rather than be satisfied
+    // by whatever the host has.
     if target_is_elf && !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
@@ -89,22 +75,15 @@ pub fn setup_env(
         let lib_str = lib_paths.join(":");
         if !lib_str.is_empty() {
             let mut parts: Vec<String> = Vec::new();
+            if let Some(farm) = farm {
+                parts.push(farm.to_string_lossy().into_owned());
+            }
             parts.push(lib_str);
             // Preserve the user's pre-existing LD_LIBRARY_PATH as a middle
             // layer, but don't propagate it to the child env.
             let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
             if !existing.is_empty() {
                 parts.push(existing);
-            }
-            // Skipped when the package declared it needs nothing from the
-            // host: these are whole system library directories, so leaving
-            // them out is what keeps a missing soname from being satisfied
-            // by a host copy built against a different libc.
-            if expose_host_libs {
-                let host_paths = host_driver_paths();
-                if !host_paths.is_empty() {
-                    parts.push(host_paths.join(":"));
-                }
             }
             lib_path = parts.join(":");
 
@@ -273,20 +252,13 @@ pub fn setup_env(
 
 /// Check whether `path` is an ELF file (first four bytes `\x7fELF`).
 /// Scripts (shebang `#!`) return false; missing files also return false.
-fn is_elf_file(path: &str) -> bool {
+pub(crate) fn is_elf_file(path: &str) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
     let mut buf = [0u8; 4];
     matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
-}
-
-/// Host driver directories for the architecture this runtime was built
-/// for, appended after the bundle's own libraries so a bundled copy always
-/// wins while host-provided GPU drivers stay reachable.
-fn host_driver_paths() -> Vec<String> {
-    onelf_format::drivers::host_driver_paths(std::env::consts::ARCH)
 }
 
 /// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find

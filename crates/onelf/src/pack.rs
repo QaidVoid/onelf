@@ -1335,28 +1335,7 @@ fn elf_interp(data: &[u8]) -> Option<String> {
 /// `DT_NEEDED`. Their sonames are looked for as strings anywhere in the
 /// bundle's ELF files instead.
 fn bundle_needs_host_libs(directory: &Path) -> bool {
-    const DRIVER_FAMILIES: &[&str] = &[
-        "libGL.so",
-        "libGLX.so",
-        "libEGL.so",
-        "libGLdispatch.so",
-        "libOpenGL.so",
-        "libGLESv2.so",
-        "libvulkan.so",
-        "libcuda.so",
-        "libnvidia",
-        // The compute backends Blender probes alongside CUDA. Measured:
-        // withholding the host directories costs OptiX while leaving CUDA
-        // working, so a miss here is a silent loss of capability rather
-        // than a failure anyone would notice.
-        "libnvoptix",
-        "libamdhip64",
-        "libze_loader",
-        "libva.so",
-        "libOpenCL.so",
-        "libdrm",
-        "libgbm.so",
-    ];
+    use onelf_format::drivers::DRIVER_FAMILIES;
 
     for entry in jwalk::WalkDir::new(directory).sort(true) {
         let Ok(entry) = entry else { continue };

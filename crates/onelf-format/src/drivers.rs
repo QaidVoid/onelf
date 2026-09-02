@@ -56,8 +56,13 @@ pub fn host_driver_paths(arch: &str) -> Vec<String> {
 /// goes silently missing. Reading the cache here keeps the decision about
 /// what the host may supply on onelf's side, while letting the answer come
 /// from the host's own index instead of a hardcoded list.
-fn cache_dirs() -> Vec<String> {
-    let Ok(data) = std::fs::read("/etc/ld.so.cache") else {
+pub fn cache_dirs() -> Vec<String> {
+    cache_dirs_in(&cache_file())
+}
+
+/// [`cache_dirs`] for the cache image at `cache`.
+pub fn cache_dirs_in(cache: &Path) -> Vec<String> {
+    let Ok(data) = std::fs::read(cache) else {
         return Vec::new();
     };
 
@@ -75,6 +80,62 @@ fn cache_dirs() -> Vec<String> {
     // of directories.
     dirs.retain(|d| Path::new(d).is_dir());
     dirs
+}
+
+/// Sonames the host is expected to provide because they have to match its
+/// GPU and compute drivers: the glvnd and Vulkan front ends, and the
+/// vendor userspace behind them. Matched as prefixes against sonames.
+///
+/// Deliberately generous. Naming something here that the host does not
+/// have costs nothing, while leaving out a driver family means the
+/// package cannot reach it at all.
+pub const DRIVER_FAMILIES: &[&str] = &[
+    "libGL.so",
+    "libGLX.so",
+    "libEGL.so",
+    "libGLdispatch.so",
+    "libOpenGL.so",
+    "libGLESv2.so",
+    "libvulkan.so",
+    "libcuda.so",
+    "libnvidia",
+    // The compute backends Blender probes alongside CUDA. Measured:
+    // withholding these costs OptiX while leaving CUDA working, so a miss
+    // here is a silent loss of capability rather than a failure anyone
+    // would notice.
+    "libnvoptix",
+    "libamdhip64",
+    "libze_loader",
+    "libva.so",
+    "libOpenCL.so",
+    "libdrm",
+    "libgbm.so",
+];
+
+/// The loader cache image this process reads: `ONELF_LD_CACHE` when set,
+/// so a test or a debugging session can supply its own, otherwise the
+/// host's.
+pub fn cache_file() -> std::path::PathBuf {
+    std::env::var_os("ONELF_LD_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/ld.so.cache"))
+}
+
+/// Every library the cache image at `cache` names, as `(soname, path)`
+/// pairs in cache order. The cache lists a soname once per directory that
+/// holds it, highest priority first, so a reader that wants one path per
+/// soname keeps the first.
+pub fn cache_paths_in(cache: &Path) -> Vec<(String, String)> {
+    let Ok(data) = std::fs::read(cache) else {
+        return Vec::new();
+    };
+    cache_entries(&data)
+        .into_iter()
+        .filter_map(|path| {
+            let (_, name) = path.rsplit_once('/')?;
+            (!name.is_empty()).then(|| (name.to_string(), path.to_string()))
+        })
+        .collect()
 }
 
 const CACHE_MAGIC_OLD: &[u8] = b"ld.so-1.7.0";

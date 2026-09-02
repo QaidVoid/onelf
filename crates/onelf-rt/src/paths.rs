@@ -120,6 +120,15 @@ pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
     Some(Mountpoint { path, _lock: lock })
 }
 
+/// Where the launch resolver keeps its link farm and recorded decision for
+/// the package `package_id`. Outside the `onelf-` namespace on purpose:
+/// it must survive across launches, so the mountpoint sweep is not to
+/// touch it. It lives and dies with the private dir.
+pub fn resolve_store(package_id: &[u8; 32]) -> Option<PathBuf> {
+    let base = private_dir()?;
+    Some(base.join(format!("resolve-{}", crate::cache::hex(&package_id[0..8]))))
+}
+
 /// How long an unclaimed leftover must have sat untouched before a sweep may
 /// reclaim it.
 ///

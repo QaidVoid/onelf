@@ -9,7 +9,7 @@ pub(crate) mod fs;
 pub(crate) mod mount;
 mod protocol;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::io::FdFlags;
@@ -147,19 +147,6 @@ fn exec_from_mount(
     env_data: Option<&[u8]>,
     mountpoint: &Path,
 ) -> bool {
-    use std::os::unix::process::CommandExt;
-
-    let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
-    let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
-    let ep_name = pkg
-        .manifest
-        .get_string(pkg.manifest.entrypoints[ep_idx].name)
-        .to_string();
-    let target_path_str = pkg.manifest.entry_path(ep_target_entry);
-    let target_path = mountpoint.join(&target_path_str);
-    let mountpoint_str = mountpoint.to_str().unwrap_or("").to_string();
-    let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-
     let exe_path = std::path::Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
     let exe_name = exe_path
@@ -168,54 +155,18 @@ fn exec_from_mount(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
-    let child_cwd: Option<PathBuf> = match ep_working_dir {
-        onelf_format::WorkingDir::PackageRoot => Some(mountpoint.to_path_buf()),
-        onelf_format::WorkingDir::EntrypointParent => target_path.parent().map(|p| p.to_path_buf()),
-        onelf_format::WorkingDir::Inherit => None,
-    };
-
-    let target_path_s = target_path.to_str().unwrap_or("");
-    let lib_path = crate::env::setup_env(
-        &mountpoint_str,
+    crate::launch::exec(&crate::launch::Launch {
+        pkg,
+        pkg_root: mountpoint,
+        mode: "fuse",
+        ep_idx,
         argv0,
         exec_path,
-        &ep_name,
-        "fuse",
-        &lib_paths_str,
-        target_path_s,
-        crate::env::expose_host_libs(pkg),
-    );
-    if let Some(data) = env_data {
-        crate::env::apply_custom_env(data, &mountpoint_str);
-    }
-
-    let lib_dirs = pkg.manifest.lib_dirs();
-    let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
-
-    if let Some(interp) =
-        crate::interp::should_use_userland_exec(&target_path, mountpoint, bundled_interp_rel)
-    {
-        if let Some(cwd) = &child_cwd {
-            let _ = std::env::set_current_dir(cwd);
-        }
-        crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
-    }
-
-    let mut cmd = crate::interp::build_exec_command(
-        &target_path,
-        mountpoint,
-        &lib_dirs,
-        &lib_path,
-        true, // FUSE mode: in private namespace
-        argv0,
         args,
-    );
-    if let Some(cwd) = &child_cwd {
-        cmd.current_dir(cwd);
-    }
-    let err = cmd.exec();
-    eprintln!("onelf-rt: exec failed: {err}");
-    std::process::exit(1);
+        interp_data,
+        env_data,
+        private_ns: true,
+    })
 }
 
 /// Whether any process other than this one is still running out of `mountpoint`.
@@ -283,8 +234,6 @@ pub fn execute_fuse(
     env_data: Option<&[u8]>,
     needs_setuid: bool,
 ) -> bool {
-    use std::os::unix::process::CommandExt;
-
     crate::paths::sweep_stale_mountpoints();
 
     // Held by the parent, which serves the filesystem and outlives the
@@ -374,19 +323,6 @@ pub fn execute_fuse(
     // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
     let _ = rustix::io::fcntl_setfd(&fuse_fd, FdFlags::CLOEXEC);
 
-    // Resolve entrypoint target path
-    let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
-    let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
-    let ep_name = pkg
-        .manifest
-        .get_string(pkg.manifest.entrypoints[ep_idx].name)
-        .to_string();
-    let target_path_str = pkg.manifest.entry_path(ep_target_entry);
-    let target_path = mountpoint.join(&target_path_str);
-
-    let mountpoint_str = mountpoint.to_str().unwrap_or("").to_string();
-    let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-
     // Set up portable directories (doesn't access FUSE mount)
     let exe_path = std::path::Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
@@ -395,16 +331,6 @@ pub fn execute_fuse(
         .and_then(|n| n.to_str())
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
-
-    // Handle working directory
-    let child_cwd: Option<PathBuf> = match ep_working_dir {
-        onelf_format::WorkingDir::PackageRoot => Some(mountpoint.clone()),
-        onelf_format::WorkingDir::EntrypointParent => target_path.parent().map(|p| p.to_path_buf()),
-        onelf_format::WorkingDir::Inherit => None,
-    };
-
-    // Extract bundled interpreter path for direct invocation (no symlinks needed)
-    let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
 
     // Death pipe: when the child (and all its descendants) exit, the write end
     // closes and poll() on the read end returns POLLHUP.
@@ -422,52 +348,21 @@ pub fn execute_fuse(
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
-            // setup_env must run in the child (after fork) because it probes
-            // directories on the FUSE mount (lib/dri/, share/vulkan/, etc.).
-            // The parent's FUSE event loop is now running concurrently.
-            let target_path_s = target_path.to_str().unwrap_or("");
-            let lib_path = crate::env::setup_env(
-                &mountpoint_str,
+            // Everything that reads the mount has to happen in the child,
+            // after the fork: the parent's FUSE event loop is what serves
+            // it, and that loop is only now starting.
+            crate::launch::exec(&crate::launch::Launch {
+                pkg,
+                pkg_root: &mountpoint,
+                mode: "fuse",
+                ep_idx,
                 argv0,
                 exec_path,
-                &ep_name,
-                "fuse",
-                &lib_paths_str,
-                target_path_s,
-                crate::env::expose_host_libs(pkg),
-            );
-            if let Some(data) = env_data {
-                crate::env::apply_custom_env(data, &mountpoint_str);
-            }
-
-            let lib_dirs = pkg.manifest.lib_dirs();
-
-            if let Some(interp) = crate::interp::should_use_userland_exec(
-                &target_path,
-                &mountpoint,
-                bundled_interp_rel,
-            ) {
-                if let Some(cwd) = &child_cwd {
-                    let _ = std::env::set_current_dir(cwd);
-                }
-                crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
-            }
-
-            let mut cmd = crate::interp::build_exec_command(
-                &target_path,
-                &mountpoint,
-                &lib_dirs,
-                &lib_path,
-                true, // FUSE mode: in private namespace
-                argv0,
                 args,
-            );
-            if let Some(cwd) = &child_cwd {
-                cmd.current_dir(cwd);
-            }
-            let err = cmd.exec();
-            eprintln!("onelf-rt: exec failed: {err}");
-            std::process::exit(1);
+                interp_data,
+                env_data,
+                private_ns: true,
+            })
         }
         Ok(Fork::ParentOf(child_pid)) => {
             // Close write end in parent -- only child holds it now

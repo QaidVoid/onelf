@@ -99,7 +99,7 @@ pub fn should_use_userland_exec(
 }
 
 /// Read the ELF e_type field and return true for ET_DYN (PIE / shared object).
-fn is_pie(path: &Path) -> bool {
+pub(crate) fn is_pie(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;

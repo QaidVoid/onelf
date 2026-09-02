@@ -4,18 +4,19 @@ mod ephemeral;
 mod fuse;
 mod integrate;
 mod interp;
+mod launch;
 mod loader;
 mod memfd;
 mod metadata;
 mod multicall;
 mod paths;
 mod portable;
+mod resolve;
 mod selfextract;
 mod ulexec;
 #[cfg(feature = "update")]
 mod update;
-
-use std::os::unix::process::CommandExt;
+mod verdef;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -101,7 +102,6 @@ fn main() {
     }
 
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
-    let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
     let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible();
 
     let target_blocks = pkg.manifest.entries[ep_target_entry].blocks.clone();
@@ -129,14 +129,6 @@ fn main() {
     // memfd (if eligible) -> fuse -> tmpfs -> cache.
     let forced_mode = std::env::var("ONELF_MODE").ok();
     let force = forced_mode.as_deref();
-
-    // Whether the host's library directories join the search path. Packages
-    // that need nothing from the host opt out at pack time, which is what
-    // stops a soname missing from the bundle being satisfied by a host copy.
-    let expose_host_libs = !pkg
-        .footer
-        .flags
-        .contains(onelf_format::Flags::NO_HOST_LIB_DIRS);
 
     // Memfd mode: single static binary, no libs needed
     if force == Some("memfd") || (force.is_none() && ep_memfd) {
@@ -179,7 +171,7 @@ fn main() {
                 "memfd",
                 &lib_paths_str,
                 "/proc/self/fd/0",
-                expose_host_libs,
+                None,
             );
             portable::setup_portable(exe_dir, exe_name);
 
@@ -281,62 +273,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    let pkg_dir_str = pkg_dir.to_str().unwrap_or("");
-    let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-    let target_path_s = target_path.to_str().unwrap_or("");
-    let lib_path = env::setup_env(
-        pkg_dir_str,
-        argv0,
-        &exec_path,
-        &ep_name,
-        "cache",
-        &lib_paths_str,
-        target_path_s,
-        expose_host_libs,
-    );
-    if let Some(data) = &env_data {
-        env::apply_custom_env(data, pkg_dir_str);
-    }
     portable::setup_portable(exe_dir, exe_name);
 
-    // Handle working directory
-    match ep_working_dir {
-        onelf_format::WorkingDir::PackageRoot => {
-            let _ = std::env::set_current_dir(&pkg_dir);
-        }
-        onelf_format::WorkingDir::EntrypointParent => {
-            if let Some(parent) = target_path.parent() {
-                let _ = std::env::set_current_dir(parent);
-            }
-        }
-        onelf_format::WorkingDir::Inherit => {}
-    }
-
-    let lib_dirs = pkg.manifest.lib_dirs();
-    let bundled_interp_rel = interp_data
-        .as_deref()
-        .and_then(interp::parse_bundled_interp_rel);
-
-    if let Some(interp) =
-        interp::should_use_userland_exec(&target_path, &pkg_dir, bundled_interp_rel)
-    {
-        interp::exec_userland(&target_path, &interp, &lib_path, argv0, &final_args);
-    }
-
-    let mut cmd = interp::build_exec_command(
-        &target_path,
-        &pkg_dir,
-        &lib_dirs,
-        &lib_path,
-        false, // cache mode: not in private namespace
+    launch::exec(&launch::Launch {
+        pkg: &pkg,
+        pkg_root: &pkg_dir,
+        mode: "cache",
+        ep_idx,
         argv0,
-        &final_args,
-    );
-
-    let err = cmd.exec();
-
-    eprintln!("onelf-rt: exec failed: {err}");
-    std::process::exit(1);
+        exec_path: &exec_path,
+        args: &final_args,
+        interp_data: interp_data.as_deref(),
+        env_data: env_data.as_deref(),
+        private_ns: false,
+    })
 }
 
 fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {

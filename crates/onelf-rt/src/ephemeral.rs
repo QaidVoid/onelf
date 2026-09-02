@@ -62,8 +62,6 @@ pub fn execute_tmpfs(
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
 ) -> bool {
-    use std::os::unix::process::CommandExt;
-
     crate::paths::sweep_stale_mountpoints();
 
     // Held through the exec below, so a concurrently starting instance
@@ -104,18 +102,6 @@ pub fn execute_tmpfs(
         std::process::exit(1);
     }
 
-    // Resolve entrypoint and set up environment.
-    let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
-    let ep_working_dir = pkg.manifest.entrypoints[ep_idx].working_dir;
-    let ep_name = pkg
-        .manifest
-        .get_string(pkg.manifest.entrypoints[ep_idx].name)
-        .to_string();
-    let target_path_str = pkg.manifest.entry_path(ep_target_entry);
-    let target_path = mountpoint.join(&target_path_str);
-    let mountpoint_str = mountpoint.to_str().unwrap_or("").to_string();
-    let lib_paths_str = pkg.manifest.lib_dirs().join(":");
-
     let exe_path = Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(Path::new("/"));
     let exe_name = exe_path
@@ -124,55 +110,18 @@ pub fn execute_tmpfs(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
-    let target_path_s = target_path.to_str().unwrap_or("");
-    let lib_path = crate::env::setup_env(
-        &mountpoint_str,
-        argv0,
-        exec_path,
-        &ep_name,
-        "tmpfs",
-        &lib_paths_str,
-        target_path_s,
-        crate::env::expose_host_libs(pkg),
-    );
-    if let Some(data) = env_data {
-        crate::env::apply_custom_env(data, &mountpoint_str);
-    }
-
-    // Working dir.
-    match ep_working_dir {
-        onelf_format::WorkingDir::PackageRoot => {
-            let _ = std::env::set_current_dir(&mountpoint);
-        }
-        onelf_format::WorkingDir::EntrypointParent => {
-            if let Some(parent) = target_path.parent() {
-                let _ = std::env::set_current_dir(parent);
-            }
-        }
-        onelf_format::WorkingDir::Inherit => {}
-    }
-
     // Exec directly: no fork, no FUSE server. When this process exits
     // the namespace is released and the tmpfs disappears with it.
-    let lib_dirs = pkg.manifest.lib_dirs();
-    let bundled_interp_rel = interp_data.and_then(crate::interp::parse_bundled_interp_rel);
-
-    if let Some(interp) =
-        crate::interp::should_use_userland_exec(&target_path, &mountpoint, bundled_interp_rel)
-    {
-        crate::interp::exec_userland(&target_path, &interp, &lib_path, argv0, args);
-    }
-
-    let mut cmd = crate::interp::build_exec_command(
-        &target_path,
-        &mountpoint,
-        &lib_dirs,
-        &lib_path,
-        true, // tmpfs mode: in private namespace
+    crate::launch::exec(&crate::launch::Launch {
+        pkg,
+        pkg_root: &mountpoint,
+        mode: "tmpfs",
+        ep_idx,
         argv0,
+        exec_path,
         args,
-    );
-    let err = cmd.exec();
-    eprintln!("onelf-rt: tmpfs: exec failed: {err}");
-    false
+        interp_data,
+        env_data,
+        private_ns: true,
+    })
 }
