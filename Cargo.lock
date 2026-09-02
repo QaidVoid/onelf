@@ -711,6 +711,7 @@ version = "0.3.3"
 dependencies = [
  "glob",
  "tar",
+ "toml",
  "zstd",
 ]
 

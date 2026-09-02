@@ -9,4 +9,5 @@ repository.workspace = true
 [dependencies]
 glob = "0.3"
 tar = "0.4"
+toml = { workspace = true }
 zstd = { workspace = true }

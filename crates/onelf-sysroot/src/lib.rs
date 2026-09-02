@@ -16,8 +16,10 @@
 pub mod archive;
 pub mod closure;
 pub mod db;
+pub mod platform;
 pub mod prune;
 
 pub use closure::Closure;
 pub use db::{Database, Package};
+pub use platform::Pin;
 pub use prune::{PlatformLine, Policy, Pruned, Trace};
