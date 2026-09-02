@@ -144,27 +144,43 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     let trace = opts.trace.as_deref().map(Trace::load).transpose()?;
     let keep = opts.keep.as_deref().map(Policy::load).transpose()?;
 
-    // Under a trace, a soname some object in the closure needs survives
-    // even when the test run never mapped it.
+    // Under a trace, a soname some surviving object needs survives too,
+    // even when the test run never mapped it, and so on transitively:
+    // what the survivors need is found by pruning, adding what they
+    // name, and pruning again until nothing new appears.
     let mut keep_names: HashSet<String> = HashSet::new();
-    if trace.is_some() {
-        for rel in &files {
+    let pruned = loop {
+        let pruned = prune(
+            &files,
+            Some(&platform),
+            policy.as_ref(),
+            trace.as_ref(),
+            &keep_names,
+            keep.as_ref(),
+        );
+        if trace.is_none() {
+            break pruned;
+        }
+        let before = keep_names.len();
+        for rel in &pruned.kept {
             let path = root.join(rel);
+            // A kept link keeps what it points to: `libtbb.so.12` is what
+            // the loader asks for, `libtbb.so.12.14` is what it gets.
+            if let Ok(target) = fs::read_link(&path)
+                && let Some(name) = target.file_name()
+            {
+                keep_names.insert(name.to_string_lossy().into_owned());
+            }
             if is_elf(&path)
                 && let Ok(needed) = parse_needed(&path)
             {
                 keep_names.extend(needed);
             }
         }
-    }
-    let pruned = prune(
-        &files,
-        Some(&platform),
-        policy.as_ref(),
-        trace.as_ref(),
-        &keep_names,
-        keep.as_ref(),
-    );
+        if keep_names.len() == before {
+            break pruned;
+        }
+    };
 
     remove_generated(appdir)?;
     let mut generated: Vec<String> = Vec::new();

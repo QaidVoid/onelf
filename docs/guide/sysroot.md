@@ -129,11 +129,14 @@ closure takes effect on its own while anything you added by hand
 stays.
 **A trace**, when you have one, lists the paths a test run opened, one per
 line. A file survives when it was opened, when any file in its directory
-was opened, or when some bundled object names it in `DT_NEEDED`. The
-directory rule is what keeps a plugin loaded by name from vanishing
-because the test run did not happen to load it. A Python package is
-kept whole once the run touched anything in it, since its modules are
-imported lazily. Without a trace nothing is pruned this way.
+was opened, or when some surviving object names it in `DT_NEEDED`,
+transitively, links to their targets included. The directory rule is
+what keeps a plugin loaded by name from vanishing because the test run
+did not happen to load it; it does not apply to the flat `bin/` and
+`lib/` directories, where every run touches something and it would
+keep everything. A Python package is kept whole once the run touched
+anything in it, since its modules are imported lazily. Without a trace
+nothing is pruned this way.
 
 Some data is loaded lazily too, icons and scripts an application reads
 on demand, and no test run opens all of it. **A keep file** names globs

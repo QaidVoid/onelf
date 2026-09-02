@@ -4369,10 +4369,17 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             "-Wl,-soname,libfixture.so.1",
             src.join("fixture.c").to_str().unwrap(),
         ],
-        &rootfs.join("usr/lib/libfixture.so.1"),
+        &rootfs.join("usr/lib/libfixture.so.1.0.0"),
     ) {
         return None; // no compiler: documented soft-skip
     }
+    // The soname is a link to the versioned file, as a distribution
+    // installs it.
+    std::os::unix::fs::symlink(
+        "libfixture.so.1.0.0",
+        rootfs.join("usr/lib/libfixture.so.1"),
+    )
+    .unwrap();
     for (name, out) in [
         ("plugin_a", "usr/lib/fixture/plugins/a.so"),
         ("plugin_b", "usr/lib/fixture/plugins/b.so"),
@@ -4548,6 +4555,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &[],
         &[
             "usr/lib/libfixture.so.1",
+            "usr/lib/libfixture.so.1.0.0",
             "usr/lib/libchainlib.so.1",
             "usr/lib/fixture/plugins/a.so",
             "usr/lib/fixture/plugins/b.so",

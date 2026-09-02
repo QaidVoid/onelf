@@ -121,15 +121,30 @@ impl Trace {
     }
 
     /// Whether `rel` survives: it was opened, or a file beside it was.
+    ///
+    /// The sibling rule is for plugin directories, where a run loads one
+    /// member by name and the next run another. The flat system
+    /// directories hold everything and are always touched, so there it
+    /// would keep all of them; a library or a tool in one of those
+    /// survives on its own account only.
     fn keeps(&self, rel: &str) -> bool {
         if self.opened.contains(rel) {
             return true;
         }
         match rel.rsplit_once('/') {
-            Some((dir, _)) => self.opened_dirs.contains(dir),
+            Some((dir, _)) => !is_flat_system_dir(dir) && self.opened_dirs.contains(dir),
             None => false,
         }
     }
+}
+
+/// The directories a distribution keeps flat and full: what a run opened
+/// there says nothing about what sits beside it.
+fn is_flat_system_dir(dir: &str) -> bool {
+    matches!(
+        dir,
+        "usr/bin" | "usr/sbin" | "bin" | "sbin" | "usr/lib" | "usr/lib64" | "lib" | "lib64"
+    )
 }
 
 /// The topmost directory of the Python package `rel` belongs to: every
