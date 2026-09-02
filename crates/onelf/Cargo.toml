@@ -18,6 +18,7 @@ ed25519-compact = { version = "2", default-features = false, features = [
 goblin = { workspace = true }
 indicatif = { workspace = true }
 onelf-format = { workspace = true }
+onelf-sysroot = { workspace = true }
 jwalk = { workspace = true }
 rayon = { workspace = true }
 rustix = { workspace = true }

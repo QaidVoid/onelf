@@ -1,0 +1,12 @@
+[package]
+name = "onelf-sysroot"
+description = "Pinned sysroots and package-database closures for onelf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glob = "0.3"
+tar = "0.4"
+zstd = { workspace = true }

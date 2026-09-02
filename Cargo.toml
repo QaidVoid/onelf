@@ -3,7 +3,8 @@ resolver = "2"
 members = [
   "crates/onelf",
   "crates/onelf-format",
-  "crates/onelf-rt"
+  "crates/onelf-rt",
+  "crates/onelf-sysroot"
 ]
 default-members = ["crates/onelf"]
 # Freestanding no_std/no_main payloads, built per-target by onelf's build.rs.
@@ -31,6 +32,7 @@ goblin = { version = "0.9", default-features = false, features = ["elf64", "elf3
 indicatif = "0.18"
 jwalk = "0.8"
 onelf-format = { version = "0.3.3", path = "crates/onelf-format" }
+onelf-sysroot = { version = "0.3.3", path = "crates/onelf-sysroot" }
 rayon = "1.11"
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
