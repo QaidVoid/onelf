@@ -1,4 +1,14 @@
 
+## [0.3.4](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.3.3...onelf-format-v0.3.4) - 2026-09-02
+
+### ⛰️  Features
+
+- *(format)* Encode host-libs policy and cache request in flags - ([58e9347](https://github.com/QaidVoid/onelf/commit/58e934764020bd261d21844bbe81fe7fd51a8727))
+- *(onelf)* Carry the GL build pin into packages - ([275697b](https://github.com/QaidVoid/onelf/commit/275697b5a88fda4fbefb168517ba8758772eebf9))
+- *(resolver)* Report the GL situation and index a fetched build - ([f177ff2](https://github.com/QaidVoid/onelf/commit/f177ff2b6a2a165fd30ba6c6c9a21652253d8aec))
+- *(rt)* Choose host libraries per soname at launch - ([29856c6](https://github.com/QaidVoid/onelf/commit/29856c6c827f5598d5da8199b1d4cdc48dee1196))
+- *(run)* Resolve host libraries like the packed runtime - ([f2a9573](https://github.com/QaidVoid/onelf/commit/f2a95735792375fccd8aa3791344dbd07d52210c))
+
 ## [0.3.3](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.3.2...onelf-format-v0.3.3) - 2026-08-23
 
 ### ⛰️  Features
