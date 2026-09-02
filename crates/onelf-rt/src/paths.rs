@@ -224,8 +224,18 @@ fn reclaim_mountpoint(base: &Path, dir_name: &str, path: &Path) {
         }
         crate::fuse::mount::fuse_unmount(path);
     }
-    // rmdir fails atomically on a non-empty directory.
-    let _ = std::fs::remove_dir(path);
+    match _lock {
+        // A claimed directory whose claim lapsed may hold a whole extracted
+        // tree, left by an instance that was killed.
+        Some(_) => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        // Without a claim to test, rmdir is as far as it is safe to go: it
+        // fails atomically on anything that is not empty.
+        None => {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
 }
 
 /// Whether `path` is a mountpoint in this process's mount namespace,

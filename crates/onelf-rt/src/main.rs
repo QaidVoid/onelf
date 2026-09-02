@@ -12,6 +12,7 @@ mod multicall;
 mod paths;
 mod portable;
 mod resolve;
+mod rundir;
 mod selfextract;
 mod ulexec;
 #[cfg(feature = "update")]
@@ -200,7 +201,7 @@ fn main() {
     let needs_setuid = read_package_file(&mut pkg, ".onelf/needs-setuid").is_some();
 
     // FUSE mode: mount package as filesystem (default for non-memfd)
-    if force != Some("cache") && force != Some("tmpfs") {
+    if matches!(force, None | Some("fuse")) {
         fuse::execute_fuse(
             &mut pkg,
             ep_idx,
@@ -221,7 +222,7 @@ fn main() {
     // Ephemeral tmpfs mode: private namespace + tmpfs + extract. Invisible
     // to the host, no persistent on-disk artifacts. Preferred over cache
     // mode whenever user namespaces are available.
-    if force != Some("cache") && !needs_setuid {
+    if matches!(force, None | Some("tmpfs")) && !needs_setuid {
         ephemeral::execute_tmpfs(
             &mut pkg,
             ep_idx,
@@ -237,10 +238,46 @@ fn main() {
         }
     }
 
-    // Persistent cache extraction mode (final fallback). The lock guard is
-    // held (through exec, its fd is left inheritable) for the lifetime of
-    // this instance so a concurrent process's GC cannot delete the package
-    // while it is still in use.
+    // Runtime directory mode: extraction into the private per-user
+    // directory, cleaned up when the last user is gone. Needs neither a
+    // namespace nor a helper, so it is the last mode that leaves nothing
+    // behind.
+    if matches!(force, None | Some("rundir")) {
+        rundir::execute_rundir(
+            &mut pkg,
+            ep_idx,
+            argv0,
+            &exec_path,
+            &final_args,
+            interp_data.as_deref(),
+            env_data.as_deref(),
+        );
+        if force == Some("rundir") {
+            eprintln!("onelf-rt: rundir mode unavailable");
+            std::process::exit(1);
+        }
+    }
+
+    // The persistent cache leaves an extraction on disk, so it runs only
+    // when asked for: by the publisher at pack time, by the user for this
+    // launch, or by forcing the mode.
+    let cache_requested = pkg
+        .footer
+        .flags
+        .contains(onelf_format::Flags::CACHE_REQUESTED)
+        || std::env::var_os("ONELF_CACHE").is_some_and(|v| !v.is_empty() && v != "0");
+    if force != Some("cache") && !cache_requested {
+        eprintln!(
+            "onelf-rt: no execution mode is available on this host; set ONELF_CACHE=1 \
+             to allow a persistent extraction under the cache directory"
+        );
+        std::process::exit(1);
+    }
+
+    // Persistent cache extraction mode. The lock guard is held (through
+    // exec, its fd is left inheritable) for the lifetime of this instance
+    // so a concurrent process's GC cannot delete the package while it is
+    // still in use.
     let (pkg_dir, _lock_guard) = match cache::ensure_extracted(&mut pkg) {
         Ok(d) => d,
         Err(e) => {

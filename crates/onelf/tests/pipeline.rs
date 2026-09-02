@@ -3769,15 +3769,8 @@ fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
-    let out = run_package(&mut run);
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OTHER"),
-        "the next package runs: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    assert!(
-        helper_mount_under(&td.join("xdg-run")).is_none(),
+        reclaimed_by(&mut run, &td),
         "the dead mount is gone from the namespace"
     );
     assert!(
@@ -3829,13 +3822,31 @@ fn a_live_helper_mount_survives_another_launch() {
     // reclaims it, which also leaves nothing behind on this machine.
     kill_group(&child);
     child.wait().unwrap();
-    let out = run_package(&mut run);
-    assert!(out.status.success());
     assert!(
-        helper_mount_under(&td.join("xdg-run")).is_none(),
+        reclaimed_by(&mut run, &td),
         "the abandoned mount is reclaimed"
     );
     let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Launch `run` until no helper mount is left under the test's runtime
+/// directory. A killed group's processes release the mountpoint lock as
+/// they die, which is not instantaneous, and a launch that arrives before
+/// the last of them is right to leave the mount alone.
+fn reclaimed_by(run: &mut Command, td: &Path) -> bool {
+    for _ in 0..40 {
+        let out = run_package(run);
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OTHER"),
+            "the next package runs: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if helper_mount_under(&td.join("xdg-run")).is_none() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
 }
 
 /// SIGKILL `child` and every process in its group.
@@ -3845,4 +3856,236 @@ fn kill_group(child: &std::process::Child) {
         .status()
         .expect("spawn kill");
     assert!(st.success());
+}
+
+/// The runtime directory mode runs the package from the private per-user
+/// directory and leaves nothing behind when it exits.
+#[test]
+fn rundir_mode_runs_and_leaves_nothing_behind() {
+    let td = workdir("rundir");
+    let pkg = pack_script(
+        &td,
+        "app",
+        "#!/bin/sh\necho mode=$ONELF_ACTIVE_MODE\necho dir=$ONELF_DIR\n",
+    );
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "rundir");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("mode=rundir"),
+        "rundir mode runs:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("dir="))
+        .expect("the app reports its directory");
+    assert!(
+        Path::new(dir).starts_with(td.join("xdg-run")),
+        "the tree lives in the private runtime directory: {dir}"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir).is_err(),
+        "the tree is removed after exit"
+    );
+    assert_eq!(
+        std::fs::read_dir(td.join("xdg-cache")).unwrap().count(),
+        0,
+        "the persistent cache is untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A rundir tree whose every process was killed is removed by the next
+/// launch of any package.
+#[test]
+fn an_abandoned_rundir_tree_is_reclaimed_by_the_next_launch() {
+    use std::os::unix::process::CommandExt;
+
+    let td = workdir("rundirkill");
+    let sleeper = pack_script(&td, "sleeper", "#!/bin/sh\nsleep 4\n");
+    let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
+    let run_dir = td.join("xdg-run");
+
+    let mut cmd = Command::new(&sleeper);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "rundir")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    isolate(&mut cmd, &td);
+    let mut child = cmd.spawn().expect("spawn package");
+
+    let tree_of = |prefix: &str| {
+        std::fs::read_dir(&run_dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+                    && p.join("bin/run").is_file()
+            })
+    };
+    let mut tree = None;
+    for _ in 0..200 {
+        tree = tree_of("onelf-sleepe");
+        if tree.is_some() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the sleeper exited early"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let tree = tree.expect("the tree appears");
+
+    kill_group(&child);
+    child.wait().unwrap();
+    assert!(tree.is_dir(), "the tree outlives its killed processes");
+
+    let mut run = Command::new(&other);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "rundir");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.status.success());
+    assert!(
+        std::fs::symlink_metadata(&tree).is_err(),
+        "the abandoned tree is removed"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A block whose bytes no longer match the manifest is refused before
+/// anything runs, and the file it belonged to is named.
+#[test]
+fn rundir_refuses_a_tampered_block() {
+    let td = workdir("rundirtamper");
+    let pkg = pack_script(&td, "app", "#!/bin/sh\necho SHOULD NOT RUN\n");
+
+    let mut data = std::fs::read(&pkg).unwrap();
+    let footer_at = data.len() - 76;
+    let payload_offset =
+        u64::from_le_bytes(data[footer_at + 36..footer_at + 44].try_into().unwrap()) as usize;
+    let payload_size =
+        u64::from_le_bytes(data[footer_at + 44..footer_at + 52].try_into().unwrap()) as usize;
+    data[payload_offset + payload_size / 2] ^= 0xff;
+    let tampered = td.join("tampered.onelf");
+    std::fs::write(&tampered, data).unwrap();
+    std::fs::set_permissions(
+        &tampered,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut run = Command::new(&tampered);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "rundir");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("SHOULD NOT RUN"),
+        "nothing runs from a tampered package"
+    );
+    // Which entry the flipped byte lands in depends on the layout; the
+    // refusal names whichever it was.
+    assert!(
+        stderr.contains("extract failed: ")
+            && (stderr.contains("bin/run") || stderr.contains(".onelf/")),
+        "the refusal names the file:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The persistent cache is the one mode that leaves something behind, so
+/// it runs only when the publisher, the user, or a forced mode asks.
+#[test]
+fn the_cache_is_used_only_on_request() {
+    let td = workdir("cacheoptin");
+    let pkg = pack_script(&td, "app", "#!/bin/sh\necho mode=$ONELF_ACTIVE_MODE\n");
+    let cache_root = td.join("xdg-cache");
+    let cache_entries = || std::fs::read_dir(&cache_root).unwrap().count();
+
+    // With every other mode refusing, and nothing asking for the cache,
+    // the launch fails and the cache root stays empty. The private
+    // directory is owned by this user and closed to others, so it is
+    // accepted, but nothing can be created inside it.
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    run.env("XDG_RUNTIME_DIR", "/proc/self/fd");
+    let out = run_package(&mut run);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "no mode is available:\n{stderr}");
+    assert!(
+        stderr.contains("ONELF_CACHE"),
+        "the failure says how to allow the cache:\n{stderr}"
+    );
+    assert_eq!(cache_entries(), 0, "an unrequested cache is never written");
+
+    // The user asks for it.
+    run.env("ONELF_CACHE", "1");
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("mode=cache"),
+        "the requested cache runs the package:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cache_entries() > 0);
+
+    // The publisher asks for it.
+    let requested = td.join("requested.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", td.join("app").to_str().unwrap()])
+        .args(["-o", requested.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--cache"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    let mut run = Command::new(&requested);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    run.env("XDG_RUNTIME_DIR", "/proc/self/fd");
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("mode=cache"),
+        "a package packed with the cache requested falls back to it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A forced cache mode still bypasses everything else.
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("mode=cache"));
+
+    let _ = std::fs::remove_dir_all(&td);
 }

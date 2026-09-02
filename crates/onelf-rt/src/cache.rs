@@ -88,7 +88,8 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
         }
 
         let data =
-            loader::read_verified_entry(&mut pkg.file, &pkg.footer, entry, pkg.dict.as_deref())?;
+            loader::read_verified_entry(&mut pkg.file, &pkg.footer, entry, pkg.dict.as_deref())
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", rel.display())))?;
 
         let mut f = fs::File::create(&out_path)?;
         f.write_all(&data)?;

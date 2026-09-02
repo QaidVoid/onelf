@@ -18,7 +18,7 @@ use rustix::runtime::{KernelSigSet, KernelSigaction, KernelSigactionFlags, kerne
 
 use crate::loader::PackageData;
 
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+pub(crate) static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Write end of the pipe the `SIGCHLD` handler writes a byte to, so the event
 /// loop can wait on the launched process exiting rather than only on the death
@@ -88,7 +88,7 @@ unsafe extern "C" fn signal_handler(sig: core::ffi::c_int) {
     }
 }
 
-fn install_signal_handlers() {
+pub(crate) fn install_signal_handlers() {
     let mut mask = KernelSigSet::empty();
     mask.insert(Signal::INT);
     mask.insert(Signal::TERM);
@@ -166,7 +166,7 @@ fn exec_from_mount(
 /// that could be using a mount private to it. A `/proc` that cannot be read
 /// reports "not in use", leaving the previous teardown behaviour in place
 /// rather than holding a mount forever on a guess.
-fn mount_in_use(mountpoint: &Path) -> bool {
+pub(crate) fn mount_in_use(mountpoint: &Path) -> bool {
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;

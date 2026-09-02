@@ -16,7 +16,7 @@ use crate::loader::PackageData;
 
 /// Compute the tmpfs size needed to hold the extracted package.
 /// Adds 25% headroom for filesystem overhead, minimum 8 MB.
-fn tmpfs_size_for(pkg: &PackageData) -> u64 {
+pub(crate) fn tmpfs_size_for(pkg: &PackageData) -> u64 {
     let content_size: u64 = pkg
         .manifest
         .entries
