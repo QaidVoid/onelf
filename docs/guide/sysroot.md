@@ -138,3 +138,80 @@ package: `bundle-libs` writes it to `.onelf/provenance.toml` under the
 `platform` label from the recipe, and `onelf info` prints it. Two builds
 from the same archive and recipe produce the same bytes, so the list can
 be checked against the archive later.
+
+## Pinning a GL build for hosts without one
+
+The platform line says the host provides the GPU stack, so the bundle
+carries none. Most hosts do. A minimal container, a headless CI runner
+or an image built without Mesa does not, and there a GL application
+would fail to load.
+
+A sysroot can name a build to fetch in that case, in
+`etc/onelf/platform.toml`:
+
+```toml
+label = "platform-1"
+
+[gl]
+url = "https://example.com/platform-1/gl.onelf"
+blake3 = "3f1c...a9e2"   # 64 hex characters
+```
+
+Every package built on the sysroot records those three values in
+`.onelf/platform`, and `onelf info` prints them. The recipe can override
+the URL and the hash:
+
+```toml
+[sysroot]
+path = "../sysroot"
+platform-url = "https://mirror.example.org/platform-1/gl.onelf"
+platform-hash = "3f1c...a9e2"
+```
+
+A mirror that serves a different file fails the hash check, so an
+override can move the download but never change what is downloaded.
+
+### Making the build
+
+A GL build is an onelf package holding a tree with `lib/` (Mesa and its
+drivers under `lib/dri`), `share/vulkan/icd.d` and
+`share/glvnd/egl_vendor.d`. Build the tree on the sysroot, then:
+
+```bash
+onelf sysroot pack-gl ./gl-tree -o gl.onelf
+blake3 = "3f1c...a9e2"
+```
+
+The command runs the verifier over the tree first: everything it needs
+apart from glibc, which the package that uses it carries, and the driver
+families it exists to provide, has to be inside. It prints the hash to
+put in `platform.toml`.
+
+The hash is the whole trust story. The package that carries it is
+already the thing you distribute, so whoever can alter the hash can
+alter the package, and no key is needed to say who built the GL build.
+
+### At launch
+
+The runtime fetches only when all four hold: the host-library policy is
+`auto` or `always`, the bundle carries no GL stack, the host has none,
+and the package carries a pin. A package that bundles Mesa never
+fetches, and neither does one on a host with a working driver.
+
+The file lands in `<cache root>/platform/<label>/gl.onelf` once its
+hash matches; a mismatch or a broken download leaves nothing behind. It
+is then extracted through the package cache and its libraries are
+indexed ahead of the host's, so two packages pinning the same label
+share one download and one extraction. `onelf cache list` shows the
+store and `onelf cache gc` collects a build no package has used past
+the age threshold.
+
+Anything that prevents a fetch, including a missing pin, is a warning
+naming the reason, and the application is launched anyway.
+
+A pin over `https://` needs the runtime that carries the HTTPS client,
+and `onelf pack` picks it when the AppDir carries such a pin. A
+`file://` pin works with the slim runtime as well. Three variables
+adjust the behaviour at launch: `ONELF_NO_PLATFORM_FETCH`,
+`ONELF_PLATFORM_URL` and `ONELF_PLATFORM_STORE`, listed under
+[Environment Variables](../reference/env-vars).

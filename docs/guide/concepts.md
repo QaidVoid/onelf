@@ -38,6 +38,14 @@ a short text file of soname prefixes, and it is the same list at pack
 time, where those libraries are left out of the bundle, and at run time,
 where the runtime goes and gets them.
 
+A host that has nothing on the platform line, a bare container or a
+runner without Mesa, is the one case the line cannot cover. For it a
+sysroot can name a **GL build**: a package of Mesa and its drivers,
+pinned by hash, that the runtime fetches once into the cache and uses
+in place of the host's stack. The pin travels inside every package built
+on that sysroot, so the publisher who chose the sysroot is the one who
+chose the build.
+
 ```
 +------------------------------------------------------------------+
 |  host                                                            |
@@ -159,6 +167,8 @@ Detail: [Execution Modes](./execution-modes).
 | sysroot | A pinned root filesystem with a package database, the source for a closure |
 | sysroot label | The `platform` name recorded in a bundle's provenance |
 | provenance | The record of which sysroot and packages a bundle came from |
+| GL build | A package of Mesa and its drivers a sysroot names for hosts that have none, pinned by hash |
+| platform store | Where fetched GL builds live under the cache root, one directory per sysroot label |
 | resolver | The launch-time step that chooses each library from the bundle or the host |
 | link farm | The directory of chosen host libraries the resolver puts on the search path |
 | rung, mode | One way of exposing the bundle to the kernel; the ladder tries them in order |

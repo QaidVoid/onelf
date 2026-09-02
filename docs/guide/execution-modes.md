@@ -150,8 +150,10 @@ with `ONELF_CACHE=1` named as the way to allow the extraction.
 ## How the entrypoint is launched
 
 Regardless of which mode is active, the runtime first decides what the
-host supplies (see [Bundling](./bundling#libraries-that-come-from-the-host)),
-then picks an exec strategy based on what the binary needs:
+host supplies (see [Bundling](./bundling#libraries-that-come-from-the-host)).
+A host with no GL stack at all gets the build the package pins, if it
+pins one (see [Pinning a GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one)).
+Then it picks an exec strategy based on what the binary needs:
 
 1. **AT_EXECFN bootstrap (preferred).** `bundle-libs` injects a small
    bootstrap into bundled executables. At runtime the kernel execs

@@ -148,7 +148,13 @@ optional = ["mesa"]                   # Vec<String>, optional dependencies by pa
 platform-line = "../platform.txt"     # Option<PathBuf>, soname prefixes the host provides
 policy = "../policy.txt"              # Option<PathBuf>, glob patterns that never ship
 trace = "../trace.txt"                # Option<PathBuf>, paths a test run opened
+platform-url = "https://..."          # Option<String>, GL build for hosts without one; overrides the sysroot's
+platform-hash = "3f1c...a9e2"         # Option<String>, its BLAKE3 hash; overrides the sysroot's
 ```
+
+`platform-url` and `platform-hash` override what the sysroot's
+`etc/onelf/platform.toml` names, field by field. A URL is `https://` or
+`file://`. See [Pinning a GL build](../guide/sysroot#pinning-a-gl-build-for-hosts-without-one).
 
 ## `[env]`
 

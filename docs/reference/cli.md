@@ -112,12 +112,14 @@ Obtain and inspect pinned sysroots. See [Bundling from a Sysroot](../guide/sysro
 ```
 onelf sysroot fetch SOURCE DIR
 onelf sysroot info DIR
+onelf sysroot pack-gl DIR -o FILE
 ```
 
 | Command | Description |
 |---------|-------------|
 | `fetch SOURCE DIR` | Materialize a `.tar` or `.tar.zst` rootfs from a local path or an `https://` URL into `DIR` |
 | `info DIR` | Print the package count, file count and glibc version of a materialized sysroot |
+| `pack-gl DIR -o FILE` | Pack a GL build for hosts without one from a tree holding `lib/`, `share/vulkan/icd.d` and friends, after verifying it is self-contained, and print the BLAKE3 hash to pin in `platform.toml` |
 
 ## `onelf info`
 
@@ -237,7 +239,9 @@ one embedded in the package. See
 
 ## `onelf cache`
 
-Manage the persistent cache (used only by the final-fallback cache mode).
+Manage the persistent cache: packages extracted by the cache mode, and
+the GL builds fetched for hosts without one. `list` shows both; `gc`
+removes packages and builds unused past the age threshold.
 
 ```
 onelf cache list
