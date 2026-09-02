@@ -27,7 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use onelf_sysroot::{PlatformLine, Policy};
+use onelf_sysroot::{Database, PlatformLine, Policy};
 
 mod ui;
 pub(crate) use ui::{color, format_size};
@@ -1130,6 +1130,85 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove bundled objects that could never load: their need is a soname no
+/// package in the sysroot provides, or one that was itself dropped here.
+///
+/// A distribution's closure carries plugins for stacks that were never
+/// installed, Qt modules and Python bindings for optional dependencies,
+/// and each would otherwise be one more line of policy. The entrypoint is
+/// never dropped: it stays a finding. A soname the sysroot does hold but
+/// the closure or policy left out stays a finding too, since that is a
+/// choice for the publisher.
+///
+/// Returns the dropped objects, relative to the tree, with the soname
+/// that condemned each. `findings` is re-audited until nothing changes,
+/// because dropping a library leaves its own dependants unloadable.
+fn drop_unloadable(
+    opts: &BundleOptions,
+    root: &Path,
+    findings: &mut Vec<(PathBuf, Vec<String>)>,
+    audit: impl Fn() -> Vec<(PathBuf, Vec<String>)>,
+) -> io::Result<Vec<(PathBuf, String)>> {
+    let held: HashSet<String> = Database::read(root)?
+        .packages()
+        .flat_map(|p| p.files.iter())
+        .filter_map(|f| Path::new(f).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    let entrypoint = opts
+        .primary
+        .as_deref()
+        .or(opts.target.as_deref())
+        .map(|t| t.strip_prefix(&opts.directory).unwrap_or(t).to_path_buf());
+    let mut gone: HashSet<String> = HashSet::new();
+    let mut dropped: Vec<(PathBuf, String)> = Vec::new();
+    loop {
+        let mut progressed = false;
+        for (object, libs) in findings.iter() {
+            let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
+            if entrypoint.as_deref() == Some(rel) {
+                continue;
+            }
+            let Some(soname) = libs
+                .iter()
+                .find(|s| !held.contains(*s) || gone.contains(*s))
+            else {
+                continue;
+            };
+            fs::remove_file(object)?;
+            remove_dangling_links_beside(object);
+            if let Some(name) = object.file_name() {
+                gone.insert(name.to_string_lossy().into_owned());
+            }
+            dropped.push((rel.to_path_buf(), soname.clone()));
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+        *findings = audit();
+    }
+    dropped.sort();
+    Ok(dropped)
+}
+
+/// The `libfoo.so -> libfoo.so.1 -> libfoo.so.1.2` chains a dropped
+/// library leaves behind point nowhere and are removed with it.
+fn remove_dangling_links_beside(object: &Path) {
+    let Some(dir) = object.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() && !path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 /// The verifier: every `DT_NEEDED` of every bundled ELF resolves inside
 /// the bundle, or names something the platform line hands to the host.
 ///
@@ -1138,12 +1217,33 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 /// From a host scan the universe was a guess, and the finding stays a
 /// warning.
 fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Result<()> {
-    let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
-    if let Some(platform) = platform {
-        for (_, libs) in &mut findings {
-            libs.retain(|s| !platform.matches_soname(s));
+    let audit = || {
+        let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+        if let Some(platform) = platform {
+            for (_, libs) in &mut findings {
+                libs.retain(|s| !platform.matches_soname(s));
+            }
+            findings.retain(|(_, libs)| !libs.is_empty());
         }
-        findings.retain(|(_, libs)| !libs.is_empty());
+        findings
+    };
+    let mut findings = audit();
+    if let Some(sr) = &opts.sysroot {
+        let dropped = drop_unloadable(opts, &sr.root, &mut findings, audit)?;
+        if !dropped.is_empty() {
+            eprintln!(
+                "\n{} {} file(s) needing libraries the sysroot does not hold:",
+                color::bold("Dropped"),
+                dropped.len()
+            );
+            for (object, soname) in &dropped {
+                eprintln!(
+                    "  {} {}",
+                    object.display(),
+                    color::dim(&format!("(needs {soname})"))
+                );
+            }
+        }
     }
     report_unbundled_needs(&findings);
     if opts.sysroot.is_some()

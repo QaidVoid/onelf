@@ -4350,6 +4350,51 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             &rootfs.join(out),
         ));
     }
+    // Plugins for a stack the sysroot does not hold: one needs a missing
+    // library directly, one through a library of its own package.
+    write(&src.join("missing.c"), "int missing(void){return 0;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libmissing.so.9",
+            src.join("missing.c").to_str().unwrap(),
+        ],
+        &src.join("libmissing.so.9"),
+    ));
+    for (name, out, needs) in [
+        (
+            "plugin_c",
+            "usr/lib/fixture/plugins/c.so",
+            "libmissing.so.9",
+        ),
+        ("chainlib", "usr/lib/libchainlib.so.1", "libmissing.so.9"),
+        (
+            "plugin_d",
+            "usr/lib/fixture/plugins/d.so",
+            "libchainlib.so.1",
+        ),
+    ] {
+        write(
+            &src.join(format!("{name}.c")),
+            &format!("int {name}(void){{return 1;}}\n"),
+        );
+        assert!(cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                &format!(
+                    "-Wl,-soname,{}",
+                    Path::new(out).file_name().unwrap().to_str().unwrap()
+                ),
+                src.join(format!("{name}.c")).to_str().unwrap(),
+                &format!("-L{}", src.display()),
+                &format!("-L{}", rootfs.join("usr/lib").display()),
+                &format!("-l:{needs}"),
+            ],
+            &rootfs.join(out),
+        ));
+    }
     write(&src.join("gl.c"), "int gl_probe(void){return 1;}\n");
     assert!(cc_with(
         &[
@@ -4445,8 +4490,11 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &[],
         &[
             "usr/lib/libfixture.so.1",
+            "usr/lib/libchainlib.so.1",
             "usr/lib/fixture/plugins/a.so",
             "usr/lib/fixture/plugins/b.so",
+            "usr/lib/fixture/plugins/c.so",
+            "usr/lib/fixture/plugins/d.so",
             "usr/share/doc/libfixture/README",
             "usr/share/fixture/data.txt",
         ],
@@ -4893,6 +4941,36 @@ fn a_sysroot_build_records_its_provenance() {
         .output()
         .expect("spawn onelf info");
     assert!(String::from_utf8_lossy(&info.stdout).contains("none recorded"));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A bundled object whose need no package in the sysroot provides can
+/// never load, so the build drops it and everything that needed it, and
+/// says so, instead of failing on each in turn.
+#[test]
+fn objects_the_sysroot_cannot_satisfy_are_dropped_not_fatal() {
+    let td = workdir("unloadable");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("Dropped 3 file(s)"), "{stderr}");
+    for gone in [
+        "lib/fixture/plugins/c.so",
+        "lib/libchainlib.so.1",
+        "lib/fixture/plugins/d.so",
+    ] {
+        assert!(!dir.join(gone).exists(), "{gone} stays");
+        assert!(stderr.contains(gone), "{gone} is named:\n{stderr}");
+    }
+    assert!(dir.join("lib/fixture/plugins/a.so").is_file());
+    assert!(dir.join("lib/libfixture.so.1").is_file());
 
     let _ = std::fs::remove_dir_all(&td);
 }
