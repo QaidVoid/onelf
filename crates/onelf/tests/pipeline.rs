@@ -4376,6 +4376,42 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     write(&rootfs.join("usr/share/doc/libfixture/README"), "docs\n");
     write(&rootfs.join("usr/share/fixture/data.txt"), "data\n");
 
+    // A vendor install under opt/, reached the way a distribution does
+    // it: a drop-in under etc/ld.so.conf.d and an RPATH in the tool.
+    std::fs::create_dir_all(rootfs.join("opt/vendor/lib")).unwrap();
+    std::fs::create_dir_all(rootfs.join("etc/ld.so.conf.d")).unwrap();
+    write(
+        &rootfs.join("etc/ld.so.conf"),
+        "include /etc/ld.so.conf.d/*.conf\n",
+    );
+    write(
+        &rootfs.join("etc/ld.so.conf.d/vendor.conf"),
+        "/opt/vendor/lib\n",
+    );
+    write(&src.join("vendor.c"), "int vendor_value(void){return 7;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libvendor.so.1",
+            src.join("vendor.c").to_str().unwrap(),
+        ],
+        &rootfs.join("opt/vendor/lib/libvendor.so.1"),
+    ));
+    write(
+        &src.join("vtool.c"),
+        "#include <stdio.h>\nint vendor_value(void);\nint main(void){printf(\"vendor=%d\\n\", vendor_value());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("vtool.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("opt/vendor/lib").display()),
+            "-l:libvendor.so.1",
+            "-Wl,--disable-new-dtags,-rpath,/opt/vendor/lib",
+        ],
+        &rootfs.join("usr/bin/vtool"),
+    ));
+
     let (gl_build, gl_hash) = pack_gl_build(td, &rootfs);
     std::fs::create_dir_all(rootfs.join("etc/onelf")).unwrap();
     write(
@@ -4438,6 +4474,18 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &["libfixture", "mesa-fake", "glibc>=2.30"],
         &["extra: more features"],
         &["usr/bin/app"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "vendor",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &[
+            "opt/vendor/lib/libvendor.so.1",
+            "usr/bin/vtool",
+            "etc/ld.so.conf.d/vendor.conf",
+        ],
     );
 
     let archive = td.join("root.tar");
@@ -4619,7 +4667,7 @@ fn a_sysroot_closure_is_bundled_and_pruned() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success()
-            && stdout.contains("packages: 5")
+            && stdout.contains("packages: 6")
             && stdout.contains("glibc:    2.99-1"),
         "{stdout}"
     );
@@ -4849,6 +4897,171 @@ fn a_sysroot_build_records_its_provenance() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A library a sysroot reaches only through `etc/ld.so.conf` and an
+/// RPATH is found there, never on the packer's machine, and lands in
+/// the bundle's library directory where the runtime's RPATH reaches it.
+/// The policy holds for such copies too: a pruned library is not brought
+/// back, and the verifier names what needed it.
+#[test]
+fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
+    let td = workdir("ldconf");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let vtool =
+        "optional = [\"vendor\"]\n\n[[entrypoint]]\nname = \"vtool\"\npath = \"bin/vtool\"\n";
+    sysroot_recipe(&dir, &fixture, vtool);
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("bin/vtool").is_file(), "a named package enters");
+    assert!(
+        dir.join("lib/libvendor.so.1").is_file(),
+        "the vendor library is copied where the RPATH reaches it"
+    );
+
+    let mut run = Command::new(dir.join("app.onelf"));
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_ENTRYPOINT", "vtool")
+        .env("ONELF_LD_CACHE", &fixture.ld_cache);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("vendor=7"),
+        "{stdout}{stderr}"
+    );
+
+    // A rebuild starts from the sysroot again: what the previous build
+    // copied into lib/ must not stand in for what the policy now prunes.
+    for stale in ["bin", "lib", "opt", "share", "etc", ".onelf"] {
+        let _ = std::fs::remove_dir_all(dir.join(stale));
+    }
+    std::fs::remove_file(dir.join("app.onelf")).unwrap();
+    let strict = td.join("strict-policy.txt");
+    write(&strict, "usr/share/doc/**\nopt/vendor/lib/**\n");
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\nplatform-line = \"{}\"\npolicy = \"{}\"\n{vtool}",
+            fixture.archive.display(),
+            fixture.platform_line.display(),
+            strict.display(),
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Left out by policy") && stderr.contains("bin/vtool needs libvendor.so.1"),
+        "{stderr}"
+    );
+    assert!(!dir.join("lib/libvendor.so.1").exists());
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package's own previous output inside its directory is never packed
+/// into the next one.
+#[test]
+fn a_previous_output_inside_the_directory_is_not_packed() {
+    let td = workdir("selfpack");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = app.join("app.onelf");
+    for _ in 0..2 {
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let list = Command::new(onelf())
+        .args(["list", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        listed.contains("bin/run") && !listed.contains("app.onelf"),
+        "{listed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A label whose pin moved on to a new build is fetched again: the store
+/// is keyed by label, so the hash it was verified against is kept beside
+/// the file and compared with the pin.
+#[test]
+fn a_moved_pin_replaces_the_stored_build() {
+    let td = workdir("glrepin");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let no_gl = td.join("no-gl.cache");
+    std::fs::write(&no_gl, ld_so_cache(&[])).unwrap();
+    let store = td.join("xdg-cache/onelf/platform/platform-test");
+
+    let pkg = build_pinned_app(&td, "app", &fixture, "");
+    let out = run_package(&mut launch_against(&pkg, &td, &no_gl));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.join("blake3"))
+            .unwrap()
+            .trim(),
+        fixture.gl_hash
+    );
+
+    // A new build under the same label: the tree gains a file, the hash
+    // changes, the sysroot's pin follows.
+    write(&td.join("gl-tree/share/note.txt"), "second build\n");
+    let (build, hash) = pack_gl_build(&td, &fixture.rootfs);
+    assert_ne!(hash, fixture.gl_hash);
+    write(
+        &td.join("sysroot/etc/onelf/platform.toml"),
+        &format!(
+            "label = \"platform-test\"\n\n[gl]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            build.display()
+        ),
+    );
+    let pkg2 = build_pinned_app(&td, "app2", &fixture, "");
+    let out = run_package(&mut launch_against(&pkg2, &td, &no_gl));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains("continuing without"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.join("blake3"))
+            .unwrap()
+            .trim(),
+        hash,
+        "the store now holds the new build"
+    );
+    assert_eq!(files_under(&store), ["blake3", "gl.onelf"]);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The sysroot's pin travels into the package as `.onelf/platform`,
 /// under the package's label, with the recipe overriding it field by
 /// field; a sysroot without the file yields no pin.
@@ -5013,7 +5226,10 @@ fn a_host_without_gl_fetches_the_pinned_build() {
         "the app loads GL from the fetched build:\n{stderr}"
     );
     assert!(!stderr.contains("continuing without"), "{stderr}");
-    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+    assert_eq!(
+        files_under(&store),
+        ["platform-test/blake3", "platform-test/gl.onelf"]
+    );
     let extracted = |td: &Path| {
         std::fs::read_dir(td.join("xdg-cache/onelf/pkg"))
             .unwrap()
@@ -5039,7 +5255,10 @@ fn a_host_without_gl_fetches_the_pinned_build() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+    assert_eq!(
+        files_under(&store),
+        ["platform-test/blake3", "platform-test/gl.onelf"]
+    );
     assert_eq!(extracted(&td), 1);
 
     // Fetching disabled, against an empty store: a warning naming the
@@ -5124,7 +5343,10 @@ fn a_build_that_does_not_match_its_pin_is_discarded() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+    assert_eq!(
+        files_under(&store),
+        ["platform-test/blake3", "platform-test/gl.onelf"]
+    );
 
     let _ = std::fs::remove_dir_all(&td);
 }
