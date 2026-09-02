@@ -24,6 +24,9 @@ rayon = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+# `onelf sysroot fetch`: the same client the runtime's updater uses, so
+# both trust the platform's certificate store.
+ureq = { version = "3", features = ["platform-verifier"] }
 xxhash-rust = { workspace = true }
 zstd = { workspace = true, features = ["zdict_builder"] }
 

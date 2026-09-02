@@ -12,6 +12,7 @@ mod payload;
 mod recipe;
 mod run;
 mod sign;
+mod sysroot_cmd;
 mod verify;
 
 use std::os::unix::fs::PermissionsExt;
@@ -194,6 +195,12 @@ enum Commands {
     Verify {
         /// Path to the onelf binary
         binary: PathBuf,
+    },
+
+    /// Obtain and inspect pinned sysroots
+    Sysroot {
+        #[command(subcommand)]
+        action: SysrootAction,
     },
 
     /// Show metadata about a packed binary
@@ -405,6 +412,28 @@ enum Commands {
         /// strings to be bundled.
         #[arg(long, value_delimiter = ',')]
         dlopen: Vec<String>,
+
+        /// Take the bundle's contents from this materialized sysroot's
+        /// package database instead of scanning this machine. Needs
+        /// --target to name the entrypoint.
+        #[arg(long, value_name = "DIR")]
+        sysroot: Option<PathBuf>,
+
+        /// Optional dependency to include from the sysroot (repeatable)
+        #[arg(long, value_name = "PACKAGE")]
+        sysroot_optional: Vec<String>,
+
+        /// File of soname prefixes the host provides, one per line
+        #[arg(long, value_name = "FILE")]
+        platform_line: Option<PathBuf>,
+
+        /// File of glob patterns that never ship, one per line
+        #[arg(long, value_name = "FILE")]
+        policy: Option<PathBuf>,
+
+        /// File of paths a test run opened, one per line
+        #[arg(long, value_name = "FILE")]
+        trace: Option<PathBuf>,
     },
 }
 
@@ -447,6 +476,22 @@ enum CacheAction {
         /// Maximum age in days
         #[arg(long, default_value = "30")]
         max_age: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum SysrootAction {
+    /// Materialize a rootfs archive, from a local path or an https:// URL
+    Fetch {
+        /// Archive path or URL (.tar or .tar.zst)
+        source: String,
+        /// Directory to materialize into
+        dir: PathBuf,
+    },
+    /// Show what a materialized sysroot holds
+    Info {
+        /// A materialized sysroot
+        dir: PathBuf,
     },
 }
 
@@ -721,7 +766,31 @@ fn main() {
             strict_libc,
             scan_dlopen,
             dlopen,
+            sysroot,
+            sysroot_optional,
+            platform_line,
+            policy,
+            trace,
         } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
+            let sysroot = match sysroot {
+                Some(root) => {
+                    let Some(command) = target.as_ref().and_then(|t| t.to_str()) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--sysroot needs --target to name the entrypoint",
+                        ));
+                    };
+                    Some(bundle::SysrootOptions {
+                        root,
+                        command: command.to_string(),
+                        optional: sysroot_optional,
+                        platform_line,
+                        policy,
+                        trace,
+                    })
+                }
+                None => None,
+            };
             bundle::bundle_libs(&bundle::BundleOptions {
                 directory,
                 primary: target.clone(),
@@ -746,14 +815,57 @@ fn main() {
                 strict_libc,
                 scan_dlopen,
                 dlopen_extra: dlopen,
+                sysroot,
             })
         }),
+        Commands::Sysroot { action } => match action {
+            SysrootAction::Fetch { source, dir } => sysroot_cmd::fetch(&source, &dir),
+            SysrootAction::Info { dir } => sysroot_cmd::info(&dir),
+        },
     };
 
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// The sysroot a recipe names, materialized from its archive when the
+/// directory does not exist yet. Paths resolve against the recipe's
+/// directory.
+fn sysroot_from_recipe(
+    dir: &std::path::Path,
+    command: &str,
+    sr: &recipe::Sysroot,
+) -> std::io::Result<bundle::SysrootOptions> {
+    let resolve = |p: &std::path::Path| {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        }
+    };
+    let root = resolve(&sr.path);
+    if !root.is_dir() {
+        let Some(archive) = &sr.archive else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{}: sysroot does not exist and [sysroot] names no archive",
+                    root.display()
+                ),
+            ));
+        };
+        sysroot_cmd::fetch(&resolve(archive).to_string_lossy(), &root)?;
+    }
+    Ok(bundle::SysrootOptions {
+        root,
+        command: command.to_string(),
+        optional: sr.optional.clone(),
+        platform_line: sr.platform_line.as_deref().map(resolve),
+        policy: sr.policy.as_deref().map(resolve),
+        trace: sr.trace.as_deref().map(resolve),
+    })
 }
 
 fn run_build(
@@ -767,8 +879,14 @@ fn run_build(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // Stage 1: bundle-libs
-    if !recipe.bundle.skip {
+    let sysroot = match &recipe.sysroot {
+        Some(sr) => Some(sysroot_from_recipe(&dir, &recipe.package.command, sr)?),
+        None => None,
+    };
+
+    // Stage 1: bundle-libs. A sysroot is applied by bundle-libs, so it
+    // runs even when the recipe would otherwise skip bundling.
+    if sysroot.is_some() || !recipe.bundle.skip {
         let search_path: Vec<PathBuf> = recipe
             .bundle
             .search_paths
@@ -800,6 +918,7 @@ fn run_build(
             strict_libc: recipe.bundle.strict_libc,
             scan_dlopen: recipe.bundle.scan_dlopen,
             dlopen_extra: recipe.bundle.dlopen.clone(),
+            sysroot,
         })?;
     }
 

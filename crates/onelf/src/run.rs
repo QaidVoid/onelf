@@ -53,6 +53,7 @@ fn bundle_from_recipe(dir: &Path, r: &recipe::Recipe) -> io::Result<()> {
         strict_libc: r.bundle.strict_libc,
         scan_dlopen: r.bundle.scan_dlopen,
         dlopen_extra: r.bundle.dlopen.clone(),
+        sysroot: None,
     })
 }
 

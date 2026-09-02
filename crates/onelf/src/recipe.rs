@@ -43,6 +43,9 @@ pub struct Recipe {
     pub update: Option<Update>,
     #[serde(default)]
     pub bundle: Bundle,
+    /// Take the bundle's contents from a pinned sysroot instead of
+    /// scanning the packer's machine.
+    pub sysroot: Option<Sysroot>,
     /// Custom environment variables set before exec. Values support
     /// `${ONELF_DIR}` which expands to the package root at runtime.
     /// Deserialized from the `[env]` TOML table into a `BTreeMap` so the
@@ -178,6 +181,26 @@ impl From<HostLibsSpec> for crate::pack::HostLibs {
             HostLibsSpec::Never => crate::pack::HostLibs::Never,
         }
     }
+}
+
+/// `[sysroot]`: a materialized rootfs whose package database decides the
+/// bundle's contents. Paths are relative to the recipe.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Sysroot {
+    /// The materialized rootfs.
+    pub path: PathBuf,
+    /// An archive to materialize into `path` when it does not exist yet.
+    pub archive: Option<PathBuf>,
+    /// Optional dependencies to include, by package name.
+    #[serde(default)]
+    pub optional: Vec<String>,
+    /// File of soname prefixes the host provides, one per line.
+    pub platform_line: Option<PathBuf>,
+    /// File of glob patterns that never ship, one per line.
+    pub policy: Option<PathBuf>,
+    /// File of paths a test run opened, one per line.
+    pub trace: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +407,26 @@ mod package_tests {
         let recipe = load(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         recipe
+    }
+
+    #[test]
+    fn a_sysroot_section_parses_with_relative_paths() {
+        let recipe = load_str(
+            "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"sysroot\"\narchive = \"root.tar.zst\"\noptional = [\"extra\"]\nplatform-line = \"platform.txt\"\npolicy = \"policy.txt\"\n",
+        );
+        let sr = recipe.sysroot.expect("section present");
+        assert_eq!(sr.path, std::path::PathBuf::from("sysroot"));
+        assert_eq!(
+            sr.archive.as_deref(),
+            Some(std::path::Path::new("root.tar.zst"))
+        );
+        assert_eq!(sr.optional, ["extra"]);
+        assert!(sr.trace.is_none());
+        assert!(
+            load_str("[package]\ncommand = \"bin/app\"\n")
+                .sysroot
+                .is_none()
+        );
     }
 
     #[test]

@@ -681,6 +681,7 @@ dependencies = [
  "rustix",
  "serde",
  "toml",
+ "ureq",
  "xxhash-rust",
  "zstd",
 ]

@@ -27,6 +27,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use onelf_sysroot::PlatformLine;
+
 mod ui;
 pub(crate) use ui::{color, format_size};
 mod gpu;
@@ -34,7 +36,9 @@ use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod resolve;
 pub(crate) use resolve::*;
 mod elf;
+pub mod sysroot;
 pub(crate) use elf::*;
+pub use sysroot::SysrootOptions;
 
 /// Ensure a file is writable so it can be overwritten on re-runs.
 /// No-op if the file doesn't exist yet.
@@ -288,6 +292,11 @@ pub struct BundleOptions {
     pub scan_dlopen: bool,
     /// Additional sonames added to the dlopen scan allow-list.
     pub dlopen_extra: Vec<String>,
+    /// Take the bundle's contents from a pinned sysroot's package database
+    /// instead of scanning this machine. The host is never consulted, the
+    /// framework bundlers stay off since the closure already holds what
+    /// the packages declare, and an unresolved soname is an error.
+    pub sysroot: Option<SysrootOptions>,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -334,6 +343,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
     }
 
+    let sysroot_platform = match &opts.sysroot {
+        Some(sr) => {
+            let (report, platform) = sysroot::populate(&opts.directory, sr)?;
+            sysroot::print_report(sr, &report);
+            Some(platform)
+        }
+        None => None,
+    };
+    let frameworks = opts.sysroot.is_none();
+
     // Auto-detect frameworks from the input binaries' DT_NEEDED entries.
     // User-provided flags are OR'd with detected flags so explicit opt-ins win
     // but the tool does the right thing when the user passes nothing. A matching
@@ -359,11 +378,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .or_else(|| target_elfs.iter().find_map(|f| read_elf_machine(f)));
 
     let detected = detect_frameworks(&target_elfs);
-    let want_gl = (opts.gl || detected.gl) && !opts.no_gl;
-    let want_dri = (opts.dri || detected.dri) && !opts.no_dri;
-    let want_vulkan = (opts.vulkan || detected.vulkan) && !opts.no_vulkan;
-    let want_wayland = (opts.wayland || detected.wayland) && !opts.no_wayland;
-    let want_gtk = (opts.gtk || detected.gtk) && !opts.no_gtk;
+    let want_gl = frameworks && (opts.gl || detected.gl) && !opts.no_gl;
+    let want_dri = frameworks && (opts.dri || detected.dri) && !opts.no_dri;
+    let want_vulkan = frameworks && (opts.vulkan || detected.vulkan) && !opts.no_vulkan;
+    let want_wayland = frameworks && (opts.wayland || detected.wayland) && !opts.no_wayland;
+    let want_gtk = frameworks && (opts.gtk || detected.gtk) && !opts.no_gtk;
 
     // Report frameworks detection turned on that the user did not request,
     // and frameworks the user explicitly suppressed, so the outcome is visible.
@@ -408,6 +427,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .iter()
         .copied()
         .chain(opts.exclude.iter().map(|s| s.as_str()))
+        .chain(
+            sysroot_platform
+                .iter()
+                .flat_map(|p| p.prefixes().iter().map(String::as_str)),
+        )
         .collect();
 
     // Bundle GPU assets first so DRI driver .so files are present when the
@@ -595,7 +619,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 ),
             }
             // After injection, so the audit sees the final DT_NEEDED set.
-            report_unbundled_needs(&audit_unbundled_needs(&opts.directory));
+            verify_needs(opts, sysroot_platform.as_ref())?;
         }
         return Ok(());
     }
@@ -656,8 +680,24 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         needed_by.retain(|soname, _| libc_family_of_soname(soname).is_none_or(|fam| fam == target));
     }
 
-    let mut ldconfig_cache = build_lib_cache();
-    let mut search_paths: Vec<PathBuf> = opts.search_path.clone();
+    // In sysroot mode the universe is the sysroot: no loader cache, no
+    // store, only its library directories.
+    let mut ldconfig_cache = if opts.sysroot.is_some() {
+        HashMap::new()
+    } else {
+        build_lib_cache()
+    };
+    let mut search_paths: Vec<PathBuf> = opts
+        .sysroot
+        .iter()
+        .flat_map(|sr| {
+            ["usr/lib", "usr/lib64", "lib", "lib64"]
+                .into_iter()
+                .map(move |d| sr.root.join(d))
+                .filter(|d| d.is_dir())
+        })
+        .collect();
+    search_paths.extend(opts.search_path.iter().cloned());
     search_paths.extend(rpath_dirs);
     let lib_dest = opts.directory.join(&opts.lib_dir);
 
@@ -672,7 +712,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
-    if Path::new("/nix/store").is_dir() {
+    if Path::new("/nix/store").is_dir() && opts.sysroot.is_none() {
         let (bundled, stubs) = find_existing_libs(&lib_dest);
         if !opts.dry_run {
             for stub in &stubs {
@@ -1006,16 +1046,50 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             ),
         }
         // After injection, so the audit sees the final DT_NEEDED set.
-        report_unbundled_needs(&audit_unbundled_needs(&opts.directory));
+        verify_needs(opts, sysroot_platform.as_ref())?;
     }
 
+    Ok(())
+}
+
+/// The verifier: every `DT_NEEDED` of every bundled ELF resolves inside
+/// the bundle, or names something the platform line hands to the host.
+///
+/// From a sysroot the universe was complete, so an omission is a policy
+/// or platform-line mistake the publisher can fix, and the bundle fails.
+/// From a host scan the universe was a guess, and the finding stays a
+/// warning.
+fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Result<()> {
+    let mut findings = audit_unbundled_needs(&opts.directory);
+    if let Some(platform) = platform {
+        for (_, libs) in &mut findings {
+            libs.retain(|s| !platform.matches_soname(s));
+        }
+        findings.retain(|(_, libs)| !libs.is_empty());
+    }
+    report_unbundled_needs(&findings);
+    if opts.sysroot.is_some()
+        && let Some((object, libs)) = findings.first()
+    {
+        let object = object
+            .strip_prefix(&opts.directory)
+            .unwrap_or(object)
+            .display();
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} needs {}, which is neither in the sysroot closure nor on the platform line",
+                object, libs[0]
+            ),
+        ));
+    }
     Ok(())
 }
 
 /// Pin a bundled file's mtime so repeated `bundle-libs` runs produce
 /// metadata-identical trees (`fs::copy` otherwise stamps "now"). Honors
 /// `SOURCE_DATE_EPOCH`, else the Unix epoch. Best-effort: errors ignored.
-fn normalize_mtime(path: &Path) {
+pub(crate) fn normalize_mtime(path: &Path) {
     let secs = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())

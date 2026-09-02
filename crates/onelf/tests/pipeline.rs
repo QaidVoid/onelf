@@ -4221,3 +4221,526 @@ int main(void) {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A synthetic Arch-style sysroot: a rootfs with a pacman database and
+/// compiled fixtures, archived with the host's `tar`.
+struct SysrootFixture {
+    rootfs: PathBuf,
+    archive: PathBuf,
+    platform_line: PathBuf,
+    policy: PathBuf,
+    /// A "host" holding the platform-line driver, for running the result.
+    ld_cache: PathBuf,
+}
+
+/// Write a package's `desc` and `files` into the database under `rootfs`.
+fn write_pacman_entry(
+    rootfs: &Path,
+    name: &str,
+    version: &str,
+    depends: &[&str],
+    optdepends: &[&str],
+    files: &[&str],
+) {
+    let dir = rootfs
+        .join("var/lib/pacman/local")
+        .join(format!("{name}-{version}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut desc = format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n");
+    if !depends.is_empty() {
+        desc.push_str(&format!("%DEPENDS%\n{}\n\n", depends.join("\n")));
+    }
+    if !optdepends.is_empty() {
+        desc.push_str(&format!("%OPTDEPENDS%\n{}\n\n", optdepends.join("\n")));
+    }
+    std::fs::write(dir.join("desc"), desc).unwrap();
+    let mut listing = String::from("%FILES%\n");
+    for f in files {
+        let mut prefix = String::new();
+        for part in f.split('/').take(f.split('/').count() - 1) {
+            prefix.push_str(part);
+            prefix.push('/');
+            listing.push_str(&prefix);
+            listing.push('\n');
+        }
+        listing.push_str(f);
+        listing.push('\n');
+    }
+    std::fs::write(dir.join("files"), listing).unwrap();
+}
+
+fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
+    let rootfs = td.join("rootfs");
+    for d in [
+        "usr/bin",
+        "usr/lib/fixture/plugins",
+        "usr/lib/extra",
+        "usr/share/doc/libfixture",
+        "usr/share/fixture",
+    ] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    write(&src.join("fixture.c"), "int fix_value(void){return 41;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            src.join("fixture.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libfixture.so.1"),
+    ) {
+        return None; // no compiler: documented soft-skip
+    }
+    for (name, out) in [
+        ("plugin_a", "usr/lib/fixture/plugins/a.so"),
+        ("plugin_b", "usr/lib/fixture/plugins/b.so"),
+        ("extra", "usr/lib/extra/libextra.so"),
+    ] {
+        write(
+            &src.join(format!("{name}.c")),
+            &format!("int {name}(void){{return 1;}}\n"),
+        );
+        assert!(cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                src.join(format!("{name}.c")).to_str().unwrap()
+            ],
+            &rootfs.join(out),
+        ));
+    }
+    write(&src.join("gl.c"), "int gl_probe(void){return 1;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            src.join("gl.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libGL.so.1"),
+    ));
+    write(
+        &src.join("app.c"),
+        "#include <stdio.h>\nint fix_value(void);\nint gl_probe(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libfixture.so.1",
+            "-l:libGL.so.1",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ));
+    write(&rootfs.join("usr/share/doc/libfixture/README"), "docs\n");
+    write(&rootfs.join("usr/share/fixture/data.txt"), "data\n");
+
+    // The sysroot's glibc is this machine's, copied in under the package
+    // name, so the closure has a libc to bundle.
+    let host_libc = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6")?;
+    let host_ld = ldd_path(&rootfs.join("usr/bin/app"), "ld-linux")?;
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "libfixture",
+        "1.0-1",
+        &["glibc>=2.30"],
+        &[],
+        &[
+            "usr/lib/libfixture.so.1",
+            "usr/lib/fixture/plugins/a.so",
+            "usr/lib/fixture/plugins/b.so",
+            "usr/share/doc/libfixture/README",
+            "usr/share/fixture/data.txt",
+        ],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "extra",
+        "1.0-1",
+        &[],
+        &[],
+        &["usr/lib/extra/libextra.so"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "mesa-fake",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libGL.so.1"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["libfixture", "mesa-fake", "glibc>=2.30"],
+        &["extra: more features"],
+        &["usr/bin/app"],
+    );
+
+    let archive = td.join("root.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+
+    let platform_line = td.join("platform-line.txt");
+    write(&platform_line, "# the host's GL stack\nlibGL.so\n");
+    let policy = td.join("policy.txt");
+    write(&policy, "usr/share/doc/**\n");
+
+    let host = td.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::copy(rootfs.join("usr/lib/libGL.so.1"), host.join("libGL.so.1")).unwrap();
+    let ld_cache = td.join("ld.so.cache");
+    std::fs::write(&ld_cache, ld_so_cache(&[&host.join("libGL.so.1")])).unwrap();
+
+    Some(SysrootFixture {
+        rootfs,
+        archive,
+        platform_line,
+        policy,
+        ld_cache,
+    })
+}
+
+fn sysroot_recipe(dir: &Path, fixture: &SysrootFixture, extra: &str) {
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\nplatform-line = \"{}\"\npolicy = \"{}\"\n{extra}",
+            fixture.archive.display(),
+            fixture.platform_line.display(),
+            fixture.policy.display(),
+        ),
+    );
+}
+
+fn onelf_build(dir: &Path) -> std::process::Output {
+    Command::new(onelf())
+        .arg("build")
+        .current_dir(dir)
+        .output()
+        .expect("spawn onelf build")
+}
+
+/// Every file under the AppDir's `bin/` and `lib/` has a counterpart in
+/// the sysroot, so nothing came from the packer's machine.
+fn assert_bundle_is_from_sysroot(appdir: &Path, rootfs: &Path) {
+    for entry in jwalk::WalkDir::new(appdir).sort(true) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(appdir).unwrap().to_path_buf();
+        let rel_s = rel.to_string_lossy();
+        if !(rel_s.starts_with("bin/") || rel_s.starts_with("lib/")) {
+            continue;
+        }
+        if rel_s.contains("libonelf-env") {
+            continue; // written by the packer itself
+        }
+        assert!(
+            rootfs.join("usr").join(&rel).exists(),
+            "{} has no counterpart in the sysroot",
+            rel.display()
+        );
+    }
+}
+
+/// The closure of the entrypoint's package comes out of the sysroot with
+/// its plugins and data, pruned by the platform line and the policy, and
+/// with nothing from the packer's own machine.
+#[test]
+fn a_sysroot_closure_is_bundled_and_pruned() {
+    let td = workdir("sysroot");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "build failed:\n{stderr}");
+    assert!(dir.join("bin/app").is_file());
+    assert!(dir.join("lib/libfixture.so.1").is_file());
+    assert!(
+        dir.join("lib/fixture/plugins/a.so").is_file(),
+        "a plugin directory no ELF names still arrives"
+    );
+    assert!(dir.join("share/fixture/data.txt").is_file());
+    assert!(
+        !dir.join("lib/extra").exists(),
+        "an unnamed optional dependency stays out"
+    );
+    assert!(
+        !dir.join("lib/libGL.so.1").exists(),
+        "the platform line keeps the driver out"
+    );
+    assert!(
+        stderr.contains("Host-provided:") && stderr.contains("libGL.so.1"),
+        "the host-provided library is reported:\n{stderr}"
+    );
+    assert!(
+        !dir.join("share/doc").exists(),
+        "the policy removes documentation"
+    );
+    assert!(
+        td.join("sysroot/var/lib/pacman/local").is_dir(),
+        "the archive was materialized"
+    );
+    assert_bundle_is_from_sysroot(&dir, &fixture.rootfs);
+
+    // Naming the optional dependency brings it in.
+    sysroot_recipe(&dir, &fixture, "optional = [\"extra\"]\n");
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("lib/extra/libextra.so").is_file());
+
+    // The package runs, with the driver coming from the host through the
+    // resolver as the platform line promised.
+    let pkg = dir.join("app.onelf");
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", &fixture.ld_cache);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "the packed app runs: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The same closure from the command line, and the sysroot commands.
+    let cli_dir = td.join("cli");
+    std::fs::create_dir_all(&cli_dir).unwrap();
+    let out = Command::new(onelf())
+        .args([
+            "bundle-libs",
+            cli_dir.to_str().unwrap(),
+            "--target",
+            "bin/app",
+        ])
+        .args(["--sysroot", td.join("sysroot").to_str().unwrap()])
+        .args(["--platform-line", fixture.platform_line.to_str().unwrap()])
+        .args(["--policy", fixture.policy.to_str().unwrap()])
+        .args(["--sysroot-optional", "extra"])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cli_dir.join("bin/app").is_file() && cli_dir.join("lib/extra/libextra.so").is_file());
+
+    let out = Command::new(onelf())
+        .args(["sysroot", "info", td.join("sysroot").to_str().unwrap()])
+        .output()
+        .expect("spawn onelf sysroot info");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success()
+            && stdout.contains("packages: 5")
+            && stdout.contains("glibc:    2.99-1"),
+        "{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A dependency the sysroot cannot supply fails the build in sysroot mode
+/// and only warns in host-scan mode.
+#[test]
+fn an_unresolved_soname_fails_the_sysroot_build_and_warns_the_host_scan() {
+    let td = workdir("sysrootfail");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(onelf())
+        .args(["sysroot", "fetch"])
+        .arg(&fixture.archive)
+        .arg(td.join("sysroot"))
+        .output()
+        .expect("spawn onelf sysroot fetch");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_file(td.join("sysroot/usr/lib/libfixture.so.1")).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "sysroot mode must fail:\n{stderr}");
+    assert!(
+        stderr.contains("libfixture.so.1") && stderr.contains("bin/app"),
+        "the failure names the soname and the object:\n{stderr}"
+    );
+
+    let out = Command::new(onelf())
+        .args(["bundle-libs", dir.to_str().unwrap(), "--target", "bin/app"])
+        .env("ONELF_LD_CACHE", &fixture.ld_cache)
+        .output()
+        .expect("spawn onelf bundle-libs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "host-scan mode only warns:\n{stderr}");
+    assert!(
+        stderr.contains("libfixture.so.1"),
+        "the warning names it:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A trace removes what the test run never opened, keeps the siblings of
+/// what it did, and keeps what some bundled object needs.
+#[test]
+fn a_trace_prunes_unopened_files_but_keeps_siblings_and_needs() {
+    let td = workdir("sysroottrace");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let trace = td.join("trace.txt");
+    write(&trace, "/usr/bin/app\n/usr/lib/fixture/plugins/a.so\n");
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        &format!("trace = \"{}\"\n", trace.display()),
+    );
+
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("share/fixture/data.txt").exists(),
+        "unopened data is removed"
+    );
+    assert!(
+        dir.join("lib/fixture/plugins/b.so").is_file(),
+        "an opened plugin's sibling stays"
+    );
+    assert!(
+        dir.join("lib/libfixture.so.1").is_file(),
+        "a needed soname stays"
+    );
+    assert!(dir.join("lib/libc.so.6").is_file());
+
+    let plain = td.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    sysroot_recipe(&plain, &fixture, "");
+    let out = onelf_build(&plain);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        plain.join("share/fixture/data.txt").is_file(),
+        "no trace, nothing pruned"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A raw ustar header for one small file, for archives `tar` itself
+/// refuses to write.
+fn raw_tar_entry(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut header = [0u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    header[100..107].copy_from_slice(b"0000644");
+    header[108..115].copy_from_slice(b"0000000");
+    header[116..123].copy_from_slice(b"0000000");
+    header[124..135].copy_from_slice(format!("{:011o}", data.len()).as_bytes());
+    header[136..147].copy_from_slice(b"00000000000");
+    header[156] = b'0';
+    header[257..262].copy_from_slice(b"ustar");
+    header[263..265].copy_from_slice(b"00");
+    header[148..156].copy_from_slice(b"        ");
+    let sum: u32 = header.iter().map(|&b| b as u32).sum();
+    header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    let mut out = header.to_vec();
+    out.extend_from_slice(data);
+    out.resize(out.len().div_ceil(512) * 512, 0);
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
+/// The same archive and recipe give the same bytes, and an archive that
+/// reaches outside its directory is refused.
+#[test]
+fn sysroot_builds_are_reproducible_and_traversal_is_refused() {
+    let td = workdir("sysrootrepro");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let mut outputs = Vec::new();
+    for name in ["one", "two"] {
+        let dir = td.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        sysroot_recipe(&dir, &fixture, "");
+        let out = onelf_build(&dir);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(std::fs::read(dir.join("app.onelf")).unwrap());
+    }
+    assert!(outputs[0] == outputs[1], "two builds differ");
+
+    let bad = td.join("bad.tar");
+    std::fs::write(&bad, raw_tar_entry("../escape", b"x")).unwrap();
+    let out = Command::new(onelf())
+        .args(["sysroot", "fetch"])
+        .arg(&bad)
+        .arg(td.join("badroot"))
+        .output()
+        .expect("spawn onelf sysroot fetch");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("escape"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!td.join("escape").exists());
+
+    let _ = std::fs::remove_dir_all(&td);
+}
