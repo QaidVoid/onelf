@@ -254,12 +254,14 @@ The runtime fetches only when all four hold: the host-library policy is
 and the package carries a pin. A package that bundles Mesa never
 fetches, and neither does one on a host with a working driver.
 
-The file lands in `<cache root>/platform/<label>/gl.onelf` once its
+The file lands in `<cache root>/platform/<label>/<hash>.onelf` once its
 hash matches, with the hash beside it so a label whose pin moves on to
 a new build is fetched again; a mismatch or a broken download leaves
 nothing behind. It is then extracted through the package cache and its
 libraries are indexed ahead of the host's, so two packages pinning the
-same label share one download and one extraction. The build's
+same label share one download and one extraction. The name is the build's own
+hash, so a label whose pin later moves to a new build keeps both rather
+than overwriting the old one and forcing a refetch. The build's
 directories are never put on the search path, where every process the
 application spawns would inherit them. Its libraries reach the
 application through the link farm by name, the ones the drivers open

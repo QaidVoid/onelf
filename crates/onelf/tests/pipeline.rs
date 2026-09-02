@@ -5301,11 +5301,11 @@ fn a_previous_output_inside_the_directory_is_not_packed() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// A label whose pin moved on to a new build is fetched again: the store
-/// is keyed by label, so the hash it was verified against is kept beside
-/// the file and compared with the pin.
+/// Two builds a label pins over its lifetime coexist in the store, keyed
+/// by hash, so an app pinning the old build never forces a refetch of the
+/// new one or the reverse.
 #[test]
-fn a_moved_pin_replaces_the_stored_build() {
+fn two_builds_under_one_label_coexist() {
     let td = workdir("glrepin");
     let Some(fixture) = synthetic_sysroot(&td) else {
         return;
@@ -5322,10 +5322,9 @@ fn a_moved_pin_replaces_the_stored_build() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        std::fs::read_to_string(store.join("blake3"))
-            .unwrap()
-            .trim(),
-        fixture.gl_hash
+        files_under(&store),
+        [format!("{}.onelf", fixture.gl_hash)],
+        "the build is stored under its hash"
     );
 
     // A new build under the same label: the tree gains a file, the hash
@@ -5347,14 +5346,30 @@ fn a_moved_pin_replaces_the_stored_build() {
         out.status.success() && !stderr.contains("continuing without"),
         "{stderr}"
     );
+    let mut want = vec![
+        format!("{}.onelf", fixture.gl_hash),
+        format!("{hash}.onelf"),
+    ];
+    want.sort();
     assert_eq!(
-        std::fs::read_to_string(store.join("blake3"))
-            .unwrap()
-            .trim(),
-        hash,
-        "the store now holds the new build"
+        files_under(&store),
+        want,
+        "both builds are kept, not overwritten"
     );
-    assert_eq!(files_under(&store), ["blake3", "gl.onelf"]);
+
+    // The original app still runs against its build without a refetch:
+    // its file is already there, so no warning and no new download.
+    let out = run_package(&mut launch_against(&pkg, &td, &no_gl));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains("continuing without"),
+        "{stderr}"
+    );
+    assert_eq!(
+        files_under(&store),
+        want,
+        "the second launch changed nothing"
+    );
 
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -5525,7 +5540,7 @@ fn a_host_without_gl_fetches_the_pinned_build() {
     assert!(!stderr.contains("continuing without"), "{stderr}");
     assert_eq!(
         files_under(&store),
-        ["platform-test/blake3", "platform-test/gl.onelf"]
+        [format!("platform-test/{}.onelf", fixture.gl_hash)]
     );
     let extracted = |td: &Path| {
         std::fs::read_dir(td.join("xdg-cache/onelf/pkg"))
@@ -5554,7 +5569,7 @@ fn a_host_without_gl_fetches_the_pinned_build() {
     );
     assert_eq!(
         files_under(&store),
-        ["platform-test/blake3", "platform-test/gl.onelf"]
+        [format!("platform-test/{}.onelf", fixture.gl_hash)]
     );
     assert_eq!(extracted(&td), 1);
 
@@ -5642,7 +5657,7 @@ fn a_build_that_does_not_match_its_pin_is_discarded() {
     );
     assert_eq!(
         files_under(&store),
-        ["platform-test/blake3", "platform-test/gl.onelf"]
+        [format!("platform-test/{}.onelf", fixture.gl_hash)]
     );
 
     let _ = std::fs::remove_dir_all(&td);
@@ -5677,7 +5692,7 @@ fn cache_gc_collects_an_unused_build() {
     };
     let listed = cache_cmd(&["list"]);
     assert!(
-        listed.contains("GL builds:") && listed.contains("platform-test ("),
+        listed.contains("GL builds:") && listed.contains("platform-test "),
         "{listed}"
     );
 

@@ -125,48 +125,51 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / 1_048_576.0
 }
 
-/// Bytes held by every file under `dir`.
-fn dir_size(dir: &Path) -> u64 {
-    jwalk::WalkDir::new(dir)
-        .into_iter()
-        .flatten()
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
-}
-
-/// A pinned GL build the store holds: its label, when a package last used
-/// it, and its size.
+/// A pinned GL build the store holds: its label, the hash it is named by,
+/// its file, when a package last used it, and its size. The store keys a
+/// build by its hash, so one label may hold several as its pin moves on.
 struct StoredBuild {
     label: String,
-    dir: PathBuf,
+    hash: String,
+    file: PathBuf,
     used: Option<SystemTime>,
     bytes: u64,
 }
 
-/// The builds the store holds, by label. A label directory without the
-/// build file is a fetch that never completed and is listed as unused.
+/// The builds the store holds: every `<hash>.onelf` under every label
+/// directory. A partial download (a dotfile) is skipped.
 fn stored_builds(root: &Path) -> Vec<StoredBuild> {
-    let Ok(entries) = fs::read_dir(layout::platform_dir(root)) else {
+    let Ok(labels) = fs::read_dir(layout::platform_dir(root)) else {
         return Vec::new();
     };
-    let mut builds: Vec<StoredBuild> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| {
-            let dir = e.path();
-            StoredBuild {
-                label: e.file_name().to_string_lossy().into_owned(),
-                used: fs::metadata(dir.join("gl.onelf"))
-                    .and_then(|m| m.modified())
-                    .ok(),
-                bytes: dir_size(&dir),
-                dir,
+    let mut builds: Vec<StoredBuild> = Vec::new();
+    for label in labels.flatten() {
+        if !label.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let label_name = label.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(label.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let Some(hash) = name.strip_suffix(".onelf") else {
+                continue;
+            };
+            if hash.starts_with('.') {
+                continue;
             }
-        })
-        .collect();
-    builds.sort_by(|a, b| a.label.cmp(&b.label));
+            let md = file.metadata().ok();
+            builds.push(StoredBuild {
+                label: label_name.clone(),
+                hash: hash.to_string(),
+                file: file.path(),
+                used: md.as_ref().and_then(|m| m.modified().ok()),
+                bytes: md.map(|m| m.len()).unwrap_or(0),
+            });
+        }
+    }
+    builds.sort_by(|a, b| (&a.label, &a.hash).cmp(&(&b.label, &b.hash)));
     builds
 }
 
@@ -184,8 +187,9 @@ pub fn cache_list() -> io::Result<()> {
         println!("GL builds:");
         for build in &builds {
             println!(
-                "  {} ({:.1} MB, last used: {})",
+                "  {} {} ({:.1} MB, last used: {})",
                 build.label,
+                &build.hash[..build.hash.len().min(16)],
                 mib(build.bytes),
                 ago(build.used)
             );
@@ -256,9 +260,13 @@ pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
             Some(Ok(age)) => age > max_age,
             Some(Err(_)) => false,
         };
-        if idle && fs::remove_dir_all(&build.dir).is_ok() {
+        if idle && fs::remove_file(&build.file).is_ok() {
             builds_removed += 1;
             build_bytes += build.bytes;
+            // Drop the label directory once its last build is gone.
+            if let Some(parent) = build.file.parent() {
+                let _ = fs::remove_dir(parent);
+            }
         }
     }
     if builds_removed > 0 {

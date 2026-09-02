@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 
 /// Where the package records its pin, relative to the package root.
 pub const PIN_FILE: &str = ".onelf/platform";
-const BUILD_FILE: &str = "gl.onelf";
-const HASH_FILE: &str = "blake3";
 
 /// A GL build pinned by hash.
 #[derive(Debug, PartialEq, Eq)]
@@ -82,14 +80,14 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
             .ok_or("no cache directory to store a GL build in (set HOME or XDG_CACHE_HOME)")?
             .join("platform"),
     };
+    // The build is stored by its own hash, so two builds a label pins over
+    // its lifetime coexist rather than overwrite each other and force a
+    // refetch on every launch. The name is the hash the bytes were
+    // verified against, so an existing file needs no re-check.
     let dir = store.join(&pin.label);
-    let file = dir.join(BUILD_FILE);
-    // The hash the stored file was verified against. A label whose pin
-    // moved on to a new build is fetched again rather than served stale.
-    let hash_file_path = dir.join(HASH_FILE);
-    let stored = fs::read_to_string(&hash_file_path).unwrap_or_default();
+    let file = dir.join(format!("{}.onelf", pin.blake3));
 
-    if !file.is_file() || stored.trim() != pin.blake3 {
+    if !file.is_file() {
         if env_set("ONELF_NO_PLATFORM_FETCH") {
             return Err(format!(
                 "fetching is disabled by ONELF_NO_PLATFORM_FETCH ({} would be fetched from {})",
@@ -97,19 +95,16 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
             ));
         }
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let tmp = dir.join(format!(".{BUILD_FILE}.{}", std::process::id()));
+        let tmp = dir.join(format!(".{}.onelf.{}", pin.blake3, std::process::id()));
         let fetched = fetch(&pin.url, &tmp).and_then(|()| verify(&tmp, &pin));
         if let Err(why) = fetched {
             let _ = fs::remove_file(&tmp);
             return Err(why);
         }
-        let _ = fs::remove_file(&hash_file_path);
         fs::rename(&tmp, &file).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("{}: {e}", file.display())
         })?;
-        fs::write(&hash_file_path, format!("{}\n", pin.blake3))
-            .map_err(|e| format!("{}: {e}", hash_file_path.display()))?;
     }
     touch(&file);
 
