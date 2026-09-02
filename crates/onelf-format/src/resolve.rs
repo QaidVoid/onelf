@@ -22,9 +22,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use onelf_format::HostLibsPolicy;
-use onelf_format::drivers::{self, DRIVER_FAMILIES};
-
+use crate::drivers::{self, DRIVER_FAMILIES};
+use crate::footer::HostLibsPolicy;
 use crate::verdef::{self, Choice, VersionSet};
 
 /// What a launch takes from the host.
@@ -228,7 +227,7 @@ impl HostIndex {
     /// The loader the host's libc was built with: its own `PT_INTERP`,
     /// or failing that any loader the cache names.
     fn loader_for(&self, host_libc: &Path) -> Option<PathBuf> {
-        if let Some(interp) = crate::interp::read_elf_interp(host_libc) {
+        if let Some(interp) = crate::elf::read_interp(host_libc) {
             let interp = PathBuf::from(interp);
             if interp.is_file() {
                 return Some(interp);
@@ -344,30 +343,28 @@ fn bundled_libs(pkg_root: &Path, lib_dirs: &[&str]) -> BTreeMap<String, PathBuf>
     out
 }
 
-/// A digest of everything on the host the decision depends on: the cache
-/// image, the directories it names, and the driver description files.
+/// A description of everything on the host the decision depends on: the
+/// cache image, the directories it names, and the driver description
+/// files, each with its size and modification time. Compared whole, so
+/// no hash is needed and nothing has to be added to the format crate's
+/// dependencies.
 fn fingerprint(ld_cache: &Path, icd_dirs: &[&str], policy: HostLibsPolicy) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"onelf-resolve-1\0");
-    hasher.update(policy.as_str().as_bytes());
+    let mut out = format!("onelf-resolve-1 {}", policy.as_str());
     let mut stamp = |path: &Path| {
-        hasher.update(path.as_os_str().as_encoded_bytes());
+        out.push('\x1f');
+        out.push_str(&path.to_string_lossy());
         match fs::metadata(path) {
             Ok(md) => {
-                hasher.update(&md.len().to_le_bytes());
                 let mtime = md
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                hasher.update(&mtime.to_le_bytes());
+                out.push_str(&format!("={}:{mtime}", md.len()));
             }
-            Err(_) => {
-                hasher.update(b"missing");
-            }
+            Err(_) => out.push_str("=missing"),
         }
-        hasher.update(b"\0");
     };
     stamp(ld_cache);
     for dir in drivers::cache_dirs_in(ld_cache) {
@@ -376,7 +373,7 @@ fn fingerprint(ld_cache: &Path, icd_dirs: &[&str], policy: HostLibsPolicy) -> St
     for dir in icd_dirs {
         stamp(Path::new(dir));
     }
-    hasher.finalize().to_hex().to_string()
+    out
 }
 
 const DECISION_FILE: &str = "decision";

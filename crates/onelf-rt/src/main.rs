@@ -11,13 +11,11 @@ mod metadata;
 mod multicall;
 mod paths;
 mod portable;
-mod resolve;
 mod rundir;
 mod selfextract;
 mod ulexec;
 #[cfg(feature = "update")]
 mod update;
-mod verdef;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

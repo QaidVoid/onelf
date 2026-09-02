@@ -10,7 +10,9 @@ pub mod entry;
 pub mod footer;
 pub mod manifest;
 pub mod reader;
+pub mod resolve;
 pub mod update;
+pub mod verdef;
 
 pub use entry::{Block, Entry, EntryKind, EntryPoint, EntryPointFlags, WorkingDir};
 pub use footer::{END_MAGIC, FOOTER_SIZE, Flags, Footer, HostLibsPolicy, MAGIC};

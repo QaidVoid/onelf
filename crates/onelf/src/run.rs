@@ -10,9 +10,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use onelf_format::WorkingDir;
+use onelf_format::cache_layout as layout;
+use onelf_format::resolve::{self, Request, Resolution};
+use onelf_format::{HostLibsPolicy, WorkingDir, drivers};
 
 use crate::bundle;
+use crate::pack::HostLibs;
 use crate::recipe;
 
 /// Translate the recipe's [bundle] section into bundle-libs invocation.
@@ -90,6 +93,47 @@ pub fn run(
         .map(|p| dir.join(p).to_string_lossy().into_owned())
         .collect();
     let lib_paths_str = lib_paths.join(":");
+    let target_is_elf = is_elf_file_at(&target);
+
+    // The same decision the packed runtime makes: what the host supplies is
+    // chosen per library, and no host directory goes on the search path.
+    // The AppDir is the developer's own tree and there is no namespace to
+    // mount in, so a host copy cannot be placed over a bundled one here;
+    // the farm still reaches everything the bundle does not carry.
+    let policy = match recipe.as_ref().and_then(|r| r.package.host_libs) {
+        Some(spec) => match HostLibs::from(spec) {
+            HostLibs::Always => HostLibsPolicy::Always,
+            HostLibs::Never => HostLibsPolicy::Never,
+            HostLibs::Auto => HostLibsPolicy::Auto,
+        },
+        None => HostLibsPolicy::Auto,
+    };
+    let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
+    let lib_dir_strs: Vec<&str> = lib_dirs.iter().filter_map(|p| p.to_str()).collect();
+    let resolution = match run_store(&dir) {
+        Some(store) if target_is_elf && !lib_dirs.is_empty() && !disabled => {
+            resolve::resolve(&Request {
+                pkg_root: &dir,
+                lib_dirs: &lib_dir_strs,
+                policy,
+                store: &store,
+                ld_cache: &drivers::cache_file(),
+                icd_dirs: resolve::ICD_DIRS,
+            })
+        }
+        _ => Resolution::default(),
+    };
+    for name in &resolution.incomparable {
+        eprintln!("onelf run: resolver: cannot order {name}; keeping the bundled copy");
+    }
+    let mut search: Vec<String> = Vec::new();
+    if let Some(farm) = &resolution.farm {
+        search.push(farm.to_string_lossy().into_owned());
+    }
+    if !lib_paths_str.is_empty() {
+        search.push(lib_paths_str.clone());
+    }
+    let search_str = search.join(":");
 
     let requested_cwd = match working_dir {
         WorkingDir::PackageRoot => Some(dir.clone()),
@@ -97,7 +141,13 @@ pub fn run(
         WorkingDir::Inherit => None,
     };
 
-    let mut cmd = build_exec_command(&target, &dir, &lib_paths_str, &ep_name)?;
+    let mut cmd = build_exec_command(
+        &target,
+        &dir,
+        &search_str,
+        &ep_name,
+        resolution.host_interp.as_deref(),
+    )?;
     cmd.args(&ep_args);
     cmd.args(passthrough_args);
 
@@ -115,7 +165,6 @@ pub fn run(
     cmd.env("ONELF_EXEC", &target);
     cmd.env("ONELF_ENTRYPOINT", &ep_name);
 
-    let target_is_elf = is_elf_file_at(&target);
     if !lib_paths_str.is_empty() {
         // Only set LD_LIBRARY_PATH for ELF targets. When the entrypoint
         // is a script the kernel hands it to a host interpreter
@@ -127,19 +176,9 @@ pub fn run(
         // ELFs.
         if target_is_elf {
             let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            // Assemble: <bundle lib> : <existing> : <host driver/system dirs>.
-            // The bundled loader has its baked-in paths scrubbed, so
-            // host-provided GPU drivers (libcuda, libvulkan, libGL,
-            // libva) need an explicit entry or Cycles/OptiX/Vulkan
-            // won't see them.
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(lib_paths_str.clone());
+            let mut parts: Vec<String> = vec![search_str.clone()];
             if !existing.is_empty() {
                 parts.push(existing);
-            }
-            let host_drivers = host_driver_paths();
-            if !host_drivers.is_empty() {
-                parts.push(host_drivers.join(":"));
             }
             cmd.env("LD_LIBRARY_PATH", parts.join(":"));
         }
@@ -345,8 +384,30 @@ fn build_exec_command(
     app_dir: &Path,
     lib_path: &str,
     argv0: &str,
+    host_interp: Option<&Path>,
 ) -> io::Result<Command> {
-    if let Some(interp) = read_elf_interp(target) {
+    let interp = read_elf_interp(target);
+
+    // The host's glibc won, so the bundled loader must not run at all. A
+    // bootstrap-injected binary carries no PT_INTERP and maps its loader
+    // itself; ONELF_INTERP redirects it, and every re-exec inherits that.
+    // Anything else is handed to the host loader directly.
+    if let Some(host_interp) = host_interp {
+        if interp.is_none() {
+            let mut cmd = Command::new(target);
+            cmd.arg0(argv0).env("ONELF_INTERP", host_interp);
+            return Ok(cmd);
+        }
+        let mut cmd = Command::new(host_interp);
+        cmd.arg("--inhibit-cache");
+        if !lib_path.is_empty() {
+            cmd.arg("--library-path").arg(lib_path);
+        }
+        cmd.arg("--argv0").arg(argv0).arg(target);
+        return Ok(cmd);
+    }
+
+    if let Some(interp) = interp {
         let interp_path = Path::new(&interp);
 
         if let Some(bundled) = find_bundled_interp(&interp, app_dir) {
@@ -417,10 +478,13 @@ fn is_elf_file_at(path: &Path) -> bool {
     matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
-/// Host driver directories to append to `LD_LIBRARY_PATH`, shared with the
-/// packed runtime so a dev-mode run resolves them identically.
-fn host_driver_paths() -> Vec<String> {
-    onelf_format::drivers::host_driver_paths(std::env::consts::ARCH)
+/// Where the resolver keeps its link farm and recorded decision for the
+/// AppDir at `dir`: under the cache root, keyed by the directory's path,
+/// so repeated dev runs of the same tree reuse it.
+fn run_store(dir: &Path) -> Option<PathBuf> {
+    let root = layout::resolve_root(rustix::process::getuid().as_raw(), None)?;
+    let id = blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex();
+    Some(root.join("run").join(&id[..16]))
 }
 
 /// Find subdirectories of `dir` that contain `.so*` files, skipping obvious

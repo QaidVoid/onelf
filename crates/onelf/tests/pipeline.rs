@@ -4089,3 +4089,135 @@ fn the_cache_is_used_only_on_request() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// `onelf run` makes the same host-library decision as the packed runtime:
+/// a host driver reaches its newer dependency through the link farm, and no
+/// host directory is placed on the library path.
+#[test]
+fn onelf_run_resolves_host_libraries_like_the_runtime() {
+    let td = workdir("runresolver");
+    let app = td.join("app");
+    let host = td.join("host");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::create_dir_all(&host).unwrap();
+
+    let fixture_c = td.join("fixture.c");
+    write(
+        &fixture_c,
+        "int fix_value(void){return 1;}\nint fix_extra(void){return 2;}\n",
+    );
+    let old_map = td.join("old.map");
+    write(&old_map, "FIX_1.0 { global: fix_value; local: *; };\n");
+    let new_map = td.join("new.map");
+    write(
+        &new_map,
+        "FIX_1.0 { global: fix_value; local: *; };\nFIX_2.0 { global: fix_extra; } FIX_1.0;\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", old_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &app.join("lib/libfixture.so.1"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let host_fixture = host.join("libfixture.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", new_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &host_fixture,
+    ));
+    let gl_c = td.join("gl.c");
+    write(
+        &gl_c,
+        "int fix_extra(void);\nint gl_probe(void){return fix_extra();}\n",
+    );
+    let host_gl = host.join("libGL.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            gl_c.to_str().unwrap(),
+            &format!("-L{}", host.display()),
+            "-l:libfixture.so.1",
+        ],
+        &host_gl,
+    ));
+    let app_c = td.join("app.c");
+    write(
+        &app_c,
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    printf("LD_LIBRARY_PATH=%s\n", lp ? lp : "");
+    void *h = dlopen("libGL.so.1", RTLD_NOW);
+    if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
+    int (*probe)(void) = dlsym(h, "gl_probe");
+    if (!probe) { printf("dlsym: %s\n", dlerror()); return 1; }
+    printf("probe=%d\n", probe());
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[app_c.to_str().unwrap(), "-ldl"],
+        &app.join("bin/app")
+    ));
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&host_gl, &host_fixture])).unwrap();
+
+    let launch = |no_resolver: bool| {
+        let mut run = Command::new(onelf());
+        run.args(["run", app.to_str().unwrap(), "--command", "bin/app"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &cache);
+        if no_resolver {
+            run.env("ONELF_NO_RESOLVER", "1");
+        }
+        isolate(&mut run, &td);
+        run.output().expect("spawn onelf run")
+    };
+
+    let without = launch(true);
+    assert!(
+        !without.status.success(),
+        "without the resolver the driver must fail to bind: {}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+
+    let with = launch(false);
+    let stdout = String::from_utf8_lossy(&with.stdout);
+    assert!(
+        with.status.success() && stdout.contains("probe=2"),
+        "with the resolver the host driver binds against the host copy:\n{stdout}{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    let lp = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("LD_LIBRARY_PATH="))
+        .expect("the app reports its library path");
+    for dir in lp.split(':').filter(|d| !d.is_empty()) {
+        assert!(
+            Path::new(dir).starts_with(&td),
+            "a host directory reached the library path: {dir}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}

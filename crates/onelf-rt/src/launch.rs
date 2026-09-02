@@ -11,9 +11,9 @@ use std::process::Command;
 
 use onelf_format::HostLibsPolicy;
 use onelf_format::drivers;
+use onelf_format::resolve::{self, Request, Resolution};
 
 use crate::loader::PackageData;
-use crate::resolve::{self, Request, Resolution};
 
 /// Everything a launch needs beyond the package itself.
 pub struct Launch<'a> {

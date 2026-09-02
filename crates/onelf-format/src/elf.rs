@@ -57,6 +57,43 @@ pub fn pt_interp_slot(data: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+/// The `PT_INTERP` string of the ELF file at `path`, or `None` for a file
+/// that is not an ELF object or names no interpreter.
+///
+/// The first 8 KB cover the header and program-header table; the string
+/// itself is read at its own offset, which `patchelf` can move far into
+/// the file. Its length is bounded like a path, so a corrupt entry cannot
+/// drive a large allocation.
+pub fn read_interp(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_INTERP: usize = 4096;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut head = vec![0u8; 8192];
+    let n = file.read(&mut head).ok()?;
+    head.truncate(n);
+    let (offset, size) = pt_interp_slot(&head)?;
+    if size == 0 || size > MAX_INTERP {
+        return None;
+    }
+    let end = offset.checked_add(size)?;
+    if end as u64 > file_len {
+        return None;
+    }
+    let bytes = match head.get(offset..end) {
+        Some(s) => s.to_vec(),
+        None => {
+            file.seek(SeekFrom::Start(offset as u64)).ok()?;
+            let mut buf = vec![0u8; size];
+            file.read_exact(&mut buf).ok()?;
+            buf
+        }
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).ok().map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
