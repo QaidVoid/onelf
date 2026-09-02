@@ -120,6 +120,7 @@ pub fn run(
                 store: &store,
                 ld_cache: &drivers::cache_file(),
                 icd_dirs: resolve::ICD_DIRS,
+                extra_root: None,
             })
         }
         _ => Resolution::default(),

@@ -56,6 +56,46 @@ pub struct Request<'a> {
     /// Directories of Vulkan ICD and EGL vendor files describing the
     /// host's drivers. [`ICD_DIRS`] outside of tests.
     pub icd_dirs: &'a [&'a str],
+    /// A fetched GL build's extracted root, indexed ahead of the host:
+    /// its [`GL_BUILD_LIB_DIRS`] and [`GL_BUILD_ICD_DIRS`] supply what
+    /// the host could not.
+    pub extra_root: Option<&'a Path>,
+}
+
+/// Library directories of a GL build, relative to its root.
+pub const GL_BUILD_LIB_DIRS: &[&str] = &["lib", "lib64"];
+
+/// Driver description directories of a GL build, relative to its root.
+pub const GL_BUILD_ICD_DIRS: &[&str] = &["share/vulkan/icd.d", "share/glvnd/egl_vendor.d"];
+
+/// Where a launch gets its GL stack from, if anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gl {
+    Bundled,
+    Host,
+    Absent,
+}
+
+/// The entry points of a GL or Vulkan stack. One of them present, on
+/// either side, is a stack the application can load.
+const GL_ENTRY: &[&str] = &["libGL.so", "libEGL.so", "libGLESv2.so", "libvulkan.so"];
+
+fn has_gl_entry(libs: &BTreeMap<String, PathBuf>) -> bool {
+    libs.keys()
+        .any(|name| GL_ENTRY.iter().any(|p| name.starts_with(p)))
+}
+
+/// Whether the bundle or the host carries a GL stack. Decided before a
+/// pinned build is fetched, so the host is indexed without one.
+pub fn gl_situation(pkg_root: &Path, lib_dirs: &[&str], ld_cache: &Path, icd_dirs: &[&str]) -> Gl {
+    if has_gl_entry(&bundled_libs(pkg_root, lib_dirs)) {
+        return Gl::Bundled;
+    }
+    if has_gl_entry(&HostIndex::load(ld_cache, icd_dirs, None).libs) {
+        Gl::Host
+    } else {
+        Gl::Absent
+    }
 }
 
 const LIBC: &str = "libc.so.6";
@@ -106,11 +146,11 @@ pub fn resolve(req: &Request) -> Resolution {
     if req.policy == HostLibsPolicy::Never {
         return Resolution::default();
     }
-    let host = HostIndex::load(req.ld_cache, req.icd_dirs);
+    let host = HostIndex::load(req.ld_cache, req.icd_dirs, req.extra_root);
     if host.libs.is_empty() {
         return Resolution::default();
     }
-    let fingerprint = fingerprint(req.ld_cache, req.icd_dirs, req.policy);
+    let fingerprint = fingerprint(req.ld_cache, req.icd_dirs, req.policy, req.extra_root);
     if let Some(recorded) = load_recorded(req.store, &fingerprint) {
         return recorded;
     }
@@ -212,12 +252,24 @@ struct HostIndex {
 }
 
 impl HostIndex {
-    fn load(ld_cache: &Path, icd_dirs: &[&str]) -> Self {
+    /// The extra root goes in first, so a soname it carries shadows the
+    /// host's copy and its drivers seed the closure walk.
+    fn load(ld_cache: &Path, icd_dirs: &[&str], extra_root: Option<&Path>) -> Self {
         let mut libs = BTreeMap::new();
+        let mut icd_libs = Vec::new();
+        if let Some(root) = extra_root {
+            libs.extend(bundled_libs(root, GL_BUILD_LIB_DIRS));
+            let dirs: Vec<String> = GL_BUILD_ICD_DIRS
+                .iter()
+                .map(|d| root.join(d).to_string_lossy().into_owned())
+                .collect();
+            let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+            icd_libs.extend(icd_library_paths(&dirs));
+        }
         for (soname, path) in drivers::cache_paths_in(ld_cache) {
             libs.entry(soname).or_insert_with(|| PathBuf::from(path));
         }
-        let icd_libs = icd_library_paths(icd_dirs);
+        icd_libs.extend(icd_library_paths(icd_dirs));
         for path in &icd_libs {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 libs.entry(name.to_string()).or_insert_with(|| path.clone());
@@ -350,7 +402,12 @@ fn bundled_libs(pkg_root: &Path, lib_dirs: &[&str]) -> BTreeMap<String, PathBuf>
 /// files, each with its size and modification time. Compared whole, so
 /// no hash is needed and nothing has to be added to the format crate's
 /// dependencies.
-fn fingerprint(ld_cache: &Path, icd_dirs: &[&str], policy: HostLibsPolicy) -> String {
+fn fingerprint(
+    ld_cache: &Path,
+    icd_dirs: &[&str],
+    policy: HostLibsPolicy,
+    extra_root: Option<&Path>,
+) -> String {
     let mut out = format!("onelf-resolve-1 {}", policy.as_str());
     let mut stamp = |path: &Path| {
         out.push('\x1f');
@@ -374,6 +431,11 @@ fn fingerprint(ld_cache: &Path, icd_dirs: &[&str], policy: HostLibsPolicy) -> St
     }
     for dir in icd_dirs {
         stamp(Path::new(dir));
+    }
+    if let Some(root) = extra_root {
+        for dir in GL_BUILD_LIB_DIRS.iter().chain(GL_BUILD_ICD_DIRS) {
+            stamp(&root.join(dir));
+        }
     }
     out
 }
@@ -517,6 +579,10 @@ mod tests {
         }
 
         fn resolve(&self, policy: HostLibsPolicy) -> Resolution {
+            self.resolve_with(policy, None)
+        }
+
+        fn resolve_with(&self, policy: HostLibsPolicy, extra_root: Option<&Path>) -> Resolution {
             resolve(&Request {
                 pkg_root: &self.pkg,
                 lib_dirs: &["lib"],
@@ -524,7 +590,12 @@ mod tests {
                 store: &self.store,
                 ld_cache: &self.cache,
                 icd_dirs: &[],
+                extra_root,
             })
+        }
+
+        fn gl(&self) -> Gl {
+            gl_situation(&self.pkg, &["lib"], &self.cache, &[])
         }
 
         fn farm_link(&self, name: &str) -> Option<PathBuf> {
@@ -671,7 +742,7 @@ mod tests {
         w.host("libdrm.so.2", &driver_needing(&["libz.so.1"]));
         w.host("libz.so.1", &versioned(&[]));
         w.host("libunrelated.so.1", &versioned(&[]));
-        let closure = HostIndex::load(&w.cache, &[]).driver_closure();
+        let closure = HostIndex::load(&w.cache, &[], None).driver_closure();
         for name in ["libvulkan.so.1", "libdrm.so.2", "libz.so.1", "libgone.so.0"] {
             assert!(closure.contains(name), "{name} missing from {closure:?}");
         }
@@ -790,5 +861,60 @@ mod tests {
     fn bump_mtime(dir: &Path) {
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         fs::File::open(dir).unwrap().set_modified(later).unwrap();
+    }
+
+    #[test]
+    fn the_gl_situation_is_bundled_host_or_absent() {
+        let w = World::new();
+        w.host("libz.so.1", &shared_object(&[(1, "Z_1")], &[]));
+        assert_eq!(w.gl(), Gl::Absent, "no GL entry point anywhere");
+        w.host("libEGL.so.1", &shared_object(&[(1, "EGL_1")], &[]));
+        assert_eq!(w.gl(), Gl::Host);
+        w.bundle("libGL.so.1", &shared_object(&[(1, "GL_1")], &[]));
+        assert_eq!(w.gl(), Gl::Bundled, "the bundle's own stack comes first");
+    }
+
+    #[test]
+    fn an_extra_root_supplies_what_the_host_lacks() {
+        let w = World::new();
+        w.host("libz.so.1", &shared_object(&[(1, "Z_1")], &[]));
+        w.bundle("libc.so.6", &shared_object(&[(2, "GLIBC_2.30")], &[]));
+        let root = temp_dir("glbuild");
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::create_dir_all(root.join("share/vulkan/icd.d")).unwrap();
+        let gl = root.join("lib/libGL.so.1");
+        fs::write(&gl, shared_object(&[(1, "GL_1")], &["libdrm.so.2"])).unwrap();
+        let drm = root.join("lib/libdrm.so.2");
+        fs::write(&drm, shared_object(&[(1, "DRM_1")], &[])).unwrap();
+        let icd = root.join("lib/libvulkan_fake.so");
+        fs::write(&icd, shared_object(&[(1, "ICD_1")], &[])).unwrap();
+        fs::write(
+            root.join("share/vulkan/icd.d/fake.json"),
+            format!("{{\"ICD\": {{\"library_path\": \"{}\"}}}}", icd.display()),
+        )
+        .unwrap();
+
+        let without = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(without.farm, None, "nothing to take from a host without GL");
+
+        let with = w.resolve_with(HostLibsPolicy::Auto, Some(&root));
+        assert_eq!(w.farm_link("libGL.so.1"), Some(gl));
+        assert_eq!(
+            w.farm_link("libdrm.so.2"),
+            Some(drm),
+            "the build's closure follows"
+        );
+        assert_eq!(
+            w.farm_link("libvulkan_fake.so"),
+            Some(icd),
+            "ICD files seed the walk"
+        );
+        assert!(with.farm.is_some());
+        assert_eq!(
+            with.host_interp, None,
+            "the extra root never supplies a loader"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

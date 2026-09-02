@@ -122,6 +122,12 @@ pub fn meta_path(root: &Path, package_id: &str) -> PathBuf {
 /// link count does not yet reflect the reference that is about to exist.
 /// Collection holds it *exclusive*, which proves no extraction is inside that
 /// window and therefore that link counts can be trusted.
+/// The GL build store: one directory per label holding the pinned
+/// build's file. Its extraction lives under `pkg/` like any package.
+pub fn platform_dir(root: &Path) -> PathBuf {
+    root.join("platform")
+}
+
 pub fn cas_lock_path(root: &Path) -> PathBuf {
     root.join("lock").join("cas")
 }
