@@ -4945,6 +4945,56 @@ fn a_sysroot_build_records_its_provenance() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `pack-gl` builds its tree from the sysroot: the named packages'
+/// closure, shared objects and driver description directories only,
+/// with glibc left to the package that uses the build.
+#[test]
+fn pack_gl_builds_its_tree_from_the_sysroot() {
+    let td = workdir("packglsysroot");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let tree = td.join("gl-from-sysroot");
+    let build = td.join("gl-from-sysroot.onelf");
+    let out = Command::new(onelf())
+        .args(["sysroot", "pack-gl"])
+        .arg(&tree)
+        .arg("-o")
+        .arg(&build)
+        .arg("--sysroot")
+        .arg(&fixture.rootfs)
+        .args(["--package", "mesa-fake"])
+        .output()
+        .expect("spawn onelf sysroot pack-gl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("2 packages (mesa-fake 1.0-1 and their dependencies)"),
+        "{stderr}"
+    );
+    assert!(tree.join("lib/libGL.so.1").is_file());
+    assert!(
+        !tree.join("lib/libc.so.6").exists(),
+        "glibc's files are left out"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("blake3 = \""));
+
+    let out = Command::new(onelf())
+        .args(["sysroot", "pack-gl"])
+        .arg(td.join("gl-none"))
+        .arg("-o")
+        .arg(td.join("gl-none.onelf"))
+        .arg("--sysroot")
+        .arg(&fixture.rootfs)
+        .args(["--package", "no-such-package"])
+        .output()
+        .expect("spawn onelf sysroot pack-gl");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no package provides no-such-package"));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A bundled object whose need no package in the sysroot provides can
 /// never load, so the build drops it and everything that needed it, and
 /// says so, instead of failing on each in turn.

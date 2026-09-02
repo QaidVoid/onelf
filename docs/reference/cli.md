@@ -112,14 +112,14 @@ Obtain and inspect pinned sysroots. See [Bundling from a Sysroot](../guide/sysro
 ```
 onelf sysroot fetch SOURCE DIR
 onelf sysroot info DIR
-onelf sysroot pack-gl DIR -o FILE
+onelf sysroot pack-gl DIR -o FILE [--sysroot SYSROOT --package NAME...]
 ```
 
 | Command | Description |
 |---------|-------------|
 | `fetch SOURCE DIR` | Materialize a `.tar` or `.tar.zst` rootfs from a local path or an `https://` URL into `DIR` |
 | `info DIR` | Print the package count, file count and glibc version of a materialized sysroot |
-| `pack-gl DIR -o FILE` | Pack a GL build for hosts without one from a tree holding `lib/`, `share/vulkan/icd.d` and friends, after verifying it is self-contained, and print the BLAKE3 hash to pin in `platform.toml` |
+| `pack-gl DIR -o FILE` | Pack a GL build for hosts without one and print the BLAKE3 hash to pin in `platform.toml`. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure: shared objects and driver description directories, glibc left out. Otherwise `DIR` is a tree you built. Either way it is verified to be self-contained |
 
 ## `onelf info`
 

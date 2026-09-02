@@ -6,6 +6,7 @@ use std::path::Path;
 use onelf_sysroot::{Database, archive};
 
 use crate::bundle::elf::audit_unbundled_needs;
+use crate::bundle::remove_dangling_links_beside;
 use crate::pack::{HostLibs, PackOptions};
 
 /// Materialize the rootfs archive at `source`, a local path or an
@@ -93,12 +94,12 @@ pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(String::from))
-        .find(|name| onelf_format::resolve::is_libc_family(name))
+        .find(|name| name.starts_with("libc.so") || name.starts_with("ld-linux"))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "lib/{name}: a GL build takes glibc from the package that uses it; prune the glibc package's files"
+                "lib/{name}: a GL build takes glibc from the package that uses it; leave the glibc package's files out"
             ),
         ));
     }
@@ -113,15 +114,23 @@ pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
         });
     }
     findings.retain(|(_, libs)| !libs.is_empty());
-    if let Some((object, libs)) = findings.first() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "{} needs {}, which the GL build does not carry",
+    // A closure carries bindings for stacks outside it, a Python module
+    // of util-linux say. Nothing loads those from a GL build, so they go,
+    // by name, rather than failing the build.
+    if !findings.is_empty() {
+        eprintln!(
+            "Dropped {} object(s) needing libraries outside the build:",
+            findings.len()
+        );
+        for (object, libs) in &findings {
+            eprintln!(
+                "  {} (needs {})",
                 object.strip_prefix(dir).unwrap_or(object).display(),
                 libs[0]
-            ),
-        ));
+            );
+            std::fs::remove_file(object)?;
+            remove_dangling_links_beside(object);
+        }
     }
 
     crate::pack::pack(

@@ -170,6 +170,75 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     Ok((report, platform))
 }
 
+/// What a GL build takes from a sysroot: the closure of the named
+/// packages, kept to shared objects and the driver description
+/// directories, with glibc's own files left out since the package that
+/// uses the build carries its glibc.
+pub struct GlSelection {
+    /// The packages the closure holds, by name and version.
+    pub packages: Vec<(String, String)>,
+    pub copied: usize,
+}
+
+/// Directories under `usr/share` a driver stack reads.
+const GL_SHARE_DIRS: &[&str] = &[
+    "usr/share/vulkan/",
+    "usr/share/glvnd/",
+    "usr/share/drirc.d/",
+    "usr/share/libdrm/",
+];
+
+/// Materialize a GL build tree at `tree` from the sysroot at `root`:
+/// the closure of `packages`, the first of which anchors it.
+pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<GlSelection> {
+    let Some((first, rest)) = packages.split_first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "name at least one package to build from",
+        ));
+    };
+    let db = Database::read(root)?;
+    for name in packages {
+        if db.satisfier(name).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}: no package provides {name}", root.display()),
+            ));
+        }
+    }
+    let closure = db.closure(first, rest);
+    let glibc: HashSet<&str> = db
+        .package("glibc")
+        .map(|p| p.files.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let wanted = |rel: &str| -> bool {
+        if glibc.contains(rel) {
+            return false;
+        }
+        let is_lib = rel.starts_with("usr/lib/") || rel.starts_with("lib/");
+        let is_object = Path::new(rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".so"));
+        (is_lib && is_object) || GL_SHARE_DIRS.iter().any(|d| rel.starts_with(d))
+    };
+    let mut copied = 0;
+    for rel in db.files_of(&closure) {
+        if wanted(&rel) && copy_entry(root, &rel, tree)? {
+            copied += 1;
+        }
+    }
+    Ok(GlSelection {
+        packages: closure
+            .packages
+            .iter()
+            .filter_map(|n| db.package(n))
+            .map(|p| (p.name.clone(), p.version.clone()))
+            .collect(),
+        copied,
+    })
+}
+
 /// Where the package records the GL build it pins, relative to the
 /// AppDir. Read by the runtime, unlike the provenance record.
 pub const PLATFORM_FILE: &str = ".onelf/platform";

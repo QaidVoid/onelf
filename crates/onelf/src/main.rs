@@ -495,11 +495,18 @@ enum SysrootAction {
     },
     /// Pack a GL build for hosts without one, and print the hash to pin
     PackGl {
-        /// A tree holding lib/, share/vulkan/icd.d and friends
+        /// A tree holding lib/, share/vulkan/icd.d and friends; built
+        /// here from the sysroot when --package is given
         dir: PathBuf,
         /// Output file
         #[arg(short, long)]
         output: PathBuf,
+        /// A materialized sysroot to build the tree from
+        #[arg(long, value_name = "DIR", requires = "package")]
+        sysroot: Option<PathBuf>,
+        /// Packages whose closure the build holds (mesa, vulkan-radeon, ...)
+        #[arg(long, value_name = "NAME", requires = "sysroot")]
+        package: Vec<String>,
     },
 }
 
@@ -833,8 +840,39 @@ fn main() {
         Commands::Sysroot { action } => match action {
             SysrootAction::Fetch { source, dir } => sysroot_cmd::fetch(&source, &dir),
             SysrootAction::Info { dir } => sysroot_cmd::info(&dir),
-            SysrootAction::PackGl { dir, output } => {
-                sysroot_cmd::pack_gl(&dir, &output, RUNTIME_BINARY_SLIM)
+            SysrootAction::PackGl {
+                dir,
+                output,
+                sysroot,
+                package,
+            } => {
+                let built = match &sysroot {
+                    Some(root) => std::fs::create_dir_all(&dir)
+                        .and_then(|()| bundle::sysroot::populate_gl(&dir, root, &package))
+                        .map(Some),
+                    None => Ok(None),
+                };
+                built.and_then(|selection| {
+                    if let Some(selection) = &selection {
+                        let named: Vec<String> = selection
+                            .packages
+                            .iter()
+                            .filter(|(n, _)| package.contains(n))
+                            .map(|(n, v)| format!("{n} {v}"))
+                            .collect();
+                        eprintln!(
+                            "Built from {}: {} files from {} packages ({} and their dependencies)",
+                            sysroot
+                                .as_deref()
+                                .unwrap_or(std::path::Path::new("?"))
+                                .display(),
+                            selection.copied,
+                            selection.packages.len(),
+                            named.join(", ")
+                        );
+                    }
+                    sysroot_cmd::pack_gl(&dir, &output, RUNTIME_BINARY_SLIM)
+                })
             }
         },
     };

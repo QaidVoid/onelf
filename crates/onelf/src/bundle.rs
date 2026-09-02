@@ -1194,7 +1194,7 @@ fn drop_unloadable(
 
 /// The `libfoo.so -> libfoo.so.1 -> libfoo.so.1.2` chains a dropped
 /// library leaves behind point nowhere and are removed with it.
-fn remove_dangling_links_beside(object: &Path) {
+pub(crate) fn remove_dangling_links_beside(object: &Path) {
     let Some(dir) = object.parent() else {
         return;
     };

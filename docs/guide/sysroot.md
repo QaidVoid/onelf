@@ -191,30 +191,27 @@ override can move the download but never change what is downloaded.
 
 A GL build is an onelf package holding a tree with `lib/` (Mesa and its
 drivers under `lib/dri`), `share/vulkan/icd.d` and
-`share/glvnd/egl_vendor.d`. The sysroot itself is the source: bundle
-from it with an empty platform line, so the driver stack stays in, name
-the drivers that nothing depends on, and prune glibc, which the package
-using the build carries:
+`share/glvnd/egl_vendor.d`. The sysroot is the source. Name the
+packages, and `pack-gl` takes their closure, keeps the shared objects
+and the driver description directories, leaves glibc to the package
+that uses the build, and packs the result:
 
 ```bash
-: > empty-line.txt
-onelf bundle-libs ./gl-tree --target bin/glxinfo --sysroot ../sysroot \
-  --platform-line empty-line.txt --policy gl-policy.txt \
-  --sysroot-optional vulkan-radeon --sysroot-optional vulkan-icd-loader \
-  --sysroot-optional libva
-onelf sysroot pack-gl ./gl-tree -o gl.onelf
+onelf sysroot pack-gl ./gl-tree -o gl.onelf --sysroot ../sysroot \
+  --package mesa --package vulkan-radeon --package vulkan-icd-loader \
+  --package libva
+Built from ../sysroot: 812 files from libdrm 2.4.134-1, libglvnd 1.7.0-3, ...
 blake3 = "3f1c...a9e2"
 ```
 
-`gl-policy.txt` prunes `usr/bin/**`, `etc/**`, glibc's files
-(`usr/lib/libc.so*`, `usr/lib/ld-linux*` and the rest of the family)
-and the data directories a driver stack does not read. `pack-gl` refuses
-a tree that still carries glibc, then runs the verifier over it:
-everything it needs apart from glibc and the driver families it exists
-to provide has to be inside. It prints the hash to put in
-`platform.toml`. Include every family the platform line names that your
-applications use; a build without `libva` leaves a video player without
-it on a host that has none.
+Name the drivers nothing depends on, Vulkan ICDs in particular, and
+every family the platform line names that your applications use: a
+build without `libva` leaves a video player without it on a host that
+has none. Without `--sysroot`, `pack-gl` packs a tree you built by
+hand; either way it refuses a tree carrying glibc, then runs the
+verifier over it, so everything it needs apart from glibc and the
+driver families it exists to provide has to be inside. It prints the
+hash to put in `platform.toml`.
 
 The hash is the whole trust story. The package that carries it is
 already the thing you distribute, so whoever can alter the hash can
