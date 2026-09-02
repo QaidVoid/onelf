@@ -121,7 +121,8 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `search-paths` | array | `[]` | Extra lib search paths (highest priority) |
 | `exclude` | array | `[]` | Excluded soname prefixes |
 | `include` | array | `[]` | Force-included sonames |
-| `gl` / `dri` / `vulkan` / `wayland` / `gtk` | bool | auto | Framework bundlers |
+| `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack; off by default, the host's is used |
+| `wayland` / `gtk` | bool | auto | Client-side framework bundlers, enabled on detection |
 | `strip` | bool | `false` | Run `strip` on bundled libs |
 | `strict-libc` | bool | `false` | Refuse wrong-family libc libs |
 | `scan-dlopen` | bool | `false` | Scan for dlopen'd libs in binary strings |

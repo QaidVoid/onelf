@@ -196,12 +196,11 @@ onelf bundle-libs ./myapp --scan-dlopen --dlopen libmyvendor.so.1
 
 ## Framework auto-detection
 
-If the binary has `DT_NEEDED` for `libGL.so.1`, onelf automatically enables
-GL/DRI bundling. Same for Qt/GTK/Vulkan/Wayland. Detection also scans the
-binary's byte content for literal soname strings, so frameworks that are
-only `dlopen`'d at runtime (Blender loading `libwayland-cursor.so` after
-checking `$XDG_SESSION_TYPE`, for example) get picked up too with no
-`DT_NEEDED` entry required.
+`bundle-libs` scans the binaries for the frameworks they use, by
+`DT_NEEDED` and by literal soname strings in their bytes, so a library
+that is only `dlopen`'d at runtime (Blender loading `libwayland-cursor.so`
+after checking `$XDG_SESSION_TYPE`, for example) is found without a
+`DT_NEEDED` entry.
 
 Detection only flags a framework when it finds a properly versioned soname
 such as `libEGL.so.1` or `libwayland-client.so.0`. This keeps Rust binaries
@@ -210,6 +209,22 @@ so a real dlopen soname shows up glued to its neighbours like
 `...eglWaitSynclibEGL.so.1libEGL.so...`. The version suffix is what tells a
 genuine soname apart from prose like `"Library libwayland-client.so could
 not be loaded."`.
+
+What detection does with a hit depends on the framework. Wayland and GTK
+are client-side, so they are bundled. GL, DRI and Vulkan are the driver
+stack, and the driver that works is the host's, so detection there does
+not bundle anything: it sets the package's host-library policy to `auto`
+and the launch resolver takes the stack from the host. The scan reports
+which it found:
+
+```
+  Frameworks: gl, vulkan detected; the host's drivers are used at launch.
+  Pass --gl, --dri or --vulkan to bundle Mesa instead.
+```
+
+Bundle Mesa when the package must run where the host has no GL at all.
+Bundling it for a host that has its own means two copies of the driver
+stack, and the resolver then takes the host's wherever it is newer.
 
 You can still force any of these explicitly:
 
@@ -319,7 +334,9 @@ The granular framework flags:
 | `--wayland` | `libwayland-*`, `libdecor-0`, `libxkbcommon`, Wayland client |
 | `--gtk` | GSettings schemas under `share/glib-2.0/schemas` |
 
-These are normally enabled automatically. Pass them manually to force-on
-when auto-detection misses something. Each has a `--no-*` counterpart
-(`--no-gl`, `--no-dri`, `--no-vulkan`, `--no-wayland`, `--no-gtk`) that
-forces-off, overriding both auto-detection and the matching `--*` flag.
+`--wayland` and `--gtk` are enabled by detection; pass them to force-on
+when detection misses something. `--gl`, `--dri` and `--vulkan` are
+opt-in, since the driver stack comes from the host unless you say
+otherwise. Each has a `--no-*` counterpart (`--no-gl`, `--no-dri`,
+`--no-vulkan`, `--no-wayland`, `--no-gtk`) that forces-off, overriding
+both detection and the matching `--*` flag.

@@ -28,7 +28,9 @@ pub struct SysrootOptions {
     pub platform: String,
     /// Optional dependencies to include, by package name.
     pub optional: Vec<String>,
-    /// Sonames the host provides, one prefix per line.
+    /// Sonames the host provides, one prefix per line. Without a file the
+    /// GPU driver families are the line, so Mesa stays out of the bundle
+    /// unless the publisher writes a line that leaves it in.
     pub platform_line: Option<PathBuf>,
     /// Paths that never ship, one glob per line.
     pub policy: Option<PathBuf>,
@@ -89,7 +91,12 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     let files = db.files_of(&closure);
     let platform = match &opts.platform_line {
         Some(p) => PlatformLine::load(p)?,
-        None => PlatformLine::default(),
+        None => PlatformLine::from_prefixes(
+            onelf_format::drivers::DRIVER_FAMILIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
     };
     let policy = opts.policy.as_deref().map(Policy::load).transpose()?;
     let trace = opts.trace.as_deref().map(Trace::load).transpose()?;

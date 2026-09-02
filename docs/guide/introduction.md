@@ -22,11 +22,13 @@ own. They are listed separately because they behave
 very differently. onelf's helper, `fusermount3`, is only a fallback for
 hosts that deny user namespaces, and its persistent cache is opt-in; the
 classic runtime mounts under `/tmp/.mount_*` and leaves that directory
-behind on a crash. For GPU drivers, onelf and Anylinux both bundle Mesa
-and take the NVIDIA blob from the host. onelf then decides at every
-launch, for each driver library the host also has, whether the host's
-copy or the bundled one is the newer, by the symbol versions each
-defines, and uses that one; the concepts page explains why.
+behind on a crash. For GPU drivers, Anylinux bundles Mesa and takes the
+NVIDIA blob from the host. onelf takes the whole stack from the host by
+default and decides at every launch, for each library the driver needs
+that the bundle also carries, whether the host's copy or the bundled one
+is the newer, by the symbol versions each defines. Bundling Mesa is a
+publisher opt-in for hosts that have no GL at all; the concepts page
+explains why.
 
 |  | onelf | Anylinux | AppImage | Flatpak | Static |
 | --- | --- | --- | --- | --- | --- |
@@ -36,7 +38,7 @@ defines, and uses that one; the concepts page explains why.
 | No helper needed | yes | yes | `fusermount` | `bwrap` | yes |
 | Invisible mount | yes | no, reused | no | n/a | n/a |
 | Nothing on disk | yes | `/tmp` fallback | mount dir on crash | installs | yes |
-| GPU drivers | bundles Mesa, host copy if newer | bundles Mesa | host dirs on path | runtime extension | n/a |
+| GPU drivers | host, per library; bundling opt-in | bundles Mesa | host dirs on path | runtime extension | n/a |
 | Bundle source | scan or package DB | `lib4bin`, `strace` | `linuxdeploy` | build in SDK | compiler |
 | Delta updates | built in | zsync hook | external tool | OSTree | no |
 | Sandbox | no | no | no | `bwrap`, as permitted | no |

@@ -85,7 +85,10 @@ libcuda.so
 
 A library on the line is left out of the bundle and reported as
 host-provided. At run time the resolver takes it from the host; see
-[Bundling](./bundling#libraries-that-come-from-the-host).
+[Bundling](./bundling#libraries-that-come-from-the-host). Without a
+platform line the GPU driver families are the line, so a closure that
+includes Mesa ships without it. To bundle Mesa, write a platform line
+that leaves it out of the list.
 
 **The policy** names what never ships, as globs over paths relative to
 the sysroot root:

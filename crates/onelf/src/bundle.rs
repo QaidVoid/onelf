@@ -383,18 +383,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .or_else(|| target_elfs.iter().find_map(|f| read_elf_machine(f)));
 
     let detected = detect_frameworks(&target_elfs);
-    let want_gl = frameworks && (opts.gl || detected.gl) && !opts.no_gl;
-    let want_dri = frameworks && (opts.dri || detected.dri) && !opts.no_dri;
-    let want_vulkan = frameworks && (opts.vulkan || detected.vulkan) && !opts.no_vulkan;
+    // The GPU stack is never bundled on detection alone: the driver that
+    // works is the host's, and the launch resolver takes it from there.
+    // Bundling Mesa is the publisher's explicit choice, for packages that
+    // must run where the host has no GL at all. The client-side frameworks
+    // (Wayland, GTK data) are bundled on detection as before.
+    let want_gl = frameworks && opts.gl && !opts.no_gl;
+    let want_dri = frameworks && opts.dri && !opts.no_dri;
+    let want_vulkan = frameworks && opts.vulkan && !opts.no_vulkan;
     let want_wayland = frameworks && (opts.wayland || detected.wayland) && !opts.no_wayland;
     let want_gtk = frameworks && (opts.gtk || detected.gtk) && !opts.no_gtk;
 
     // Report frameworks detection turned on that the user did not request,
     // and frameworks the user explicitly suppressed, so the outcome is visible.
     let auto: Vec<&str> = [
-        (detected.gl && !opts.gl && want_gl, "gl"),
-        (detected.dri && !opts.dri && want_dri, "dri"),
-        (detected.vulkan && !opts.vulkan && want_vulkan, "vulkan"),
         (detected.wayland && !opts.wayland && want_wayland, "wayland"),
         (detected.gtk && !opts.gtk && want_gtk, "gtk"),
     ]
@@ -406,6 +408,22 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             "  {} auto-enabled: {}",
             color::bold("Frameworks:"),
             auto.join(", ")
+        );
+    }
+    let driver_stack: Vec<&str> = [
+        (detected.gl && !want_gl, "gl"),
+        (detected.dri && !want_dri, "dri"),
+        (detected.vulkan && !want_vulkan, "vulkan"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if frameworks && !driver_stack.is_empty() {
+        eprintln!(
+            "  {} {} detected; the host's drivers are used at launch. \
+             Pass --gl, --dri or --vulkan to bundle Mesa instead.",
+            color::bold("Frameworks:"),
+            driver_stack.join(", ")
         );
     }
     let suppressed: Vec<&str> = [
