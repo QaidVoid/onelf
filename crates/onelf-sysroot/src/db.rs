@@ -208,7 +208,29 @@ pub(crate) mod fixture {
         std::fs::write(dir.join("files"), files).unwrap();
     }
 
-    pub(crate) fn temp_root(tag: &str) -> std::path::PathBuf {
+    /// A fresh directory under the system temp dir, removed on drop.
+    pub(crate) struct TempRoot(std::path::PathBuf);
+
+    impl std::ops::Deref for TempRoot {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempRoot {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn temp_root(tag: &str) -> TempRoot {
         let dir = std::env::temp_dir().join(format!(
             "onelf-sysroot-{tag}-{}-{}",
             std::process::id(),
@@ -218,7 +240,7 @@ pub(crate) mod fixture {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempRoot(dir)
     }
 
     pub(crate) fn pkg(name: &str, files: &[&str]) -> Package {
