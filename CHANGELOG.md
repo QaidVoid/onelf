@@ -1,4 +1,27 @@
 
+## [0.3.4](https://github.com/QaidVoid/onelf/compare/0.3.3...0.3.4) - 2026-09-02
+
+### ⛰️  Features
+
+- *(bundle)* Take the GPU stack from the host unless asked to bundle it - ([5acb29d](https://github.com/QaidVoid/onelf/commit/5acb29dd983c913001d5a12c98345f62797b8c8b))
+- *(bundle)* Record a sysroot build's provenance - ([275b4a2](https://github.com/QaidVoid/onelf/commit/275b4a2c0b1c793e147285ff24a9637638546b90))
+- *(bundle)* Take the closure from a pinned sysroot - ([d04162b](https://github.com/QaidVoid/onelf/commit/d04162bad476677625cdccfa5aaeb54c95171939))
+- *(format)* Encode host-libs policy and cache request in flags - ([58e9347](https://github.com/QaidVoid/onelf/commit/58e934764020bd261d21844bbe81fe7fd51a8727))
+- *(onelf)* Carry the GL build pin into packages - ([275697b](https://github.com/QaidVoid/onelf/commit/275697b5a88fda4fbefb168517ba8758772eebf9))
+- *(pack)* Make the payload block size configurable - ([581728d](https://github.com/QaidVoid/onelf/commit/581728df2fa903feb0cddd361967ff4e7494b0d1))
+- *(resolver)* Report the GL situation and index a fetched build - ([f177ff2](https://github.com/QaidVoid/onelf/commit/f177ff2b6a2a165fd30ba6c6c9a21652253d8aec))
+- *(rt)* Fetch the pinned GL build when the host has none - ([25abda3](https://github.com/QaidVoid/onelf/commit/25abda398c10692c9a7d75e9bfa1dbe98abb11f7))
+- *(rt)* Add the runtime-directory mode and make the cache opt-in - ([af70e21](https://github.com/QaidVoid/onelf/commit/af70e2163b8207f5f5c2a0fb23e1a6e3b3c19993))
+- *(rt)* Reclaim dead helper mounts on the next launch - ([1817e36](https://github.com/QaidVoid/onelf/commit/1817e368b2398b6597c5e234dde12d89fd0ec8c2))
+- *(rt)* Run under the host loader when its glibc is newer - ([1adf25c](https://github.com/QaidVoid/onelf/commit/1adf25cd5ffc276f3783c6219cdc3e900ae7ac61))
+- *(rt)* Choose host libraries per soname at launch - ([29856c6](https://github.com/QaidVoid/onelf/commit/29856c6c827f5598d5da8199b1d4cdc48dee1196))
+- *(run)* Resolve host libraries like the packed runtime - ([f2a9573](https://github.com/QaidVoid/onelf/commit/f2a95735792375fccd8aa3791344dbd07d52210c))
+- *(sysroot)* Read pacman databases, closures, archives and prune - ([0906bd8](https://github.com/QaidVoid/onelf/commit/0906bd8ff478d2cc1d00de2dc1179fa04a28ff1b))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Fold a rootfs's compatibility links when flattening - ([c2af02a](https://github.com/QaidVoid/onelf/commit/c2af02af0a14f346ab81730221bdbdd0b665ec3c))
+
 ## [0.3.3](https://github.com/QaidVoid/onelf/compare/0.3.2...0.3.3) - 2026-08-23
 
 ### ⛰️  Features

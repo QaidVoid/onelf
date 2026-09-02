@@ -1,4 +1,16 @@
 
+## [0.3.4](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.3...onelf-rt-v0.3.4) - 2026-09-02
+
+### ⛰️  Features
+
+- *(pack)* Make the payload block size configurable - ([581728d](https://github.com/QaidVoid/onelf/commit/581728df2fa903feb0cddd361967ff4e7494b0d1))
+- *(rt)* Fetch the pinned GL build when the host has none - ([25abda3](https://github.com/QaidVoid/onelf/commit/25abda398c10692c9a7d75e9bfa1dbe98abb11f7))
+- *(rt)* Add the runtime-directory mode and make the cache opt-in - ([af70e21](https://github.com/QaidVoid/onelf/commit/af70e2163b8207f5f5c2a0fb23e1a6e3b3c19993))
+- *(rt)* Reclaim dead helper mounts on the next launch - ([1817e36](https://github.com/QaidVoid/onelf/commit/1817e368b2398b6597c5e234dde12d89fd0ec8c2))
+- *(rt)* Run under the host loader when its glibc is newer - ([1adf25c](https://github.com/QaidVoid/onelf/commit/1adf25cd5ffc276f3783c6219cdc3e900ae7ac61))
+- *(rt)* Choose host libraries per soname at launch - ([29856c6](https://github.com/QaidVoid/onelf/commit/29856c6c827f5598d5da8199b1d4cdc48dee1196))
+- *(run)* Resolve host libraries like the packed runtime - ([f2a9573](https://github.com/QaidVoid/onelf/commit/f2a95735792375fccd8aa3791344dbd07d52210c))
+
 ## [0.3.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.2...onelf-rt-v0.3.3) - 2026-08-23
 
 ### ⛰️  Features
