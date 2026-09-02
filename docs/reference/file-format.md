@@ -35,7 +35,7 @@ manifest, payload, and dictionary begin.
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
 | 8 | 2 | format_version | `1` |
-| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`; other bits reserved |
+| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 reserved (never set), bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
 | 28 | 8 | manifest_original | Uncompressed manifest size |

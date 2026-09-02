@@ -49,7 +49,8 @@ bitflags! {
     pub struct Flags: u16 {
         const HAS_DICT       = 1 << 0;
         const MEMFD_HINT     = 1 << 1;
-        const SHARUN_COMPAT  = 1 << 2;
+        // Bit 2 was reserved for a sharun compatibility mode that never
+        // shipped. It stays unused so an old package's flags read the same.
         /// Payload blocks are stored raw (no zstd). `compressed_size`
         /// equals `original_size` for every block; the runtime reads
         /// payload bytes directly without decompression.
