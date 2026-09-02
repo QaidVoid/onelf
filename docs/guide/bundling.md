@@ -33,44 +33,90 @@ With no flags, this:
 
 ## Libraries that come from the host
 
-A library the bundle does not provide is not a hard error at runtime. The
-runtime appends the host's library directories to the search path so GPU
-drivers stay reachable, and those directories hold the whole system's
-libraries, not just drivers. So a missing soname is quietly satisfied by
-the host's copy and loaded into a process that is already holding the
-bundled libc. Two different glibcs then share one process, which is what
-actually crashes.
+A library the bundle does not provide is not a hard error at runtime, but
+what the host may supply is decided one library at a time, at launch, by
+the runtime's resolver. No host directory is ever placed on the search
+path.
 
-The bundled loader's own fallbacks are already closed: its compiled-in
-search directories and its `ld.so.cache` path are both blanked at bundle
-time. The search path above is the deliberate exception.
+The problem the resolver exists for is a host GPU driver. Mesa and the
+vendor drivers are `dlopen`'d by name and have to match the user's
+hardware, so they come from the host, and they bring their own
+dependencies with them: the host's libstdc++, libdrm, LLVM and, at the
+bottom, the host's glibc. Whether those can share a process with the
+bundled copies depends on which side is newer, and that differs per
+library. Putting host directories after the bundle's on the search path
+loads the bundled copies first and the driver fails to bind; putting them
+before loads host copies next to a bundled libc built against something
+else. Neither order is right for every library.
 
-That search path is the well-known library directories plus every further
-directory the host's `ld.so.cache` names. onelf reads the cache itself
-rather than letting the loader do it, so the loader stays sealed and the
-decision about what the host may supply stays on onelf's side. Without
-this the list is a guess about where a distribution puts things, and a
-host GPU driver can load while its own dependencies cannot: Gentoo slots
-LLVM under `/usr/lib/llvm/<n>/lib64`, so Mesa's RADV driver resolves, the
-`libLLVM.so.<n>` behind it does not, and Vulkan goes silently missing.
-Cache directories are appended last, so nothing they contain can displace
-a bundled library or the driver closure that has to be searched first.
+So the runtime compares. For each soname present both in the bundle and
+on the host, it reads the versions each copy defines and picks the
+superset. Under symbol versioning a newer build only ever adds versions,
+so the winner can stand in for the loser. Equal sets keep the bundled
+copy. Two copies that each define a version the other lacks cannot be
+ordered; the bundled one is kept and the soname is reported on stderr:
 
-The symptom is "works on my machine", and that is not a joke about
-testing: on the packer's machine the host copy *is* the matching one, so
-the bundle genuinely works there and fails on a machine whose libraries
-are older or newer.
+```
+onelf-rt: resolver: cannot order libfoo.so.1; keeping the bundled copy
+```
 
-So `bundle-libs` reports what it did not bundle:
+The loader and libc are compared first, as a pair, because a libc only
+runs under the loader it shipped with. When the host's glibc is newer
+than the bundled one, the whole glibc family comes from the host and the
+entrypoint runs under the host loader. Every bundled library still loads
+from the bundle, since a newer libc satisfies whatever the older one did.
+
+Host winners are placed over their bundled copies with a bind mount
+inside the private mount namespace, or a symlink in a tree that belongs
+to this launch alone, so every process the app starts sees the same
+choice, including one that clears its environment and re-execs. Host
+libraries the bundle does not carry at all, the driver itself for one,
+are reached through a link farm the runtime puts first on the library
+path. A soname that is neither bundled nor chosen fails by name:
+
+```
+error while loading shared libraries: libm.so.6: cannot open shared object file
+```
+
+rather than loading whatever the host has and crashing later, somewhere
+else, on a machine you do not have.
+
+The decision is recorded under the private runtime directory, keyed by
+the package and a fingerprint of the host's loader cache and driver
+directories, so a second launch on an unchanged host reuses it. Set
+`ONELF_NO_RESOLVER=1` to launch with nothing from the host, which is the
+quickest way to tell whether a failure is the resolver's doing.
+
+### What the resolver may consider
+
+The package records a policy, and `pack` decides its default from the
+bundle's contents:
+
+| Mode | Meaning |
+|------|---------|
+| `auto` (default when the bundle references a driver stack) | The driver stack's host closure: the driver families, what the host's Vulkan and EGL vendor files name, and everything they need |
+| `never` (default otherwise) | Nothing from the host |
+| `always` | Every bundled soname is compared as well |
+
+```bash
+onelf pack app -o app.onelf --command bin/app --host-libs always
+```
+
+or as `host-libs` under `[package]` in a recipe.
+
+Detection is deliberately generous, because a wrong "never" breaks an app
+that works while a wrong "auto" only costs a comparison. It matches
+driver sonames anywhere in the bundle's binaries, not just in
+`DT_NEEDED`, since drivers are reached through `dlopen`. Reach for
+`always` if your app loads a host library under a name it does not
+mention, such as one built at runtime from parts.
+
+`bundle-libs` reports what it did not bundle:
 
 ```
 warning: 1 librar(ies) are not in the bundle:
   - libm.so.6 (needed by myapp)
 ```
-
-Whether that is fatal depends on the host library directories below. A
-package that keeps them resolves these from the host; one that does not
-fails where the library is first used.
 
 Some entries are expected. GL, DRI, Vulkan and NSS libraries are meant to
 come from the host, because they have to match the user's drivers and
@@ -80,43 +126,6 @@ deliberate ones from the accidental ones; nothing fails.
 For the accidental ones, point `--search-path` at a directory holding the
 library and repack. A library reached only through `dlopen` will not
 appear in `DT_NEEDED` at all, so `--scan-dlopen` is what finds those.
-
-### Withholding the host directories
-
-A package that needs nothing from the host is better off without those
-directories entirely, and by default it does not get them. `pack` decides
-from the bundle's contents: if nothing references a GPU driver stack, the
-host's directories are left off the search path.
-
-The effect is that a missing library fails honestly:
-
-```
-error while loading shared libraries: libm.so.6: cannot open shared object file
-```
-
-rather than loading the host's copy next to your bundled libc and
-crashing later, somewhere else, on a machine you do not have.
-
-Override it when the guess is wrong:
-
-```bash
-onelf pack app -o app.onelf --command bin/app --host-libs always
-```
-
-| Mode | Meaning |
-|------|---------|
-| `auto` (default) | Expose them only if the bundle references a driver stack |
-| `always` | Always expose them |
-| `never` | Never expose them |
-
-or as `host-libs` under `[package]` in a recipe.
-
-Detection is deliberately generous, because a wrong "no" breaks an app
-that works while a wrong "yes" only leaves the previous behaviour in
-place. It matches driver sonames anywhere in the bundle's binaries, not
-just in `DT_NEEDED`, since drivers are reached through `dlopen`. Reach for
-`always` if your app loads a host library under a name it does not
-mention, such as one built at runtime from parts.
 
 ## Self-extracting binaries (Bun, etc.)
 

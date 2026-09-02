@@ -20,30 +20,25 @@ The runtime walks the AppDir's `lib` subdirectories and builds a
 search-path string of the form:
 
 ```
-<bundle lib dirs>:<previous LD_LIBRARY_PATH>:<host driver dirs>
+<resolver link farm>:<bundle lib dirs>:<previous LD_LIBRARY_PATH>
 ```
 
 That string is used two ways:
 
 1. Passed to the bundled dynamic linker via `--library-path` when the
    runtime invokes it explicitly.
-2. Set as `LD_LIBRARY_PATH` so AT_EXECFN-bootstrapped binaries find
-   the bundled libs through the kernel-loaded interpreter, and so any
-   nested execs the app does (where the runtime is not in the loop)
+2. Set as `LD_LIBRARY_PATH` for AT_EXECFN-bootstrapped binaries, which
+   reach the bundled libraries through their own run path and only need
+   the farm from the environment, so that nested execs the app does
    still resolve correctly.
 
-Host driver dirs probed (each added only if it exists):
-
-- `/run/opengl-driver/lib` (NixOS)
-- `/run/opengl-driver-32/lib` (NixOS 32-bit)
-- `/usr/lib/x86_64-linux-gnu` (Debian/Ubuntu multiarch)
-- `/usr/lib64` (Fedora/RHEL/openSUSE)
-- `/usr/lib`, `/lib/x86_64-linux-gnu`, `/lib64` (generic fallbacks)
-
-This lets bundled apps find host-provided GPU userspace drivers
-(libcuda, libvulkan, libGL, libva) on every distro without the user
-having to set `LD_LIBRARY_PATH` manually. The bundle's own libs come
-first in the search path, so they always win on name conflicts.
+The link farm holds the host libraries the runtime's resolver chose for
+this launch: the driver stack the bundle does not carry, and any library
+whose host copy is newer than the bundled one. See
+[Bundling](./bundling#libraries-that-come-from-the-host) for how the
+choice is made. No host directory is ever placed on the path, so a
+library the bundle lacks and the resolver did not choose fails by name
+instead of being satisfied from the host.
 
 If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
 

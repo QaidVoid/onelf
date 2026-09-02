@@ -6,8 +6,9 @@ Reference for all environment variables onelf reads or sets.
 
 | Variable | Value |
 |----------|-------|
-| `ONELF_DIR` | Absolute path to the package root (FUSE mount, tmpfs, or cache dir). Empty string in `memfd` mode. |
-| `ONELF_ACTIVE_MODE` | `memfd`, `fuse`, `tmpfs`, `cache`, or `dev` (set by `onelf run`) |
+| `ONELF_DIR` | Absolute path to the package root (FUSE mount, tmpfs, runtime directory, or cache dir). Empty string in `memfd` mode. |
+| `ONELF_ACTIVE_MODE` | `memfd`, `fuse`, `tmpfs`, `rundir`, `cache`, or `dev` (set by `onelf run`) |
+| `ONELF_INTERP` | Set only when the host's glibc is newer than the bundled one: the host loader every bootstrapped binary in the process tree runs under |
 | `ONELF_ARGV0` | Original `argv[0]` before multicall resolution |
 | `ONELF_EXEC` | Absolute path to the packed binary |
 | `ONELF_ENTRYPOINT` | Resolved entrypoint name |
@@ -17,7 +18,7 @@ Reference for all environment variables onelf reads or sets.
 
 | Variable | Set when | Points to |
 |----------|----------|-----------|
-| `LD_LIBRARY_PATH` | `lib/` contains `.so` files | `<pkg>/lib` followed by host driver paths |
+| `LD_LIBRARY_PATH` | `lib/` contains `.so` files | the resolver's link farm of chosen host libraries, then `<pkg>/lib` on explicit linker invocations |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `GBM_BACKENDS_PATH` | `lib/gbm/` exists | `<pkg>/lib/gbm` |
@@ -33,7 +34,9 @@ Reference for all environment variables onelf reads or sets.
 binaries that do not drive an explicit linker invocation. The runtime
 also passes `--library-path` to the bundled linker on direct
 invocations. Both mechanisms cover the bundled lib search; the env
-var gets inherited by child processes the app spawns.
+var gets inherited by child processes the app spawns. No host directory
+appears in either: what the host supplies is chosen per library by the
+resolver and reached through its link farm.
 
 ## Read by the runtime (user-settable)
 
@@ -42,6 +45,9 @@ var gets inherited by child processes the app spawns.
 | `ONELF_MODE` | Force a specific execution mode. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` fallback path even when user namespaces are available. Useful for debugging mount visibility. |
+| `ONELF_CACHE` | `1` allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |
+| `ONELF_NO_RESOLVER` | `1` launches with nothing taken from the host, as if the package were packed with `host-libs = never`. The way to tell whether a failure is the resolver's doing. |
+| `ONELF_LD_CACHE` | Path of the loader cache image the resolver reads instead of `/etc/ld.so.cache`, so a fixture can describe a host of its own. |
 | `XDG_RUNTIME_DIR` | Where to create mountpoint dirs (falls back to `/tmp`) |
 | `XDG_CACHE_HOME` | Where the persistent cache mode stores packages (falls back to `$HOME/.cache`) |
 | `XDG_DATA_HOME` | Where `onelf integrate` installs `.desktop` files and icons (falls back to `$HOME/.local/share`) |

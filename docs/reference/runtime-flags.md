@@ -44,8 +44,9 @@ the corresponding XDG variable at the new directory.
 
 ## Execution mode override
 
-Not a flag, but an environment variable: `ONELF_MODE`. See
-[Execution Modes](../guide/execution-modes).
+Not a flag, but an environment variable: `ONELF_MODE`, with `memfd`,
+`fuse`, `tmpfs`, `rundir` or `cache`. `ONELF_CACHE=1` allows the cache
+without forcing it. See [Execution Modes](../guide/execution-modes).
 
 ## Passing flags through
 

@@ -35,7 +35,7 @@ manifest, payload, and dictionary begin.
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
 | 8 | 2 | format_version | `1` |
-| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`; other bits reserved |
+| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 `SHARUN_COMPAT`, bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
 | 28 | 8 | manifest_original | Uncompressed manifest size |
@@ -185,6 +185,9 @@ whole-entry hash for verification.
 Footer flags are decoded with `from_bits_retain`, so a bit a reader does
 not recognise is kept and ignored rather than treated as corruption. That
 is what lets a flag be added without invalidating existing packages, and
-why the two most recent ones are set only for the new behaviour: a
-package written before they existed reads as "embedded updater, host
-library directories exposed", which is what it was built expecting.
+why each newer one is set only for the new behaviour: a package written
+before they existed reads as "embedded updater, host drivers reachable
+through the resolver, no cache unless asked", which is what it was built
+expecting. The two host-library bits encode three policies: bit 5 set is
+`never`, bit 6 set is `always`, and neither is `auto`. Bit 5 wins when
+both are set.

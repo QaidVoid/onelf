@@ -1,17 +1,30 @@
 # Execution Modes
 
-When you run a packed file, the runtime chooses one of four modes based on
-what the system supports and how the package was configured. You can force
-a specific one with `ONELF_MODE`:
+When you run a packed file, the runtime tries a ladder of modes and uses
+the first one the host supports. Every rung but the last leaves nothing
+behind when the app exits. You can force one with `ONELF_MODE`:
 
 ```bash
 ONELF_MODE=fuse    ./myapp.onelf
 ONELF_MODE=tmpfs   ./myapp.onelf
+ONELF_MODE=rundir  ./myapp.onelf
 ONELF_MODE=memfd   ./myapp.onelf
 ONELF_MODE=cache   ./myapp.onelf
 ```
 
-The default is "try them in order, fall back on failure".
+The default is "try them in order, fall back on failure". A forced mode
+that fails is an error, not a fallback.
+
+## The ladder
+
+```
+memfd                 static single binary
+userns + FUSE         invisible, kernel teardown, lazy
+fusermount3 + FUSE    host-visible, lazy, swept by any next launch
+userns + tmpfs        invisible, eager
+runtime directory     private dir, eager, cleaned on exit
+persistent cache      only on request
+```
 
 ## Mode 1: memfd (fastest, most limited)
 
@@ -47,16 +60,25 @@ is `exec`'d from the mount.
 - Kernel with FUSE support (essentially every modern Linux).
 - Unprivileged user namespaces enabled
   (`/proc/sys/kernel/unprivileged_userns_clone` is `1` or missing).
+  Ubuntu 23.10 and later restrict them through AppArmor for binaries
+  without an installed profile, which a downloaded file never has, so
+  Ubuntu desktops usually land on the next rung.
 
 ## Mode 3: FUSE via fusermount3 (compat fallback)
 
-Some hardened distros (Debian stable defaults, RHEL ≤ 8 without changes)
-disable unprivileged user namespaces. For those, onelf falls back to the
-classic `fusermount3` setuid helper protocol: it socketpair-passes
-`/dev/fuse` back from a `fusermount3` subprocess.
+Where user namespaces are unavailable, onelf falls back to the classic
+`fusermount3` setuid helper protocol: it socketpair-passes `/dev/fuse`
+back from a `fusermount3` subprocess.
 
 The mount lives in the host namespace in this mode, so it's visible to
-other processes. Kernel still cleans up on process exit.
+other processes. It is still lazy, which matters for large packages.
+
+A runtime that is killed outright cannot unmount what it served, and the
+kernel does not do it either. Such a mount answers every request with a
+disconnected transport. Every launch of any package sweeps the private
+runtime directory for those: a mountpoint whose owner lock is free and
+whose filesystem reports the disconnect is lazily unmounted and removed.
+A mount whose owner is alive is never touched.
 
 **Requirements:**
 - `fusermount3` binary on `$PATH`.
@@ -75,21 +97,44 @@ mountpoint, extracts the full package into it, and execs the entrypoint.
 **Requirements:**
 - Unprivileged user namespaces enabled.
 
-## Mode 5: Persistent cache (last resort)
+## Mode 5: Runtime directory (no namespaces, no helper)
 
-If none of the above work, the runtime falls back to extracting under
-`$XDG_CACHE_HOME/onelf/pkg/{id}/`. This is visible on disk and persists
-between runs. A content-addressable store (`cas/`) deduplicates files
-across packages.
+Without namespaces and without `fusermount3` there is nothing left to
+mount with, so the runtime extracts the package into its private per-user
+directory and runs it from there. On a systemd host that directory is
+`$XDG_RUNTIME_DIR`, a RAM-backed tmpfs that is cleared at logout.
 
 **Properties:**
-- First run is slower (full decompression to disk).
-- Subsequent runs are instant (already extracted).
-- Leaves persistent files on disk. Auto-GC removes packages unused for
-  30 days (tunable via `ONELF_GC_MAX_AGE`).
+- Needs nothing from the host beyond a writable private directory.
+- Visible to other processes of the same user, like any file there.
+- The tree is removed when the last process using it exits. A launch
+  killed before it could clean up leaves a tree that the next launch of
+  any package removes.
+- Every block is verified against its recorded hash before the
+  entrypoint runs, as in every other mode.
+- Uses space in the runtime directory equal to the uncompressed package
+  size. A package larger than the free space fails with a message naming
+  the directory and the sizes, and the ladder moves on.
 
-**Requirements:**
-- Writable home directory. That's it.
+## Mode 6: Persistent cache (only on request)
+
+The cache extracts under `$XDG_CACHE_HOME/onelf/pkg/{id}/` and keeps
+the extraction between runs, which makes later launches instant and
+leaves the package's full size on disk. A content-addressable store
+(`cas/`) deduplicates files across packages, and auto-GC removes
+packages unused for 30 days (tunable via `ONELF_GC_MAX_AGE`).
+
+Because it is the one mode that leaves something behind, the runtime
+never falls into it on its own. It runs when one of three things asks
+for it:
+
+- the publisher packed with `--cache`, or `[package] cache = true` in
+  the recipe;
+- the user set `ONELF_CACHE=1` for this launch;
+- the mode was forced with `ONELF_MODE=cache`.
+
+Otherwise a host where every earlier rung fails gets an error saying so,
+with `ONELF_CACHE=1` named as the way to allow the extraction.
 
 ## Comparison
 
@@ -99,12 +144,14 @@ across packages.
 | fuse (namespace) | fast | fast | no | no | `/dev/fuse` + userns |
 | fuse (fusermount3) | fast | fast | yes (mount) | no | `fusermount3` |
 | tmpfs | slow (full extract to RAM) | slow again | no | no | userns |
-| cache | slow (extract to disk) | fast | yes | yes | writable $HOME |
+| rundir | slow (full extract) | slow again | yes (files) | no | writable runtime dir |
+| cache | slow (extract to disk) | fast | yes | yes | writable $HOME, and a request |
 
 ## How the entrypoint is launched
 
-Regardless of which mode is active, the runtime picks an exec strategy
-based on what the binary needs:
+Regardless of which mode is active, the runtime first decides what the
+host supplies (see [Bundling](./bundling#libraries-that-come-from-the-host)),
+then picks an exec strategy based on what the binary needs:
 
 1. **AT_EXECFN bootstrap (preferred).** `bundle-libs` injects a small
    bootstrap into bundled executables. At runtime the kernel execs
@@ -112,7 +159,9 @@ based on what the binary needs:
    bundled interpreter's path relative to the binary's own location,
    and jumps into it. `/proc/self/exe` points at the real binary,
    which is what Python, Electron, and Qt read to find their bundled
-   resources.
+   resources. When the host's glibc is newer than the bundled one, the
+   runtime sets `ONELF_INTERP` to the host loader and the bootstrap
+   jumps into that instead, for this process and every one it execs.
 
 2. **Userland-execve.** For binaries without bootstrap injection that
    are PIE (`ET_DYN`), the runtime can map the bundled loader into
@@ -145,7 +194,7 @@ Set `ONELF_MODE` in the environment:
 ONELF_MODE=fuse ./myapp.onelf
 
 # Useful on old CI where kernel features are limited
-ONELF_MODE=cache ./myapp.onelf
+ONELF_MODE=rundir ./myapp.onelf
 ```
 
 If the forced mode fails, the runtime errors out instead of falling back.

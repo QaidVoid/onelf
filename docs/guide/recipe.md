@@ -67,7 +67,8 @@ runtime behavior, and metadata.
 | `command` | string | required | Path to main binary, relative to AppDir |
 | `output` | path | `{name}.onelf` | Where to write the packed file |
 | `working-dir` | enum | `inherit` | `inherit`, `package`, or `command` |
-| `host-libs` | string | `auto` | `auto`, `always`, `never`: expose the host's library dirs |
+| `host-libs` | string | `auto` | `auto`, `always`, `never`: what the launch resolver may take from the host. See [Bundling](./bundling#libraries-that-come-from-the-host) |
+| `cache` | bool | `false` | Allow the persistent cache as the last execution mode. See [Execution Modes](./execution-modes#mode-6-persistent-cache-only-on-request) |
 | `memfd` | bool | auto | Force memfd-eligible (auto-detected otherwise) |
 | `exclude` | array | `[]` | Glob patterns to exclude from the pack |
 | `version` | string | none | Shown by `onelf info` |
