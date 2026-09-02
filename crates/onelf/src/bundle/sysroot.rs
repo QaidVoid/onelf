@@ -156,7 +156,11 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
     }
     if md.file_type().is_symlink() {
         let target = fs::read_link(&src)?;
-        let target = relink(&dest_rel, &target);
+        let Some(target) = relink(rel, &target) else {
+            // A link that flattening folds onto itself, such as the
+            // `bin -> usr/bin` compatibility links a rootfs carries.
+            return Ok(false);
+        };
         let target_str = target.to_string_lossy();
         if !onelf_format::symlink_target_within_root(&dest_rel, &target_str) {
             return Err(io::Error::new(
@@ -167,8 +171,10 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
                 ),
             ));
         }
-        if fs::symlink_metadata(&dest).is_ok() {
-            fs::remove_file(&dest)?;
+        match fs::symlink_metadata(&dest) {
+            Ok(existing) if existing.is_dir() => return Ok(false),
+            Ok(_) => fs::remove_file(&dest)?,
+            Err(_) => {}
         }
         std::os::unix::fs::symlink(&target, &dest)?;
         return Ok(true);
@@ -184,18 +190,43 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// A symlink target as it must read at the link's new location. Absolute
-/// targets are mapped through the same `usr/` flattening and made relative
-/// to the link's directory; relative ones already are.
-fn relink(link_rel: &Path, target: &Path) -> PathBuf {
-    if !target.is_absolute() {
-        return target.to_path_buf();
+/// A symlink target as it must read at the link's new location, or
+/// `None` when flattening folds the link onto itself.
+///
+/// The target is resolved in sysroot space first, then mapped through the
+/// same `usr/` flattening as the link, then made relative to the link's
+/// directory. A relative target is taken relative to the link's directory
+/// in the sysroot, which is what the loader would do.
+fn relink(link_rel: &str, target: &Path) -> Option<PathBuf> {
+    let link = Path::new(link_rel);
+    let resolved = if target.is_absolute() {
+        normalize(target.strip_prefix("/").unwrap_or(target))
+    } else {
+        normalize(&link.parent().unwrap_or(Path::new("")).join(target))
+    };
+    let mapped = PathBuf::from(appdir_path(&resolved.to_string_lossy()));
+    let dest = PathBuf::from(appdir_path(link_rel));
+    if mapped == dest {
+        return None;
     }
-    let mapped = PathBuf::from(appdir_path(
-        target.to_string_lossy().trim_start_matches('/'),
-    ));
-    let from = link_rel.parent().unwrap_or(Path::new(""));
-    relative_path(from, &mapped)
+    let from = dest.parent().unwrap_or(Path::new(""));
+    Some(relative_path(from, &mapped))
+}
+
+/// `path` with `.` and `..` components folded, without touching the
+/// filesystem. A `..` at the root is dropped rather than escaping.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    out
 }
 
 /// `to` expressed relative to the directory `from`, both relative to the
@@ -274,25 +305,29 @@ mod tests {
 
     #[test]
     fn symlink_targets_are_remapped_relative_to_the_link() {
+        let some = |s: &str| Some(PathBuf::from(s));
         assert_eq!(
-            relink(Path::new("lib/libfoo.so"), Path::new("libfoo.so.1")),
-            PathBuf::from("libfoo.so.1")
+            relink("usr/lib/libfoo.so", Path::new("libfoo.so.1")),
+            some("libfoo.so.1")
         );
         assert_eq!(
-            relink(
-                Path::new("lib/libfoo.so"),
-                Path::new("/usr/lib/libfoo.so.1")
-            ),
-            PathBuf::from("libfoo.so.1")
+            relink("usr/lib/libfoo.so", Path::new("/usr/lib/libfoo.so.1")),
+            some("libfoo.so.1")
         );
         assert_eq!(
-            relink(Path::new("bin/tool"), Path::new("/usr/lib/tool/bin/tool")),
-            PathBuf::from("../lib/tool/bin/tool")
+            relink("usr/bin/tool", Path::new("/usr/lib/tool/bin/tool")),
+            some("../lib/tool/bin/tool")
         );
         assert_eq!(
-            relink(Path::new("lib64"), Path::new("/usr/lib")),
-            PathBuf::from("lib")
+            relink("usr/bin/tool", Path::new("../lib/tool/bin/tool")),
+            some("../lib/tool/bin/tool")
         );
+        assert_eq!(relink("lib64", Path::new("usr/lib")), some("lib"));
+        assert_eq!(relink("usr/lib64", Path::new("lib")), some("lib"));
+        assert_eq!(relink("usr/sbin", Path::new("bin")), some("bin"));
+        // The compatibility links a rootfs carries fold onto themselves.
+        assert_eq!(relink("bin", Path::new("usr/bin")), None);
+        assert_eq!(relink("lib", Path::new("usr/lib")), None);
     }
 
     #[test]
