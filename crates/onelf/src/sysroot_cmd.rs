@@ -88,7 +88,22 @@ pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
         )?;
     }
 
-    let mut findings = audit_unbundled_needs(dir);
+    if let Some(name) = std::fs::read_dir(dir.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .find(|name| onelf_format::resolve::is_libc_family(name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "lib/{name}: a GL build takes glibc from the package that uses it; prune the glibc package's files"
+            ),
+        ));
+    }
+
+    let mut findings = audit_unbundled_needs(dir, Path::new("lib"));
     for (_, libs) in &mut findings {
         libs.retain(|s| {
             !onelf_format::drivers::DRIVER_FAMILIES

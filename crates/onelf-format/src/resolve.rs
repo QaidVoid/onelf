@@ -68,6 +68,20 @@ pub const GL_BUILD_LIB_DIRS: &[&str] = &["lib", "lib64"];
 /// Driver description directories of a GL build, relative to its root.
 pub const GL_BUILD_ICD_DIRS: &[&str] = &["share/vulkan/icd.d", "share/glvnd/egl_vendor.d"];
 
+/// Libraries a GL build carries that nothing names in `DT_NEEDED`: the
+/// glvnd vendor libraries, Mesa's gallium and DRI megadrivers, Vulkan
+/// ICDs and layers are all opened by name at runtime. They seed the
+/// closure walk so they and their dependencies reach the farm, since
+/// the build's directories are never put on the search path themselves.
+const GL_BUILD_SEEDS: &[&str] = &[
+    "libGLX_",
+    "libEGL_",
+    "libgallium",
+    "libdril",
+    "libvulkan_",
+    "libVkLayer_",
+];
+
 /// Where a launch gets its GL stack from, if anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gl {
@@ -246,8 +260,9 @@ fn versions(path: &Path) -> VersionSet {
 /// its ICD files name by path.
 struct HostIndex {
     libs: BTreeMap<String, PathBuf>,
-    /// Drivers reached through ICD files rather than the cache. They seed
-    /// the closure walk alongside the driver families.
+    /// Drivers reached through ICD files rather than the cache, and a GL
+    /// build's dlopen-only libraries. They seed the closure walk alongside
+    /// the driver families.
     icd_libs: Vec<PathBuf>,
 }
 
@@ -259,12 +274,20 @@ impl HostIndex {
         let mut icd_libs = Vec::new();
         if let Some(root) = extra_root {
             libs.extend(bundled_libs(root, GL_BUILD_LIB_DIRS));
+            icd_libs.extend(
+                libs.iter()
+                    .filter(|(name, _)| GL_BUILD_SEEDS.iter().any(|p| name.starts_with(p)))
+                    .map(|(_, path)| path.clone()),
+            );
             let dirs: Vec<String> = GL_BUILD_ICD_DIRS
                 .iter()
                 .map(|d| root.join(d).to_string_lossy().into_owned())
                 .collect();
             let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
-            icd_libs.extend(icd_library_paths(&dirs));
+            // The build's ICD files name their drivers by bare soname, so
+            // they relocate; those resolve against the build's own
+            // directories rather than a cache.
+            icd_libs.extend(icd_library_paths_in(&dirs, Some(&libs)));
         }
         for (soname, path) in drivers::cache_paths_in(ld_cache) {
             libs.entry(soname).or_insert_with(|| PathBuf::from(path));
@@ -329,6 +352,13 @@ impl HostIndex {
 /// that name a file by path. A bare soname there is found through the
 /// cache like any other and needs no entry.
 fn icd_library_paths(icd_dirs: &[&str]) -> Vec<PathBuf> {
+    icd_library_paths_in(icd_dirs, None)
+}
+
+fn icd_library_paths_in(
+    icd_dirs: &[&str],
+    bare_names: Option<&BTreeMap<String, PathBuf>>,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in icd_dirs {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -346,6 +376,9 @@ fn icd_library_paths(icd_dirs: &[&str]) -> Vec<PathBuf> {
                 continue;
             };
             if !value.contains('/') {
+                if let Some(lib) = bare_names.and_then(|names| names.get(value)) {
+                    out.push(lib.clone());
+                }
                 continue;
             }
             let lib = if value.starts_with('/') {
@@ -888,6 +921,8 @@ mod tests {
         fs::write(&drm, shared_object(&[(1, "DRM_1")], &[])).unwrap();
         let icd = root.join("lib/libvulkan_fake.so");
         fs::write(&icd, shared_object(&[(1, "ICD_1")], &[])).unwrap();
+        let vendor = root.join("lib/libEGL_fake.so.0");
+        fs::write(&vendor, shared_object(&[(1, "VENDOR_1")], &["libdrm.so.2"])).unwrap();
         fs::write(
             root.join("share/vulkan/icd.d/fake.json"),
             format!("{{\"ICD\": {{\"library_path\": \"{}\"}}}}", icd.display()),
@@ -908,6 +943,11 @@ mod tests {
             w.farm_link("libvulkan_fake.so"),
             Some(icd),
             "ICD files seed the walk"
+        );
+        assert_eq!(
+            w.farm_link("libEGL_fake.so.0"),
+            Some(vendor),
+            "a vendor library nothing names is farmed by its name"
         );
         assert!(with.farm.is_some());
         assert_eq!(

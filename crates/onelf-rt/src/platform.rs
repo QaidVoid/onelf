@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 /// Where the package records its pin, relative to the package root.
 pub const PIN_FILE: &str = ".onelf/platform";
 const BUILD_FILE: &str = "gl.onelf";
+const HASH_FILE: &str = "blake3";
 
 /// A GL build pinned by hash.
 #[derive(Debug, PartialEq, Eq)]
@@ -83,8 +84,12 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
     };
     let dir = store.join(&pin.label);
     let file = dir.join(BUILD_FILE);
+    // The hash the stored file was verified against. A label whose pin
+    // moved on to a new build is fetched again rather than served stale.
+    let hash_file_path = dir.join(HASH_FILE);
+    let stored = fs::read_to_string(&hash_file_path).unwrap_or_default();
 
-    if !file.is_file() {
+    if !file.is_file() || stored.trim() != pin.blake3 {
         if env_set("ONELF_NO_PLATFORM_FETCH") {
             return Err(format!(
                 "fetching is disabled by ONELF_NO_PLATFORM_FETCH ({} would be fetched from {})",
@@ -98,10 +103,13 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
             let _ = fs::remove_file(&tmp);
             return Err(why);
         }
+        let _ = fs::remove_file(&hash_file_path);
         fs::rename(&tmp, &file).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("{}: {e}", file.display())
         })?;
+        fs::write(&hash_file_path, format!("{}\n", pin.blake3))
+            .map_err(|e| format!("{}: {e}", hash_file_path.display()))?;
     }
     touch(&file);
 

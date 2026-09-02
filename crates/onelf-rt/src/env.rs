@@ -80,6 +80,11 @@ pub fn setup_env(
                 parts.push(farm.to_string_lossy().into_owned());
             }
             parts.push(lib_str);
+            // A fetched GL build's directories are never placed here: the
+            // path reaches every process the app spawns, and a foreign
+            // build's libstdc++ or zlib next to the host's libc would break
+            // a host binary. What the app needs from the build comes
+            // through the farm, by name, one library at a time.
             // Preserve the user's pre-existing LD_LIBRARY_PATH as a middle
             // layer, but don't propagate it to the child env.
             let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -170,22 +175,19 @@ pub fn setup_env(
         }
     }
 
-    // Auto-set DRIRC_CONFIGDIR if package has DRI config files
-    if env::var("DRIRC_CONFIGDIR").is_err() {
-        let drirc_dir = pkg.join("share/drirc.d");
-        if drirc_dir.is_dir() {
-            unsafe {
-                env::set_var("DRIRC_CONFIGDIR", drirc_dir.to_string_lossy().as_ref());
-            }
+    // Mesa's driver configuration and libdrm's device tables: from the
+    // package when it carries them, else from a fetched GL build.
+    let data_roots = [Some(pkg), platform_root].into_iter().flatten();
+    for (var, rel) in [
+        ("DRIRC_CONFIGDIR", "share/drirc.d"),
+        ("LIBDRM_IDS_PATH", "share/libdrm"),
+    ] {
+        if env::var(var).is_ok() {
+            continue;
         }
-    }
-
-    // Auto-set LIBDRM_IDS_PATH if package has libdrm data
-    if env::var("LIBDRM_IDS_PATH").is_err() {
-        let libdrm_dir = pkg.join("share/libdrm");
-        if libdrm_dir.is_dir() {
+        if let Some(dir) = data_roots.clone().map(|r| r.join(rel)).find(|d| d.is_dir()) {
             unsafe {
-                env::set_var("LIBDRM_IDS_PATH", libdrm_dir.to_string_lossy().as_ref());
+                env::set_var(var, dir.to_string_lossy().as_ref());
             }
         }
     }
