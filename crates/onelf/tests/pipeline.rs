@@ -3671,3 +3671,178 @@ fn the_launcher_returns_without_waiting_for_a_daemon() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// Pack a package whose entrypoint is the shell script `body`.
+fn pack_script(td: &Path, tag: &str, body: &str) -> PathBuf {
+    let app = td.join(tag);
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), body);
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join(format!("{tag}.onelf"));
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", tag])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    pkg
+}
+
+/// The mountpoint under `run_dir` that this process's mount namespace
+/// currently lists, if any.
+fn helper_mount_under(run_dir: &Path) -> Option<PathBuf> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let prefix = format!("{}/onelf-", run_dir.display());
+    info.lines().find_map(|line| {
+        let mp = line.split(' ').nth(4)?.replace("\\040", " ");
+        mp.starts_with(&prefix).then(|| PathBuf::from(mp))
+    })
+}
+
+/// Launch `pkg` through the host's FUSE helper and wait for its mount to
+/// appear. `None` when the helper cannot mount here, which is a documented
+/// soft-skip like the other environment probes.
+fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, PathBuf)> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .env("ONELF_FUSE_NO_NAMESPACE", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    isolate(&mut cmd, td);
+    let mut child = cmd.spawn().expect("spawn package");
+    let run_dir = td.join("xdg-run");
+    for _ in 0..200 {
+        if let Some(mp) = helper_mount_under(&run_dir) {
+            return Some((child, mp));
+        }
+        if child.try_wait().unwrap().is_some() {
+            eprintln!("skip: the FUSE helper cannot mount here");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    eprintln!("skip: the FUSE helper mount did not appear");
+    None
+}
+
+/// A mount served through the host's FUSE helper outlives a runtime that
+/// was killed, and the kernel cannot tear it down on its own. The next
+/// launch of any package reclaims it.
+#[test]
+fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
+    if !fuse_available() || !have("fusermount3") {
+        return; // documented soft-skip
+    }
+    let td = workdir("deadmount");
+    let sleeper = pack_script(&td, "sleeper", "#!/bin/sh\nsleep 4\n");
+    let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
+
+    let Some((mut child, mountpoint)) = launch_via_helper(&sleeper, &td) else {
+        return;
+    };
+    // The runtime and the app it launched share the mountpoint lock, so
+    // the whole group has to die for the mount to count as abandoned.
+    kill_group(&child);
+    child.wait().unwrap();
+    assert!(
+        helper_mount_under(&td.join("xdg-run")).is_some(),
+        "the mount outlives its killed runtime"
+    );
+
+    let mut run = Command::new(&other);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OTHER"),
+        "the next package runs: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        helper_mount_under(&td.join("xdg-run")).is_none(),
+        "the dead mount is gone from the namespace"
+    );
+    assert!(
+        std::fs::symlink_metadata(&mountpoint).is_err(),
+        "the dead mount's directory is removed"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A live helper mount belongs to a running instance and is left alone by
+/// another package's launch.
+#[test]
+fn a_live_helper_mount_survives_another_launch() {
+    if !fuse_available() || !have("fusermount3") {
+        return; // documented soft-skip
+    }
+    let td = workdir("livemount");
+    let sleeper = pack_script(&td, "sleeper", "#!/bin/sh\nsleep 4\n");
+    let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
+
+    let Some((mut child, mountpoint)) = launch_via_helper(&sleeper, &td) else {
+        return;
+    };
+
+    let mut run = Command::new(&other);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.status.success());
+
+    assert_eq!(
+        helper_mount_under(&td.join("xdg-run")),
+        Some(mountpoint.clone()),
+        "the live mount is still in the namespace"
+    );
+    assert!(
+        mountpoint.join("bin/run").is_file(),
+        "the live mount still answers"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the instance is still running"
+    );
+
+    // Once the instance is gone its mount is abandoned, and the next launch
+    // reclaims it, which also leaves nothing behind on this machine.
+    kill_group(&child);
+    child.wait().unwrap();
+    let out = run_package(&mut run);
+    assert!(out.status.success());
+    assert!(
+        helper_mount_under(&td.join("xdg-run")).is_none(),
+        "the abandoned mount is reclaimed"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// SIGKILL `child` and every process in its group.
+fn kill_group(child: &std::process::Child) {
+    let st = Command::new("kill")
+        .args(["-9", "--", &format!("-{}", child.id())])
+        .status()
+        .expect("spawn kill");
+    assert!(st.success());
+}

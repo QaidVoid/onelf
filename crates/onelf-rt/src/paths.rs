@@ -191,27 +191,64 @@ fn sweep_in(base: &Path) {
 }
 
 /// Remove `path` when no instance claims the mountpoint directory it holds.
+///
+/// A mount served through the host's FUSE helper lives in the host
+/// namespace, so it outlives an owner that was killed. Its lock is free,
+/// which is the only safe signal to go by: a mount whose daemon is alive
+/// but slow would block a status query, and such a daemon holds the lock.
+/// Once the lock is ours, a disconnected transport proves the daemon is
+/// gone, and the mount is lazily unmounted before the directory goes.
 fn reclaim_mountpoint(base: &Path, dir_name: &str, path: &Path) {
     use rustix::fs::FlockOperation;
 
-    if !path.is_dir() {
-        return;
-    }
-    match std::fs::File::open(mountpoint_lock_path(base, dir_name)) {
+    // The lock is opened before anything stats `path`: on a dead mount a
+    // stat fails, and on a live private one it says nothing useful.
+    let _lock = match std::fs::File::open(mountpoint_lock_path(base, dir_name)) {
         Ok(lock) => {
             if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
                 return;
             }
+            Some(lock)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if !older_than_grace(path) {
+            if !path.is_dir() || !older_than_grace(path) {
                 return;
             }
+            None
         }
         Err(_) => return,
+    };
+    if is_mountpoint(path) {
+        if !is_dead_mount(path) {
+            return;
+        }
+        crate::fuse::mount::fuse_unmount(path);
     }
     // rmdir fails atomically on a non-empty directory.
     let _ = std::fs::remove_dir(path);
+}
+
+/// Whether `path` is a mountpoint in this process's mount namespace,
+/// read from `/proc/self/mountinfo` so nothing has to stat a mount that
+/// may no longer answer.
+pub(crate) fn is_mountpoint(path: &Path) -> bool {
+    let target = path.to_string_lossy();
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    info.lines().any(|line| {
+        line.split(' ')
+            .nth(4)
+            .map(|mp| mp.replace("\\040", " ") == *target)
+            .unwrap_or(false)
+    })
+}
+
+/// Whether the filesystem at `path` reports a disconnected transport, which
+/// is what a FUSE mount answers once its daemon has exited. The kernel
+/// fails the query immediately in that state, so this never blocks.
+fn is_dead_mount(path: &Path) -> bool {
+    matches!(rustix::fs::statfs(path), Err(rustix::io::Errno::NOTCONN))
 }
 
 /// Remove the lock file for `dir_name` once its directory is gone and nobody

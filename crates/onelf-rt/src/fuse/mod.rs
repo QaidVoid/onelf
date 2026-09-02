@@ -116,22 +116,6 @@ fn install_signal_handlers() {
     }
 }
 
-/// Check if a path is currently a mountpoint by reading /proc/self/mountinfo.
-/// This avoids stat/exists calls that can hang on dead FUSE mounts.
-fn is_mountpoint(path: &Path) -> bool {
-    let target = path.to_string_lossy();
-    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
-    };
-    // Field 5 (0-indexed: 4) in mountinfo is the mount point
-    info.lines().any(|line| {
-        line.split(' ')
-            .nth(4)
-            .map(|mp| mp.replace("\\040", " ") == *target)
-            .unwrap_or(false)
-    })
-}
-
 /// Execute directly from an existing FUSE mount (another instance is serving).
 /// This process becomes the child, so no fork or FUSE loop is needed.
 // Threads the launch context straight to the exec call; grouping it
@@ -249,7 +233,7 @@ pub fn execute_fuse(
 
     // If already mounted by another instance, reuse it and exec directly.
     // (Only reachable via the fusermount3 path; namespace mounts are private.)
-    if is_mountpoint(&mountpoint) {
+    if crate::paths::is_mountpoint(&mountpoint) {
         if mountpoint.read_dir().is_ok() {
             return exec_from_mount(
                 pkg,
