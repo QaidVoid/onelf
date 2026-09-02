@@ -148,14 +148,24 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
         )));
     }
 
-    // Receive the /dev/fuse fd via SCM_RIGHTS
+    // Receive the /dev/fuse fd via SCM_RIGHTS. Close-on-exec from the
+    // start: the app this process execs must not inherit it, or the mount
+    // would outlive its server. A killed server cannot abort a connection
+    // some other process still holds open, and that process, once it
+    // touches the mount, waits for a reply that never comes and cannot
+    // even be killed.
     let mut cmsg_buf = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut cmsg_buf);
     let mut iov_buf = [0u8; 1];
     let iov = io::IoSliceMut::new(&mut iov_buf);
 
-    let _msg = recvmsg(&sock_parent, &mut [iov], &mut ancillary, RecvFlags::empty())
-        .map_err(|e| io::Error::other(format!("recvmsg: {e}")))?;
+    let _msg = recvmsg(
+        &sock_parent,
+        &mut [iov],
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    )
+    .map_err(|e| io::Error::other(format!("recvmsg: {e}")))?;
 
     for msg in ancillary.drain() {
         if let RecvAncillaryMessage::ScmRights(mut fds) = msg
