@@ -129,6 +129,8 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         &keep,
     );
 
+    remove_generated(appdir)?;
+    let mut generated: Vec<String> = Vec::new();
     let mut report = SysrootReport {
         packages: closure
             .packages
@@ -145,10 +147,14 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     };
     for rel in &pruned.kept {
         match copy_entry(root, rel, appdir)? {
-            true => report.copied += 1,
-            false => report.absent += 1,
+            Some(dest) => {
+                report.copied += 1;
+                generated.push(dest.to_string_lossy().into_owned());
+            }
+            None => report.absent += 1,
         }
     }
+    record_generated(appdir, generated)?;
     let record = appdir.join(PROVENANCE_FILE);
     if let Some(parent) = record.parent() {
         fs::create_dir_all(parent)?;
@@ -224,7 +230,7 @@ pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<
     };
     let mut copied = 0;
     for rel in db.files_of(&closure) {
-        if wanted(&rel) && copy_entry(root, &rel, tree)? {
+        if wanted(&rel) && copy_entry(root, &rel, tree)?.is_some() {
             copied += 1;
         }
     }
@@ -237,6 +243,62 @@ pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<
             .collect(),
         copied,
     })
+}
+
+/// Where a sysroot build lists what it put into the AppDir, relative to
+/// the AppDir. The next build removes those files first, so a changed
+/// policy or closure takes effect without touching anything the
+/// publisher added by hand. Never packed.
+pub const GENERATED_FILE: &str = ".onelf/generated";
+
+/// Remove what the previous sysroot build generated, and the directories
+/// that emptied as a result.
+pub fn remove_generated(appdir: &Path) -> io::Result<()> {
+    let record = appdir.join(GENERATED_FILE);
+    let text = match fs::read_to_string(&record) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let path = appdir.join(line);
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    // Deepest first, so a directory is tried after its children.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    dirs.dedup();
+    for dir in dirs {
+        let mut dir = dir.as_path();
+        while dir != appdir && fs::remove_dir(dir).is_ok() {
+            let Some(parent) = dir.parent() else { break };
+            dir = parent;
+        }
+    }
+    fs::remove_file(&record)
+}
+
+/// Add `paths`, relative to the AppDir, to the record of generated files.
+pub fn record_generated(appdir: &Path, paths: Vec<String>) -> io::Result<()> {
+    let record = appdir.join(GENERATED_FILE);
+    let mut all: Vec<String> = fs::read_to_string(&record)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    all.extend(paths);
+    all.sort();
+    all.dedup();
+    if let Some(parent) = record.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut text = all.join("\n");
+    text.push('\n');
+    fs::write(&record, text)
 }
 
 /// Where the package records the GL build it pins, relative to the
@@ -337,10 +399,13 @@ fn appdir_path(rel: &str) -> &str {
 
 /// Copy one file or symlink. Returns false when the sysroot lacks it,
 /// which a debloated rootfs does for files its database still lists.
-fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
+/// Copy one sysroot entry into the AppDir, returning its AppDir-relative
+/// path, or `None` for an entry the sysroot lacks or a link that folds
+/// onto itself.
+fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<Option<PathBuf>> {
     let src = root.join(rel);
     let Ok(md) = fs::symlink_metadata(&src) else {
-        return Ok(false);
+        return Ok(None);
     };
     let dest_rel = PathBuf::from(appdir_path(rel));
     let dest = appdir.join(&dest_rel);
@@ -352,7 +417,7 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
         let Some(target) = relink(rel, &target) else {
             // A link that flattening folds onto itself, such as the
             // `bin -> usr/bin` compatibility links a rootfs carries.
-            return Ok(false);
+            return Ok(None);
         };
         let target_str = target.to_string_lossy();
         if !onelf_format::symlink_target_within_root(&dest_rel, &target_str) {
@@ -365,22 +430,22 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<bool> {
             ));
         }
         match fs::symlink_metadata(&dest) {
-            Ok(existing) if existing.is_dir() => return Ok(false),
+            Ok(existing) if existing.is_dir() => return Ok(None),
             Ok(_) => fs::remove_file(&dest)?,
             Err(_) => {}
         }
         std::os::unix::fs::symlink(&target, &dest)?;
-        return Ok(true);
+        return Ok(Some(dest_rel));
     }
     if !md.file_type().is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     if fs::symlink_metadata(&dest).is_ok() {
         fs::remove_file(&dest)?;
     }
     fs::copy(&src, &dest)?;
     super::normalize_mtime(&dest);
-    Ok(true)
+    Ok(Some(dest_rel))
 }
 
 /// A symlink target as it must read at the link's new location, or

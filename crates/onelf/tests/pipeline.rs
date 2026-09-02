@@ -5069,11 +5069,8 @@ fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
     );
 
     // A rebuild starts from the sysroot again: what the previous build
-    // copied into lib/ must not stand in for what the policy now prunes.
-    for stale in ["bin", "lib", "opt", "share", "etc", ".onelf"] {
-        let _ = std::fs::remove_dir_all(dir.join(stale));
-    }
-    std::fs::remove_file(dir.join("app.onelf")).unwrap();
+    // generated is removed first, so nothing stands in for what the
+    // policy now prunes.
     let strict = td.join("strict-policy.txt");
     write(&strict, "usr/share/doc/**\nopt/vendor/lib/**\n");
     write(
@@ -5093,6 +5090,23 @@ fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
         "{stderr}"
     );
     assert!(!dir.join("lib/libvendor.so.1").exists());
+    assert!(
+        !dir.join("opt").exists(),
+        "the previous build's copy under opt/ is gone"
+    );
+
+    // Dropping the package altogether removes its binary too, while a
+    // file the publisher put there stays.
+    write(&dir.join("bin/extra-tool"), "#!/bin/sh\necho mine\n");
+    sysroot_recipe(&dir, &fixture, "");
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("bin/vtool").exists());
+    assert!(dir.join("bin/extra-tool").is_file());
 
     let _ = std::fs::remove_dir_all(&td);
 }

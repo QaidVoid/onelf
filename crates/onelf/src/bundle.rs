@@ -1009,6 +1009,14 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         );
     }
 
+    if opts.sysroot.is_some() && !opts.dry_run {
+        let generated = copied
+            .iter()
+            .map(|(soname, _, _, _)| opts.lib_dir.join(soname).to_string_lossy().into_owned())
+            .collect();
+        sysroot::record_generated(&opts.directory, generated)?;
+    }
+
     if !left_out.is_empty() {
         eprintln!(
             "\n{} ({})",

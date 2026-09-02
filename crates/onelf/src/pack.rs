@@ -436,6 +436,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         if output_abs.as_deref() == Some(dir_abs.join(&rel_path).as_path()) {
             continue;
         }
+        // The packer's own bookkeeping of a sysroot build, not content.
+        if rel_path == Path::new(crate::bundle::sysroot::GENERATED_FILE) {
+            continue;
+        }
 
         // Check exclude patterns against each path component and file extension
         if !opts.exclude.is_empty() {

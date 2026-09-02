@@ -114,8 +114,10 @@ under "Left out by policy" and the verifier names the file that needed
 it, which is the next thing to prune. A distribution's closure carries
 plugins whose own dependencies were never installed, Qt modules and
 Python bindings for optional stacks, and this is how they are cut.
-Start from a clean AppDir when the policy changes: files a previous
-build copied are not removed.
+A build records what it put into the AppDir in `.onelf/generated` and
+removes those files first the next time, so a changed policy or
+closure takes effect on its own while anything you added by hand
+stays.
 **A trace**, when you have one, lists the paths a test run opened, one per
 line. A file survives when it was opened, when any file in its directory
 was opened, or when some bundled object names it in `DT_NEEDED`. The
