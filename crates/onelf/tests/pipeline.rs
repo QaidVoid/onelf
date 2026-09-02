@@ -3740,6 +3740,47 @@ fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, Path
     None
 }
 
+/// The app never holds the mount's `/dev/fuse` descriptor, on either
+/// mount path. An inherited one keeps the connection alive after the
+/// server dies, and the holder then blocks on the mount unkillably.
+#[test]
+fn the_app_does_not_inherit_the_fuse_descriptor() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("fusefd");
+    let pkg = pack_script(
+        &td,
+        "fds",
+        "#!/bin/sh\nfor f in /proc/self/fd/*; do readlink \"$f\"; done\n",
+    );
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "fuse");
+        if helper {
+            cmd.env("ONELF_FUSE_NO_NAMESPACE", "1");
+        }
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        if !out.status.success() {
+            eprintln!("skip: helper={helper} cannot mount here");
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("/dev/") && !stdout.contains("/dev/fuse"),
+            "helper={helper}: the app holds the mount's descriptor:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A mount served through the host's FUSE helper outlives a runtime that
 /// was killed, and the kernel cannot tear it down on its own. The next
 /// launch of any package reclaims it.
@@ -4420,6 +4461,23 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(&rootfs.join("usr/share/doc/libfixture/README"), "docs\n");
     write(&rootfs.join("usr/share/fixture/data.txt"), "data\n");
+    write(&rootfs.join("usr/share/fixture/icons/a.svg"), "<svg/>\n");
+    write(&rootfs.join("usr/share/fixture/icons/b.svg"), "<svg/>\n");
+    write(
+        &rootfs.join("usr/lib/fixture/py/pkg/__init__.py"),
+        "import pkg.sub\n",
+    );
+    write(&rootfs.join("usr/lib/fixture/py/pkg/sub/__init__.py"), "\n");
+    write(
+        &rootfs.join("usr/lib/fixture/py/pkg/sub/lazy.py"),
+        "x = 1\n",
+    );
+    // A plugin whose name collides with the platform line, under a
+    // subdirectory: it goes to the host, its package does not.
+    write(
+        &rootfs.join("usr/lib/fixture/plugins/libGL.so.helper"),
+        "not a library\n",
+    );
 
     // A vendor install under opt/, reached the way a distribution does
     // it: a drop-in under etc/ld.so.conf.d and an RPATH in the tool.
@@ -4497,6 +4555,12 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             "usr/lib/fixture/plugins/d.so",
             "usr/share/doc/libfixture/README",
             "usr/share/fixture/data.txt",
+            "usr/share/fixture/icons/a.svg",
+            "usr/share/fixture/icons/b.svg",
+            "usr/lib/fixture/py/pkg/__init__.py",
+            "usr/lib/fixture/py/pkg/sub/__init__.py",
+            "usr/lib/fixture/py/pkg/sub/lazy.py",
+            "usr/lib/fixture/plugins/libGL.so.helper",
         ],
     );
     write_pacman_entry(
@@ -4645,6 +4709,10 @@ fn a_sysroot_closure_is_bundled_and_pruned() {
         "the platform line keeps the driver out"
     );
     assert!(
+        stderr.contains("Host packages: mesa-fake") && !stderr.contains("libfixture,"),
+        "a package is the host's by its top-level libraries only:\n{stderr}"
+    );
+    assert!(
         stderr.contains("Host-provided:") && stderr.contains("libGL.so.1"),
         "the host-provided library is reported:\n{stderr}"
     );
@@ -4781,11 +4849,20 @@ fn a_trace_prunes_unopened_files_but_keeps_siblings_and_needs() {
     let dir = td.join("app");
     std::fs::create_dir_all(&dir).unwrap();
     let trace = td.join("trace.txt");
-    write(&trace, "/usr/bin/app\n/usr/lib/fixture/plugins/a.so\n");
+    write(
+        &trace,
+        "/usr/bin/app\n/usr/lib/fixture/plugins/a.so\n/usr/lib/fixture/py/pkg/__init__.py\n",
+    );
+    let keep = td.join("keep.txt");
+    write(&keep, "usr/share/fixture/icons/**\n");
     sysroot_recipe(
         &dir,
         &fixture,
-        &format!("trace = \"{}\"\n", trace.display()),
+        &format!(
+            "trace = \"{}\"\nkeep = \"{}\"\n",
+            trace.display(),
+            keep.display()
+        ),
     );
 
     let out = onelf_build(&dir);
@@ -4807,6 +4884,14 @@ fn a_trace_prunes_unopened_files_but_keeps_siblings_and_needs() {
         "a needed soname stays"
     );
     assert!(dir.join("lib/libc.so.6").is_file());
+    assert!(
+        dir.join("lib/fixture/py/pkg/sub/lazy.py").is_file(),
+        "a Python package the run touched is kept whole"
+    );
+    assert!(
+        dir.join("share/fixture/icons/b.svg").is_file(),
+        "a keep glob protects data the run never opened"
+    );
 
     let plain = td.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
@@ -4922,14 +5007,13 @@ fn a_sysroot_build_records_its_provenance() {
     let stdout = String::from_utf8_lossy(&info.stdout);
     assert!(info.status.success());
     assert!(stdout.contains("Platform:     platform-test"), "{stdout}");
-    for line in [
-        "app 1.0-1",
-        "glibc 2.99-1",
-        "libfixture 1.0-1",
-        "mesa-fake 1.0-1",
-    ] {
+    for line in ["app 1.0-1", "glibc 2.99-1", "libfixture 1.0-1"] {
         assert!(stdout.contains(line), "{line} missing:\n{stdout}");
     }
+    assert!(
+        !stdout.contains("mesa-fake 1.0-1"),
+        "a package whose library the host supplies contributes nothing:\n{stdout}"
+    );
     assert!(
         !stdout.contains("extra 1.0-1"),
         "an unnamed optional package is not listed"

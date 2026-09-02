@@ -98,6 +98,15 @@ platform line the GPU driver families are the line, so a closure that
 includes Mesa ships without it. To bundle Mesa, write a platform line
 that leaves it out of the list.
 
+A package whose top-level library is on the line is the host's package,
+and it stays out whole: Mesa's gallium and DRI drivers serve the
+`libGL` the host supplies and nothing in the bundle. So does whatever
+only such packages depended on, LLVM when nothing else needs it. The
+report lists them under "Host packages". A file of theirs that
+something bundled does need is reported as left out, and the verifier
+names the needer, so the choice is yours: put the library on the
+platform line, or leave the package out of the line.
+
 **The policy** names what never ships, as globs over paths relative to
 the sysroot root:
 
@@ -122,8 +131,24 @@ stays.
 line. A file survives when it was opened, when any file in its directory
 was opened, or when some bundled object names it in `DT_NEEDED`. The
 directory rule is what keeps a plugin loaded by name from vanishing
-because the test run did not happen to load it. Without a trace nothing is
-pruned this way.
+because the test run did not happen to load it. A Python package is
+kept whole once the run touched anything in it, since its modules are
+imported lazily. Without a trace nothing is pruned this way.
+
+Some data is loaded lazily too, icons and scripts an application reads
+on demand, and no test run opens all of it. **A keep file** names globs
+the trace may not prune, in the policy's format:
+
+```
+usr/share/blender/**
+```
+
+Capturing a trace is a matter of running the application from the
+package and recording what it opens. `strace -f -y -e trace=%file` on
+a run in cache mode (`ONELF_MODE=cache ONELF_CACHE=1`) lists every
+path under the extracted tree; map `lib/`, `bin/` and `share/` back
+to `usr/` and the result is the trace. Run the paths you care about: a
+render, a file import, a session in the interface.
 
 ## The verifier
 

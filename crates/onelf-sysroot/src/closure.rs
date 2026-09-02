@@ -22,6 +22,17 @@ impl Database {
     /// resolved through `provides`. Naming a package nothing depends on,
     /// a Vulkan driver say, is how it enters at all.
     pub fn closure(&self, root: &str, optional: &[String]) -> Closure {
+        self.closure_excluding(root, optional, &BTreeSet::new())
+    }
+
+    /// As [`Self::closure`], with `excluded` packages treated as absent:
+    /// neither they nor what only they depend on enter.
+    pub fn closure_excluding(
+        &self,
+        root: &str,
+        optional: &[String],
+        excluded: &BTreeSet<String>,
+    ) -> Closure {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut unsatisfied = Vec::new();
         let mut queue: VecDeque<String> = VecDeque::new();
@@ -39,6 +50,9 @@ impl Database {
             let Some(package) = self.package(&name) else {
                 continue;
             };
+            if excluded.contains(&name) && name != root {
+                continue;
+            }
             let wanted = package.depends.iter().chain(
                 package
                     .optdepends
@@ -59,7 +73,10 @@ impl Database {
         unsatisfied.sort();
         unsatisfied.dedup();
         Closure {
-            packages: seen.into_iter().collect(),
+            packages: seen
+                .into_iter()
+                .filter(|n| n == root || !excluded.contains(n))
+                .collect(),
             unsatisfied,
         }
     }

@@ -104,6 +104,7 @@ onelf bundle-libs DIRECTORY [options]
 | `--platform-line FILE` | | Soname prefixes the host provides, one per line |
 | `--policy FILE` | | Glob patterns that never ship, one per line |
 | `--trace FILE` | | Paths a test run opened, one per line |
+| `--keep FILE` | | Glob patterns the trace may not prune, one per line |
 
 ## `onelf sysroot`
 

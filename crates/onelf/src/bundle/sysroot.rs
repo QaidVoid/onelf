@@ -37,6 +37,8 @@ pub struct SysrootOptions {
     pub policy: Option<PathBuf>,
     /// Paths a test run opened, one per line.
     pub trace: Option<PathBuf>,
+    /// Globs the trace may not prune.
+    pub keep: Option<PathBuf>,
     /// The GL build's URL, overriding the sysroot's own pin.
     pub platform_url: Option<String>,
     /// The GL build's BLAKE3 hash, overriding the sysroot's own pin.
@@ -55,6 +57,12 @@ pub struct SysrootReport {
     pub copied: usize,
     /// Files the database lists that the sysroot does not hold.
     pub absent: usize,
+    /// Packages owning a library on the platform line, left to the host
+    /// whole along with whatever only they depended on.
+    pub host_packages: Vec<String>,
+    /// Every file of those packages, relative to the sysroot root, so the
+    /// dependency walk leaves them alone as well.
+    pub host_files: HashSet<String>,
     /// The GL build the package pins, when the sysroot or recipe names one.
     pub pin: Option<Pin>,
 }
@@ -94,8 +102,6 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         )
     })?;
 
-    let closure = db.closure(&owner.name, &opts.optional);
-    let files = db.files_of(&closure);
     let platform = match &opts.platform_line {
         Some(p) => PlatformLine::load(p)?,
         None => PlatformLine::from_prefixes(
@@ -105,19 +111,49 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
                 .collect(),
         ),
     };
+    // A package whose library the host supplies is the host's package: its
+    // other files, Mesa's gallium and DRI drivers say, serve that library
+    // and nothing in the bundle, and so does what only it depended on.
+    let full = db.closure(&owner.name, &opts.optional);
+    let is_top_level_object = |rel: &str| {
+        let Some((dir, name)) = rel.rsplit_once('/') else {
+            return false;
+        };
+        matches!(dir, "usr/lib" | "usr/lib64" | "lib" | "lib64") && name.contains(".so")
+    };
+    let host_packages: std::collections::BTreeSet<String> = full
+        .packages
+        .iter()
+        .filter(|n| *n != &owner.name)
+        .filter_map(|n| db.package(n))
+        .filter(|p| {
+            p.files
+                .iter()
+                .any(|f| is_top_level_object(f) && platform.matches(f))
+        })
+        .map(|p| p.name.clone())
+        .collect();
+    let host_files: HashSet<String> = host_packages
+        .iter()
+        .filter_map(|n| db.package(n))
+        .flat_map(|p| p.files.iter().cloned())
+        .collect();
+    let closure = db.closure_excluding(&owner.name, &opts.optional, &host_packages);
+    let files = db.files_of(&closure);
     let policy = opts.policy.as_deref().map(Policy::load).transpose()?;
     let trace = opts.trace.as_deref().map(Trace::load).transpose()?;
+    let keep = opts.keep.as_deref().map(Policy::load).transpose()?;
 
     // Under a trace, a soname some object in the closure needs survives
     // even when the test run never mapped it.
-    let mut keep: HashSet<String> = HashSet::new();
+    let mut keep_names: HashSet<String> = HashSet::new();
     if trace.is_some() {
         for rel in &files {
             let path = root.join(rel);
             if is_elf(&path)
                 && let Ok(needed) = parse_needed(&path)
             {
-                keep.extend(needed);
+                keep_names.extend(needed);
             }
         }
     }
@@ -126,11 +162,29 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         Some(&platform),
         policy.as_ref(),
         trace.as_ref(),
-        &keep,
+        &keep_names,
+        keep.as_ref(),
     );
 
     remove_generated(appdir)?;
     let mut generated: Vec<String> = Vec::new();
+    // The host packages' own libraries on the line are reported as
+    // host-provided like any other, so the report reads the same whether
+    // a library left alone or with its package.
+    let mut host_provided = pruned.host_provided.clone();
+    let mut removed_platform = pruned.removed_platform;
+    for rel in host_packages
+        .iter()
+        .filter_map(|n| db.package(n))
+        .flat_map(|p| p.files.iter())
+        .filter(|f| platform.matches(f))
+    {
+        removed_platform += 1;
+        host_provided.push(rel.rsplit('/').next().unwrap_or(rel).to_string());
+    }
+    host_provided.sort();
+    host_provided.dedup();
+
     let mut report = SysrootReport {
         packages: closure
             .packages
@@ -139,10 +193,12 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect(),
         unsatisfied: closure.unsatisfied.clone(),
-        host_provided: pruned.host_provided.clone(),
-        removed_platform: pruned.removed_platform,
+        host_provided,
+        removed_platform,
         removed_policy: pruned.removed_policy,
         removed_trace: pruned.removed_trace,
+        host_packages: host_packages.into_iter().collect(),
+        host_files,
         ..Default::default()
     };
     for rel in &pruned.kept {
@@ -545,6 +601,13 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
             String::new()
         }
     );
+    if !report.host_packages.is_empty() {
+        eprintln!(
+            "  {} {}",
+            color::bold("Host packages:"),
+            report.host_packages.join(", ")
+        );
+    }
     if !report.host_provided.is_empty() {
         eprintln!(
             "  {} {}",

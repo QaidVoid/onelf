@@ -204,6 +204,8 @@ pub struct Sysroot {
     pub policy: Option<PathBuf>,
     /// File of paths a test run opened, one per line.
     pub trace: Option<PathBuf>,
+    /// File of glob patterns the trace may not prune.
+    pub keep: Option<PathBuf>,
     /// URL of the GL build for hosts without one, overriding what the
     /// sysroot's `etc/onelf/platform.toml` names.
     pub platform_url: Option<String>,

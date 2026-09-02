@@ -434,6 +434,10 @@ enum Commands {
         /// File of paths a test run opened, one per line
         #[arg(long, value_name = "FILE")]
         trace: Option<PathBuf>,
+
+        /// File of glob patterns the trace may not prune
+        #[arg(long, value_name = "FILE")]
+        keep: Option<PathBuf>,
     },
 }
 
@@ -787,6 +791,7 @@ fn main() {
             platform_line,
             policy,
             trace,
+            keep,
         } => scaffold_from_binary(&directory, from_binary.as_deref()).and_then(|_| {
             let sysroot = match sysroot {
                 Some(root) => {
@@ -804,6 +809,7 @@ fn main() {
                         platform_line,
                         policy,
                         trace,
+                        keep,
                         platform_url: None,
                         platform_hash: None,
                     })
@@ -923,6 +929,7 @@ fn sysroot_from_recipe(
         platform_line: sr.platform_line.as_deref().map(resolve),
         policy: sr.policy.as_deref().map(resolve),
         trace: sr.trace.as_deref().map(resolve),
+        keep: sr.keep.as_deref().map(resolve),
         platform_url: sr.platform_url.clone(),
         platform_hash: sr.platform_hash.clone(),
     })

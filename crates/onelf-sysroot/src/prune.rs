@@ -132,20 +132,54 @@ impl Trace {
     }
 }
 
+/// The topmost directory of the Python package `rel` belongs to: every
+/// directory from it down to the file's own holds an `__init__.py`.
+fn package_root<'a>(rel: &'a str, init_dirs: &HashSet<&str>) -> Option<&'a str> {
+    let (mut dir, _) = rel.rsplit_once('/')?;
+    if !init_dirs.contains(dir) {
+        return None;
+    }
+    while let Some((parent, _)) = dir.rsplit_once('/')
+        && init_dirs.contains(parent)
+    {
+        dir = parent;
+    }
+    Some(dir)
+}
+
 /// Apply the tiers to `files`, relative paths in any order. `keep_names`
 /// are basenames that survive the trace regardless, the sonames some
-/// bundled object needs.
+/// bundled object needs; `keep` are globs the trace may not prune.
+///
+/// A Python package is kept whole once the trace opened anything in it:
+/// its modules are imported lazily, so file granularity there would cut
+/// what the next run needs.
 pub fn prune(
     files: &[String],
     platform: Option<&PlatformLine>,
     policy: Option<&Policy>,
     trace: Option<&Trace>,
     keep_names: &HashSet<String>,
+    keep: Option<&Policy>,
 ) -> Pruned {
     let mut out = Pruned::default();
     let mut sorted: Vec<&String> = files.iter().collect();
     sorted.sort();
     sorted.dedup();
+
+    let init_dirs: HashSet<&str> = sorted
+        .iter()
+        .filter_map(|rel| rel.strip_suffix("/__init__.py"))
+        .collect();
+    let opened_packages: HashSet<&str> = trace
+        .map(|t| {
+            t.opened
+                .iter()
+                .filter_map(|rel| package_root(rel, &init_dirs))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for rel in sorted {
         let name = rel.rsplit('/').next().unwrap_or(rel);
         if platform.is_some_and(|p| p.matches(rel)) {
@@ -160,6 +194,8 @@ pub fn prune(
         if let Some(trace) = trace
             && !trace.keeps(rel)
             && !keep_names.contains(name)
+            && !keep.is_some_and(|k| k.matches(rel))
+            && !package_root(rel, &init_dirs).is_some_and(|root| opened_packages.contains(root))
         {
             out.removed_trace += 1;
             continue;
@@ -198,7 +234,7 @@ mod tests {
         let path = root.join("platform-line.txt");
         std::fs::write(&path, "# host drivers\nlibnvidia\nlibGL.so\n").unwrap();
         let line = PlatformLine::load(&path).unwrap();
-        let out = prune(&files(), Some(&line), None, None, &HashSet::new());
+        let out = prune(&files(), Some(&line), None, None, &HashSet::new(), None);
         assert_eq!(out.removed_platform, 1);
         assert_eq!(out.host_provided, ["libnvidia-glcore.so.550"]);
         assert!(!out.kept.iter().any(|f| f.contains("nvidia")));
@@ -212,7 +248,7 @@ mod tests {
         let path = root.join("policy.txt");
         std::fs::write(&path, "usr/share/doc/**\n/usr/share/man/**\n").unwrap();
         let policy = Policy::load(&path).unwrap();
-        let out = prune(&files(), None, Some(&policy), None, &HashSet::new());
+        let out = prune(&files(), None, Some(&policy), None, &HashSet::new(), None);
         assert_eq!(out.removed_policy, 2);
         assert!(out.kept.iter().any(|f| f.ends_with("app.mo")));
         assert!(!out.kept.iter().any(|f| f.contains("share/doc")));
@@ -232,7 +268,7 @@ mod tests {
     fn the_trace_keeps_opened_files_their_siblings_and_needed_names() {
         let trace = Trace::from_paths(vec!["/usr/bin/app".into(), "/usr/lib/plugins/a.so".into()]);
         let keep: HashSet<String> = ["libfixture.so.1".to_string()].into_iter().collect();
-        let out = prune(&files(), None, None, Some(&trace), &keep);
+        let out = prune(&files(), None, None, Some(&trace), &keep, None);
         assert!(out.kept.contains(&"usr/bin/app".to_string()));
         assert!(
             out.kept.contains(&"usr/lib/plugins/b.so".to_string()),
@@ -251,8 +287,51 @@ mod tests {
 
     #[test]
     fn no_trace_means_no_pruning() {
-        let out = prune(&files(), None, None, None, &HashSet::new());
+        let out = prune(&files(), None, None, None, &HashSet::new(), None);
         assert_eq!(out.kept.len(), files().len());
         assert_eq!(out.removed_trace, 0);
+    }
+
+    #[test]
+    fn a_trace_keeps_python_packages_whole_and_honours_keep_globs() {
+        let files: Vec<String> = [
+            "usr/lib/python3/site-packages/pkg/__init__.py",
+            "usr/lib/python3/site-packages/pkg/sub/__init__.py",
+            "usr/lib/python3/site-packages/pkg/sub/lazy.py",
+            "usr/lib/python3/site-packages/other/__init__.py",
+            "usr/lib/python3/site-packages/other/never.py",
+            "usr/share/app/icons/a.svg",
+            "usr/share/app/icons/b.svg",
+            "usr/share/app/data/unused.dat",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let trace = Trace::from_paths(vec![
+            "/usr/lib/python3/site-packages/pkg/__init__.py".into(),
+        ]);
+        let root = temp_root("keep");
+        std::fs::write(root.join("keep.txt"), "usr/share/app/icons/**\n").unwrap();
+        let keep = Policy::load(&root.join("keep.txt")).unwrap();
+        let pruned = prune(
+            &files,
+            None,
+            None,
+            Some(&trace),
+            &HashSet::new(),
+            Some(&keep),
+        );
+        let kept: Vec<&str> = pruned.kept.iter().map(String::as_str).collect();
+        assert!(
+            kept.contains(&"usr/lib/python3/site-packages/pkg/sub/lazy.py"),
+            "{kept:?}"
+        );
+        assert!(
+            !kept.contains(&"usr/lib/python3/site-packages/other/never.py"),
+            "{kept:?}"
+        );
+        assert!(kept.contains(&"usr/share/app/icons/b.svg"), "{kept:?}");
+        assert!(!kept.contains(&"usr/share/app/data/unused.dat"), "{kept:?}");
+        assert_eq!(pruned.removed_trace, 3);
     }
 }

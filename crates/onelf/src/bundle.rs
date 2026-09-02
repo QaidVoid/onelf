@@ -343,10 +343,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
     }
 
+    let mut host_files: HashSet<String> = HashSet::new();
     let sysroot_platform = match &opts.sysroot {
         Some(sr) => {
             let (report, platform) = sysroot::populate(&opts.directory, sr)?;
             sysroot::print_report(sr, &report);
+            host_files = report.host_files;
             Some(platform)
         }
         None => {
@@ -759,7 +761,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .ok()
             .is_some_and(|rel| policy.matches(&rel.to_string_lossy()))
     };
+    // Likewise a file of a package left to the host whole.
+    let with_host_package = |src: &Path| -> bool {
+        opts.sysroot.as_ref().is_some_and(|sr| {
+            src.strip_prefix(&sr.root)
+                .ok()
+                .is_some_and(|rel| host_files.contains(rel.to_string_lossy().as_ref()))
+        })
+    };
     let mut left_out: Vec<(String, String)> = Vec::new();
+    let mut left_with_host: Vec<(String, String)> = Vec::new();
     let mut already_processed: HashSet<String> = HashSet::new();
     let mut expanded_nix: HashSet<PathBuf> = HashSet::new();
     // BLAKE3(content) -> soname, so aliases with identical bytes symlink instead of copy.
@@ -822,6 +833,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ) {
             Some(src) if pruned_by_policy(&src) => {
                 left_out.push((soname, requirer));
+            }
+            Some(src) if with_host_package(&src) => {
+                left_with_host.push((soname, requirer));
             }
             Some(src) => {
                 let resolved = fs::canonicalize(&src).unwrap_or(src.clone());
@@ -1015,6 +1029,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .map(|(soname, _, _, _)| opts.lib_dir.join(soname).to_string_lossy().into_owned())
             .collect();
         sysroot::record_generated(&opts.directory, generated)?;
+    }
+
+    if !left_with_host.is_empty() {
+        eprintln!(
+            "\n{} ({})",
+            color::bold("Left out with a host package"),
+            left_with_host.len()
+        );
+        for (lib, requirer) in &left_with_host {
+            eprintln!(
+                "  {} {}",
+                lib,
+                color::dim(&format!("(needed by {})", color::cyan(requirer)))
+            );
+        }
     }
 
     if !left_out.is_empty() {

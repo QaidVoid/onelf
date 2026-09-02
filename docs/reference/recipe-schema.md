@@ -148,6 +148,7 @@ optional = ["mesa"]                   # Vec<String>, packages to add to the clos
 platform-line = "../platform.txt"     # Option<PathBuf>, soname prefixes the host provides
 policy = "../policy.txt"              # Option<PathBuf>, glob patterns that never ship
 trace = "../trace.txt"                # Option<PathBuf>, paths a test run opened
+keep = "../keep.txt"                  # Option<PathBuf>, glob patterns the trace may not prune
 platform-url = "https://..."          # Option<String>, GL build for hosts without one; overrides the sysroot's
 platform-hash = "3f1c...a9e2"         # Option<String>, its BLAKE3 hash; overrides the sysroot's
 ```
