@@ -1,0 +1,222 @@
+/*
+ * onelf's own look on top of the VitePress default theme.
+ *
+ * The idea is a single file: dense, monospace-forward, one warm accent on
+ * ink. Light mode is paper rather than white so the same accent reads.
+ */
+
+:root {
+  --vp-font-family-base: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --vp-font-family-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --onelf-font-display: "Space Grotesk", var(--vp-font-family-base);
+
+  /* Accent: worn brass on paper. */
+  --vp-c-brand-1: #a8641b;
+  --vp-c-brand-2: #c0762a;
+  --vp-c-brand-3: #d98a3a;
+  --vp-c-brand-soft: rgba(217, 138, 58, 0.14);
+
+  --vp-c-bg: #faf7f1;
+  --vp-c-bg-alt: #f2ede4;
+  --vp-c-bg-soft: #f2ede4;
+  --vp-c-bg-elv: #ffffff;
+  --vp-c-divider: #e3dccf;
+  --vp-c-text-1: #1c1a17;
+  --vp-c-text-2: #4d4740;
+  --vp-c-text-3: #7a7266;
+
+  --vp-code-block-bg: #1c1a17;
+  --vp-code-block-color: #e8e2d6;
+  --vp-code-color: #8a5216;
+  --vp-code-bg: rgba(217, 138, 58, 0.12);
+
+  --onelf-terminal-bg: #1c1a17;
+  --onelf-terminal-bar: #24211d;
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #a8641b 20%, #d98a3a);
+  --vp-home-hero-image-background-image: none;
+  --vp-home-hero-image-filter: none;
+
+  --vp-button-brand-bg: var(--vp-c-brand-1);
+  --vp-button-brand-hover-bg: var(--vp-c-brand-2);
+  --vp-button-brand-active-bg: var(--vp-c-brand-3);
+  --vp-button-brand-text: #fff8ee;
+  --vp-button-brand-hover-text: #fff8ee;
+  --vp-button-brand-active-text: #fff8ee;
+}
+
+.dark {
+  /* Accent: amber on ink. */
+  --vp-c-brand-1: #f0a848;
+  --vp-c-brand-2: #f7b968;
+  --vp-c-brand-3: #ffcc88;
+  --vp-c-brand-soft: rgba(240, 168, 72, 0.14);
+
+  --vp-c-bg: #0f0e0c;
+  --vp-c-bg-alt: #151310;
+  --vp-c-bg-soft: #181613;
+  --vp-c-bg-elv: #1c1a17;
+  --vp-c-divider: #2a2621;
+  --vp-c-text-1: #ece6da;
+  --vp-c-text-2: #b3ab9d;
+  --vp-c-text-3: #7d7668;
+
+  --vp-code-block-bg: #151310;
+  --vp-code-color: #f0a848;
+  --vp-code-bg: rgba(240, 168, 72, 0.12);
+
+  --onelf-terminal-bg: #131110;
+  --onelf-terminal-bar: #1a1815;
+
+  --vp-home-hero-name-background: linear-gradient(120deg, #f0a848 20%, #ffd69a);
+
+  --vp-button-brand-text: #1a1204;
+  --vp-button-brand-hover-text: #1a1204;
+  --vp-button-brand-active-text: #1a1204;
+}
+
+/* Headings in the display face, tight and a little heavy. */
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3,
+.VPHero .name,
+.VPHero .text,
+.VPFeature .title {
+  font-family: var(--onelf-font-display);
+  letter-spacing: -0.015em;
+}
+.vp-doc h1 {
+  font-weight: 700;
+}
+.vp-doc h2 {
+  border-top: 1px solid var(--vp-c-divider);
+  padding-top: 20px;
+}
+
+/* A hairline under the nav, a faint grid behind the hero. */
+.VPNavBar {
+  border-bottom: 1px solid var(--vp-c-divider);
+}
+.VPHome {
+  background-image:
+    linear-gradient(var(--vp-c-divider) 1px, transparent 1px),
+    linear-gradient(90deg, var(--vp-c-divider) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: center top;
+  background-attachment: local;
+}
+.VPHome .VPHero,
+.VPHome .VPFeatures {
+  position: relative;
+}
+.VPHome::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 0%, transparent 30%, var(--vp-c-bg) 75%);
+}
+.VPHome .VPHero .container,
+.VPHome .VPFeatures .container {
+  position: relative;
+}
+
+.VPHero .tagline {
+  max-width: 520px;
+  font-size: 18px;
+  line-height: 1.6;
+}
+.VPHero .name {
+  font-size: clamp(48px, 7vw, 72px);
+  font-weight: 700;
+}
+.VPHero .text {
+  font-weight: 600;
+}
+
+/* Feature cards: flat, bordered, brand top rule on hover. */
+.VPFeature {
+  border: 1px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-elv);
+  border-radius: 10px;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+.VPFeature:hover {
+  border-color: var(--vp-c-brand-1);
+  transform: translateY(-2px);
+}
+.VPFeature .icon {
+  font-family: var(--vp-font-family-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-soft);
+  border-radius: 6px;
+  width: auto;
+  padding: 0 10px;
+  letter-spacing: 0.06em;
+}
+.VPFeature .details {
+  line-height: 1.6;
+}
+
+/* Code: a quieter frame, and no ligatures so ASCII diagrams keep their
+   columns. */
+.vp-doc div[class*="language-"] {
+  border: 1px solid var(--vp-c-divider);
+}
+.vp-doc code,
+.vp-doc pre,
+.hero-terminal {
+  font-variant-ligatures: none;
+}
+.vp-doc [class*="language-"] code .highlighted {
+  background: var(--vp-c-brand-soft);
+}
+
+/* Tables read better with a ruled head, zebra-free rows, and a first
+   column that does not wrap. */
+.vp-doc table {
+  font-size: 13px;
+}
+.vp-doc td:first-child,
+.vp-doc th:first-child {
+  white-space: nowrap;
+}
+.vp-doc th {
+  font-family: var(--vp-font-family-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vp-c-text-2);
+}
+.vp-doc tr:nth-child(2n) {
+  background-color: transparent;
+}
+.vp-doc td,
+.vp-doc th {
+  border-color: var(--vp-c-divider);
+}
+
+/* Sidebar: active item carries the accent as a left rule. */
+.VPSidebarItem.level-1.is-active > .item .text,
+.VPSidebarItem.level-2.is-active > .item .text {
+  color: var(--vp-c-brand-1);
+}
+.VPSidebarItem.is-active > .item {
+  box-shadow: inset 2px 0 0 var(--vp-c-brand-1);
+}
+
+/* Custom blocks in the same key. */
+.vp-doc .custom-block.tip {
+  border-color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-soft);
+}
+.vp-doc .custom-block.tip .custom-block-title {
+  color: var(--vp-c-brand-1);
+}
+
+.VPFooter {
+  border-top: 1px solid var(--vp-c-divider);
+}
