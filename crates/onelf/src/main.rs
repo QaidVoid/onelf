@@ -100,13 +100,17 @@ enum Commands {
         #[arg(long)]
         update_key: Option<PathBuf>,
 
-        /// Whether the host's library directories join the runtime search
-        /// path. They exist so host GPU drivers stay reachable, but they
-        /// hold every system library, so anything missing from the bundle
-        /// is silently taken from the host. `auto` decides from the
-        /// bundle's contents.
+        /// What the launch resolver may take from the host: `never`
+        /// nothing, `auto` the driver stack's closure, `always` any
+        /// bundled soname. `auto` decides from the bundle's contents.
         #[arg(long, value_name = "MODE", default_value = "auto")]
         host_libs: HostLibsArg,
+
+        /// Let the runtime fall back to the persistent cache when no
+        /// other execution mode works. Off by default so the package
+        /// leaves nothing on disk.
+        #[arg(long)]
+        cache: bool,
 
         /// Record the update URL but do not embed the updater, linking the
         /// slim runtime instead. Saves about 1.3 MB per package. For
@@ -450,9 +454,9 @@ enum CacheAction {
 enum HostLibsArg {
     /// Decide from the bundle's contents
     Auto,
-    /// Always expose the host's library directories
+    /// Compare every bundled soname against the host
     Always,
-    /// Never expose them
+    /// Take nothing from the host
     Never,
 }
 
@@ -528,6 +532,7 @@ fn main() {
             update_key,
             no_embed_updater,
             host_libs,
+            cache,
             exclude,
             preload,
             needs_setuid,
@@ -576,6 +581,7 @@ fn main() {
                         memfd: memfd_opt,
                         working_dir: wd,
                         host_libs: host_libs.into(),
+                        cache,
                         update_url: update_url.clone(),
                         embed_updater: !no_embed_updater,
                         update_key,
@@ -873,6 +879,7 @@ fn run_build(
                 .host_libs
                 .map(Into::into)
                 .unwrap_or(pack::HostLibs::Auto),
+            cache: recipe.package.cache,
             update_url,
             embed_updater,
             update_key,

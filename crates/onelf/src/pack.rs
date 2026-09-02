@@ -10,6 +10,7 @@
 
 use crate::bundle::format_size;
 use crate::payload::ONELF_ENV_SONAME;
+use onelf_format::HostLibsPolicy;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -29,21 +30,24 @@ use onelf_format::{
 
 use crate::compress;
 
-/// Whether a package wants the host's library directories on its search
-/// path at runtime.
+/// What the launch resolver may take from the host.
 ///
-/// Those directories hold the whole system's libraries, not just the GPU
-/// drivers they are there for, so exposing them means any soname the
-/// bundle is missing is quietly satisfied by the host's copy. Packages
-/// that need nothing from the host are better off without them.
+/// The runtime compares each library present in both the bundle and on
+/// the host and loads whichever carries the newer symbol versions. The
+/// policy bounds which sonames it compares at all: only the driver
+/// stack's host closure, every bundled soname, or nothing. Packages that
+/// need nothing from the host are better off with nothing, so that a
+/// missing soname fails by name instead of being quietly satisfied by a
+/// host copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostLibs {
-    /// Decide from the bundle's contents.
+    /// Decide from the bundle's contents: `auto` when a driver stack is
+    /// referenced, `never` otherwise.
     #[default]
     Auto,
-    /// Always expose them.
+    /// Compare every bundled soname against the host.
     Always,
-    /// Never expose them.
+    /// Take nothing from the host.
     Never,
 }
 
@@ -65,9 +69,12 @@ pub struct PackOptions {
     pub no_compress: bool,
     pub memfd: Option<bool>,
     pub working_dir: WorkingDir,
-    /// Whether the host's library directories join the runtime search
-    /// path. See [`HostLibs`].
+    /// What the launch resolver may take from the host. See [`HostLibs`].
     pub host_libs: HostLibs,
+    /// Ask the runtime to fall back to the persistent cache when no
+    /// other execution mode works. Without it the runtime stops at the
+    /// runtime directory and reports failure, leaving nothing on disk.
+    pub cache: bool,
     pub update_url: Option<String>,
     /// Embed the update-capable runtime when `update_url` is set. False
     /// records the update metadata but links the slim runtime, for
@@ -1096,13 +1103,15 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.update_url.is_some() && !opts.embed_updater {
         flags |= Flags::EXTERNAL_UPDATER;
     }
-    let expose_host_libs = match opts.host_libs {
-        HostLibs::Always => true,
-        HostLibs::Never => false,
-        HostLibs::Auto => bundle_needs_host_libs(&opts.directory),
+    let policy = match opts.host_libs {
+        HostLibs::Always => HostLibsPolicy::Always,
+        HostLibs::Never => HostLibsPolicy::Never,
+        HostLibs::Auto if bundle_needs_host_libs(&opts.directory) => HostLibsPolicy::Auto,
+        HostLibs::Auto => HostLibsPolicy::Never,
     };
-    if !expose_host_libs {
-        flags |= Flags::NO_HOST_LIB_DIRS;
+    flags |= policy.to_flags();
+    if opts.cache {
+        flags |= Flags::CACHE_REQUESTED;
     }
 
     // Write the output file
@@ -1450,6 +1459,7 @@ mod tests {
             memfd: Some(false),
             working_dir: WorkingDir::Inherit,
             host_libs: HostLibs::default(),
+            cache: false,
             update_url: None,
             embed_updater: true,
             update_key: None,

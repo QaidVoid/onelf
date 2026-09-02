@@ -71,6 +71,62 @@ bitflags! {
         /// Polarity is deliberate: unset means "expose", so every package
         /// built before this flag existed keeps its behaviour.
         const NO_HOST_LIB_DIRS = 1 << 5;
+        /// The launch resolver may take any bundled soname from the host,
+        /// not only the driver stack's closure. See [`HostLibsPolicy`].
+        const HOST_LIBS_ALWAYS = 1 << 6;
+        /// The publisher asked for the persistent cache as the last
+        /// execution mode. Without it the runtime stops at the runtime
+        /// directory and reports failure rather than leaving an
+        /// extraction on disk.
+        const CACHE_REQUESTED = 1 << 7;
+    }
+}
+
+/// What the launch resolver may take from the host.
+///
+/// Two flag bits encode three values so that a package written before
+/// either bit existed reads as [`HostLibsPolicy::Auto`], which is the
+/// behaviour it was built expecting: host drivers reachable, nothing else
+/// promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostLibsPolicy {
+    /// Nothing from the host.
+    Never,
+    /// The driver stack's host closure only.
+    Auto,
+    /// Any bundled soname.
+    Always,
+}
+
+impl HostLibsPolicy {
+    /// Decode the policy from footer flags. `NO_HOST_LIB_DIRS` wins over
+    /// `HOST_LIBS_ALWAYS` when both are set, since a package that asked for
+    /// nothing from the host must not get everything by a flag mix-up.
+    pub fn from_flags(flags: Flags) -> Self {
+        if flags.contains(Flags::NO_HOST_LIB_DIRS) {
+            HostLibsPolicy::Never
+        } else if flags.contains(Flags::HOST_LIBS_ALWAYS) {
+            HostLibsPolicy::Always
+        } else {
+            HostLibsPolicy::Auto
+        }
+    }
+
+    /// The flag bits that encode this policy.
+    pub fn to_flags(self) -> Flags {
+        match self {
+            HostLibsPolicy::Never => Flags::NO_HOST_LIB_DIRS,
+            HostLibsPolicy::Auto => Flags::empty(),
+            HostLibsPolicy::Always => Flags::HOST_LIBS_ALWAYS,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostLibsPolicy::Never => "never",
+            HostLibsPolicy::Auto => "auto",
+            HostLibsPolicy::Always => "always",
+        }
     }
 }
 
@@ -220,5 +276,49 @@ mod tests {
         let mut bad = buf.clone();
         bad[8..10].copy_from_slice(&2u16.to_le_bytes());
         assert!(Footer::from_bytes(&bad.try_into().unwrap()).is_err());
+    }
+
+    #[test]
+    fn host_libs_policy_decodes_every_encoding() {
+        assert_eq!(
+            HostLibsPolicy::from_flags(Flags::empty()),
+            HostLibsPolicy::Auto
+        );
+        assert_eq!(
+            HostLibsPolicy::from_flags(Flags::NO_HOST_LIB_DIRS),
+            HostLibsPolicy::Never
+        );
+        assert_eq!(
+            HostLibsPolicy::from_flags(Flags::HOST_LIBS_ALWAYS),
+            HostLibsPolicy::Always
+        );
+        assert_eq!(
+            HostLibsPolicy::from_flags(Flags::NO_HOST_LIB_DIRS | Flags::HOST_LIBS_ALWAYS),
+            HostLibsPolicy::Never
+        );
+        for policy in [
+            HostLibsPolicy::Never,
+            HostLibsPolicy::Auto,
+            HostLibsPolicy::Always,
+        ] {
+            assert_eq!(HostLibsPolicy::from_flags(policy.to_flags()), policy);
+        }
+    }
+
+    #[test]
+    fn host_libs_policy_ignores_unknown_bits() {
+        let unknown = Flags::from_bits_retain(1 << 15);
+        assert_eq!(HostLibsPolicy::from_flags(unknown), HostLibsPolicy::Auto);
+        assert_eq!(
+            HostLibsPolicy::from_flags(unknown | Flags::HOST_LIBS_ALWAYS),
+            HostLibsPolicy::Always
+        );
+        let mut buf = Vec::new();
+        let mut f = sample();
+        f.flags = unknown | Flags::CACHE_REQUESTED;
+        f.write_to(&mut buf).unwrap();
+        let back = Footer::from_bytes(&buf.try_into().unwrap()).unwrap();
+        assert!(back.flags.contains(Flags::CACHE_REQUESTED));
+        assert_eq!(back.flags.bits() & (1 << 15), 1 << 15);
     }
 }

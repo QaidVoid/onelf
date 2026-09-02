@@ -66,9 +66,14 @@ pub struct Package {
     pub output: Option<PathBuf>,
     #[serde(default)]
     pub working_dir: WorkingDirSpec,
-    /// Whether the host's library directories join the runtime search path.
-    /// `auto` (the default) decides from the bundle's contents.
+    /// What the launch resolver may take from the host. `auto` (the
+    /// default) decides from the bundle's contents.
     pub host_libs: Option<HostLibsSpec>,
+    /// Let the runtime fall back to the persistent cache when no other
+    /// execution mode works. Off by default, so a package leaves nothing
+    /// on disk unless the publisher or the user asks for it.
+    #[serde(default)]
+    pub cache: bool,
     /// Mark the default entrypoint memfd-eligible (overrides auto-detect).
     pub memfd: Option<bool>,
     #[serde(default)]
@@ -156,7 +161,7 @@ fn default_block_size() -> u64 {
     crate::compress::DEFAULT_BLOCK_SIZE
 }
 
-/// Recipe spelling of the host library directory policy.
+/// Recipe spelling of the host library policy.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostLibsSpec {
@@ -358,6 +363,37 @@ pub fn expand_env(s: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::load;
+
+    fn load_str(body: &str) -> super::Recipe {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-recipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("onelf.toml");
+        std::fs::write(&path, body).unwrap();
+        let recipe = load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        recipe
+    }
+
+    #[test]
+    fn cache_defaults_off_and_parses_on() {
+        let recipe = load_str("[package]\ncommand = \"bin/app\"\n");
+        assert!(!recipe.package.cache);
+
+        let recipe = load_str("[package]\ncommand = \"bin/app\"\ncache = true\n");
+        assert!(recipe.package.cache);
+    }
 }
 
 #[cfg(test)]

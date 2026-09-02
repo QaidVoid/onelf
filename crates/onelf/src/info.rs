@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, Manifest};
+use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, HostLibsPolicy, Manifest};
 
 pub fn info(path: &Path) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(path)?;
@@ -16,6 +16,18 @@ pub fn info(path: &Path) -> io::Result<()> {
     println!();
     println!("Format version: {}", footer.format_version);
     println!("Flags:          {:?}", footer.flags);
+    println!(
+        "Host libs:      {}",
+        HostLibsPolicy::from_flags(footer.flags).as_str()
+    );
+    println!(
+        "Cache:          {}",
+        if footer.flags.contains(Flags::CACHE_REQUESTED) {
+            "requested as last resort"
+        } else {
+            "only on request"
+        }
+    );
     println!();
     println!("Manifest:");
     println!("  Offset:       {}", footer.manifest_offset);
