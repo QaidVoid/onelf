@@ -120,3 +120,21 @@ sudo nsenter -t $(pgrep myapp.onelf) -m ls /run/user/$UID/onelf-myapp-*/
 
 But for 99% of cases, `onelf extract` is the right tool: it unpacks the
 package as a regular directory you can browse normally.
+
+## Provenance
+
+A package built from a [sysroot](./sysroot) records the platform label
+and every package that contributed a file. `onelf info` prints them:
+
+```
+Provenance:
+  Platform:     platform-1.tar.zst
+  glibc 2.44-1
+  jq 1.8.2-1
+  oniguruma 6.9.10-1
+```
+
+A package built from a host scan says `none recorded`. The record is
+display only: nothing the runtime does depends on it, and a record that
+does not parse is reported as malformed while the rest of the output
+still prints.

@@ -138,6 +138,7 @@ packer's machine. Paths are relative to the recipe. See
 |-------|------|---------|-------------|
 | `path` | path | required | The materialized rootfs, outside the AppDir |
 | `archive` | path | none | `.tar` or `.tar.zst` materialized into `path` when it does not exist |
+| `platform` | string | archive or directory name | Label recorded as the package's platform in its provenance |
 | `optional` | array | `[]` | Optional dependencies to include, by package name |
 | `platform-line` | path | none | File of soname prefixes the host provides |
 | `policy` | path | none | File of glob patterns that never ship |

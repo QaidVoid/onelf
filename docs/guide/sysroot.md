@@ -130,6 +130,8 @@ Sysroot: ../sysroot
   Host-provided: libGL.so.1, libEGL.so.1
 ```
 
-The package list is the bundle's provenance. Two builds from the same
-archive and recipe produce the same bytes, so the list can be checked
-against the archive later.
+The package list is the bundle's provenance, and it travels with the
+package: `bundle-libs` writes it to `.onelf/provenance.toml` under the
+`platform` label from the recipe, and `onelf info` prints it. Two builds
+from the same archive and recipe produce the same bytes, so the list can
+be checked against the archive later.

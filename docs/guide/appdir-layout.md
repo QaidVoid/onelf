@@ -28,7 +28,8 @@ myapp/
     ├── interp                   # bundled interpreter path (cross-libc)
     ├── update-url               # self-update zsync URL
     ├── env                      # custom environment variables (auto-generated)
-    └── package-info.toml        # version, description, license (auto-generated)
+    ├── package-info.toml        # version, description, license (auto-generated)
+    └── provenance.toml          # platform and packages, from a sysroot build
 ```
 
 ## Conventions
@@ -41,8 +42,10 @@ myapp/
 - **`share/`** is prepended to `XDG_DATA_DIRS` so GLib/GTK discover bundled
   schemas, icons, and mime types.
 - **`.onelf/`** is the onelf namespace. Some files here are auto-generated
-  by pack (interp, env, package-info.toml), while `icons/` and `desktop/`
-  are user-provided for [desktop integration](./desktop).
+  by pack (interp, env, package-info.toml), `provenance.toml` is written
+  by a [sysroot build](./sysroot) and read only by `onelf info`, while
+  `icons/` and `desktop/` are user-provided for
+  [desktop integration](./desktop).
 
 ## Minimal AppDir
 
