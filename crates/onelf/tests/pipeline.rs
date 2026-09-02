@@ -4231,6 +4231,43 @@ struct SysrootFixture {
     policy: PathBuf,
     /// A "host" holding the platform-line driver, for running the result.
     ld_cache: PathBuf,
+    /// The GL build the sysroot pins, made with `onelf sysroot pack-gl`.
+    gl_build: PathBuf,
+    gl_hash: String,
+}
+
+/// Pack a GL build holding `libGL.so.1` from the rootfs and return its
+/// path and hash, as `pack-gl` prints it.
+fn pack_gl_build(td: &Path, rootfs: &Path) -> (PathBuf, String) {
+    let tree = td.join("gl-tree");
+    std::fs::create_dir_all(tree.join("lib")).unwrap();
+    std::fs::copy(
+        rootfs.join("usr/lib/libGL.so.1"),
+        tree.join("lib/libGL.so.1"),
+    )
+    .unwrap();
+    let build = td.join("gl.onelf");
+    let out = Command::new(onelf())
+        .args(["sysroot", "pack-gl"])
+        .arg(&tree)
+        .arg("-o")
+        .arg(&build)
+        .output()
+        .expect("spawn onelf sysroot pack-gl");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hash = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("blake3 = \""))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("no hash line in:\n{stdout}"))
+        .to_string();
+    assert_eq!(hash.len(), 64);
+    (build, hash)
 }
 
 /// Write a package's `desc` and `files` into the database under `rootfs`.
@@ -4339,6 +4376,16 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     write(&rootfs.join("usr/share/doc/libfixture/README"), "docs\n");
     write(&rootfs.join("usr/share/fixture/data.txt"), "data\n");
 
+    let (gl_build, gl_hash) = pack_gl_build(td, &rootfs);
+    std::fs::create_dir_all(rootfs.join("etc/onelf")).unwrap();
+    write(
+        &rootfs.join("etc/onelf/platform.toml"),
+        &format!(
+            "label = \"platform-test\"\n\n[gl]\nurl = \"file://{}\"\nblake3 = \"{gl_hash}\"\n",
+            gl_build.display()
+        ),
+    );
+
     // The sysroot's glibc is this machine's, copied in under the package
     // name, so the closure has a libc to bundle.
     let host_libc = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6")?;
@@ -4421,6 +4468,8 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         platform_line,
         policy,
         ld_cache,
+        gl_build,
+        gl_hash,
     })
 }
 
@@ -4796,6 +4845,94 @@ fn a_sysroot_build_records_its_provenance() {
         .output()
         .expect("spawn onelf info");
     assert!(String::from_utf8_lossy(&info.stdout).contains("none recorded"));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The sysroot's pin travels into the package as `.onelf/platform`,
+/// under the package's label, with the recipe overriding it field by
+/// field; a sysroot without the file yields no pin.
+#[test]
+fn a_sysroot_pin_is_carried_into_the_package() {
+    let td = workdir("pin");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "platform = \"platform-test\"\n");
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("GL build:"), "{stderr}");
+    let record = std::fs::read_to_string(dir.join(".onelf/platform")).unwrap();
+    assert_eq!(
+        record,
+        format!(
+            "label = \"platform-test\"\nurl = \"file://{}\"\nblake3 = \"{}\"\n",
+            fixture.gl_build.display(),
+            fixture.gl_hash
+        )
+    );
+
+    let pkg = dir.join("app.onelf");
+    let list = Command::new(onelf())
+        .args(["list", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    assert!(String::from_utf8_lossy(&list.stdout).contains(".onelf/platform"));
+    let info = Command::new(onelf())
+        .args(["info", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf info");
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(stdout.contains("GL build:"), "{stdout}");
+    assert!(stdout.contains(&fixture.gl_hash), "{stdout}");
+
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        "platform = \"platform-test\"\nplatform-url = \"file:///elsewhere/gl.onelf\"\n",
+    );
+    let out = onelf_build(&dir);
+    assert!(out.status.success());
+    let record = std::fs::read_to_string(dir.join(".onelf/platform")).unwrap();
+    assert!(
+        record.contains("url = \"file:///elsewhere/gl.onelf\""),
+        "{record}"
+    );
+    assert!(
+        record.contains(&fixture.gl_hash),
+        "the sysroot's hash stays"
+    );
+
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        "platform = \"platform-test\"\nplatform-url = \"http://insecure/gl.onelf\"\n",
+    );
+    let out = onelf_build(&dir);
+    assert!(!out.status.success(), "a plain http pin is refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("https://"));
+
+    std::fs::remove_file(td.join("sysroot/etc/onelf/platform.toml")).unwrap();
+    sysroot_recipe(&dir, &fixture, "platform = \"platform-test\"\n");
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join(".onelf/platform").exists());
+    let list = Command::new(onelf())
+        .args(["list", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    assert!(!String::from_utf8_lossy(&list.stdout).contains(".onelf/platform"));
 
     let _ = std::fs::remove_dir_all(&td);
 }

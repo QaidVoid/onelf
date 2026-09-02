@@ -204,6 +204,11 @@ pub struct Sysroot {
     pub policy: Option<PathBuf>,
     /// File of paths a test run opened, one per line.
     pub trace: Option<PathBuf>,
+    /// URL of the GL build for hosts without one, overriding what the
+    /// sysroot's `etc/onelf/platform.toml` names.
+    pub platform_url: Option<String>,
+    /// BLAKE3 hash of that build, overriding the sysroot's.
+    pub platform_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,10 +434,15 @@ mod package_tests {
         let recipe = load_str(
             "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"sysroot\"\nplatform = \"platform-1\"\n",
         );
-        assert_eq!(
-            recipe.sysroot.unwrap().platform.as_deref(),
-            Some("platform-1")
+        let sr = recipe.sysroot.unwrap();
+        assert_eq!(sr.platform.as_deref(), Some("platform-1"));
+        assert!(sr.platform_url.is_none() && sr.platform_hash.is_none());
+        let recipe = load_str(
+            "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"sysroot\"\nplatform-url = \"https://e/gl.onelf\"\nplatform-hash = \"abc\"\n",
         );
+        let sr = recipe.sysroot.unwrap();
+        assert_eq!(sr.platform_url.as_deref(), Some("https://e/gl.onelf"));
+        assert_eq!(sr.platform_hash.as_deref(), Some("abc"));
         assert!(
             load_str("[package]\ncommand = \"bin/app\"\n")
                 .sysroot

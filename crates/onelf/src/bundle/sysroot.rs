@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use onelf_sysroot::platform::{self, Pin};
 use onelf_sysroot::prune::prune;
 use onelf_sysroot::{Database, PlatformLine, Policy, Trace};
 
@@ -36,6 +37,10 @@ pub struct SysrootOptions {
     pub policy: Option<PathBuf>,
     /// Paths a test run opened, one per line.
     pub trace: Option<PathBuf>,
+    /// The GL build's URL, overriding the sysroot's own pin.
+    pub platform_url: Option<String>,
+    /// The GL build's BLAKE3 hash, overriding the sysroot's own pin.
+    pub platform_hash: Option<String>,
 }
 
 /// What populating did, for the report.
@@ -50,6 +55,8 @@ pub struct SysrootReport {
     pub copied: usize,
     /// Files the database lists that the sysroot does not hold.
     pub absent: usize,
+    /// The GL build the package pins, when the sysroot or recipe names one.
+    pub pin: Option<Pin>,
 }
 
 /// Copy the closure of the entrypoint's package into `appdir`. Returns
@@ -148,7 +155,65 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     }
     fs::write(&record, render_provenance(&opts.platform, &report.packages))?;
     super::normalize_mtime(&record);
+
+    report.pin = resolve_pin(opts)?;
+    let pin_path = appdir.join(PLATFORM_FILE);
+    match &report.pin {
+        Some(pin) => {
+            fs::write(&pin_path, render_pin(pin))?;
+            super::normalize_mtime(&pin_path);
+        }
+        None => {
+            let _ = fs::remove_file(&pin_path);
+        }
+    }
     Ok((report, platform))
+}
+
+/// Where the package records the GL build it pins, relative to the
+/// AppDir. Read by the runtime, unlike the provenance record.
+pub const PLATFORM_FILE: &str = ".onelf/platform";
+
+/// The pin the package carries: the sysroot's, with the recipe's URL and
+/// hash overriding field by field, under the package's own label.
+fn resolve_pin(opts: &SysrootOptions) -> io::Result<Option<Pin>> {
+    let from_sysroot = platform::read(&opts.root)?;
+    let url = opts
+        .platform_url
+        .clone()
+        .or_else(|| from_sysroot.as_ref().map(|p| p.url.clone()));
+    let blake3 = opts
+        .platform_hash
+        .as_ref()
+        .map(|h| h.to_ascii_lowercase())
+        .or_else(|| from_sysroot.as_ref().map(|p| p.blake3.clone()));
+    let (Some(url), Some(blake3)) = (url, blake3) else {
+        if opts.platform_url.is_some() || opts.platform_hash.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a GL build pin needs both platform-url and platform-hash",
+            ));
+        }
+        return Ok(None);
+    };
+    platform::check_url(&url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    platform::check_hash(&blake3).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(Some(Pin {
+        label: opts.platform.clone(),
+        url,
+        blake3,
+    }))
+}
+
+/// The `.onelf/platform` record: three `key = "value"` lines the runtime
+/// reads without a TOML parser.
+pub fn render_pin(pin: &Pin) -> String {
+    format!(
+        "label = {}\nurl = {}\nblake3 = {}\n",
+        toml_string(&pin.label),
+        toml_string(&pin.url),
+        toml_string(&pin.blake3)
+    )
 }
 
 /// Where the bundle records what it was built from, relative to the
@@ -348,6 +413,15 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
             "  {} {}",
             color::bold("Host-provided:"),
             report.host_provided.join(", ")
+        );
+    }
+    if let Some(pin) = &report.pin {
+        eprintln!(
+            "  {} {} from {} ({}...)",
+            color::bold("GL build:"),
+            pin.label,
+            pin.url,
+            &pin.blake3[..16]
         );
     }
     for (dep, by) in &report.unsatisfied {

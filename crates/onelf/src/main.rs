@@ -493,6 +493,14 @@ enum SysrootAction {
         /// A materialized sysroot
         dir: PathBuf,
     },
+    /// Pack a GL build for hosts without one, and print the hash to pin
+    PackGl {
+        /// A tree holding lib/, share/vulkan/icd.d and friends
+        dir: PathBuf,
+        /// Output file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -596,6 +604,7 @@ fn main() {
                 WorkingDirArg::Package => WorkingDir::PackageRoot,
                 WorkingDirArg::Command => WorkingDir::EntrypointParent,
             };
+            let pins_https = pins_https_build(&directory);
 
             let entrypoints = entrypoint
                 .into_iter()
@@ -638,9 +647,9 @@ fn main() {
                         needs_setuid,
                     },
                     // Pick the runtime: slim (~700KB) by default; the
-                    // update-capable runtime (~2MB) only when the user actually
-                    // configures self-updates.
-                    if update_url.is_some() && !no_embed_updater {
+                    // update-capable runtime (~2MB) when the user configures
+                    // self-updates or the package pins a GL build over HTTPS.
+                    if (update_url.is_some() && !no_embed_updater) || pins_https {
                         RUNTIME_BINARY_UPDATE
                     } else {
                         RUNTIME_BINARY_SLIM
@@ -788,6 +797,8 @@ fn main() {
                         platform_line,
                         policy,
                         trace,
+                        platform_url: None,
+                        platform_hash: None,
                     })
                 }
                 None => None,
@@ -822,6 +833,9 @@ fn main() {
         Commands::Sysroot { action } => match action {
             SysrootAction::Fetch { source, dir } => sysroot_cmd::fetch(&source, &dir),
             SysrootAction::Info { dir } => sysroot_cmd::info(&dir),
+            SysrootAction::PackGl { dir, output } => {
+                sysroot_cmd::pack_gl(&dir, &output, RUNTIME_BINARY_SLIM)
+            }
         },
     };
 
@@ -871,7 +885,17 @@ fn sysroot_from_recipe(
         platform_line: sr.platform_line.as_deref().map(resolve),
         policy: sr.policy.as_deref().map(resolve),
         trace: sr.trace.as_deref().map(resolve),
+        platform_url: sr.platform_url.clone(),
+        platform_hash: sr.platform_hash.clone(),
     })
+}
+
+/// Whether the AppDir pins a GL build over HTTPS, which only the
+/// update-capable runtime can fetch.
+fn pins_https_build(dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(dir.join(bundle::sysroot::PLATFORM_FILE))
+        .map(|t| t.lines().any(|l| l.starts_with("url = \"https://")))
+        .unwrap_or(false)
 }
 
 fn run_build(
@@ -976,7 +1000,7 @@ fn run_build(
         .map(std::fs::read)
         .transpose()?;
     let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
-    let runtime: &[u8] = if update_url.is_some() && embed_updater {
+    let runtime: &[u8] = if (update_url.is_some() && embed_updater) || pins_https_build(&dir) {
         RUNTIME_BINARY_UPDATE
     } else {
         RUNTIME_BINARY_SLIM

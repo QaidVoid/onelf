@@ -35,7 +35,7 @@ mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod resolve;
 pub(crate) use resolve::*;
-mod elf;
+pub(crate) mod elf;
 pub mod sysroot;
 pub(crate) use elf::*;
 pub use sysroot::SysrootOptions;
@@ -353,6 +353,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             // A record from an earlier sysroot build would describe a
             // bundle this run is about to change.
             let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
+            let _ = fs::remove_file(opts.directory.join(sysroot::PLATFORM_FILE));
             None
         }
     };

@@ -91,7 +91,9 @@ pub const ICD_DIRS: &[&str] = &[
     "/usr/share/glvnd/egl_vendor.d",
 ];
 
-fn is_libc_family(soname: &str) -> bool {
+/// Whether `soname` belongs to the glibc family, which a package always
+/// carries as a unit with its loader.
+pub fn is_libc_family(soname: &str) -> bool {
     LIBC_FAMILY.iter().any(|p| soname.starts_with(p))
 }
 

@@ -102,6 +102,17 @@ pub fn info(path: &Path) -> io::Result<()> {
             Err(e) => println!("  malformed record: {e}"),
         },
     }
+    if let Some(text) = read_metadata_string(
+        path,
+        &footer,
+        &manifest,
+        crate::bundle::sysroot::PLATFORM_FILE,
+    )? {
+        println!("  GL build:");
+        for line in text.lines() {
+            println!("    {line}");
+        }
+    }
     println!();
 
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {

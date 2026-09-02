@@ -494,6 +494,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && !p.starts_with(".onelf/icons")
                 && !p.starts_with(".onelf/desktop")
                 && p.as_path() != Path::new(crate::bundle::sysroot::PROVENANCE_FILE)
+                && p.as_path() != Path::new(crate::bundle::sysroot::PLATFORM_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(
