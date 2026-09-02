@@ -73,6 +73,11 @@ pub const DRIVER_FAMILIES: &[&str] = &[
     "libamdhip64",
     "libze_loader",
     "libva.so",
+    // The VA-API display wrappers ship with libva and track its version.
+    "libva-drm.so",
+    "libva-x11.so",
+    "libva-wayland.so",
+    "libva-glx.so",
     "libOpenCL.so",
     "libdrm",
     "libgbm.so",
