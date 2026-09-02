@@ -17,13 +17,21 @@ pub struct Closure {
 }
 
 impl Database {
-    /// The transitive `depends` closure of `root`, plus every optional
-    /// dependency named in `optional`, resolved through `provides`.
+    /// The transitive `depends` closure of `root` and of every package
+    /// named in `optional`, plus every optional dependency so named,
+    /// resolved through `provides`. Naming a package nothing depends on,
+    /// a Vulkan driver say, is how it enters at all.
     pub fn closure(&self, root: &str, optional: &[String]) -> Closure {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut unsatisfied = Vec::new();
         let mut queue: VecDeque<String> = VecDeque::new();
         queue.push_back(root.to_string());
+        queue.extend(
+            optional
+                .iter()
+                .filter_map(|name| self.satisfier(name))
+                .map(|p| p.name.clone()),
+        );
         while let Some(name) = queue.pop_front() {
             if !seen.insert(name.clone()) {
                 continue;
