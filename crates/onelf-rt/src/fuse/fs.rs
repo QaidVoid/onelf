@@ -4,9 +4,10 @@
 //! against the in-memory manifest. File reads decompress payload blocks on
 //! demand with a per-inode block cache and sequential prefetch.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::time::Instant;
 
@@ -194,6 +195,64 @@ impl BlockCache {
     }
 }
 
+/// Records the sysroot-space path of every file the app looks up or
+/// opens, into the file named by `ONELF_TRACE`. The trace tier reads
+/// that list back to prune what a run never touched, so this is how a
+/// trace is captured: run the packed app under `ONELF_TRACE=trace.txt`
+/// through the paths that matter, then name the file in the recipe.
+struct TraceRecorder {
+    file: File,
+    seen: HashSet<usize>,
+}
+
+impl TraceRecorder {
+    /// A recorder when `ONELF_TRACE` names a writable file, else none.
+    /// The file is appended, so several runs accumulate into one trace.
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("ONELF_TRACE").filter(|v| !v.is_empty())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file,
+            seen: HashSet::new(),
+        })
+    }
+
+    /// Write entry `idx`'s sysroot path once. Directories are skipped:
+    /// only files and symlinks appear in a package database's file list.
+    fn record(&mut self, idx: usize, manifest: &Manifest) {
+        if !self.seen.insert(idx) {
+            return;
+        }
+        let entry = &manifest.entries[idx];
+        if entry.kind != EntryKind::File && entry.kind != EntryKind::Symlink {
+            return;
+        }
+        if let Some(sysroot) = appdir_to_sysroot(&manifest.entry_path(idx)) {
+            let _ = writeln!(self.file, "/{sysroot}");
+        }
+    }
+}
+
+/// Map an AppDir-relative path back to the sysroot path the trace tier
+/// matches against: the flattened `bin/`, `lib/`, `share/` and friends
+/// regain their `usr/` prefix, everything else is already in sysroot
+/// space, and the runtime's own `.onelf/` bookkeeping is dropped.
+fn appdir_to_sysroot(path: &str) -> Option<String> {
+    if path.starts_with(".onelf") {
+        return None;
+    }
+    const FLATTENED: &[&str] = &["bin/", "sbin/", "lib/", "lib64/", "share/", "include/"];
+    if FLATTENED.iter().any(|p| path.starts_with(p)) {
+        Some(format!("usr/{path}"))
+    } else {
+        Some(path.to_string())
+    }
+}
+
 pub struct FuseState<'a> {
     manifest: &'a Manifest,
     file: &'a mut File,
@@ -204,6 +263,8 @@ pub struct FuseState<'a> {
     /// Per-inode verdict of whole-entry verification, used only for
     /// version-1 manifests whose blocks carry no hash of their own.
     verified: HashMap<u64, bool>,
+    /// Present when `ONELF_TRACE` asked for a trace of this run.
+    recorder: Option<TraceRecorder>,
 }
 
 impl<'a> FuseState<'a> {
@@ -222,6 +283,7 @@ impl<'a> FuseState<'a> {
             children,
             cache: BlockCache::new(cache_budget()),
             verified: HashMap::new(),
+            recorder: TraceRecorder::from_env(),
         }
     }
 
@@ -404,11 +466,15 @@ impl<'a> FuseState<'a> {
             return Continue(());
         }
 
+        let manifest = self.manifest;
+        let children = &self.children;
+        let recorder = &mut self.recorder;
         let response = dispatch(
             &header,
             &buf[IN_HEADER_SIZE..n],
-            self.manifest,
-            &self.children,
+            manifest,
+            children,
+            recorder,
         );
         if !response.is_empty() {
             let _ = rustix::io::write(fuse_fd, &response);
@@ -627,12 +693,13 @@ fn dispatch(
     body: &[u8],
     manifest: &Manifest,
     children: &[Vec<u64>],
+    recorder: &mut Option<TraceRecorder>,
 ) -> Vec<u8> {
     match header.opcode {
         FUSE_INIT => handle_init(header, body),
-        FUSE_LOOKUP => handle_lookup(header, body, manifest, children),
+        FUSE_LOOKUP => handle_lookup(header, body, manifest, children, recorder),
         FUSE_GETATTR => handle_getattr(header, manifest),
-        FUSE_OPEN => handle_open(header, manifest),
+        FUSE_OPEN => handle_open(header, manifest, recorder),
         FUSE_RELEASE | FUSE_RELEASEDIR => reply_ok(header, &[]),
         FUSE_OPENDIR => handle_opendir(header, manifest),
         FUSE_READDIR => handle_readdir(header, body, manifest, children),
@@ -682,6 +749,7 @@ fn handle_lookup(
     body: &[u8],
     manifest: &Manifest,
     children: &[Vec<u64>],
+    recorder: &mut Option<TraceRecorder>,
 ) -> Vec<u8> {
     let parent_inode = header.nodeid;
     if parent_inode == 0 || inode_to_entry(parent_inode) >= manifest.entries.len() {
@@ -703,6 +771,9 @@ fn handle_lookup(
         let entry = &manifest.entries[entry_idx];
         let entry_name = manifest.get_string(entry.name);
         if entry_name == name_str {
+            if let Some(rec) = recorder {
+                rec.record(entry_idx, manifest);
+            }
             let attr = make_attr(child_inode, entry, manifest);
             let entry_out = FuseEntryOut {
                 nodeid: child_inode,
@@ -742,12 +813,19 @@ fn handle_getattr(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
     reply_ok(header, &payload)
 }
 
-fn handle_open(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
+fn handle_open(
+    header: &FuseInHeader,
+    manifest: &Manifest,
+    recorder: &mut Option<TraceRecorder>,
+) -> Vec<u8> {
     let inode = header.nodeid;
     if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
     }
 
+    if let Some(rec) = recorder {
+        rec.record(inode_to_entry(inode), manifest);
+    }
     let entry = &manifest.entries[inode_to_entry(inode)];
     if entry.kind != EntryKind::File {
         return reply_err(header, -libc_eisdir());

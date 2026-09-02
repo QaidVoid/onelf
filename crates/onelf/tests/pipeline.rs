@@ -3962,7 +3962,74 @@ fn kill_group(child: &std::process::Child) {
     assert!(st.success());
 }
 
-/// The runtime directory mode runs the package from the private per-user
+/// `ONELF_TRACE` records the sysroot-space path of every file the run
+/// opened, so a trace can be captured by running the packed app instead
+/// of by hand. It works on the FUSE path, which sees every open.
+#[test]
+fn onelf_trace_records_what_the_run_opened() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("trace-record");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("share/data")).unwrap();
+    write(&app.join("share/data/used.txt"), "read me\n");
+    write(&app.join("share/data/unused.txt"), "never opened\n");
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncat \"$ONELF_DIR/share/data/used.txt\"\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let trace = td.join("trace.txt");
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .env("ONELF_TRACE", &trace);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    if !out.status.success() {
+        eprintln!("skip: FUSE cannot mount here");
+        return;
+    }
+
+    let recorded = std::fs::read_to_string(&trace).unwrap_or_default();
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert!(
+        lines.contains(&"/usr/bin/run"),
+        "the entrypoint is recorded in sysroot space:\n{recorded}"
+    );
+    assert!(
+        lines.contains(&"/usr/share/data/used.txt"),
+        "the opened data file is recorded:\n{recorded}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("unused.txt")),
+        "a file the run never opened is not recorded:\n{recorded}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(".onelf")),
+        "the runtime's own bookkeeping is not recorded:\n{recorded}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The runtime directory mode runs the package from the private per-user/// The runtime directory mode runs the package from the private per-user
 /// directory and leaves nothing behind when it exits.
 #[test]
 fn rundir_mode_runs_and_leaves_nothing_behind() {

@@ -146,12 +146,23 @@ the trace may not prune, in the policy's format:
 usr/share/blender/**
 ```
 
-Capturing a trace is a matter of running the application from the
-package and recording what it opens. `strace -f -y -e trace=%file` on
-a run in cache mode (`ONELF_MODE=cache ONELF_CACHE=1`) lists every
-path under the extracted tree; map `lib/`, `bin/` and `share/` back
-to `usr/` and the result is the trace. Run the paths you care about: a
-render, a file import, a session in the interface.
+To capture a trace, run the packed application under `ONELF_TRACE`
+pointing at a file. The runtime records the sysroot path of every file
+the run opens, already in the form the trace tier reads:
+
+```bash
+ONELF_TRACE=trace.txt ./myapp.onelf
+```
+
+The file is appended, so several runs accumulate into one trace. Do the
+things the application has to be able to do: open a document, render a
+frame, click through the interface, exercise the plugins you ship. Then
+name the file in the recipe and rebuild.
+
+Recording happens on the FUSE execution path, which sees every open, so
+it needs a host where FUSE is available; that is the default on desktop
+Linux. Build the package once without a trace, capture, then add the
+`trace` line and build again.
 
 ## The verifier
 
