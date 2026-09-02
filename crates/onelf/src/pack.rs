@@ -412,12 +412,28 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut files: Vec<CollectedFile> = Vec::new();
     let mut symlinks: Vec<CollectedSymlink> = Vec::new();
 
+    // The output of a previous pack may sit inside the directory, as it
+    // does for a recipe whose AppDir is the recipe's own directory. It is
+    // never content.
+    let dir_abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let output_abs = opts.output.parent().and_then(|parent| {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        Some(parent.canonicalize().ok()?.join(opts.output.file_name()?))
+    });
+
     for entry in WalkDir::new(&dir).skip_hidden(false).sort(true) {
         let entry = entry.map_err(io::Error::other)?;
         let abs_path = entry.path();
         let rel_path = abs_path.strip_prefix(&dir).unwrap().to_path_buf();
 
         if rel_path.as_os_str().is_empty() {
+            continue;
+        }
+        if output_abs.as_deref() == Some(dir_abs.join(&rel_path).as_path()) {
             continue;
         }
 
@@ -1148,7 +1164,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         manifest_checksum,
     };
 
-    let out = File::create(&opts.output)?;
+    // Written beside the output and renamed over it at the end, so a
+    // reader never sees a partial package and an instance still running
+    // the previous one keeps its file.
+    let staged = opts
+        .output
+        .with_extension(format!("onelf-{}.tmp", std::process::id()));
+    let out = File::create(&staged)?;
     let mut w = BufWriter::new(out);
 
     // [Runtime ELF]
@@ -1179,7 +1201,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Make output executable
     let perms = fs::Permissions::from_mode(0o755);
-    fs::set_permissions(&opts.output, perms)?;
+    fs::set_permissions(&staged, perms)?;
+    if let Err(e) = fs::rename(&staged, &opts.output) {
+        let _ = fs::remove_file(&staged);
+        return Err(e);
+    }
 
     let output_size = fs::metadata(&opts.output).map(|m| m.len()).unwrap_or(0);
 
