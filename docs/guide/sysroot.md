@@ -47,18 +47,26 @@ command = "bin/myapp"
 [sysroot]
 path = "../sysroot"
 archive = "../platform-1.tar.zst"   # materialized into path when absent
-optional = ["mesa", "pipewire"]      # optional dependencies to include
+optional = ["mesa", "vulkan-radeon"]  # packages to add to the closure
 platform-line = "../platform-line.txt"
 policy = "../policy.txt"
 trace = "../trace.txt"               # optional
 ```
 
 `onelf build` then finds the package owning `usr/bin/myapp`, takes its
-transitive dependencies plus the optional ones you name, prunes them, and
-copies the result into the AppDir with `usr/` flattened into the usual
-`bin/`, `lib/` and `share/`. The normal `bundle-libs` steps follow: run
-paths, the bootstrap, the loader scrub. Their dependency lookup is
-restricted to the sysroot's own library directories.
+transitive dependencies, prunes them, and copies the result into the
+AppDir with `usr/` flattened into the usual `bin/`, `lib/` and `share/`.
+`optional` names packages to add: an optional dependency of something in
+the closure, or a package nothing depends on at all, such as a Vulkan
+driver. Each enters with its own dependencies.
+
+The normal `bundle-libs` steps follow: run paths, the bootstrap, the
+loader scrub. Their dependency lookup never leaves the sysroot: its
+library directories, the directories its `etc/ld.so.conf` names, and
+the RPATH of each binary, read as paths inside the sysroot. A library a
+binary needs that sits outside `lib/`, under a vendor's `opt/` install
+say, is copied into `lib/`, because the RPATH the packer writes reaches
+`lib/` and nothing else.
 
 The same works from the command line:
 
@@ -100,6 +108,14 @@ usr/include/**
 usr/lib/*.a
 ```
 
+It holds for dependencies too. A library the policy prunes is not
+copied back because something bundled needs it; the build reports it
+under "Left out by policy" and the verifier names the file that needed
+it, which is the next thing to prune. A distribution's closure carries
+plugins whose own dependencies were never installed, Qt modules and
+Python bindings for optional stacks, and this is how they are cut.
+Start from a clean AppDir when the policy changes: files a previous
+build copied are not removed.
 **A trace**, when you have one, lists the paths a test run opened, one per
 line. A file survives when it was opened, when any file in its directory
 was opened, or when some bundled object names it in `DT_NEEDED`. The
@@ -175,17 +191,30 @@ override can move the download but never change what is downloaded.
 
 A GL build is an onelf package holding a tree with `lib/` (Mesa and its
 drivers under `lib/dri`), `share/vulkan/icd.d` and
-`share/glvnd/egl_vendor.d`. Build the tree on the sysroot, then:
+`share/glvnd/egl_vendor.d`. The sysroot itself is the source: bundle
+from it with an empty platform line, so the driver stack stays in, name
+the drivers that nothing depends on, and prune glibc, which the package
+using the build carries:
 
 ```bash
+: > empty-line.txt
+onelf bundle-libs ./gl-tree --target bin/glxinfo --sysroot ../sysroot \
+  --platform-line empty-line.txt --policy gl-policy.txt \
+  --sysroot-optional vulkan-radeon --sysroot-optional vulkan-icd-loader \
+  --sysroot-optional libva
 onelf sysroot pack-gl ./gl-tree -o gl.onelf
 blake3 = "3f1c...a9e2"
 ```
 
-The command runs the verifier over the tree first: everything it needs
-apart from glibc, which the package that uses it carries, and the driver
-families it exists to provide, has to be inside. It prints the hash to
-put in `platform.toml`.
+`gl-policy.txt` prunes `usr/bin/**`, `etc/**`, glibc's files
+(`usr/lib/libc.so*`, `usr/lib/ld-linux*` and the rest of the family)
+and the data directories a driver stack does not read. `pack-gl` refuses
+a tree that still carries glibc, then runs the verifier over it:
+everything it needs apart from glibc and the driver families it exists
+to provide has to be inside. It prints the hash to put in
+`platform.toml`. Include every family the platform line names that your
+applications use; a build without `libva` leaves a video player without
+it on a host that has none.
 
 The hash is the whole trust story. The package that carries it is
 already the thing you distribute, so whoever can alter the hash can
@@ -199,10 +228,15 @@ and the package carries a pin. A package that bundles Mesa never
 fetches, and neither does one on a host with a working driver.
 
 The file lands in `<cache root>/platform/<label>/gl.onelf` once its
-hash matches; a mismatch or a broken download leaves nothing behind. It
-is then extracted through the package cache and its libraries are
-indexed ahead of the host's, so two packages pinning the same label
-share one download and one extraction. `onelf cache list` shows the
+hash matches, with the hash beside it so a label whose pin moves on to
+a new build is fetched again; a mismatch or a broken download leaves
+nothing behind. It is then extracted through the package cache and its
+libraries are indexed ahead of the host's, so two packages pinning the
+same label share one download and one extraction. The build's
+directories are never put on the search path, where every process the
+application spawns would inherit them. Its libraries reach the
+application through the link farm by name, the ones the drivers open
+by name (glvnd vendors, gallium, ICDs) included. `onelf cache list` shows the
 store and `onelf cache gc` collects a build no package has used past
 the age threshold.
 
