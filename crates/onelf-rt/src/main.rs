@@ -10,6 +10,7 @@ mod memfd;
 mod metadata;
 mod multicall;
 mod paths;
+mod platform;
 mod portable;
 mod rundir;
 mod selfextract;
@@ -170,6 +171,7 @@ fn main() {
                 "memfd",
                 &lib_paths_str,
                 "/proc/self/fd/0",
+                None,
                 None,
             );
             portable::setup_portable(exe_dir, exe_name);

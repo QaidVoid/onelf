@@ -4937,6 +4937,243 @@ fn a_sysroot_pin_is_carried_into_the_package() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A recipe directory holding a built package on the fixture sysroot,
+/// plus a launch of it against a host described by `ld_cache`.
+fn build_pinned_app(td: &Path, name: &str, fixture: &SysrootFixture, extra: &str) -> PathBuf {
+    let dir = td.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(
+        &dir,
+        fixture,
+        &format!("platform = \"platform-test\"\n{extra}"),
+    );
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir.join("app.onelf")
+}
+
+fn launch_against(pkg: &Path, td: &Path, ld_cache: &Path) -> Command {
+    let mut run = Command::new(pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", ld_cache);
+    isolate(&mut run, td);
+    run
+}
+
+/// Whether the fixture app was exec'd without a GL stack of the
+/// fixture's making: the loader either finds no `libGL.so.1` or finds the
+/// real host's, which lacks the fixture's probe symbol.
+fn entrypoint_ran(stderr: &str) -> bool {
+    stderr.contains("libGL.so.1") || stderr.contains("gl_probe")
+}
+
+/// Every file under `dir`, relative, sorted. Hidden temp files included.
+fn files_under(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = jwalk::WalkDir::new(dir)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .map(|e| {
+            e.path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A host with no GL stack gets the build the package pins: fetched
+/// once into the store, verified, and shared by every package pinning
+/// it. Without a pin, or with fetching disabled, the launch warns and
+/// runs the entrypoint anyway.
+#[test]
+fn a_host_without_gl_fetches_the_pinned_build() {
+    let td = workdir("glfetch");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let no_gl = td.join("no-gl.cache");
+    std::fs::write(&no_gl, ld_so_cache(&[])).unwrap();
+    let store = td.join("xdg-cache/onelf/platform");
+
+    let pkg = build_pinned_app(&td, "app", &fixture, "");
+    let out = run_package(&mut launch_against(&pkg, &td, &no_gl));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "the app loads GL from the fetched build:\n{stderr}"
+    );
+    assert!(!stderr.contains("continuing without"), "{stderr}");
+    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+    let extracted = |td: &Path| {
+        std::fs::read_dir(td.join("xdg-cache/onelf/pkg"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .count()
+    };
+    assert_eq!(
+        extracted(&td),
+        1,
+        "the build is extracted through the package cache"
+    );
+
+    // A second package pinning the same build reuses download and
+    // extraction: nothing new appears in the store.
+    let dir2 = td.join("app2");
+    std::fs::create_dir_all(&dir2).unwrap();
+    write(&dir2.join("README"), "a different package\n");
+    let pkg2 = build_pinned_app(&td, "app2", &fixture, "");
+    let out = run_package(&mut launch_against(&pkg2, &td, &no_gl));
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+    assert_eq!(extracted(&td), 1);
+
+    // Fetching disabled, against an empty store: a warning naming the
+    // variable, no copy, and the entrypoint still runs (and fails to
+    // find the driver it needs, which is the loader's complaint).
+    let empty = td.join("empty-store");
+    let mut run = launch_against(&pkg, &td, &no_gl);
+    run.env("ONELF_NO_PLATFORM_FETCH", "1")
+        .env("ONELF_PLATFORM_STORE", &empty);
+    let out = run_package(&mut run);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ONELF_NO_PLATFORM_FETCH") && stderr.contains("continuing without"),
+        "{stderr}"
+    );
+    assert!(entrypoint_ran(&stderr), "the entrypoint ran: {stderr}");
+    assert!(files_under(&empty).is_empty());
+
+    // No pin at all: the same warning shape, naming what is missing.
+    std::fs::remove_file(td.join("sysroot/etc/onelf/platform.toml")).unwrap();
+    let unpinned = build_pinned_app(&td, "app3", &fixture, "");
+    let out = run_package(&mut launch_against(&unpinned, &td, &no_gl));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pins no GL build") && entrypoint_ran(&stderr),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The hash is the trust root: a build that differs from the pin is
+/// discarded before anything is placed in the store, a plain-HTTP source
+/// is refused without a request, and a truncated source leaves nothing.
+#[test]
+fn a_build_that_does_not_match_its_pin_is_discarded() {
+    let td = workdir("gltamper");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let no_gl = td.join("no-gl.cache");
+    std::fs::write(&no_gl, ld_so_cache(&[])).unwrap();
+    let store = td.join("xdg-cache/onelf/platform");
+    let pkg = build_pinned_app(&td, "app", &fixture, "");
+
+    let mut bytes = std::fs::read(&fixture.gl_build).unwrap();
+    let tampered = td.join("tampered.onelf");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 1;
+    std::fs::write(&tampered, &bytes).unwrap();
+    let truncated = td.join("truncated.onelf");
+    std::fs::write(&truncated, &bytes[..middle]).unwrap();
+
+    for (url, expect) in [
+        (format!("file://{}", tampered.display()), "hash mismatch"),
+        (
+            "http://127.0.0.1:1/gl.onelf".to_string(),
+            "https:// or file://",
+        ),
+        (format!("file://{}", truncated.display()), "hash mismatch"),
+    ] {
+        let mut run = launch_against(&pkg, &td, &no_gl);
+        run.env("ONELF_PLATFORM_URL", &url);
+        let out = run_package(&mut run);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expect) && stderr.contains("continuing without"),
+            "{url}: {stderr}"
+        );
+        assert!(entrypoint_ran(&stderr), "the entrypoint ran: {stderr}");
+        assert!(
+            files_under(&store).is_empty(),
+            "{url} left {:?}",
+            files_under(&store)
+        );
+    }
+
+    // The pin itself still works afterwards.
+    let out = run_package(&mut launch_against(&pkg, &td, &no_gl));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(files_under(&store), ["platform-test/gl.onelf"]);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The store is part of the cache: listed by label, collected once idle.
+#[test]
+fn cache_gc_collects_an_unused_build() {
+    let td = workdir("glgc");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let no_gl = td.join("no-gl.cache");
+    std::fs::write(&no_gl, ld_so_cache(&[])).unwrap();
+    let pkg = build_pinned_app(&td, "app", &fixture, "");
+    let out = run_package(&mut launch_against(&pkg, &td, &no_gl));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cache_cmd = |args: &[&str]| {
+        let out = Command::new(onelf())
+            .arg("cache")
+            .args(args)
+            .env("XDG_CACHE_HOME", td.join("xdg-cache"))
+            .output()
+            .expect("spawn onelf cache");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let listed = cache_cmd(&["list"]);
+    assert!(
+        listed.contains("GL builds:") && listed.contains("platform-test ("),
+        "{listed}"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let collected = cache_cmd(&["gc", "--max-age", "0"]);
+    assert!(
+        collected.contains("Removed 1 GL build(s)") && collected.contains("reclaimed"),
+        "{collected}"
+    );
+    assert!(!td.join("xdg-cache/onelf/platform/platform-test").exists());
+    assert!(!cache_cmd(&["list"]).contains("GL builds:"));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The record is display only: an edited one changes nothing about how
 /// the package runs, and builds stay reproducible with it in place.
 #[test]

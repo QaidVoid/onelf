@@ -11,7 +11,7 @@ use std::process::Command;
 
 use onelf_format::HostLibsPolicy;
 use onelf_format::drivers;
-use onelf_format::resolve::{self, Request, Resolution};
+use onelf_format::resolve::{self, Gl, Request, Resolution};
 
 use crate::loader::PackageData;
 
@@ -53,11 +53,12 @@ pub fn exec(launch: &Launch) -> ! {
     let lib_paths_str = lib_dirs.join(":");
 
     let target_is_elf = crate::env::is_elf_file(target_path_s);
-    let resolution = if target_is_elf && !lib_dirs.is_empty() {
+    let resolved = if target_is_elf && !lib_dirs.is_empty() {
         resolve_for(launch.pkg, launch.pkg_root, &lib_dirs)
     } else {
-        Resolution::default()
+        Resolved::default()
     };
+    let resolution = &resolved.resolution;
     for name in &resolution.incomparable {
         eprintln!("onelf-rt: resolver: cannot order {name}; keeping the bundled copy");
     }
@@ -74,6 +75,7 @@ pub fn exec(launch: &Launch) -> ! {
         &lib_paths_str,
         target_path_s,
         resolution.farm.as_deref(),
+        resolved.platform_root.as_deref(),
     );
     if let Some(data) = launch.env_data {
         crate::env::apply_custom_env(data, pkg_root_s);
@@ -227,10 +229,26 @@ fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, lau
     std::process::exit(1);
 }
 
+/// What the resolver decided, with the GL build it was given, if any.
+#[derive(Default)]
+struct Resolved {
+    resolution: Resolution,
+    /// The fetched GL build's extracted root.
+    platform_root: Option<std::path::PathBuf>,
+    /// Held through exec so the extraction is not collected while this
+    /// instance runs. The fd is inheritable.
+    _platform_lock: Option<std::fs::File>,
+}
+
 /// Run the resolver for this package on this host. `ONELF_NO_RESOLVER`
 /// turns it off for one launch, which is the way to tell whether a
 /// failure is the resolver's doing.
-fn resolve_for(pkg: &PackageData, pkg_root: &Path, lib_dirs: &[&str]) -> Resolution {
+///
+/// A host with no GL stack gets the build the package pins, if it pins
+/// one and the build can be had; the resolver then indexes that build
+/// ahead of the host. Anything that stops that is a warning, and the
+/// launch goes on without a GL stack.
+fn resolve_for(pkg: &PackageData, pkg_root: &Path, lib_dirs: &[&str]) -> Resolved {
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
     let policy = if disabled {
         HostLibsPolicy::Never
@@ -238,17 +256,39 @@ fn resolve_for(pkg: &PackageData, pkg_root: &Path, lib_dirs: &[&str]) -> Resolut
         HostLibsPolicy::from_flags(pkg.footer.flags)
     };
     if policy == HostLibsPolicy::Never {
-        return Resolution::default();
+        return Resolved::default();
     }
     let Some(store) = crate::paths::resolve_store(&pkg.manifest.header.package_id) else {
-        return Resolution::default();
+        return Resolved::default();
     };
-    resolve::resolve(&Request {
+    let ld_cache = drivers::cache_file();
+
+    let mut platform = None;
+    if resolve::gl_situation(pkg_root, lib_dirs, &ld_cache, resolve::ICD_DIRS) == Gl::Absent {
+        match crate::platform::obtain(pkg_root) {
+            Ok(fetched) => platform = Some(fetched),
+            Err(why) => {
+                eprintln!("onelf-rt: this host has no GL stack and {why}; continuing without one")
+            }
+        }
+    }
+    let (platform_root, lock) = match platform {
+        Some((root, lock)) => (Some(root), Some(lock)),
+        None => (None, None),
+    };
+
+    let resolution = resolve::resolve(&Request {
         pkg_root,
         lib_dirs,
         policy,
         store: &store,
-        ld_cache: &drivers::cache_file(),
+        ld_cache: &ld_cache,
         icd_dirs: resolve::ICD_DIRS,
-    })
+        extra_root: platform_root.as_deref(),
+    });
+    Resolved {
+        resolution,
+        platform_root,
+        _platform_lock: lock,
+    }
 }

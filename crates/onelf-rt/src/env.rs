@@ -34,6 +34,7 @@ pub fn setup_env(
     lib_subpath: &str,
     target_path: &str,
     farm: Option<&Path>,
+    platform_root: Option<&Path>,
 ) -> String {
     let launch_dir = env::current_dir()
         .ok()
@@ -95,8 +96,15 @@ pub fn setup_env(
             // (see interp::build_exec_command).
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
-            // contains a dri/ subdirectory (both use the same paths)
-            let dri_paths: Vec<String> = lib_paths
+            // contains a dri/ subdirectory (both use the same paths). A
+            // fetched GL build's library directories count as well.
+            let mut driver_dirs = lib_paths.clone();
+            if let Some(root) = platform_root {
+                for dir in onelf_format::resolve::GL_BUILD_LIB_DIRS {
+                    driver_dirs.push(root.join(dir).to_string_lossy().into_owned());
+                }
+            }
+            let dri_paths: Vec<String> = driver_dirs
                 .iter()
                 .map(|p| Path::new(p).join("dri").to_string_lossy().to_string())
                 .filter(|p| Path::new(p).is_dir())
@@ -117,7 +125,7 @@ pub fn setup_env(
 
             // Auto-set GBM_BACKENDS_PATH if any lib dir contains a gbm/ subdirectory
             if env::var("GBM_BACKENDS_PATH").is_err() {
-                let gbm_paths: Vec<String> = lib_paths
+                let gbm_paths: Vec<String> = driver_dirs
                     .iter()
                     .map(|p| Path::new(p).join("gbm").to_string_lossy().to_string())
                     .filter(|p| Path::new(p).is_dir())
@@ -134,15 +142,17 @@ pub fn setup_env(
     // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
-    setup_xdg_data_dirs(pkg);
+    setup_xdg_data_dirs(pkg, platform_root);
 
-    // EGL vendor discovery: merge bundled + host dirs so both Mesa
-    // and proprietary drivers (NVIDIA, AMD) are visible to libglvnd.
+    // EGL vendor discovery: merge bundled, fetched and host dirs so both
+    // Mesa and proprietary drivers (NVIDIA, AMD) are visible to libglvnd.
     if env::var("__EGL_VENDOR_LIBRARY_DIRS").is_err() {
         let mut egl_dirs: Vec<String> = Vec::new();
-        let egl_dir = pkg.join("share/glvnd/egl_vendor.d");
-        if egl_dir.is_dir() {
-            egl_dirs.push(egl_dir.to_string_lossy().into_owned());
+        for root in [Some(pkg)].into_iter().chain([platform_root]).flatten() {
+            let egl_dir = root.join("share/glvnd/egl_vendor.d");
+            if egl_dir.is_dir() {
+                egl_dirs.push(egl_dir.to_string_lossy().into_owned());
+            }
         }
         for d in &[
             "/run/opengl-driver/share/glvnd/egl_vendor.d",
@@ -264,13 +274,21 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
 /// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find
 /// bundled GSettings schemas, icons, MIME types, etc. Host dirs are preserved
 /// so system themes and desktop integrations still work.
-fn setup_xdg_data_dirs(pkg: &Path) {
-    let share = pkg.join("share");
-    if !share.is_dir() {
+/// The package's `share/` goes first, a fetched GL build's after it so
+/// the Vulkan loader finds the build's ICD files, then the host's.
+fn setup_xdg_data_dirs(pkg: &Path, platform_root: Option<&Path>) {
+    let shares: Vec<String> = [Some(pkg), platform_root]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join("share"))
+        .filter(|share| share.is_dir())
+        .map(|share| share.to_string_lossy().into_owned())
+        .collect();
+    if shares.is_empty() {
         return;
     }
 
-    let pkg_share = share.to_string_lossy();
+    let pkg_share = shares.join(":");
     let existing = env::var("XDG_DATA_DIRS").unwrap_or_default();
 
     let new_val = if existing.is_empty() {

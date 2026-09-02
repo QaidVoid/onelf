@@ -263,6 +263,19 @@ fn hardened_agent(redirects: u32) -> ureq::Agent {
         .new_agent()
 }
 
+/// Download `url` to `into` through the hardened client. Used for a
+/// pinned GL build, which its hash verifies afterwards.
+pub fn download(url: &str, into: &Path) -> Result<(), String> {
+    let response = hardened_agent(10)
+        .get(url)
+        .call()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let mut reader = response.into_body().into_reader();
+    let mut file = std::fs::File::create(into).map_err(|e| format!("{}: {e}", into.display()))?;
+    io::copy(&mut reader, &mut file).map_err(|e| format!("{url}: {e}"))?;
+    Ok(())
+}
+
 /// A zsync client carrying the same policy as the rest of the update.
 fn update_http_client() -> zsync_rs::HttpClient {
     zsync_rs::HttpClient::with_agent(hardened_agent(10))

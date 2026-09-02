@@ -1,10 +1,11 @@
-//! Package loading from the current binary.
+//! Package loading from the current binary, or from any package file.
 //!
-//! Reads the ONELF footer from the end of `/proc/self/exe`, decompresses the
+//! Reads the ONELF footer from the end of the file, decompresses the
 //! manifest, and optionally loads the zstd dictionary.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use onelf_format::{Entry, FOOTER_SIZE, Footer, Manifest};
 
@@ -15,8 +16,14 @@ pub struct PackageData {
     pub dict: Option<Vec<u8>>,
 }
 
+/// The package this process is running from.
 pub fn load() -> io::Result<PackageData> {
-    let mut file = File::open("/proc/self/exe")?;
+    load_from(Path::new("/proc/self/exe"))
+}
+
+/// The package at `path`, which is how a pinned GL build is opened.
+pub fn load_from(path: &Path) -> io::Result<PackageData> {
+    let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
 
     if file_size < FOOTER_SIZE as u64 {

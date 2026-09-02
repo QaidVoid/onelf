@@ -125,15 +125,80 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / 1_048_576.0
 }
 
+/// Bytes held by every file under `dir`.
+fn dir_size(dir: &Path) -> u64 {
+    jwalk::WalkDir::new(dir)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// A pinned GL build the store holds: its label, when a package last used
+/// it, and its size.
+struct StoredBuild {
+    label: String,
+    dir: PathBuf,
+    used: Option<SystemTime>,
+    bytes: u64,
+}
+
+/// The builds the store holds, by label. A label directory without the
+/// build file is a fetch that never completed and is listed as unused.
+fn stored_builds(root: &Path) -> Vec<StoredBuild> {
+    let Ok(entries) = fs::read_dir(layout::platform_dir(root)) else {
+        return Vec::new();
+    };
+    let mut builds: Vec<StoredBuild> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let dir = e.path();
+            StoredBuild {
+                label: e.file_name().to_string_lossy().into_owned(),
+                used: fs::metadata(dir.join("gl.onelf"))
+                    .and_then(|m| m.modified())
+                    .ok(),
+                bytes: dir_size(&dir),
+                dir,
+            }
+        })
+        .collect();
+    builds.sort_by(|a, b| a.label.cmp(&b.label));
+    builds
+}
+
 pub fn cache_list() -> io::Result<()> {
     let root = cache_root()?;
+    let now = SystemTime::now();
+    let ago = |t: Option<SystemTime>| {
+        t.and_then(|t| now.duration_since(t).ok())
+            .map(|age| format!("{}s ago", age.as_secs()))
+            .unwrap_or_else(|| "unknown".into())
+    };
+
+    let builds = stored_builds(&root);
+    if !builds.is_empty() {
+        println!("GL builds:");
+        for build in &builds {
+            println!(
+                "  {} ({:.1} MB, last used: {})",
+                build.label,
+                mib(build.bytes),
+                ago(build.used)
+            );
+        }
+        println!();
+    }
+
     let pkg_dir = root.join("pkg");
     if !pkg_dir.exists() {
         println!("No cached packages.");
         return Ok(());
     }
 
-    let now = SystemTime::now();
     let mut count = 0u64;
 
     for entry in fs::read_dir(&pkg_dir)? {
@@ -144,12 +209,9 @@ pub fn cache_list() -> io::Result<()> {
         let name = entry.file_name();
         let id = name.to_string_lossy();
 
-        let last_used = fs::metadata(layout::meta_path(&root, &id))
+        let last_used = ago(fs::metadata(layout::meta_path(&root, &id))
             .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .map(|age| format!("{}s ago", age.as_secs()))
-            .unwrap_or_else(|| "unknown".into());
+            .ok());
 
         println!("  {id} (last used: {last_used})");
         count += 1;
@@ -180,14 +242,39 @@ pub fn cache_clear() -> io::Result<()> {
 
 pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
     let root = cache_root()?;
+    let now = SystemTime::now();
+    let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+
+    // A build's file is touched on every use, so its age is its idleness.
+    // Its extraction is a package like any other and goes through the
+    // package pass below when idle.
+    let mut builds_removed = 0u64;
+    let mut build_bytes = 0u64;
+    for build in stored_builds(&root) {
+        let idle = match build.used.map(|t| now.duration_since(t)) {
+            None => true,
+            Some(Ok(age)) => age > max_age,
+            Some(Err(_)) => false,
+        };
+        if idle && fs::remove_dir_all(&build.dir).is_ok() {
+            builds_removed += 1;
+            build_bytes += build.bytes;
+        }
+    }
+    if builds_removed > 0 {
+        println!(
+            "Removed {builds_removed} GL build(s) unused for {max_age_days} days, \
+             reclaimed {:.1} MB.",
+            mib(build_bytes)
+        );
+    }
+
     let meta_dir = root.join("meta");
     if !meta_dir.exists() {
         println!("No cached packages.");
         return Ok(());
     }
 
-    let now = SystemTime::now();
-    let max_age = std::time::Duration::from_secs(max_age_days * 86400);
     let mut removed = 0u64;
     let mut skipped = 0u64;
 
