@@ -214,6 +214,21 @@ pub(crate) enum RunpathOutcome {
 /// `$ORIGIN/../lib` to a directory above the package and finds nothing.
 const ORIGIN_RUNPATH: &str = "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
 
+/// Shorter `$ORIGIN` runpaths, longest first, for a slot too small to
+/// hold the full one. Any of these is safe: an entry that resolves to no
+/// directory is ignored, and none names a host path. The empty string is
+/// the floor, so a too-small slot is always overwritten rather than left
+/// with a host path like `/usr/lib` that a musl host would satisfy with
+/// its own libraries.
+const ORIGIN_RUNPATH_FALLBACKS: &[&str] = &[
+    "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../../lib",
+    "$ORIGIN/lib:$ORIGIN/../lib",
+    "$ORIGIN/../lib",
+    "$ORIGIN/lib",
+    "$ORIGIN",
+    "",
+];
+
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes.
 ///
 /// Returns [`RunpathOutcome::NeedsPatchelf`] when no in-place slot is big
@@ -284,14 +299,22 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
             end += 1;
         }
         let slot_size = end - file_pos;
-        if new_bytes.len() + 1 > slot_size {
-            continue;
-        }
-        data[file_pos..file_pos + new_bytes.len()].copy_from_slice(new_bytes);
-        for b in &mut data[file_pos + new_bytes.len()..file_pos + slot_size] {
+        // The full runpath when it fits, else the longest `$ORIGIN`
+        // fallback that does. The slot is always overwritten: leaving its
+        // old contents would keep an absolute host path such as `/usr/lib`,
+        // which on a musl host loads the host's own libraries into a glibc
+        // process (see ORIGIN_RUNPATH_FALLBACKS).
+        let write = std::iter::once(ORIGIN_RUNPATH)
+            .chain(ORIGIN_RUNPATH_FALLBACKS.iter().copied())
+            .find(|s| s.len() < slot_size)
+            .unwrap_or("");
+        data[file_pos..file_pos + write.len()].copy_from_slice(write.as_bytes());
+        for b in &mut data[file_pos + write.len()..file_pos + slot_size] {
             *b = 0;
         }
-        rewritten += 1;
+        if write.len() >= new_bytes.len() {
+            rewritten += 1;
+        }
     }
     // Retag every `DT_RUNPATH` as `DT_RPATH`, whether or not its string was
     // rewritten above.
@@ -318,8 +341,10 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
     if total > 0 && rewritten == total {
         return Ok(RunpathOutcome::Set);
     }
-    // A slot too small to hold the new string keeps its old contents, but is
-    // now an RPATH, so the executable's entry still covers it.
+    // A slot too small for the full string was overwritten with the
+    // longest safe `$ORIGIN` fallback instead, and retagged RPATH, so it
+    // names no host path and the executable's inherited entry covers the
+    // rest. Good enough for a library.
     if total > 0 && !is_executable {
         return Ok(RunpathOutcome::Set);
     }

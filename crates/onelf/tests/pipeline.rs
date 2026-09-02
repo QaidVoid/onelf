@@ -1469,6 +1469,69 @@ fn packing_does_not_hold_the_whole_tree() {
 /// positioned to notice, because on the packer's machine the host copy is
 /// the correct one. So bundling must say which libraries will come from
 /// the host.
+/// An absolute RPATH in a bundled library, `/usr/lib` as distributions
+/// write, is scrubbed so no host directory is searched. Left in place it
+/// loads the host's libraries into the process, which on a musl host
+/// means the musl libc against a glibc binary.
+#[test]
+fn an_absolute_rpath_in_a_bundled_library_is_scrubbed() {
+    let td = workdir("rpathscrub");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let src = td.join("plugin.c");
+    write(&src, "int plugin(void){return 0;}\n");
+    // A short absolute RPATH: the full $ORIGIN string will not fit its
+    // dynstr slot, which is the case that used to leave the host path.
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libplugin.so.1",
+            "-Wl,--disable-new-dtags,-rpath,/usr/lib",
+            src.to_str().unwrap(),
+        ],
+        &dir.join("lib/libplugin.so.1"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    write(&dir.join("run.c"), "int main(void){return 0;}\n");
+    assert!(cc_with(
+        &[dir.join("run.c").to_str().unwrap()],
+        &dir.join("bin/run")
+    ));
+
+    let out = Command::new(onelf())
+        .args(["bundle-libs", dir.to_str().unwrap(), "--target", "bin/run"])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let readelf = Command::new("readelf")
+        .args(["-d", dir.join("lib/libplugin.so.1").to_str().unwrap()])
+        .output()
+        .expect("spawn readelf");
+    let dyn_s = String::from_utf8_lossy(&readelf.stdout);
+    let rpath_line = dyn_s
+        .lines()
+        .find(|l| l.contains("RPATH") || l.contains("RUNPATH"))
+        .unwrap_or("");
+    assert!(
+        !rpath_line.contains("/usr/lib") && !rpath_line.contains("/lib]"),
+        "the host rpath survived: {rpath_line}"
+    );
+    assert!(
+        rpath_line.is_empty() || rpath_line.contains("$ORIGIN"),
+        "a surviving rpath must be $ORIGIN-relative: {rpath_line}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 #[test]
 fn bundling_reports_libraries_it_did_not_bundle() {
     let td = workdir("hostleak");
