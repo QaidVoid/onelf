@@ -30,8 +30,13 @@ pub struct Launch<'a> {
     pub interp_data: Option<&'a [u8]>,
     pub env_data: Option<&'a [u8]>,
     /// Whether this process is inside a private mount namespace, which
-    /// decides how a self-extracting binary gets its loader.
+    /// decides how a self-extracting binary gets its loader and how a host
+    /// library shadows its bundled copy.
     pub private_ns: bool,
+    /// Whether the package tree belongs to this launch alone and may be
+    /// edited in place, the other way a host library can shadow a bundled
+    /// copy when there is no namespace to mount in.
+    pub tree_writable: bool,
 }
 
 /// Replace this process with the entrypoint. Only returns by exiting.
@@ -55,6 +60,9 @@ pub fn exec(launch: &Launch) -> ! {
     };
     for name in &resolution.incomparable {
         eprintln!("onelf-rt: resolver: cannot order {name}; keeping the bundled copy");
+    }
+    if let Some(farm) = &resolution.farm {
+        shadow_bundled_copies(farm, launch, &lib_dirs);
     }
 
     let lib_path = crate::env::setup_env(
@@ -111,15 +119,91 @@ pub fn exec(launch: &Launch) -> ! {
     std::process::exit(1);
 }
 
+/// Put each host winner in place of the bundled copy it beat.
+///
+/// The farm on the library path is not enough for that: `bundle-libs`
+/// gives every executable a `DT_RPATH`, and the loader searches that
+/// before any library path, so a bundled copy would always be found
+/// first. Inside a private mount namespace the host file is bind-mounted
+/// over the bundled path, which every process in the tree then sees,
+/// including one that clears its environment and re-execs. A tree that is
+/// this launch's own gets a symlink instead. With neither, the farm is
+/// all there is, and only libraries the bundle does not carry can come
+/// from the host.
+fn shadow_bundled_copies(farm: &Path, launch: &Launch, lib_dirs: &[&str]) {
+    if !launch.private_ns && !launch.tree_writable {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(farm) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(host) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        for dir in lib_dirs {
+            let bundled = launch.pkg_root.join(dir).join(entry.file_name());
+            if !bundled.is_file() {
+                continue;
+            }
+            let outcome = if launch.private_ns {
+                rustix::mount::mount_bind(&host, &bundled).map_err(std::io::Error::from)
+            } else {
+                std::fs::remove_file(&bundled)
+                    .and_then(|()| std::os::unix::fs::symlink(&host, &bundled))
+            };
+            if let Err(e) = outcome {
+                eprintln!(
+                    "onelf-rt: resolver: cannot place {} over {}: {e}",
+                    host.display(),
+                    bundled.display()
+                );
+            }
+        }
+    }
+}
+
 /// The host's libc won, so the entrypoint runs under the host loader with
 /// the link farm shadowing every bundled glibc file. The bundled loader
-/// must not run at all here: a bootstrap-injected binary would jump into
-/// it and load a libc that does not match the one the farm now names.
+/// must not run at all here, or it would load a libc that does not match
+/// the one the farm now names.
 ///
-/// Userland exec keeps `/proc/self/exe` pointing at the entrypoint. A
-/// non-PIE binary, or one that carries a trailer the loader path cannot
-/// preserve, is handed to the host loader on its command line instead.
+/// A bootstrap-injected binary carries no `PT_INTERP` and maps its loader
+/// itself, so it is kernel-exec'd with `ONELF_INTERP` naming the host
+/// loader; the bootstrap honours that over its own relative path, and so
+/// does every re-exec the app performs. Anything else runs under the host
+/// loader directly: userland exec keeps `/proc/self/exe` pointing at the
+/// entrypoint, and a non-PIE binary, or one that carries a trailer the
+/// loader path cannot preserve, is handed to the loader on its command
+/// line instead.
 fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, launch: &Launch) {
+    let interp = crate::interp::read_elf_interp(target);
+    // A self-extracting binary needs `/proc/self/exe` to be itself, which
+    // only a kernel exec gives it. Its `PT_INTERP` names the host loader,
+    // and the host loader is what won, so the kernel can be left to it.
+    let kernel_exec = match &interp {
+        None => true,
+        Some(interp) => {
+            crate::selfextract::has_self_extract_trailer(target) && Path::new(interp).is_file()
+        }
+    };
+    if kernel_exec {
+        let mut cmd = Command::new(target);
+        cmd.arg0(launch.argv0)
+            .args(launch.args)
+            .env("ONELF_INTERP", host_interp);
+        let host_only: Vec<&str> = lib_path
+            .split(':')
+            .filter(|dir| !dir.is_empty() && !Path::new(dir).starts_with(launch.pkg_root))
+            .collect();
+        if !host_only.is_empty() {
+            cmd.env("LD_LIBRARY_PATH", host_only.join(":"));
+        }
+        let err = cmd.exec();
+        eprintln!("onelf-rt: exec failed: {err}");
+        std::process::exit(1);
+    }
+
     let direct = crate::ulexec::is_supported()
         && crate::interp::is_pie(target)
         && !crate::selfextract::has_self_extract_trailer(target);

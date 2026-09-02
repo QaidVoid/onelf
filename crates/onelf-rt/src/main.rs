@@ -286,6 +286,7 @@ fn main() {
         interp_data: interp_data.as_deref(),
         env_data: env_data.as_deref(),
         private_ns: false,
+        tree_writable: false,
     })
 }
 

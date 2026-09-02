@@ -123,5 +123,6 @@ pub fn execute_tmpfs(
         interp_data,
         env_data,
         private_ns: true,
+        tree_writable: false,
     })
 }

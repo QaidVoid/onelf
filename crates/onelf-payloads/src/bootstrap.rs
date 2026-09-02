@@ -474,6 +474,7 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
     let argc = *(stack as *const u32) as usize;
     // envp = stack + argc + 2 (skip argc word + argv[argc] + NULL)
     let mut envp = (stack as *const *const u8).add(argc + 2);
+    let interp_override = env_interp_override(envp);
     while !(*envp).is_null() {
         envp = envp.add(1);
     }
@@ -527,7 +528,11 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
         i += 1;
     }
 
-    let plen = dlen + rel_path_len;
+    let plen = if interp_override.is_null() {
+        dlen + rel_path_len
+    } else {
+        cstr_len(interp_override)
+    };
 
     let nph = if has(AT_PHNUM) {
         *(*auxv.add(AT_PHNUM as usize)) as usize
@@ -571,8 +576,12 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
 
     // Build interp path after the phdrs: dirname(execfn) + rel_path.
     let ipath = nw.add(nph + 1) as *mut u8;
-    bcopy(ipath, execfn, dlen);
-    bcopy(ipath.add(dlen), rel_path, rel_path_len);
+    if interp_override.is_null() {
+        bcopy(ipath, execfn, dlen);
+        bcopy(ipath.add(dlen), rel_path, rel_path_len);
+    } else {
+        bcopy(ipath, interp_override, plen);
+    }
     *ipath.add(plen) = 0;
 
     // Append the PT_INTERP entry.
@@ -624,6 +633,38 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
     arch::close(fd);
 
     ibase + (*ehdr).e_entry
+}
+
+/// The absolute path in `ONELF_INTERP`, or null when the environment at
+/// `envp` does not set one.
+///
+/// The runtime sets it when the entrypoint is to run under a loader other
+/// than the bundled one, which happens when the host's glibc is newer than
+/// the bundle's. Every process the app execs inherits the variable, so the
+/// whole tree keeps to one loader rather than each re-exec falling back
+/// to the bundled one beside a foreign libc.
+unsafe fn env_interp_override(mut envp: *const *const u8) -> *const u8 {
+    const KEY: &[u8] = b"ONELF_INTERP=";
+    while !(*envp).is_null() {
+        if slice_eq(*envp, KEY) {
+            let value = (*envp).add(KEY.len());
+            if *value == b'/' {
+                return value;
+            }
+        }
+        envp = envp.add(1);
+    }
+    core::ptr::null()
+}
+
+/// Length of the NUL-terminated `s`. Volatile for the same reason as
+/// [`bcopy`]: a plain loop is lowered to a `strlen` libcall.
+unsafe fn cstr_len(s: *const u8) -> usize {
+    let mut n = 0usize;
+    while core::ptr::read_volatile(s.add(n)) != 0 {
+        n += 1;
+    }
+    n
 }
 
 /// True if the NUL-terminated `s` starts with `prefix`.
@@ -786,6 +827,7 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
 
     let argc = *(stack as *const u32) as usize;
     let mut envp = (stack as *const *const u8).add(argc + 2);
+    let interp_override = env_interp_override(envp);
     while !(*envp).is_null() {
         envp = envp.add(1);
     }
@@ -835,7 +877,11 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
         i += 1;
     }
 
-    let plen = dlen + rel_path_len;
+    let plen = if interp_override.is_null() {
+        dlen + rel_path_len
+    } else {
+        cstr_len(interp_override)
+    };
 
     let nph = if has(AT_PHNUM) {
         *(*auxv.add(AT_PHNUM as usize)) as usize
@@ -877,8 +923,12 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
     }
 
     let ipath = nw.add(nph + 1) as *mut u8;
-    bcopy(ipath, execfn, dlen);
-    bcopy(ipath.add(dlen), rel_path, rel_path_len);
+    if interp_override.is_null() {
+        bcopy(ipath, execfn, dlen);
+        bcopy(ipath.add(dlen), rel_path, rel_path_len);
+    } else {
+        bcopy(ipath, interp_override, plen);
+    }
     *ipath.add(plen) = 0;
 
     let iph = nw.add(nph);

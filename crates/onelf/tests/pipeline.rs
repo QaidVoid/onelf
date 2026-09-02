@@ -1588,7 +1588,10 @@ fn a_package_needing_nothing_from_the_host_does_not_get_its_lib_dirs() {
 /// A package that loads a driver stack keeps the host directories, since
 /// GPU userspace has to come from the host.
 #[test]
-fn a_package_that_uses_a_driver_stack_keeps_the_host_lib_dirs() {
+fn a_package_that_uses_a_driver_stack_is_packed_with_auto() {
+    const NO_HOST_LIB_DIRS: u16 = 1 << 5;
+    const HOST_LIBS_ALWAYS: u16 = 1 << 6;
+
     let td = workdir("hostlibsgl");
     let app = td.join("app");
     std::fs::create_dir_all(app.join("bin")).unwrap();
@@ -1612,8 +1615,676 @@ fn a_package_that_uses_a_driver_stack_keeps_the_host_lib_dirs() {
         .expect("spawn onelf pack");
     assert!(o.status.success());
     assert!(
+        !has_footer_flag(&pkg, NO_HOST_LIB_DIRS) && !has_footer_flag(&pkg, HOST_LIBS_ALWAYS),
+        "a package referencing a driver soname must be packed with auto"
+    );
+    let info = Command::new(onelf())
+        .args(["info", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf info");
+    assert!(String::from_utf8_lossy(&info.stdout).contains("Host libs:      auto"));
+
+    // The same binary with no driver reference takes nothing from the host.
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"x\");return 0;}\n",
+    );
+    assert!(cc(&src, &app.join("bin/g")));
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/g", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    assert!(has_footer_flag(&pkg, NO_HOST_LIB_DIRS));
+
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args([
+            "--command",
+            "bin/g",
+            "--mtime",
+            "0",
+            "--host-libs",
+            "always",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    assert!(has_footer_flag(&pkg, HOST_LIBS_ALWAYS));
+    assert!(!has_footer_flag(&pkg, NO_HOST_LIB_DIRS));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Compile with the host `cc` and explicit arguments. Returns false when
+/// no compiler is available.
+fn cc_with(args: &[&str], out: &Path) -> bool {
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        eprintln!("skip: no C compiler available");
+        return false;
+    };
+    let st = Command::new(compiler)
+        .arg("-o")
+        .arg(out)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success(), "compiling {} failed", out.display());
+    true
+}
+
+/// A new-format glibc loader cache image naming `paths`, so a test can
+/// describe a host of its own making through `ONELF_LD_CACHE`.
+fn ld_so_cache(paths: &[&Path]) -> Vec<u8> {
+    let mut out = Vec::from(&b"glibc-ld.so.cache1.1"[..]);
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&[0; 3]);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&[0; 12]);
+    let strings_at = 48 + paths.len() * 24;
+    let mut strings: Vec<u8> = Vec::new();
+    for p in paths {
+        let off = (strings_at + strings.len()) as u32;
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        strings.extend_from_slice(p.to_str().unwrap().as_bytes());
+        strings.push(0);
+    }
+    out.extend_from_slice(&strings);
+    out
+}
+
+/// The crash class the resolver exists for: a host driver built against a
+/// newer copy of a library the bundle also carries. Directory ordering
+/// loads the bundled copy first and the driver fails to bind. The resolver
+/// compares the two by symbol version and hands the driver the host copy.
+///
+/// The host is a fixture: a driver `libGL.so.1` needing `FIX_2.0` from
+/// `libfixture.so.1`, described by a loader cache of its own.
+#[test]
+fn the_resolver_hands_a_host_driver_its_newer_dependency() {
+    let td = workdir("resolver");
+    let app = td.join("app");
+    let host = td.join("host");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::create_dir_all(&host).unwrap();
+
+    let fixture_c = td.join("fixture.c");
+    write(
+        &fixture_c,
+        "int fix_value(void){return 1;}\nint fix_extra(void){return 2;}\n",
+    );
+    let old_map = td.join("old.map");
+    write(&old_map, "FIX_1.0 { global: fix_value; local: *; };\n");
+    let new_map = td.join("new.map");
+    write(
+        &new_map,
+        "FIX_1.0 { global: fix_value; local: *; };\nFIX_2.0 { global: fix_extra; } FIX_1.0;\n",
+    );
+    let bundled_fixture = app.join("lib/libfixture.so.1");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", old_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &bundled_fixture,
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let host_fixture = host.join("libfixture.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", new_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &host_fixture,
+    ));
+
+    let gl_c = td.join("gl.c");
+    write(
+        &gl_c,
+        "int fix_extra(void);\nint gl_probe(void){return fix_extra();}\n",
+    );
+    let host_gl = host.join("libGL.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            gl_c.to_str().unwrap(),
+            &format!("-L{}", host.display()),
+            "-l:libfixture.so.1",
+        ],
+        &host_gl,
+    ));
+
+    let app_c = td.join("app.c");
+    write(
+        &app_c,
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    printf("LD_LIBRARY_PATH=%s\n", lp ? lp : "");
+    void *h = dlopen("libGL.so.1", RTLD_NOW);
+    if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
+    int (*probe)(void) = dlsym(h, "gl_probe");
+    if (!probe) { printf("dlsym: %s\n", dlerror()); return 1; }
+    printf("probe=%d\n", probe());
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[app_c.to_str().unwrap(), "-ldl"],
+        &app.join("bin/app")
+    ));
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&host_gl, &host_fixture])).unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/app", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
         !has_footer_flag(&pkg, 1 << 5),
-        "a package referencing a driver soname must keep the host lib dirs"
+        "the driver reference selects auto"
+    );
+
+    let launch = |no_resolver: bool| {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &cache);
+        if no_resolver {
+            run.env("ONELF_NO_RESOLVER", "1");
+        }
+        isolate(&mut run, &td);
+        run_package(&mut run)
+    };
+
+    let without = launch(true);
+    assert!(
+        !without.status.success(),
+        "without the resolver the driver must fail to bind: {}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+
+    let with = launch(false);
+    let stdout = String::from_utf8_lossy(&with.stdout);
+    assert!(
+        with.status.success() && stdout.contains("probe=2"),
+        "with the resolver the host driver binds against the host copy:\n{stdout}{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    let lp = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("LD_LIBRARY_PATH="))
+        .expect("the app reports its library path");
+    let private = td.join("xdg-run");
+    for dir in lp.split(':').filter(|d| !d.is_empty()) {
+        assert!(
+            Path::new(dir).starts_with(&private),
+            "a host directory reached the library path: {dir}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two copies that each define a version the other lacks cannot be ordered.
+/// The bundled copy is kept and the soname is named on stderr.
+#[test]
+fn incomparable_copies_are_named_and_stay_bundled() {
+    let td = workdir("incomparable");
+    let app = td.join("app");
+    let host = td.join("host");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::create_dir_all(&host).unwrap();
+
+    let fixture_c = td.join("fixture.c");
+    write(
+        &fixture_c,
+        "int fix_value(void){return 1;}\nint fix_extra(void){return 2;}\n",
+    );
+    let bundle_map = td.join("bundle.map");
+    write(
+        &bundle_map,
+        "FIX_1.0 { global: fix_value; local: *; };\nFIX_2.0 { global: fix_extra; } FIX_1.0;\n",
+    );
+    let host_map = td.join("host.map");
+    write(
+        &host_map,
+        "FIX_1.0 { global: fix_value; local: *; };\nVENDOR_1 { global: fix_extra; } FIX_1.0;\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", bundle_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &app.join("lib/libfixture.so.1"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let host_fixture = host.join("libfixture.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            &format!("-Wl,--version-script={}", host_map.display()),
+            fixture_c.to_str().unwrap(),
+        ],
+        &host_fixture,
+    ));
+    let gl_c = td.join("gl.c");
+    write(&gl_c, "int gl_probe(void){return 7;}\n");
+    let host_gl = host.join("libGL.so.1");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            gl_c.to_str().unwrap(),
+            &format!("-L{}", host.display()),
+            "-l:libfixture.so.1",
+        ],
+        &host_gl,
+    ));
+    let app_c = td.join("app.c");
+    write(
+        &app_c,
+        "#include <stdio.h>\nconst char *drv = \"libGL.so.1\";\nint main(void){puts(drv);return 0;}\n",
+    );
+    assert!(cc_with(&[app_c.to_str().unwrap()], &app.join("bin/app")));
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&host_gl, &host_fixture])).unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/app", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", &cache);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("onelf-rt: resolver: cannot order libfixture.so.1"),
+        "the incomparable soname must be named:\n{stderr}"
+    );
+    let farm = std::fs::read_dir(td.join("xdg-run"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("resolve-"))
+        })
+        .map(|p| p.join("farm"));
+    let farm = farm.expect("the resolver records its decision");
+    assert!(
+        farm.join("libGL.so.1").is_symlink(),
+        "the driver comes from the host"
+    );
+    assert!(
+        !farm.join("libfixture.so.1").exists(),
+        "an incomparable copy stays bundled"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Unlink the version definition before the last one from the ELF at
+/// `path`, so the copy reads as defining fewer versions than the one it
+/// was made from while staying the same bytes everywhere else. glibc lists
+/// its private version last, and the loader needs that one, so the entry
+/// before it is the newest public version.
+fn trim_newest_version(path: &Path) {
+    let mut data = std::fs::read(path).unwrap();
+    assert_eq!(&data[0..4], b"\x7fELF");
+    assert_eq!(data[4], 2, "64-bit ELF expected");
+    let shoff = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
+    let shentsize = u16::from_le_bytes(data[58..60].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(data[60..62].try_into().unwrap()) as usize;
+    let mut verdef = None;
+    for i in 0..shnum {
+        let at = shoff + i * shentsize;
+        let sh_type = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap());
+        if sh_type == 0x6fff_fffd {
+            let offset = u64::from_le_bytes(data[at + 24..at + 32].try_into().unwrap()) as usize;
+            verdef = Some(offset);
+            break;
+        }
+    }
+    let base = verdef.expect("the library defines versions");
+    let mut positions = vec![base];
+    loop {
+        let pos = *positions.last().unwrap();
+        let next = u32::from_le_bytes(data[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        if next == 0 {
+            break;
+        }
+        positions.push(pos + next);
+    }
+    assert!(positions.len() >= 3, "at least three version definitions");
+    let last = positions[positions.len() - 1];
+    let before = positions[positions.len() - 3];
+    let skip = (last - before) as u32;
+    data[before + 16..before + 20].copy_from_slice(&skip.to_le_bytes());
+    std::fs::write(path, data).unwrap();
+}
+
+/// The path `ldd` reports for `soname` when running `binary`.
+fn ldd_path(binary: &Path, soname: &str) -> Option<PathBuf> {
+    let out = Command::new("ldd").arg(binary).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with(soname) || line.contains(&format!("/{soname}")) {
+            let path = line
+                .split_once("=> ")
+                .map(|(_, rest)| rest)
+                .unwrap_or(line)
+                .split_whitespace()
+                .next()?;
+            return Some(PathBuf::from(path));
+        }
+        None
+    })
+}
+
+/// A host whose glibc is newer than the bundle's runs the entrypoint under
+/// the host loader, with the bundle's own libraries still loading from the
+/// bundle.
+///
+/// This machine's glibc is both sides of the comparison: the bundled copy
+/// is the same file with its newest version definition trimmed away, so
+/// the host copy reads as a strict superset.
+#[test]
+fn a_newer_host_glibc_runs_the_entrypoint_under_the_host_loader() {
+    let td = workdir("hostloader");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let fixture_c = td.join("fixture.c");
+    write(&fixture_c, "int fix_value(void){return 41;}\n");
+    let fixture = td.join("libfixture.so.1");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            fixture_c.to_str().unwrap(),
+        ],
+        &fixture,
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let app_c = td.join("app.c");
+    write(
+        &app_c,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int fix_value(void);
+int main(void) {
+    FILE *m = fopen("/proc/self/maps", "r");
+    char line[4096];
+    while (m && fgets(line, sizeof line, m)) fputs(line, stdout);
+    printf("value=%d\n", fix_value() + 1);
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[
+            app_c.to_str().unwrap(),
+            &format!("-L{}", td.display()),
+            "-l:libfixture.so.1",
+        ],
+        &app.join("bin/app"),
+    ));
+    let Some(host_libc) = ldd_path(&app.join("bin/app"), "libc.so.6") else {
+        eprintln!("skip: ldd does not report libc.so.6");
+        return;
+    };
+    let Some(host_ld) = ldd_path(&app.join("bin/app"), "ld-linux") else {
+        eprintln!("skip: ldd does not report the loader");
+        return;
+    };
+
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .args(["--search-path", td.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        o.status.success(),
+        "bundle-libs failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let bundled_libc = app.join("lib/libc.so.6");
+    assert!(bundled_libc.is_file(), "bundle-libs bundles libc");
+    trim_newest_version(&bundled_libc);
+
+    let cache = td.join("ld.so.cache");
+    let mut listed: Vec<PathBuf> = vec![host_libc.clone(), host_ld.clone()];
+    for name in ["libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1"] {
+        if let Some(p) = ldd_path(&app.join("bin/app"), name) {
+            listed.push(p);
+        }
+        let sibling = host_libc.with_file_name(name);
+        if sibling.is_file() && !listed.contains(&sibling) {
+            listed.push(sibling);
+        }
+    }
+    let refs: Vec<&Path> = listed.iter().map(PathBuf::as_path).collect();
+    std::fs::write(&cache, ld_so_cache(&refs)).unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args([
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+            "--host-libs",
+            "always",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let launch = |no_resolver: bool| {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &cache);
+        if no_resolver {
+            run.env("ONELF_NO_RESOLVER", "1");
+        }
+        isolate(&mut run, &td);
+        run_package(&mut run)
+    };
+
+    // A host file shadowing a bundled one keeps the bundled path, so the
+    // mapping is identified by inode rather than by name.
+    let inode_of = |p: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).unwrap().ino()
+    };
+    let host_libc_ino = inode_of(&host_libc);
+    let host_ld_ino = inode_of(&host_ld);
+    let mapped_inodes = |maps: &str, soname: &str| -> Vec<u64> {
+        let mut inodes: Vec<u64> = maps
+            .lines()
+            .filter(|l| l.ends_with(soname) || l.contains(&format!("/{soname} ")))
+            .filter_map(|l| l.split_whitespace().nth(4)?.parse().ok())
+            .collect();
+        inodes.sort();
+        inodes.dedup();
+        inodes
+    };
+    let maps_of = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let without = launch(true);
+    let maps = maps_of(&without);
+    assert!(
+        without.status.success() && maps.contains("value=42"),
+        "the bundle runs on its own:\n{maps}{}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    assert!(
+        !mapped_inodes(&maps, "libc.so.6").contains(&host_libc_ino),
+        "without the resolver the bundled libc is mapped:\n{maps}"
+    );
+
+    let with = launch(false);
+    let maps = maps_of(&with);
+    assert!(
+        with.status.success() && maps.contains("value=42"),
+        "the entrypoint runs under the host loader:\n{maps}{}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    assert_eq!(
+        mapped_inodes(&maps, "ld-linux-x86-64.so.2"),
+        [host_ld_ino],
+        "only the host loader is mapped:\n{maps}"
+    );
+    assert_eq!(
+        mapped_inodes(&maps, "libc.so.6"),
+        [host_libc_ino],
+        "only the host libc is mapped:\n{maps}"
+    );
+    assert!(
+        maps.contains("libfixture.so.1"),
+        "the bundle's own library still loads:\n{maps}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// With nothing taken from the host, a soname the bundle lacks fails by
+/// name rather than being satisfied by a host copy.
+#[test]
+fn a_never_package_fails_by_soname_when_a_library_is_missing() {
+    let td = workdir("neverfail");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+
+    let fixture_c = td.join("fixture.c");
+    write(&fixture_c, "int fix_value(void){return 1;}\n");
+    let fixture = td.join("libfixture.so.1");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            fixture_c.to_str().unwrap(),
+        ],
+        &fixture,
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let app_c = td.join("app.c");
+    write(
+        &app_c,
+        "#include <stdio.h>\nint fix_value(void);\nint main(void){printf(\"%d\\n\", fix_value());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            app_c.to_str().unwrap(),
+            &format!("-L{}", td.display()),
+            "-l:libfixture.so.1",
+        ],
+        &app.join("bin/app"),
+    ));
+
+    // Bundle the loader and libc so the launch never consults the host
+    // loader's own search path, then withhold the one library the app
+    // needs.
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .args(["--search-path", td.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        o.status.success(),
+        "bundle-libs failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(app.join("lib/libfixture.so.1").is_file());
+    std::fs::remove_file(app.join("lib/libfixture.so.1")).unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args([
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+            "--host-libs",
+            "never",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("libfixture.so.1"),
+        "the missing soname must be named:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&td);

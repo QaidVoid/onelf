@@ -166,6 +166,7 @@ fn exec_from_mount(
         interp_data,
         env_data,
         private_ns: true,
+        tree_writable: false,
     })
 }
 
@@ -362,6 +363,7 @@ pub fn execute_fuse(
                 interp_data,
                 env_data,
                 private_ns: true,
+                tree_writable: false,
             })
         }
         Ok(Fork::ParentOf(child_pid)) => {
