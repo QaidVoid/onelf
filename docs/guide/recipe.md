@@ -128,6 +128,24 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `dlopen` | array | `[]` | Extra sonames for `scan-dlopen` allow-list |
 | `skip` | bool | `false` | Don't run bundle-libs at all |
 
+### `[sysroot]`
+
+Take the bundle's contents from a pinned sysroot instead of scanning the
+packer's machine. Paths are relative to the recipe. See
+[Bundling from a Sysroot](./sysroot).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | path | required | The materialized rootfs, outside the AppDir |
+| `archive` | path | none | `.tar` or `.tar.zst` materialized into `path` when it does not exist |
+| `optional` | array | `[]` | Optional dependencies to include, by package name |
+| `platform-line` | path | none | File of soname prefixes the host provides |
+| `policy` | path | none | File of glob patterns that never ship |
+| `trace` | path | none | File of paths a test run opened |
+
+When this section is present, `bundle-libs` runs even if `[bundle] skip`
+is set, since it is what applies the sysroot.
+
 ### `[env]`
 
 Custom environment variables set by the runtime before exec.

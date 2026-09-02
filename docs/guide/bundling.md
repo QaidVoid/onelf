@@ -31,6 +31,23 @@ With no flags, this:
    the host's `ld.so.preload`, `ld.so.cache`, or hardcoded fallback
    library dirs.
 
+## Two ways to decide what goes in
+
+The walk above takes its universe from the machine you pack on: the
+`ldconfig` cache, the Nix store, and the search paths you add. It cannot
+see a `dlopen` by computed name, a plugin directory or a data file, and
+what it finds is what your distribution installs. For those cases a
+pinned sysroot with a package database is the other source: the bundle
+becomes the closure of your application's package, pruned by what you
+declare, with nothing taken from your machine. See
+[Bundling from a Sysroot](./sysroot).
+
+Both sources end in the same verifier. Every `DT_NEEDED` of every bundled
+ELF must resolve inside the bundle or name something the host provides.
+From a sysroot an unresolved soname is an error, since the universe was
+complete. From a host scan it is the warning described below, since the
+universe was a guess.
+
 ## Libraries that come from the host
 
 A library the bundle does not provide is not a hard error at runtime, but

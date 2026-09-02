@@ -137,6 +137,18 @@ dlopen = ["libmyvendor.so.1"]    # extra sonames for scan-dlopen allow-list
 skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
 ```
 
+## `[sysroot]`
+
+```toml
+[sysroot]
+path = "../sysroot"                   # PathBuf, required; must be outside the AppDir
+archive = "../platform-1.tar.zst"     # Option<PathBuf>, materialized into path when absent
+optional = ["mesa"]                   # Vec<String>, optional dependencies by package name
+platform-line = "../platform.txt"     # Option<PathBuf>, soname prefixes the host provides
+policy = "../policy.txt"              # Option<PathBuf>, glob patterns that never ship
+trace = "../trace.txt"                # Option<PathBuf>, paths a test run opened
+```
+
 ## `[env]`
 
 ```toml

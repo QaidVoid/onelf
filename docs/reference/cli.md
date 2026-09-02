@@ -99,6 +99,25 @@ onelf bundle-libs DIRECTORY [options]
 | `--strict-libc` | `false` | Skip wrong-family libc libs |
 | `--scan-dlopen` | `false` | Scan binary strings for common dlopen sonames |
 | `--dlopen SONAME` | | Extra sonames for `--scan-dlopen` (comma/repeat) |
+| `--sysroot DIR` | | Take the bundle's contents from this sysroot's package database; needs `--target` |
+| `--sysroot-optional PKG` | | Optional dependency to include from the sysroot (repeatable) |
+| `--platform-line FILE` | | Soname prefixes the host provides, one per line |
+| `--policy FILE` | | Glob patterns that never ship, one per line |
+| `--trace FILE` | | Paths a test run opened, one per line |
+
+## `onelf sysroot`
+
+Obtain and inspect pinned sysroots. See [Bundling from a Sysroot](../guide/sysroot).
+
+```
+onelf sysroot fetch SOURCE DIR
+onelf sysroot info DIR
+```
+
+| Command | Description |
+|---------|-------------|
+| `fetch SOURCE DIR` | Materialize a `.tar` or `.tar.zst` rootfs from a local path or an `https://` URL into `DIR` |
+| `info DIR` | Print the package count, file count and glibc version of a materialized sysroot |
 
 ## `onelf info`
 

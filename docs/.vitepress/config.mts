@@ -28,6 +28,7 @@ export default defineConfig({
           items: [
             { text: "AppDir Layout", link: "/guide/appdir-layout" },
             { text: "Bundling Libraries", link: "/guide/bundling" },
+            { text: "Bundling from a Sysroot", link: "/guide/sysroot" },
             { text: "Cross-libc Packages", link: "/guide/cross-libc" },
             { text: "Recipe File", link: "/guide/recipe" },
             { text: "Reproducible Builds", link: "/guide/reproducible" },
