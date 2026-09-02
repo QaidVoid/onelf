@@ -477,10 +477,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // `.onelf/` is reserved for injected metadata, except for the
     // documented user-provided asset dirs `.onelf/icons/` and
-    // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`). The
-    // bare `.onelf` directory is allowed as their parent. Any other
-    // collision is rejected so injected metadata is never shadowed by, or
-    // silently duplicated alongside, source content.
+    // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`) and the
+    // provenance record `bundle-libs` writes from a sysroot. The bare
+    // `.onelf` directory is allowed as their parent. Any other collision
+    // is rejected so injected metadata is never shadowed by, or silently
+    // duplicated alongside, source content.
     let reserved = Path::new(".onelf");
     let collision = files
         .iter()
@@ -492,6 +493,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != reserved
                 && !p.starts_with(".onelf/icons")
                 && !p.starts_with(".onelf/desktop")
+                && p.as_path() != Path::new(crate::bundle::sysroot::PROVENANCE_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(

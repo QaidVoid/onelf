@@ -781,6 +781,7 @@ fn main() {
                         ));
                     };
                     Some(bundle::SysrootOptions {
+                        platform: bundle::sysroot::default_label(&root, None),
                         root,
                         command: command.to_string(),
                         optional: sysroot_optional,
@@ -858,9 +859,14 @@ fn sysroot_from_recipe(
         };
         sysroot_cmd::fetch(&resolve(archive).to_string_lossy(), &root)?;
     }
+    let platform = sr
+        .platform
+        .clone()
+        .unwrap_or_else(|| bundle::sysroot::default_label(&root, sr.archive.as_deref()));
     Ok(bundle::SysrootOptions {
         root,
         command: command.to_string(),
+        platform,
         optional: sr.optional.clone(),
         platform_line: sr.platform_line.as_deref().map(resolve),
         policy: sr.policy.as_deref().map(resolve),

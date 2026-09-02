@@ -4744,3 +4744,192 @@ fn sysroot_builds_are_reproducible_and_traversal_is_refused() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A bundle built from a sysroot records what it came from, and `onelf
+/// info` reports it; a host-scan bundle reports that nothing is recorded.
+#[test]
+fn a_sysroot_build_records_its_provenance() {
+    let td = workdir("provenance");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "platform = \"platform-test\"\n");
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pkg = dir.join("app.onelf");
+
+    let list = Command::new(onelf())
+        .args(["list", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    assert!(String::from_utf8_lossy(&list.stdout).contains(".onelf/provenance.toml"));
+
+    let info = Command::new(onelf())
+        .args(["info", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf info");
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(info.status.success());
+    assert!(stdout.contains("Platform:     platform-test"), "{stdout}");
+    for line in [
+        "app 1.0-1",
+        "glibc 2.99-1",
+        "libfixture 1.0-1",
+        "mesa-fake 1.0-1",
+    ] {
+        assert!(stdout.contains(line), "{line} missing:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("extra 1.0-1"),
+        "an unnamed optional package is not listed"
+    );
+
+    let plain = pack_script(&td, "plain", "#!/bin/sh\necho hi\n");
+    let info = Command::new(onelf())
+        .args(["info", plain.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf info");
+    assert!(String::from_utf8_lossy(&info.stdout).contains("none recorded"));
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The record is display only: an edited one changes nothing about how
+/// the package runs, and builds stay reproducible with it in place.
+#[test]
+fn an_edited_provenance_record_changes_nothing() {
+    let td = workdir("provenanceedit");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let out = Command::new(onelf())
+        .args(["sysroot", "fetch"])
+        .arg(&fixture.archive)
+        .arg(td.join("sysroot"))
+        .output()
+        .expect("spawn onelf sysroot fetch");
+    assert!(out.status.success());
+
+    let bundle = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        let out = Command::new(onelf())
+            .args(["bundle-libs", dir.to_str().unwrap(), "--target", "bin/app"])
+            .args(["--sysroot", td.join("sysroot").to_str().unwrap()])
+            .args(["--platform-line", fixture.platform_line.to_str().unwrap()])
+            .args(["--policy", fixture.policy.to_str().unwrap()])
+            .output()
+            .expect("spawn onelf bundle-libs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let pack = |dir: &Path, out: &Path| {
+        let o = Command::new(onelf())
+            .args(["pack", dir.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args(["--command", "bin/app", "--mtime", "0"])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    let run = |pkg: &Path| {
+        let mut run = Command::new(pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &fixture.ld_cache);
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let honest = td.join("honest");
+    bundle(&honest);
+    pack(&honest, &td.join("honest.onelf"));
+    let expected = run(&td.join("honest.onelf"));
+
+    let edited = td.join("edited");
+    bundle(&edited);
+    std::fs::write(
+        edited.join(".onelf/provenance.toml"),
+        "platform = \"lies\"\n\n[[package]]\nname = \"nothing-here\"\nversion = \"9\"\n",
+    )
+    .unwrap();
+    pack(&edited, &td.join("edited.onelf"));
+    assert_eq!(run(&td.join("edited.onelf")), expected);
+
+    let again = td.join("again");
+    bundle(&again);
+    pack(&again, &td.join("again.onelf"));
+    assert!(
+        std::fs::read(td.join("honest.onelf")).unwrap()
+            == std::fs::read(td.join("again.onelf")).unwrap(),
+        "two sysroot builds with their records differ"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A record that does not parse is reported as malformed, and the rest
+/// of the package's information still prints.
+#[test]
+fn a_malformed_provenance_record_is_reported_not_fatal() {
+    let td = workdir("provenancebad");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let out = Command::new(onelf())
+        .args(["sysroot", "fetch"])
+        .arg(&fixture.archive)
+        .arg(td.join("sysroot"))
+        .output()
+        .expect("spawn onelf sysroot fetch");
+    assert!(out.status.success());
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(onelf())
+        .args(["bundle-libs", dir.to_str().unwrap(), "--target", "bin/app"])
+        .args(["--sysroot", td.join("sysroot").to_str().unwrap()])
+        .args(["--platform-line", fixture.platform_line.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let record = dir.join(".onelf/provenance.toml");
+    let text = std::fs::read_to_string(&record).unwrap();
+    std::fs::write(&record, &text[..text.len() - 6]).unwrap();
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", dir.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/app", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let info = Command::new(onelf())
+        .args(["info", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf info");
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(info.status.success());
+    assert!(stdout.contains("malformed record"), "{stdout}");
+    assert!(stdout.contains("Entrypoints:"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}

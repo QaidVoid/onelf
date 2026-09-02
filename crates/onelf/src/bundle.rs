@@ -349,7 +349,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             sysroot::print_report(sr, &report);
             Some(platform)
         }
-        None => None,
+        None => {
+            // A record from an earlier sysroot build would describe a
+            // bundle this run is about to change.
+            let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
+            None
+        }
     };
     let frameworks = opts.sysroot.is_none();
 

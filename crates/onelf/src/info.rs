@@ -84,6 +84,26 @@ pub fn info(path: &Path) -> io::Result<()> {
         println!();
     }
 
+    println!("Provenance:");
+    match read_metadata_string(
+        path,
+        &footer,
+        &manifest,
+        crate::bundle::sysroot::PROVENANCE_FILE,
+    )? {
+        None => println!("  none recorded (built from a host scan)"),
+        Some(text) => match parse_provenance(&text) {
+            Ok((platform, packages)) => {
+                println!("  Platform:     {platform}");
+                for (name, version) in packages {
+                    println!("  {name} {version}");
+                }
+            }
+            Err(e) => println!("  malformed record: {e}"),
+        },
+    }
+    println!();
+
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {
         let has_key =
             read_metadata_string(path, &footer, &manifest, ".onelf/update-key")?.is_some();
@@ -213,6 +233,33 @@ pub fn read_footer_and_manifest(path: &Path) -> io::Result<(Footer, Manifest)> {
 
     let manifest = read_manifest(&mut file, &footer)?;
     Ok((footer, manifest))
+}
+
+/// The platform label and `(name, version)` pairs of a provenance record.
+/// Display only: nothing the runtime does depends on it.
+fn parse_provenance(text: &str) -> Result<(String, Vec<(String, String)>), String> {
+    let value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let platform = value
+        .get("platform")
+        .and_then(toml::Value::as_str)
+        .ok_or("no platform label")?
+        .to_string();
+    let mut packages = Vec::new();
+    if let Some(list) = value.get("package") {
+        let list = list.as_array().ok_or("package is not a list")?;
+        for entry in list {
+            let name = entry
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or("package without a name")?;
+            let version = entry
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .ok_or("package without a version")?;
+            packages.push((name.to_string(), version.to_string()));
+        }
+    }
+    Ok((platform, packages))
 }
 
 fn hex(bytes: &[u8]) -> String {

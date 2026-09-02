@@ -192,6 +192,9 @@ pub struct Sysroot {
     pub path: PathBuf,
     /// An archive to materialize into `path` when it does not exist yet.
     pub archive: Option<PathBuf>,
+    /// A label for this sysroot, recorded in the package's provenance.
+    /// Defaults to the archive's file name, or the directory's name.
+    pub platform: Option<String>,
     /// Optional dependencies to include, by package name.
     #[serde(default)]
     pub optional: Vec<String>,
@@ -422,6 +425,14 @@ mod package_tests {
         );
         assert_eq!(sr.optional, ["extra"]);
         assert!(sr.trace.is_none());
+        assert!(sr.platform.is_none());
+        let recipe = load_str(
+            "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"sysroot\"\nplatform = \"platform-1\"\n",
+        );
+        assert_eq!(
+            recipe.sysroot.unwrap().platform.as_deref(),
+            Some("platform-1")
+        );
         assert!(
             load_str("[package]\ncommand = \"bin/app\"\n")
                 .sysroot

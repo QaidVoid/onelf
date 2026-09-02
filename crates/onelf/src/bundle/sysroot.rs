@@ -24,6 +24,8 @@ pub struct SysrootOptions {
     pub root: PathBuf,
     /// The entrypoint relative to the AppDir, as in the recipe.
     pub command: String,
+    /// The label recorded as the package's platform in its provenance.
+    pub platform: String,
     /// Optional dependencies to include, by package name.
     pub optional: Vec<String>,
     /// Sonames the host provides, one prefix per line.
@@ -133,7 +135,57 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             false => report.absent += 1,
         }
     }
+    let record = appdir.join(PROVENANCE_FILE);
+    if let Some(parent) = record.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&record, render_provenance(&opts.platform, &report.packages))?;
+    super::normalize_mtime(&record);
     Ok((report, platform))
+}
+
+/// Where the bundle records what it was built from, relative to the
+/// AppDir. Read by `onelf info`, never by the runtime.
+pub const PROVENANCE_FILE: &str = ".onelf/provenance.toml";
+
+/// The provenance record: the platform label and every contributing
+/// package with its version, in name order.
+pub fn render_provenance(platform: &str, packages: &[(String, String)]) -> String {
+    let mut out = format!("platform = {}\n", toml_string(platform));
+    for (name, version) in packages {
+        out.push_str(&format!(
+            "\n[[package]]\nname = {}\nversion = {}\n",
+            toml_string(name),
+            toml_string(version)
+        ));
+    }
+    out
+}
+
+/// A basic TOML string: quotes, backslashes and control characters
+/// escaped, so a package name cannot open a new table.
+fn toml_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The label a sysroot gets when the recipe names none: the archive's
+/// file name, or the directory's.
+pub fn default_label(root: &Path, archive: Option<&Path>) -> String {
+    archive
+        .and_then(|a| a.file_name())
+        .or_else(|| root.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sysroot".to_string())
 }
 
 /// The AppDir path a sysroot path lands at: `usr/` is the prefix the
@@ -328,6 +380,26 @@ mod tests {
         // The compatibility links a rootfs carries fold onto themselves.
         assert_eq!(relink("bin", Path::new("usr/bin")), None);
         assert_eq!(relink("lib", Path::new("usr/lib")), None);
+    }
+
+    #[test]
+    fn the_record_renders_to_fixed_bytes_with_escaping() {
+        let packages = vec![
+            ("app".to_string(), "1.0-1".to_string()),
+            ("we\"ird".to_string(), "2\\3".to_string()),
+        ];
+        assert_eq!(
+            render_provenance("platform-1", &packages),
+            "platform = \"platform-1\"\n\n[[package]]\nname = \"app\"\nversion = \"1.0-1\"\n\n[[package]]\nname = \"we\\\"ird\"\nversion = \"2\\\\3\"\n"
+        );
+        assert_eq!(
+            default_label(
+                Path::new("/x/sysroot"),
+                Some(Path::new("/y/platform-1.tar.zst"))
+            ),
+            "platform-1.tar.zst"
+        );
+        assert_eq!(default_label(Path::new("/x/sysroot"), None), "sysroot");
     }
 
     #[test]
