@@ -195,12 +195,15 @@ pub(crate) fn expand_nix_cache(
     }
 }
 
+/// `confined` limits the search to `search_paths`: in sysroot mode the
+/// packer's own machine is never consulted.
 pub(crate) fn locate_lib(
     soname: &str,
     ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
     search_paths: &[PathBuf],
     target_class: Option<u8>,
     target_machine: Option<u16>,
+    confined: bool,
 ) -> Option<PathBuf> {
     let class_matches = |path: &Path| -> bool {
         match target_class {
@@ -227,6 +230,10 @@ pub(crate) fn locate_lib(
         if candidate.exists() && acceptable(&candidate) {
             return Some(candidate);
         }
+    }
+
+    if confined {
+        return None;
     }
 
     // 2. ldconfig cache. Sort candidates so the first acceptable match is

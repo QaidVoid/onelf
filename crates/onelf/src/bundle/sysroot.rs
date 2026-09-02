@@ -370,6 +370,9 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     for c in &to[common..] {
         out.push(c.as_os_str());
     }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
     out
 }
 
@@ -458,6 +461,11 @@ mod tests {
         assert_eq!(relink("lib64", Path::new("usr/lib")), some("lib"));
         assert_eq!(relink("usr/lib64", Path::new("lib")), some("lib"));
         assert_eq!(relink("usr/sbin", Path::new("bin")), some("bin"));
+        // A link to its own directory, as `..//lib` from `lib/gcc4.8`.
+        assert_eq!(
+            relink("opt/tbb/lib/gcc4.8", Path::new("..//lib")),
+            some(".")
+        );
         // The compatibility links a rootfs carries fold onto themselves.
         assert_eq!(relink("bin", Path::new("usr/bin")), None);
         assert_eq!(relink("lib", Path::new("usr/lib")), None);

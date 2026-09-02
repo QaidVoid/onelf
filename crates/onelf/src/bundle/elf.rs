@@ -108,18 +108,42 @@ pub(crate) fn expand_runpath_entry(entry: &str, origin: &Path) -> PathBuf {
 
 /// Split colon-separated runpath strings into their component directories,
 /// expand `$ORIGIN` relative to `origin`, and keep only those that exist.
+#[cfg(test)]
 pub(crate) fn resolve_runpath_dirs<'a>(
     raw: impl Iterator<Item = &'a str>,
     origin: &Path,
 ) -> Vec<PathBuf> {
+    resolve_runpath_dirs_under(raw, origin, None)
+}
+
+/// As [`resolve_runpath_dirs`], with an absolute entry taken as a path
+/// inside `root` when one is given: a sysroot's binaries name the
+/// sysroot's directories, which need not exist on the packer's machine.
+pub(crate) fn resolve_runpath_dirs_under<'a>(
+    raw: impl Iterator<Item = &'a str>,
+    origin: &Path,
+    root: Option<&Path>,
+) -> Vec<PathBuf> {
     raw.flat_map(|s| s.split(':'))
         .filter(|s| !s.is_empty())
         .map(|entry| expand_runpath_entry(entry, origin))
+        .map(|dir| match root {
+            Some(root) if dir.is_absolute() && !dir.starts_with(root) => {
+                root.join(dir.strip_prefix("/").unwrap_or(&dir))
+            }
+            _ => dir,
+        })
         .filter(|p| p.is_dir())
         .collect()
 }
 
 pub(crate) fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
+    parse_rpaths_under(path, None)
+}
+
+/// The directories an ELF's `DT_RUNPATH` (or failing that `DT_RPATH`)
+/// names, absolute ones mapped under `root` when given.
+pub(crate) fn parse_rpaths_under(path: &Path, root: Option<&Path>) -> Vec<PathBuf> {
     let Ok(data) = fs::read(path) else {
         return Vec::new();
     };
@@ -136,7 +160,7 @@ pub(crate) fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
     } else {
         &elf.rpaths
     };
-    resolve_runpath_dirs(raw.iter().copied(), origin)
+    resolve_runpath_dirs_under(raw.iter().copied(), origin, root)
 }
 
 /// Rewrite RPATH/RUNPATH to `$ORIGIN/../lib` so the bundled ELF finds its
@@ -500,38 +524,47 @@ pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
     Ok(RunpathOutcome::Unguaranteed)
 }
 
-/// Sonames a bundled object needs that no bundled file provides.
+/// Sonames a bundled object needs that the bundle does not provide where
+/// the loader will look.
 ///
-/// Anything listed here is resolved from the host at runtime, and not by
-/// accident: the runtime appends the host's library directories to the
-/// search path so GPU drivers stay reachable (`drivers::host_driver_paths`).
-/// Those directories hold the whole system's libraries, not just drivers,
-/// so a soname missing from the bundle is quietly satisfied by the host's
-/// copy and loaded next to the bundled libc. A glibc that disagrees with
-/// the bundled one is exactly the mismatch that crashes, and nothing
-/// reports it, because on the packer's machine the host copy is the right
-/// one.
-///
-/// The loader's own fallbacks are already closed: `scrub_loader_paths`
-/// blanks its compiled-in directories and its `ld.so.cache` path. This is
-/// the one remaining route, and it is one the runtime opens deliberately.
+/// The packer writes every object an RPATH of `$ORIGIN/../lib`, and the
+/// entrypoint's RPATH names `lib_dir`, so those two directories are the
+/// whole search: a copy anywhere else in the tree, a vendor's `opt/`
+/// install say, does not count. A soname listed here is resolved from
+/// the host at runtime or not at all. On the packer's machine the host's
+/// copy is the right one, so nothing else reports the omission.
 ///
 /// The dynamic loader is excluded: it is named through PT_INTERP rather
 /// than DT_NEEDED, and is handled separately.
-pub(crate) fn audit_unbundled_needs(directory: &Path) -> Vec<(PathBuf, Vec<String>)> {
-    let mut provided: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in jwalk::WalkDir::new(directory).sort(true) {
-        let Ok(entry) = entry else { continue };
-        if let Some(name) = entry.file_name().to_str() {
-            provided.insert(name.to_string());
-        }
-    }
+pub(crate) fn audit_unbundled_needs(
+    directory: &Path,
+    lib_dir: &Path,
+) -> Vec<(PathBuf, Vec<String>)> {
+    use std::collections::{HashMap, HashSet};
+
+    let names_in = |dir: &Path| -> HashSet<String> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect()
+    };
+    let shared = names_in(&directory.join(lib_dir));
+    let mut beside: HashMap<PathBuf, HashSet<String>> = HashMap::new();
 
     let mut findings: Vec<(PathBuf, Vec<String>)> = Vec::new();
     for path in find_elf_files(directory) {
         let Ok(needed) = parse_needed(&path) else {
             continue;
         };
+        let origin_lib = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("../lib");
+        let local = beside
+            .entry(origin_lib.clone())
+            .or_insert_with(|| names_in(&origin_lib));
         let mut missing: Vec<String> = needed
             .into_iter()
             .filter(|soname| {
@@ -539,7 +572,7 @@ pub(crate) fn audit_unbundled_needs(directory: &Path) -> Vec<(PathBuf, Vec<Strin
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(soname);
-                !provided.contains(bare) && !is_dynamic_loader(bare)
+                !shared.contains(bare) && !local.contains(bare) && !is_dynamic_loader(bare)
             })
             .collect();
         if !missing.is_empty() {

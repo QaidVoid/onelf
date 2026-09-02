@@ -27,7 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use onelf_sysroot::PlatformLine;
+use onelf_sysroot::{PlatformLine, Policy};
 
 mod ui;
 pub(crate) use ui::{color, format_size};
@@ -548,8 +548,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 .entry(name.to_string())
                 .or_insert_with(|| format!("{requirer} (PT_INTERP)"));
         }
-        // Collect RPATH/RUNPATH directories from input binaries
-        for dir in parse_rpaths(path) {
+        // Collect RPATH/RUNPATH directories from input binaries. An
+        // absolute one names the sysroot's filesystem in sysroot mode, a
+        // `$ORIGIN` one the tree itself.
+        let sysroot_root = opts.sysroot.as_ref().map(|sr| sr.root.as_path());
+        for dir in parse_rpaths_under(path, sysroot_root) {
             if !rpath_dirs.contains(&dir) {
                 rpath_dirs.push(dir);
             }
@@ -611,7 +614,18 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             })?;
         }
     }
-    needed_by.retain(|soname, _| !existing.contains(soname));
+    // Only the library directory counts as present. The RPATH the packer
+    // writes reaches that directory and nothing else, so a copy elsewhere
+    // in the tree (a vendor's `opt/` install, a Python extension's
+    // private library) does not satisfy a need; one is copied in.
+    let reachable: HashSet<String> = fs::read_dir(opts.directory.join(&opts.lib_dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|name| name.contains(".so"))
+        .collect();
+    needed_by.retain(|soname, _| !reachable.contains(soname));
 
     if needed_by.is_empty() {
         eprintln!("All dependencies satisfied, nothing to bundle.");
@@ -719,6 +733,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 .into_iter()
                 .map(move |d| sr.root.join(d))
                 .filter(|d| d.is_dir())
+                .chain(onelf_sysroot::ldconf::search_dirs(&sr.root))
         })
         .collect();
     search_paths.extend(opts.search_path.iter().cloned());
@@ -727,6 +742,24 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     let mut copied: Vec<(String, PathBuf, u64, String)> = Vec::new();
     let mut not_found: Vec<(String, String)> = Vec::new();
+    // In sysroot mode the policy holds for dependencies too: a library it
+    // prunes is not brought back because something bundled needs it. The
+    // verifier then names that something, which is the file to prune next.
+    let policy = opts
+        .sysroot
+        .as_ref()
+        .and_then(|sr| sr.policy.as_deref())
+        .map(Policy::load)
+        .transpose()?;
+    let pruned_by_policy = |src: &Path| -> bool {
+        let (Some(sr), Some(policy)) = (opts.sysroot.as_ref(), policy.as_ref()) else {
+            return false;
+        };
+        src.strip_prefix(&sr.root)
+            .ok()
+            .is_some_and(|rel| policy.matches(&rel.to_string_lossy()))
+    };
+    let mut left_out: Vec<(String, String)> = Vec::new();
     let mut already_processed: HashSet<String> = HashSet::new();
     let mut expanded_nix: HashSet<PathBuf> = HashSet::new();
     // BLAKE3(content) -> soname, so aliases with identical bytes symlink instead of copy.
@@ -755,6 +788,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 &search_paths,
                 target_class,
                 target_machine,
+                opts.sysroot.is_some(),
             ) {
                 let resolved = fs::canonicalize(&src).unwrap_or(src);
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
@@ -784,7 +818,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             &search_paths,
             target_class,
             target_machine,
+            opts.sysroot.is_some(),
         ) {
+            Some(src) if pruned_by_policy(&src) => {
+                left_out.push((soname, requirer));
+            }
             Some(src) => {
                 let resolved = fs::canonicalize(&src).unwrap_or(src.clone());
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
@@ -914,7 +952,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 copied.push((soname.clone(), resolved.clone(), size, requirer));
 
                 // Collect RPATHs from resolved lib for transitive dep resolution
-                for dir in parse_rpaths(&resolved) {
+                let sysroot_root = opts.sysroot.as_ref().map(|sr| sr.root.as_path());
+                for dir in parse_rpaths_under(&resolved, sysroot_root) {
                     if !search_paths.contains(&dir) {
                         search_paths.push(dir);
                     }
@@ -968,6 +1007,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             color::bold(&format_size(total_size)),
             lib_dest.display()
         );
+    }
+
+    if !left_out.is_empty() {
+        eprintln!(
+            "\n{} ({})",
+            color::bold("Left out by policy"),
+            left_out.len()
+        );
+        for (lib, requirer) in &left_out {
+            eprintln!(
+                "  {} {}",
+                lib,
+                color::dim(&format!("(needed by {})", color::cyan(requirer)))
+            );
+        }
     }
 
     if !not_found.is_empty() {
@@ -1084,7 +1138,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 /// From a host scan the universe was a guess, and the finding stays a
 /// warning.
 fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Result<()> {
-    let mut findings = audit_unbundled_needs(&opts.directory);
+    let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
     if let Some(platform) = platform {
         for (_, libs) in &mut findings {
             libs.retain(|s| !platform.matches_soname(s));
@@ -1099,10 +1153,14 @@ fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Re
             .strip_prefix(&opts.directory)
             .unwrap_or(object)
             .display();
+        let more = match findings.len() {
+            1 => String::new(),
+            n => format!(" ({} more listed above)", n - 1),
+        };
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "{} needs {}, which is neither in the sysroot closure nor on the platform line",
+                "{} needs {}, which is neither in the sysroot closure nor on the platform line{more}",
                 object, libs[0]
             ),
         ));
