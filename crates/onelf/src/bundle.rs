@@ -947,7 +947,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     // on someone else's system they're dead paths at best and
                     // wrong-content paths at worst. Scrub before shipping.
                     if is_dynamic_loader(&soname)
-                        && let Err(e) = scrub_loader_paths(&dest)
+                        && let Err(e) = scrub_loader_paths(
+                            &dest,
+                            libc_family_of_soname(&soname).unwrap_or(LibcFamily::Glibc),
+                        )
                     {
                         eprintln!(
                             "  {} failed to scrub loader paths in {}: {e}",

@@ -907,35 +907,53 @@ pub(crate) fn is_dynamic_loader(soname: &str) -> bool {
     soname.starts_with("ld-linux") || soname.starts_with("ld-musl-") || soname == "ld.so"
 }
 
-/// Rewrite absolute-path byte sequences baked into the dynamic loader.
+/// Byte patterns a loader bakes in that name the packer's filesystem, and
+/// their equal-length replacements. Each replacement is a path that does
+/// not exist on any sane system, so the loader's lookup fails cleanly
+/// instead of reading a host file.
 ///
 /// glibc's `ld-linux` hardcodes its build-time `/etc/ld.so.cache`,
-/// `/etc/ld-nix.so.preload`, `/nix/store/<hash>-glibc-X/lib/`, and a
-/// few other absolute paths. Those exist on the packer's machine but
-/// not on the user's; worse, if any do exist, they'll point at a
-/// libc that disagrees with the one we bundled. The fix is to replace
-/// each prefix with a path that is guaranteed not to resolve (starts
-/// with `/XXX`), keeping byte length identical so ELF offsets stay
-/// valid.
+/// `/etc/ld-nix.so.preload`, `/nix/store/<hash>-glibc-X/lib/`, and its
+/// fallback library directories, and nothing else under those prefixes.
+///
+/// musl's loader is libc itself, so `/etc/passwd`, `/etc/resolv.conf`,
+/// and `/usr/share/zoneinfo/` sit in the same file and must survive: they
+/// are what `getpwnam`, `getaddrinfo`, and `localtime` read at runtime.
+/// Only its default library search path names the host.
+fn loader_scrub_list(family: LibcFamily) -> &'static [(&'static [u8], &'static [u8])] {
+    match family {
+        LibcFamily::Glibc => &[
+            (b"/etc/", b"/XXX/"),
+            (b"/usr/", b"/XXX/"),
+            (b"/nix/", b"/XXX/"),
+            // /lib/ and /lib64/ appear as glibc's hardcoded fallback
+            // library search paths. Our bundled libs live in `lib/` (no
+            // leading slash), so scrubbing absolute /lib doesn't hurt.
+            (b"/lib/", b"/XXX/"),
+            (b"/lib64/", b"/XXX///"),
+        ],
+        LibcFamily::Musl => &[(
+            b"/lib:/usr/local/lib:/usr/lib",
+            b"/XXX:/XXX/local/lib:/XXX/lib",
+        )],
+    }
+}
+
+/// Rewrite absolute-path byte sequences baked into the dynamic loader.
+///
+/// The paths exist on the packer's machine but not on the user's; worse,
+/// if any do exist, they'll point at a libc that disagrees with the one
+/// we bundled. The fix is to replace each with a path that is guaranteed
+/// not to resolve (starts with `/XXX`), keeping byte length identical so
+/// ELF offsets stay valid. What gets replaced depends on the libc family,
+/// see [`loader_scrub_list`].
 ///
 /// This is the same idea as sharun's `sed` pass, done in pure Rust
 /// with a more targeted prefix list.
-pub(crate) fn scrub_loader_paths(path: &Path) -> io::Result<()> {
+pub(crate) fn scrub_loader_paths(path: &Path, family: LibcFamily) -> io::Result<()> {
     let mut data = fs::read(path)?;
     let mut changed = false;
-    // Each pattern and replacement are equal length to avoid any ELF
-    // structure shifts. Replacements are paths that simply don't exist
-    // on any sane system.
-    let replacements: &[(&[u8], &[u8])] = &[
-        (b"/etc/", b"/XXX/"),
-        (b"/usr/", b"/XXX/"),
-        (b"/nix/", b"/XXX/"),
-        // /lib/ and /lib64/ appear as glibc's hardcoded fallback
-        // library search paths. Our bundled libs live in `lib/` (no
-        // leading slash), so scrubbing absolute /lib doesn't hurt.
-        (b"/lib/", b"/XXX/"),
-        (b"/lib64/", b"/XXX///"),
-    ];
+    let replacements = loader_scrub_list(family);
 
     for (needle, replace) in replacements {
         debug_assert_eq!(needle.len(), replace.len());
@@ -1609,5 +1627,45 @@ mod runpath_tests {
         );
         let written = &out[guard_off - 81..guard_off - 81 + ORIGIN_RUNPATH.len()];
         assert_eq!(written, ORIGIN_RUNPATH.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    const MUSL_LIBC: &[u8] =
+        b"\0/etc/passwd\0/etc/resolv.conf\0/usr/share/zoneinfo/\0/lib:/usr/local/lib:/usr/lib\0";
+    const GLIBC_LDSO: &[u8] = b"\0/etc/ld.so.cache\0/etc/ld.so.preload\0/usr/lib64/\0/lib64/\0";
+
+    fn scrub(tag: &str, bytes: &[u8], family: LibcFamily) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!("onelf-scrub-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loader");
+        fs::write(&path, bytes).unwrap();
+        scrub_loader_paths(&path, family).unwrap();
+        let out = fs::read(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        out
+    }
+
+    #[test]
+    fn musl_keeps_the_paths_libc_reads_at_runtime() {
+        let out = scrub("musl", MUSL_LIBC, LibcFamily::Musl);
+        assert_eq!(out.len(), MUSL_LIBC.len());
+        assert_eq!(
+            out,
+            b"\0/etc/passwd\0/etc/resolv.conf\0/usr/share/zoneinfo/\0/XXX:/XXX/local/lib:/XXX/lib\0"
+        );
+    }
+
+    #[test]
+    fn glibc_loses_every_host_prefix() {
+        let out = scrub("glibc", GLIBC_LDSO, LibcFamily::Glibc);
+        assert_eq!(out.len(), GLIBC_LDSO.len());
+        assert_eq!(
+            out,
+            b"\0/XXX/ld.so.cache\0/XXX/ld.so.preload\0/XXX/XXX///\0/XXX///\0"
+        );
     }
 }
