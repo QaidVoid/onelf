@@ -24,6 +24,7 @@ pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_BIG_WRITES: u32 = 1 << 3;
 pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
+pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
 pub const FUSE_NO_OPENDIR_SUPPORT: u32 = 1 << 24;
 

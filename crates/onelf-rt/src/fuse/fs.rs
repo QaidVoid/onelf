@@ -715,11 +715,15 @@ fn handle_init(header: &FuseInHeader, body: &[u8]) -> Vec<u8> {
     };
 
     let mut flags = FUSE_ASYNC_READ | FUSE_BIG_WRITES;
+    // FUSE_MAX_PAGES is what makes `max_pages` below count. Without it the
+    // kernel caps every read at 32 pages, 128 KiB, so each 256 KiB block
+    // takes two requests and a 1 MiB readahead takes eight.
     flags |= init_in.flags
         & (FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO
             | FUSE_CACHE_SYMLINKS
-            | FUSE_NO_OPENDIR_SUPPORT);
+            | FUSE_NO_OPENDIR_SUPPORT
+            | FUSE_MAX_PAGES);
 
     let init_out = FuseInitOut {
         major: 7,
