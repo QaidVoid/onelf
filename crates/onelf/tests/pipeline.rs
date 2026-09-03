@@ -6082,6 +6082,54 @@ fn a_publisher_file_with_an_unmet_need_is_a_finding_not_dropped() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A recipe can pin the sysroot archive by hash, the way it pins a GL
+/// build. An archive that does not match is not unpacked at all: it is
+/// executable code, and TLS says who served it, not that it is the one
+/// the recipe was written against.
+#[test]
+fn a_sysroot_archive_that_does_not_match_its_hash_is_not_unpacked() {
+    let td = workdir("sysroot-hash");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fresh = td.join("fresh-sysroot");
+    let recipe = |hash: &str| {
+        write(
+            &dir.join("onelf.toml"),
+            &format!(
+                "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"{}\"\narchive = \"{}\"\nhash = \"{hash}\"\nplatform-line = \"{}\"\npolicy = \"{}\"\n",
+                fresh.display(),
+                fixture.archive.display(),
+                fixture.platform_line.display(),
+                fixture.policy.display(),
+            ),
+        );
+    };
+
+    recipe(&"0".repeat(64));
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a wrong hash must fail:\n{stderr}");
+    assert!(stderr.contains("hash mismatch"), "{stderr}");
+    assert!(
+        !fresh.exists(),
+        "the archive was unpacked despite the mismatch"
+    );
+
+    let good = blake3::hash(&std::fs::read(&fixture.archive).unwrap()).to_hex();
+    recipe(&good.to_string().to_ascii_uppercase());
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fresh.is_dir());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.

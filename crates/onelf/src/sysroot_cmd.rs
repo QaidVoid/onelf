@@ -10,19 +10,27 @@ use crate::bundle::remove_dangling_links_beside;
 use crate::pack::{HostLibs, PackOptions};
 
 /// Materialize the rootfs archive at `source`, a local path or an
-/// `https://` URL, into `dir`.
-pub fn fetch(source: &str, dir: &Path) -> io::Result<()> {
+/// `https://` URL, into `dir`. With `hash`, the archive's BLAKE3 has to
+/// match before anything is unpacked: a sysroot is executable code, and
+/// TLS says who served it, not that it is the one the recipe was written
+/// against.
+pub fn fetch(source: &str, dir: &Path, hash: Option<&str>) -> io::Result<()> {
     if source.starts_with("http://") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "a sysroot is executable code; fetch it over https:// only",
         ));
     }
+    if let Some(hash) = hash {
+        onelf_sysroot::platform::check_hash(hash)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
     if let Some(rest) = source.strip_prefix("https://") {
         let name = rest.rsplit('/').next().unwrap_or("sysroot.tar");
         let staged = dir.with_extension(format!("download-{}", std::process::id()));
         let downloaded = download(source, &staged);
         let result = downloaded.and_then(|()| {
+            check_archive_hash(&staged, hash)?;
             eprintln!("Materializing {name} into {}", dir.display());
             archive::materialize(&staged, dir)
         });
@@ -30,12 +38,30 @@ pub fn fetch(source: &str, dir: &Path) -> io::Result<()> {
         return result;
     }
     let archive_path = Path::new(source);
+    check_archive_hash(archive_path, hash)?;
     eprintln!(
         "Materializing {} into {}",
         archive_path.display(),
         dir.display()
     );
     archive::materialize(archive_path, dir)
+}
+
+fn check_archive_hash(archive: &Path, expected: Option<&str>) -> io::Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = hash_file(archive)?;
+    if actual != expected.to_ascii_lowercase() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: hash mismatch (expected {expected}, got {actual}); not materializing",
+                archive.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn download(url: &str, into: &Path) -> io::Result<()> {

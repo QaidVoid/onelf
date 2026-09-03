@@ -143,6 +143,7 @@ skip = false                     # don't run bundle-libs at all (pre-bundled App
 [sysroot]
 path = "../sysroot"                   # PathBuf, required; must be outside the AppDir
 archive = "../platform-1.tar.zst"     # Option<PathBuf>, materialized into path when absent
+hash = "3f2a..."                       # Option<String>, BLAKE3 of the archive; a mismatch is not unpacked
 platform = "platform-1"               # Option<String>, provenance label; defaults to the archive or directory name
 optional = ["mesa"]                   # Vec<String>, packages to add to the closure, by name
 platform-line = "../platform.txt"     # Option<PathBuf>, soname prefixes the host provides

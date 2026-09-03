@@ -192,6 +192,9 @@ pub struct Sysroot {
     pub path: PathBuf,
     /// An archive to materialize into `path` when it does not exist yet.
     pub archive: Option<PathBuf>,
+    /// The archive's BLAKE3 hash. When set, an archive that does not
+    /// match is not unpacked.
+    pub hash: Option<String>,
     /// A label for this sysroot, recorded in the package's provenance.
     /// Defaults to the archive's file name, or the directory's name.
     pub platform: Option<String>,

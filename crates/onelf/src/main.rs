@@ -491,6 +491,9 @@ enum SysrootAction {
         source: String,
         /// Directory to materialize into
         dir: PathBuf,
+        /// BLAKE3 hash the archive must have before it is unpacked
+        #[arg(long)]
+        hash: Option<String>,
     },
     /// Show what a materialized sysroot holds
     Info {
@@ -844,7 +847,9 @@ fn main() {
             })
         }),
         Commands::Sysroot { action } => match action {
-            SysrootAction::Fetch { source, dir } => sysroot_cmd::fetch(&source, &dir),
+            SysrootAction::Fetch { source, dir, hash } => {
+                sysroot_cmd::fetch(&source, &dir, hash.as_deref())
+            }
             SysrootAction::Info { dir } => sysroot_cmd::info(&dir),
             SysrootAction::PackGl {
                 dir,
@@ -915,7 +920,11 @@ fn sysroot_from_recipe(
                 ),
             ));
         };
-        sysroot_cmd::fetch(&resolve(archive).to_string_lossy(), &root)?;
+        sysroot_cmd::fetch(
+            &resolve(archive).to_string_lossy(),
+            &root,
+            sr.hash.as_deref(),
+        )?;
     }
     let platform = sr
         .platform
