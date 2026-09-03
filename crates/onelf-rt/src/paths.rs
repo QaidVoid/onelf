@@ -94,9 +94,8 @@ impl Mountpoint {
 pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
     use rustix::fs::FlockOperation;
 
-    let name_prefix: String = package_name.chars().take(6).collect();
     let hash_suffix = crate::cache::hex(&package_id[0..4]);
-    let dir_name = format!("onelf-{name_prefix}-{hash_suffix}");
+    let dir_name = format!("onelf-{}-{hash_suffix}", name_stem(package_name));
 
     let base = private_dir()?;
     let lock_path = mountpoint_lock_path(&base, &dir_name);
@@ -118,6 +117,23 @@ pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
         return None;
     }
     Some(Mountpoint { path, _lock: lock })
+}
+
+/// The package name as the readable part of a directory name: its first
+/// six characters that are safe in one path component, or `pkg` when it
+/// has none. The name is the manifest's, so only its length is checked
+/// on the way in; a `/` in it would put the lock under a missing parent.
+fn name_stem(package_name: &str) -> String {
+    let stem: String = package_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(6)
+        .collect();
+    if stem.is_empty() {
+        "pkg".to_string()
+    } else {
+        stem
+    }
 }
 
 /// Where the launch resolver keeps its link farm and recorded decision for
@@ -429,5 +445,18 @@ mod tests {
         assert!(!is_safe_owned_dir(std::path::Path::new(
             "/nonexistent/onelf/private/xyz"
         )));
+    }
+}
+
+#[cfg(test)]
+mod name_stem_tests {
+    use super::name_stem;
+
+    #[test]
+    fn keeps_only_path_safe_characters() {
+        assert_eq!(name_stem("my app/\u{e9}vil-1.2"), "myappv");
+        assert_eq!(name_stem("blender"), "blende");
+        assert_eq!(name_stem("///"), "pkg");
+        assert_eq!(name_stem(""), "pkg");
     }
 }
