@@ -1801,7 +1801,8 @@ fn ld_so_cache(paths: &[&Path]) -> Vec<u8> {
     let mut strings: Vec<u8> = Vec::new();
     for p in paths {
         let off = (strings_at + strings.len()) as u32;
-        out.extend_from_slice(&0i32.to_le_bytes());
+        // Tagged for this ABI, as ldconfig would; the reader drops the rest.
+        out.extend_from_slice(&onelf_format::drivers::native_entry_flags().to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&off.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());

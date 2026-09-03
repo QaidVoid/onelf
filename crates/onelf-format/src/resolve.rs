@@ -649,7 +649,7 @@ mod tests {
         let mut strings: Vec<u8> = Vec::new();
         for p in paths {
             let off = (strings_at + strings.len()) as u32;
-            out.extend_from_slice(&0i32.to_le_bytes());
+            out.extend_from_slice(&drivers::native_entry_flags().to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&off.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());

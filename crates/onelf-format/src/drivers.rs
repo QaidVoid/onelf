@@ -33,7 +33,7 @@ pub fn cache_dirs_in(cache: &Path) -> Vec<String> {
     };
 
     let mut dirs: Vec<String> = Vec::new();
-    for entry in cache_entries(&data) {
+    for entry in cache_paths(&data) {
         let Some((dir, _)) = entry.rsplit_once('/') else {
             continue;
         };
@@ -100,7 +100,7 @@ pub fn cache_paths_in(cache: &Path) -> Vec<(String, String)> {
     let Ok(data) = std::fs::read(cache) else {
         return Vec::new();
     };
-    cache_entries(&data)
+    cache_paths(&data)
         .into_iter()
         .filter_map(|path| {
             let (_, name) = path.rsplit_once('/')?;
@@ -112,14 +112,65 @@ pub fn cache_paths_in(cache: &Path) -> Vec<(String, String)> {
 const CACHE_MAGIC_OLD: &[u8] = b"ld.so-1.7.0";
 const CACHE_MAGIC_NEW: &[u8] = b"glibc-ld.so.cache1.1";
 
-/// Library paths recorded in a glibc loader cache image.
+/// The ABI bits of a cache entry's flags word, `FLAG_REQUIRED_MASK` in
+/// glibc's `dl-cache.h`. A multilib host lists `libGL.so.1` once per ABI,
+/// and the loader picks by these bits; a reader that ignores them hands a
+/// 32-bit process the 64-bit copy.
+const FLAG_ABI_MASK: u32 = 0xff00;
+
+/// The ABI bits glibc tags this runtime's own libraries with, or `None`
+/// where the value is not known, in which case nothing is filtered.
+const fn native_abi() -> Option<u32> {
+    if cfg!(target_arch = "x86_64") {
+        Some(0x0300) // FLAG_X8664_LIB64
+    } else if cfg!(target_arch = "x86") {
+        Some(0x0000) // FLAG_ELF_LIBC6 alone
+    } else if cfg!(target_arch = "aarch64") {
+        Some(0x0a00) // FLAG_AARCH64_LIB64
+    } else if cfg!(target_arch = "powerpc64") {
+        Some(0x0500) // FLAG_POWERPC_LIB64
+    } else {
+        None
+    }
+}
+
+/// `FLAG_ELF_LIBC6`, the type bits every entry a current `ldconfig`
+/// writes carries.
+const FLAG_ELF_LIBC6: u32 = 0x0003;
+
+/// The flags word `ldconfig` writes for a library of this runtime's ABI.
+/// For a test that describes a host of its own making.
+pub const fn native_entry_flags() -> u32 {
+    match native_abi() {
+        Some(abi) => abi | FLAG_ELF_LIBC6,
+        None => FLAG_ELF_LIBC6,
+    }
+}
+
+fn for_this_abi(flags: u32) -> bool {
+    match native_abi() {
+        Some(abi) => flags & FLAG_ABI_MASK == abi,
+        None => true,
+    }
+}
+
+/// The paths a cache image lists for this runtime's ABI, in cache order.
+fn cache_paths(data: &[u8]) -> Vec<&str> {
+    cache_entries(data)
+        .into_iter()
+        .filter_map(|(flags, path)| for_this_abi(flags).then_some(path))
+        .collect()
+}
+
+/// Library paths recorded in a glibc loader cache image, each with the
+/// entry's flags word.
 ///
 /// Two layouts exist. `ldconfig` in its compatibility mode writes the old
 /// header, its entries, and then a complete new-format cache after them;
 /// otherwise it writes the new format alone, which is what current
 /// distributions ship. The new format is preferred wherever it appears, since
 /// the old one cannot express hwcap and is only kept for compatibility.
-fn cache_entries(data: &[u8]) -> Vec<&str> {
+fn cache_entries(data: &[u8]) -> Vec<(u32, &str)> {
     if data.starts_with(CACHE_MAGIC_NEW) {
         return new_entries(data, 0);
     }
@@ -146,10 +197,11 @@ fn cache_entries(data: &[u8]) -> Vec<&str> {
 }
 
 /// Entries of a new-format cache whose header starts at `base`.
-fn new_entries(data: &[u8], base: usize) -> Vec<&str> {
+fn new_entries(data: &[u8], base: usize) -> Vec<(u32, &str)> {
     // Header: magic+version (20), nlibs (4), len_strings (4), flags (1),
     // padding (3), extension_offset (4), unused (12). Entries follow at 48
-    // and are 24 bytes each; string offsets are relative to `base`.
+    // and are 24 bytes each, flags first; string offsets are relative to
+    // `base`.
     let Some(nlibs) = read_u32(data, base + 20) else {
         return Vec::new();
     };
@@ -158,11 +210,11 @@ fn new_entries(data: &[u8], base: usize) -> Vec<&str> {
         let Some(entry) = base.checked_add(48).and_then(|s| s.checked_add(i * 24)) else {
             break;
         };
-        let Some(value) = read_u32(data, entry + 8) else {
+        let (Some(flags), Some(value)) = (read_u32(data, entry), read_u32(data, entry + 8)) else {
             break;
         };
         if let Some(s) = read_str(data, base + value as usize) {
-            out.push(s);
+            out.push((flags, s));
         }
     }
     out
@@ -170,15 +222,15 @@ fn new_entries(data: &[u8], base: usize) -> Vec<&str> {
 
 /// Entries of an old-format cache with `nlibs` entries and a string table
 /// beginning at `strings`.
-fn old_entries(data: &[u8], nlibs: usize, strings: usize) -> Vec<&str> {
+fn old_entries(data: &[u8], nlibs: usize, strings: usize) -> Vec<(u32, &str)> {
     let mut out = Vec::new();
     for i in 0..nlibs {
         let entry = 16 + i * 12;
-        let Some(value) = read_u32(data, entry + 8) else {
+        let (Some(flags), Some(value)) = (read_u32(data, entry), read_u32(data, entry + 8)) else {
             break;
         };
         if let Some(s) = read_str(data, strings + value as usize) {
-            out.push(s);
+            out.push((flags, s));
         }
     }
     out
@@ -203,8 +255,19 @@ fn read_str(data: &[u8], at: usize) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn paths(img: &[u8]) -> Vec<&str> {
+        cache_entries(img).into_iter().map(|(_, p)| p).collect()
+    }
+
     /// A new-format cache image naming `paths`.
     fn new_cache(paths: &[&str]) -> Vec<u8> {
+        let flagged: Vec<(u32, &str)> = paths.iter().map(|p| (0, *p)).collect();
+        new_cache_flagged(&flagged)
+    }
+
+    /// A new-format cache image naming `entries` as `(flags, path)`.
+    fn new_cache_flagged(entries: &[(u32, &str)]) -> Vec<u8> {
+        let paths: Vec<&str> = entries.iter().map(|(_, p)| *p).collect();
         let mut out = Vec::from(CACHE_MAGIC_NEW);
         out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // len_strings
@@ -216,9 +279,9 @@ mod tests {
 
         let base = out.len();
         let strings_at = base + paths.len() * 24;
-        let (offsets, strings) = string_table(paths, strings_at);
-        for off in offsets {
-            out.extend_from_slice(&0i32.to_le_bytes()); // flags
+        let (offsets, strings) = string_table(&paths, strings_at);
+        for (off, (flags, _)) in offsets.into_iter().zip(entries) {
+            out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes()); // key
             out.extend_from_slice(&(off as u32).to_le_bytes()); // value
             out.extend_from_slice(&0u32.to_le_bytes()); // osversion
@@ -304,7 +367,7 @@ mod tests {
             "/usr/lib/llvm/22/lib64/libLLVM.so.22.1",
         ]);
         assert_eq!(
-            cache_entries(&img),
+            paths(&img),
             [
                 "/usr/lib64/libc.so.6",
                 "/usr/lib/llvm/22/lib64/libLLVM.so.22.1"
@@ -317,31 +380,28 @@ mod tests {
         // glibc before 2.32 writes both. The old section is compatibility
         // padding; reading it instead would miss anything hwcap-tagged.
         let img = old_cache(&["/lib/old.so.1"], Some(&["/usr/lib64/new.so.2"]));
-        assert_eq!(cache_entries(&img), ["/usr/lib64/new.so.2"]);
+        assert_eq!(paths(&img), ["/usr/lib64/new.so.2"]);
     }
 
     #[test]
     fn reads_an_old_format_cache_with_nothing_appended() {
         let img = old_cache(&["/lib/libz.so.1", "/usr/lib/libm.so.6"], None);
-        assert_eq!(
-            cache_entries(&img),
-            ["/lib/libz.so.1", "/usr/lib/libm.so.6"]
-        );
+        assert_eq!(paths(&img), ["/lib/libz.so.1", "/usr/lib/libm.so.6"]);
     }
 
     #[test]
     fn a_damaged_cache_yields_nothing_rather_than_panicking() {
-        assert!(cache_entries(b"").is_empty());
-        assert!(cache_entries(b"not a cache at all").is_empty());
+        assert!(paths(b"").is_empty());
+        assert!(paths(b"not a cache at all").is_empty());
         // Truncated part-way through the entry table, and a count that would
         // run far past the end of the image.
         let img = new_cache(&["/usr/lib64/libc.so.6"]);
         for cut in 0..img.len() {
-            let _ = cache_entries(&img[..cut]);
+            let _ = paths(&img[..cut]);
         }
         let mut lying = new_cache(&["/usr/lib64/libc.so.6"]);
         lying[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(cache_entries(&lying).len() < 2);
+        assert!(paths(&lying).len() < 2);
     }
 
     #[test]
@@ -349,11 +409,30 @@ mod tests {
         // A path resolved against the app's working directory would be a way
         // in for anything that can chdir the process.
         let img = new_cache(&["not/absolute", "/usr/lib64/fine.so"]);
-        assert_eq!(cache_entries(&img), ["/usr/lib64/fine.so"]);
+        assert_eq!(paths(&img), ["/usr/lib64/fine.so"]);
 
         let mut unterminated = new_cache(&["/usr/lib64/fine.so"]);
         let last = unterminated.len() - 1;
         unterminated[last] = b'x'; // clobber the NUL
-        assert!(cache_entries(&unterminated).is_empty());
+        assert!(paths(&unterminated).is_empty());
+    }
+
+    #[test]
+    fn only_this_abi_is_kept_on_a_multilib_host() {
+        let Some(native) = native_abi() else {
+            return;
+        };
+        // ldconfig lists the other ABI's copy first on a multilib host.
+        let other = if native == 0 { 0x0300 } else { 0 };
+        let img = new_cache_flagged(&[
+            (other | 0x0003, "/usr/lib32/libGL.so.1"),
+            (native | 0x0003, "/usr/lib64/libGL.so.1"),
+            (native | 0x0003, "/usr/lib64/libc.so.6"),
+        ]);
+        assert_eq!(paths(&img).len(), 3, "the reader sees every entry");
+        assert_eq!(
+            cache_paths(&img),
+            ["/usr/lib64/libGL.so.1", "/usr/lib64/libc.so.6"]
+        );
     }
 }
