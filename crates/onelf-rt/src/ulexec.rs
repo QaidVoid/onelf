@@ -239,24 +239,43 @@ impl StackBuilder {
     }
 }
 
+/// The size of the stack the kernel would have set up: `RLIMIT_STACK`,
+/// held between 8 MiB and 1 GiB, with an unlimited setting taking the
+/// top of that range. The mapping is reserved, not committed, so the
+/// large end costs address space only.
+fn stack_size() -> usize {
+    const MIN: u64 = 8 << 20;
+    const MAX: u64 = 1 << 30;
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Stack)
+        .current
+        .unwrap_or(MAX);
+    limit.clamp(MIN, MAX) as usize
+}
+
 /// Allocate a fresh stack and lay out `argc`/`argv`/`envp`/`auxv` for the loader.
+///
+/// This is the main stack for the rest of the process's life, so it is
+/// sized like the kernel's and given a guard page: an overrun faults
+/// instead of writing into whatever is mapped below.
 fn make_stack(
     loaded: &Loaded,
     av: &[(usize, usize)],
     exe: &CStr,
     args: &[CString],
     env: &[CString],
+    page: usize,
 ) -> usize {
-    let stack_size = 8 * 1024 * 1024;
+    let stack_size = stack_size();
     let stack = unsafe {
         mmap_anonymous(
             std::ptr::null_mut(),
             stack_size,
             ProtFlags::READ | ProtFlags::WRITE,
-            MapFlags::PRIVATE,
+            MapFlags::PRIVATE | MapFlags::STACK | MapFlags::NORESERVE,
         )
     }
     .expect("ulexec: stack") as usize;
+    let _ = unsafe { mprotect(stack as *mut _, page, MprotectFlags::empty()) };
     let top = stack + stack_size;
     let word = size_of::<usize>();
 
@@ -377,7 +396,7 @@ pub fn exec_with_interp(
     let exe = CString::new(interp_str.as_ref()).unwrap();
 
     let loaded = load(interpreter, page);
-    let sp = make_stack(&loaded, &auxv, &exe, &argv, &env);
+    let sp = make_stack(&loaded, &auxv, &exe, &argv, &env, page);
     close_cloexec_fds();
     unsafe { enter(sp, loaded.entry) }
 }
