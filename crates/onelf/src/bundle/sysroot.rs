@@ -475,6 +475,22 @@ fn appdir_path(rel: &str) -> &str {
 /// path, or `None` for an entry the sysroot lacks or a link that folds
 /// onto itself.
 fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<Option<PathBuf>> {
+    // The path comes from the sysroot's own package database, which a
+    // fetched archive supplies. The archive extractor refuses entries that
+    // leave the sysroot; the database inside it gets the same check here,
+    // since a `..` in it would read outside the sysroot and write outside
+    // the AppDir.
+    if !Path::new(rel).components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{rel}: package database path leaves the sysroot"),
+        ));
+    }
     let src = root.join(rel);
     let Ok(md) = fs::symlink_metadata(&src) else {
         return Ok(None);
@@ -682,6 +698,29 @@ mod tests {
         // The compatibility links a rootfs carries fold onto themselves.
         assert_eq!(relink("bin", Path::new("usr/bin")), None);
         assert_eq!(relink("lib", Path::new("usr/lib")), None);
+    }
+
+    #[test]
+    fn a_database_path_leaving_the_sysroot_is_refused() {
+        let root = std::env::temp_dir().join(format!("onelf-dbpath-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sysroot")).unwrap();
+        fs::create_dir_all(root.join("appdir")).unwrap();
+        fs::write(root.join("outside"), b"secret").unwrap();
+        for rel in ["../outside", "usr/../../outside", "/outside"] {
+            let err = copy_entry(&root.join("sysroot"), rel, &root.join("appdir")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{rel}");
+        }
+        assert!(
+            copy_entry(
+                &root.join("sysroot"),
+                "usr/lib/missing",
+                &root.join("appdir")
+            )
+            .unwrap()
+            .is_none()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
