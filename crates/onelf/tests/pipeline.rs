@@ -3149,6 +3149,105 @@ fn crafted_footer_is_refused_by_every_reader() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A package whose manifest names an entry `..` is refused by everything
+/// that puts files on disk: `extract`, cache mode, and rundir mode. The
+/// path check has unit tests; this drives it through a crafted package.
+#[test]
+fn a_crafted_entry_path_is_refused_by_every_writer() {
+    let td = workdir("crafted-path");
+    let pkg = pack_script(&td, "escape", "#!/bin/sh\necho RAN\n");
+    let bytes = std::fs::read(&pkg).unwrap();
+    let f = bytes.len() - 76;
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[f + at..f + at + 8].try_into().unwrap());
+    let (m_off, m_comp, m_orig) = (
+        u64_at(12) as usize,
+        u64_at(20) as usize,
+        u64_at(28) as usize,
+    );
+    let (p_off, p_size) = (u64_at(36) as usize, u64_at(44) as usize);
+    let d_off = u64_at(52) as usize;
+    let d_size = u32::from_le_bytes(bytes[f + 60..f + 64].try_into().unwrap()) as usize;
+
+    let manifest = zstd::bulk::decompress(&bytes[m_off..m_off + m_comp], m_orig).unwrap();
+    let mut m = onelf_format::Manifest::deserialize(&manifest).unwrap();
+    // The script's entry, `run`, becomes `..`. Same length, so nothing
+    // else in the table moves.
+    let at = m
+        .string_table
+        .windows(4)
+        .position(|w| w == b"run\0")
+        .expect("the entry name");
+    m.string_table[at..at + 4].copy_from_slice(b"..\0\0");
+    let manifest = m.serialize().unwrap();
+    let compressed = zstd::bulk::compress(&manifest, 3).unwrap();
+
+    let mut out = bytes[..m_off].to_vec();
+    out.extend_from_slice(&compressed);
+    let new_p_off = out.len();
+    out.extend_from_slice(&bytes[p_off..p_off + p_size]);
+    let new_d_off = out.len();
+    if d_size > 0 {
+        out.extend_from_slice(&bytes[d_off..d_off + d_size]);
+    }
+    let mut footer = bytes[f..].to_vec();
+    footer[20..28].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+    footer[28..36].copy_from_slice(&(manifest.len() as u64).to_le_bytes());
+    footer[36..44].copy_from_slice(&(new_p_off as u64).to_le_bytes());
+    if d_size > 0 {
+        footer[52..60].copy_from_slice(&(new_d_off as u64).to_le_bytes());
+    }
+    footer[64..68].copy_from_slice(&xxhash_rust::xxh32::xxh32(&manifest, 0).to_le_bytes());
+    out.extend_from_slice(&footer);
+    let bad = td.join("bad.onelf");
+    std::fs::write(&bad, &out).unwrap();
+    std::fs::set_permissions(
+        &bad,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    // The crafted package still parses; only the write is refused.
+    let o = run_onelf(&["list", bad.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = run_onelf(
+        &[
+            "extract",
+            bad.to_str().unwrap(),
+            "-o",
+            td.join("out").to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(o.status.code(), Some(1), "extract");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("unsafe path component"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    for mode in ["cache", "rundir"] {
+        let mut run = Command::new(&bad);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", mode);
+        isolate(&mut run, &td);
+        let o = run_package(&mut run);
+        assert!(!o.status.success(), "{mode} ran a crafted package");
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains("RAN"),
+            "{mode} ran the entry"
+        );
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("unsafe path component"),
+            "{mode}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// An AppDir usually exposes its launcher as a symlink, so an entrypoint
 /// must be able to target one. Symlinks used to be left out of the path
 /// index, which reported the launcher as missing from its own directory.
