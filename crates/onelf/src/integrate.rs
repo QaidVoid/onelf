@@ -44,7 +44,12 @@ impl IntegrationContext {
             }
             None => {
                 let idx = manifest.header.default_entrypoint as usize;
-                let ep = &manifest.entrypoints[idx];
+                let ep = manifest.entrypoints.get(idx).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "package declares no entrypoints",
+                    )
+                })?;
                 manifest.get_string(ep.name).to_string()
             }
         };
