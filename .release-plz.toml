@@ -23,7 +23,8 @@ git_tag_name = "{{ version }}"
 git_release_enable = true
 changelog_include = [
     "onelf-format",
-    "onelf-rt"
+    "onelf-rt",
+    "onelf-sysroot"
 ]
 changelog_path="./CHANGELOG.md"
 
@@ -33,6 +34,10 @@ git_tag_enable = false
 
 [[package]]
 name = "onelf-rt"
+git_tag_enable = false
+
+[[package]]
+name = "onelf-sysroot"
 git_tag_enable = false
 
 [changelog]
