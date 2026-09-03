@@ -4,6 +4,7 @@
 mod macros;
 
 pub mod cache_layout;
+pub mod desktop;
 pub mod drivers;
 pub mod elf;
 pub mod entry;

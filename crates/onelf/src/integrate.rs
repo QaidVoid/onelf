@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use onelf_format::desktop::{exec_arg, exec_arg_tail};
 use onelf_format::{Footer, Manifest};
 
 use crate::extract::decompress_entry;
@@ -182,65 +183,9 @@ fn install_desktop(
     Ok(())
 }
 
-/// Quote a single `Exec=` field argument per the Desktop Entry spec: a
-/// value containing whitespace or a reserved character is double-quoted,
-/// with `"`, `` ` ``, `$`, and `\` backslash-escaped inside the quotes.
-fn desktop_exec_arg(s: &str) -> String {
-    let reserved = |c: char| c.is_whitespace() || "\"'\\<>~|&;$*?#()`".contains(c);
-    if !s.is_empty() && !s.chars().any(reserved) {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if matches!(c, '"' | '`' | '$' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-/// Given the value of an `Exec=` line (everything after `Exec=`), return the
-/// argument tail after the first argument (the executable), honoring Desktop
-/// Entry double-quote quoting so a quoted or space-containing executable path
-/// is removed as one whole argument rather than split on its spaces.
-fn exec_arg_tail(value: &str) -> &str {
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] == b'"' {
-        // Quoted argument: skip to the matching unescaped closing quote.
-        i += 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' if i + 1 < bytes.len() => i += 2,
-                b'"' => {
-                    i += 1;
-                    break;
-                }
-                _ => i += 1,
-            }
-        }
-    } else {
-        // Unquoted argument: skip to the next whitespace.
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-    }
-    // Skip the whitespace separating the first argument from the tail.
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    &value[i..]
-}
-
 /// Patch `Exec=`, `TryExec=`, and `Icon=` in an existing desktop file.
 fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    let quoted = desktop_exec_arg(exec_path);
+    let quoted = exec_arg(exec_path);
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let mut has_exec = false;
     let mut has_tryexec = false;
@@ -292,12 +237,13 @@ fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -
 
 /// Generate a minimal `.desktop` file.
 fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
+    let quoted = exec_arg(exec_path);
     let mut lines = vec![
         "[Desktop Entry]".to_string(),
         "Type=Application".to_string(),
         format!("Name={name}"),
-        format!("Exec={exec_path}"),
-        format!("TryExec={exec_path}"),
+        format!("Exec={quoted}"),
+        format!("TryExec={quoted}"),
     ];
     if let Some(icon) = icon_name {
         lines.push(format!("Icon={icon}"));
@@ -403,19 +349,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exec_arg_tail_handles_quoting() {
-        // Unquoted executable, arguments preserved.
-        assert_eq!(exec_arg_tail("/usr/bin/foo %U"), "%U");
-        // Quoted executable containing a space: removed whole, tail kept.
-        assert_eq!(exec_arg_tail("\"/opt/my app/bin\" %F extra"), "%F extra");
-        // No arguments.
-        assert_eq!(exec_arg_tail("/usr/bin/foo"), "");
-        assert_eq!(exec_arg_tail("\"/opt/my app/bin\""), "");
-        // Leading whitespace tolerated.
-        assert_eq!(exec_arg_tail("  /usr/bin/foo  %U"), "%U");
-    }
-
-    #[test]
     fn patch_replaces_quoted_exec_without_fragments() {
         let desktop = "[Desktop Entry]\nType=Application\nExec=\"/opt/my app/bin\" %F\nIcon=old\n";
         let out = patch_desktop_file(desktop, "/new/path/app", Some("newicon"));
@@ -424,6 +357,16 @@ mod tests {
         assert!(out.contains("Exec=/new/path/app %F"), "got:\n{out}");
         assert!(!out.contains("app/bin"), "stale path fragment left:\n{out}");
         assert!(out.contains("Icon=newicon"));
+    }
+
+    #[test]
+    fn generated_file_quotes_exec_path_with_spaces() {
+        let out = generate_desktop_file("App", "/opt/has space/app", None);
+        assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
+        assert!(
+            out.contains("TryExec=\"/opt/has space/app\"\n"),
+            "got:\n{out}"
+        );
     }
 
     #[test]

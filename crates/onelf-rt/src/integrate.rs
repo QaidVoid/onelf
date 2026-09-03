@@ -72,24 +72,24 @@ fn remove_icons(hicolor: &Path, int_name: &str) {
 }
 
 fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
+    use onelf_format::desktop::{exec_arg, exec_arg_tail};
+
+    let quoted = exec_arg(exec_path);
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let mut has_exec = false;
     let mut has_tryexec = false;
 
     for line in &mut lines {
         if line.starts_with("Exec=") {
-            let rest = &line[5..];
-            let mut parts = rest.split_whitespace();
-            let _old = parts.next();
-            let tail: Vec<&str> = parts.collect();
+            let tail = exec_arg_tail(&line[5..]);
             if tail.is_empty() {
-                *line = format!("Exec={exec_path}");
+                *line = format!("Exec={quoted}");
             } else {
-                *line = format!("Exec={exec_path} {}", tail.join(" "));
+                *line = format!("Exec={quoted} {tail}");
             }
             has_exec = true;
         } else if line.starts_with("TryExec=") {
-            *line = format!("TryExec={exec_path}");
+            *line = format!("TryExec={quoted}");
             has_tryexec = true;
         } else if line.starts_with("Icon=")
             && let Some(name) = icon_name
@@ -99,10 +99,10 @@ fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -
     }
 
     if !has_exec {
-        lines.push(format!("Exec={exec_path}"));
+        lines.push(format!("Exec={quoted}"));
     }
     if !has_tryexec {
-        lines.push(format!("TryExec={exec_path}"));
+        lines.push(format!("TryExec={quoted}"));
     }
 
     let mut result = lines.join("\n");
@@ -113,12 +113,13 @@ fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -
 }
 
 fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
+    let quoted = onelf_format::desktop::exec_arg(exec_path);
     let mut lines = vec![
         "[Desktop Entry]".to_string(),
         "Type=Application".to_string(),
         format!("Name={name}"),
-        format!("Exec={exec_path}"),
-        format!("TryExec={exec_path}"),
+        format!("Exec={quoted}"),
+        format!("TryExec={quoted}"),
     ];
     if let Some(icon) = icon_name {
         lines.push(format!("Icon={icon}"));
@@ -282,5 +283,23 @@ pub fn handle_integrate_flags(
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch_desktop_file;
+
+    #[test]
+    fn patch_quotes_a_path_with_spaces_and_keeps_the_tail() {
+        let desktop = "[Desktop Entry]\nExec=\"/opt/my app/bin\" %F\nIcon=old\n";
+        let out = patch_desktop_file(desktop, "/home/me/My Apps/app.onelf", Some("new"));
+        assert!(
+            out.contains("Exec=\"/home/me/My Apps/app.onelf\" %F\n"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("TryExec=\"/home/me/My Apps/app.onelf\"\n"));
+        assert!(!out.contains("app/bin"), "stale fragment left:\n{out}");
+        assert!(out.contains("Icon=new\n"));
     }
 }
