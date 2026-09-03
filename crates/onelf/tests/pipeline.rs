@@ -1009,6 +1009,82 @@ fn cache_gc_spares_a_running_package() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `cache clear` spares a running package the same way `gc` does. The
+/// old one removed the whole root, taking plugins and locale data out
+/// from under whatever was running.
+#[test]
+fn cache_clear_spares_a_running_package() {
+    let td = workdir("clearlive");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho STARTED\nsleep 2\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("live.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+
+    let mut live = Command::new(&pkg);
+    live.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    isolate(&mut live, &td);
+    let mut child = match live.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
+        Err(e) => panic!("spawn package: {e}"),
+    };
+    {
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        let n = child.stdout.take().unwrap().read(&mut buf).unwrap_or(0);
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("STARTED"));
+    }
+    let cache = td.join("xdg-cache");
+    let pkg_dirs = || -> usize {
+        std::fs::read_dir(cache.join("onelf/pkg"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(pkg_dirs(), 1, "the running package is extracted");
+    let clear = || -> String {
+        let o = Command::new(onelf())
+            .args(["cache", "clear"])
+            .env("XDG_CACHE_HOME", &cache)
+            .env("HOME", td.to_str().unwrap())
+            .output()
+            .expect("spawn onelf cache clear");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    let while_running = clear();
+    assert!(while_running.contains("Skipped 1"), "{while_running}");
+    assert_eq!(
+        pkg_dirs(),
+        1,
+        "clear removed a package a live instance holds"
+    );
+
+    let _ = child.wait();
+    let when_idle = clear();
+    assert!(when_idle.contains("Cache cleared"), "{when_idle}");
+    assert_eq!(pkg_dirs(), 0, "clear must remove the package once idle");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Every bundled object must end up with a search path the loader will
 /// actually inherit, whatever depth the executable sits at.
 ///

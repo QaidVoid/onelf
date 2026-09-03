@@ -229,19 +229,68 @@ pub fn cache_list() -> io::Result<()> {
     Ok(())
 }
 
-/// Remove the whole cache.
+/// Remove everything in the cache that no running instance is using.
 ///
-/// The recursive delete is safe because `cache_root` only ever yields a
-/// `0700` directory owned by this user, never a shared or foreign path.
+/// A package still running keeps its tree, since it opens plugins, locale
+/// data, and drivers from there lazily for as long as it runs. Every GL
+/// build file goes: a running instance uses the build's extraction, which
+/// is a package like any other, not the file. Directories left empty are
+/// removed; the root itself stays only while something in it is in use.
 pub fn cache_clear() -> io::Result<()> {
     let root = cache_root()?;
-    if root.exists() {
-        fs::remove_dir_all(&root)?;
+    if !root.exists() {
+        println!("No cache to clear.");
+        return Ok(());
+    }
+
+    let mut removed = 0u64;
+    let mut skipped = 0u64;
+    if let Ok(entries) = fs::read_dir(root.join("meta")) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if try_remove_locked(&root, &id) {
+                removed += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    let mut builds = 0u64;
+    for build in stored_builds(&root) {
+        if fs::remove_file(&build.file).is_ok() {
+            builds += 1;
+            if let Some(parent) = build.file.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+    let reclaimed = collect_cas(&root);
+    remove_empty_dirs(&root);
+
+    if skipped == 0 {
         println!("Cache cleared.");
     } else {
-        println!("No cache to clear.");
+        println!(
+            "Removed {removed} package(s) and {builds} GL build(s), reclaimed {:.1} MB.",
+            mib(reclaimed)
+        );
+        println!("Skipped {skipped} package(s) still in use by a running instance.");
     }
     Ok(())
+}
+
+/// Remove `dir` and every directory under it that holds nothing. Lock files
+/// of running packages keep their directories, and the root with them.
+fn remove_empty_dirs(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_empty_dirs(&entry.path());
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
