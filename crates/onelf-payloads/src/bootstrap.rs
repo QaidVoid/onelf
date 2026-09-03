@@ -313,6 +313,7 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+const AT_SECURE: u64 = 23;
 const AT_EXECFN: u64 = 31;
 
 const PROT_READ: i32 = 1;
@@ -473,8 +474,8 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
 
     let argc = *(stack as *const u32) as usize;
     // envp = stack + argc + 2 (skip argc word + argv[argc] + NULL)
-    let mut envp = (stack as *const *const u8).add(argc + 2);
-    let interp_override = env_interp_override(envp);
+    let env_start = (stack as *const *const u8).add(argc + 2);
+    let mut envp = env_start;
     while !(*envp).is_null() {
         envp = envp.add(1);
     }
@@ -499,6 +500,17 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
     }
 
     let has = |t: u64| seen & (1u32 << t) != 0;
+
+    // A set-id or capability-raised exec. glibc drops LD_PRELOAD and its
+    // kin on that flag, but this runs before glibc, so the loader override
+    // has to be dropped here or the caller picks what runs with the
+    // raised privilege.
+    let secure = has(AT_SECURE) && *(*auxv.add(AT_SECURE as usize)) != 0;
+    let interp_override = if secure {
+        core::ptr::null()
+    } else {
+        env_interp_override(env_start)
+    };
 
     if !has(AT_EXECFN) {
         die(b"onelf: no AT_EXECFN\n");
@@ -826,8 +838,8 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
     let rel_path = meta.add(6);
 
     let argc = *(stack as *const u32) as usize;
-    let mut envp = (stack as *const *const u8).add(argc + 2);
-    let interp_override = env_interp_override(envp);
+    let env_start = (stack as *const *const u8).add(argc + 2);
+    let mut envp = env_start;
     while !(*envp).is_null() {
         envp = envp.add(1);
     }
@@ -851,6 +863,13 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
     }
 
     let has = |t: u64| seen & (1u32 << t) != 0;
+
+    let secure = has(AT_SECURE) && *(*auxv.add(AT_SECURE as usize)) != 0;
+    let interp_override = if secure {
+        core::ptr::null()
+    } else {
+        env_interp_override(env_start)
+    };
 
     if !has(AT_EXECFN) {
         die(b"onelf: no AT_EXECFN\n");

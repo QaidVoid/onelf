@@ -8,7 +8,7 @@ Reference for all environment variables onelf reads or sets.
 |----------|-------|
 | `ONELF_DIR` | Absolute path to the package root (FUSE mount, tmpfs, runtime directory, or cache dir). Empty string in `memfd` mode. |
 | `ONELF_ACTIVE_MODE` | `memfd`, `fuse`, `tmpfs`, `rundir`, `cache`, or `dev` (set by `onelf run`) |
-| `ONELF_INTERP` | Set only when the host's glibc is newer than the bundled one: the host loader every bootstrapped binary in the process tree runs under |
+| `ONELF_INTERP` | Set only when the host's glibc is newer than the bundled one: the host loader every bootstrapped binary in the process tree runs under. Ignored by a set-uid, set-gid, or capability-raised executable, as glibc ignores `LD_PRELOAD` there |
 | `ONELF_ARGV0` | Original `argv[0]` before multicall resolution |
 | `ONELF_EXEC` | Absolute path to the packed binary |
 | `ONELF_ENTRYPOINT` | Resolved entrypoint name |
