@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Cursor, Read, Write};
 use std::path::PathBuf;
 
-use crate::entry::{ENTRY_HEADER_SIZE, ENTRYPOINT_SIZE, Entry, EntryPoint};
+use crate::entry::{ENTRY_HEADER_SIZE, ENTRYPOINT_SIZE, Entry, EntryKind, EntryPoint};
 
 /// Returns true if `name` is a single safe path component: non-empty,
 /// not `.` or `..`, and free of `/` and NUL. Used to reject entry names
@@ -220,9 +220,22 @@ impl Manifest {
         let st = self.string_table.len() as u32;
         let bad = |msg: &'static str| io::Error::new(io::ErrorKind::InvalidData, msg);
 
-        for e in &self.entries {
-            if e.parent != u32::MAX && e.parent as usize >= n {
-                return Err(bad("entry parent index out of range"));
+        for (i, e) in self.entries.iter().enumerate() {
+            // The packer writes every directory before its contents, so a
+            // parent always precedes its children. Requiring that here is
+            // what rules out a cycle, which would otherwise make every
+            // path lookup walk the whole table.
+            if e.parent != u32::MAX {
+                let p = e.parent as usize;
+                if p >= n {
+                    return Err(bad("entry parent index out of range"));
+                }
+                if p >= i {
+                    return Err(bad("entry parent does not precede it"));
+                }
+                if self.entries[p].kind != EntryKind::Dir {
+                    return Err(bad("entry parent is not a directory"));
+                }
             }
             if e.name > st {
                 return Err(bad("entry name offset out of range"));
@@ -355,6 +368,12 @@ impl Manifest {
             parts.push(name);
             if entry.parent == u32::MAX {
                 break;
+            }
+            if entry.parent as usize >= idx {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "entry parent does not precede it",
+                ));
             }
             idx = entry.parent as usize;
         }
@@ -546,12 +565,27 @@ mod tests {
     }
 
     #[test]
-    fn parent_cycle_terminates() {
-        // entries 0 and 1 point at each other; entry_path must not hang.
+    fn parent_cycle_is_rejected() {
+        // entries 0 and 1 point at each other. Deserializing refuses the
+        // table, and a path lookup on it in memory errors rather than
+        // returning a path that walked the cycle.
         let st = b"\0a\0b\0".to_vec();
         let m = manifest(vec![entry(1, 1), entry(3, 0)], st);
-        let path = m.entry_path(0);
-        assert!(!path.is_empty());
+        assert!(Manifest::deserialize(&m.serialize().unwrap()).is_err());
+        assert!(m.validated_entry_path(0).is_err());
+        assert!(
+            !m.entry_path(0).is_empty(),
+            "the unvalidated walk still ends"
+        );
+    }
+
+    #[test]
+    fn a_file_cannot_be_a_parent() {
+        let st = b"\0a\0b\0".to_vec();
+        let mut file = entry(1, u32::MAX);
+        file.kind = EntryKind::File;
+        let m = manifest(vec![file, entry(3, 0)], st);
+        assert!(Manifest::deserialize(&m.serialize().unwrap()).is_err());
     }
 
     #[test]
