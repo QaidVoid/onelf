@@ -18,10 +18,10 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
-    // The constructor must never unwind into the loader; just stop.
-    loop {
-        core::hint::spin_loop();
-    }
+    // The constructor must never unwind into the loader. Exiting with a
+    // distinct status is something a user can report; a process spinning
+    // at full CPU forever is not.
+    unsafe { sys::exit_group(127) }
 }
 
 // Resolved from the application's libc at load time (kept UNDEF here).
@@ -67,6 +67,10 @@ mod sys {
     pub unsafe fn close(fd: i32) -> i64 {
         sys3(3, fd as i64, 0, 0)
     }
+    pub unsafe fn exit_group(code: i32) -> ! {
+        sys3(231, code as i64, 0, 0);
+        loop {}
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -87,6 +91,10 @@ mod sys {
     }
     pub unsafe fn close(fd: i32) -> i64 {
         svc4(57, fd as i64, 0, 0, 0)
+    }
+    pub unsafe fn exit_group(code: i32) -> ! {
+        svc4(94, code as i64, 0, 0, 0);
+        loop {}
     }
 }
 
@@ -119,6 +127,10 @@ mod sys {
     }
     pub unsafe fn close(fd: i32) -> i64 {
         sys3(6, fd, 0, 0) as i64
+    }
+    pub unsafe fn exit_group(code: i32) -> ! {
+        sys3(252, code, 0, 0);
+        loop {}
     }
 }
 
