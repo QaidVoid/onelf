@@ -50,6 +50,11 @@ pub fn parse_pin(text: &str) -> Option<Pin> {
     if pin.label.is_empty() || pin.label.contains('/') || pin.label.starts_with('.') {
         return None;
     }
+    // The hash names the stored file and is compared against the bytes, so
+    // it has to be exactly one BLAKE3 digest in hex.
+    if pin.blake3.len() != 64 || !pin.blake3.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     Some(pin)
 }
 
@@ -180,16 +185,25 @@ mod tests {
 
     #[test]
     fn a_record_parses_and_unescapes() {
-        let pin =
-            parse_pin("label = \"platform-1\"\nurl = \"https://e/a\\\"b\"\nblake3 = \"ABC\"\n")
-                .unwrap();
+        let hash = "AB".repeat(32);
+        let pin = parse_pin(&format!(
+            "label = \"platform-1\"\nurl = \"https://e/a\\\"b\"\nblake3 = \"{hash}\"\n"
+        ))
+        .unwrap();
         assert_eq!(pin.label, "platform-1");
         assert_eq!(pin.url, "https://e/a\"b");
-        assert_eq!(pin.blake3, "abc");
+        assert_eq!(pin.blake3, "ab".repeat(32));
         assert!(parse_pin("label = \"x\"\n").is_none(), "incomplete");
         assert!(
-            parse_pin("label = \"../x\"\nurl = \"u\"\nblake3 = \"h\"\n").is_none(),
+            parse_pin(&format!(
+                "label = \"../x\"\nurl = \"u\"\nblake3 = \"{hash}\"\n"
+            ))
+            .is_none(),
             "a label is a directory name"
+        );
+        assert!(
+            parse_pin("label = \"x\"\nurl = \"u\"\nblake3 = \"abc\"\n").is_none(),
+            "the hash names a file and is checked against bytes"
         );
     }
 
