@@ -603,7 +603,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     // Filter libs already present in the directory tree. Stale stub loaders
     // are deleted only in the non-dry-run path so they get re-resolved.
-    let (existing, stubs) = find_existing_libs(&opts.directory);
+    let (_, stubs) = find_existing_libs(&opts.directory);
     if !opts.dry_run {
         for stub in &stubs {
             // Fail if a stub can't be removed: leaving it in place would ship
@@ -970,9 +970,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // Resolve transitive dependencies
                 if opts.recursive {
                     for dep in lib_needed {
+                        // Only the library directory satisfies a need, as
+                        // for the direct ones above: a copy elsewhere in the
+                        // tree is where the loader never looks.
                         if already_processed.contains(&dep)
                             || is_excluded(&dep, &excludes)
-                            || existing.contains(&dep)
+                            || reachable.contains(&dep)
                         {
                             continue;
                         }

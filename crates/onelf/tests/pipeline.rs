@@ -1672,6 +1672,79 @@ fn an_absolute_rpath_in_a_bundled_library_is_scrubbed() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A transitive dependency present only where the loader never looks, a
+/// vendor's `opt/` copy say, is still copied into the library directory.
+/// The walk used to count any copy in the tree as present, and the audit
+/// then reported the soname as missing with the file right there.
+#[test]
+fn a_transitive_dependency_is_copied_despite_a_stray_copy() {
+    let td = workdir("transitive-stray");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src.join("bar.c"), "int bar(void){return 1;}\n");
+    write(
+        &src.join("foo.c"),
+        "int bar(void); int foo(void){return bar();}\n",
+    );
+    write(
+        &src.join("app.c"),
+        "int foo(void); int main(void){return foo();}\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libbar.so.1",
+            src.join("bar.c").to_str().unwrap(),
+        ],
+        &src.join("libbar.so.1"),
+    ) {
+        return;
+    }
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfoo.so.1",
+            src.join("foo.c").to_str().unwrap(),
+            &format!("-L{}", src.display()),
+            "-l:libbar.so.1",
+        ],
+        &src.join("libfoo.so.1"),
+    ));
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("opt/vendor")).unwrap();
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", src.display()),
+            &format!("-Wl,-rpath-link,{}", src.display()),
+            "-l:libfoo.so.1",
+        ],
+        &app.join("bin/app"),
+    ));
+    std::fs::copy(src.join("libbar.so.1"), app.join("opt/vendor/libbar.so.1")).unwrap();
+
+    let o = run_onelf(
+        &[
+            "bundle-libs",
+            app.to_str().unwrap(),
+            "--search-path",
+            src.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(app.join("lib/libfoo.so.1").is_file());
+    assert!(
+        app.join("lib/libbar.so.1").is_file(),
+        "the transitive dependency was not copied:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and
