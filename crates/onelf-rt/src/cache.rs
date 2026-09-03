@@ -256,7 +256,11 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
         let hash_hex = hex(&entry.content_hash);
         let shard = &hash_hex[..2];
         let cas_shard_dir = cas_dir.join(shard);
-        let cas_path = cas_shard_dir.join(&hash_hex);
+        // Keyed by content and mode: a blob is one inode hardlinked into
+        // every package tree that carries it, so two packages shipping the
+        // same bytes as 0644 and 0755 cannot share one.
+        let mode = entry.mode & 0o777;
+        let cas_path = cas_shard_dir.join(format!("{hash_hex}-{mode:03o}"));
 
         // Reuse an existing CAS entry only if its bytes actually hash to
         // the requested value. A slot whose content does not verify was
@@ -286,7 +290,7 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
             let write = (|| -> io::Result<()> {
                 let mut f = fs::File::create(&tmp_path)?;
                 f.write_all(&data)?;
-                f.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
+                f.set_permissions(fs::Permissions::from_mode(mode))?;
                 Ok(())
             })();
             if let Err(e) = write {

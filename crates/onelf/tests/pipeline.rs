@@ -4032,6 +4032,56 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Two packages shipping the same bytes with different modes get their
+/// own blob each. A blob is one inode hardlinked into every tree that
+/// carries it, so a shared one took the first package's mode, and the
+/// second package's copy of an executable came out unexecutable.
+#[test]
+fn cas_blobs_with_different_modes_do_not_share_an_inode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = workdir("cas-mode");
+    let body = "#!/bin/sh\necho SAME BYTES\n";
+    // Package A carries the script as plain data, package B runs it.
+    let a = td.join("a");
+    write(&a.join("bin/run"), "#!/bin/sh\necho A\n");
+    std::fs::set_permissions(a.join("bin/run"), PermissionsExt::from_mode(0o755)).unwrap();
+    write(&a.join("share/script.sh"), body);
+    std::fs::set_permissions(a.join("share/script.sh"), PermissionsExt::from_mode(0o644)).unwrap();
+    let b = td.join("b");
+    write(&b.join("bin/run"), body);
+    std::fs::set_permissions(b.join("bin/run"), PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut pkgs = Vec::new();
+    for (app, name) in [(&a, "a"), (&b, "b")] {
+        let pkg = td.join(format!("{name}.onelf"));
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0", "--name", name])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        pkgs.push(pkg);
+    }
+    for (pkg, expect) in pkgs.iter().zip(["A", "SAME BYTES"]) {
+        let mut cmd = Command::new(pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache");
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            pkg.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(expect));
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Stopping and resuming the app must not stop the server. A stopped child
 /// raises SIGCHLD too, and a server that took that for an exit parked in
 /// `waitpid` while the resumed app blocked forever on its next read from
