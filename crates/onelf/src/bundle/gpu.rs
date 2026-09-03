@@ -448,8 +448,8 @@ const ALL_GL_PREFIXES: &[&str] = &[
     "libglapi.so",
     "libgbm.so",
     "libxatracker.so",
-    // utility
-    "libGLU.so",
+    // Not libGLU: nothing copied in replaces it, so an app's own copy
+    // would be removed and never come back.
 ];
 
 /// Remove GL libraries from subdirectories of `directory` that would conflict
@@ -485,14 +485,35 @@ fn remove_conflicting_gl_libs(directory: &Path, lib_dest: &Path, dry_run: bool) 
     }
 }
 
+/// An ELF program: it has an interpreter and no soname. glibc's libc
+/// carries `PT_INTERP` too, and the soname is what tells them apart.
+fn is_program(path: &Path) -> bool {
+    let Ok(data) = fs::read(path) else {
+        return false;
+    };
+    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
+        return false;
+    };
+    elf.soname.is_none()
+        && elf
+            .program_headers
+            .iter()
+            .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP)
+}
+
 /// Recursively find GL-related files and symlinks to remove, skipping
 /// files directly in lib_dest (those get overwritten by copy_prefixed_libs).
+///
+/// A directory holding an executable is left alone. Electron ships ANGLE
+/// as `libEGL.so` and `libGLESv2.so` beside its binary, and those are not
+/// Mesa's to replace: removing them takes the GPU process with them.
 fn collect_gl_conflicts(dir: &Path, lib_dest_canon: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
+    let entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    let beside_executable = entries.iter().any(|p| p.is_file() && is_program(p));
+    for path in entries {
         let is_symlink = path.is_symlink();
 
         if path.is_dir() && !is_symlink {
@@ -502,6 +523,9 @@ fn collect_gl_conflicts(dir: &Path, lib_dest_canon: &Path, out: &mut Vec<PathBuf
         }
 
         if !is_symlink && !path.is_file() {
+            continue;
+        }
+        if beside_executable {
             continue;
         }
 
@@ -1081,4 +1105,36 @@ fn copy_data_dir(src: &Path, dest: &Path, dry_run: bool) -> io::Result<u64> {
         count += 1;
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod gl_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn an_apps_own_gl_beside_its_executable_is_kept() {
+        let root = std::env::temp_dir().join(format!("onelf-glconf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("app");
+        fs::create_dir_all(app.join("electron")).unwrap();
+        fs::create_dir_all(app.join("plugins")).unwrap();
+        fs::create_dir_all(app.join("lib")).unwrap();
+        // ANGLE beside the program that loads it, as Electron ships it.
+        fs::copy(
+            std::env::current_exe().unwrap(),
+            app.join("electron/electron"),
+        )
+        .unwrap();
+        fs::write(app.join("electron/libEGL.so"), b"angle").unwrap();
+        fs::write(app.join("electron/libGLESv2.so"), b"angle").unwrap();
+        // A stray Mesa copy in a plugin directory is what --gl replaces.
+        fs::write(app.join("plugins/libGLX_mesa.so.0"), b"mesa").unwrap();
+        // The app's own GLU has no replacement and stays.
+        fs::write(app.join("plugins/libGLU.so.1"), b"glu").unwrap();
+
+        let mut out = Vec::new();
+        collect_gl_conflicts(&app, &app.join("lib"), &mut out);
+        assert_eq!(out, vec![app.join("plugins/libGLX_mesa.so.0")]);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
