@@ -233,6 +233,36 @@ const ORIGIN_RUNPATH_FALLBACKS: &[&str] = &[
 ///
 /// Returns [`RunpathOutcome::NeedsPatchelf`] when no in-place slot is big
 /// enough, since patchelf has to run against the file rather than the image.
+/// File range of the dynamic string table.
+///
+/// From the `.dynstr` section header when there is one, else from
+/// `DT_STRTAB` and `DT_STRSZ` mapped through the `PT_LOAD` holding them.
+/// An object stripped of its section headers (`sstrip`, `llvm-strip
+/// --strip-sections`, some vendor blobs) keeps its dynamic section, and
+/// would otherwise keep its host RUNPATH too.
+fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
+    if let Some(sh) = elf
+        .section_headers
+        .iter()
+        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
+    {
+        return Some((sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
+    }
+    let dynamic = elf.dynamic.as_ref()?;
+    let strtab = dynamic.info.strtab as u64;
+    let strsz = dynamic.info.strsz as u64;
+    if strsz == 0 {
+        return None;
+    }
+    let load = elf.program_headers.iter().find(|p| {
+        p.p_type == goblin::elf::program_header::PT_LOAD
+            && strtab >= p.p_vaddr
+            && strtab < p.p_vaddr + p.p_filesz
+    })?;
+    let off = strtab - load.p_vaddr + load.p_offset;
+    Some((off as usize, (off + strsz) as usize))
+}
+
 fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<RunpathOutcome> {
     let new_bytes = ORIGIN_RUNPATH.as_bytes();
     let is_self_extract = has_embedded_payload(data);
@@ -248,11 +278,7 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
             .program_headers
             .iter()
             .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
-    let dynstr_range = elf
-        .section_headers
-        .iter()
-        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
+    let dynstr_range = dynstr_range(&elf);
     let dynamic_present = elf.dynamic.is_some();
 
     // File offset of the dynamic array, so a DT_RUNPATH tag can be rewritten
@@ -703,11 +729,7 @@ pub(crate) fn strip_absolute_needed_in(modified: &mut [u8]) -> bool {
     let Ok(elf) = goblin::elf::Elf::parse(modified) else {
         return false;
     };
-    let dynstr_offset = elf
-        .section_headers
-        .iter()
-        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| sh.sh_offset as usize);
+    let dynstr_offset = dynstr_range(&elf).map(|(off, _)| off);
     let (Some(dynstr_offset), Some(dynamic)) = (dynstr_offset, &elf.dynamic) else {
         return false;
     };
@@ -1375,6 +1397,13 @@ mod runpath_tests {
     /// section's last byte and the guard region begins immediately after.
     /// Returns the file bytes and the guard's offset.
     fn elf_with_runpath(runpath: &[u8]) -> (Vec<u8>, usize) {
+        elf_with_runpath_and(runpath, true)
+    }
+
+    /// [`elf_with_runpath`], optionally without section headers, in which
+    /// case a `PT_LOAD` covering the file and `DT_STRTAB`/`DT_STRSZ` are
+    /// the only way to the string table, as after `sstrip`.
+    fn elf_with_runpath_and(runpath: &[u8], section_headers: bool) -> (Vec<u8>, usize) {
         const SHSTRTAB: &[u8] = b"\0.dynstr\0.shstrtab\0";
         let mut dynstr = vec![0u8];
         dynstr.extend_from_slice(runpath);
@@ -1391,11 +1420,16 @@ mod runpath_tests {
         f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
         f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
         f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        f[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        f[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
         f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
-        f[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
-        f[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+        if section_headers {
+            f[60..62].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+            f[62..64].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+        }
 
+        // PT_LOAD first, mapping the whole file at vaddr 0, then PT_DYNAMIC.
+        let load_off = f.len();
+        f.extend_from_slice(&[0u8; 56]);
         let ph_off = f.len();
         f.extend_from_slice(&[0u8; 56]);
 
@@ -1408,7 +1442,12 @@ mod runpath_tests {
             f.push(0);
         }
         let dyn_off = f.len() as u64;
-        for (tag, val) in [(goblin::elf::dynamic::DT_RUNPATH, 1u64), (0, 0)] {
+        for (tag, val) in [
+            (goblin::elf::dynamic::DT_RUNPATH, 1u64),
+            (goblin::elf::dynamic::DT_STRTAB, dynstr_off),
+            (goblin::elf::dynamic::DT_STRSZ, dynstr.len() as u64),
+            (0, 0),
+        ] {
             f.extend_from_slice(&tag.to_le_bytes());
             f.extend_from_slice(&val.to_le_bytes());
         }
@@ -1418,6 +1457,16 @@ mod runpath_tests {
         f[ph_off + 16..ph_off + 24].copy_from_slice(&dyn_off.to_le_bytes());
         f[ph_off + 32..ph_off + 40].copy_from_slice(&dyn_size.to_le_bytes());
         f[ph_off + 40..ph_off + 48].copy_from_slice(&dyn_size.to_le_bytes());
+
+        let file_len = f.len() as u64;
+        f[load_off..load_off + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        f[load_off + 4..load_off + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        f[load_off + 32..load_off + 40].copy_from_slice(&file_len.to_le_bytes());
+        f[load_off + 40..load_off + 48].copy_from_slice(&file_len.to_le_bytes());
+        f[load_off + 48..load_off + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        if !section_headers {
+            return (f, guard_off);
+        }
 
         let shstr_off = f.len() as u64;
         f.extend_from_slice(SHSTRTAB);
@@ -1473,6 +1522,20 @@ mod runpath_tests {
         let slot = &out[guard_off - old.len() - 1..guard_off];
         let written = &slot[..slot.iter().position(|&b| b == 0).unwrap()];
         assert!(written.is_empty() || written.starts_with(b"$ORIGIN"));
+        assert!(!out.windows(old.len()).any(|w| w == old));
+    }
+
+    #[test]
+    fn a_section_stripped_object_is_still_rewritten() {
+        let old = b"/usr/lib/tinysparql-3.0";
+        let (bytes, guard_off) = elf_with_runpath_and(old, false);
+        let out = rewrite("stripped", &bytes);
+        assert_eq!(out.len(), bytes.len());
+        assert!(
+            out[guard_off..guard_off + GUARD_LEN]
+                .iter()
+                .all(|&b| b == GUARD)
+        );
         assert!(!out.windows(old.len()).any(|w| w == old));
     }
 
