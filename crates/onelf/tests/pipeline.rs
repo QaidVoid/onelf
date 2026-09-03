@@ -3844,6 +3844,91 @@ fn the_app_does_not_inherit_the_fuse_descriptor() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The same holds on the userland exec path, where no `execve` runs to
+/// drop close-on-exec descriptors. A binary rebuilt after `bundle-libs`
+/// and packed as is keeps its `PT_INTERP`, which is what selects that path.
+#[test]
+fn the_app_does_not_inherit_the_fuse_descriptor_under_userland_exec() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("fusefd-ulexec");
+    let src = td.join("fds.c");
+    write(
+        &src,
+        r#"
+#include <stdio.h>
+#include <dirent.h>
+#include <unistd.h>
+int main(void) {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) { buf[n] = 0; printf("exe %s\n", buf); }
+    DIR *d = opendir("/proc/self/fd");
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        char p[64];
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "/proc/self/fd/%s", e->d_name);
+        n = readlink(p, buf, sizeof buf - 1);
+        if (n > 0) { buf[n] = 0; printf("%s %s\n", e->d_name, buf); }
+    }
+    return 0;
+}
+"#,
+    );
+    let app = td.join("app");
+    let bin = app.join("bin/fds");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &bin) {
+        return;
+    }
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // The rebuild after bundling: PT_INTERP is back, .onelf/interp stays.
+    assert!(cc(&src, &bin));
+    let pkg = td.join("fds.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/fds",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut cmd = Command::new(&pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse");
+    isolate(&mut cmd, &td);
+    let out = run_package(&mut cmd);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("exe {}", pkg.display())),
+        "expected the userland exec path (exe is the package):\n{stdout}"
+    );
+    let leaked = stdout
+        .lines()
+        .filter(|l| !l.starts_with("exe "))
+        .any(|l| l.contains("/dev/fuse") || l.contains("fds.onelf"));
+    assert!(
+        !leaked,
+        "the app holds a descriptor execve would have closed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Stopping and resuming the app must not stop the server. A stopped child
 /// raises SIGCHLD too, and a server that took that for an exit parked in
 /// `waitpid` while the resumed app blocked forever on its next read from

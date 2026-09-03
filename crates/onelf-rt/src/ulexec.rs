@@ -378,7 +378,37 @@ pub fn exec_with_interp(
 
     let loaded = load(interpreter, page);
     let sp = make_stack(&loaded, &auxv, &exe, &argv, &env);
+    close_cloexec_fds();
     unsafe { enter(sp, loaded.entry) }
+}
+
+/// Do what `execve` would have done to the descriptor table: close every
+/// descriptor marked close-on-exec.
+///
+/// Nothing else drops them, since no `execve` runs. Left open, the app
+/// holds the package file, the FUSE server's `/dev/fuse` connection, and
+/// the read end of the death pipe. The `/dev/fuse` one is the dangerous
+/// one: a killed server cannot abort a connection another process still
+/// holds, so a survivor that touches the mount then waits unkillably.
+fn close_cloexec_fds() {
+    use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    // Collected first: the directory handle is itself a descriptor.
+    let fds: Vec<i32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter(|&fd| fd > 2)
+        .collect();
+    for fd in fds {
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        if rustix::io::fcntl_getfd(borrowed).is_ok_and(|f| f.contains(rustix::io::FdFlags::CLOEXEC))
+        {
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+    }
 }
 
 /// Whether userland-exec is supported on this platform.
