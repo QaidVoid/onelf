@@ -373,6 +373,19 @@ fn inject_onelf_file(
 }
 
 pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
+    // The CLI parser enforces this range; a recipe does not, and a block
+    // size of zero never advances the chunker.
+    if !(compress::MIN_BLOCK_SIZE..=compress::MAX_BLOCK_SIZE).contains(&opts.block_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "block size {} is outside {}..={} bytes",
+                opts.block_size,
+                compress::MIN_BLOCK_SIZE,
+                compress::MAX_BLOCK_SIZE
+            ),
+        ));
+    }
     let dir = opts.directory.canonicalize()?;
 
     // Resolve lib dirs: handle "auto" detection and conflict checking

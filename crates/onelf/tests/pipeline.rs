@@ -3372,6 +3372,36 @@ fn source_onelf_path_is_rejected() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A recipe block size outside the range the CLI enforces is refused
+/// before packing. Zero never advanced the chunker, which pushed empty
+/// blocks until the packer ran out of memory.
+#[test]
+fn a_recipe_block_size_out_of_range_is_refused() {
+    let td = workdir("recipe-bs");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(&app.join("blob.bin"), &"x".repeat(64 * 1024));
+    for size in ["0", "1", "1073741824"] {
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\ncommand = \"bin/run.sh\"\n\n[bundle]\nskip = true\n\n[compression]\nblock-size = {size}\n"
+            ),
+        );
+        let o = Command::new(onelf())
+            .args(["build", app.to_str().unwrap()])
+            .output()
+            .expect("spawn onelf build");
+        assert_eq!(o.status.code(), Some(1), "block-size = {size}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("block size") && err.contains("outside"),
+            "block-size = {size}: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Recipe `${VAR}` expansion runs after the TOML is parsed, so an env value
 /// containing a quote and newline cannot inject a new recipe key. The
 /// variable is set on the child process only, never on this test process.
