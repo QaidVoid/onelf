@@ -321,49 +321,78 @@ unsafe fn trim(base: *const u8, mut s: usize, mut e: usize) -> (usize, usize) {
 unsafe fn find_root() -> bool {
     let self_addr = onelf_env_init as *const () as usize as u64;
 
+    // Read in chunks and scan complete lines as they arrive, carrying a
+    // partial last line over to the next read. The whole file does not fit
+    // the buffer for a large application (an Electron app maps a few
+    // hundred libraries before any constructor runs), and this object is
+    // an early dependency at a high address, so it sits near the end.
     let maps = &raw mut G_MAPS as *mut u8;
-    let n = read_file(b"/proc/self/maps\0".as_ptr(), maps, MAPS_CAP - 1);
-    if n <= 0 {
+    let fd = sys::openat_rdonly(b"/proc/self/maps\0".as_ptr());
+    if fd < 0 {
         return false;
     }
-    let n = n as usize;
-    *maps.add(n) = 0;
-
-    // Scan lines: "start-end perms off dev inode  /path/to/lib.so".
-    let mut line = 0usize;
+    let mut have = 0usize;
+    let mut eof = false;
     let mut so = 0usize;
     let mut so_len = 0usize;
     let mut found = false;
-    while *maps.add(line) != 0 {
-        let mut p = line;
-        let start = parse_hex(maps, &mut p);
-        let mut end = 0u64;
-        if *maps.add(p) == b'-' {
-            p += 1;
-            end = parse_hex(maps, &mut p);
-        }
-        let mut eol = p;
-        while *maps.add(eol) != 0 && *maps.add(eol) != b'\n' {
-            eol += 1;
-        }
-        if self_addr >= start && self_addr < end {
-            let mut path = p;
-            while path < eol && *maps.add(path) != b'/' {
-                path += 1;
+    while !found {
+        if !eof {
+            let r = sys::read(fd as i32, maps.add(have), (MAPS_CAP - 1 - have) as u64);
+            if r <= 0 {
+                eof = true;
+            } else {
+                have += r as usize;
             }
-            if path < eol {
-                so = path;
-                so_len = eol - path;
-                found = true;
+        }
+        *maps.add(have) = 0;
+
+        // Scan lines: "start-end perms off dev inode  /path/to/lib.so".
+        let mut line = 0usize;
+        while line < have {
+            let mut eol = line;
+            while eol < have && *maps.add(eol) != b'\n' {
+                eol += 1;
             }
+            if eol == have && !eof {
+                break; // partial line: wait for the rest
+            }
+            let mut p = line;
+            let start = parse_hex(maps, &mut p);
+            let mut end = 0u64;
+            if *maps.add(p) == b'-' {
+                p += 1;
+                end = parse_hex(maps, &mut p);
+            }
+            if self_addr >= start && self_addr < end {
+                let mut path = p;
+                while path < eol && *maps.add(path) != b'/' {
+                    path += 1;
+                }
+                if path < eol {
+                    so = path;
+                    so_len = eol - path;
+                    found = true;
+                }
+                break;
+            }
+            line = eol + 1;
+        }
+        if found || eof {
             break;
         }
-        line = if *maps.add(eol) == b'\n' {
-            eol + 1
-        } else {
-            eol
-        };
+        if line == 0 && have == MAPS_CAP - 1 {
+            break; // one line longer than the buffer: not a maps file we know
+        }
+        // Keep the partial line, moved to the front.
+        let mut k = 0usize;
+        while line + k < have {
+            *maps.add(k) = *maps.add(line + k);
+            k += 1;
+        }
+        have = k;
     }
+    sys::close(fd as i32);
     if !found || so_len == 0 {
         return false;
     }
