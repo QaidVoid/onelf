@@ -292,7 +292,10 @@ impl HostIndex {
         for (soname, path) in drivers::cache_paths_in(ld_cache) {
             libs.entry(soname).or_insert_with(|| PathBuf::from(path));
         }
-        icd_libs.extend(icd_library_paths(icd_dirs));
+        // After the cache, so an ICD file naming its driver by bare soname
+        // (NVIDIA's `libGLX_nvidia.so.0`, which no driver family names)
+        // resolves through it and seeds the walk like one named by path.
+        icd_libs.extend(icd_library_paths_in(icd_dirs, Some(&libs)));
         for path in &icd_libs {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 libs.entry(name.to_string()).or_insert_with(|| path.clone());
@@ -348,13 +351,10 @@ impl HostIndex {
     }
 }
 
-/// `library_path` values from the host's Vulkan ICD and EGL vendor files
-/// that name a file by path. A bare soname there is found through the
-/// cache like any other and needs no entry.
-fn icd_library_paths(icd_dirs: &[&str]) -> Vec<PathBuf> {
-    icd_library_paths_in(icd_dirs, None)
-}
-
+/// `library_path` values from Vulkan ICD and EGL vendor files under
+/// `icd_dirs`. A value with a `/` names a file, absolute or relative to
+/// the file; a bare soname is looked up in `bare_names` and dropped when
+/// that is `None` or lacks it.
 fn icd_library_paths_in(
     icd_dirs: &[&str],
     bare_names: Option<&BTreeMap<String, PathBuf>>,
@@ -602,6 +602,8 @@ mod tests {
         cache: PathBuf,
         pkg: PathBuf,
         store: PathBuf,
+        /// Where the host's ICD files go; empty unless a test writes one.
+        icd_dir: PathBuf,
         /// The farm the last resolution produced, where `farm_link` looks.
         last_farm: std::cell::RefCell<Option<PathBuf>>,
     }
@@ -613,11 +615,14 @@ mod tests {
             let pkg = root.join("pkg");
             fs::create_dir_all(&host_lib).unwrap();
             fs::create_dir_all(pkg.join("lib")).unwrap();
+            let icd_dir = root.join("icd.d");
+            fs::create_dir_all(&icd_dir).unwrap();
             World {
                 cache: root.join("ld.so.cache"),
                 store: root.join("store"),
                 host_lib,
                 pkg,
+                icd_dir,
                 last_farm: std::cell::RefCell::new(None),
             }
         }
@@ -656,13 +661,14 @@ mod tests {
         }
 
         fn resolve_with(&self, policy: HostLibsPolicy, extra_root: Option<&Path>) -> Resolution {
+            let icd_dir = self.icd_dir.to_string_lossy().into_owned();
             let r = resolve(&Request {
                 pkg_root: &self.pkg,
                 lib_dirs: &["lib"],
                 policy,
                 store: &self.store,
                 ld_cache: &self.cache,
-                icd_dirs: &[],
+                icd_dirs: &[icd_dir.as_str()],
                 extra_root,
             });
             *self.last_farm.borrow_mut() = r.farm.clone();
@@ -1024,5 +1030,27 @@ mod tests {
             "the old farm was torn down under a running instance"
         );
         assert!(new_farm.join("libGL.so.1").exists());
+    }
+
+    #[test]
+    fn an_icd_naming_its_driver_by_bare_soname_seeds_the_walk() {
+        let w = World::new();
+        // NVIDIA's files name the vendor library by soname alone, and no
+        // driver family prefix matches `libGLX_nvidia`.
+        w.host(
+            "libGLX_nvidia.so.0",
+            &driver_needing(&["libnvidia-glcore.so.1"]),
+        );
+        let host_glcore = w.host("libnvidia-glcore.so.1", &versioned(&[]));
+        fs::write(
+            w.icd_dir.join("nvidia_icd.json"),
+            r#"{ "ICD": { "library_path": "libGLX_nvidia.so.0" } }"#,
+        )
+        .unwrap();
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(w.farm_link("libGLX_nvidia.so.0").is_some());
+        assert_eq!(w.farm_link("libnvidia-glcore.so.1"), Some(host_glcore));
     }
 }
