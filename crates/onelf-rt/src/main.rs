@@ -18,9 +18,13 @@ mod ulexec;
 #[cfg(feature = "update")]
 mod update;
 
+use std::ffi::OsString;
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let argv0 = args.first().map(|s| s.as_str()).unwrap_or("onelf");
+    // Bytes, not text: a file manager hands a GUI app whatever name the
+    // file has, and `args()` would abort the launch on one that is not UTF-8.
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let argv0 = args.first().and_then(|s| s.to_str()).unwrap_or("onelf");
 
     let exec_path = std::fs::read_link("/proc/self/exe")
         .ok()
@@ -111,10 +115,10 @@ fn main() {
         .manifest
         .get_string(pkg.manifest.entrypoints[ep_idx].args)
         .to_string();
-    let extra_args: Vec<String> = if ep_args_str.is_empty() {
+    let extra_args: Vec<OsString> = if ep_args_str.is_empty() {
         Vec::new()
     } else {
-        ep_args_str.split('\x1f').map(String::from).collect()
+        ep_args_str.split('\x1f').map(OsString::from).collect()
     };
 
     // Build final args: extra_args + remaining argv (skip argv[0])

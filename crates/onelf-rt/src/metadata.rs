@@ -3,6 +3,7 @@
 //! Handles `--onelf-icon` and `--onelf-desktop` flags, resolving metadata
 //! from the `.onelf/` convention and writing to stdout.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 
 use onelf_format::{EntryKind, Manifest};
@@ -43,9 +44,9 @@ pub(crate) fn resolve_desktop(manifest: &Manifest, entrypoint: &str) -> Option<u
 
 /// Check args for `--onelf-icon` or `--onelf-desktop` and handle them.
 /// Returns `true` if a metadata flag was handled (caller should exit).
-pub fn handle_metadata_flags(args: &[String], pkg: &mut PackageData, ep_name: &str) -> bool {
-    let is_icon = args.iter().any(|a| a == "--onelf-icon");
-    let is_desktop = args.iter().any(|a| a == "--onelf-desktop");
+pub fn handle_metadata_flags(args: &[OsString], pkg: &mut PackageData, ep_name: &str) -> bool {
+    let is_icon = args.iter().any(|a| a.as_os_str() == "--onelf-icon");
+    let is_desktop = args.iter().any(|a| a.as_os_str() == "--onelf-desktop");
 
     if !is_icon && !is_desktop {
         return false;

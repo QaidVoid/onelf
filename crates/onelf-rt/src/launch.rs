@@ -5,6 +5,7 @@
 //! exist on disk and in nothing after that, so they share this one path.
 //! The memfd mode has no tree and no libraries and does not come here.
 
+use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -26,7 +27,7 @@ pub struct Launch<'a> {
     pub ep_idx: usize,
     pub argv0: &'a str,
     pub exec_path: &'a str,
-    pub args: &'a [String],
+    pub args: &'a [OsString],
     pub interp_data: Option<&'a [u8]>,
     pub env_data: Option<&'a [u8]>,
     /// Whether this process is inside a private mount namespace, which

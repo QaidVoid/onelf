@@ -5,6 +5,7 @@
 //! executable. The new binary is written to a sibling temp file and moved
 //! atomically into place.
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,10 @@ pub enum UpdateFlag {
 }
 
 /// Inspect argv for update flags. Returns the chosen action if matched.
-pub fn parse_flag(args: &[String]) -> Option<UpdateFlag> {
-    if args.iter().any(|a| a == "--onelf-update") {
+pub fn parse_flag(args: &[OsString]) -> Option<UpdateFlag> {
+    if args.iter().any(|a| a.as_os_str() == "--onelf-update") {
         Some(UpdateFlag::Apply)
-    } else if args.iter().any(|a| a == "--onelf-check-update") {
+    } else if args.iter().any(|a| a.as_os_str() == "--onelf-check-update") {
         Some(UpdateFlag::Check)
     } else {
         None

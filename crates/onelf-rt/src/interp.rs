@@ -8,6 +8,7 @@
 //! 1. userland-exec: Maps interpreter directly, bypasses kernel loader (preferred)
 //! 2. Command-based: Invokes interpreter via --argv0 (fallback for non-ELF entrypoints)
 
+use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -128,7 +129,7 @@ pub fn exec_userland(
     interpreter: &Path,
     lib_path: &str,
     argv0: &str,
-    args: &[String],
+    args: &[OsString],
 ) -> ! {
     crate::ulexec::exec_with_interp(target, interpreter, lib_path, argv0, args)
 }
@@ -173,7 +174,7 @@ pub fn build_exec_command(
     lib_path: &str,
     private_ns: bool,
     argv0: &str,
-    args: &[String],
+    args: &[OsString],
 ) -> Command {
     use std::os::unix::process::CommandExt;
 

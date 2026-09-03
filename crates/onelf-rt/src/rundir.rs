@@ -9,6 +9,7 @@
 //! The tree is this launch's own, so a host library the resolver chose can
 //! be placed over its bundled copy with a plain symlink.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -27,7 +28,7 @@ pub fn execute_rundir(
     ep_idx: usize,
     argv0: &str,
     exec_path: &str,
-    args: &[String],
+    args: &[OsString],
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
 ) -> bool {

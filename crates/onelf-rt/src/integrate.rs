@@ -3,6 +3,7 @@
 //! Handles `--onelf-integrate` and `--onelf-unintegrate` flags to install or
 //! remove .desktop files and icons without needing the `onelf` CLI tool.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -267,13 +268,13 @@ fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
 /// Check args for `--onelf-integrate` or `--onelf-unintegrate` and handle them.
 /// Returns `true` if a flag was handled (caller should exit).
 pub fn handle_integrate_flags(
-    args: &[String],
+    args: &[OsString],
     pkg: &mut PackageData,
     ep_name: &str,
     exec_path: &str,
 ) -> bool {
-    let is_integrate = args.iter().any(|a| a == "--onelf-integrate");
-    let is_unintegrate = args.iter().any(|a| a == "--onelf-unintegrate");
+    let is_integrate = args.iter().any(|a| a.as_os_str() == "--onelf-integrate");
+    let is_unintegrate = args.iter().any(|a| a.as_os_str() == "--onelf-unintegrate");
 
     if is_integrate {
         do_integrate(pkg, ep_name, exec_path);

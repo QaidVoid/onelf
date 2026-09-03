@@ -15,10 +15,10 @@
 //! `AT_HWCAP` / `AT_PLATFORM` -- are carried over verbatim) with only the
 //! program-specific entries overridden for the loaded image.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::mem::size_of;
 use std::os::fd::AsFd;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use goblin::elf::Elf;
@@ -350,7 +350,7 @@ pub fn exec_with_interp(
     interpreter: &Path,
     lib_path: &str,
     argv0: &str,
-    args: &[String],
+    args: &[OsString],
 ) -> ! {
     let interp_str = interpreter.to_string_lossy();
     let target_str = target.to_string_lossy();
@@ -375,7 +375,7 @@ pub fn exec_with_interp(
     argv.push(CString::new(argv0).unwrap());
     argv.push(CString::new(target_str.as_ref()).unwrap());
     for arg in args {
-        argv.push(CString::new(arg.as_str()).unwrap());
+        argv.push(CString::new(arg.as_bytes()).unwrap());
     }
 
     // Forward the environment verbatim, including non-UTF-8 names/values, which

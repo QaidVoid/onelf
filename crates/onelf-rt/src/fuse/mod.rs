@@ -9,6 +9,7 @@ pub(crate) mod fs;
 pub(crate) mod mount;
 mod protocol;
 
+use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -136,7 +137,7 @@ fn exec_from_mount(
     ep_idx: usize,
     argv0: &str,
     exec_path: &str,
-    args: &[String],
+    args: &[OsString],
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
     mountpoint: &Path,
@@ -224,7 +225,7 @@ pub fn execute_fuse(
     ep_idx: usize,
     argv0: &str,
     exec_path: &str,
-    args: &[String],
+    args: &[OsString],
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
     needs_setuid: bool,

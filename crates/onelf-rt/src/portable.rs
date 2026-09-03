@@ -6,6 +6,7 @@
 //! in `REAL_*` variables. Also loads `{binary}.env` if present.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ struct PortableDir {
 
 /// Check args for `--onelf-portable-*` flags. Creates directories and exits if matched.
 /// Returns `true` if a flag was handled.
-pub fn handle_portable_flags(args: &[String], exe_dir: &Path, exe_name: &str) -> bool {
+pub fn handle_portable_flags(args: &[OsString], exe_dir: &Path, exe_name: &str) -> bool {
     let dirs = [
         ("--onelf-portable-home", "home"),
         ("--onelf-portable-config", "config"),
@@ -26,11 +27,11 @@ pub fn handle_portable_flags(args: &[String], exe_dir: &Path, exe_name: &str) ->
         ("--onelf-portable-cache", "cache"),
     ];
 
-    let create_all = args.iter().any(|a| a == "--onelf-portable");
+    let create_all = args.iter().any(|a| a.as_os_str() == "--onelf-portable");
 
     let mut handled = create_all;
     for (flag, suffix) in &dirs {
-        if create_all || args.iter().any(|a| a == *flag) {
+        if create_all || args.iter().any(|a| a.as_os_str() == *flag) {
             let dir = exe_dir.join(format!("{exe_name}.{suffix}"));
             match fs::create_dir(&dir) {
                 Ok(()) => println!("created: {}", dir.display()),

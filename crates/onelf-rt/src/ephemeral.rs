@@ -9,6 +9,7 @@
 //! Trade-off vs. FUSE: the whole package sits in RAM (vs. on-demand).
 //! Fine for AppImage-scale bundles, use FUSE for very large packages.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::fuse::mount;
@@ -58,7 +59,7 @@ pub fn execute_tmpfs(
     ep_idx: usize,
     argv0: &str,
     exec_path: &str,
-    args: &[String],
+    args: &[OsString],
     interp_data: Option<&[u8]>,
     env_data: Option<&[u8]>,
 ) -> bool {

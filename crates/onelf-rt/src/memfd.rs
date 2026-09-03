@@ -4,6 +4,7 @@
 //! the payload is decompressed directly into a memfd and executed without
 //! touching the filesystem.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -11,7 +12,7 @@ use std::process::Command;
 
 use rustix::fs::MemfdFlags;
 
-pub fn execute_memfd(data: &[u8], argv0: &str, args: &[String]) -> io::Result<()> {
+pub fn execute_memfd(data: &[u8], argv0: &str, args: &[OsString]) -> io::Result<()> {
     let fd = rustix::fs::memfd_create(c"onelf", MemfdFlags::empty())
         .map_err(|e| io::Error::other(format!("memfd_create: {e}")))?;
 

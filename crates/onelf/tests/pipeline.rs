@@ -4119,6 +4119,42 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// An argument that is not UTF-8 reaches the app as the bytes it was.
+/// A file manager passes whatever name the file has, and the runtime used
+/// to collect argv as `String`, which aborts the launch on such a name.
+#[test]
+fn a_non_utf8_argument_reaches_the_app_intact() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let td = workdir("argv-bytes");
+    let pkg = pack_script(
+        &td,
+        "hexdump",
+        "#!/bin/sh\nprintf '%s' \"$1\" | od -An -tx1\n",
+    );
+    for mode in ["cache", "fuse"] {
+        if mode == "fuse" && !fuse_available() {
+            continue;
+        }
+        let mut cmd = Command::new(&pkg);
+        cmd.arg(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", mode);
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hex = String::from_utf8_lossy(&out.stdout).replace(char::is_whitespace, "");
+        assert_eq!(hex, "636166e92e747874", "{mode}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Two packages shipping the same bytes with different modes get their
 /// own blob each. A blob is one inode hardlinked into every tree that
 /// carries it, so a shared one took the first package's mode, and the
