@@ -108,18 +108,7 @@ pub fn read_payload_entry(
         return Ok(buf);
     }
     let original = onelf_format::reader::block_original_size(block)?;
-
-    let data = if let Some(d) = dict {
-        let cursor = Cursor::new(&buf);
-        let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
-        let mut result = Vec::with_capacity(original);
-        decoder.read_to_end(&mut result)?;
-        result
-    } else {
-        zstd::bulk::decompress(&buf, original).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
-        })?
-    };
+    let data = decode_block(&buf, original, dict)?;
 
     if block.has_content_hash() && blake3::hash(&data).as_bytes() != &block.content_hash {
         return Err(io::Error::new(
@@ -173,21 +162,64 @@ pub fn read_payload_blocks(
             continue;
         }
         let original = onelf_format::reader::block_original_size(block)?;
-
-        let decompressed = if let Some(d) = dict {
-            let cursor = Cursor::new(&buf);
-            let mut decoder = zstd::Decoder::with_dictionary(cursor, d)?;
-            let mut block_result = Vec::with_capacity(original);
-            decoder.read_to_end(&mut block_result)?;
-            block_result
-        } else {
-            zstd::bulk::decompress(&buf, original).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("decompression: {e}"))
-            })?
-        };
-
-        result.extend_from_slice(&decompressed);
+        result.extend_from_slice(&decode_block(&buf, original, dict)?);
     }
 
     Ok(result)
+}
+
+/// Decompress one block that the manifest says is `original` bytes long.
+///
+/// Both paths are held to that length. The dictionary decoder streams, so
+/// without a bound a few kilobytes of input could expand without limit
+/// before the hash check; and a block that comes up short is an error,
+/// since on a v1 manifest with no per-block hash it would be served with
+/// every later offset shifted.
+fn decode_block(buf: &[u8], original: usize, dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let data = match dict {
+        Some(d) => {
+            let decoder = zstd::Decoder::with_dictionary(Cursor::new(buf), d)?;
+            let mut out = Vec::with_capacity(original);
+            decoder.take(original as u64 + 1).read_to_end(&mut out)?;
+            out
+        }
+        None => zstd::bulk::decompress(buf, original)
+            .map_err(|e| invalid(format!("decompression: {e}")))?,
+    };
+    if data.len() != original {
+        return Err(invalid(format!(
+            "block decompressed to {} bytes, manifest says {original}",
+            data.len()
+        )));
+    }
+    Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DICT: &[u8] = b"a raw content dictionary shared by every block in this test";
+
+    fn compressed(data: &[u8], dict: Option<&[u8]>) -> Vec<u8> {
+        match dict {
+            Some(d) => zstd::bulk::Compressor::with_dictionary(3, d)
+                .unwrap()
+                .compress(data)
+                .unwrap(),
+            None => zstd::bulk::compress(data, 3).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_block_must_decode_to_exactly_the_length_the_manifest_claims() {
+        let data = b"hello hello hello hello hello world".repeat(50);
+        for dict in [None, Some(DICT)] {
+            let buf = compressed(&data, dict);
+            assert_eq!(decode_block(&buf, data.len(), dict).unwrap(), data);
+            assert!(decode_block(&buf, data.len() - 1, dict).is_err());
+            assert!(decode_block(&buf, data.len() + 1, dict).is_err());
+        }
+    }
 }
