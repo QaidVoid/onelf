@@ -70,7 +70,7 @@ fn fuse_available() -> bool {
         };
 
         if !ok {
-            eprintln!("skip: FUSE is not mountable here, as with cc and patchelf");
+            skip("FUSE is not mountable here, as with cc and patchelf");
         }
         let _ = std::fs::remove_dir_all(&td);
         ok
@@ -85,6 +85,32 @@ fn patchelf() -> Option<String> {
         return Some(p);
     }
     have("patchelf").then(|| "patchelf".to_string())
+}
+
+/// Announce that a test is skipping for lack of something in the
+/// environment. Under `CI` that is a failure: a runner without a compiler
+/// or a mountable FUSE goes green having tested little, and the point of
+/// the runner is to notice.
+fn skip(reason: &str) {
+    if std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
+        panic!("skip under CI: {reason}");
+    }
+    skip("{reason}");
+}
+
+/// Spawn a packed binary, retrying briefly while the kernel reports the
+/// file as busy; the same window [`run_package`] rides out.
+fn spawn_package(cmd: &mut Command) -> std::process::Child {
+    for _ in 0..100 {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawn package: {e}"),
+        }
+    }
+    panic!("package remained busy after repeated attempts")
 }
 
 fn workdir(tag: &str) -> PathBuf {
@@ -166,7 +192,7 @@ fn cc(src: &Path, out: &Path) -> bool {
     } else if have("gcc") {
         "gcc"
     } else {
-        eprintln!("skip: no C compiler available");
+        skip("no C compiler available");
         return false;
     };
     let st = Command::new(compiler)
@@ -961,12 +987,7 @@ fn cache_gc_spares_a_running_package() {
         .env("ONELF_MODE", "cache")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = match live.spawn() {
-        Ok(c) => c,
-        // Same ETXTBSY window the other tests hit.
-        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
-        Err(e) => panic!("spawn package: {e}"),
-    };
+    let mut child = spawn_package(&mut live);
 
     // Wait for it to announce itself, so the package is extracted and the
     // shared lock is definitely held.
@@ -1038,11 +1059,7 @@ fn cache_clear_spares_a_running_package() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     isolate(&mut live, &td);
-    let mut child = match live.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
-        Err(e) => panic!("spawn package: {e}"),
-    };
+    let mut child = spawn_package(&mut live);
     {
         use std::io::Read;
         let mut buf = [0u8; 8];
@@ -1850,7 +1867,7 @@ fn cc_with(args: &[&str], out: &Path) -> bool {
     } else if have("gcc") {
         "gcc"
     } else {
-        eprintln!("skip: no C compiler available");
+        skip("no C compiler available");
         return false;
     };
     let st = Command::new(compiler)
@@ -2281,11 +2298,11 @@ int main(void) {
         &app.join("bin/app"),
     ));
     let Some(host_libc) = ldd_path(&app.join("bin/app"), "libc.so.6") else {
-        eprintln!("skip: ldd does not report libc.so.6");
+        skip("ldd does not report libc.so.6");
         return;
     };
     let Some(host_ld) = ldd_path(&app.join("bin/app"), "ld-linux") else {
-        eprintln!("skip: ldd does not report the loader");
+        skip("ldd does not report the loader");
         return;
     };
 
@@ -2659,11 +2676,7 @@ fn concurrent_first_runs_never_see_a_partial_package() {
         isolate(&mut run, &td);
         run.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        match run.spawn() {
-            Ok(c) => kids.push(c),
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => return,
-            Err(e) => panic!("spawn package: {e}"),
-        }
+        kids.push(spawn_package(&mut run));
     }
 
     let expected = format!("{}", payload.len());
@@ -3620,7 +3633,7 @@ fn a_static_entrypoint_still_runs_from_a_memfd() {
     } else if have("gcc") {
         "gcc"
     } else {
-        eprintln!("skip: no C compiler available");
+        skip("no C compiler available");
         return;
     };
     let built = Command::new(compiler)
@@ -3631,7 +3644,7 @@ fn a_static_entrypoint_still_runs_from_a_memfd() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !built {
-        eprintln!("skip: no static libc available to link against");
+        skip("no static libc available to link against");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -3682,7 +3695,7 @@ fn forcing_memfd_on_a_linked_entrypoint_says_so() {
     let bin = app.join("bin/m");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     if !cc_libm(&src, &bin) {
-        eprintln!("skip: no C compiler available");
+        skip("no C compiler available");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -3722,7 +3735,7 @@ fn forcing_memfd_on_a_linked_entrypoint_says_so() {
 #[test]
 fn packing_refuses_memfd_for_a_bundled_entrypoint() {
     let Some(_pe) = patchelf() else {
-        eprintln!("skip: patchelf not available");
+        skip("patchelf not available");
         return;
     };
     let td = workdir("memfd-pack");
@@ -3731,7 +3744,7 @@ fn packing_refuses_memfd_for_a_bundled_entrypoint() {
     let bin = app.join("bin/m");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     if !cc_libm(&src, &bin) {
-        eprintln!("skip: no C compiler available");
+        skip("no C compiler available");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -3776,7 +3789,7 @@ fn packing_refuses_memfd_for_a_bundled_entrypoint() {
 #[test]
 fn a_daemonized_process_outlives_the_launcher() {
     if !fuse_available() {
-        eprintln!("skip: FUSE is not mountable here");
+        skip("FUSE is not mountable here");
         return;
     }
     let td = workdir("daemonize");
@@ -3864,7 +3877,7 @@ fn a_daemonized_process_outlives_the_launcher() {
 #[test]
 fn the_launcher_returns_without_waiting_for_a_daemon() {
     if !fuse_available() {
-        eprintln!("skip: FUSE is not mountable here");
+        skip("FUSE is not mountable here");
         return;
     }
     let td = workdir("prompt-return");
@@ -3983,13 +3996,13 @@ fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, Path
             return Some((child, mp));
         }
         if child.try_wait().unwrap().is_some() {
-            eprintln!("skip: the FUSE helper cannot mount here");
+            skip("the FUSE helper cannot mount here");
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let _ = child.kill();
-    eprintln!("skip: the FUSE helper mount did not appear");
+    skip("the FUSE helper mount did not appear");
     None
 }
 
@@ -4022,7 +4035,7 @@ fn the_app_does_not_inherit_the_fuse_descriptor() {
         isolate(&mut cmd, &td);
         let out = run_package(&mut cmd);
         if !out.status.success() {
-            eprintln!("skip: helper={helper} cannot mount here");
+            skip("helper={helper} cannot mount here");
             continue;
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -4431,7 +4444,7 @@ fn onelf_trace_records_what_the_run_opened() {
     isolate(&mut run, &td);
     let out = run_package(&mut run);
     if !out.status.success() {
-        eprintln!("skip: FUSE cannot mount here");
+        skip("FUSE cannot mount here");
         return;
     }
 
