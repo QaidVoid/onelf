@@ -1175,8 +1175,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 ///
 /// A distribution's closure carries plugins for stacks that were never
 /// installed, Qt modules and Python bindings for optional dependencies,
-/// and each would otherwise be one more line of policy. The entrypoint is
-/// never dropped: it stays a finding. A soname the sysroot does hold but
+/// and each would otherwise be one more line of policy. Only what this
+/// build generated is dropped: a file the publisher placed by hand stays
+/// a finding, as does the entrypoint. A soname the sysroot does hold but
 /// the closure or policy left out stays a finding too, since that is a
 /// choice for the publisher.
 ///
@@ -1195,6 +1196,13 @@ fn drop_unloadable(
         .filter_map(|f| Path::new(f).file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .collect();
+    let generated: HashSet<PathBuf> =
+        fs::read_to_string(opts.directory.join(sysroot::GENERATED_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
     let entrypoint = opts
         .primary
         .as_deref()
@@ -1206,7 +1214,7 @@ fn drop_unloadable(
         let mut progressed = false;
         for (object, libs) in findings.iter() {
             let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
-            if entrypoint.as_deref() == Some(rel) {
+            if entrypoint.as_deref() == Some(rel) || !generated.contains(rel) {
                 continue;
             }
             let Some(soname) = libs

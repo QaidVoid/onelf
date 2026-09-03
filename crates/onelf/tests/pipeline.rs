@@ -5445,6 +5445,37 @@ fn objects_the_sysroot_cannot_satisfy_are_dropped_not_fatal() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Only what the sysroot build generated is dropped for an unmet need. A
+/// file the publisher placed by hand stays, and the verifier names it:
+/// deleting their work under an informational line would hide it.
+#[test]
+fn a_publisher_file_with_an_unmet_need_is_a_finding_not_dropped() {
+    let td = workdir("unloadable-own");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+    let mine = dir.join("lib/fixture/plugins/mine.so");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::copy(fixture.rootfs.join("usr/lib/fixture/plugins/c.so"), &mine).unwrap();
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the unmet need is fatal:\n{stderr}");
+    assert!(mine.is_file(), "the publisher's file was dropped");
+    assert!(
+        stderr.contains("lib/fixture/plugins/mine.so") && stderr.contains("libmissing.so.9"),
+        "the finding names the file and the soname:\n{stderr}"
+    );
+    assert!(
+        !dir.join("lib/fixture/plugins/c.so").exists(),
+        "the generated copy still goes"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.
