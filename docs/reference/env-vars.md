@@ -45,6 +45,7 @@ resolver and reached through its link farm.
 | `ONELF_MODE` | Force a specific execution mode. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` fallback path even when user namespaces are available. Useful for debugging mount visibility. |
+| `ONELF_FUSE_CACHE_BYTES` | Byte ceiling for the FUSE server's cache of decompressed blocks. Default 32 MiB; a value that does not parse or is zero keeps the default. |
 | `ONELF_CACHE` | `1` allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |
 | `ONELF_NO_RESOLVER` | `1` launches with nothing taken from the host, as if the package were packed with `host-libs = never`. The way to tell whether a failure is the resolver's doing. |
 | `ONELF_LD_CACHE` | Path of the loader cache image the resolver reads instead of `/etc/ld.so.cache`, so a fixture can describe a host of its own. |

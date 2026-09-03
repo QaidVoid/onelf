@@ -66,8 +66,11 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--dict` | `false` | Train shared zstd dictionary |
 | `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
 | `--preload PATH` | | Library dlopen'd on every exec via onelf-env (repeatable, re-exec-safe) |
-| `--memfd` | auto | Force memfd eligibility on |
-| `--no-memfd` | | Force memfd eligibility off |
+| `--memfd` | `false` | Mark the default entrypoint memfd-eligible |
+| `--no-memfd` | `false` | Force memfd eligibility off |
+| `--cache` | `false` | Let the runtime fall back to the persistent cache when no other execution mode works |
+| `--needs-setuid` | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
+| `--mtime SECS` | | Pin every entry's mtime to a Unix timestamp for reproducible output |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
 | `--update-url URL` | | zsync URL; enables update runtime |
 | `--update-key PATH` | | 32-byte Ed25519 public key; required for self-update |
