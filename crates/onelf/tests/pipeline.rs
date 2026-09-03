@@ -3187,6 +3187,97 @@ fn crafted_footer_is_refused_by_every_reader() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Rewrite the manifest of a packed file in place, keeping every other
+/// region where it was. Returns the crafted package's path.
+fn with_manifest(
+    pkg: &Path,
+    out: &Path,
+    edit: impl FnOnce(&mut onelf_format::Manifest),
+) -> PathBuf {
+    let bytes = std::fs::read(pkg).unwrap();
+    let f = bytes.len() - 76;
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[f + at..f + at + 8].try_into().unwrap());
+    let (m_off, m_comp, m_orig) = (
+        u64_at(12) as usize,
+        u64_at(20) as usize,
+        u64_at(28) as usize,
+    );
+    let (p_off, p_size) = (u64_at(36) as usize, u64_at(44) as usize);
+    let d_off = u64_at(52) as usize;
+    let d_size = u32::from_le_bytes(bytes[f + 60..f + 64].try_into().unwrap()) as usize;
+
+    let manifest = zstd::bulk::decompress(&bytes[m_off..m_off + m_comp], m_orig).unwrap();
+    let mut m = onelf_format::Manifest::deserialize(&manifest).unwrap();
+    edit(&mut m);
+    let manifest = m.serialize().unwrap();
+    let compressed = zstd::bulk::compress(&manifest, 3).unwrap();
+
+    let mut file = bytes[..m_off].to_vec();
+    file.extend_from_slice(&compressed);
+    let new_p_off = file.len();
+    file.extend_from_slice(&bytes[p_off..p_off + p_size]);
+    let new_d_off = file.len();
+    if d_size > 0 {
+        file.extend_from_slice(&bytes[d_off..d_off + d_size]);
+    }
+    let mut footer = bytes[f..].to_vec();
+    footer[20..28].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+    footer[28..36].copy_from_slice(&(manifest.len() as u64).to_le_bytes());
+    footer[36..44].copy_from_slice(&(new_p_off as u64).to_le_bytes());
+    if d_size > 0 {
+        footer[52..60].copy_from_slice(&(new_d_off as u64).to_le_bytes());
+    }
+    footer[64..68].copy_from_slice(&xxhash_rust::xxh32::xxh32(&manifest, 0).to_le_bytes());
+    file.extend_from_slice(&footer);
+    std::fs::write(out, &file).unwrap();
+    std::fs::set_permissions(
+        out,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    out.to_path_buf()
+}
+
+/// `verify` checks what the runtime checks. The runtime serves blocks and
+/// verifies each against its own hash, so a package whose whole-entry
+/// hash is right but a block hash is wrong fails at launch; `verify`
+/// used to pass it, checking the whole entry only.
+#[test]
+fn verify_rejects_a_block_hash_the_runtime_would_reject() {
+    let td = workdir("blockhash");
+    let pkg = pack_script(&td, "blk", "#!/bin/sh\necho RAN\n");
+    let bad = with_manifest(&pkg, &td.join("bad.onelf"), |m| {
+        let entry = m
+            .entries
+            .iter_mut()
+            .find(|e| e.kind == onelf_format::EntryKind::File && !e.blocks.is_empty())
+            .expect("a file with a block");
+        assert!(entry.blocks[0].has_content_hash(), "a v2 manifest");
+        entry.blocks[0].content_hash[0] ^= 1;
+    });
+
+    // FUSE serves and checks block by block; the extracting modes check
+    // the whole entry, which this package still satisfies.
+    if fuse_available() {
+        let mut run = Command::new(&bad);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "fuse");
+        isolate(&mut run, &td);
+        let o = run_package(&mut run);
+        assert!(!o.status.success(), "the FUSE server must refuse the block");
+    }
+
+    let o = run_onelf(&["verify", bad.to_str().unwrap()], None);
+    assert!(
+        !o.status.success(),
+        "verify passed a package the runtime refuses:\n{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package whose manifest names an entry `..` is refused by everything
 /// that puts files on disk: `extract`, cache mode, and rundir mode. The
 /// path check has unit tests; this drives it through a crafted package.

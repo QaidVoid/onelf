@@ -85,6 +85,15 @@ pub(crate) fn decompress_entry(
                 ),
             ));
         }
+        // What the FUSE server checks on every read. A block that fails
+        // here fails at launch, so it has to fail here too.
+        if block.has_content_hash() && blake3::hash(&decompressed).as_bytes() != &block.content_hash
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "block hash mismatch (tampered or corrupt package)",
+            ));
+        }
 
         result.extend_from_slice(&decompressed);
     }
@@ -94,9 +103,9 @@ pub(crate) fn decompress_entry(
 
 /// Decompress an entry and verify its bytes against the recorded BLAKE3
 /// `content_hash` before returning, so extraction never writes tampered
-/// or corrupt content to disk or stdout. `decompress_entry` itself stays
-/// unverified because `verify` needs to decompress-then-report every
-/// mismatch rather than fail fast.
+/// or corrupt content to disk or stdout. `decompress_entry` itself checks
+/// each block but not the whole entry, because `verify` needs to
+/// decompress-then-report every mismatch rather than fail fast.
 pub(crate) fn decompress_verified(
     file: &mut File,
     footer: &onelf_format::Footer,

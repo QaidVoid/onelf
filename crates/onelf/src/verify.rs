@@ -33,7 +33,16 @@ pub fn verify(binary: &Path) -> io::Result<()> {
 
     for (idx, rel_path) in &file_entries {
         let entry = &manifest.entries[*idx];
-        let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
+        let data = match decompress_entry(&mut file, &footer, entry, dict.as_deref()) {
+            Ok(data) => data,
+            // A block that does not decode or does not hash is this file's
+            // failure, reported with the rest rather than ending the run.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                failed.push((rel_path.clone(), e.to_string()));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let actual: [u8; 32] = blake3::hash(&data).into();
         if actual != entry.content_hash {
             failed.push((
