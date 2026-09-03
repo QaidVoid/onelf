@@ -5670,6 +5670,60 @@ fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Two packs into one directory keep their scratch files apart. The
+/// payload scratch used to be named by replacing the output's extension,
+/// so `app.x86_64` and `app.aarch64` packing at once shared one and each
+/// copied the other's bytes under its own offsets. A scratch file a
+/// crashed pack left behind is not content either.
+#[test]
+fn concurrent_packs_into_one_directory_do_not_share_scratch() {
+    let td = workdir("scratch");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    write(&app.join("data.bin"), &"x".repeat(2 * 1024 * 1024));
+    write(
+        &app.join("app.onelf.onelf-payload-1.tmp"),
+        "left by a crashed pack",
+    );
+
+    let outputs = [td.join("app.x86_64"), td.join("app.aarch64")];
+    let children: Vec<_> = outputs
+        .iter()
+        .map(|out| {
+            Command::new(onelf())
+                .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+                .args(["--command", "bin/run", "--mtime", "0", "--level", "1"])
+                .spawn()
+                .expect("spawn onelf pack")
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    for out in &outputs {
+        let o = run_onelf(&["verify", out.to_str().unwrap()], None);
+        assert!(
+            o.status.success(),
+            "{} does not verify: {}",
+            out.display(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let o = run_onelf(&["list", out.to_str().unwrap()], None);
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains(".tmp"),
+            "the leftover scratch file was packed"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&td)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+        "scratch files were left beside the outputs"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package's own previous output inside its directory is never packed
 /// into the next one.
 #[test]

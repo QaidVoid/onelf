@@ -372,6 +372,21 @@ fn inject_onelf_file(
     });
 }
 
+/// A scratch file beside `output` for this pack alone. The whole output
+/// name is kept, so `app.x86_64` and `app.aarch64` packing at once in one
+/// directory do not share it, and the pid is added, so two packs of one
+/// output do not either.
+fn sibling_tmp(output: &Path, tag: &str) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(format!(".onelf-{tag}-{}.tmp", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// True for a name [`sibling_tmp`] produces, whichever pack produced it.
+fn is_scratch_name(name: &str) -> bool {
+    name.ends_with(".tmp") && name.contains(".onelf-")
+}
+
 pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // The CLI parser enforces this range; a recipe does not, and a block
     // size of zero never advances the chunker.
@@ -451,6 +466,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
         // The packer's own bookkeeping of a sysroot build, not content.
         if rel_path == Path::new(crate::bundle::sysroot::GENERATED_FILE) {
+            continue;
+        }
+        // Scratch a crashed pack left beside its output, not content either.
+        if is_scratch_name(&entry.file_name().to_string_lossy()) {
             continue;
         }
 
@@ -743,7 +762,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         "Compressing files..."
     });
 
-    let payload_tmp_path = opts.output.with_extension("onelf-payload.tmp");
+    let payload_tmp_path = sibling_tmp(&opts.output, "payload");
     let mut payload_tmp = BufWriter::new(File::create(&payload_tmp_path)?);
     let mut payload_offset: u64 = 0;
     let mut compressed_files: Vec<CompressedFile> = Vec::with_capacity(files.len());
@@ -1184,9 +1203,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Written beside the output and renamed over it at the end, so a
     // reader never sees a partial package and an instance still running
     // the previous one keeps its file.
-    let staged = opts
-        .output
-        .with_extension(format!("onelf-{}.tmp", std::process::id()));
+    let staged = sibling_tmp(&opts.output, "staged");
     let out = File::create(&staged)?;
     let mut w = BufWriter::new(out);
 
