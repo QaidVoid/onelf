@@ -321,11 +321,13 @@ impl<'a> FuseState<'a> {
     /// on: a launcher that waits for a daemon its child started is a launcher
     /// that only returns once that daemon has given up, and reports it dead.
     /// The mount is handed to a background server in that case, so leaving
-    /// here does not take the filesystem with it.
+    /// here does not take the filesystem with it. Either signal may be left
+    /// out; the caller passes no death pipe when it has already hung up and
+    /// the child turned out to be alive.
     pub fn run_loop(
         &mut self,
         fuse_fd: &impl AsFd,
-        death_pipe: &impl AsFd,
+        death_pipe: Option<&impl AsFd>,
         child_exit: Option<&impl AsFd>,
         buf: &mut [u8],
     ) {
@@ -347,7 +349,9 @@ impl<'a> FuseState<'a> {
 
             let mut poll_fds = Vec::with_capacity(3);
             poll_fds.push(PollFd::new(fuse_fd, PollFlags::IN));
-            poll_fds.push(PollFd::new(death_pipe, PollFlags::IN));
+            if let Some(fd) = death_pipe {
+                poll_fds.push(PollFd::new(fd, PollFlags::IN));
+            }
             if let Some(fd) = child_exit {
                 poll_fds.push(PollFd::new(fd, PollFlags::IN));
             }
@@ -358,16 +362,9 @@ impl<'a> FuseState<'a> {
                 Err(_) => return,
             }
 
-            if poll_fds[1]
-                .revents()
-                .intersects(PollFlags::HUP | PollFlags::IN)
-            {
-                return;
-            }
-
-            if poll_fds
-                .get(2)
-                .is_some_and(|p| p.revents().intersects(PollFlags::IN | PollFlags::HUP))
+            if poll_fds[1..]
+                .iter()
+                .any(|p| p.revents().intersects(PollFlags::HUP | PollFlags::IN))
             {
                 return;
             }

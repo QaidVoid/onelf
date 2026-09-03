@@ -3844,6 +3844,73 @@ fn the_app_does_not_inherit_the_fuse_descriptor() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Stopping and resuming the app must not stop the server. A stopped child
+/// raises SIGCHLD too, and a server that took that for an exit parked in
+/// `waitpid` while the resumed app blocked forever on its next read from
+/// the mount. Ctrl-Z, `kill -STOP`, and a debugger attaching all do this.
+#[test]
+fn a_stopped_and_resumed_app_still_reads_from_the_mount() {
+    use std::io::BufRead;
+
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("stopcont");
+    write(&td.join("stopper/data.txt"), "STILL SERVED\n");
+    let pkg = pack_script(
+        &td,
+        "stopper",
+        "#!/bin/sh\necho \"pid $$\"\nsleep 2\ncat \"$ONELF_DIR/data.txt\"\n",
+    );
+    let mut cmd = Command::new(&pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    isolate(&mut cmd, &td);
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(c) => break c,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("spawn package: {e}"),
+        }
+    };
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    let app_pid = first.trim().strip_prefix("pid ").expect("pid line");
+    for sig in ["-STOP", "-CONT"] {
+        let st = Command::new("kill").args([sig, app_pid]).status().unwrap();
+        assert!(st.success(), "kill {sig} {app_pid}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let reader = std::thread::spawn(move || {
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+        rest
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = Command::new("kill").args(["-9", app_pid]).status();
+            let _ = child.kill();
+            panic!("the app hung after being stopped and resumed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let rest = reader.join().unwrap();
+    assert!(status.success(), "exit {status}:\n{rest}");
+    assert!(rest.contains("STILL SERVED"), "output:\n{rest}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A mount served through the host's FUSE helper outlives a runtime that
 /// was killed, and the kernel cannot tear it down on its own. The next
 /// launch of any package reclaims it.

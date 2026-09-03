@@ -9,6 +9,7 @@ pub(crate) mod fs;
 pub(crate) mod mount;
 mod protocol;
 
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -104,9 +105,18 @@ pub(crate) fn install_signal_handlers() {
         Signal::QUIT,
         Signal::CHILD,
     ] {
+        // Only an exit is worth waking the event loop for. Without
+        // NOCLDSTOP a Ctrl-Z, a `kill -STOP`, or a debugger attaching also
+        // raise SIGCHLD, and the loop would stop serving the mount for a
+        // child that is about to resume and read from it.
+        let sa_flags = if sig == Signal::CHILD {
+            flags | KernelSigactionFlags::NOCLDSTOP
+        } else {
+            flags
+        };
         let action = KernelSigaction {
             sa_handler_kernel: Some(signal_handler),
-            sa_flags: flags,
+            sa_flags,
             sa_restorer: Some(__onelf_signal_restorer),
             sa_mask: mask.clone(),
         };
@@ -358,7 +368,10 @@ pub fn execute_fuse(
 
             // Installed before the handlers, so a child that exits immediately
             // still finds somewhere to record it.
-            let sigchld = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok();
+            let sigchld = rustix::pipe::pipe_with(
+                rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+            )
+            .ok();
             if let Some((_, w)) = &sigchld {
                 SIGCHLD_PIPE.store(rustix::fd::AsRawFd::as_raw_fd(w), Ordering::Relaxed);
             }
@@ -375,23 +388,44 @@ pub fn execute_fuse(
             let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];
             state.run_loop(
                 &fuse_fd,
-                &pipe_read,
+                Some(&pipe_read),
                 sigchld.as_ref().map(|(r, _)| r),
                 &mut fuse_buf,
             );
 
-            // Event loop exited -- reap child
+            // Event loop exited -- reap child. A wake that finds the child
+            // still running (the death pipe closed by an app that shuts every
+            // inherited descriptor, or a stray SIGCHLD) must not park this
+            // process in `waitpid`: nothing else serves the mount, so the
+            // child's next read would block forever. Keep serving on the
+            // exit pipe alone until the child really is gone.
             let exit_status = loop {
                 match waitpid(Some(child_pid), WaitOptions::NOHANG) {
                     Ok(Some((_pid, status))) => break status,
-                    Ok(None) => match waitpid(Some(child_pid), WaitOptions::empty()) {
-                        Ok(Some((_pid, status))) => break status,
-                        Ok(None) => continue,
-                        Err(rustix::io::Errno::INTR) => continue,
-                        Err(_) => {
-                            cleanup_mountpoint(&mountpoint, used_namespace);
-                            std::process::exit(1);
+                    Ok(None) => match &sigchld {
+                        Some((r, _)) => {
+                            // Drain, then look again before sleeping: an exit
+                            // that landed between the check above and the
+                            // drain wrote its byte into what was just thrown
+                            // away, and nothing would wake the loop for it.
+                            let mut scratch = [0u8; 64];
+                            while rustix::io::read(r, &mut scratch).is_ok_and(|n| n > 0) {}
+                            if let Ok(Some((_pid, status))) =
+                                waitpid(Some(child_pid), WaitOptions::NOHANG)
+                            {
+                                break status;
+                            }
+                            state.run_loop(&fuse_fd, None::<&OwnedFd>, Some(r), &mut fuse_buf);
                         }
+                        None => match waitpid(Some(child_pid), WaitOptions::empty()) {
+                            Ok(Some((_pid, status))) => break status,
+                            Ok(None) => continue,
+                            Err(rustix::io::Errno::INTR) => continue,
+                            Err(_) => {
+                                cleanup_mountpoint(&mountpoint, used_namespace);
+                                std::process::exit(1);
+                            }
+                        },
                     },
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(_) => {
