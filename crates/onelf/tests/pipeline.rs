@@ -2946,6 +2946,33 @@ fn crafted_footer_is_refused_by_every_reader() {
         "extract must exit with an error, not die on a bad alloc"
     );
 
+    // manifest_original is 8 bytes at offset 28. The runtime sizes the
+    // manifest buffer from it, and used to do so without any check.
+    let mut bytes = std::fs::read(&good).unwrap();
+    bytes[footer_at + 28..footer_at + 36].copy_from_slice(&u64::MAX.to_le_bytes());
+    let huge = td.join("huge.onelf");
+    std::fs::write(&huge, &bytes).unwrap();
+    std::fs::set_permissions(
+        &huge,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let mut run = Command::new(&huge);
+    run.env_clear().env("PATH", "/usr/bin:/bin");
+    isolate(&mut run, &td);
+    let o = run_package(&mut run);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "the runtime must refuse its own crafted footer, not die on a bad alloc: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("implausibly"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
     let _ = std::fs::remove_dir_all(&td);
 }
 

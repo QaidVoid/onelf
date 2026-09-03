@@ -38,23 +38,7 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
     let mut footer_buf = [0u8; FOOTER_SIZE];
     file.read_exact(&mut footer_buf)?;
     let footer = Footer::from_bytes(&footer_buf)?;
-
-    // Validate every region the footer points at against the real file
-    // size before trusting any offset/size taken from it. Guards both
-    // out-of-bounds reads and overflow in offset+size arithmetic.
-    let in_bounds = |off: u64, len: u64| off.checked_add(len).is_some_and(|e| e <= file_size);
-    if !in_bounds(footer.manifest_offset, footer.manifest_compressed) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "manifest region out of bounds",
-        ));
-    }
-    if !in_bounds(footer.payload_offset, footer.payload_size) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload region out of bounds",
-        ));
-    }
+    onelf_format::reader::validate_footer(&footer, file_size)?;
 
     // Read and decompress manifest
     file.seek(SeekFrom::Start(footer.manifest_offset))?;
@@ -84,12 +68,6 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
 
     // Read dictionary if present
     let dict = if footer.flags.contains(onelf_format::Flags::HAS_DICT) && footer.dict_size > 0 {
-        if !in_bounds(footer.dict_offset, footer.dict_size as u64) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "dictionary region out of bounds",
-            ));
-        }
         file.seek(SeekFrom::Start(footer.dict_offset))?;
         let mut dict_buf = vec![0u8; footer.dict_size as usize];
         file.read_exact(&mut dict_buf)?;

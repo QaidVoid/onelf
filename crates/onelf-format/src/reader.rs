@@ -40,7 +40,9 @@ pub fn validate_footer(footer: &Footer, file_size: u64) -> io::Result<()> {
     }
     // The manifest decompresses into a buffer sized by this field, so it has
     // to be backed by something even though it describes no file region.
-    if footer.manifest_original > file_size.saturating_mul(MAX_MANIFEST_EXPANSION) {
+    if footer.manifest_original > MAX_MANIFEST_ORIGINAL
+        || footer.manifest_original > file_size.saturating_mul(MAX_MANIFEST_EXPANSION)
+    {
         return Err(invalid("manifest expands implausibly"));
     }
     if footer.dict_size > 0 && !in_bounds(footer.dict_offset, footer.dict_size as u64, file_size) {
@@ -53,6 +55,11 @@ pub fn validate_footer(footer: &Footer, file_size: u64) -> io::Result<()> {
 /// whole file. Compressed manifests are small and text-like; anything beyond
 /// this is a crafted header rather than a real package.
 const MAX_MANIFEST_EXPANSION: u64 = 1024;
+
+/// Absolute ceiling on the decompressed manifest. The ratio above still
+/// lets a large package claim gigabytes; a manifest is a few dozen bytes
+/// per entry, so this covers millions of entries and nothing real beyond.
+const MAX_MANIFEST_ORIGINAL: u64 = 256 << 20;
 
 /// Absolute file offset of `block`'s compressed bytes, checked against the
 /// payload region `footer` declares.
