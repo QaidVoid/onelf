@@ -1358,14 +1358,19 @@ fn resolve_primary(opts: &BundleOptions) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Every regular file under `dir` that starts with the ELF magic.
+///
+/// Symlinks are not followed: the tree is rewritten in place, and a link
+/// pointing outside it would have the host's library patched. A link to a
+/// file inside the tree is reached through the file itself.
 fn find_elf_files(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !path.is_file() {
+        if !entry.file_type().is_file() {
             continue;
         }
+        let path = entry.path();
         if is_elf(&path) {
             result.push(path);
         }

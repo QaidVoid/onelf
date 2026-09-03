@@ -1469,6 +1469,53 @@ fn packing_does_not_hold_the_whole_tree() {
 /// positioned to notice, because on the packer's machine the host copy is
 /// the correct one. So bundling must say which libraries will come from
 /// the host.
+#[test]
+fn bundling_reports_libraries_it_did_not_bundle() {
+    let td = workdir("hostleak");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+
+    let src = td.join("m.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"MAIN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/main")) {
+        return; // no compiler: documented soft-skip
+    }
+
+    // A complete bundle has nothing to report.
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .output()
+        .expect("spawn bundle-libs");
+    assert!(o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !err.contains("not in the bundle"),
+        "a complete bundle must not warn: {err}"
+    );
+
+    // Excluding a real dependency is the same situation a dlopen-only or
+    // unresolvable library produces, and must be named.
+    let app2 = td.join("app2");
+    std::fs::create_dir_all(app2.join("bin")).unwrap();
+    std::fs::copy(app.join("bin/main"), app2.join("bin/main")).unwrap();
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app2.to_str().unwrap()])
+        .args(["--exclude", "libc.so.6"])
+        .output()
+        .expect("spawn bundle-libs");
+    assert!(o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("not in the bundle") && err.contains("libc.so.6"),
+        "an excluded dependency must be named as host-resolved: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// An absolute RPATH in a bundled library, `/usr/lib` as distributions
 /// write, is scrubbed so no host directory is searched. Left in place it
 /// loads the host's libraries into the process, which on a musl host
@@ -1532,50 +1579,49 @@ fn an_absolute_rpath_in_a_bundled_library_is_scrubbed() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A symlink in the tree that points outside it is not an object to
+/// rewrite. The tree is patched in place, and following the link would
+/// have the host's library stripped, given an `$ORIGIN` run path, and
+/// injected with the bootstrap.
 #[test]
-fn bundling_reports_libraries_it_did_not_bundle() {
-    let td = workdir("hostleak");
+fn a_symlink_out_of_the_tree_is_left_alone() {
+    let td = workdir("symlink-out");
+    let src = td.join("tool.c");
+    write(&src, "int main(void) { return 0; }\n");
     let app = td.join("app");
     std::fs::create_dir_all(app.join("bin")).unwrap();
-
-    let src = td.join("m.c");
-    write(
-        &src,
-        "#include <stdio.h>\nint main(void){puts(\"MAIN\");return 0;}\n",
-    );
-    if !cc(&src, &app.join("bin/main")) {
-        return; // no compiler: documented soft-skip
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    let tool = app.join("bin/tool");
+    if !cc(&src, &tool) {
+        return;
     }
+    // Any ELF the tree does not own, standing in for a host library.
+    let host = td.join("host/libhost.so.1");
+    std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+    std::fs::copy(&tool, &host).unwrap();
+    let before = std::fs::read(&host).unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&host)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    std::os::unix::fs::symlink(&host, app.join("lib/libhost.so.1")).unwrap();
 
-    // A complete bundle has nothing to report.
-    let o = Command::new(onelf())
-        .args(["bundle-libs", app.to_str().unwrap()])
-        .output()
-        .expect("spawn bundle-libs");
-    assert!(o.status.success());
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(
-        !err.contains("not in the bundle"),
-        "a complete bundle must not warn: {err}"
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        std::fs::read(&host).unwrap(),
+        before,
+        "the host file was rewritten through the link"
     );
-
-    // Excluding a real dependency is the same situation a dlopen-only or
-    // unresolvable library produces, and must be named.
-    let app2 = td.join("app2");
-    std::fs::create_dir_all(app2.join("bin")).unwrap();
-    std::fs::copy(app.join("bin/main"), app2.join("bin/main")).unwrap();
-    let o = Command::new(onelf())
-        .args(["bundle-libs", app2.to_str().unwrap()])
-        .args(["--exclude", "libc.so.6"])
-        .output()
-        .expect("spawn bundle-libs");
-    assert!(o.status.success());
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(
-        err.contains("not in the bundle") && err.contains("libc.so.6"),
-        "an excluded dependency must be named as host-resolved: {err}"
+    assert_eq!(
+        std::fs::metadata(&host).unwrap().modified().unwrap(),
+        old,
+        "the host file's mtime was normalised through the link"
     );
-
+    assert!(app.join("lib/libhost.so.1").is_symlink());
     let _ = std::fs::remove_dir_all(&td);
 }
 
