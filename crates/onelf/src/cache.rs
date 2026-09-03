@@ -189,7 +189,7 @@ pub fn cache_list() -> io::Result<()> {
             println!(
                 "  {} {} ({:.1} MB, last used: {})",
                 build.label,
-                &build.hash[..build.hash.len().min(16)],
+                build.hash.chars().take(16).collect::<String>(),
                 mib(build.bytes),
                 ago(build.used)
             );
@@ -296,7 +296,7 @@ fn remove_empty_dirs(dir: &Path) {
 pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
     let root = cache_root()?;
     let now = SystemTime::now();
-    let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+    let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86400));
 
     // A build's file is touched on every use, so its age is its idleness.
     // Its extraction is a package like any other and goes through the
