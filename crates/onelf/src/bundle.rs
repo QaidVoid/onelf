@@ -931,15 +931,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         std::os::unix::fs::PermissionsExt::from_mode(0o755),
                     );
                     normalize_mtime(&dest);
-                    // Strip hardcoded RPATH/RUNPATH so the bundled lib uses
-                    // LD_LIBRARY_PATH (set by the runtime) instead of absolute paths
-                    if let Err(e) = set_origin_runpath(&dest) {
-                        eprintln!(
-                            "  {} failed to rewrite RUNPATH of {}: {e}",
-                            color::bold_red("warning:"),
-                            soname
-                        );
-                    }
                     // The dynamic loader itself ships with baked-in absolute
                     // paths (ld.so.cache location, preload hook, fallback
                     // library dirs). On the packer's system those resolve to

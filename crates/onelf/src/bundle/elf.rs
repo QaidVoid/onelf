@@ -403,152 +403,6 @@ fn run_patchelf_rpath(path: &Path, patchelf: Option<&Path>) -> RunpathOutcome {
     }
 }
 
-pub(crate) fn set_origin_runpath(path: &Path) -> io::Result<RunpathOutcome> {
-    let new_bytes = ORIGIN_RUNPATH.as_bytes();
-    let data = fs::read(path)?;
-
-    // Binaries with an embedded payload (pre-1.3.12 Bun via an EOF trailer,
-    // >=1.3.12 Bun via a `.bun` section) must not be structurally rewritten:
-    // patchelf grows the file and reshuffles the program headers, clobbering
-    // the trailer or perturbing the layout the runtime payload lookup depends
-    // on. The in-place rewrite is safe (same file size), so we still attempt
-    // that, but we skip the patchelf fallback for these binaries.
-    let is_self_extract = has_embedded_payload(&data);
-
-    let elf = goblin::elf::Elf::parse(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // Only meaningful for binaries with dynamic dependencies. A bottom-
-    // of-stack lib like libc.so.6 or the dynamic loader has no DT_NEEDED
-    // entries and doesn't need DT_RUNPATH itself.
-    let has_needed = !elf.libraries.is_empty();
-    // PT_INTERP marks an executable; pure shared libraries lack it. We
-    // only warn / fall back to patchelf for executables, since libs
-    // typically resolve their deps via the executable's DT_RUNPATH.
-    // glibc's libc.so.6 (and ld.so) carry PT_INTERP but are libraries,
-    // distinguished by a DT_SONAME; exclude anything with a SONAME so
-    // they aren't mis-flagged as un-RUNPATH'd app executables.
-    let has_soname = elf.soname.is_some();
-    let is_executable = !has_soname
-        && elf
-            .program_headers
-            .iter()
-            .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP);
-
-    // Find the .dynstr section's file range. The end matters: the slot scan
-    // below counts trailing NULs, and without a bound it runs off the end of
-    // the string table into whatever section follows.
-    let dynstr_range = elf
-        .section_headers
-        .iter()
-        .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
-        .map(|sh| (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
-
-    let dynamic_present = elf.dynamic.is_some();
-    // Track per-slot outcome: the in-place rewrite is trustworthy only when
-    // *every* present DT_RPATH/DT_RUNPATH slot was rewritten. Rewriting some
-    // and skipping a too-small one would leave a stale runpath behind, so in
-    // that case we fall through to patchelf, which resets the runpath whole.
-    let mut slots_total = 0usize;
-    let mut slots_rewritten = 0usize;
-
-    if let (Some((dynstr_offset, dynstr_end)), Some(dynamic)) = (dynstr_range, &elf.dynamic) {
-        let mut modified = data.clone();
-        let limit = dynstr_end.min(modified.len());
-        for dyn_entry in &dynamic.dyns {
-            if dyn_entry.d_tag == goblin::elf::dynamic::DT_RPATH
-                || dyn_entry.d_tag == goblin::elf::dynamic::DT_RUNPATH
-            {
-                slots_total += 1;
-                let file_pos = dynstr_offset + dyn_entry.d_val as usize;
-                if file_pos >= limit {
-                    continue;
-                }
-                let mut end = file_pos;
-                while end < limit && modified[end] != 0 {
-                    end += 1;
-                }
-                while end < limit && modified[end] == 0 {
-                    end += 1;
-                }
-                let slot_size = end - file_pos;
-                if new_bytes.len() + 1 > slot_size {
-                    // Slot too small; will fall back to patchelf below.
-                    continue;
-                }
-                modified[file_pos..file_pos + new_bytes.len()].copy_from_slice(new_bytes);
-                for i in new_bytes.len()..slot_size {
-                    modified[file_pos + i] = 0;
-                }
-                slots_rewritten += 1;
-            }
-        }
-        if slots_total > 0 && slots_rewritten == slots_total {
-            fs::write(path, &modified)?;
-            return Ok(RunpathOutcome::Set);
-        }
-    }
-
-    drop(elf);
-
-    if !dynamic_present || !has_needed {
-        // Nothing depends on libs (static binary, libc.so itself, the
-        // dynamic loader, etc.). DT_RUNPATH wouldn't help here.
-        return Ok(RunpathOutcome::NotNeeded);
-    }
-
-    if !is_executable {
-        // Shared libraries usually resolve their deps via the
-        // executable's DT_RUNPATH (transitive search). Skip patchelf
-        // and the noisy warning for bare libs.
-        return Ok(RunpathOutcome::NotNeeded);
-    }
-
-    if is_self_extract {
-        // Don't risk patchelf growing the file and clobbering the
-        // self-extract trailer. The runtime still sets LD_LIBRARY_PATH
-        // as a fallback for these binaries.
-        return Ok(RunpathOutcome::SelfExtract);
-    }
-
-    // No usable in-place slot. Fall back to patchelf, which can
-    // either resize an existing slot or add a fresh DT_RUNPATH by
-    // growing the file's string table.
-    if let Some(patchelf) = which_patchelf() {
-        let status = std::process::Command::new(&patchelf)
-            .arg("--force-rpath")
-            .arg("--set-rpath")
-            .arg(ORIGIN_RUNPATH)
-            .arg(path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        match status {
-            Ok(o) if o.status.success() => return Ok(RunpathOutcome::Set),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!(
-                    "  {} patchelf failed for {}: {}",
-                    color::bold_red("warning:"),
-                    path.display(),
-                    stderr.trim()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} could not run patchelf for {}: {e}",
-                    color::bold_red("warning:"),
-                    path.display(),
-                );
-            }
-        }
-    }
-    // No patchelf available and no in-place slot. The runtime still sets
-    // LD_LIBRARY_PATH as a fallback for the initial launch, but it won't
-    // survive a sandboxed re-exec. The caller reports this.
-    Ok(RunpathOutcome::Unguaranteed)
-}
-
 /// Sonames a bundled object needs that the bundle does not provide where
 /// the loader will look.
 ///
@@ -1588,23 +1442,25 @@ mod runpath_tests {
         (f, guard_off)
     }
 
-    /// Write `bytes` to a fresh file, run `set_origin_runpath` on it, and
-    /// return what the function left on disk.
+    /// Write `bytes` to a fresh file, finalize it the way `bundle-libs`
+    /// does (with no patchelf to fall back to), and return what was left
+    /// on disk.
     fn rewrite(tag: &str, bytes: &[u8]) -> Vec<u8> {
         let dir = std::env::temp_dir().join(format!("onelf-runpath-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.so");
         fs::write(&path, bytes).unwrap();
-        set_origin_runpath(&path).unwrap();
+        finalize_one(&path, None).unwrap();
         let out = fs::read(&path).unwrap();
         let _ = fs::remove_dir_all(&dir);
         out
     }
 
     #[test]
-    fn short_slot_leaves_the_next_section_alone() {
-        let (bytes, guard_off) = elf_with_runpath(b"/usr/lib/tinysparql-3.0");
+    fn short_slot_is_scrubbed_without_touching_the_next_section() {
+        let old = b"/usr/lib/tinysparql-3.0";
+        let (bytes, guard_off) = elf_with_runpath(old);
         let out = rewrite("short", &bytes);
         assert_eq!(out.len(), bytes.len());
         assert!(
@@ -1612,7 +1468,12 @@ mod runpath_tests {
                 .iter()
                 .all(|&b| b == GUARD)
         );
-        assert_eq!(&out[..guard_off], &bytes[..guard_off]);
+        // The slot holds an `$ORIGIN` fallback or nothing, never the host
+        // path it came with, and its NUL terminator stays inside it.
+        let slot = &out[guard_off - old.len() - 1..guard_off];
+        let written = &slot[..slot.iter().position(|&b| b == 0).unwrap()];
+        assert!(written.is_empty() || written.starts_with(b"$ORIGIN"));
+        assert!(!out.windows(old.len()).any(|w| w == old));
     }
 
     #[test]
