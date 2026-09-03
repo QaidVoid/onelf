@@ -226,7 +226,7 @@ pub fn resolve(req: &Request) -> Resolution {
         }
     }
 
-    let farm = match materialize(req.store, &winners) {
+    let farm = match materialize(req.store, &fingerprint, &winners) {
         Ok(farm) => farm,
         Err(e) => {
             eprintln!(
@@ -474,22 +474,59 @@ fn fingerprint(
 }
 
 const DECISION_FILE: &str = "decision";
-const FARM_DIR: &str = "farm";
 
-/// Rebuild the link farm from `winners`. An empty set leaves no farm.
-fn materialize(store: &Path, winners: &BTreeMap<String, PathBuf>) -> io::Result<Option<PathBuf>> {
-    let farm = store.join(FARM_DIR);
-    match fs::remove_dir_all(&farm) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+/// The link farm for one host state. Keyed by the fingerprint, so a
+/// launch after the host changed builds a new one beside the old rather
+/// than replacing it: an instance started earlier may still be loading
+/// through the old farm, and two instances starting together build the
+/// same one and race for nothing.
+fn farm_dir(store: &Path, fingerprint: &str) -> PathBuf {
+    // FNV-1a, so the name is stable across runs without a hash dependency.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in fingerprint.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
+    store.join(format!("farm-{h:016x}"))
+}
+
+/// The link farm for `fingerprint` holding `winners`, built if it does not
+/// exist yet. An empty set leaves no farm.
+///
+/// Built in a scratch directory and renamed into place. A rename that finds
+/// the farm already there lost to another instance building the same
+/// thing, which is fine. Nothing is ever removed.
+fn materialize(
+    store: &Path,
+    fingerprint: &str,
+    winners: &BTreeMap<String, PathBuf>,
+) -> io::Result<Option<PathBuf>> {
     if winners.is_empty() {
         return Ok(None);
     }
-    fs::create_dir_all(&farm)?;
+    let farm = farm_dir(store, fingerprint);
+    if farm.is_dir() {
+        return Ok(Some(farm));
+    }
+    let scratch = store.join(format!(
+        ".{}.{}",
+        farm.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)?;
     for (name, target) in winners {
-        std::os::unix::fs::symlink(target, farm.join(name))?;
+        std::os::unix::fs::symlink(target, scratch.join(name))?;
+    }
+    match fs::rename(&scratch, &farm) {
+        Ok(()) => {}
+        Err(_) if farm.is_dir() => {
+            let _ = fs::remove_dir_all(&scratch);
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(e);
+        }
     }
     Ok(Some(farm))
 }
@@ -529,7 +566,7 @@ fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
     if lines.next()?.strip_prefix("fingerprint ")? != fingerprint {
         return None;
     }
-    let farm = store.join(FARM_DIR);
+    let farm = farm_dir(store, fingerprint);
     let mut resolution = Resolution::default();
     for line in lines {
         if let Some(interp) = line.strip_prefix("interp ") {
@@ -565,6 +602,8 @@ mod tests {
         cache: PathBuf,
         pkg: PathBuf,
         store: PathBuf,
+        /// The farm the last resolution produced, where `farm_link` looks.
+        last_farm: std::cell::RefCell<Option<PathBuf>>,
     }
 
     impl World {
@@ -579,6 +618,7 @@ mod tests {
                 store: root.join("store"),
                 host_lib,
                 pkg,
+                last_farm: std::cell::RefCell::new(None),
             }
         }
 
@@ -616,7 +656,7 @@ mod tests {
         }
 
         fn resolve_with(&self, policy: HostLibsPolicy, extra_root: Option<&Path>) -> Resolution {
-            resolve(&Request {
+            let r = resolve(&Request {
                 pkg_root: &self.pkg,
                 lib_dirs: &["lib"],
                 policy,
@@ -624,7 +664,9 @@ mod tests {
                 ld_cache: &self.cache,
                 icd_dirs: &[],
                 extra_root,
-            })
+            });
+            *self.last_farm.borrow_mut() = r.farm.clone();
+            r
         }
 
         fn gl(&self) -> Gl {
@@ -632,7 +674,8 @@ mod tests {
         }
 
         fn farm_link(&self, name: &str) -> Option<PathBuf> {
-            fs::read_link(self.store.join(FARM_DIR).join(name)).ok()
+            let farm = self.last_farm.borrow().clone()?;
+            fs::read_link(farm.join(name)).ok()
         }
     }
 
@@ -678,7 +721,7 @@ mod tests {
         w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
 
         let r = w.resolve(HostLibsPolicy::Auto);
-        assert_eq!(r.farm, Some(w.store.join(FARM_DIR)));
+        assert!(r.farm.as_ref().is_some_and(|f| f.starts_with(&w.store)));
         assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo));
         // The driver itself is not bundled, so it can only come from the
         // host, and it must be reachable without a host directory on the
@@ -956,5 +999,30 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_change_leaves_the_old_farm_for_running_instances() {
+        let w = World::new();
+        let host_gl = w.host("libGL.so.1", &versioned(&["GL_1.0", "GL_2.0"]));
+        w.bundle("libGL.so.1", &versioned(&["GL_1.0"]));
+        w.resolve(HostLibsPolicy::Auto);
+        let old_farm = w.last_farm.borrow().clone().expect("a farm");
+        assert_eq!(
+            fs::read_link(old_farm.join("libGL.so.1")).ok(),
+            Some(host_gl)
+        );
+
+        // The host changes, so the next launch decides afresh. An instance
+        // started before is still loading through the old farm.
+        w.host("libnew.so.1", &versioned(&[]));
+        w.resolve(HostLibsPolicy::Auto);
+        let new_farm = w.last_farm.borrow().clone().expect("a farm");
+        assert_ne!(old_farm, new_farm);
+        assert!(
+            old_farm.join("libGL.so.1").exists(),
+            "the old farm was torn down under a running instance"
+        );
+        assert!(new_farm.join("libGL.so.1").exists());
     }
 }

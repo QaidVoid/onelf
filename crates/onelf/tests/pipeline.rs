@@ -2147,7 +2147,17 @@ fn incomparable_copies_are_named_and_stay_bundled() {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("resolve-"))
         })
-        .map(|p| p.join("farm"));
+        .and_then(|store| {
+            // One farm per host fingerprint, named after it.
+            std::fs::read_dir(store)
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("farm"))
+                })
+        });
     let farm = farm.expect("the resolver records its decision");
     assert!(
         farm.join("libGL.so.1").is_symlink(),
