@@ -1860,6 +1860,44 @@ fn a_package_needing_nothing_from_the_host_does_not_get_its_lib_dirs() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The host-libs decision looks only at what is packed. A driver
+/// reference in a file `--exclude` leaves out cannot load anything, and
+/// used to keep the host's library directories open all the same.
+#[test]
+fn an_excluded_file_does_not_decide_the_host_libs_policy() {
+    const NO_HOST_LIB_DIRS: u16 = 1 << 5;
+
+    let td = workdir("hostlibsexcl");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    // Only the ELF magic and the soname matter to the scan.
+    write(
+        &app.join("plugins/gl.so"),
+        "\x7fELF\x02\x01\x01junk libvulkan.so.1 junk",
+    );
+
+    let pack = |exclude: bool| {
+        let pkg = td.join("out.onelf");
+        let mut c = Command::new(onelf());
+        c.args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"]);
+        if exclude {
+            c.args(["--exclude", "plugins"]);
+        }
+        let o = c.output().expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        has_footer_flag(&pkg, NO_HOST_LIB_DIRS)
+    };
+    assert!(!pack(false), "the packed driver reference keeps auto");
+    assert!(pack(true), "an excluded reference must not");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package that loads a driver stack keeps the host directories, since
 /// GPU userspace has to come from the host.
 #[test]

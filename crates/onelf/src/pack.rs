@@ -1161,7 +1161,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let policy = match opts.host_libs {
         HostLibs::Always => HostLibsPolicy::Always,
         HostLibs::Never => HostLibsPolicy::Never,
-        HostLibs::Auto if bundle_needs_host_libs(&opts.directory) => HostLibsPolicy::Auto,
+        HostLibs::Auto if bundle_needs_host_libs(&files) => HostLibsPolicy::Auto,
         HostLibs::Auto => HostLibsPolicy::Never,
     };
     flags |= policy.to_flags();
@@ -1387,7 +1387,7 @@ fn elf_interp(data: &[u8]) -> Option<String> {
     std::str::from_utf8(text).ok().map(String::from)
 }
 
-/// Whether a tree needs libraries the host must supply.
+/// Whether the files being packed need libraries the host must supply.
 ///
 /// Deliberately generous. Guessing "no" when the answer is "yes" breaks an
 /// app that works today, while guessing "yes" only leaves the current
@@ -1396,38 +1396,45 @@ fn elf_interp(data: &[u8]) -> Option<String> {
 ///
 /// Driver stacks are loaded by `dlopen` at runtime and so never appear in
 /// `DT_NEEDED`. Their sonames are looked for as strings anywhere in the
-/// bundle's ELF files instead.
-fn bundle_needs_host_libs(directory: &Path) -> bool {
+/// bundle's ELF files instead. Only what is packed is consulted: a file
+/// `--exclude` left out cannot load anything.
+fn bundle_needs_host_libs(files: &[CollectedFile]) -> bool {
     use onelf_format::drivers::DRIVER_FAMILIES;
 
-    for entry in jwalk::WalkDir::new(directory).sort(true) {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let name = path
+    for file in files {
+        let name = file
+            .rel_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         if DRIVER_FAMILIES.iter().any(|f| name.contains(f)) {
             return true;
         }
-        // Magic first. A tree like Blender's is mostly Python and data
-        // files, and reading those in full to discover they are not ELF
-        // costs more than the whole rest of this scan.
-        let Ok(mut file) = std::fs::File::open(&path) else {
-            continue;
+        let data = match &file.source {
+            // Magic first. A tree like Blender's is mostly Python and data
+            // files, and reading those in full to discover they are not ELF
+            // costs more than the whole rest of this scan.
+            FileSource::Disk(path) => {
+                let Ok(mut f) = std::fs::File::open(path) else {
+                    continue;
+                };
+                let mut magic = [0u8; 4];
+                if std::io::Read::read_exact(&mut f, &mut magic).is_err() || magic != *b"\x7fELF" {
+                    continue;
+                }
+                let mut data = magic.to_vec();
+                if std::io::Read::read_to_end(&mut f, &mut data).is_err() {
+                    continue;
+                }
+                Cow::Owned(data)
+            }
+            FileSource::Memory(bytes) => {
+                if !bytes.starts_with(b"\x7fELF") {
+                    continue;
+                }
+                Cow::Borrowed(bytes.as_slice())
+            }
         };
-        let mut magic = [0u8; 4];
-        if std::io::Read::read_exact(&mut file, &mut magic).is_err() || magic != *b"\x7fELF" {
-            continue;
-        }
-        let mut data = magic.to_vec();
-        if std::io::Read::read_to_end(&mut file, &mut data).is_err() {
-            continue;
-        }
         // NSS modules are dlopened by glibc for getpwnam, DNS and friends.
         // glibc 2.34 folded files and dns into libc.so.6 itself, so a
         // bundle shipping that or newer needs nothing from the host for
@@ -1447,12 +1454,6 @@ fn bundle_needs_host_libs(directory: &Path) -> bool {
     false
 }
 
-/// Substring search anchored on the first byte.
-///
-/// `windows().any()` compares at every offset. Every needle here starts
-/// with `l` or `G`, which is a small fraction of a binary, so seeking the
-/// first byte and comparing only there does far less work on the hundreds
-/// of megabytes this walks.
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     let Some((&first, rest)) = needle.split_first() else {
         return true;
