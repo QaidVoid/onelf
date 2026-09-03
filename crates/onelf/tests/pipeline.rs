@@ -3278,6 +3278,68 @@ fn verify_rejects_a_block_hash_the_runtime_would_reject() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Metadata that lands on disk is verified the way extraction is. The
+/// desktop and icon readers used the unverified decoder, so `integrate`
+/// wrote whatever the payload held into `~/.local/share`.
+#[test]
+fn integrate_refuses_metadata_whose_hash_does_not_match() {
+    let td = workdir("badmeta");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &app.join(".onelf/desktop/default.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Meta\nExec=run\n",
+    );
+    let pkg = td.join("meta.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", "meta"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let bad = with_manifest(&pkg, &td.join("bad.onelf"), |m| {
+        let idx = (0..m.entries.len())
+            .find(|&i| m.entry_path(i) == ".onelf/desktop/default.desktop")
+            .expect("the desktop entry");
+        m.entries[idx].content_hash[0] ^= 1;
+    });
+    let data_home = td.join("share");
+    for args in [
+        vec![
+            "desktop",
+            bad.to_str().unwrap(),
+            "-o",
+            td.join("d").to_str().unwrap(),
+        ],
+        vec!["integrate", bad.to_str().unwrap()],
+    ] {
+        let o = Command::new(onelf())
+            .args(&args)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("HOME", td.to_str().unwrap())
+            .output()
+            .expect("spawn onelf");
+        assert!(!o.status.success(), "{} accepted a bad hash", args[0]);
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("content hash mismatch"),
+            "{}: {}",
+            args[0],
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let written = std::fs::read_dir(data_home.join("applications"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(written, 0, "integrate wrote unverified metadata");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A package whose manifest names an entry `..` is refused by everything
 /// that puts files on disk: `extract`, cache mode, and rundir mode. The
 /// path check has unit tests; this drives it through a crafted package.

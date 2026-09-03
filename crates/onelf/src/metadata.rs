@@ -10,7 +10,7 @@ use std::path::Path;
 
 use onelf_format::{EntryKind, Manifest};
 
-use crate::extract::decompress_entry;
+use crate::extract::decompress_verified;
 use crate::info::read_footer_and_manifest;
 
 pub(crate) fn find_entry_by_path(manifest: &Manifest, path: &str) -> Option<usize> {
@@ -80,7 +80,7 @@ fn extract_metadata(
 
     let dict = crate::info::read_dict(&mut file, &footer)?;
 
-    let data = decompress_entry(&mut file, &footer, entry, dict.as_deref())?;
+    let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
 
     match output {
         Some(path) if path.as_os_str() == "-" => {

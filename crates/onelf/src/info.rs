@@ -284,7 +284,7 @@ fn read_metadata_string(
     manifest: &Manifest,
     entry_path: &str,
 ) -> io::Result<Option<String>> {
-    use crate::extract::decompress_entry;
+    use crate::extract::decompress_verified;
 
     let idx = (0..manifest.entries.len()).find(|&i| {
         manifest.entries[i].kind == EntryKind::File && manifest.entry_path(i) == entry_path
@@ -293,7 +293,7 @@ fn read_metadata_string(
 
     let mut file = File::open(path)?;
     let dict = read_dict(&mut file, footer)?;
-    let data = decompress_entry(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
+    let data = decompress_verified(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
     Ok(Some(String::from_utf8_lossy(&data).trim().to_string()))
 }
 
@@ -302,7 +302,7 @@ fn read_package_info(
     footer: &Footer,
     manifest: &Manifest,
 ) -> io::Result<Option<String>> {
-    use crate::extract::decompress_entry;
+    use crate::extract::decompress_verified;
 
     let idx = (0..manifest.entries.len()).find(|&i| {
         manifest.entries[i].kind == EntryKind::File
@@ -314,7 +314,7 @@ fn read_package_info(
     let mut file = File::open(path)?;
     let dict = read_dict(&mut file, footer)?;
 
-    let data = decompress_entry(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
+    let data = decompress_verified(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
     let text = String::from_utf8(data).unwrap_or_default();
     Ok(Some(text))
 }

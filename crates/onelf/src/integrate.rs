@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use onelf_format::desktop::{exec_arg, exec_arg_tail};
 use onelf_format::{Footer, Manifest};
 
-use crate::extract::decompress_entry;
+use crate::extract::decompress_verified;
 use crate::info::read_footer_and_manifest;
 use crate::metadata::{resolve_desktop, resolve_icon};
 
@@ -77,7 +77,7 @@ impl IntegrationContext {
 
         let dict = crate::info::read_dict(&mut file, &self.footer)?;
 
-        decompress_entry(&mut file, &self.footer, entry, dict.as_deref())
+        decompress_verified(&mut file, &self.footer, entry, dict.as_deref())
     }
 }
 
