@@ -103,12 +103,14 @@ replacement on the `--search-path`.
 
 - We can't cross-libc arbitrary system calls. A binary that directly uses
   glibc-specific APIs (like `obstack_*`) won't magically work on musl.
-- Name service modules. A bundled glibc of 2.34 or newer resolves users,
-  groups, hosts and services on its own; the host's `nsswitch.conf` is
-  read, and a service it names that the bundle lacks (`systemd`, `sss`,
-  `resolve`) is skipped. For an older glibc, `files` and `dns` are
-  modules, and `bundle-libs` brings those two along. Anything else in the
-  host's `nsswitch.conf` stays out.
+- Name service modules. The host's `nsswitch.conf` is read, and a
+  service it names that the bundle lacks (`systemd`, `sss`, `resolve`) is
+  skipped, so a user from LDAP or SSSD is not visible and hostnames go
+  through `files` and `dns` as they would without those services. A
+  bundled glibc of 2.34 or newer has `files` and `dns` built in; for an
+  older one `bundle-libs` brings those two modules along. `compat`, which
+  some distributions name instead of `files`, is a module on every glibc
+  and is always brought along. Anything else stays out.
 - Before glibc 2.34, `dlopen` lives in `libdl.so.2`. A bundle of such a
   glibc applies `.onelf/env` as usual, but `.onelf/preload` only when
   something in the bundle links `libdl.so.2`; otherwise it says so on

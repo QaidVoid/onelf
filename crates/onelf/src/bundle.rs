@@ -921,11 +921,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut bundled_by_hash: HashMap<[u8; 32], String> = HashMap::new();
     let mut queue: Vec<String> = needed_by.keys().cloned().collect();
     queue.sort();
-    // Name services a glibc older than 2.34 loads by dlopen: `files` and
-    // `dns` were folded into libc.so.6 in 2.34, and before that they are
-    // modules the excluded `libnss_` prefix would leave behind, with every
-    // user, group, host and service lookup failing on a host whose own
-    // glibc did not win. These two are let through when that libc lands.
+    // Name service modules glibc loads by dlopen, let through the excluded
+    // `libnss_` prefix when libc lands: `compat` on every glibc, and
+    // `files` and `dns` too before 2.34 folded those into libc.so.6.
+    // Without them every user, group, host and service lookup fails on a
+    // host whose own glibc did not win.
     let mut nss_allow: HashSet<String> = HashSet::new();
     let mut gconv_files: Vec<String> = Vec::new();
 
@@ -1034,12 +1034,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let bytes = fs::read(&resolved).ok();
                 let content_hash: Option<[u8; 32]> =
                     bytes.as_deref().map(|b| blake3::hash(b).into());
-                if soname == "libc.so.6"
-                    && bytes
+                if soname == "libc.so.6" {
+                    // `compat` is still a module on every glibc, and a host
+                    // whose nsswitch.conf names it with nothing after it
+                    // (openSUSE does) would resolve no user at all without
+                    // it. `files` and `dns` joined libc in 2.34.
+                    let old = bytes
                         .as_deref()
-                        .is_some_and(|b| !b.windows(10).any(|w| w == b"GLIBC_2.34"))
-                {
-                    for module in ["libnss_files.so.2", "libnss_dns.so.2"] {
+                        .is_some_and(|b| !b.windows(10).any(|w| w == b"GLIBC_2.34"));
+                    let modules: &[&str] = if old {
+                        &["libnss_compat.so.2", "libnss_files.so.2", "libnss_dns.so.2"]
+                    } else {
+                        &["libnss_compat.so.2"]
+                    };
+                    for module in modules {
                         nss_allow.insert(module.to_string());
                         needed_by
                             .entry(module.to_string())

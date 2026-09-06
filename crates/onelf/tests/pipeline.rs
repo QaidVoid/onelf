@@ -2035,6 +2035,36 @@ int main(int argc, char **argv) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A glibc bundle carries the `compat` name service module. It is a
+/// module on every glibc, and a host whose `nsswitch.conf` names it with
+/// nothing after it, as openSUSE does, would resolve no user at all.
+#[test]
+fn a_glibc_bundle_carries_the_compat_name_service() {
+    let td = workdir("nsscompat");
+    let src = td.join("pw.c");
+    write(
+        &src,
+        "#include <pwd.h>\n#include <stdio.h>\nint main(void){struct passwd *p = getpwnam(\"root\"); puts(p ? p->pw_dir : \"(null)\"); return p ? 0 : 1;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &app.join("bin/pw")) {
+        return;
+    }
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    if !app.join("lib/libc.so.6").is_file() {
+        skip("the fixture is not a glibc binary");
+        return;
+    }
+    assert!(
+        app.join("lib/libnss_compat.so.2").is_file(),
+        "compat is not bundled:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and
