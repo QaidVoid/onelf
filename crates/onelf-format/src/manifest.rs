@@ -261,6 +261,18 @@ impl Manifest {
             if off > st {
                 return Err(bad("lib_dir offset out of range"));
             }
+            // Joined onto the package root and put on the library path, so
+            // an absolute one or one climbing out would name a host
+            // directory.
+            let dir = self.get_string(off);
+            let safe = !dir.is_empty()
+                && std::path::Path::new(dir)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                && !dir.contains('\0');
+            if !safe {
+                return Err(bad("lib_dir is not a relative path inside the package"));
+            }
         }
         if self.header.name_offset as u32 > st {
             return Err(bad("name_offset out of range"));
@@ -577,6 +589,24 @@ mod tests {
             !m.entry_path(0).is_empty(),
             "the unvalidated walk still ends"
         );
+    }
+
+    #[test]
+    fn a_lib_dir_leaving_the_package_is_rejected() {
+        for (st, ok) in [
+            (&b"\0lib\0"[..], true),
+            (b"\0opt/app/lib\0", true),
+            (b"\0/usr/lib\0", false),
+            (b"\0../lib\0", false),
+            (b"\0lib/../../x\0", false),
+            (b"\0\0", false),
+        ] {
+            let mut m = manifest(vec![entry(0, u32::MAX)], st.to_vec());
+            m.lib_dir_offsets = vec![1];
+            m.header.lib_dir_count = 1;
+            let back = Manifest::deserialize(&m.serialize().unwrap());
+            assert_eq!(back.is_ok(), ok, "{:?}", String::from_utf8_lossy(st));
+        }
     }
 
     #[test]
