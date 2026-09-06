@@ -4,11 +4,16 @@
 //! setgid bits are dropped, since the bundle never needs either. Every
 //! entry path is checked before anything is written, so an archive cannot
 //! reach outside the directory it is unpacked into.
+//!
+//! Directory permissions are applied last. A rootfs holds directories a
+//! distribution made read-only, and giving one its archived mode as soon
+//! as it appears locks out every entry underneath it that has not been
+//! written yet.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
@@ -26,6 +31,7 @@ pub fn materialize(archive: &Path, into: &Path) -> io::Result<()> {
     };
 
     std::fs::create_dir_all(into)?;
+    let mut deferred: Vec<(PathBuf, u32)> = Vec::new();
     let mut tar = tar::Archive::new(reader);
     tar.set_preserve_permissions(true);
     tar.set_preserve_ownerships(false);
@@ -39,24 +45,49 @@ pub fn materialize(archive: &Path, into: &Path) -> io::Result<()> {
                 format!("{}: entry escapes the target directory", path.display()),
             ));
         }
-        if !entry.unpack_in(into)? {
+        let placed = entry
+            .unpack_in(into)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", path.display(), chain(&e))))?;
+        if !placed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: entry could not be placed", path.display()),
             ));
         }
         let unpacked = into.join(&path);
-        if let Ok(md) = std::fs::symlink_metadata(&unpacked)
-            && md.file_type().is_file()
-            && md.permissions().mode() & 0o6000 != 0
-        {
+        let Ok(md) = std::fs::symlink_metadata(&unpacked) else {
+            continue;
+        };
+        let mode = md.permissions().mode();
+        if md.file_type().is_dir() && mode & 0o300 != 0o300 {
+            deferred.push((unpacked, mode & 0o7777));
             std::fs::set_permissions(
-                &unpacked,
-                std::fs::Permissions::from_mode(md.permissions().mode() & 0o777),
+                &into.join(&path),
+                std::fs::Permissions::from_mode(mode | 0o300),
             )?;
+        } else if md.file_type().is_file() && mode & 0o6000 != 0 {
+            std::fs::set_permissions(&unpacked, std::fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
+    // Deepest first, so a read-only parent is closed after its children.
+    deferred.sort_by(|a, b| b.0.cmp(&a.0));
+    for (dir, mode) in deferred {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;
+    }
     Ok(())
+}
+
+/// An error and everything under it, joined. The tar crate reports the
+/// path it could not place and keeps the reason it could not as the
+/// source, which is the half worth reading.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
 }
 
 /// A relative path with no `..` and no root.
@@ -101,6 +132,56 @@ mod tests {
             builder.append_link(&mut header, path, target).unwrap();
         }
         builder.into_inner().unwrap()
+    }
+
+    /// A distribution ships directories nothing may write to, and their
+    /// contents come after them in the archive. Applying the mode as
+    /// soon as the directory appears makes the rest of it unwritable, so
+    /// the mode waits until the end.
+    #[test]
+    fn a_read_only_directory_still_receives_its_contents() {
+        let root = temp_root("tarro");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/certs/", &[][..])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o444);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/certs/ca.pem", &b"pem"[..])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        builder
+            .append_link(&mut header, "etc/certs/0a1b2c3d.0", "ca.pem")
+            .unwrap();
+        let archive = root.join("root.tar");
+        std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+
+        let into = root.join("sysroot");
+        materialize(&archive, &into).unwrap();
+
+        assert_eq!(
+            std::fs::read(into.join("etc/certs/ca.pem")).unwrap(),
+            b"pem"
+        );
+        assert!(into.join("etc/certs/0a1b2c3d.0").is_symlink());
+        let mode = std::fs::metadata(into.join("etc/certs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o555, "the archived mode is restored");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
