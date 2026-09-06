@@ -6864,6 +6864,75 @@ fn a_shared_set_is_served_from_its_build_rather_than_copied() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A sysroot build carries the caches the distribution generated after
+/// installing, which no package owns and a closure therefore never
+/// names. Without the compiled schema cache a GTK application exits at
+/// startup saying its schema is not installed.
+#[test]
+fn a_sysroot_build_carries_the_caches_no_package_owns() {
+    let td = workdir("caches");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    // Generated after install: present in the rootfs, owned by nobody.
+    let schemas = fixture.rootfs.join("usr/share/glib-2.0/schemas");
+    std::fs::create_dir_all(&schemas).unwrap();
+    write(&schemas.join("gschemas.compiled"), "COMPILED");
+    write(
+        &schemas.join("org.example.app.gschema.xml"),
+        "<schemalist/>",
+    );
+    // Only the XML is owned, as a distribution ships it.
+    let desc = fixture.rootfs.join("var/lib/pacman/local/app-1.0-1/files");
+    let listing = std::fs::read_to_string(&desc).unwrap();
+    write(
+        &desc,
+        &listing.replace(
+            "%FILES%\n",
+            "%FILES%\nusr/share/glib-2.0/schemas/org.example.app.gschema.xml\n",
+        ),
+    );
+    // A cache for a directory the bundle does not carry stays behind.
+    let elsewhere = fixture.rootfs.join("usr/share/icons/Nothing");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    write(&elsewhere.join("icon-theme.cache"), "UNRELATED");
+
+    // Straight at the rootfs, so the edits above are what the build sees;
+    // the archive was made before them.
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"{}\"\nplatform-line = \"{}\"\npolicy = \"{}\"\n",
+            fixture.rootfs.display(),
+            fixture.platform_line.display(),
+            fixture.policy.display(),
+        ),
+    );
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dir.join("share/glib-2.0/schemas/org.example.app.gschema.xml")
+            .is_file(),
+        "the owned schema"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("share/glib-2.0/schemas/gschemas.compiled")).ok(),
+        Some("COMPILED".to_string()),
+        "the cache beside it comes along"
+    );
+    assert!(
+        !dir.join("share/icons/Nothing").exists(),
+        "a cache for a directory the bundle lacks stays behind"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.
