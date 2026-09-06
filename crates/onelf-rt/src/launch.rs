@@ -277,7 +277,20 @@ fn resolve_for(
     let ld_cache = drivers::cache_file();
 
     let mut platform = None;
-    if resolve::gl_situation(pkg_root, lib_dirs, &ld_cache, resolve::ICD_DIRS) == Gl::Absent {
+    // A set holds the toolkit, and the toolkit is what usually names a
+    // GL entry point, so its directories count towards the decision.
+    let set_lib_dirs: Vec<std::path::PathBuf> = set_roots
+        .iter()
+        .flat_map(|root| crate::sets::lib_dirs(root))
+        .collect();
+    if resolve::gl_situation(
+        pkg_root,
+        lib_dirs,
+        &set_lib_dirs,
+        &ld_cache,
+        resolve::ICD_DIRS,
+    ) == Gl::Absent
+    {
         match crate::platform::obtain(pkg_root) {
             Ok(fetched) => platform = Some(fetched),
             Err(why) => {

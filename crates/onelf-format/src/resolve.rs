@@ -17,7 +17,7 @@
 //! so a soname the bundle lacks and the resolver did not choose fails by
 //! name instead of being satisfied by whatever the host has.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -103,13 +103,61 @@ fn has_gl_entry(libs: &BTreeMap<String, PathBuf>) -> bool {
         .any(|name| GL_ENTRY.iter().any(|p| name.starts_with(p)))
 }
 
+/// The GL entry points `carried` objects name and `carried` does not
+/// itself hold. This is what the launch will ask the host, or a pinned
+/// build, to supply.
+fn gl_entries_wanted(carried: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
+    let mut wanted = BTreeSet::new();
+    for path in carried.values() {
+        for needed in verdef::read_needed(path).unwrap_or_default() {
+            if GL_ENTRY.iter().any(|p| needed.starts_with(p)) && !carried.contains_key(&needed) {
+                wanted.insert(needed);
+            }
+        }
+    }
+    wanted
+}
+
 /// Whether the bundle or the host carries a GL stack. Decided before a
 /// pinned build is fetched, so the host is indexed without one.
-pub fn gl_situation(pkg_root: &Path, lib_dirs: &[&str], ld_cache: &Path, icd_dirs: &[&str]) -> Gl {
-    if has_gl_entry(&bundled_libs(pkg_root, lib_dirs)) {
+///
+/// `extra_dirs` are library directories beside the package, which is
+/// where a shared dependency set puts a toolkit, and a toolkit is
+/// usually what names a GL entry point.
+///
+/// A host counts only when it has every entry point the package asks
+/// for. Some hosts have part of a stack and not the rest: an image with
+/// `libGL.so.1` and no `libEGL.so.1` is one an X server pulls in, and
+/// treating that as a stack leaves the application to fail on the
+/// missing half.
+pub fn gl_situation(
+    pkg_root: &Path,
+    lib_dirs: &[&str],
+    extra_dirs: &[PathBuf],
+    ld_cache: &Path,
+    icd_dirs: &[&str],
+) -> Gl {
+    let mut carried = bundled_libs(pkg_root, lib_dirs);
+    for dir in extra_dirs {
+        for (name, path) in libs_in(dir) {
+            carried.entry(name).or_insert(path);
+        }
+    }
+    if has_gl_entry(&carried) {
         return Gl::Bundled;
     }
-    if has_gl_entry(&HostIndex::load(ld_cache, icd_dirs, None).libs) {
+    let host = HostIndex::load(ld_cache, icd_dirs, None).libs;
+    let wanted = gl_entries_wanted(&carried);
+    // Nothing names one outright, so a plugin may still ask for one by
+    // dlopen and any entry point is worth having.
+    if wanted.is_empty() {
+        return if has_gl_entry(&host) {
+            Gl::Host
+        } else {
+            Gl::Absent
+        };
+    }
+    if wanted.iter().all(|name| host.contains_key(name)) {
         Gl::Host
     } else {
         Gl::Absent
@@ -422,23 +470,26 @@ fn json_library_path(text: &str) -> Option<&str> {
 fn bundled_libs(pkg_root: &Path, lib_dirs: &[&str]) -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
     for dir in lib_dirs {
-        let Ok(entries) = fs::read_dir(pkg_root.join(dir)) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(String::from) else {
-                continue;
-            };
-            if !name.contains(".so") {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_file() {
-                out.entry(name).or_insert(path);
-            }
+        for (name, path) in libs_in(&pkg_root.join(dir)) {
+            out.entry(name).or_insert(path);
         }
     }
     out
+}
+
+/// Every shared object directly in `dir`, by file name.
+fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str().map(String::from)?;
+            let path = entry.path();
+            (name.contains(".so") && path.is_file()).then_some((name, path))
+        })
+        .collect()
 }
 
 /// A description of everything on the host the decision depends on: the
@@ -693,7 +744,7 @@ mod tests {
         }
 
         fn gl(&self) -> Gl {
-            gl_situation(&self.pkg, &["lib"], &self.cache, &[])
+            gl_situation(&self.pkg, &["lib"], &[], &self.cache, &[])
         }
 
         fn farm_link(&self, name: &str) -> Option<PathBuf> {
@@ -960,6 +1011,27 @@ mod tests {
     fn bump_mtime(dir: &Path) {
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         fs::File::open(dir).unwrap().set_modified(later).unwrap();
+    }
+
+    /// An image that has `libGL.so.1` and not `libEGL.so.1`, which is
+    /// what an X server pulls in, is not a stack for a package whose
+    /// toolkit links `libEGL`. Counting it as one leaves the launch to
+    /// fail on the missing half instead of fetching the pinned build.
+    #[test]
+    fn a_partial_host_stack_does_not_count() {
+        let w = World::new();
+        w.host("libGL.so.1", &shared_object(&[(1, "GL_1")], &[]));
+        w.bundle(
+            "libQtGui.so.6",
+            &shared_object(&[(1, "Qt_6")], &["libEGL.so.1"]),
+        );
+        assert_eq!(
+            w.gl(),
+            Gl::Absent,
+            "the host has no libEGL, which the bundle asks for"
+        );
+        w.host("libEGL.so.1", &shared_object(&[(1, "EGL_1")], &[]));
+        assert_eq!(w.gl(), Gl::Host, "both halves present");
     }
 
     #[test]
