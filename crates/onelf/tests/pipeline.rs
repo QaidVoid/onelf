@@ -5802,6 +5802,19 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             &rootfs.join(out),
         ));
     }
+    // A library only the GL package depends on. The platform line hands
+    // GL to the host, so a set's build never carries this, and a bundle
+    // that thinks otherwise ships without it.
+    write(&src.join("helper.c"), "int helper(void){return 0;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libhelper.so.1",
+            src.join("helper.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libhelper.so.1"),
+    ));
     write(&src.join("gl.c"), "int gl_probe(void){return 1;}\n");
     assert!(cc_with(
         &[
@@ -5814,7 +5827,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(
         &src.join("app.c"),
-        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);return 0;}\n",
+        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);return 0;}\n",
     );
     assert!(cc_with(
         &[
@@ -5826,6 +5839,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             ),
             "-l:libfixture.so.1",
             "-l:libGL.so.1",
+            "-l:libhelper.so.1",
         ],
         &rootfs.join("usr/bin/app"),
     ));
@@ -5914,7 +5928,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &rootfs,
         "libfixture",
         "1.0-1",
-        &["glibc>=2.30"],
+        &["glibc>=2.30", "mesa-fake"],
         &[],
         &[
             "usr/lib/libfixture.so.1",
@@ -5946,9 +5960,17 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     );
     write_pacman_entry(
         &rootfs,
-        "mesa-fake",
+        "helper",
         "1.0-1",
         &["glibc"],
+        &[],
+        &["usr/lib/libhelper.so.1"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "mesa-fake",
+        "1.0-1",
+        &["glibc", "helper"],
         &[],
         &["usr/lib/libGL.so.1"],
     );
@@ -6165,7 +6187,7 @@ fn a_sysroot_closure_is_bundled_and_pruned() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success()
-            && stdout.contains("packages: 6")
+            && stdout.contains("packages: 7")
             && stdout.contains("glibc:    2.99-1"),
         "{stdout}"
     );
@@ -6435,7 +6457,7 @@ fn pack_gl_builds_its_tree_from_the_sysroot() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("2 packages (mesa-fake 1.0-1 and their dependencies)"),
+        stderr.contains("3 packages (mesa-fake 1.0-1 and their dependencies)"),
         "{stderr}"
     );
     assert!(tree.join("lib/libGL.so.1").is_file());
@@ -6747,6 +6769,13 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
     assert!(
         !dir.join("lib/libfixture.so.1").exists(),
         "the set's library stays out"
+    );
+    // libhelper sits behind the GL package, which the platform line
+    // hands to the host, so the set's own build has no copy of it. The
+    // bundle has to carry it rather than count on the set.
+    assert!(
+        dir.join("lib/libhelper.so.1").exists(),
+        "a library the set's build cannot hold is bundled"
     );
 
     let store = td.join("store");

@@ -203,8 +203,13 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
                     format!("set {}: {e}", set.name),
                 )
             })?;
+        // The set's build leaves out whatever the platform line hands
+        // to the host, so a package reached only through one of those is
+        // not in the set either. Reading the closure without that
+        // exclusion promises libraries the set never carries, and the
+        // bundle then omits them on the strength of the promise.
         let names: Vec<String> = db
-            .closure(first, rest)
+            .closure_excluding(first, rest, &host_packages)
             .packages
             .into_iter()
             .filter(|n| n != "glibc" && n != &owner.name)
