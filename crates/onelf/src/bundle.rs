@@ -29,7 +29,7 @@ use std::process::Command;
 
 use onelf_sysroot::{Database, PlatformLine, Policy};
 
-mod ui;
+pub(crate) mod ui;
 pub(crate) use ui::{color, format_size};
 mod discover;
 mod gpu;

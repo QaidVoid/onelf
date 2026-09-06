@@ -13,6 +13,27 @@ use onelf_format::{EntryKind, Manifest};
 use crate::extract::decompress_verified;
 use crate::info::read_footer_and_manifest;
 
+/// Read one file out of a packed package, or `None` when it holds no
+/// such path.
+///
+/// Used to ask a dependency set what it ships rather than working it out
+/// a second time from the sysroot, which is how the two came to disagree.
+pub(crate) fn read_packed_file(binary: &Path, path: &str) -> io::Result<Option<Vec<u8>>> {
+    let (footer, manifest) = read_footer_and_manifest(binary)?;
+    let Some(index) = find_entry_by_path(&manifest, path) else {
+        return Ok(None);
+    };
+    let mut file = File::open(binary)?;
+    let dict = crate::info::read_dict(&mut file, &footer)?;
+    let data = decompress_verified(
+        &mut file,
+        &footer,
+        &manifest.entries[index],
+        dict.as_deref(),
+    )?;
+    Ok(Some(data))
+}
+
 pub(crate) fn find_entry_by_path(manifest: &Manifest, path: &str) -> Option<usize> {
     manifest
         .entries

@@ -6833,6 +6833,96 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A set's build says what it ships, and a package pinning it believes
+/// the build rather than working the answer out again from the sysroot.
+/// The two drifted apart before: a build drops what it cannot load, and
+/// a package that inferred the contents left out a library the build had
+/// never carried, so nothing held it at launch.
+#[test]
+fn a_package_believes_the_set_build_about_what_it_ships() {
+    let td = workdir("setshipped");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    // The build records what it holds, and what it dropped is absent
+    // from that record.
+    let listed = String::from_utf8(
+        run_onelf(
+            &[
+                "extract",
+                set_pkg.to_str().unwrap(),
+                "--file",
+                ".onelf/sonames",
+                "-o",
+                "-",
+            ],
+            None,
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert!(
+        listed.lines().any(|l| l == "libfixture.so.1"),
+        "the build lists what it carries: {listed}"
+    );
+    assert!(
+        !listed.lines().any(|l| l == "libchainlib.so.1"),
+        "and not what it dropped: {listed}"
+    );
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sets = format!(
+        "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+        set_pkg.display()
+    );
+    sysroot_recipe(&dir, &fixture, &sets);
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("lib/libfixture.so.1").exists(),
+        "a name the build lists stays out of the bundle"
+    );
+    // The build dropped libchainlib, so the package cannot rely on it
+    // being there and has to decide for itself.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("is not at hand"),
+        "the build was read, not inferred"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A set keeps the shape of the tree it was packed from. A library
 /// whose dependency sits in a subdirectory, reachable only through its
 /// own run path, keeps both the dependency and a run path that still

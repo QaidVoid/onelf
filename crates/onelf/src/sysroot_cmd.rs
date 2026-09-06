@@ -7,6 +7,7 @@ use onelf_sysroot::{Database, archive};
 
 use crate::bundle::elf::audit_unbundled_needs;
 use crate::bundle::remove_dangling_links_beside;
+use crate::bundle::ui::color;
 use crate::pack::{HostLibs, PackOptions};
 
 /// Materialize the rootfs archive at `source`, a local path or an
@@ -126,6 +127,31 @@ pub fn pack_set(dir: &Path, output: &Path, name: &str, runtime: &[u8]) -> io::Re
     )
 }
 
+/// Record the name every shared object in `dir` answers to.
+///
+/// Every directory of a set that holds a shared object goes on the
+/// launch's library path, so a name anywhere in the tree is a name the
+/// loader will find.
+fn write_shipped_sonames(dir: &Path) -> io::Result<()> {
+    let mut names: Vec<String> = jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file() || e.path_is_symlink())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| n.contains(".so"))
+        .collect();
+    names.sort();
+    names.dedup();
+    let path = dir.join(crate::bundle::sysroot::SHIPPED_FILE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, names.join("\n") + "\n")?;
+    crate::bundle::normalize_mtime(&path);
+    Ok(())
+}
+
 fn pack_tree(
     dir: &Path,
     output: &Path,
@@ -198,6 +224,27 @@ fn pack_tree(
     // of util-linux say. Nothing loads those from a GL build, so they go,
     // by name, rather than failing the build.
     if !findings.is_empty() {
+        // A library directly in lib/ is one a package elsewhere resolves
+        // by soname. Dropping it is still right, since an optional
+        // dependency the sysroot does not hold makes it unloadable
+        // wherever it sits, but it is worth naming: a set meant to carry
+        // it is one package short. What keeps a package from leaving out
+        // a library on the strength of a build that dropped it is the
+        // record written below, not this.
+        for (object, libs) in findings.iter().filter(|(object, _)| {
+            object.parent() == Some(&dir.join("lib"))
+                && object
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".so"))
+        }) {
+            eprintln!(
+                "  {} {} is dropped for want of {}; name the package that provides it if the build should carry it",
+                color::bold_red("warning:"),
+                object.strip_prefix(dir).unwrap_or(object).display(),
+                libs[0]
+            );
+        }
         eprintln!(
             "Dropped {} object(s) needing libraries outside the build:",
             findings.len()
@@ -212,6 +259,12 @@ fn pack_tree(
             remove_dangling_links_beside(object);
         }
     }
+
+    // What the build ships, for the packages that leave it out to read
+    // rather than work out a second time. The two answers drifted apart
+    // before: a package pinning a set left out a library the set had
+    // never carried, and nothing held it at launch.
+    write_shipped_sonames(dir)?;
 
     crate::pack::pack(
         &PackOptions {

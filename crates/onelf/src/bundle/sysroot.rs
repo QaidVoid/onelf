@@ -227,13 +227,34 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         .filter_map(|n| db.package(n))
         .flat_map(|p| p.files.iter().cloned())
         .collect();
-    let set_sonames: HashSet<String> = set_packages
-        .iter()
-        .filter_map(|n| db.package(n))
-        .flat_map(|p| p.files.iter())
-        .filter(|f| is_top_level_object(f))
-        .filter_map(|f| f.rsplit('/').next().map(String::from))
-        .collect();
+    // What the sets actually ship, read from the builds themselves where
+    // they can be found. Inferring it from the sysroot a second time is
+    // only close: the build drops what it cannot load, and the sysroot
+    // it was made from may not be the one in hand.
+    let mut set_sonames: HashSet<String> = HashSet::new();
+    for set in &opts.sets {
+        match shipped_sonames(set) {
+            Some(shipped) => set_sonames.extend(shipped),
+            None => {
+                eprintln!(
+                    "  {} set {}: its build is not at hand, so what it holds is \
+                     inferred from the sysroot; put the build beside the recipe \
+                     or in ONELF_PLATFORM_STORE to read it instead",
+                    color::bold("note:"),
+                    set.name
+                );
+                set_sonames.extend(
+                    db.closure_excluding(&set.packages[0], &set.packages[1..], &host_packages)
+                        .packages
+                        .iter()
+                        .filter_map(|n| db.package(n))
+                        .flat_map(|p| p.files.iter())
+                        .filter(|f| is_top_level_object(f))
+                        .filter_map(|f| f.rsplit('/').next().map(String::from)),
+                );
+            }
+        }
+    }
     let closure = db.closure_excluding(&owner.name, &opts.optional, &left_out);
     let files = db.files_of(&closure);
     let policy = opts.policy.as_deref().map(Policy::load).transpose()?;
@@ -360,6 +381,11 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
 /// relative to the AppDir: one table per set with the build's URL and
 /// hash, and the packages left to it.
 pub const SETS_FILE: &str = ".onelf/sets";
+
+/// The name every shared object in a dependency build answers to, one
+/// per line, written by `pack-set` and read by the packages that leave
+/// the build's contents out of their own bundle.
+pub const SHIPPED_FILE: &str = ".onelf/sonames";
 
 /// The sets record as TOML.
 pub fn render_sets(sets: &[SharedSet], closures: &[(String, Vec<String>)]) -> String {
@@ -522,6 +548,37 @@ fn populate_closure(
             .collect(),
         copied,
     })
+}
+
+/// The sonames a set's build records, when the build can be found.
+///
+/// Looked for where a build plausibly sits without going to the network:
+/// a `file://` URL names one outright, and a store keyed by hash holds
+/// the ones already fetched. Anything else leaves the caller to infer.
+fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = set.url.strip_prefix("file://") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(store) = std::env::var_os("ONELF_PLATFORM_STORE") {
+        candidates.push(
+            Path::new(&store)
+                .join(&set.name)
+                .join(format!("{}.onelf", set.blake3)),
+        );
+    }
+    let text = candidates.iter().filter(|p| p.is_file()).find_map(|path| {
+        crate::metadata::read_packed_file(path, SHIPPED_FILE)
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    })?;
+    Some(
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+    )
 }
 
 /// Caches a distribution generates after installing a package rather
