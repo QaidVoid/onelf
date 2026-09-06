@@ -14,6 +14,17 @@
 use std::env;
 use std::path::Path;
 
+/// `set_var` for a name and value that came from a file: `std` aborts on
+/// an empty name, a `=` in the name, or a NUL in either, and a stray line
+/// in `.onelf/env` is not worth the whole launch.
+pub(crate) fn set_var_checked(key: &str, value: &str) {
+    if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
+        return;
+    }
+    // SAFETY: the runtime is single-threaded at this point (before exec)
+    unsafe { env::set_var(key, value) };
+}
+
 /// Set up environment variables and return a colon-joined lib path
 /// string for use with the dynamic linker's `--library-path` flag.
 ///
@@ -374,9 +385,7 @@ pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
         }
         if let Some((key, val)) = line.split_once('=') {
             let expanded = expand_env_value(val.trim(), onelf_dir);
-            unsafe {
-                env::set_var(key.trim(), expanded);
-            }
+            set_var_checked(key.trim(), &expanded);
         }
     }
 }
@@ -429,5 +438,19 @@ mod expand_value_tests {
             expand_env_value("${ONELF_DIR}/bin:${ONELF_T_PE_d2:-/usr/bin:/bin}", "/R"),
             "/R/bin:/usr/bin:/bin"
         );
+    }
+}
+
+#[cfg(test)]
+mod set_var_tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_env_line_is_skipped_not_fatal() {
+        for (k, v) in [("", "x"), ("A=B", "x"), ("A\0", "x"), ("A", "x\0")] {
+            set_var_checked(k, v);
+        }
+        set_var_checked("ONELF_TEST_SET_VAR_CHECKED", "ok");
+        assert_eq!(env::var("ONELF_TEST_SET_VAR_CHECKED").as_deref(), Ok("ok"));
     }
 }

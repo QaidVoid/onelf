@@ -130,7 +130,7 @@ fn load_env_file(path: &Path) {
         // Handle "unset VAR"
         if let Some(var) = trimmed.strip_prefix("unset ") {
             let var = var.trim();
-            if !var.is_empty() {
+            if !var.is_empty() && !var.contains('=') && !var.contains('\0') {
                 unsafe { env::remove_var(var) };
             }
             continue;
@@ -138,11 +138,7 @@ fn load_env_file(path: &Path) {
 
         // Handle "KEY=VALUE"
         if let Some((key, value)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            if !key.is_empty() {
-                unsafe { env::set_var(key, value) };
-            }
+            crate::env::set_var_checked(key.trim(), value.trim());
         }
     }
 }
