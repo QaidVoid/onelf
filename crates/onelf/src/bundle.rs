@@ -1259,18 +1259,36 @@ fn drop_unloadable(
 }
 
 /// The `libfoo.so -> libfoo.so.1 -> libfoo.so.1.2` chains a dropped
-/// library leaves behind point nowhere and are removed with it.
+/// library leaves behind point nowhere and are removed with it. Only
+/// links that led to the dropped object go: a link that dangled for
+/// some other reason is the publisher's, and stays.
 pub(crate) fn remove_dangling_links_beside(object: &Path) {
-    let Some(dir) = object.parent() else {
+    let (Some(dir), Some(name)) = (object.parent(), object.file_name()) else {
         return;
     };
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_symlink() && !path.exists() {
-            let _ = fs::remove_file(&path);
+    let mut gone: HashSet<std::ffi::OsString> = HashSet::from([name.to_os_string()]);
+    loop {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut removed = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_symlink() || path.exists() {
+                continue;
+            }
+            let Ok(target) = fs::read_link(&path) else {
+                continue;
+            };
+            let led_here = target.parent().is_none_or(|p| p.as_os_str().is_empty())
+                && target.file_name().is_some_and(|t| gone.contains(t));
+            if led_here && fs::remove_file(&path).is_ok() {
+                gone.insert(entry.file_name());
+                removed = true;
+            }
+        }
+        if !removed {
+            return;
         }
     }
 }
@@ -2006,5 +2024,32 @@ mod correctness_tests {
         assert_eq!(before, after, "a self-copy must not truncate the file");
 
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod dangling_link_tests {
+    use super::*;
+
+    #[test]
+    fn only_links_that_led_to_the_dropped_object_go() {
+        let dir = std::env::temp_dir().join(format!("onelf-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("libfoo.so.1.2"), b"x").unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1.2", dir.join("libfoo.so.1")).unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1", dir.join("libfoo.so")).unwrap();
+        // The publisher's own dangling link, unrelated to libfoo.
+        std::os::unix::fs::symlink("libbar.so.9", dir.join("libbar.so")).unwrap();
+
+        fs::remove_file(dir.join("libfoo.so.1.2")).unwrap();
+        remove_dangling_links_beside(&dir.join("libfoo.so.1.2"));
+        assert!(!dir.join("libfoo.so.1").is_symlink(), "the chain goes");
+        assert!(!dir.join("libfoo.so").is_symlink(), "the whole chain goes");
+        assert!(
+            dir.join("libbar.so").is_symlink(),
+            "an unrelated link stays"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
