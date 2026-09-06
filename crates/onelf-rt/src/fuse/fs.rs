@@ -491,7 +491,7 @@ impl<'a> FuseState<'a> {
 
         let inode = read_in.fh;
         let entry_idx = inode_to_entry(inode);
-        if entry_idx >= self.manifest.entries.len() {
+        if inode == 0 || entry_idx >= self.manifest.entries.len() {
             let r = reply_err(header, -libc_enoent());
             let _ = rustix::io::write(fuse_fd, &r);
             return;
