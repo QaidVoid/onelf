@@ -53,17 +53,9 @@ pub fn exec(launch: &Launch) -> ! {
     let lib_dirs = manifest.lib_dirs();
     let lib_paths_str = lib_dirs.join(":");
 
-    // The sets the package left its dependencies to. Nothing in the
-    // bundle replaces them, so a set that cannot be had ends the launch
-    // here rather than at the first missing symbol.
-    let sets = match crate::sets::obtain_all(launch.pkg_root) {
-        Ok(sets) => sets,
-        Err(why) => {
-            eprintln!("onelf-rt: {why}");
-            std::process::exit(1);
-        }
-    };
-    let set_roots: Vec<std::path::PathBuf> = sets.iter().map(|s| s.root.clone()).collect();
+    // The sets the package left its dependencies to, obtained before any
+    // mode made a mount namespace of its own.
+    let set_roots = crate::sets::roots();
     let set_lib_dirs: Vec<std::path::PathBuf> = set_roots
         .iter()
         .flat_map(|r| crate::sets::lib_dirs(r))

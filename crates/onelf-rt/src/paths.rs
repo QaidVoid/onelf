@@ -92,13 +92,47 @@ impl Mountpoint {
 /// the window where a freshly created but not yet mounted directory looks
 /// exactly like an abandoned one to a concurrent sweep.
 pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
-    use rustix::fs::FlockOperation;
-
     let hash_suffix = crate::cache::hex(&package_id[0..4]);
     let dir_name = format!("onelf-{}-{hash_suffix}", name_stem(package_name));
+    let (path, lock) = claim_mountpoint(&dir_name)?;
+    Some(Mountpoint { path, _lock: lock })
+}
+
+/// The mountpoint a dependency set's build is served at, named by the
+/// build's hash so every package that pins that set shares one mount,
+/// with the shared lock claiming it.
+pub fn create_set_mountpoint(hash: &str) -> Option<(PathBuf, std::fs::File)> {
+    claim_mountpoint(&format!("onelf-set-{}", &hash[..hash.len().min(16)]))
+}
+
+/// The lock file guarding the mountpoint named `dir_name`, for a server
+/// that has to ask whether anyone still holds it.
+pub fn set_lock_path(dir_name: &str) -> Option<PathBuf> {
+    Some(mountpoint_lock_path(&private_dir()?, dir_name))
+}
+
+/// Take the lock that serializes creating the mount for `dir_name`.
+///
+/// The mountpoint's own lock cannot do this: every user holds it shared
+/// for as long as it runs, so it says nothing about who is mounting. Two
+/// launches starting together would otherwise both find no mount and
+/// both make one, stacking a second mount on the first and leaving a
+/// server with nothing to serve.
+pub fn lock_set_creation(dir_name: &str) -> Option<std::fs::File> {
+    let path = private_dir()?.join(format!(".{dir_name}.create"));
+    let lock = open_lock_inheritable(&path).ok()?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).ok()?;
+    Some(lock)
+}
+
+/// Claim `dir_name` under the private runtime dir and create it. The
+/// shared lock is taken first, so a concurrent sweep cannot mistake a
+/// directory that exists but is not yet mounted for an abandoned one.
+fn claim_mountpoint(dir_name: &str) -> Option<(PathBuf, std::fs::File)> {
+    use rustix::fs::FlockOperation;
 
     let base = private_dir()?;
-    let lock_path = mountpoint_lock_path(&base, &dir_name);
+    let lock_path = mountpoint_lock_path(&base, dir_name);
     let lock = match open_lock_inheritable(&lock_path) {
         Ok(f) => f,
         Err(e) => {
@@ -111,12 +145,12 @@ pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
         return None;
     }
 
-    let path = base.join(&dir_name);
+    let path = base.join(dir_name);
     if let Err(e) = std::fs::create_dir_all(&path) {
         eprintln!("onelf-rt: cannot create {}: {e}", path.display());
         return None;
     }
-    Some(Mountpoint { path, _lock: lock })
+    Some((path, lock))
 }
 
 /// The package name as the readable part of a directory name: its first

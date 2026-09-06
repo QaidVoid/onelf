@@ -201,6 +201,12 @@ fn main() {
     // Read custom environment variables from recipe [env] section
     let env_data = read_package_file(&mut pkg, ".onelf/env");
 
+    // The dependency sets the package left its libraries to. Obtained
+    // before any mode is chosen: a set is served from the host mount
+    // namespace so every package naming it shares one mount, and a mode
+    // that unshares first would make that mount private to this launch.
+    sets::init(read_package_file(&mut pkg, sets::SETS_FILE).as_deref());
+
     // The app runs setuid binaries, so it has to stay in the namespace it
     // was started in. That rules out the two modes that make one of their
     // own, leaving fusermount3 and, failing that, extraction. The file's

@@ -91,6 +91,21 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
 /// Shared by the GL build and by every dependency set, which differ only
 /// in when they are wanted, not in how they are obtained.
 pub fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
+    let file = store_build(pin)?;
+    extract_build(&file)
+}
+
+/// Extract the build at `file` through the ordinary package cache.
+pub fn extract_build(file: &Path) -> Result<(PathBuf, fs::File), String> {
+    let mut pkg = crate::loader::load_from(file)
+        .map_err(|e| format!("{}: not a usable build: {e}", file.display()))?;
+    crate::cache::ensure_extracted(&mut pkg)
+        .map_err(|e| format!("{}: cannot extract: {e}", file.display()))
+}
+
+/// The build `pin` names, in the shared store: fetched and verified if
+/// the store lacks it. Returns the stored file.
+pub fn store_build(pin: &Pin) -> Result<PathBuf, String> {
     let store = match std::env::var_os("ONELF_PLATFORM_STORE").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => crate::cache::base_dir()
@@ -124,12 +139,7 @@ pub fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
         })?;
     }
     touch(&file);
-
-    let mut pkg = crate::loader::load_from(&file)
-        .map_err(|e| format!("{}: not a usable build: {e}", file.display()))?;
-    let (root, lock) = crate::cache::ensure_extracted(&mut pkg)
-        .map_err(|e| format!("{}: cannot extract: {e}", file.display()))?;
-    Ok((root, lock))
+    Ok(file)
 }
 
 /// Copy or download the build to `into`. The scheme decides: a local

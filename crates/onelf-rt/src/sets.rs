@@ -7,10 +7,20 @@
 //! launch rather than a degraded one.
 //!
 //! Obtaining one is the GL build's path exactly, so two packages naming
-//! the same set share one download and one extraction.
+//! the same set share one download.
+//!
+//! What they do with it depends on the mode. Mounted, the set is served
+//! from its stored file by a detached FUSE server at a mountpoint named
+//! after the build's hash, so nothing is copied to disk and every package
+//! naming that set shares one mount. The server lives in the host mount
+//! namespace, which is why sets are obtained before any execution mode
+//! makes a namespace of its own: a mount made afterwards would be private
+//! to one launch. Extracted, the set goes through the ordinary package
+//! cache, which costs a full copy but needs no FUSE.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::platform::Pin;
 
@@ -70,20 +80,191 @@ pub fn parse(text: &str) -> Vec<Pin> {
     out
 }
 
-/// Obtain every set the package at `pkg_root` names. The error names the
-/// first set that could not be had, since the bundle cannot run without
-/// what it left out.
-pub fn obtain_all(pkg_root: &Path) -> Result<Vec<Obtained>, String> {
-    let Ok(text) = fs::read_to_string(pkg_root.join(SETS_FILE)) else {
-        return Ok(Vec::new());
+/// The sets this launch obtained, held for the life of the process: the
+/// locks in them are what keep a mount or an extraction from being
+/// reclaimed while the application runs, and they are inheritable so the
+/// claim survives the `exec`.
+static OBTAINED: OnceLock<Vec<Obtained>> = OnceLock::new();
+
+/// Obtain every set the record names, before any execution mode makes a
+/// mount namespace of its own. A set that cannot be had ends the launch:
+/// the bundle carries none of it, so there is nothing to degrade to.
+pub fn init(record: Option<&[u8]>) {
+    let text = match record.map(String::from_utf8_lossy) {
+        Some(text) => text.into_owned(),
+        None => return,
     };
     let mut out = Vec::new();
     for pin in parse(&text) {
-        let (root, lock) = crate::platform::obtain_build(&pin)
-            .map_err(|why| format!("dependency set {}: {why}", pin.label))?;
-        out.push(Obtained { root, _lock: lock });
+        match obtain(&pin) {
+            Ok(o) => out.push(o),
+            Err(why) => {
+                eprintln!("onelf-rt: dependency set {}: {why}", pin.label);
+                std::process::exit(1);
+            }
+        }
     }
-    Ok(out)
+    let _ = OBTAINED.set(out);
+}
+
+/// The extracted or mounted root of every set this launch obtained.
+pub fn roots() -> Vec<PathBuf> {
+    OBTAINED
+        .get()
+        .map(|sets| sets.iter().map(|s| s.root.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the set should be served from its stored file rather than
+/// copied out of it. `ONELF_SET_MODE` forces either way; mounting is the
+/// default and falls back to extraction wherever FUSE cannot serve.
+fn mount_wanted() -> bool {
+    !matches!(std::env::var("ONELF_SET_MODE").as_deref(), Ok("extract"))
+}
+
+fn obtain(pin: &Pin) -> Result<Obtained, String> {
+    let file = crate::platform::store_build(pin)?;
+    if mount_wanted() {
+        match mount(&file, &pin.blake3) {
+            Ok(obtained) => return Ok(obtained),
+            Err(why) => eprintln!(
+                "onelf-rt: dependency set {}: cannot mount ({why}); extracting instead",
+                pin.label
+            ),
+        }
+    }
+    let (root, lock) = crate::platform::extract_build(&file)?;
+    Ok(Obtained { root, _lock: lock })
+}
+
+/// Serve the build at `file` from a mountpoint named after `hash`, or
+/// join the mount another instance already serves there.
+fn mount(file: &Path, hash: &str) -> Result<Obtained, String> {
+    use rustix::runtime::{Fork, kernel_fork};
+
+    let (mountpoint, lock) =
+        crate::paths::create_set_mountpoint(hash).ok_or("no private runtime directory")?;
+
+    let dir_name = mountpoint
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let joined = |lock: fs::File| Obtained {
+        root: mountpoint.clone(),
+        _lock: lock,
+    };
+
+    // Another instance is already serving this set: its mount is in the
+    // host namespace, so it is ours to use as well. The shared lock just
+    // taken is what stops it being reclaimed under us.
+    if served(&mountpoint) {
+        return Ok(joined(lock));
+    }
+    if !crate::fuse::mount::fusermount3_available() {
+        return Err("fusermount3 is not available".into());
+    }
+
+    // One launch mounts, the rest wait and join what it made.
+    let _creating = crate::paths::lock_set_creation(&dir_name);
+    if served(&mountpoint) {
+        return Ok(joined(lock));
+    }
+
+    match unsafe { kernel_fork() } {
+        Ok(Fork::Child(_)) => {
+            // The inherited lock is the parent's claim, not the server's:
+            // closing this descriptor leaves the parent's open file
+            // description holding it, and lets the server ask whether
+            // anyone still does.
+            drop(lock);
+            serve(file, &mountpoint);
+        }
+        Ok(Fork::ParentOf(child)) => {
+            for _ in 0..400 {
+                if served(&mountpoint) {
+                    return Ok(joined(lock));
+                }
+                if matches!(
+                    rustix::process::waitpid(Some(child), rustix::process::WaitOptions::NOHANG),
+                    Ok(Some(_))
+                ) {
+                    return Err("the server exited before the mount appeared".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err("the mount did not appear".into())
+        }
+        Err(e) => Err(format!("fork: {e}")),
+    }
+}
+
+/// Whether something is already serving `mountpoint`: a mount is there
+/// and answers a directory read, which a mount whose server died does
+/// not.
+fn served(mountpoint: &Path) -> bool {
+    crate::paths::is_mountpoint(mountpoint) && mountpoint.read_dir().is_ok()
+}
+
+/// The detached server: mount, serve until nothing claims the mountpoint
+/// any more, then take it down. Never returns.
+fn serve(file: &Path, mountpoint: &Path) -> ! {
+    // Out of the launcher's session and off its standard streams, so a
+    // Ctrl-C aimed at the application does not take the set down and
+    // `app | head` does not wait on this process.
+    let _ = rustix::process::setsid();
+    if let Ok(null) = rustix::fs::open(
+        "/dev/null",
+        rustix::fs::OFlags::RDWR,
+        rustix::fs::Mode::empty(),
+    ) {
+        for target in 0..=2 {
+            use std::os::fd::FromRawFd;
+            let mut slot =
+                std::mem::ManuallyDrop::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(target) });
+            let _ = rustix::io::dup2(&null, &mut slot);
+        }
+    }
+
+    let served = (|| -> Result<(), String> {
+        let fuse_fd = crate::fuse::mount::fuse_mount(mountpoint).map_err(|e| e.to_string())?;
+        let mut pkg = crate::loader::load_from(file).map_err(|e| e.to_string())?;
+        let lock_path = crate::paths::set_lock_path(
+            mountpoint
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default(),
+        );
+        let mut state = crate::fuse::fs::FuseState::new(
+            &pkg.manifest,
+            &mut pkg.file,
+            &pkg.footer,
+            pkg.dict.as_deref(),
+        );
+        let mut buf = vec![0u8; 1024 * 1024 + 4096];
+        state.serve_detached(&fuse_fd, &mut buf, || {
+            lock_path.as_deref().is_none_or(unclaimed)
+        });
+        drop(fuse_fd);
+        Ok(())
+    })();
+    // A server that never mounted has nothing to take down, and
+    // unmounting what is not mounted is a no-op, so one path serves both.
+    let _ = served;
+    crate::fuse::mount::fuse_unmount(mountpoint);
+    let _ = std::fs::remove_dir(mountpoint);
+    std::process::exit(0);
+}
+
+/// Whether nobody holds the mountpoint's shared lock any more, which is
+/// what says the last package using this set is gone. Tested on a fresh
+/// descriptor each time, since a lock belongs to the open file
+/// description that took it.
+fn unclaimed(lock_path: &Path) -> bool {
+    let Ok(lock) = fs::File::open(lock_path) else {
+        return false;
+    };
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
 }
 
 /// The library directories a set root carries, in search order.

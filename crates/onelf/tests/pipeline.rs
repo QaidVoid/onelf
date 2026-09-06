@@ -6760,6 +6760,110 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A set is served from its stored file rather than copied out of it:
+/// one mount, whatever the number of packages using it, and nothing of
+/// the set on disk beyond the build. `ONELF_SET_MODE=extract` asks for
+/// the copy instead, and a host that cannot mount falls back to it.
+#[test]
+fn a_shared_set_is_served_from_its_build_rather_than_copied() {
+    if !fuse_available() || !have("fusermount3") {
+        return; // documented soft-skip
+    }
+    let td = workdir("setmount");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        &format!(
+            "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pkg = dir.join("app.onelf");
+
+    let run = |mode: Option<&str>| -> std::process::Output {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .env("ONELF_LD_CACHE", &fixture.ld_cache)
+            .env("ONELF_PLATFORM_STORE", td.join("store"));
+        if let Some(mode) = mode {
+            cmd.env("ONELF_SET_MODE", mode);
+        }
+        isolate(&mut cmd, &td);
+        run_package(&mut cmd)
+    };
+    let copies_of_the_set = || {
+        jwalk::WalkDir::new(td.join("xdg-cache"))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("libfixture.so"))
+            .count()
+    };
+
+    let out = run(None);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mounted = copies_of_the_set();
+    if mounted > 0 {
+        skip("this host mounted nothing; the fallback covered the run");
+        return;
+    }
+
+    // The copy is what the other mode asks for, and it works too.
+    let out = run(Some("extract"));
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(copies_of_the_set() > 0, "extract mode copied nothing");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.

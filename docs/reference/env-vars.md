@@ -54,6 +54,7 @@ resolver and reached through its link farm.
 | `ONELF_NO_PLATFORM_FETCH` | `1` stops the runtime from fetching the pinned GL build or dependency set on a host without one. A build already in the store is still used. The launch warns and continues. |
 | `ONELF_PLATFORM_URL` | Fetch the pinned GL build from this URL instead of the package's. The pinned hash still has to match, so a mirror cannot substitute content. |
 | `ONELF_PLATFORM_STORE` | Directory holding fetched GL builds and dependency sets instead of `platform/` under the cache root. |
+| `ONELF_SET_MODE` | `mount` serves a dependency set from its stored build, the default; `extract` copies it out through the package cache. A host that cannot mount falls back to `extract`. |
 | `XDG_RUNTIME_DIR` | Where to create mountpoint dirs (falls back to `/tmp`) |
 | `XDG_CACHE_HOME` | Where the persistent cache mode stores packages (falls back to `$HOME/.cache`) |
 | `XDG_DATA_HOME` | Where `onelf integrate` installs `.desktop` files and icons (falls back to `$HOME/.local/share`) |

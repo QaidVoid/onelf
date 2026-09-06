@@ -237,9 +237,21 @@ info` prints. The hash is the trust story, as for the GL build.
 ### At launch
 
 Every set the package names is fetched into the shared store under the
-cache root, verified against its hash before it is placed there, and
-extracted through the ordinary package cache, so two packages naming the
-same set share one download and one extraction. Each set's library
+cache root and verified against its hash before it is placed there, so
+two packages naming the same set share one download.
+
+By default the set is then served from that stored file: a detached FUSE
+server mounts it at a mountpoint named after the build's hash, so nothing
+is copied to disk and every package naming the set shares one mount, one
+server and one block cache. The mount lives in the host mount namespace,
+which is why sets are obtained before an execution mode is chosen; a mode
+that unshares first would make the mount private to one launch. The
+server takes the mount down once the last package using it exits, proven
+by the mountpoint lock rather than guessed at. `ONELF_SET_MODE=extract`
+asks for a copy through the ordinary package cache instead, and a host
+that cannot mount falls back to that on its own.
+
+Each set's library
 directories go on the launch's library path after the bundle's own, so a
 name the bundle kept stays the bundle's and the set supplies the rest.
 Its `share/` joins `XDG_DATA_DIRS`, and its libraries are compared
