@@ -5682,6 +5682,8 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     for d in [
         "usr/bin",
         "usr/lib/fixture/plugins",
+        "usr/lib/fixture/backends",
+        "usr/lib/qt6/plugins/platforms",
         "usr/lib/extra",
         "usr/share/doc/libfixture",
         "usr/share/fixture",
@@ -5691,18 +5693,45 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     let src = td.join("src");
     std::fs::create_dir_all(&src).unwrap();
 
-    write(&src.join("fixture.c"), "int fix_value(void){return 41;}\n");
+    // A backend reached only through the library's own run path, in a
+    // subdirectory, the way libproxy loads its backends.
+    write(
+        &src.join("backend.c"),
+        "int backend_value(void){return 1;}\n",
+    );
     if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libbackend.so.1",
+            src.join("backend.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/fixture/backends/libbackend.so.1"),
+    ) {
+        return None; // no compiler: documented soft-skip
+    }
+    write(
+        &src.join("fixture.c"),
+        "int backend_value(void);\nint fix_value(void){return 40 + backend_value();}\n",
+    );
+    assert!(cc_with(
         &[
             "-shared",
             "-fPIC",
             "-Wl,-soname,libfixture.so.1",
             src.join("fixture.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib/fixture/backends").display()),
+            "-l:libbackend.so.1",
+            "-Wl,-rpath,/usr/lib/fixture/backends",
         ],
         &rootfs.join("usr/lib/libfixture.so.1.0.0"),
-    ) {
-        return None; // no compiler: documented soft-skip
-    }
+    ));
+    // A toolkit plugin directory, so the launch can name it to Qt.
+    write(&src.join("qfake.c"), "int qfake(void){return 1;}\n");
+    assert!(cc_with(
+        &["-shared", "-fPIC", src.join("qfake.c").to_str().unwrap(),],
+        &rootfs.join("usr/lib/qt6/plugins/platforms/libqfake.so"),
+    ));
     // The soname is a link to the versioned file, as a distribution
     // installs it.
     std::os::unix::fs::symlink(
@@ -5785,12 +5814,16 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(
         &src.join("app.c"),
-        "#include <stdio.h>\nint fix_value(void);\nint gl_probe(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe());return 0;}\n",
+        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);return 0;}\n",
     );
     assert!(cc_with(
         &[
             src.join("app.c").to_str().unwrap(),
             &format!("-L{}", rootfs.join("usr/lib").display()),
+            &format!(
+                "-Wl,-rpath-link,{}",
+                rootfs.join("usr/lib/fixture/backends").display()
+            ),
             "-l:libfixture.so.1",
             "-l:libGL.so.1",
         ],
@@ -5886,6 +5919,8 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &[
             "usr/lib/libfixture.so.1",
             "usr/lib/libfixture.so.1.0.0",
+            "usr/lib/fixture/backends/libbackend.so.1",
+            "usr/lib/qt6/plugins/platforms/libqfake.so",
             "usr/lib/libchainlib.so.1",
             "usr/lib/fixture/plugins/a.so",
             "usr/lib/fixture/plugins/b.so",
@@ -6007,8 +6042,17 @@ fn assert_bundle_is_from_sysroot(appdir: &Path, rootfs: &Path) {
         if rel_s.contains("libonelf-env") {
             continue; // written by the packer itself
         }
+        // A dependency the bundler flattened into the library directory
+        // sits elsewhere in the sysroot, so the name is what to match.
+        let named_in_sysroot = || {
+            let name = rel.file_name().unwrap_or_default();
+            jwalk::WalkDir::new(rootfs)
+                .into_iter()
+                .flatten()
+                .any(|e| e.file_name() == name)
+        };
         assert!(
-            rootfs.join("usr").join(&rel).exists(),
+            rootfs.join("usr").join(&rel).exists() || named_in_sysroot(),
             "{} has no counterpart in the sysroot",
             rel.display()
         );
@@ -6756,6 +6800,120 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A set keeps the shape of the tree it was packed from. A library
+/// whose dependency sits in a subdirectory, reachable only through its
+/// own run path, keeps both the dependency and a run path that still
+/// points at it once the set is somewhere else. Plugin directories the
+/// set carries are named to Qt, which would otherwise look for them
+/// beside the application and find nothing.
+#[test]
+fn a_shared_set_keeps_what_only_its_run_path_reaches() {
+    let td = workdir("setrunpath");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    // The backend is only named by the run path of the library above it,
+    // so an audit that reads needs alone would have dropped both.
+    assert!(
+        set_tree
+            .join("lib/fixture/backends/libbackend.so.1")
+            .is_file(),
+        "the set kept the backend its run path reaches"
+    );
+    assert!(
+        set_tree.join("lib/libfixture.so.1.0.0").exists(),
+        "the set kept the library that needs it"
+    );
+    let rpath = String::from_utf8(
+        Command::new("objdump")
+            .args(["-x"])
+            .arg(set_tree.join("lib/libfixture.so.1.0.0"))
+            .output()
+            .expect("spawn objdump")
+            .stdout,
+    )
+    .unwrap();
+    let run_path: String = rpath
+        .lines()
+        .filter(|l| l.contains("RPATH") || l.contains("RUNPATH"))
+        .collect();
+    assert!(
+        run_path.contains("$ORIGIN") && !run_path.contains("/usr/lib/fixture"),
+        "the run path moved with the tree: {run_path}"
+    );
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sets = format!(
+        "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+        set_pkg.display()
+    );
+    sysroot_recipe(&dir, &fixture, &sets);
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let store = td.join("store");
+    let mut cmd = Command::new(dir.join("app.onelf"));
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache")
+        .env("ONELF_LD_CACHE", &fixture.ld_cache)
+        .env("ONELF_PLATFORM_STORE", &store)
+        .env("SHOW_QT", "1");
+    isolate(&mut cmd, &td);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 41 from the library and its backend, 1 from the GL probe.
+    assert!(stdout.contains("value=42"), "{stdout}");
+    let qt = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("qt="))
+        .expect("the launch names the plugin directories");
+    assert!(
+        qt.split(':')
+            .any(|d| Path::new(d).join("platforms").is_dir()),
+        "a named directory holds the platform plugins: {qt}"
     );
     let _ = std::fs::remove_dir_all(&td);
 }

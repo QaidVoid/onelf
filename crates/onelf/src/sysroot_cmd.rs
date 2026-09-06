@@ -163,8 +163,29 @@ fn pack_tree(
         ));
     }
 
+    // The tree keeps the run paths the distribution wrote, and those name
+    // the host. Rewriting them first means the audit below judges the
+    // tree as it will actually be loaded.
+    let (rewritten, _, _, _) = crate::bundle::elf::finalize_tree(dir, Path::new("lib"));
+    if rewritten > 0 {
+        eprintln!("Rewrote the run path of {rewritten} object(s)");
+    }
+
+    // Every directory in the tree that holds a shared object is on the
+    // launch's library path, so a soname the tree carries anywhere is
+    // one the loader will find.
+    let carried: std::collections::HashSet<String> = jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file() || e.path_is_symlink())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| n.contains(".so"))
+        .collect();
+
     let mut findings = audit_unbundled_needs(dir, Path::new("lib"));
     for (_, libs) in &mut findings {
+        libs.retain(|s| !carried.contains(s));
         libs.retain(|s| {
             !onelf_format::drivers::DRIVER_FAMILIES
                 .iter()

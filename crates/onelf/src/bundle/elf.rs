@@ -163,6 +163,27 @@ pub(crate) fn parse_rpaths(path: &Path) -> Vec<PathBuf> {
     parse_rpaths_under(path, None)
 }
 
+/// An ELF's run path entries as written, before `$ORIGIN` expansion or
+/// any mapping. `DT_RUNPATH` when present, else `DT_RPATH`, matching what
+/// the loader consults.
+pub(crate) fn parse_rpaths_raw(path: &Path) -> Vec<String> {
+    let Ok(data) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
+        return Vec::new();
+    };
+    let raw = if !elf.runpaths.is_empty() {
+        &elf.runpaths
+    } else {
+        &elf.rpaths
+    };
+    raw.iter()
+        .flat_map(|entry| entry.split(':'))
+        .map(String::from)
+        .collect()
+}
+
 /// The directories an ELF's `DT_RUNPATH` (or failing that `DT_RPATH`)
 /// names, absolute ones mapped under `root` when given.
 pub(crate) fn parse_rpaths_under(path: &Path, root: Option<&Path>) -> Vec<PathBuf> {
@@ -244,6 +265,64 @@ pub(crate) fn origin_runpath(depth: usize, lib_rel: &Path) -> String {
     s
 }
 
+/// `$ORIGIN`-relative form of `target` seen from `from`, both inside the
+/// same tree. `None` when either is not under it.
+fn origin_relative(from: &Path, target: &Path, root: &Path) -> Option<String> {
+    let (from, target) = (
+        from.strip_prefix(root).ok()?,
+        target.strip_prefix(root).ok()?,
+    );
+    let mut f = from.components();
+    let mut t = target.components();
+    let mut shared = 0usize;
+    loop {
+        match (f.clone().next(), t.clone().next()) {
+            (Some(a), Some(b)) if a == b => {
+                f.next();
+                t.next();
+                shared += 1;
+            }
+            _ => break,
+        }
+    }
+    let _ = shared;
+    let up = f.count();
+    let mut out = String::from("$ORIGIN");
+    for _ in 0..up {
+        out.push_str("/..");
+    }
+    let rest: PathBuf = t.collect();
+    if rest.as_os_str().is_empty() {
+        return Some(out);
+    }
+    out.push('/');
+    out.push_str(&rest.to_string_lossy());
+    Some(out)
+}
+
+/// The run path an object in the tree at `root` needs: the entry that
+/// reaches the library directory, plus every directory its original run
+/// path named that the tree actually carries.
+///
+/// A tree assembled from a sysroot keeps the layout the distribution
+/// used, so a library that keeps its plugins in a directory of its own
+/// still needs to reach it, and the absolute path it was built with
+/// names the host rather than the tree.
+pub(crate) fn tree_runpath(root: &Path, object: &Path, lib_rel: &Path) -> String {
+    let mut parts = vec![origin_runpath_for(root, object, lib_rel)];
+    let Some(dir) = object.parent() else {
+        return parts.join(":");
+    };
+    for target in run_path_dirs_in_tree(object, root) {
+        if let Some(entry) = origin_relative(dir, &target, root)
+            && !parts.iter().any(|p| p.split(':').any(|e| e == entry))
+        {
+            parts.push(entry);
+        }
+    }
+    parts.join(":")
+}
+
 /// The `$ORIGIN` run path for `path` in the tree at `root`. A file in a
 /// subdirectory of the library directory, a plugin or a charset module,
 /// gets its own directory first, since such files name their helpers by
@@ -299,6 +378,7 @@ fn rewrite_origin_runpath_in(
     data: &mut [u8],
     path: &Path,
     runpath: &str,
+    origin_only: &str,
 ) -> io::Result<RunpathOutcome> {
     let new_bytes = runpath.as_bytes();
     let is_self_extract = has_embedded_payload(data);
@@ -366,7 +446,7 @@ fn rewrite_origin_runpath_in(
         // keep an absolute host path such as `/usr/lib`, which on a musl
         // host loads the host's own libraries into a glibc process. Any
         // of the three names no host path.
-        let write = [runpath, "$ORIGIN", ""]
+        let write = [runpath, origin_only, "$ORIGIN", ""]
             .into_iter()
             .find(|s| s.len() < slot_size)
             .unwrap_or("");
@@ -406,9 +486,15 @@ fn rewrite_origin_runpath_in(
     // A slot too small for the full string was overwritten with the
     // longest safe `$ORIGIN` fallback instead, and retagged RPATH, so it
     // names no host path and the executable's inherited entry covers the
-    // rest. Good enough for a library.
+    // rest. Good enough for a library, unless the full string named a
+    // directory of its own: that one is the only way its dependency is
+    // reached, so the write has to happen even at the cost of patchelf.
     if total > 0 && !is_executable {
-        return Ok(RunpathOutcome::Set);
+        return Ok(if runpath == origin_only {
+            RunpathOutcome::Set
+        } else {
+            RunpathOutcome::NeedsPatchelf
+        });
     }
 
     // Nothing to resolve: a static binary, or a bottom-of-stack library
@@ -477,6 +563,23 @@ fn run_patchelf_rpath(path: &Path, runpath: &str, patchelf: Option<&Path>) -> Ru
 ///
 /// The dynamic loader is excluded: it is named through PT_INTERP rather
 /// than DT_NEEDED, and is handled separately.
+/// The directories an object's absolute run path entries name, mapped
+/// into the tree at `root`. A tree built from a sysroot keeps the run
+/// paths the distribution wrote, and the conventional layout drops the
+/// `usr/` prefix, so `/usr/lib/libproxy` is `lib/libproxy` here.
+fn run_path_dirs_in_tree(object: &Path, root: &Path) -> Vec<PathBuf> {
+    parse_rpaths_raw(object)
+        .into_iter()
+        .filter(|entry| entry.starts_with('/'))
+        .flat_map(|entry| {
+            let rel = entry.trim_start_matches('/').to_string();
+            let flat = rel.strip_prefix("usr/").unwrap_or(&rel).to_string();
+            [root.join(&rel), root.join(&flat)]
+        })
+        .filter(|d| d.is_dir())
+        .collect()
+}
+
 pub(crate) fn audit_unbundled_needs(
     directory: &Path,
     lib_dir: &Path,
@@ -505,6 +608,16 @@ pub(crate) fn audit_unbundled_needs(
         let local = beside
             .entry(origin_lib.clone())
             .or_insert_with(|| names_in(&origin_lib));
+        // Wherever the object's own run path points inside the tree. A
+        // library that keeps its plugins in a directory of its own says
+        // so there, and the plugin is no more missing than a sibling is.
+        let mut on_run_path: HashSet<String> = HashSet::new();
+        for entry in parse_rpaths(&path) {
+            on_run_path.extend(names_in(&entry));
+        }
+        for entry in run_path_dirs_in_tree(&path, directory) {
+            on_run_path.extend(names_in(&entry));
+        }
         // A file in a subdirectory of the library directory has its own
         // directory on its run path too, for the helpers beside it.
         let siblings = if dir.starts_with(&lib_root) && dir != lib_root {
@@ -522,6 +635,7 @@ pub(crate) fn audit_unbundled_needs(
                 !shared.contains(bare)
                     && !local.contains(bare)
                     && !siblings.contains(bare)
+                    && !on_run_path.contains(bare)
                     && !is_dynamic_loader(bare)
             })
             .collect();
@@ -559,8 +673,11 @@ pub(crate) fn finalize_tree(
             let _ = fs::set_permissions(&path, PermissionsExt::from_mode(perms | 0o200));
         }
 
-        let runpath = origin_runpath_for(directory, &path, lib_rel);
-        if let Ok((outcome, did_scrub)) = finalize_one(&path, &runpath, patchelf.as_deref()) {
+        let runpath = tree_runpath(directory, &path, lib_rel);
+        let origin_only = origin_runpath_for(directory, &path, lib_rel);
+        if let Ok((outcome, did_scrub)) =
+            finalize_one(&path, &runpath, &origin_only, patchelf.as_deref())
+        {
             match outcome {
                 RunpathOutcome::Set => rewritten += 1,
                 RunpathOutcome::Unguaranteed => unguaranteed.push(path.clone()),
@@ -593,11 +710,12 @@ pub(crate) fn finalize_tree(
 fn finalize_one(
     path: &Path,
     runpath: &str,
+    origin_only: &str,
     patchelf: Option<&Path>,
 ) -> io::Result<(RunpathOutcome, bool)> {
     let mut data = fs::read(path)?;
 
-    let outcome = rewrite_origin_runpath_in(&mut data, path, runpath)?;
+    let outcome = rewrite_origin_runpath_in(&mut data, path, runpath, origin_only)?;
     let scrubbed = scrub_nix_store_paths_in(&mut data);
     let stripped = strip_absolute_needed_in(&mut data);
 
@@ -1553,7 +1671,7 @@ mod runpath_tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.so");
         fs::write(&path, bytes).unwrap();
-        finalize_one(&path, "$ORIGIN/../lib", None).unwrap();
+        finalize_one(&path, "$ORIGIN/../lib", "$ORIGIN/../lib", None).unwrap();
         let out = fs::read(&path).unwrap();
         let _ = fs::remove_dir_all(&dir);
         out
