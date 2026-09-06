@@ -6327,6 +6327,27 @@ fn a_sysroot_archive_that_does_not_match_its_hash_is_not_unpacked() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The recipe's archive may be an `https://` URL, as `sysroot fetch`
+/// accepts on the command line. It used to be joined onto the recipe's
+/// directory as if it were a path.
+#[test]
+fn a_recipe_sysroot_archive_may_be_a_url() {
+    let td = workdir("sysroot-url");
+    let dir = td.join("app");
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"fresh\"\narchive = \"https://onelf.invalid/root.tar.zst\"\n",
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("https://onelf.invalid/root.tar.zst") && !stderr.contains("https:/onelf"),
+        "the URL must reach the fetcher as written:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.

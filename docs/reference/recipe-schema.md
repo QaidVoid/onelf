@@ -142,7 +142,7 @@ skip = false                     # don't run bundle-libs at all (pre-bundled App
 ```toml
 [sysroot]
 path = "../sysroot"                   # PathBuf, required; must be outside the AppDir
-archive = "../platform-1.tar.zst"     # Option<PathBuf>, materialized into path when absent
+archive = "../platform-1.tar.zst"     # Option<PathBuf>, materialized into path when absent; a path or an https:// URL
 hash = "3f2a..."                       # Option<String>, BLAKE3 of the archive; a mismatch is not unpacked
 platform = "platform-1"               # Option<String>, provenance label; defaults to the archive or directory name
 optional = ["mesa"]                   # Vec<String>, packages to add to the closure, by name

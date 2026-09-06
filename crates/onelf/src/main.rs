@@ -920,11 +920,15 @@ fn sysroot_from_recipe(
                 ),
             ));
         };
-        sysroot_cmd::fetch(
-            &resolve(archive).to_string_lossy(),
-            &root,
-            sr.hash.as_deref(),
-        )?;
+        // A URL is handed over as written; only a path is relative to the
+        // recipe.
+        let archive_str = archive.to_string_lossy();
+        let source = if archive_str.contains("://") {
+            archive_str.into_owned()
+        } else {
+            resolve(archive).to_string_lossy().into_owned()
+        };
+        sysroot_cmd::fetch(&source, &root, sr.hash.as_deref())?;
     }
     let platform = sr
         .platform

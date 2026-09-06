@@ -190,7 +190,8 @@ impl From<HostLibsSpec> for crate::pack::HostLibs {
 pub struct Sysroot {
     /// The materialized rootfs.
     pub path: PathBuf,
-    /// An archive to materialize into `path` when it does not exist yet.
+    /// An archive to materialize into `path` when it does not exist yet:
+    /// a path relative to the recipe, or an `https://` URL.
     pub archive: Option<PathBuf>,
     /// The archive's BLAKE3 hash. When set, an archive that does not
     /// match is not unpacked.
