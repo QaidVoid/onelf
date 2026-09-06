@@ -4955,12 +4955,30 @@ fn reclaimed_by(run: &mut Command, td: &Path) -> bool {
 }
 
 /// SIGKILL `child` and every process in its group.
+/// Kill everything in the child's process group and wait for all of it
+/// to be gone. `wait` on the child alone reaps the runtime; the app it
+/// forked and that app's children are still being torn down for a few
+/// milliseconds, and until then they hold the locks they inherited.
 fn kill_group(child: &std::process::Child) {
+    let group = format!("-{}", child.id());
     let st = Command::new("kill")
-        .args(["-9", "--", &format!("-{}", child.id())])
+        .args(["-9", "--", &group])
         .status()
         .expect("spawn kill");
     assert!(st.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", "--", &group])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn kill")
+            .success();
+        if !alive || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// `ONELF_TRACE` records the sysroot-space path of every file the run
