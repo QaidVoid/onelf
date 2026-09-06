@@ -523,8 +523,10 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u64, meta: *const u8) -> u64 {
         [const { core::mem::MaybeUninit::uninit() }; 4096];
     let resolved = resolved.as_mut_ptr() as *mut u8;
     if slice_eq(execfn, b"/proc/") {
+        // A result that fills the buffer was cut short, and a truncated
+        // path names the wrong file or none; the /proc name is kept then.
         let n = arch::readlink(execfn, resolved, 4095);
-        if n > 0 {
+        if n > 0 && n < 4095 {
             *resolved.add(n as usize) = 0;
             execfn = resolved as *const u8;
         }
@@ -880,8 +882,10 @@ unsafe extern "C" fn _onelf_bootstrap(stack: *mut u32, meta: *const u8) -> u32 {
         [const { core::mem::MaybeUninit::uninit() }; 4096];
     let resolved = resolved.as_mut_ptr() as *mut u8;
     if slice_eq(execfn, b"/proc/") {
+        // A result that fills the buffer was cut short, and a truncated
+        // path names the wrong file or none; the /proc name is kept then.
         let n = arch::readlink(execfn, resolved, 4095);
-        if n > 0 {
+        if n > 0 && n < 4095 {
             *resolved.add(n as usize) = 0;
             execfn = resolved as *const u8;
         }
