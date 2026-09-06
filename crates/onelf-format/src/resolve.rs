@@ -60,6 +60,10 @@ pub struct Request<'a> {
     /// its [`GL_BUILD_LIB_DIRS`] and [`GL_BUILD_ICD_DIRS`] supply what
     /// the host could not.
     pub extra_root: Option<&'a Path>,
+    /// Extracted roots of the dependency sets the package pins. Their
+    /// libraries are the ones the bundle left out, so they are compared
+    /// against the host exactly as a bundled copy would be.
+    pub set_roots: &'a [PathBuf],
 }
 
 /// Library directories of a GL build, relative to its root.
@@ -169,7 +173,14 @@ pub fn resolve(req: &Request) -> Resolution {
         return recorded;
     }
 
-    let bundled = bundled_libs(req.pkg_root, req.lib_dirs);
+    let mut bundled = bundled_libs(req.pkg_root, req.lib_dirs);
+    // A name the bundle carries itself wins: the set supplies what was
+    // left out, not a second copy of what was kept.
+    for root in req.set_roots {
+        for (name, path) in bundled_libs(root, GL_BUILD_LIB_DIRS) {
+            bundled.entry(name).or_insert(path);
+        }
+    }
     let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut incomparable = Vec::new();
     let mut host_interp = None;
@@ -662,6 +673,7 @@ mod tests {
 
         fn resolve_with(&self, policy: HostLibsPolicy, extra_root: Option<&Path>) -> Resolution {
             let icd_dir = self.icd_dir.to_string_lossy().into_owned();
+            let set_roots = self.set_roots();
             let r = resolve(&Request {
                 pkg_root: &self.pkg,
                 lib_dirs: &["lib"],
@@ -670,9 +682,14 @@ mod tests {
                 ld_cache: &self.cache,
                 icd_dirs: &[icd_dir.as_str()],
                 extra_root,
+                set_roots: &set_roots,
             });
             *self.last_farm.borrow_mut() = r.farm.clone();
             r
+        }
+
+        fn set_roots(&self) -> Vec<PathBuf> {
+            Vec::new()
         }
 
         fn gl(&self) -> Gl {

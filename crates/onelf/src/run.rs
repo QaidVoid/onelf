@@ -124,6 +124,7 @@ pub fn run(
                 ld_cache: &drivers::cache_file(),
                 icd_dirs: resolve::ICD_DIRS,
                 extra_root: None,
+                set_roots: &[],
             })
         }
         _ => Resolution::default(),

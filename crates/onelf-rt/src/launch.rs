@@ -53,9 +53,25 @@ pub fn exec(launch: &Launch) -> ! {
     let lib_dirs = manifest.lib_dirs();
     let lib_paths_str = lib_dirs.join(":");
 
+    // The sets the package left its dependencies to. Nothing in the
+    // bundle replaces them, so a set that cannot be had ends the launch
+    // here rather than at the first missing symbol.
+    let sets = match crate::sets::obtain_all(launch.pkg_root) {
+        Ok(sets) => sets,
+        Err(why) => {
+            eprintln!("onelf-rt: {why}");
+            std::process::exit(1);
+        }
+    };
+    let set_roots: Vec<std::path::PathBuf> = sets.iter().map(|s| s.root.clone()).collect();
+    let set_lib_dirs: Vec<std::path::PathBuf> = set_roots
+        .iter()
+        .flat_map(|r| crate::sets::lib_dirs(r))
+        .collect();
+
     let target_is_elf = crate::env::is_elf_file(target_path_s);
     let resolved = if target_is_elf && !lib_dirs.is_empty() {
-        resolve_for(launch.pkg, launch.pkg_root, &lib_dirs)
+        resolve_for(launch.pkg, launch.pkg_root, &lib_dirs, &set_roots)
     } else {
         Resolved::default()
     };
@@ -77,6 +93,8 @@ pub fn exec(launch: &Launch) -> ! {
         target_path_s,
         resolution.farm.as_deref(),
         resolved.platform_root.as_deref(),
+        &set_lib_dirs,
+        &set_roots,
     );
     if let Some(data) = launch.env_data {
         crate::env::apply_custom_env(data, pkg_root_s);
@@ -246,7 +264,12 @@ struct Resolved {
 /// one and the build can be had; the resolver then indexes that build
 /// ahead of the host. Anything that stops that is a warning, and the
 /// launch goes on without a GL stack.
-fn resolve_for(pkg: &PackageData, pkg_root: &Path, lib_dirs: &[&str]) -> Resolved {
+fn resolve_for(
+    pkg: &PackageData,
+    pkg_root: &Path,
+    lib_dirs: &[&str],
+    set_roots: &[std::path::PathBuf],
+) -> Resolved {
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
     let policy = if disabled {
         HostLibsPolicy::Never
@@ -283,6 +306,7 @@ fn resolve_for(pkg: &PackageData, pkg_root: &Path, lib_dirs: &[&str]) -> Resolve
         ld_cache: &ld_cache,
         icd_dirs: resolve::ICD_DIRS,
         extra_root: platform_root.as_deref(),
+        set_roots,
     });
     Resolved {
         resolution,

@@ -14,6 +14,7 @@ mod platform;
 mod portable;
 mod rundir;
 mod selfextract;
+mod sets;
 mod ulexec;
 #[cfg(feature = "update")]
 mod update;
@@ -177,6 +178,8 @@ fn main() {
                 "/proc/self/fd/0",
                 None,
                 None,
+                &[],
+                &[],
             );
             portable::setup_portable(exe_dir, exe_name);
 

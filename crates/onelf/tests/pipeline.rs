@@ -6648,6 +6648,118 @@ fn a_shared_set_is_left_out_and_pinned() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The launch side of a shared set: the package left its library to the
+/// set, so the runtime fetches the set, extracts it into the shared
+/// store, and puts it on the library path. Two packages naming the same
+/// set share one extraction, and a set that cannot be had ends the
+/// launch with the reason rather than at the first missing symbol.
+#[test]
+fn a_shared_set_is_fetched_and_put_on_the_library_path() {
+    let td = workdir("setlaunch");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sets = format!(
+        "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+        set_pkg.display()
+    );
+    sysroot_recipe(&dir, &fixture, &sets);
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pkg = dir.join("app.onelf");
+    assert!(
+        !dir.join("lib/libfixture.so.1").exists(),
+        "the set's library stays out"
+    );
+
+    let store = td.join("store");
+    let run = |store: Option<&Path>| -> std::process::Output {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .env("ONELF_LD_CACHE", &fixture.ld_cache);
+        match store {
+            Some(s) => cmd.env("ONELF_PLATFORM_STORE", s),
+            None => cmd.env("ONELF_NO_PLATFORM_FETCH", "1"),
+        };
+        isolate(&mut cmd, &td);
+        run_package(&mut cmd)
+    };
+
+    // Fetching disabled: the launch says which set it could not get.
+    let out = run(None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "ran without its set:\n{err}");
+    assert!(err.contains("dependency set fixture"), "{err}");
+
+    // With the store reachable the set is fetched and the app runs.
+    let out = run(Some(&store));
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The fixture's binary calls into libfixture, which only the set has.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        store
+            .join("fixture")
+            .join(format!("{hash}.onelf"))
+            .is_file(),
+        "the set is stored by its hash"
+    );
+
+    // A second launch reuses the stored build rather than fetching again.
+    std::fs::remove_file(&set_pkg).unwrap();
+    let out = run(Some(&store));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.

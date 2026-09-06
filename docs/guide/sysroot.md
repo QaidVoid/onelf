@@ -234,9 +234,22 @@ and accepts what the set provides when it verifies the bundle. The
 package records each set's URL and hash in `.onelf/sets`, which `onelf
 info` prints. The hash is the trust story, as for the GL build.
 
-The runtime side, fetching a set into the shared store at launch and
-indexing it ahead of the bundle, is not in place yet. A package pinning
-a set builds and verifies today, and runs once that lands.
+### At launch
+
+Every set the package names is fetched into the shared store under the
+cache root, verified against its hash before it is placed there, and
+extracted through the ordinary package cache, so two packages naming the
+same set share one download and one extraction. Each set's library
+directories go on the launch's library path after the bundle's own, so a
+name the bundle kept stays the bundle's and the set supplies the rest.
+Its `share/` joins `XDG_DATA_DIRS`, and its libraries are compared
+against the host exactly as bundled copies are.
+
+Unlike the GL build, a set is not optional: the bundle carries none of
+it, so a set that cannot be obtained ends the launch naming the set and
+the reason, rather than failing later at the first missing symbol.
+`ONELF_NO_PLATFORM_FETCH` and `ONELF_PLATFORM_STORE` apply to sets as
+they do to the GL build.
 
 ## Pinning a GL build for hosts without one
 

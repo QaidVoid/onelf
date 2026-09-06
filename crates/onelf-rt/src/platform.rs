@@ -42,20 +42,20 @@ pub fn parse_pin(text: &str) -> Option<Pin> {
             _ => {}
         }
     }
-    let pin = Pin {
-        label: label?,
-        url: url?,
-        blake3: blake3?,
-    };
-    if pin.label.is_empty() || pin.label.contains('/') || pin.label.starts_with('.') {
+    checked_pin(label?, url?, blake3?)
+}
+
+/// A pin, if the three values can name a stored build: the label is a
+/// directory name and the hash names the file and is compared against
+/// its bytes, so it has to be exactly one BLAKE3 digest in hex.
+pub fn checked_pin(label: String, url: String, blake3: String) -> Option<Pin> {
+    if label.is_empty() || label.contains('/') || label.starts_with('.') {
         return None;
     }
-    // The hash names the stored file and is compared against the bytes, so
-    // it has to be exactly one BLAKE3 digest in hex.
-    if pin.blake3.len() != 64 || !pin.blake3.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if blake3.len() != 64 || !blake3.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some(pin)
+    Some(Pin { label, url, blake3 })
 }
 
 fn env_set(name: &str) -> bool {
@@ -79,10 +79,22 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
         pin.url = url;
     }
 
+    obtain_build(&pin)
+}
+
+/// Make the build `pin` names available: fetched into the shared store if
+/// it is not there, verified against the hash before it is placed, then
+/// extracted through the ordinary package cache. Returns the extracted
+/// root and the lock that keeps it from being collected while this
+/// instance runs.
+///
+/// Shared by the GL build and by every dependency set, which differ only
+/// in when they are wanted, not in how they are obtained.
+pub fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
     let store = match std::env::var_os("ONELF_PLATFORM_STORE").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => crate::cache::base_dir()
-            .ok_or("no cache directory to store a GL build in (set HOME or XDG_CACHE_HOME)")?
+            .ok_or("no cache directory to store a build in (set HOME or XDG_CACHE_HOME)")?
             .join("platform"),
     };
     // The build is stored by its own hash, so two builds a label pins over
@@ -101,7 +113,7 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
         }
         fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let tmp = dir.join(format!(".{}.onelf.{}", pin.blake3, std::process::id()));
-        let fetched = fetch(&pin.url, &tmp).and_then(|()| verify(&tmp, &pin));
+        let fetched = fetch(&pin.url, &tmp).and_then(|()| verify(&tmp, pin));
         if let Err(why) = fetched {
             let _ = fs::remove_file(&tmp);
             return Err(why);
@@ -114,7 +126,7 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
     touch(&file);
 
     let mut pkg = crate::loader::load_from(&file)
-        .map_err(|e| format!("{}: not a usable GL build: {e}", file.display()))?;
+        .map_err(|e| format!("{}: not a usable build: {e}", file.display()))?;
     let (root, lock) = crate::cache::ensure_extracted(&mut pkg)
         .map_err(|e| format!("{}: cannot extract: {e}", file.display()))?;
     Ok((root, lock))
@@ -132,9 +144,7 @@ fn fetch(url: &str, into: &Path) -> Result<(), String> {
     if url.starts_with("https://") {
         return download(url, into);
     }
-    Err(format!(
-        "{url}: the GL build must be an https:// or file:// URL"
-    ))
+    Err(format!("{url}: a build must be an https:// or file:// URL"))
 }
 
 #[cfg(feature = "update")]

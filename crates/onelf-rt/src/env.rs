@@ -12,7 +12,7 @@
 //! invocation.
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `set_var` for a name and value that came from a file: `std` aborts on
 /// an empty name, a `=` in the name, or a NUL in either, and a stray line
@@ -46,6 +46,8 @@ pub fn setup_env(
     target_path: &str,
     farm: Option<&Path>,
     platform_root: Option<&Path>,
+    set_lib_dirs: &[PathBuf],
+    set_roots: &[PathBuf],
 ) -> String {
     let launch_dir = env::current_dir()
         .ok()
@@ -91,6 +93,13 @@ pub fn setup_env(
                 parts.push(farm.to_string_lossy().into_owned());
             }
             parts.push(lib_str);
+            // After the bundle's own directories: a set supplies what the
+            // bundle left out, and a name the bundle kept stays its own.
+            parts.extend(
+                set_lib_dirs
+                    .iter()
+                    .map(|d| d.to_string_lossy().into_owned()),
+            );
             // A fetched GL build's directories are never placed here: the
             // path reaches every process the app spawns, and a foreign
             // build's libstdc++ or zlib next to the host's libc would break
@@ -178,7 +187,7 @@ pub fn setup_env(
     // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
-    setup_xdg_data_dirs(pkg, platform_root);
+    setup_xdg_data_dirs(pkg, platform_root, set_roots);
 
     // EGL vendor discovery: merge bundled, fetched and host dirs so both
     // Mesa and proprietary drivers (NVIDIA, AMD) are visible to libglvnd.
@@ -309,10 +318,11 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
 /// so system themes and desktop integrations still work.
 /// The package's `share/` goes first, a fetched GL build's after it so
 /// the Vulkan loader finds the build's ICD files, then the host's.
-fn setup_xdg_data_dirs(pkg: &Path, platform_root: Option<&Path>) {
+fn setup_xdg_data_dirs(pkg: &Path, platform_root: Option<&Path>, set_roots: &[PathBuf]) {
     let shares: Vec<String> = [Some(pkg), platform_root]
         .into_iter()
         .flatten()
+        .chain(set_roots.iter().map(PathBuf::as_path))
         .map(|root| root.join("share"))
         .filter(|share| share.is_dir())
         .map(|share| share.to_string_lossy().into_owned())
