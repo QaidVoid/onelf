@@ -278,13 +278,40 @@ fn unclaimed(lock_path: &Path) -> bool {
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
 }
 
-/// The library directories a set root carries, in search order.
+/// Every directory in the set that holds a shared object, `lib` first.
+///
+/// A set keeps the layout the distribution used, so a library that keeps
+/// its plugins in a directory of its own still has them there, and the
+/// absolute run path it was built with named the host. Putting each such
+/// directory on this launch's library path is what the packer does for a
+/// bundle's own tree, and it is the only thing that reaches a plugin the
+/// loader is asked for by bare soname.
 pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
-    onelf_format::resolve::GL_BUILD_LIB_DIRS
+    let mut dirs: Vec<PathBuf> = onelf_format::resolve::GL_BUILD_LIB_DIRS
         .iter()
         .map(|d| root.join(d))
         .filter(|d| d.is_dir())
-        .collect()
+        .collect();
+    let mut queue: Vec<PathBuf> = dirs.clone();
+    while let Some(dir) = queue.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let holds_objects = fs::read_dir(&path).is_ok_and(|mut e| {
+                e.any(|f| f.is_ok_and(|f| f.file_name().to_string_lossy().contains(".so")))
+            });
+            if holds_objects && !dirs.contains(&path) {
+                dirs.push(path.clone());
+            }
+            queue.push(path);
+        }
+    }
+    dirs
 }
 
 #[cfg(test)]
