@@ -788,7 +788,8 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<Option<PathBu
     if fs::symlink_metadata(&dest).is_ok() {
         fs::remove_file(&dest)?;
     }
-    fs::copy(&src, &dest)?;
+    fs::copy(&src, &dest)
+        .map_err(|e| io::Error::new(e.kind(), format!("copying {rel} from the sysroot: {e}")))?;
     super::normalize_mtime(&dest);
     Ok(Some(dest_rel))
 }

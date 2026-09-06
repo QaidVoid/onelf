@@ -1,7 +1,9 @@
 //! Materializing a sysroot from a rootfs archive.
 //!
 //! No privileges are needed: ownership is not restored, and setuid and
-//! setgid bits are dropped, since the bundle never needs either. Every
+//! setgid bits are dropped, since the bundle never needs either. Such a
+//! file also gains owner read, because a mode like `---s--x---` leaves
+//! the packer unable to read the sysroot it just wrote. Every
 //! entry path is checked before anything is written, so an archive cannot
 //! reach outside the directory it is unpacked into.
 //!
@@ -60,13 +62,11 @@ pub fn materialize(archive: &Path, into: &Path) -> io::Result<()> {
         };
         let mode = md.permissions().mode();
         if md.file_type().is_dir() && mode & 0o300 != 0o300 {
+            std::fs::set_permissions(&unpacked, std::fs::Permissions::from_mode(mode | 0o300))?;
             deferred.push((unpacked, mode & 0o7777));
-            std::fs::set_permissions(
-                &into.join(&path),
-                std::fs::Permissions::from_mode(mode | 0o300),
-            )?;
         } else if md.file_type().is_file() && mode & 0o6000 != 0 {
-            std::fs::set_permissions(&unpacked, std::fs::Permissions::from_mode(mode & 0o777))?;
+            let stripped = (mode & 0o777) | 0o400;
+            std::fs::set_permissions(&unpacked, std::fs::Permissions::from_mode(stripped))?;
         }
     }
     // Deepest first, so a read-only parent is closed after its children.
@@ -132,6 +132,28 @@ mod tests {
             builder.append_link(&mut header, path, target).unwrap();
         }
         builder.into_inner().unwrap()
+    }
+
+    /// D-Bus ships its launch helper `---s--x---`. Dropping the setuid
+    /// bit alone would leave a file the packer cannot read out of the
+    /// sysroot it just wrote, so owner read comes with it.
+    #[test]
+    fn a_setuid_only_binary_is_left_readable() {
+        let root = temp_root("tarsuid");
+        let bytes = archive_with(
+            &[("usr/lib/dbus-daemon-launch-helper", b"elf", 0o4110)],
+            &[],
+        );
+        let archive = root.join("root.tar");
+        std::fs::write(&archive, &bytes).unwrap();
+        let into = root.join("sysroot");
+        materialize(&archive, &into).unwrap();
+
+        let helper = into.join("usr/lib/dbus-daemon-launch-helper");
+        assert_eq!(std::fs::read(&helper).unwrap(), b"elf");
+        let mode = std::fs::metadata(&helper).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o510, "setuid dropped, owner read added");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A distribution ships directories nothing may write to, and their
