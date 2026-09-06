@@ -297,5 +297,30 @@ pub fn build_exec_command(
 
 /// Parse the bundled interpreter relative path from `.onelf/interp` metadata.
 pub fn parse_bundled_interp_rel(interp_data: &[u8]) -> Option<&str> {
-    std::str::from_utf8(interp_data).ok()?.lines().next()
+    let line = std::str::from_utf8(interp_data).ok()?.lines().next()?;
+    // Joined onto the package root, so an absolute line would replace the
+    // root and a climbing one would leave it. The packer writes neither.
+    let inside = Path::new(line)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (inside && !line.is_empty()).then_some(line)
+}
+
+#[cfg(test)]
+mod interp_file_tests {
+    use super::parse_bundled_interp_rel;
+
+    #[test]
+    fn the_interp_line_stays_inside_the_package() {
+        assert_eq!(
+            parse_bundled_interp_rel(b"lib/ld-linux-x86-64.so.2\n"),
+            Some("lib/ld-linux-x86-64.so.2")
+        );
+        assert_eq!(
+            parse_bundled_interp_rel(b"/lib64/ld-linux-x86-64.so.2\n"),
+            None
+        );
+        assert_eq!(parse_bundled_interp_rel(b"../../lib/ld.so\n"), None);
+        assert_eq!(parse_bundled_interp_rel(b"\n"), None);
+    }
 }
