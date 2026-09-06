@@ -319,6 +319,9 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             None => report.absent += 1,
         }
     }
+    let caches = copy_generated_caches(root, appdir)?;
+    report.copied += caches.len();
+    generated.extend(caches);
     record_generated(appdir, generated)?;
     let record = appdir.join(PROVENANCE_FILE);
     if let Some(parent) = record.parent() {
@@ -407,6 +410,9 @@ const SET_SKIP_DIRS: &[&str] = &[
     "usr/share/gtk-doc/",
     "usr/lib/pkgconfig/",
     "usr/lib/cmake/",
+    // Introspection XML, read by binding generators at build time. What
+    // a running program reads is the compiled typelib beside it.
+    "usr/share/gir-1.0/",
 ];
 
 /// Materialize a shared set's tree at `tree` from the sysroot at `root`:
@@ -414,8 +420,19 @@ const SET_SKIP_DIRS: &[&str] = &[
 /// development and documentation directories. A set carries whatever its
 /// packages need at runtime, plugins and data included, since nothing
 /// else supplies those for it.
-pub fn populate_set(tree: &Path, root: &Path, packages: &[String]) -> io::Result<GlSelection> {
-    populate_closure(tree, root, packages, |rel| {
+///
+/// The platform line applies here as it does to a bundle: a package
+/// whose top-level library the host provides is the host's, and so is
+/// whatever only it depended on. Without that a toolkit set drags in the
+/// GPU stack and the compiler behind it, which is most of its size and
+/// none of its purpose.
+pub fn populate_set(
+    tree: &Path,
+    root: &Path,
+    packages: &[String],
+    platform: &PlatformLine,
+) -> io::Result<GlSelection> {
+    populate_closure(tree, root, packages, Some(platform), |rel| {
         !SET_SKIP_DIRS.iter().any(|d| rel.starts_with(d))
     })
 }
@@ -423,7 +440,7 @@ pub fn populate_set(tree: &Path, root: &Path, packages: &[String]) -> io::Result
 /// Materialize a GL build tree at `tree` from the sysroot at `root`:
 /// the closure of `packages`, the first of which anchors it.
 pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<GlSelection> {
-    populate_closure(tree, root, packages, |rel| {
+    populate_closure(tree, root, packages, None, |rel| {
         let is_lib = rel.starts_with("usr/lib/") || rel.starts_with("lib/");
         let is_object = Path::new(rel)
             .file_name()
@@ -439,6 +456,7 @@ fn populate_closure(
     tree: &Path,
     root: &Path,
     packages: &[String],
+    platform: Option<&PlatformLine>,
     wanted: impl Fn(&str) -> bool,
 ) -> io::Result<GlSelection> {
     let Some((first, rest)) = packages.split_first() else {
@@ -456,7 +474,28 @@ fn populate_closure(
             ));
         }
     }
-    let closure = db.closure(first, rest);
+    let host_packages: std::collections::BTreeSet<String> = match platform {
+        Some(platform) => db
+            .closure(first, rest)
+            .packages
+            .iter()
+            .filter(|n| !packages.contains(n))
+            .filter_map(|n| db.package(n))
+            .filter(|p| {
+                p.files.iter().any(|f| {
+                    let Some((dir, name)) = f.rsplit_once('/') else {
+                        return false;
+                    };
+                    matches!(dir, "usr/lib" | "usr/lib64" | "lib" | "lib64")
+                        && name.contains(".so")
+                        && platform.matches(f)
+                })
+            })
+            .map(|p| p.name.clone())
+            .collect(),
+        None => std::collections::BTreeSet::new(),
+    };
+    let closure = db.closure_excluding(first, rest, &host_packages);
     let glibc: HashSet<&str> = db
         .package("glibc")
         .map(|p| p.files.iter().map(String::as_str).collect())
@@ -468,6 +507,7 @@ fn populate_closure(
             copied += 1;
         }
     }
+    copied += copy_generated_caches(root, tree)?.len();
     Ok(GlSelection {
         packages: closure
             .packages
@@ -477,6 +517,61 @@ fn populate_closure(
             .collect(),
         copied,
     })
+}
+
+/// Caches a distribution generates after installing a package rather
+/// than shipping inside it. No package owns them, so a closure never
+/// names them, and the library that reads each one treats a missing
+/// cache as an empty index rather than an error: a GTK application whose
+/// compiled schema cache is absent exits at startup saying its schema is
+/// not installed, and one whose icon cache is absent draws no icons.
+const GENERATED_CACHES: &[&str] = &[
+    "gschemas.compiled",
+    "icon-theme.cache",
+    "mime.cache",
+    "mimeinfo.cache",
+    "loaders.cache",
+    "immodules.cache",
+    "giomodule.cache",
+];
+
+/// Copy every generated cache the sysroot holds for a directory the tree
+/// already carries, and return what was copied, relative to the tree.
+///
+/// Tied to the directories the closure produced: a cache is an index of
+/// what sits beside it, so one arrives only where its subject already
+/// did. The sysroot's own copy is used rather than a freshly built one,
+/// since building it would mean running a tool from the packer's machine
+/// over the sysroot's data.
+fn copy_generated_caches(root: &Path, tree: &Path) -> io::Result<Vec<String>> {
+    let mut copied = Vec::new();
+    for entry in jwalk::WalkDir::new(tree).skip_hidden(false).sort(true) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(rel) = dir.strip_prefix(tree) else {
+            continue;
+        };
+        for name in GENERATED_CACHES {
+            let dest = dir.join(name);
+            if dest.exists() {
+                continue;
+            }
+            // The AppDir flattens `usr/`, so a tree directory answers to
+            // either shape in the sysroot.
+            let src = ["usr", ""]
+                .iter()
+                .map(|prefix| root.join(prefix).join(rel).join(name))
+                .find(|p| p.is_file());
+            let Some(src) = src else { continue };
+            fs::copy(&src, &dest)?;
+            super::normalize_mtime(&dest);
+            copied.push(rel.join(name).to_string_lossy().into_owned());
+        }
+    }
+    Ok(copied)
 }
 
 /// Where a sysroot build lists what it put into the AppDir, relative to

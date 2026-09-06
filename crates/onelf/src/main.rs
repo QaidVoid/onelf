@@ -549,6 +549,11 @@ enum SysrootAction {
         /// Packages whose closure the set holds (qt6-base, gtk4, ...)
         #[arg(long)]
         package: Vec<String>,
+        /// File of soname prefixes the host provides, one per line.
+        /// Without one the GPU driver families are the line, so the
+        /// stack behind them stays with the host.
+        #[arg(long)]
+        platform_line: Option<PathBuf>,
     },
 }
 
@@ -933,13 +938,23 @@ fn main() {
                 name,
                 sysroot,
                 package,
+                platform_line,
             } => {
-                let built = match &sysroot {
+                let line = match &platform_line {
+                    Some(p) => onelf_sysroot::PlatformLine::load(p),
+                    None => Ok(onelf_sysroot::PlatformLine::from_prefixes(
+                        onelf_format::drivers::DRIVER_FAMILIES
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    )),
+                };
+                let built = line.and_then(|line| match &sysroot {
                     Some(root) => std::fs::create_dir_all(&dir)
-                        .and_then(|()| bundle::sysroot::populate_set(&dir, root, &package))
+                        .and_then(|()| bundle::sysroot::populate_set(&dir, root, &package, &line))
                         .map(Some),
                     None => Ok(None),
-                };
+                });
                 built.and_then(|selection| {
                     if let Some(selection) = &selection {
                         eprintln!(
