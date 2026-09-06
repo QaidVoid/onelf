@@ -196,6 +196,48 @@ package: `bundle-libs` writes it to `.onelf/provenance.toml` under the
 from the same archive and recipe produce the same bytes, so the list can
 be checked against the archive later.
 
+## Sharing a dependency set
+
+A toolkit the size of Qt or GTK is most of a bundle, and every package
+carries its own copy. A shared set is that copy made once: the closure
+of the named sysroot packages, packed as a build and fetched by any
+package that pins it, so ten Qt applications share one download and one
+extraction on a machine. Unlike the GL build it is never conditional on
+the host: the host's toolkit is not consulted, because no loader can
+tell whether it is the right version, and the application behaves the
+same everywhere.
+
+Build the set from the sysroot the application is built on, so the two
+agree on every version:
+
+```bash
+onelf sysroot pack-set ./qt-tree -o qt-6.7.onelf --name qt --sysroot ../sysroot \
+  --package qt6-base --package qt6-declarative
+Built set qt from ../sysroot: 3140 files from 41 packages
+blake3 = "3f1c...a9e2"
+```
+
+The set holds everything those packages need at runtime, plugins and
+data included, and leaves out glibc and the development and
+documentation directories. Then name it in the recipe:
+
+```toml
+[sysroot.sets.qt]
+packages = ["qt6-base", "qt6-declarative"]
+url = "https://mirror.example.org/qt-6.7.onelf"
+blake3 = "3f1c...a9e2"
+```
+
+The build leaves the closure of those packages out of the bundle, along
+with whatever only they depended on, reports what it left to the set,
+and accepts what the set provides when it verifies the bundle. The
+package records each set's URL and hash in `.onelf/sets`, which `onelf
+info` prints. The hash is the trust story, as for the GL build.
+
+The runtime side, fetching a set into the shared store at launch and
+indexing it ahead of the bundle, is not in place yet. A package pinning
+a set builds and verifies today, and runs once that lands.
+
 ## Pinning a GL build for hosts without one
 
 The platform line says the host provides the GPU stack, so the bundle

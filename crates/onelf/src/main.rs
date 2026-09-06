@@ -531,6 +531,25 @@ enum SysrootAction {
         #[arg(long, value_name = "NAME", requires = "sysroot")]
         package: Vec<String>,
     },
+    /// Pack a shared dependency set for packages to fetch instead of
+    /// bundling it, and print the hash to pin
+    PackSet {
+        /// A tree holding the set; built here from the sysroot when
+        /// --package is given
+        dir: PathBuf,
+        /// Output file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// The set's name, as the recipe refers to it
+        #[arg(long)]
+        name: String,
+        /// A materialized sysroot to build the tree from
+        #[arg(long)]
+        sysroot: Option<PathBuf>,
+        /// Packages whose closure the set holds (qt6-base, gtk4, ...)
+        #[arg(long)]
+        package: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -834,6 +853,7 @@ fn main() {
                         keep,
                         platform_url: None,
                         platform_hash: None,
+                        sets: Vec::new(),
                     })
                 }
                 None => None,
@@ -907,6 +927,34 @@ fn main() {
                     sysroot_cmd::pack_gl(&dir, &output, RUNTIME_BINARY_SLIM)
                 })
             }
+            SysrootAction::PackSet {
+                dir,
+                output,
+                name,
+                sysroot,
+                package,
+            } => {
+                let built = match &sysroot {
+                    Some(root) => std::fs::create_dir_all(&dir)
+                        .and_then(|()| bundle::sysroot::populate_set(&dir, root, &package))
+                        .map(Some),
+                    None => Ok(None),
+                };
+                built.and_then(|selection| {
+                    if let Some(selection) = &selection {
+                        eprintln!(
+                            "Built set {name} from {}: {} files from {} packages",
+                            sysroot
+                                .as_deref()
+                                .unwrap_or(std::path::Path::new("?"))
+                                .display(),
+                            selection.copied,
+                            selection.packages.len(),
+                        );
+                    }
+                    sysroot_cmd::pack_set(&dir, &output, &name, RUNTIME_BINARY_SLIM)
+                })
+            }
         },
     };
 
@@ -967,15 +1015,29 @@ fn sysroot_from_recipe(
         keep: sr.keep.as_deref().map(resolve),
         platform_url: sr.platform_url.clone(),
         platform_hash: sr.platform_hash.clone(),
+        sets: sr
+            .sets
+            .iter()
+            .map(|(name, set)| bundle::sysroot::SharedSet {
+                name: name.clone(),
+                packages: set.packages.clone(),
+                url: set.url.clone(),
+                blake3: set.blake3.clone(),
+            })
+            .collect(),
     })
 }
 
 /// Whether the AppDir pins a GL build over HTTPS, which only the
 /// update-capable runtime can fetch.
 fn pins_https_build(dir: &std::path::Path) -> bool {
-    std::fs::read_to_string(dir.join(bundle::sysroot::PLATFORM_FILE))
-        .map(|t| t.lines().any(|l| l.starts_with("url = \"https://")))
-        .unwrap_or(false)
+    [bundle::sysroot::PLATFORM_FILE, bundle::sysroot::SETS_FILE]
+        .iter()
+        .any(|f| {
+            std::fs::read_to_string(dir.join(f))
+                .map(|t| t.lines().any(|l| l.starts_with("url = \"https://")))
+                .unwrap_or(false)
+        })
 }
 
 fn run_build(

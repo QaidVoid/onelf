@@ -417,11 +417,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     }
 
     let mut host_files: HashSet<String> = HashSet::new();
+    let mut set_sonames: HashSet<String> = HashSet::new();
     let sysroot_platform = match &opts.sysroot {
         Some(sr) => {
             let (report, platform) = sysroot::populate(&opts.directory, sr)?;
             sysroot::print_report(sr, &report);
             host_files = report.host_files;
+            set_sonames = report.set_sonames;
             Some(platform)
         }
         None => {
@@ -429,6 +431,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             // bundle this run is about to change.
             let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
             let _ = fs::remove_file(opts.directory.join(sysroot::PLATFORM_FILE));
+            let _ = fs::remove_file(opts.directory.join(sysroot::SETS_FILE));
             None
         }
     };
@@ -803,7 +806,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 ),
             }
             // After injection, so the audit sees the final DT_NEEDED set.
-            verify_needs(opts, sysroot_platform.as_ref())?;
+            verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
         }
         return Ok(());
     }
@@ -1356,7 +1359,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             ),
         }
         // After injection, so the audit sees the final DT_NEEDED set.
-        verify_needs(opts, sysroot_platform.as_ref())?;
+        verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
     }
 
     Ok(())
@@ -1474,15 +1477,19 @@ pub(crate) fn remove_dangling_links_beside(object: &Path) {
 /// or platform-line mistake the publisher can fix, and the bundle fails.
 /// From a host scan the universe was a guess, and the finding stays a
 /// warning.
-fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Result<()> {
+fn verify_needs(
+    opts: &BundleOptions,
+    platform: Option<&PlatformLine>,
+    set_sonames: &HashSet<String>,
+) -> io::Result<()> {
     let audit = || {
         let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
-        if let Some(platform) = platform {
-            for (_, libs) in &mut findings {
-                libs.retain(|s| !platform.matches_soname(s));
-            }
-            findings.retain(|(_, libs)| !libs.is_empty());
+        for (_, libs) in &mut findings {
+            libs.retain(|s| {
+                !platform.is_some_and(|p| p.matches_soname(s)) && !set_sonames.contains(s)
+            });
         }
+        findings.retain(|(_, libs)| !libs.is_empty());
         findings
     };
     let mut findings = audit();
@@ -1518,7 +1525,7 @@ fn verify_needs(opts: &BundleOptions, platform: Option<&PlatformLine>) -> io::Re
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "{} needs {}, which is neither in the sysroot closure nor on the platform line{more}",
+                "{} needs {}, which is neither in the sysroot closure, on the platform line, nor in a shared set{more}",
                 object, libs[0]
             ),
         ));

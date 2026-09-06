@@ -6547,6 +6547,107 @@ fn a_recipe_sysroot_archive_may_be_a_url() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A shared set named in the recipe stays out of the bundle: the closure
+/// of its packages is left to the build the recipe pins, the verifier
+/// accepts what the set provides, and the package records the pin for
+/// the runtime. `pack-set` builds that set from the same sysroot.
+#[test]
+fn a_shared_set_is_left_out_and_pinned() {
+    let td = workdir("sharedset");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    // The set: libfixture and what it depends on, packed from the sysroot.
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        set_tree.join("lib/libfixture.so.1").is_file(),
+        "the set holds the library"
+    );
+    assert!(
+        set_tree.join("share/fixture/data.txt").is_file(),
+        "and the package's data"
+    );
+    assert!(
+        !set_tree.join("share/doc").exists(),
+        "but not its documentation"
+    );
+    assert!(!set_tree.join("lib/libc.so.6").exists(), "and never glibc");
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sets = format!(
+        "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+        set_pkg.display()
+    );
+    sysroot_recipe(&dir, &fixture, &sets);
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Shared set: fixture leaves out"),
+        "{stderr}"
+    );
+    assert!(dir.join("bin/app").is_file());
+    assert!(
+        !dir.join("lib/libfixture.so.1").exists(),
+        "the set's library stays out"
+    );
+    assert!(!dir.join("lib/fixture").exists(), "and its plugins");
+    assert!(
+        dir.join("lib/libc.so.6").is_file(),
+        "glibc is still bundled"
+    );
+
+    let pkg = dir.join("app.onelf");
+    let o = run_onelf(&["info", pkg.to_str().unwrap()], None);
+    let info = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        info.contains("Shared sets:") && info.contains("[fixture]"),
+        "{info}"
+    );
+    assert!(info.contains(&hash), "the pin is recorded:\n{info}");
+
+    // A set naming a package the sysroot lacks is an error, not a silence.
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        "\n[sysroot.sets.ghost]\npackages = [\"no-such-package\"]\nurl = \"https://example.invalid/x.onelf\"\nblake3 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    );
+    let out = onelf_build(&dir);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no-such-package"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.

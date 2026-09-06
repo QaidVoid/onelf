@@ -120,6 +120,7 @@ Obtain and inspect pinned sysroots. See [Bundling from a Sysroot](../guide/sysro
 onelf sysroot fetch SOURCE DIR [--hash BLAKE3]
 onelf sysroot info DIR
 onelf sysroot pack-gl DIR -o FILE [--sysroot SYSROOT --package NAME...]
+onelf sysroot pack-set DIR -o FILE --name NAME [--sysroot SYSROOT --package NAME...]
 ```
 
 | Command | Description |
@@ -127,6 +128,7 @@ onelf sysroot pack-gl DIR -o FILE [--sysroot SYSROOT --package NAME...]
 | `fetch SOURCE DIR` | Materialize a `.tar` or `.tar.zst` rootfs from a local path or an `https://` URL into `DIR`. With `--hash`, an archive whose BLAKE3 does not match is not unpacked |
 | `info DIR` | Print the package count, file count and glibc version of a materialized sysroot |
 | `pack-gl DIR -o FILE` | Pack a GL build for hosts without one and print the BLAKE3 hash to pin in `platform.toml`. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure: shared objects and driver description directories, glibc left out. Otherwise `DIR` is a tree you built. Either way it is verified to be self-contained |
+| `pack-set DIR -o FILE --name NAME` | Pack a shared dependency set and print the BLAKE3 hash to pin in a recipe's `[sysroot.sets.<name>]`. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure, everything but glibc and the development and documentation directories; otherwise `DIR` is a tree you built. Verified to be self-contained like a GL build |
 
 ## `onelf info`
 

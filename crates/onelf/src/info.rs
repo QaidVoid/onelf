@@ -113,6 +113,14 @@ pub fn info(path: &Path) -> io::Result<()> {
             println!("    {line}");
         }
     }
+    if let Some(text) =
+        read_metadata_string(path, &footer, &manifest, crate::bundle::sysroot::SETS_FILE)?
+    {
+        println!("  Shared sets:");
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            println!("    {line}");
+        }
+    }
     println!();
 
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {

@@ -43,6 +43,19 @@ pub struct SysrootOptions {
     pub platform_url: Option<String>,
     /// The GL build's BLAKE3 hash, overriding the sysroot's own pin.
     pub platform_hash: Option<String>,
+    /// Dependency sets a pinned build supplies instead of the bundle.
+    pub sets: Vec<SharedSet>,
+}
+
+/// A dependency set shared between packages: the closure of `packages`
+/// stays out of the bundle, and the build at `url`, verified by `blake3`,
+/// is what supplies it at launch.
+#[derive(Debug, Clone)]
+pub struct SharedSet {
+    pub name: String,
+    pub packages: Vec<String>,
+    pub url: String,
+    pub blake3: String,
 }
 
 /// What populating did, for the report.
@@ -65,6 +78,10 @@ pub struct SysrootReport {
     pub host_files: HashSet<String>,
     /// The GL build the package pins, when the sysroot or recipe names one.
     pub pin: Option<Pin>,
+    /// Each shared set with the packages of its closure left to it.
+    pub sets: Vec<(String, Vec<String>)>,
+    /// Sonames a shared set provides, which the verifier accepts.
+    pub set_sonames: HashSet<String>,
 }
 
 /// Copy the closure of the entrypoint's package into `appdir`. Returns
@@ -133,12 +150,86 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         })
         .map(|p| p.name.clone())
         .collect();
-    let host_files: HashSet<String> = host_packages
+    // A shared set's closure is left out the same way: its packages and
+    // what only they depended on come from the set's build at launch.
+    let mut set_packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut set_report: Vec<(String, Vec<String>)> = Vec::new();
+    for set in &opts.sets {
+        if set.name.is_empty()
+            || !set
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "set {}: a set name is letters, digits, - and _ only",
+                    set.name
+                ),
+            ));
+        }
+        let Some((first, rest)) = set.packages.split_first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("set {}: names no packages", set.name),
+            ));
+        };
+        for name in &set.packages {
+            if db.satisfier(name).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "set {}: no package in the sysroot provides {name}",
+                        set.name
+                    ),
+                ));
+            }
+        }
+        if set.packages.iter().any(|p| p == &owner.name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "set {}: names the application's own package {}",
+                    set.name, owner.name
+                ),
+            ));
+        }
+        platform::check_url(&set.url)
+            .and_then(|()| platform::check_hash(&set.blake3))
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("set {}: {e}", set.name),
+                )
+            })?;
+        let names: Vec<String> = db
+            .closure(first, rest)
+            .packages
+            .into_iter()
+            .filter(|n| n != "glibc" && n != &owner.name)
+            .collect();
+        set_packages.extend(names.iter().cloned());
+        set_report.push((set.name.clone(), names));
+    }
+    let left_out: std::collections::BTreeSet<String> = host_packages
+        .iter()
+        .chain(set_packages.iter())
+        .cloned()
+        .collect();
+    let host_files: HashSet<String> = left_out
         .iter()
         .filter_map(|n| db.package(n))
         .flat_map(|p| p.files.iter().cloned())
         .collect();
-    let closure = db.closure_excluding(&owner.name, &opts.optional, &host_packages);
+    let set_sonames: HashSet<String> = set_packages
+        .iter()
+        .filter_map(|n| db.package(n))
+        .flat_map(|p| p.files.iter())
+        .filter(|f| is_top_level_object(f))
+        .filter_map(|f| f.rsplit('/').next().map(String::from))
+        .collect();
+    let closure = db.closure_excluding(&owner.name, &opts.optional, &left_out);
     let files = db.files_of(&closure);
     let policy = opts.policy.as_deref().map(Policy::load).transpose()?;
     let trace = opts.trace.as_deref().map(Trace::load).transpose()?;
@@ -215,6 +306,8 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         removed_trace: pruned.removed_trace,
         host_packages: host_packages.into_iter().collect(),
         host_files,
+        sets: set_report,
+        set_sonames,
         ..Default::default()
     };
     for rel in &pruned.kept {
@@ -245,7 +338,44 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             let _ = fs::remove_file(&pin_path);
         }
     }
+    let sets_path = appdir.join(SETS_FILE);
+    if opts.sets.is_empty() {
+        let _ = fs::remove_file(&sets_path);
+    } else {
+        fs::write(&sets_path, render_sets(&opts.sets, &report.sets))?;
+        super::normalize_mtime(&sets_path);
+    }
     Ok((report, platform))
+}
+
+/// Where the package records the shared sets it needs at launch,
+/// relative to the AppDir: one table per set with the build's URL and
+/// hash, and the packages left to it.
+pub const SETS_FILE: &str = ".onelf/sets";
+
+/// The sets record as TOML.
+pub fn render_sets(sets: &[SharedSet], closures: &[(String, Vec<String>)]) -> String {
+    let mut out = String::new();
+    for set in sets {
+        let packages = closures
+            .iter()
+            .find(|(n, _)| n == &set.name)
+            .map(|(_, p)| p.as_slice())
+            .unwrap_or(&[]);
+        // The name is a bare key: populate() refused anything else.
+        out.push_str(&format!(
+            "[{}]\nurl = {}\nblake3 = {}\npackages = [{}]\n\n",
+            set.name,
+            toml_string(&set.url),
+            toml_string(&set.blake3),
+            packages
+                .iter()
+                .map(|p| toml_string(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
 }
 
 /// What a GL build takes from a sysroot: the closure of the named
@@ -266,9 +396,51 @@ const GL_SHARE_DIRS: &[&str] = &[
     "usr/share/libdrm/",
 ];
 
+/// Directories under `usr/share` that serve nothing at runtime and are
+/// left out of a shared set.
+const SET_SKIP_DIRS: &[&str] = &[
+    "usr/include/",
+    "usr/share/man/",
+    "usr/share/doc/",
+    "usr/share/info/",
+    "usr/share/licenses/",
+    "usr/share/gtk-doc/",
+    "usr/lib/pkgconfig/",
+    "usr/lib/cmake/",
+];
+
+/// Materialize a shared set's tree at `tree` from the sysroot at `root`:
+/// every file of the closure of `packages` apart from glibc's and the
+/// development and documentation directories. A set carries whatever its
+/// packages need at runtime, plugins and data included, since nothing
+/// else supplies those for it.
+pub fn populate_set(tree: &Path, root: &Path, packages: &[String]) -> io::Result<GlSelection> {
+    populate_closure(tree, root, packages, |rel| {
+        !SET_SKIP_DIRS.iter().any(|d| rel.starts_with(d))
+    })
+}
+
 /// Materialize a GL build tree at `tree` from the sysroot at `root`:
 /// the closure of `packages`, the first of which anchors it.
 pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<GlSelection> {
+    populate_closure(tree, root, packages, |rel| {
+        let is_lib = rel.starts_with("usr/lib/") || rel.starts_with("lib/");
+        let is_object = Path::new(rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".so"));
+        (is_lib && is_object) || GL_SHARE_DIRS.iter().any(|d| rel.starts_with(d))
+    })
+}
+
+/// The closure of `packages` copied into `tree`, glibc's files always left
+/// out and `wanted` deciding the rest.
+fn populate_closure(
+    tree: &Path,
+    root: &Path,
+    packages: &[String],
+    wanted: impl Fn(&str) -> bool,
+) -> io::Result<GlSelection> {
     let Some((first, rest)) = packages.split_first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -289,20 +461,10 @@ pub fn populate_gl(tree: &Path, root: &Path, packages: &[String]) -> io::Result<
         .package("glibc")
         .map(|p| p.files.iter().map(String::as_str).collect())
         .unwrap_or_default();
-    let wanted = |rel: &str| -> bool {
-        if glibc.contains(rel) {
-            return false;
-        }
-        let is_lib = rel.starts_with("usr/lib/") || rel.starts_with("lib/");
-        let is_object = Path::new(rel)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(".so"));
-        (is_lib && is_object) || GL_SHARE_DIRS.iter().any(|d| rel.starts_with(d))
-    };
     let mut copied = 0;
     for rel in db.files_of(&closure) {
-        if wanted(&rel) && copy_entry(root, &rel, tree)?.is_some() {
+        if !glibc.contains(rel.as_str()) && wanted(&rel) && copy_entry(root, &rel, tree)?.is_some()
+        {
             copied += 1;
         }
     }
@@ -654,6 +816,15 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
             pin.label,
             pin.url,
             &pin.blake3[..16]
+        );
+    }
+    for (name, packages) in &report.sets {
+        eprintln!(
+            "  {} {} leaves out {} package(s): {}",
+            color::bold("Shared set:"),
+            name,
+            packages.len(),
+            packages.join(", ")
         );
     }
     for (dep, by) in &report.unsatisfied {

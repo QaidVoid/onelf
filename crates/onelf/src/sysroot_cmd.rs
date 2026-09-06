@@ -93,6 +93,9 @@ pub fn info(dir: &Path) -> io::Result<()> {
 /// runtime never runs it.
 const GL_ENTRYPOINT: &str = "bin/onelf-gl";
 
+/// The entrypoint a shared set carries, for the same reason.
+const SET_ENTRYPOINT: &str = "bin/onelf-set";
+
 /// Pack the GL tree at `dir` into `output` and print the hash to pin.
 ///
 /// The tree has to be self-contained apart from glibc, which the package
@@ -100,14 +103,44 @@ const GL_ENTRYPOINT: &str = "bin/onelf-gl";
 /// Anything else it needs and does not carry is an error here rather
 /// than a silent failure on a host with nothing to fall back on.
 pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
-    let entry = dir.join(GL_ENTRYPOINT);
+    pack_tree(dir, output, runtime, GL_ENTRYPOINT, "onelf-gl")
+}
+
+/// Pack the shared set tree at `dir` into `output` under `name` and print
+/// the hash to pin. The same rules as a GL build: glibc stays out, and
+/// anything the set needs beyond glibc and the driver families has to be
+/// inside it.
+pub fn pack_set(dir: &Path, output: &Path, name: &str, runtime: &[u8]) -> io::Result<()> {
+    if name.is_empty() || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a set name is a non-empty name without slashes",
+        ));
+    }
+    pack_tree(
+        dir,
+        output,
+        runtime,
+        SET_ENTRYPOINT,
+        &format!("onelf-set-{name}"),
+    )
+}
+
+fn pack_tree(
+    dir: &Path,
+    output: &Path,
+    runtime: &[u8],
+    entrypoint: &str,
+    name: &str,
+) -> io::Result<()> {
+    let entry = dir.join(entrypoint);
     if !entry.exists() {
         if let Some(parent) = entry.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(
             &entry,
-            "#!/bin/sh\necho 'onelf GL build; not meant to be run'\n",
+            "#!/bin/sh\necho 'onelf dependency build; not meant to be run'\n",
         )?;
         std::fs::set_permissions(
             &entry,
@@ -125,7 +158,7 @@ pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "lib/{name}: a GL build takes glibc from the package that uses it; leave the glibc package's files out"
+                "lib/{name}: a build takes glibc from the package that uses it; leave the glibc package's files out"
             ),
         ));
     }
@@ -163,8 +196,8 @@ pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
         &PackOptions {
             directory: dir.to_path_buf(),
             output: output.to_path_buf(),
-            command: GL_ENTRYPOINT.to_string(),
-            name: Some("onelf-gl".to_string()),
+            command: entrypoint.to_string(),
+            name: Some(name.to_string()),
             entrypoints: Vec::new(),
             default_entrypoint: None,
             lib_dirs: vec!["auto".to_string()],

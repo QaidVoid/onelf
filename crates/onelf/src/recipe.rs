@@ -215,6 +215,21 @@ pub struct Sysroot {
     pub platform_url: Option<String>,
     /// BLAKE3 hash of that build, overriding the sysroot's.
     pub platform_hash: Option<String>,
+    /// Dependency sets shared between packages: sysroot packages whose
+    /// closure the bundle leaves out and a pinned build supplies.
+    #[serde(default)]
+    pub sets: BTreeMap<String, SharedSet>,
+}
+
+/// One shared dependency set: the sysroot packages it holds, made into a
+/// build with `onelf sysroot pack-set`, and where that build is fetched
+/// from, pinned by hash.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SharedSet {
+    pub packages: Vec<String>,
+    pub url: String,
+    pub blake3: String,
 }
 
 #[derive(Debug, Deserialize)]

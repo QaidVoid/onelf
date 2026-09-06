@@ -161,6 +161,19 @@ platform-hash = "3f1c...a9e2"         # Option<String>, its BLAKE3 hash; overrid
 `etc/onelf/platform.toml` names, field by field. A URL is `https://` or
 `file://`. See [Pinning a GL build](../guide/sysroot#pinning-a-gl-build-for-hosts-without-one).
 
+### `[sysroot.sets.<name>]`
+
+```toml
+[sysroot.sets.qt]
+packages = ["qt6-base", "qt6-declarative"]   # Vec<String>, sysroot packages whose closure the set holds
+url = "https://mirror.example.org/qt-6.7.onelf"  # String, https:// or file://
+blake3 = "3f1c...a9e2"                       # String, the set's BLAKE3
+```
+
+A dependency set shared between packages. The closure of `packages` is
+left out of the bundle and expected from the build at `url`, made with
+`onelf sysroot pack-set`. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set).
+
 ## `[env]`
 
 ```toml
