@@ -161,8 +161,19 @@ fn mount(file: &Path, hash: &str) -> Result<Obtained, String> {
     if served(&mountpoint) {
         return Ok(joined(lock));
     }
+    // Only the helper will do. The other mount path unshares a mount
+    // namespace, and a mount made there is invisible outside it: the
+    // application is a different process, and a second package could
+    // never join it. A namespace mount would also have to be made before
+    // the mode is chosen, putting every launch with a set into a user
+    // namespace, which is exactly what a `needs-setuid` package and a
+    // rootless podman or distrobox host ask the runtime not to do.
     if !crate::fuse::mount::fusermount3_available() {
-        return Err("fusermount3 is not available".into());
+        return Err(
+            "a shared mount needs fusermount3, which is not on PATH (install fuse3, \
+             or set ONELF_SET_MODE=extract to stop asking)"
+                .into(),
+        );
     }
 
     // One launch mounts, the rest wait and join what it made.

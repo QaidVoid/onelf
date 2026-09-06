@@ -1412,6 +1412,17 @@ fn bundle_needs_host_libs(files: &[CollectedFile]) -> bool {
     use onelf_format::drivers::DRIVER_FAMILIES;
 
     for file in files {
+        // A pinned GL build or a shared set says outright that something
+        // comes from outside the bundle. Both are reached through the
+        // launch resolver, so a package carrying either needs it, even
+        // when nothing left in the bundle names a driver family: the
+        // libraries that did were the ones left out.
+        let rel = file.rel_path.as_path();
+        if rel == Path::new(crate::bundle::sysroot::PLATFORM_FILE)
+            || rel == Path::new(crate::bundle::sysroot::SETS_FILE)
+        {
+            return true;
+        }
         let name = file
             .rel_path
             .file_name()

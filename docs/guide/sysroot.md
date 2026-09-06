@@ -251,6 +251,15 @@ by the mountpoint lock rather than guessed at. `ONELF_SET_MODE=extract`
 asks for a copy through the ordinary package cache instead, and a host
 that cannot mount falls back to that on its own.
 
+Mounting needs `fusermount3`, even on a host whose user namespaces work.
+The namespace mount the FUSE execution mode uses is private to the
+process that made it, so no other package could join it and the
+application, being a different process, would not see it either; and
+making one would put every launch with a set into a user namespace,
+which is what a `needs-setuid` package and a rootless podman or
+distrobox host ask the runtime not to do. Where the helper is missing the
+set is copied out instead, which costs disk but behaves the same.
+
 Each set's library
 directories go on the launch's library path after the bundle's own, so a
 name the bundle kept stays the bundle's and the set supplies the rest.

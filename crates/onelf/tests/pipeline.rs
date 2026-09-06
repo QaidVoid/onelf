@@ -6933,6 +6933,45 @@ fn a_sysroot_build_carries_the_caches_no_package_owns() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A package that pins a GL build or names a shared set needs the launch
+/// resolver to fetch and index it, whatever is left in the bundle. The
+/// scan for driver sonames cannot tell: the libraries that named them
+/// are exactly the ones left out.
+#[test]
+fn pinning_a_build_keeps_the_resolver_on() {
+    const NO_HOST_LIB_DIRS: u16 = 1 << 5;
+
+    let td = workdir("pinpolicy");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    let pkg = td.join("p.onelf");
+    let pack = || {
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        has_footer_flag(&pkg, NO_HOST_LIB_DIRS)
+    };
+    assert!(pack(), "a plain script takes nothing from the host");
+
+    let hash = "ab".repeat(32);
+    write(
+        &app.join(".onelf/sets"),
+        &format!("[demo]\nurl = \"https://e/x.onelf\"\nblake3 = \"{hash}\"\npackages = []\n"),
+    );
+    assert!(!pack(), "a package naming a set needs the resolver");
+
+    std::fs::remove_file(app.join(".onelf/sets")).unwrap();
+    write(
+        &app.join(".onelf/platform"),
+        &format!("label = \"p\"\nurl = \"https://e/gl.onelf\"\nblake3 = \"{hash}\"\n"),
+    );
+    assert!(!pack(), "a package pinning a GL build needs the resolver");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A library a sysroot reaches only through `etc/ld.so.conf` and an
 /// RPATH is found there, never on the packer's machine, and lands in
 /// the bundle's library directory where the runtime's RPATH reaches it.
