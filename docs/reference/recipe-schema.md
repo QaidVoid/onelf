@@ -134,6 +134,9 @@ strip = false                    # run strip --strip-unneeded
 strict-libc = false              # skip wrong-family libc libs
 scan-dlopen = false              # scan strings for common dlopen'd libs
 dlopen = ["libmyvendor.so.1"]    # extra sonames for scan-dlopen allow-list
+trace-run = false                # run the command and bundle what it loads at runtime
+trace-seconds = 5                # how long the traced run may go
+trace-args = ["--version"]       # arguments for the traced run
 skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
 ```
 

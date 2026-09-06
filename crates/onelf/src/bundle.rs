@@ -31,6 +31,7 @@ use onelf_sysroot::{Database, PlatformLine, Policy};
 
 mod ui;
 pub(crate) use ui::{color, format_size};
+mod discover;
 mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod resolve;
@@ -355,6 +356,13 @@ pub struct BundleOptions {
     pub strip: bool,
     pub strict_libc: bool,
     pub scan_dlopen: bool,
+    /// Run the target and bundle every host library it loaded at runtime,
+    /// the way `dlopen` by computed name hides from `DT_NEEDED`.
+    pub trace_run: bool,
+    /// How long the traced run may go before it is stopped.
+    pub trace_seconds: u64,
+    /// Arguments for the traced run.
+    pub trace_args: Vec<String>,
     /// Additional sonames added to the dlopen scan allow-list.
     pub dlopen_extra: Vec<String>,
     /// Take the bundle's contents from a pinned sysroot's package database
@@ -634,6 +642,72 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         needed_by
             .entry(lib.clone())
             .or_insert_with(|| "--include".into());
+    }
+
+    // What the target loads when it runs: dlopen by computed name leaves
+    // nothing in DT_NEEDED for the scan above to find. The run is against
+    // this machine, so it has no meaning for a sysroot build, whose trace
+    // tier covers that ground.
+    if opts.trace_run {
+        if opts.sysroot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--trace-run runs the target against this machine, which a sysroot build does not use; record a trace with ONELF_TRACE instead",
+            ));
+        }
+        let Some(target) = resolve_primary(opts) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--trace-run needs --target to name what to run",
+            ));
+        };
+        let family = parse_interp(&target)
+            .as_deref()
+            .and_then(libc_family_from_interp);
+        eprintln!(
+            "{} {} for up to {}s to see what it loads...",
+            color::bold("Running"),
+            target
+                .strip_prefix(&opts.directory)
+                .unwrap_or(&target)
+                .display(),
+            opts.trace_seconds
+        );
+        let host_dirs: Vec<PathBuf> = onelf_format::drivers::cache_dirs()
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(STANDARD_LIB_PATHS.iter().map(PathBuf::from))
+            .chain(opts.search_path.iter().cloned())
+            .filter(|d| d.is_dir())
+            .collect();
+        let loaded = discover::loaded_libraries(
+            &target,
+            &opts.trace_args,
+            opts.trace_seconds,
+            family,
+            &opts.directory,
+            &host_dirs,
+        )?;
+        let mut traced = 0usize;
+        for path in loaded {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if needed_by.contains_key(name) {
+                continue;
+            }
+            needed_by.insert(name.to_string(), "trace run".into());
+            if let Some(dir) = path.parent()
+                && !rpath_dirs.contains(&dir.to_path_buf())
+            {
+                rpath_dirs.push(dir.to_path_buf());
+            }
+            eprintln!("  {} {}", color::bold_green("Loaded"), name);
+            traced += 1;
+        }
+        if traced == 0 {
+            eprintln!("  nothing beyond what DT_NEEDED already names");
+        }
     }
 
     // Opt-in dlopen scan: match string literals against a known allow-list

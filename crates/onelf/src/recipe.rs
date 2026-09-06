@@ -271,6 +271,15 @@ pub struct Bundle {
     /// Extra sonames added to the --scan-dlopen allow-list.
     #[serde(default)]
     pub dlopen: Vec<String>,
+    /// Run the command and bundle every library it loaded at runtime.
+    #[serde(default)]
+    pub trace_run: bool,
+    /// How long the traced run may go before it is stopped; 5 by default.
+    #[serde(default)]
+    pub trace_seconds: Option<u64>,
+    /// Arguments for the traced run.
+    #[serde(default)]
+    pub trace_args: Vec<String>,
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).
     #[serde(default)]
     pub skip: bool,

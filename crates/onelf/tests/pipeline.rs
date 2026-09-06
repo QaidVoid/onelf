@@ -1969,6 +1969,72 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A library opened by `dlopen` with a computed name is in no `DT_NEEDED`
+/// and matches no string scan. Running the target under the loader's own
+/// report finds it.
+#[test]
+fn a_trace_run_bundles_what_the_app_dlopens() {
+    let td = workdir("tracerun");
+    let src = td.join("app.c");
+    write(
+        &src,
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    char name[64];
+    // Assembled at runtime, so the string scan cannot see it.
+    snprintf(name, sizeof name, "%s%s", "libz", ".so.1");
+    void *h = argc > 1 && strcmp(argv[1], "--open") == 0 ? dlopen(name, RTLD_NOW) : NULL;
+    puts(h ? "OPENED" : "NOT OPENED");
+    return 0;
+}
+"#,
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &app.join("bin/app")) {
+        return;
+    }
+    if !std::process::Command::new(app.join("bin/app"))
+        .arg("--open")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("OPENED"))
+    {
+        skip("this host has no libz.so.1 to dlopen");
+        return;
+    }
+
+    // Without the run, zlib is invisible.
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!app.join("lib/libz.so.1").exists());
+
+    let o = run_onelf(
+        &[
+            "bundle-libs",
+            app.to_str().unwrap(),
+            "--target",
+            "bin/app",
+            "--trace-run",
+            "--trace-seconds",
+            "3",
+            "--trace-arg",
+            "--open",
+        ],
+        None,
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains("libz.so.1"),
+        "the run names what it found:\n{err}"
+    );
+    assert!(app.join("lib/libz.so.1").is_file(), "not bundled:\n{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and

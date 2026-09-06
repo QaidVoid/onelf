@@ -413,6 +413,22 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         dlopen: Vec<String>,
 
+        /// Run the target for a few seconds and bundle every library it
+        /// loaded at runtime: what dlopen by computed name hides from
+        /// DT_NEEDED. Needs --target. Uses the glibc loader's own report;
+        /// a musl target needs strace on PATH.
+        #[arg(long, requires = "target")]
+        trace_run: bool,
+
+        /// How long the traced run may go before it is stopped
+        #[arg(long, default_value = "5", requires = "trace_run")]
+        trace_seconds: u64,
+
+        /// Argument for the traced run (repeatable; `--trace-arg --version`
+        /// passes `--version` through)
+        #[arg(long, requires = "trace_run", allow_hyphen_values = true)]
+        trace_arg: Vec<String>,
+
         /// Take the bundle's contents from this materialized sysroot's
         /// package database instead of scanning this machine. Needs
         /// --target to name the entrypoint.
@@ -789,6 +805,9 @@ fn main() {
             strict_libc,
             scan_dlopen,
             dlopen,
+            trace_run,
+            trace_seconds,
+            trace_arg,
             sysroot,
             sysroot_optional,
             platform_line,
@@ -843,6 +862,9 @@ fn main() {
                 strict_libc,
                 scan_dlopen,
                 dlopen_extra: dlopen,
+                trace_run,
+                trace_seconds,
+                trace_args: trace_arg,
                 sysroot,
             })
         }),
@@ -1006,6 +1028,9 @@ fn run_build(
             strict_libc: recipe.bundle.strict_libc,
             scan_dlopen: recipe.bundle.scan_dlopen,
             dlopen_extra: recipe.bundle.dlopen.clone(),
+            trace_run: recipe.bundle.trace_run,
+            trace_seconds: recipe.bundle.trace_seconds.unwrap_or(5),
+            trace_args: recipe.bundle.trace_args.clone(),
             sysroot,
         })?;
     }

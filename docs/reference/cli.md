@@ -102,6 +102,9 @@ onelf bundle-libs DIRECTORY [options]
 | `--strict-libc` | `false` | Skip wrong-family libc libs |
 | `--scan-dlopen` | `false` | Scan binary strings for common dlopen sonames |
 | `--dlopen SONAME` | | Extra sonames for `--scan-dlopen` (comma/repeat) |
+| `--trace-run` | `false` | Run the `--target` for a few seconds and bundle every library it loaded at runtime, from the glibc loader's own report (a musl target needs `strace`) |
+| `--trace-seconds N` | `5` | How long the traced run may go before it is stopped |
+| `--trace-arg ARG` | | Argument for the traced run (repeatable) |
 | `--sysroot DIR` | | Take the bundle's contents from this sysroot's package database; needs `--target` |
 | `--sysroot-optional PKG` | | Optional dependency to include from the sysroot (repeatable) |
 | `--platform-line FILE` | | Soname prefixes the host provides, one per line |

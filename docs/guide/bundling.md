@@ -201,6 +201,23 @@ You can extend the allow-list with extra sonames:
 onelf bundle-libs ./myapp --scan-dlopen --dlopen libmyvendor.so.1
 ```
 
+The scan only knows names. For what it cannot know, run the application
+and let the loader say what it loaded:
+
+```bash
+onelf bundle-libs ./myapp --target bin/myapp --trace-run --trace-seconds 5 --trace-arg --version
+```
+
+The target runs for up to the given time, from this machine's libraries,
+and every shared object it loaded from outside the tree joins the bundle,
+subject to the same exclusions as everything else. glibc's loader reports
+this on its own through `LD_DEBUG`, per process, so helpers the app
+spawns count too; a musl target is watched with `strace`, which has to
+be installed. A GUI app needs a display for the run; an app that reads
+its arguments needs `--trace-arg` to make it exercise the path you care
+about. The run is against this machine, so it does not apply to a
+sysroot build, which records a trace with `ONELF_TRACE` instead.
+
 ## Framework auto-detection
 
 `bundle-libs` scans the binaries for the frameworks they use, by
