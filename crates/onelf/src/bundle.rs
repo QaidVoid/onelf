@@ -777,6 +777,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut bundled_by_hash: HashMap<[u8; 32], String> = HashMap::new();
     let mut queue: Vec<String> = needed_by.keys().cloned().collect();
     queue.sort();
+    // Name services a glibc older than 2.34 loads by dlopen: `files` and
+    // `dns` were folded into libc.so.6 in 2.34, and before that they are
+    // modules the excluded `libnss_` prefix would leave behind, with every
+    // user, group, host and service lookup failing on a host whose own
+    // glibc did not win. These two are let through when that libc lands.
+    let mut nss_allow: HashSet<String> = HashSet::new();
 
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
@@ -808,7 +814,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     }
 
     while let Some(soname) = queue.pop() {
-        if already_processed.contains(&soname) || is_excluded(&soname, &excludes) {
+        if already_processed.contains(&soname)
+            || (is_excluded(&soname, &excludes) && !nss_allow.contains(&soname))
+        {
             continue;
         }
         already_processed.insert(soname.clone());
@@ -878,9 +886,22 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // so transitive deps (e.g. libsndfile for libpulsecommon) are found
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
 
-                let content_hash: Option<[u8; 32]> = fs::read(&resolved)
-                    .ok()
-                    .map(|bytes| blake3::hash(&bytes).into());
+                let bytes = fs::read(&resolved).ok();
+                let content_hash: Option<[u8; 32]> =
+                    bytes.as_deref().map(|b| blake3::hash(b).into());
+                if soname == "libc.so.6"
+                    && bytes
+                        .as_deref()
+                        .is_some_and(|b| !b.windows(10).any(|w| w == b"GLIBC_2.34"))
+                {
+                    for module in ["libnss_files.so.2", "libnss_dns.so.2"] {
+                        nss_allow.insert(module.to_string());
+                        needed_by
+                            .entry(module.to_string())
+                            .or_insert_with(|| "libc.so.6 (nsswitch)".into());
+                        queue.push(module.to_string());
+                    }
+                }
                 if let Some(hash) = content_hash
                     && let Some(existing_name) = bundled_by_hash.get(&hash).cloned()
                 {
