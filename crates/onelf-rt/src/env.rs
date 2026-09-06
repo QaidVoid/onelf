@@ -187,6 +187,7 @@ pub fn setup_env(
     // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
+    setup_qt_plugin_path(pkg, set_roots);
     setup_xdg_data_dirs(pkg, platform_root, set_roots);
 
     // EGL vendor discovery: merge bundled, fetched and host dirs so both
@@ -318,6 +319,29 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
 /// so system themes and desktop integrations still work.
 /// The package's `share/` goes first, a fetched GL build's after it so
 /// the Vulkan loader finds the build's ICD files, then the host's.
+/// Point Qt at the plugin directories the package and its sets carry.
+///
+/// A relocatable Qt finds its plugins relative to the executable, which
+/// holds while the toolkit sits in the same tree as the application. A
+/// shared set moves it out, and Qt then looks under the application's own
+/// root, finds no platform plugin and aborts before its first window.
+/// Naming the directories outright is what survives either layout.
+fn setup_qt_plugin_path(pkg: &Path, set_roots: &[PathBuf]) {
+    if env::var_os("QT_PLUGIN_PATH").is_some() {
+        return;
+    }
+    let dirs: Vec<String> = std::iter::once(pkg)
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .flat_map(|root| ["lib/qt6/plugins", "lib/qt5/plugins"].map(|d| root.join(d)))
+        .filter(|d| d.is_dir())
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    if !dirs.is_empty() {
+        // SAFETY: the runtime is single-threaded at this point (before exec)
+        unsafe { env::set_var("QT_PLUGIN_PATH", dirs.join(":")) };
+    }
+}
+
 fn setup_xdg_data_dirs(pkg: &Path, platform_root: Option<&Path>, set_roots: &[PathBuf]) {
     let shares: Vec<String> = [Some(pkg), platform_root]
         .into_iter()
