@@ -244,14 +244,21 @@ pub(crate) fn origin_runpath(depth: usize, lib_rel: &Path) -> String {
     s
 }
 
-/// The `$ORIGIN` run path for `path` in the tree at `root`.
+/// The `$ORIGIN` run path for `path` in the tree at `root`. A file in a
+/// subdirectory of the library directory, a plugin or a charset module,
+/// gets its own directory first, since such files name their helpers by
+/// bare soname and expect them beside themselves.
 pub(crate) fn origin_runpath_for(root: &Path, path: &Path, lib_rel: &Path) -> String {
-    let depth = path
+    let dir = path
         .parent()
         .and_then(|dir| dir.strip_prefix(root).ok())
-        .map(|rel| rel.components().count())
-        .unwrap_or(0);
-    origin_runpath(depth, lib_rel)
+        .unwrap_or(Path::new(""));
+    let to_lib = origin_runpath(dir.components().count(), lib_rel);
+    if dir.starts_with(lib_rel) && dir != lib_rel {
+        format!("$ORIGIN:{to_lib}")
+    } else {
+        to_lib
+    }
 }
 
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes.
@@ -484,7 +491,8 @@ pub(crate) fn audit_unbundled_needs(
             .filter_map(|e| e.file_name().to_str().map(String::from))
             .collect()
     };
-    let shared = names_in(&directory.join(lib_dir));
+    let lib_root = directory.join(lib_dir);
+    let shared = names_in(&lib_root);
     let mut beside: HashMap<PathBuf, HashSet<String>> = HashMap::new();
 
     let mut findings: Vec<(PathBuf, Vec<String>)> = Vec::new();
@@ -492,13 +500,18 @@ pub(crate) fn audit_unbundled_needs(
         let Ok(needed) = parse_needed(&path) else {
             continue;
         };
-        let origin_lib = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("../lib");
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let origin_lib = dir.join("../lib");
         let local = beside
             .entry(origin_lib.clone())
             .or_insert_with(|| names_in(&origin_lib));
+        // A file in a subdirectory of the library directory has its own
+        // directory on its run path too, for the helpers beside it.
+        let siblings = if dir.starts_with(&lib_root) && dir != lib_root {
+            names_in(dir)
+        } else {
+            HashSet::new()
+        };
         let mut missing: Vec<String> = needed
             .into_iter()
             .filter(|soname| {
@@ -506,7 +519,10 @@ pub(crate) fn audit_unbundled_needs(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(soname);
-                !shared.contains(bare) && !local.contains(bare) && !is_dynamic_loader(bare)
+                !shared.contains(bare)
+                    && !local.contains(bare)
+                    && !siblings.contains(bare)
+                    && !is_dynamic_loader(bare)
             })
             .collect();
         if !missing.is_empty() {
@@ -1594,6 +1610,10 @@ mod runpath_tests {
         assert_eq!(
             origin_runpath_for(root, Path::new("/tree/app"), Path::new("usr/lib")),
             "$ORIGIN/usr/lib"
+        );
+        assert_eq!(
+            origin_runpath_for(root, Path::new("/tree/lib/gconv/EUC-CN.so"), lib),
+            "$ORIGIN:$ORIGIN/../../lib"
         );
     }
 
