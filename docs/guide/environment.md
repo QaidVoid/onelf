@@ -30,7 +30,9 @@ That string is used two ways:
 2. Set as `LD_LIBRARY_PATH` for AT_EXECFN-bootstrapped binaries, which
    reach the bundled libraries through their own run path and only need
    the farm from the environment, so that nested execs the app does
-   still resolve correctly.
+   still resolve correctly. A binary that got no `$ORIGIN` run path at
+   bundle time (no slot and no `patchelf`) has no other way to the
+   bundled libraries, so it receives the whole string instead.
 
 The link farm holds the host libraries the runtime's resolver chose for
 this launch: the driver stack the bundle does not carry, and any library

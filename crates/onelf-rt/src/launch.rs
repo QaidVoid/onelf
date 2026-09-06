@@ -195,12 +195,9 @@ fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, lau
         cmd.arg0(launch.argv0)
             .args(launch.args)
             .env("ONELF_INTERP", host_interp);
-        let host_only: Vec<&str> = lib_path
-            .split(':')
-            .filter(|dir| !dir.is_empty() && !Path::new(dir).starts_with(launch.pkg_root))
-            .collect();
-        if !host_only.is_empty() {
-            cmd.env("LD_LIBRARY_PATH", host_only.join(":"));
+        let path = crate::interp::kernel_exec_library_path(target, launch.pkg_root, lib_path);
+        if !path.is_empty() {
+            cmd.env("LD_LIBRARY_PATH", path);
         }
         let err = cmd.exec();
         eprintln!("onelf-rt: exec failed: {err}");

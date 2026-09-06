@@ -4581,6 +4581,64 @@ fn cas_blobs_with_different_modes_do_not_share_an_inode() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A binary the packer could not give an RPATH still finds its own
+/// libraries. Distribution binaries carry no RPATH slot, and without
+/// patchelf at bundle time nothing can add one; the runtime used to hand
+/// such a binary only the host-side directories, and it failed on its
+/// own libc.
+#[test]
+fn a_binary_without_an_rpath_still_finds_the_bundled_libc() {
+    let td = workdir("norpath");
+    let src = td.join("app.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"NO RPATH OK\");return 0;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &app.join("bin/app")) {
+        return;
+    }
+    // No patchelf reachable: an empty PATH and a bogus override.
+    let o = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap()])
+        .env("PATH", td.to_str().unwrap())
+        .env(
+            "ONELF_PATCHELF",
+            td.join("no-such-patchelf").to_str().unwrap(),
+        )
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let data = std::fs::read(app.join("bin/app")).unwrap();
+    assert!(
+        !data.windows(7).any(|w| w == b"$ORIGIN"),
+        "the fixture grew an RPATH after all; the test needs one without"
+    );
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/app", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache")
+        .env("ONELF_NO_RESOLVER", "1");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("NO RPATH OK"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Stopping and resuming the app must not stop the server. A stopped child
 /// raises SIGCHLD too, and a server that took that for an exit parked in
 /// `waitpid` while the resumed app blocked forever on its next read from
