@@ -260,11 +260,19 @@ which is what a `needs-setuid` package and a rootless podman or
 distrobox host ask the runtime not to do. Where the helper is missing the
 set is copied out instead, which costs disk but behaves the same.
 
-Each set's library
-directories go on the launch's library path after the bundle's own, so a
-name the bundle kept stays the bundle's and the set supplies the rest.
-Its `share/` joins `XDG_DATA_DIRS`, and its libraries are compared
-against the host exactly as bundled copies are.
+Every directory of a set that holds a shared object goes on the launch's
+library path after the bundle's own, so a name the bundle kept stays the
+bundle's and the set supplies the rest. Its `share/` joins
+`XDG_DATA_DIRS`, any Qt plugin directory it carries joins
+`QT_PLUGIN_PATH`, and its libraries are compared against the host
+exactly as bundled copies are.
+
+A toolkit that locates its own parts relative to the executable is the
+one thing a set changes for the application, since the toolkit is no
+longer beside it. Qt is the common case and the runtime handles it. An
+application that hardcodes an absolute data path has the same problem
+whether or not a set is involved; see
+[Environment](./environment#data-paths-compiled-into-a-library).
 
 Unlike the GL build, a set is not optional: the bundle carries none of
 it, so a set that cannot be obtained ends the launch naming the set and

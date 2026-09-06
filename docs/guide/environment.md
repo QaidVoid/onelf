@@ -60,8 +60,39 @@ data directory exists:
 - `DRIRC_CONFIGDIR` for `share/drirc.d/`
 - `XKB_CONFIG_ROOT` for `share/X11/xkb/`
 
+`QT_PLUGIN_PATH` names every `lib/qt6/plugins` and `lib/qt5/plugins`
+the package and its [shared sets](./sysroot#sharing-a-dependency-set)
+carry, unless the caller already set it. A relocatable Qt finds its
+plugins relative to the executable, which holds while the toolkit sits
+in the package, and stops holding the moment a set moves it elsewhere.
+Qt then finds no platform plugin and aborts, and because it logs to the
+journal rather than stderr the abort prints nothing at all.
+
 Finally, the package's own `share/` is prepended to `XDG_DATA_DIRS`,
 so GLib/GTK discover bundled GSettings schemas and icon themes.
+
+## Data paths compiled into a library
+
+The variables above cover the toolkits. An application that hardcodes an
+absolute data path is a different matter, and the runtime cannot help it:
+the path names the host's filesystem, so on a machine that happens to
+have the same package installed the app silently reads the host's copy,
+and on one that does not it fails. The bundled copy goes unused either
+way.
+
+The symptom is a package that works on the machine that built it and
+fails in a container with a message about a missing file under `/usr`.
+`libqalculate` reading `/usr/share/qalculate` is one example. Test in a
+container that does not have the app installed, and where the app offers
+an environment variable for the directory, set it from the recipe:
+
+```toml
+[env]
+QALCULATE_DEFINITIONS_DIR = "${ONELF_DIR}/share/qalculate"
+```
+
+An app with no such variable needs a patched build, or a wrapper
+entrypoint that arranges the path before exec.
 
 ## Custom environment variables
 
@@ -72,7 +103,7 @@ package root at runtime, so paths follow the running app:
 ```toml
 [env]
 PYTHONHOME = "${ONELF_DIR}/python"
-QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
+GST_PLUGIN_SYSTEM_PATH = "${ONELF_DIR}/lib/gstreamer-1.0"
 ```
 
 `${ONELF_DIR}` and `$${VAR}` (escaped, expanded against the **live**
