@@ -1784,6 +1784,42 @@ fn an_absolute_needed_entry_is_bundled_by_basename() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `--memfd` and `--no-memfd` contradict each other, and `--update-key`
+/// without `--update-url` names a key nothing will use; both were
+/// accepted silently.
+#[test]
+fn contradictory_pack_flags_are_refused() {
+    let td = workdir("flags");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    let pkg = td.join("p.onelf");
+    let base = [
+        "pack",
+        app.to_str().unwrap(),
+        "-o",
+        pkg.to_str().unwrap(),
+        "--command",
+        "bin/run",
+    ];
+    for extra in [
+        vec!["--memfd", "--no-memfd"],
+        vec!["--update-key", "/dev/null"],
+    ] {
+        let o = Command::new(onelf())
+            .args(base)
+            .args(&extra)
+            .output()
+            .expect("spawn onelf pack");
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and

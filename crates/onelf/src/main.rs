@@ -81,7 +81,7 @@ enum Commands {
         no_compress: bool,
 
         /// Mark default entrypoint as memfd-eligible
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_memfd")]
         memfd: bool,
 
         /// Force cache mode (disable memfd)
@@ -98,7 +98,7 @@ enum Commands {
 
         /// Path to a file holding the raw 32-byte Ed25519 public key used
         /// to verify signed self-updates (stored in .onelf/update-key)
-        #[arg(long)]
+        #[arg(long, requires = "update_url")]
         update_key: Option<PathBuf>,
 
         /// What the launch resolver may take from the host: `never`
