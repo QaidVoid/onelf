@@ -1820,6 +1820,36 @@ fn contradictory_pack_flags_are_refused() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `./bin/app` and `bin/app` name the same entry. Shell completion writes
+/// the first form, and the packer used to reject it as not found.
+#[test]
+fn a_command_with_a_leading_dot_slash_is_found() {
+    let td = workdir("dotslash");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho DOTSLASH\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("p.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "./bin/run", "--mtime", "0"])
+        .args(["--entrypoint", "alt=./bin/run"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("DOTSLASH"));
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and

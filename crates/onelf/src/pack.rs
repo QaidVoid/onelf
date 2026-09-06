@@ -372,6 +372,15 @@ fn inject_onelf_file(
     });
 }
 
+/// A path as the walk records it: `./bin/app` and `bin/app` name the same
+/// entry, and a shell completion or a recipe writes either.
+fn package_relative(path: &str) -> PathBuf {
+    Path::new(path)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
 /// A scratch file beside `output` for this pack alone. The whole output
 /// name is kept, so `app.x86_64` and `app.aarch64` packing at once in one
 /// directory do not share it, and the pid is added, so two packs of one
@@ -956,7 +965,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut entrypoints: Vec<EntryPoint> = Vec::new();
 
     // Find the command file entry
-    let command_path = PathBuf::from(&opts.command);
+    let command_path = package_relative(&opts.command);
     let command_entry_idx = *path_to_index.get(&command_path).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -1011,7 +1020,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     let (ep0_target_idx, ep0_target_path) = match default_decl {
         Some((_, path, _)) => {
-            let p = PathBuf::from(path);
+            let p = package_relative(path);
             let idx = *path_to_index.get(&p).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -1081,7 +1090,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         if opts.default_entrypoint.as_deref() == Some(name.as_str()) {
             continue;
         }
-        let ep_path = PathBuf::from(path);
+        let ep_path = package_relative(path);
         let ep_entry_idx = *path_to_index.get(&ep_path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
