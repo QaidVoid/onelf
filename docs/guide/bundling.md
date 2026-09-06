@@ -13,7 +13,12 @@ With no flags, this:
 
 1. Scans every ELF file under `./myapp/` for `DT_NEEDED` entries.
 2. Resolves each soname via ldconfig (or the NixOS store, when detected).
-3. Copies the resolved `.so` files into `./myapp/lib/`.
+3. Copies the resolved `.so` files into `./myapp/lib/`. With glibc come
+   its charset converters, into `lib/gconv/`: the Unicode, Windows,
+   ISO Latin, and common East Asian ones with the configuration that names
+   them. `iconv` loads those by name from beside its own libc, and on a
+   host with another glibc none would load, so a bundled app could not
+   convert text at all. The runtime points `GCONV_PATH` at them.
 4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to the one `$ORIGIN`
    entry that reaches `lib/` from where the file sits: `$ORIGIN/../lib`
    for `bin/app`, `$ORIGIN/../../../lib` for `opt/tool/bin/app`. No entry

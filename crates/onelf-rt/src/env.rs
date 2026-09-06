@@ -139,6 +139,26 @@ pub fn setup_env(
                 }
             }
 
+            // The bundled glibc's charset converters. They bind to that
+            // glibc's private symbols, so they are the only ones it can
+            // load, and the host's are the only ones a host program can:
+            // a host program the app spawns inherits this and loses every
+            // conversion but UTF-8. A leak of the same shape as the driver
+            // paths above, and a bundled app that cannot convert text at
+            // all is the worse of the two.
+            if env::var("GCONV_PATH").is_err() {
+                let gconv: Vec<String> = lib_paths
+                    .iter()
+                    .map(|p| Path::new(p).join("gconv").to_string_lossy().to_string())
+                    .filter(|p| Path::new(p).is_dir())
+                    .collect();
+                if !gconv.is_empty() {
+                    unsafe {
+                        env::set_var("GCONV_PATH", gconv.join(":"));
+                    }
+                }
+            }
+
             // Auto-set GBM_BACKENDS_PATH if any lib dir contains a gbm/ subdirectory
             if env::var("GBM_BACKENDS_PATH").is_err() {
                 let gbm_paths: Vec<String> = driver_dirs

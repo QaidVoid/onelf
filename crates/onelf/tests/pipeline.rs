@@ -1884,6 +1884,91 @@ fn extract_refuses_stdout_without_a_file_and_names_missing_files() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A bundled glibc brings its charset converters, and the runtime points
+/// `GCONV_PATH` at them. They bind to that glibc's private symbols, so on
+/// a host with another glibc nothing else can serve `iconv`.
+#[test]
+fn a_glibc_bundle_carries_its_charset_converters() {
+    let td = workdir("gconv");
+    let src = td.join("conv.c");
+    write(
+        &src,
+        r#"
+#include <iconv.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+    printf("GCONV_PATH=%s\n", getenv("GCONV_PATH") ? getenv("GCONV_PATH") : "");
+    iconv_t cd = iconv_open("CP1252", "UTF-8");
+    if (cd == (iconv_t)-1) { puts("iconv_open failed"); return 1; }
+    char in[] = "caf\xc3\xa9", out[8] = {0};
+    char *ip = in, *op = out; size_t il = 5, ol = 8;
+    if (iconv(cd, &ip, &il, &op, &ol) == (size_t)-1) { puts("iconv failed"); return 1; }
+    printf("cp1252=%02x%02x%02x%02x\n", (unsigned char)out[0], (unsigned char)out[1],
+        (unsigned char)out[2], (unsigned char)out[3]);
+    return 0;
+}
+"#,
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &app.join("bin/conv")) {
+        return;
+    }
+    // Only a glibc bundle has converters to bring; a musl one is skipped.
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    if !app.join("lib/libc.so.6").is_file() {
+        skip("the fixture is not a glibc binary");
+        return;
+    }
+    assert!(
+        app.join("lib/gconv/gconv-modules").is_file(),
+        "the configuration"
+    );
+    assert!(
+        app.join("lib/gconv/CP1252.so").is_file(),
+        "a Windows code page"
+    );
+    assert!(
+        app.join("lib/gconv/UTF-16.so").is_file(),
+        "a Unicode encoding"
+    );
+    assert!(
+        !app.join("lib/gconv/BIG5.so").exists(),
+        "the long tail stays out"
+    );
+
+    let pkg = td.join("conv.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/conv", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success());
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache")
+        .env("ONELF_NO_RESOLVER", "1");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/lib/gconv"),
+        "GCONV_PATH points into the package:\n{stdout}"
+    );
+    assert!(stdout.contains("cp1252=636166e9"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and

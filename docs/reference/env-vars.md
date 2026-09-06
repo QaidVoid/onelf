@@ -19,6 +19,7 @@ Reference for all environment variables onelf reads or sets.
 | Variable | Set when | Points to |
 |----------|----------|-----------|
 | `LD_LIBRARY_PATH` | `lib/` contains `.so` files | the resolver's link farm of chosen host libraries, then `<pkg>/lib` on explicit linker invocations |
+| `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `GBM_BACKENDS_PATH` | `lib/gbm/` exists | `<pkg>/lib/gbm` |

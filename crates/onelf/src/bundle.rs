@@ -233,6 +233,71 @@ fn copy_prefixed_libs(
     )
 }
 
+/// The charset converters a bundled glibc brings along, by file name
+/// prefix: the Unicode encodings, the Windows and ISO Latin code pages,
+/// the common East Asian ones, and the `lib*` tables those share. glibc's
+/// other two hundred are for charsets an application is very unlikely to
+/// meet.
+const GCONV_MODULES: &[&str] = &[
+    "UTF", "UNICODE", "ANSI", "CP", "LATIN", "ISO8859", "SJIS", "EUC-JP", "EUC-KR", "EUC-CN", "lib",
+];
+
+/// Copy glibc's charset converters from beside `libc` into `gconv/`
+/// under `lib_dest`, with the configuration that names them. Returns the
+/// files copied, relative to `lib_dest`.
+///
+/// `iconv` loads these by `dlopen`, and they bind to `GLIBC_PRIVATE`, so
+/// only the modules of the very glibc that was bundled can serve it: on a
+/// host with a different glibc every conversion but the built-in UTF-8
+/// ones fails without them. The runtime points `GCONV_PATH` here.
+fn bundle_gconv(libc: &Path, lib_dest: &Path, strip: bool) -> io::Result<Vec<String>> {
+    let Some(src) = libc.parent().map(|d| d.join("gconv")) else {
+        return Ok(Vec::new());
+    };
+    if !src.is_dir() {
+        return Ok(Vec::new());
+    }
+    let dest = lib_dest.join("gconv");
+    let mut copied = Vec::new();
+    let mut copy = |from: &Path, rel: &str| -> io::Result<()> {
+        let to = dest.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        ensure_writable(&to);
+        fs::copy(from, &to)?;
+        normalize_mtime(&to);
+        copied.push(format!("gconv/{rel}"));
+        Ok(())
+    };
+    let modules_conf = src.join("gconv-modules");
+    if modules_conf.is_file() {
+        copy(&modules_conf, "gconv-modules")?;
+    }
+    if let Ok(entries) = fs::read_dir(src.join("gconv-modules.d")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.path().is_file() && name.ends_with(".conf") {
+                copy(&entry.path(), &format!("gconv-modules.d/{name}"))?;
+            }
+        }
+    }
+    for entry in fs::read_dir(&src)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".so") || !GCONV_MODULES.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        copy(&entry.path(), &name)?;
+        if strip {
+            strip_debug(&dest.join(&*name));
+        }
+    }
+    copied.sort();
+    Ok(copied)
+}
+
 const DEFAULT_EXCLUDES: &[&str] = &[
     "libnss_",
     "libcuda.so",
@@ -788,6 +853,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // user, group, host and service lookup failing on a host whose own
     // glibc did not win. These two are let through when that libc lands.
     let mut nss_allow: HashSet<String> = HashSet::new();
+    let mut gconv_files: Vec<String> = Vec::new();
 
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
@@ -984,6 +1050,23 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     bundled_by_hash.insert(hash, soname.clone());
                 }
                 copied.push((soname.clone(), resolved.clone(), size, requirer));
+                if soname == "libc.so.6" && !opts.dry_run {
+                    match bundle_gconv(&resolved, &lib_dest, opts.strip) {
+                        Ok(files) if !files.is_empty() => {
+                            eprintln!(
+                                "  {} {} gconv module(s) beside libc",
+                                color::bold_green("Copied"),
+                                files.len()
+                            );
+                            gconv_files = files;
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "  {} could not copy gconv modules: {e}",
+                            color::bold_red("warning:")
+                        ),
+                    }
+                }
 
                 // Collect RPATHs from resolved lib for transitive dep resolution
                 let sysroot_root = opts.sysroot.as_ref().map(|sr| sr.root.as_path());
@@ -1050,6 +1133,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         let generated = copied
             .iter()
             .map(|(soname, _, _, _)| opts.lib_dir.join(soname).to_string_lossy().into_owned())
+            .chain(
+                gconv_files
+                    .iter()
+                    .map(|f| opts.lib_dir.join(f).to_string_lossy().into_owned()),
+            )
             .collect();
         sysroot::record_generated(&opts.directory, generated)?;
     }
