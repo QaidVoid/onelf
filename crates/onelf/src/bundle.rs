@@ -554,7 +554,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // absolute one names the sysroot's filesystem in sysroot mode, a
         // `$ORIGIN` one the tree itself.
         let sysroot_root = opts.sysroot.as_ref().map(|sr| sr.root.as_path());
-        for dir in parse_rpaths_under(path, sysroot_root) {
+        for dir in parse_rpaths_under(path, sysroot_root)
+            .into_iter()
+            .chain(parse_needed_dirs_under(path, sysroot_root))
+        {
             if !rpath_dirs.contains(&dir) {
                 rpath_dirs.push(dir);
             }

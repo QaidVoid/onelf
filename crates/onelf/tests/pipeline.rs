@@ -1745,6 +1745,45 @@ fn a_transitive_dependency_is_copied_despite_a_stray_copy() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A library a binary names by absolute path in `DT_NEEDED`, as a
+/// toolchain does when linking one that has no soname, is bundled under
+/// its basename. The walk searches by basename, so the directory the
+/// entry points at has to be on the search path for it to be found.
+#[test]
+fn an_absolute_needed_entry_is_bundled_by_basename() {
+    let td = workdir("absneeded");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src.join("noso.c"), "int noso(void){return 3;}\n");
+    write(
+        &src.join("app.c"),
+        "int noso(void); int main(void){return noso()-3;}\n",
+    );
+    if !cc_with(
+        &["-shared", "-fPIC", src.join("noso.c").to_str().unwrap()],
+        &src.join("libnoso.so"),
+    ) {
+        return;
+    }
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            src.join("libnoso.so").to_str().unwrap()
+        ],
+        &app.join("bin/app"),
+    ));
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        app.join("lib/libnoso.so").is_file(),
+        "not bundled:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and

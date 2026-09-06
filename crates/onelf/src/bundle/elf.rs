@@ -36,6 +36,28 @@ pub(crate) fn parse_needed_bytes(data: &[u8]) -> io::Result<Vec<String>> {
         .collect())
 }
 
+/// Directories named by absolute `DT_NEEDED` entries, mapped under `root`
+/// when given. The walk searches by basename, so the directory such an
+/// entry points at has to be on the search path for it to be found at
+/// all; a toolchain linking a library by path with no soname writes one.
+pub(crate) fn parse_needed_dirs_under(path: &Path, root: Option<&Path>) -> Vec<PathBuf> {
+    let Ok(data) = fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
+        return Vec::new();
+    };
+    elf.libraries
+        .iter()
+        .filter(|s| s.starts_with('/'))
+        .filter_map(|s| Path::new(s).parent().map(Path::to_path_buf))
+        .map(|dir| match root {
+            Some(root) => root.join(dir.strip_prefix("/").unwrap_or(&dir)),
+            None => dir,
+        })
+        .collect()
+}
+
 /// Parse PT_INTERP from an ELF binary, returning the interpreter path.
 ///
 /// goblin returns `p_filesz - 1` bytes verbatim, so a slot padded with
