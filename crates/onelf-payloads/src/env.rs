@@ -31,6 +31,23 @@ unsafe extern "C" {
     fn getenv(name: *const u8) -> *const u8;
 }
 
+// `dlopen` lived in libdl.so.2 before glibc 2.34, and nothing guarantees
+// that library is in the process. A strong reference would make the
+// loader refuse this object, and with it the whole application, at
+// startup; a weak one resolves to null and is checked before use.
+core::arch::global_asm!(".weak dlopen");
+
+/// Where the loader wrote `dlopen`'s address: zero when the weak symbol
+/// went unresolved. Read through memory, since the compiler takes a
+/// function's address to be non-null and folds a direct comparison away.
+struct Relocated(*const ());
+unsafe impl Sync for Relocated {}
+static DLOPEN_ADDR: Relocated = Relocated(dlopen as *const ());
+
+unsafe fn have_dlopen() -> bool {
+    !core::ptr::read_volatile(&DLOPEN_ADDR.0).is_null()
+}
+
 const RTLD_NOW: i32 = 0x0002;
 const RTLD_GLOBAL: i32 = 0x0100;
 
@@ -71,6 +88,9 @@ mod sys {
         sys3(231, code as i64, 0, 0);
         loop {}
     }
+    pub unsafe fn write_stderr(buf: *const u8, n: usize) {
+        sys3(1, 2, buf as i64, n as i64);
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -95,6 +115,9 @@ mod sys {
     pub unsafe fn exit_group(code: i32) -> ! {
         svc4(94, code as i64, 0, 0, 0);
         loop {}
+    }
+    pub unsafe fn write_stderr(buf: *const u8, n: usize) {
+        svc4(64, 2, buf as i64, n as i64, 0);
     }
 }
 
@@ -131,6 +154,9 @@ mod sys {
     pub unsafe fn exit_group(code: i32) -> ! {
         sys3(252, code, 0, 0);
         loop {}
+    }
+    pub unsafe fn write_stderr(buf: *const u8, n: usize) {
+        sys3(4, 2, buf as i32, n as i32);
     }
 }
 
@@ -522,6 +548,11 @@ unsafe fn apply_env() {
 unsafe fn apply_preload() {
     let n = read_onelf_file(b"/.onelf/preload\0");
     if n <= 0 {
+        return;
+    }
+    if !have_dlopen() {
+        const MSG: &[u8] = b"onelf-env: dlopen is not in this process (glibc before 2.34 keeps it in libdl.so.2), .onelf/preload not applied\n";
+        sys::write_stderr(MSG.as_ptr(), MSG.len());
         return;
     }
     let buf = &raw const G_BUF as *const u8;
