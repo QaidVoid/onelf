@@ -28,6 +28,12 @@ pub fn extract(
     preserve_mode: bool,
 ) -> io::Result<()> {
     if files.is_empty() {
+        if output.is_some_and(|p| p.as_os_str() == "-") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stdout output (-o -) needs a single --file to name what to write",
+            ));
+        }
         let output_dir = output.unwrap_or(Path::new("onelf_extracted"));
         return extract_all(binary, output_dir, preserve_mode);
     }
@@ -149,10 +155,15 @@ fn extract_selective(
         })
         .collect();
 
-    if matched.is_empty() {
+    let missing: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !matched.iter().any(|(_, p)| p == f))
+        .collect();
+    if !missing.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("no files matched: {}", files.join(", ")),
+            format!("not in the package: {}", missing.join(", ")),
         ));
     }
 

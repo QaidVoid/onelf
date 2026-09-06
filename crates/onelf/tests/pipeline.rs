@@ -1850,6 +1850,40 @@ fn a_command_with_a_leading_dot_slash_is_found() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// `extract -o -` with nothing to name what goes to stdout is an error,
+/// not a directory called `-`; and a `--file` the package lacks is named
+/// rather than silently skipped.
+#[test]
+fn extract_refuses_stdout_without_a_file_and_names_missing_files() {
+    let td = workdir("extract-args");
+    let pkg = pack_script(&td, "ex", "#!/bin/sh\necho hi\n");
+    let o = Command::new(onelf())
+        .args(["extract", pkg.to_str().unwrap(), "-o", "-"])
+        .current_dir(&td)
+        .output()
+        .expect("spawn onelf extract");
+    assert!(!o.status.success());
+    assert!(!td.join("-").exists(), "a directory named - was created");
+
+    let o = Command::new(onelf())
+        .args([
+            "extract",
+            pkg.to_str().unwrap(),
+            "-o",
+            td.join("out").to_str().unwrap(),
+        ])
+        .args(["--file", "bin/run", "--file", "bin/missing"])
+        .output()
+        .expect("spawn onelf extract");
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("bin/missing"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and
