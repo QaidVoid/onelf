@@ -37,6 +37,16 @@ fn have(cmd: &str) -> bool {
 /// own terms. Both have to be tried to know, so this packs a package and
 /// runs it, once, forcing FUSE so a fallback to another mode cannot make
 /// an unavailable mount look available.
+/// Whether this machine lets an ordinary user make a user namespace.
+/// Some distributions turn that off, and the path overlays need one.
+fn user_namespaces_available() -> bool {
+    match std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+        Ok(v) => v.trim() == "1",
+        // The knob is Debian's; its absence means the kernel allows it.
+        Err(_) => std::path::Path::new("/proc/self/ns/user").exists(),
+    }
+}
+
 fn fuse_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -5839,7 +5849,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(
         &src.join("app.c"),
-        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);return 0;}\n",
+        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}return 0;}\n",
     );
     assert!(cc_with(
         &[
@@ -6852,6 +6862,55 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
     assert!(
         out.status.success(),
         "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An application that opens a path it was built with reads the
+/// bundle's copy, not the host's and not nothing.
+///
+/// The target does not exist on the machine running this, which is the
+/// case that matters: a host with the application installed would have
+/// hidden the problem, and a host without it has nothing to bind onto.
+#[test]
+fn a_path_the_application_was_built_with_reads_the_bundle() {
+    if !user_namespaces_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("hostpaths");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+    let recipe = dir.join("onelf.toml");
+    let mut text = std::fs::read_to_string(&recipe).unwrap();
+    text.push_str("\n[paths]\n\"/usr/share/fixture\" = \"share/fixture\"\n");
+    write(&recipe, &text);
+
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut cmd = Command::new(dir.join("app.onelf"));
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache")
+        .env("ONELF_LD_CACHE", &fixture.ld_cache)
+        .env("ONELF_NO_PLATFORM_FETCH", "1")
+        .env("SHOW_DATA", "1");
+    isolate(&mut cmd, &td);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("data=data"),
+        "the bundle's copy answered for the path:\n{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&td);

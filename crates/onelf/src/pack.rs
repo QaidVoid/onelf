@@ -91,6 +91,9 @@ pub struct PackOptions {
     pub mtime: Option<u64>,
     /// Custom environment variables to set before exec (KEY=VALUE pairs).
     pub env: Vec<(String, String)>,
+    /// Absolute host path to bundle-relative directory, for an
+    /// application that opens a path it was built with.
+    pub paths: Vec<(String, String)>,
     /// Libraries to dlopen on every exec, written to `.onelf/preload` and
     /// applied by the bundled onelf-env constructor. `${ONELF_DIR}`
     /// expands to the package root at runtime.
@@ -558,6 +561,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != Path::new(crate::bundle::sysroot::PLATFORM_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SETS_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SHIPPED_FILE)
+                && p.as_path() != Path::new(crate::bundle::sysroot::PATHS_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(
@@ -689,6 +693,25 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             &mut files,
             ".onelf/env",
             env_lines.join("\n").into_bytes(),
+            inject_mtime,
+        );
+    }
+
+    // Write the path overlays as .onelf/paths (ABSOLUTE\tRELATIVE per
+    // line). The runtime makes each bundle directory answer for the
+    // absolute path, for an application that opens one it was built
+    // with and offers no way to say otherwise.
+    if !opts.paths.is_empty() {
+        let lines: Vec<String> = opts
+            .paths
+            .iter()
+            .map(|(abs, rel)| format!("{abs}\t{rel}"))
+            .collect();
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            crate::bundle::sysroot::PATHS_FILE,
+            lines.join("\n").into_bytes(),
             inject_mtime,
         );
     }
@@ -1514,6 +1537,7 @@ mod tests {
             output: out.to_path_buf(),
             command: command.to_string(),
             name: None,
+            paths: Vec::new(),
             entrypoints: Vec::new(),
             default_entrypoint: None,
             lib_dirs: Vec::new(),

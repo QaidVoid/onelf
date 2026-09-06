@@ -59,6 +59,12 @@ pub struct Recipe {
     /// re-exec (DT_NEEDED + $ORIGIN RUNPATH), unlike `LD_PRELOAD`.
     #[serde(default)]
     pub preload: Vec<String>,
+    /// Directories of the bundle made visible at the absolute paths an
+    /// application compiled into itself. The key is the absolute path
+    /// the application opens, the value is the directory in the bundle
+    /// that should answer for it.
+    #[serde(default)]
+    pub paths: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]

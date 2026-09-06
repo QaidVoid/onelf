@@ -174,6 +174,20 @@ A dependency set shared between packages. The closure of `packages` is
 left out of the bundle and expected from the build at `url`, made with
 `onelf sysroot pack-set`. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set).
 
+## `[paths]`
+
+```toml
+[paths]
+"/usr/share/galculator" = "share/galculator"
+```
+
+Absolute path the application opens, mapped to the directory in the
+bundle that should answer for it. Applied in a private mount namespace
+before `exec`, so it is visible to the application and its children and
+to nothing else. For an application that compiled a data path into
+itself and offers no environment variable; prefer `[env]` where one
+exists. See [Environment](../guide/environment#making-the-bundle-answer-for-a-compiled-in-path).
+
 ## `[env]`
 
 ```toml

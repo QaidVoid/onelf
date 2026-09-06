@@ -290,6 +290,7 @@ fn pack_tree(
             package_info: None,
             mtime: Some(0),
             env: Vec::new(),
+            paths: Vec::new(),
             preload: Vec::new(),
             needs_setuid: false,
         },

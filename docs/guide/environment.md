@@ -91,8 +91,37 @@ an environment variable for the directory, set it from the recipe:
 QALCULATE_DEFINITIONS_DIR = "${ONELF_DIR}/share/qalculate"
 ```
 
-An app with no such variable needs a patched build, or a wrapper
-entrypoint that arranges the path before exec.
+An app with no such variable needs `[paths]`, below.
+
+## Making the bundle answer for a compiled-in path
+
+When the application offers no variable, the recipe can name the path
+outright and the runtime makes the bundle's own directory answer for it:
+
+```toml
+[paths]
+"/usr/share/galculator" = "share/galculator"
+```
+
+The key is the absolute path the application opens, the value is the
+directory in the bundle that should be found there. The runtime enters a
+private mount namespace before executing the entrypoint, so the change
+is visible to the application and the processes it starts, and to
+nothing else on the machine. Where the path already exists it is bound
+over; where it does not, the bundle's directory is laid over the
+parent so that one name appears without hiding what the parent holds.
+
+Two cases fall back to the old behaviour, each with a message on the
+terminal rather than a silent difference:
+
+- A host that does not allow an ordinary user to make a user namespace.
+- A package built with `needs-setuid`, or a launch with
+  `ONELF_FUSE_NO_NAMESPACE` set. Both ask to stay in the host's user
+  namespace, because a setuid bit does nothing inside one onelf made,
+  and the mounts have to go where the namespace goes.
+
+Reach for this only when there is no environment variable to set. A
+variable costs nothing and works everywhere; this needs a namespace.
 
 ## Custom environment variables
 

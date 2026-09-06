@@ -91,6 +91,9 @@ pub fn exec(launch: &Launch) -> ! {
     if let Some(data) = launch.env_data {
         crate::env::apply_custom_env(data, pkg_root_s);
     }
+    // Last, so the mount namespace this may enter holds nothing but the
+    // exec that follows.
+    crate::hostpaths::apply(launch.pkg_root);
 
     match ep.working_dir {
         onelf_format::WorkingDir::PackageRoot => {

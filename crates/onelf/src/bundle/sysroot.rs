@@ -390,6 +390,10 @@ pub const SETS_FILE: &str = ".onelf/sets";
 /// the build's contents out of their own bundle.
 pub const SHIPPED_FILE: &str = ".onelf/sonames";
 
+/// Absolute paths the runtime makes bundle directories answer for, one
+/// `ABSOLUTE<tab>RELATIVE` pair per line.
+pub const PATHS_FILE: &str = ".onelf/paths";
+
 /// The sets record as TOML.
 pub fn render_sets(sets: &[SharedSet], closures: &[(String, Vec<String>)]) -> String {
     let mut out = String::new();

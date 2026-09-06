@@ -2,6 +2,7 @@ mod cache;
 mod env;
 mod ephemeral;
 mod fuse;
+mod hostpaths;
 mod integrate;
 mod interp;
 mod launch;
