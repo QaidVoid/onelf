@@ -5775,11 +5775,16 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             "usr/lib/fixture/plugins/c.so",
             "libmissing.so.9",
         ),
-        ("chainlib", "usr/lib/libchainlib.so.1", "libmissing.so.9"),
+        (
+            "chainlib",
+            "usr/lib/libchainlib.so.1.0.0",
+            "libmissing.so.9",
+        ),
         (
             "plugin_d",
             "usr/lib/fixture/plugins/d.so",
-            "libchainlib.so.1",
+            // Linked against the file; the need recorded is its soname.
+            "libchainlib.so.1.0.0",
         ),
     ] {
         write(
@@ -5792,7 +5797,14 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
                 "-fPIC",
                 &format!(
                     "-Wl,-soname,{}",
-                    Path::new(out).file_name().unwrap().to_str().unwrap()
+                    // The soname is the name dependants use, which for a
+                    // versioned file is not the file's own name.
+                    Path::new(out)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .trim_end_matches(".0.0")
                 ),
                 src.join(format!("{name}.c")).to_str().unwrap(),
                 &format!("-L{}", src.display()),
@@ -5935,7 +5947,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             "usr/lib/libfixture.so.1.0.0",
             "usr/lib/fixture/backends/libbackend.so.1",
             "usr/lib/qt6/plugins/platforms/libqfake.so",
-            "usr/lib/libchainlib.so.1",
+            "usr/lib/libchainlib.so.1.0.0",
             "usr/lib/fixture/plugins/a.so",
             "usr/lib/fixture/plugins/b.so",
             "usr/lib/fixture/plugins/c.so",
@@ -6216,7 +6228,11 @@ fn an_unresolved_soname_fails_the_sysroot_build_and_warns_the_host_scan() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::fs::remove_file(td.join("sysroot/usr/lib/libfixture.so.1")).unwrap();
+    // The file and every name for it: a soname link alone comes back,
+    // since the copy makes the ones a distribution leaves to ldconfig.
+    for name in ["libfixture.so.1", "libfixture.so.1.0.0"] {
+        let _ = std::fs::remove_file(td.join("sysroot/usr/lib").join(name));
+    }
     sysroot_recipe(&dir, &fixture, "");
 
     let out = onelf_build(&dir);
@@ -6501,12 +6517,20 @@ fn objects_the_sysroot_cannot_satisfy_are_dropped_not_fatal() {
     assert!(stderr.contains("Dropped 3 file(s)"), "{stderr}");
     for gone in [
         "lib/fixture/plugins/c.so",
-        "lib/libchainlib.so.1",
+        "lib/libchainlib.so.1.0.0",
         "lib/fixture/plugins/d.so",
     ] {
         assert!(!dir.join(gone).exists(), "{gone} stays");
         assert!(stderr.contains(gone), "{gone} is named:\n{stderr}");
     }
+    // chainlib installs as a versioned file and is needed by its soname,
+    // the way a distribution ships one. Dropping it has to take the
+    // plugin that needs that soname with it, and the link the copy made
+    // for it has to go too.
+    assert!(
+        !dir.join("lib/libchainlib.so.1").exists(),
+        "the soname link goes with the file it named"
+    );
     assert!(dir.join("lib/fixture/plugins/a.so").is_file());
     assert!(dir.join("lib/libfixture.so.1").is_file());
 

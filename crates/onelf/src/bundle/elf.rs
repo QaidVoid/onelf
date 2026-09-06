@@ -99,6 +99,13 @@ pub(crate) fn libc_family_from_interp(interp: &str) -> Option<LibcFamily> {
     }
 }
 
+/// The `DT_SONAME` of a shared object, the name its dependants use.
+pub(crate) fn parse_soname(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let elf = goblin::elf::Elf::parse(&data).ok()?;
+    elf.soname.map(String::from)
+}
+
 /// Map a soname to the libc family it belongs to, when known.
 pub(crate) fn libc_family_of_soname(soname: &str) -> Option<LibcFamily> {
     if soname == "libc.so.6" || soname.starts_with("ld-linux") {

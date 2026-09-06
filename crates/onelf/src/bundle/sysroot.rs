@@ -348,6 +348,9 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     let caches = copy_generated_caches(root, appdir)?;
     report.copied += caches.len();
     generated.extend(caches);
+    let links = link_sonames(appdir)?;
+    report.copied += links.len();
+    generated.extend(links);
     record_generated(appdir, generated)?;
     let record = appdir.join(PROVENANCE_FILE);
     if let Some(parent) = record.parent() {
@@ -539,6 +542,7 @@ fn populate_closure(
         }
     }
     copied += copy_generated_caches(root, tree)?.len();
+    copied += link_sonames(tree)?.len();
     Ok(GlSelection {
         packages: closure
             .packages
@@ -579,6 +583,52 @@ fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
             .map(String::from)
             .collect(),
     )
+}
+
+/// Recreate the soname links a distribution leaves to `ldconfig`, and
+/// return what was made, relative to `dir`.
+///
+/// A package ships the versioned file and usually a development symlink
+/// and stops there: `libfoo.so` and `libfoo.so.1.2.3` are its files, and
+/// `libfoo.so.1`, the name every dependant asks for, is made by
+/// `ldconfig` when the package is installed. No package database records
+/// it, so copying what the database lists loses exactly the name that
+/// matters.
+fn link_sonames(dir: &Path) -> io::Result<Vec<String>> {
+    let mut made = Vec::new();
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(soname) = super::elf::parse_soname(&path) else {
+            continue;
+        };
+        if path.file_name().and_then(|n| n.to_str()) == Some(soname.as_str()) {
+            continue;
+        }
+        // A soname naming a directory of its own is not a name the
+        // loader resolves beside the file, so there is nothing to make.
+        if soname.contains('/') || soname.is_empty() {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let link = parent.join(&soname);
+        if link.exists() || link.is_symlink() {
+            continue;
+        }
+        let Some(target) = path.file_name() else {
+            continue;
+        };
+        std::os::unix::fs::symlink(target, &link)?;
+        if let Ok(rel) = link.strip_prefix(dir) {
+            made.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    Ok(made)
 }
 
 /// Caches a distribution generates after installing a package rather

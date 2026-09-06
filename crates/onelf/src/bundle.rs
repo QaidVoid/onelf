@@ -1418,11 +1418,19 @@ fn drop_unloadable(
             else {
                 continue;
             };
+            // What goes with it: the file's own name, and the soname
+            // its dependants actually ask for. A library is dropped as
+            // `libfoo.so.1.2.3` and needed as `libfoo.so.1`, so
+            // recording only the former leaves everything that needed it
+            // looking satisfied, and the failure surfaces later as an
+            // unmet need nothing can explain.
+            let dropped_soname = crate::bundle::elf::parse_soname(object);
             fs::remove_file(object)?;
             remove_dangling_links_beside(object);
             if let Some(name) = object.file_name() {
                 gone.insert(name.to_string_lossy().into_owned());
             }
+            gone.extend(dropped_soname);
             dropped.push((rel.to_path_buf(), soname.clone()));
             progressed = true;
         }
