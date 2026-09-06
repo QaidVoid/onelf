@@ -640,11 +640,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // still rely on LD_LIBRARY_PATH.
         if !opts.dry_run {
             let lib_dest = opts.directory.join(&opts.lib_dir);
-            let (rewritten, _scrubbed, unguaranteed, self_extract) = finalize_tree(&opts.directory);
+            let (rewritten, _scrubbed, unguaranteed, self_extract) =
+                finalize_tree(&opts.directory, &opts.lib_dir);
             if rewritten > 0 {
                 eprintln!(
-                    "{} RUNPATH to $ORIGIN/../lib in {} binaries",
+                    "{} RUNPATH to reach {} in {} binaries",
                     color::bold("Rewrote"),
+                    opts.lib_dir.display(),
                     rewritten
                 );
             }
@@ -1145,11 +1147,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Hardcoded absolute paths (e.g. /nix/store/...) won't exist on the
     // target system; LD_LIBRARY_PATH (set by the runtime) is used instead.
     if !opts.dry_run {
-        let (rewritten, scrubbed, unguaranteed, self_extract) = finalize_tree(&opts.directory);
+        let (rewritten, scrubbed, unguaranteed, self_extract) =
+            finalize_tree(&opts.directory, &opts.lib_dir);
         if rewritten > 0 {
             eprintln!(
-                "{} RUNPATH to $ORIGIN/../lib in {} binaries",
+                "{} RUNPATH to reach {} in {} binaries",
                 color::bold("Rewrote"),
+                opts.lib_dir.display(),
                 rewritten
             );
         }

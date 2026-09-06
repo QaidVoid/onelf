@@ -224,32 +224,35 @@ pub(crate) enum RunpathOutcome {
     NeedsPatchelf,
 }
 
-/// RUNPATH string written into every bundled binary.
+/// The `$ORIGIN` run path for a file `depth` directories below the tree
+/// root, reaching the library directory `lib_rel`, itself relative to the
+/// root: `bin/app` gets `$ORIGIN/../lib`, `opt/x/bin/app` gets
+/// `$ORIGIN/../../../lib`, and a library in `lib/` gets `$ORIGIN/../lib`.
 ///
-/// Covers a binary sitting at the package root (`blender`), and at depth 1
-/// (`bin/foo`), 2 (`libexec/podman/x`), and 3 (`share/pkg/helpers/y`).
-/// Entries that do not exist are ignored by the loader, so one list serves
-/// every depth.
-///
-/// The root case matters: an application whose executable is the top-level
-/// file, which is how Blender and similar redistributables ship, resolves
-/// `$ORIGIN/../lib` to a directory above the package and finds nothing.
-const ORIGIN_RUNPATH: &str = "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib";
+/// One exact entry per file, rather than one list for every depth. A list
+/// carries entries that resolve outside the tree for every file but one,
+/// and from a tree extracted two directories below `/` the deepest of them
+/// is the host's `/lib`, which is precisely the directory a bundle must
+/// never search.
+pub(crate) fn origin_runpath(depth: usize, lib_rel: &Path) -> String {
+    let mut s = String::from("$ORIGIN");
+    for _ in 0..depth {
+        s.push_str("/..");
+    }
+    s.push('/');
+    s.push_str(&lib_rel.to_string_lossy());
+    s
+}
 
-/// Shorter `$ORIGIN` runpaths, longest first, for a slot too small to
-/// hold the full one. Any of these is safe: an entry that resolves to no
-/// directory is ignored, and none names a host path. The empty string is
-/// the floor, so a too-small slot is always overwritten rather than left
-/// with a host path like `/usr/lib` that a musl host would satisfy with
-/// its own libraries.
-const ORIGIN_RUNPATH_FALLBACKS: &[&str] = &[
-    "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../../lib",
-    "$ORIGIN/lib:$ORIGIN/../lib",
-    "$ORIGIN/../lib",
-    "$ORIGIN/lib",
-    "$ORIGIN",
-    "",
-];
+/// The `$ORIGIN` run path for `path` in the tree at `root`.
+pub(crate) fn origin_runpath_for(root: &Path, path: &Path, lib_rel: &Path) -> String {
+    let depth = path
+        .parent()
+        .and_then(|dir| dir.strip_prefix(root).ok())
+        .map(|rel| rel.components().count())
+        .unwrap_or(0);
+    origin_runpath(depth, lib_rel)
+}
 
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes.
 ///
@@ -285,8 +288,12 @@ fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     Some((off as usize, (off + strsz) as usize))
 }
 
-fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<RunpathOutcome> {
-    let new_bytes = ORIGIN_RUNPATH.as_bytes();
+fn rewrite_origin_runpath_in(
+    data: &mut [u8],
+    path: &Path,
+    runpath: &str,
+) -> io::Result<RunpathOutcome> {
+    let new_bytes = runpath.as_bytes();
     let is_self_extract = has_embedded_payload(data);
 
     let elf = match goblin::elf::Elf::parse(data) {
@@ -347,13 +354,13 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
             end += 1;
         }
         let slot_size = end - file_pos;
-        // The full runpath when it fits, else the longest `$ORIGIN`
-        // fallback that does. The slot is always overwritten: leaving its
-        // old contents would keep an absolute host path such as `/usr/lib`,
-        // which on a musl host loads the host's own libraries into a glibc
-        // process (see ORIGIN_RUNPATH_FALLBACKS).
-        let write = std::iter::once(ORIGIN_RUNPATH)
-            .chain(ORIGIN_RUNPATH_FALLBACKS.iter().copied())
+        // The runpath when it fits, else `$ORIGIN` alone, else nothing.
+        // The slot is always overwritten: leaving its old contents would
+        // keep an absolute host path such as `/usr/lib`, which on a musl
+        // host loads the host's own libraries into a glibc process. Any
+        // of the three names no host path.
+        let write = [runpath, "$ORIGIN", ""]
+            .into_iter()
             .find(|s| s.len() < slot_size)
             .unwrap_or("");
         data[file_pos..file_pos + write.len()].copy_from_slice(write.as_bytes());
@@ -417,14 +424,14 @@ fn rewrite_origin_runpath_in(data: &mut [u8], path: &Path) -> io::Result<Runpath
 
 /// Run `patchelf --set-rpath` against `path`, reporting whether the RUNPATH
 /// ended up guaranteed.
-fn run_patchelf_rpath(path: &Path, patchelf: Option<&Path>) -> RunpathOutcome {
+fn run_patchelf_rpath(path: &Path, runpath: &str, patchelf: Option<&Path>) -> RunpathOutcome {
     let Some(patchelf) = patchelf else {
         return RunpathOutcome::Unguaranteed;
     };
     match std::process::Command::new(patchelf)
         .arg("--force-rpath")
         .arg("--set-rpath")
-        .arg(ORIGIN_RUNPATH)
+        .arg(runpath)
         .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -515,7 +522,10 @@ pub(crate) fn audit_unbundled_needs(
 /// `$ORIGIN/../lib`, scrub `/nix/store` paths, and strip absolute DT_NEEDED
 /// entries, temporarily granting owner-write to read-only files. Returns
 /// `(rewritten, scrubbed, unguaranteed, self_extract)`.
-pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Vec<PathBuf>) {
+pub(crate) fn finalize_tree(
+    directory: &Path,
+    lib_rel: &Path,
+) -> (usize, usize, Vec<PathBuf>, Vec<PathBuf>) {
     let mut rewritten = 0usize;
     let mut scrubbed = 0usize;
     let mut unguaranteed: Vec<PathBuf> = Vec::new();
@@ -533,7 +543,8 @@ pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Ve
             let _ = fs::set_permissions(&path, PermissionsExt::from_mode(perms | 0o200));
         }
 
-        if let Ok((outcome, did_scrub)) = finalize_one(&path, patchelf.as_deref()) {
+        let runpath = origin_runpath_for(directory, &path, lib_rel);
+        if let Ok((outcome, did_scrub)) = finalize_one(&path, &runpath, patchelf.as_deref()) {
             match outcome {
                 RunpathOutcome::Set => rewritten += 1,
                 RunpathOutcome::Unguaranteed => unguaranteed.push(path.clone()),
@@ -563,10 +574,14 @@ pub(crate) fn finalize_tree(directory: &Path) -> (usize, usize, Vec<PathBuf>, Ve
 /// so running them as separate read-modify-write cycles read and wrote each
 /// binary three times over. Returns the RUNPATH outcome and whether any
 /// scrubbing changed the image.
-fn finalize_one(path: &Path, patchelf: Option<&Path>) -> io::Result<(RunpathOutcome, bool)> {
+fn finalize_one(
+    path: &Path,
+    runpath: &str,
+    patchelf: Option<&Path>,
+) -> io::Result<(RunpathOutcome, bool)> {
     let mut data = fs::read(path)?;
 
-    let outcome = rewrite_origin_runpath_in(&mut data, path)?;
+    let outcome = rewrite_origin_runpath_in(&mut data, path, runpath)?;
     let scrubbed = scrub_nix_store_paths_in(&mut data);
     let stripped = strip_absolute_needed_in(&mut data);
 
@@ -577,7 +592,7 @@ fn finalize_one(path: &Path, patchelf: Option<&Path>) -> io::Result<(RunpathOutc
     // patchelf owns the file itself, so it can only run after ours is
     // written back.
     if outcome == RunpathOutcome::NeedsPatchelf {
-        return Ok((run_patchelf_rpath(path, patchelf), scrubbed));
+        return Ok((run_patchelf_rpath(path, runpath, patchelf), scrubbed));
     }
     Ok((outcome, scrubbed))
 }
@@ -1522,7 +1537,7 @@ mod runpath_tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("lib.so");
         fs::write(&path, bytes).unwrap();
-        finalize_one(&path, None).unwrap();
+        finalize_one(&path, "$ORIGIN/../lib", None).unwrap();
         let out = fs::read(&path).unwrap();
         let _ = fs::remove_dir_all(&dir);
         out
@@ -1562,6 +1577,27 @@ mod runpath_tests {
     }
 
     #[test]
+    fn the_runpath_reaches_lib_from_every_depth() {
+        let lib = Path::new("lib");
+        assert_eq!(origin_runpath(0, lib), "$ORIGIN/lib");
+        assert_eq!(origin_runpath(1, lib), "$ORIGIN/../lib");
+        assert_eq!(origin_runpath(3, lib), "$ORIGIN/../../../lib");
+        let root = Path::new("/tree");
+        assert_eq!(
+            origin_runpath_for(root, Path::new("/tree/opt/x/bin/app"), lib),
+            "$ORIGIN/../../../lib"
+        );
+        assert_eq!(
+            origin_runpath_for(root, Path::new("/tree/lib/libfoo.so"), lib),
+            "$ORIGIN/../lib"
+        );
+        assert_eq!(
+            origin_runpath_for(root, Path::new("/tree/app"), Path::new("usr/lib")),
+            "$ORIGIN/usr/lib"
+        );
+    }
+
+    #[test]
     fn large_enough_slot_is_rewritten_in_place() {
         let (bytes, guard_off) = elf_with_runpath(&[b'x'; 80]);
         let out = rewrite("large", &bytes);
@@ -1571,8 +1607,8 @@ mod runpath_tests {
                 .iter()
                 .all(|&b| b == GUARD)
         );
-        let written = &out[guard_off - 81..guard_off - 81 + ORIGIN_RUNPATH.len()];
-        assert_eq!(written, ORIGIN_RUNPATH.as_bytes());
+        let written = &out[guard_off - 81..guard_off - 81 + "$ORIGIN/../lib".len()];
+        assert_eq!(written, b"$ORIGIN/../lib");
     }
 }
 

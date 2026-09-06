@@ -242,7 +242,7 @@ The `bundle-libs` pass prints something like:
 
 ```
 Copied 32 libraries (61.6 MB) to ./lib
-Rewrote RUNPATH to $ORIGIN/../lib in 194 binaries
+Rewrote RUNPATH to reach lib in 194 binaries
 Injected AT_EXECFN bootstrap into 9 binaries
 ```
 

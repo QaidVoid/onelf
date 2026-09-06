@@ -14,12 +14,14 @@ With no flags, this:
 1. Scans every ELF file under `./myapp/` for `DT_NEEDED` entries.
 2. Resolves each soname via ldconfig (or the NixOS store, when detected).
 3. Copies the resolved `.so` files into `./myapp/lib/`.
-4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to
-   `$ORIGIN/../lib:$ORIGIN/../../lib:$ORIGIN/../../../lib`, so the
-   bundled binaries find their libs relative to their own location
-   without needing `LD_LIBRARY_PATH`. For binaries without an existing
-   slot, `bundle-libs` falls back to `patchelf --set-rpath` (when
-   patchelf is in `PATH`) to add a fresh entry.
+4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to the one `$ORIGIN`
+   entry that reaches `lib/` from where the file sits: `$ORIGIN/../lib`
+   for `bin/app`, `$ORIGIN/../../../lib` for `opt/tool/bin/app`. No entry
+   ever resolves outside the tree, so the bundled binaries find their
+   libs relative to their own location without `LD_LIBRARY_PATH` and
+   without a host directory ever being searched. For binaries without an
+   existing slot, `bundle-libs` falls back to `patchelf --set-rpath`
+   (when patchelf is in `PATH`) to add a fresh entry.
 5. Injects an AT_EXECFN bootstrap into each bundled executable. At
    runtime, the bootstrap reads `AT_EXECFN`, computes the bundled
    interpreter path relative to the binary's own location, and jumps

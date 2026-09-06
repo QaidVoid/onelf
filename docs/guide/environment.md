@@ -95,9 +95,9 @@ loop on the re-exec.
 onelf makes this survive by moving the guarantee into the ELF itself,
 not the environment:
 
-- **Libraries**: `bundle-libs` bakes an `$ORIGIN/../lib` `DT_RUNPATH`
-  into binaries, so bundled libs resolve relative to the binary's own
-  location on every exec. Executables that could not get one (no
+- **Libraries**: `bundle-libs` bakes an `$ORIGIN` `DT_RPATH` into every
+  binary, the one entry that reaches `lib/` from the binary's own depth,
+  so bundled libs resolve relative to its location on every exec. Executables that could not get one (no
   in-place slot and no `patchelf`, or self-extract binaries) are
   reported at pack time. They fall back to `LD_LIBRARY_PATH` and are
   not re-exec-safe.
