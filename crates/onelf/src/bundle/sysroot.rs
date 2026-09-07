@@ -589,6 +589,65 @@ fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
     )
 }
 
+/// Rewrite the absolute module paths in a copied cache to paths relative
+/// to the cache itself.
+///
+/// A distribution generates these caches with the paths its own
+/// filesystem uses, `/usr/lib/gdk-pixbuf-2.0/...` and the like. Copied
+/// unchanged into a bundle they name the host's modules, and the host's
+/// modules are built against the host's libc: on a musl host a GTK
+/// application then tries to load a musl module into a glibc process and
+/// says so, repeatedly, while quietly losing its image loaders and input
+/// methods. Both gdk-pixbuf and GTK resolve a relative path against the
+/// directory the cache sits in, which is what makes the bundle's own
+/// copies findable wherever the bundle ends up.
+fn relocate_cache(cache: &Path, tree: &Path) -> io::Result<()> {
+    let Ok(text) = fs::read_to_string(cache) else {
+        return Ok(()); // a binary cache has no paths to rewrite
+    };
+    let Some(dir) = cache.parent() else {
+        return Ok(());
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    let mut changed = false;
+    while let Some(start) = rest.find("\"/") {
+        let (before, after) = rest.split_at(start + 1);
+        out.push_str(before);
+        let Some(end) = after.find('"') else {
+            rest = after;
+            break;
+        };
+        let (path, tail) = after.split_at(end);
+        match relative_in_tree(path, dir, tree) {
+            Some(relative) => {
+                out.push_str(&relative);
+                changed = true;
+            }
+            None => out.push_str(path),
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    if changed {
+        fs::write(cache, out)?;
+    }
+    Ok(())
+}
+
+/// The path `absolute` names, as the cache in `dir` should spell it, when
+/// the tree actually holds that file.
+fn relative_in_tree(absolute: &str, dir: &Path, tree: &Path) -> Option<String> {
+    let mapped = appdir_path(absolute.trim_start_matches('/'));
+    let target = tree.join(Path::new(&mapped));
+    if !target.is_file() {
+        return None;
+    }
+    let from = dir.strip_prefix(tree).ok()?;
+    let to = Path::new(&mapped);
+    Some(relative_path(from, to).to_string_lossy().into_owned())
+}
+
 /// Recreate the soname links a distribution leaves to `ldconfig`, and
 /// return what was made, relative to `dir`.
 ///
@@ -683,6 +742,7 @@ fn copy_generated_caches(root: &Path, tree: &Path) -> io::Result<Vec<String>> {
                 .find(|p| p.is_file());
             let Some(src) = src else { continue };
             fs::copy(&src, &dest)?;
+            relocate_cache(&dest, tree)?;
             super::normalize_mtime(&dest);
             copied.push(rel.join(name).to_string_lossy().into_owned());
         }
@@ -1050,6 +1110,43 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module cache names the packaging distribution's own filesystem.
+    /// Left that way it sends the bundle to the host's modules, which on
+    /// a musl host cannot be loaded into a glibc process at all.
+    #[test]
+    fn a_module_cache_is_rewritten_to_reach_the_bundles_own_copies() {
+        let root = std::env::temp_dir().join(format!(
+            "onelf-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let dir = root.join("lib/gdk-pixbuf-2.0/2.10.0");
+        std::fs::create_dir_all(dir.join("loaders")).unwrap();
+        std::fs::write(dir.join("loaders/libpixbufloader_svg.so"), b"elf").unwrap();
+        let cache = dir.join("loaders.cache");
+        std::fs::write(
+            &cache,
+            "\"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so\"\n\
+             \"svg\" 6 \"gdk-pixbuf\"\n\
+             \"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/absent.so\"\n",
+        )
+        .unwrap();
+
+        relocate_cache(&cache, &root).unwrap();
+
+        let got = std::fs::read_to_string(&cache).unwrap();
+        assert!(
+            got.contains("\"loaders/libpixbufloader_svg.so\""),
+            "the bundle's own copy is named: {got}"
+        );
+        assert!(
+            got.contains("\"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/absent.so\""),
+            "a path the tree does not hold is left alone: {got}"
+        );
+        assert!(got.contains("\"svg\" 6"), "the rest is untouched: {got}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn symlink_targets_are_remapped_relative_to_the_link() {

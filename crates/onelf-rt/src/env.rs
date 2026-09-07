@@ -188,6 +188,7 @@ pub fn setup_env(
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
     setup_qt_plugin_path(pkg, set_roots);
+    setup_glib_modules(pkg, set_roots);
     setup_xdg_data_dirs(pkg, platform_root, set_roots);
 
     // EGL vendor discovery: merge bundled, fetched and host dirs so both
@@ -319,6 +320,102 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
 /// so system themes and desktop integrations still work.
 /// The package's `share/` goes first, a fetched GL build's after it so
 /// the Vulkan loader finds the build's ICD files, then the host's.
+/// Point GLib and GTK at the module caches the package and its sets
+/// carry.
+///
+/// Each of these has a path compiled into the library that reads it, and
+/// that path is the packaging distribution's. Left alone, a bundle finds
+/// the host's image loaders, input methods and GIO modules, which are
+/// built against the host's libc: on a musl host they cannot be loaded
+/// into a glibc process at all, and on a glibc host they are simply the
+/// wrong versions.
+fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
+    let roots = || std::iter::once(pkg).chain(set_roots.iter().map(PathBuf::as_path));
+
+    // The version directory differs between builds, so the cache is
+    // looked for one level down rather than named outright.
+    let cache = |base: &str, name: &str| -> Option<PathBuf> {
+        roots()
+            .flat_map(|root| {
+                std::fs::read_dir(root.join(base))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path().join(name))
+            })
+            .find(|p| p.is_file())
+    };
+    if let Some(path) = cache("lib/gdk-pixbuf-2.0", "loaders.cache")
+        .and_then(|c| absolutised(&c, pkg))
+    {
+        set_if_unset("GDK_PIXBUF_MODULE_FILE", &path);
+    }
+    if let Some(path) = cache("lib/gtk-3.0", "immodules.cache").and_then(|c| absolutised(&c, pkg)) {
+        set_if_unset("GTK_IM_MODULE_FILE", &path);
+    }
+
+    let gio: Vec<String> = roots()
+        .map(|root| root.join("lib/gio/modules"))
+        .filter(|d| d.is_dir())
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    if !gio.is_empty() && env::var_os("GIO_EXTRA_MODULES").is_none() {
+        // SAFETY: the runtime is single-threaded at this point
+        unsafe { env::set_var("GIO_EXTRA_MODULES", gio.join(":")) };
+    }
+}
+
+/// A copy of `cache` whose module paths are absolute, written where the
+/// launch can reach it.
+///
+/// The packed cache names its modules relative to itself, which is the
+/// only form that survives being unpacked anywhere. GTK, though,
+/// resolves such a path against the working directory rather than
+/// against the cache, and so finds nothing. Spelling the paths out at
+/// launch, when the root is finally known, satisfies both.
+fn absolutised(cache: &Path, pkg: &Path) -> Option<PathBuf> {
+    let dir = cache.parent()?;
+    let text = std::fs::read_to_string(cache).ok()?;
+    let mut out = String::with_capacity(text.len() + 256);
+    let mut rewrote = false;
+    for (i, piece) in text.split('"').enumerate() {
+        if i > 0 {
+            out.push('"');
+        }
+        // Odd pieces are the quoted ones. A module path is the only kind
+        // with a directory in it and a shared object at the end.
+        let is_module =
+            i % 2 == 1 && piece.contains('/') && piece.contains(".so") && !piece.starts_with('/');
+        if is_module {
+            out.push_str(&dir.join(piece).to_string_lossy());
+            rewrote = true;
+        } else {
+            out.push_str(piece);
+        }
+    }
+    if !rewrote {
+        return Some(cache.to_path_buf());
+    }
+    // Named after the package root, which carries the package's hash, so
+    // a second launch of the same package reuses this rather than
+    // leaving another copy behind.
+    let dest_dir = env::temp_dir().join(format!(
+        "onelf-modules-{}",
+        pkg.file_name()?.to_string_lossy()
+    ));
+    std::fs::create_dir_all(&dest_dir).ok()?;
+    let dest = dest_dir.join(cache.file_name()?);
+    std::fs::write(&dest, out).ok()?;
+    Some(dest)
+}
+
+fn set_if_unset(name: &str, value: &Path) {
+    if env::var_os(name).is_none() {
+        // SAFETY: the runtime is single-threaded at this point
+        unsafe { env::set_var(name, value) };
+    }
+}
+
 /// Point Qt at the plugin directories the package and its sets carry.
 ///
 /// A relocatable Qt finds its plugins relative to the executable, which
