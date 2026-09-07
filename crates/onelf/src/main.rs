@@ -64,7 +64,7 @@ enum Commands {
         lib_dir: Vec<String>,
 
         /// Zstd compression level (0-22)
-        #[arg(long, default_value = "12")]
+        #[arg(long, default_value = "19")]
         level: i32,
 
         /// Bytes per payload block, with an optional K/M suffix (4K to 32M)

@@ -163,7 +163,9 @@ impl Default for Compression {
 }
 
 fn default_level() -> i32 {
-    12
+    // 19 rather than 12: measured on a real bundle it is 6% smaller for
+    // pack-time cost only, and 22 buys nothing further.
+    19
 }
 
 fn default_block_size() -> u64 {

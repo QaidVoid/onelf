@@ -41,7 +41,7 @@ path = "bin/amdgpu_top"
 args = ["--gui"]
 
 [compression]
-level = 12
+level = 19
 dict = false
 
 [update]
@@ -93,7 +93,7 @@ entrypoint automatically.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `level` | int | `12` | Zstd level, 0 to 22 |
+| `level` | int | `19` | Zstd level, 0 to 22 |
 | `dict` | bool | `false` | Train a shared dictionary for better ratio |
 | `store` | bool | `false` | Store payload raw, no zstd (overrides `dict`/`level`) |
 

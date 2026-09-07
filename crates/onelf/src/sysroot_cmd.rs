@@ -275,7 +275,7 @@ fn pack_tree(
             entrypoints: Vec::new(),
             default_entrypoint: None,
             lib_dirs: vec!["auto".to_string()],
-            level: 12,
+            level: 19,
             block_size: crate::compress::DEFAULT_BLOCK_SIZE,
             use_dict: false,
             no_compress: false,

@@ -70,7 +70,7 @@ default unless another entry has `default = true`.
 
 ```toml
 [compression]
-level = 12            # i32, 0..=22, default 12
+level = 19            # i32, 0..=22, default 19
 block-size = 262144   # u64 bytes, 4 KiB..=32 MiB, default 256 KiB
 dict = false          # bool, default false
 store = false         # bool, default false
