@@ -31,8 +31,8 @@ pub(crate) fn set_var_checked(key: &str, value: &str) {
 /// For shebang scripts (non-ELF target), returns an empty string: the
 /// kernel hands off to a host interpreter linked against the host glibc,
 /// and pointing it at our bundled libs would mix two glibcs in one
-/// process. Scripts that need bundled libs must export `LD_LIBRARY_PATH`
-/// themselves before execing bundled binaries.
+/// process. Scripts that need bundled libs export `LD_LIBRARY_PATH`
+/// from `ONELF_LIB_PATH` themselves before execing bundled binaries.
 // Describes a single exec; every argument is distinct and a parameter
 // object would be built at each call site and read once.
 #[allow(clippy::too_many_arguments)]
@@ -81,7 +81,7 @@ pub fn setup_env(
     // directory is ever placed here: a soname the bundle lacks and the
     // resolver did not choose must fail by name rather than be satisfied
     // by whatever the host has.
-    if target_is_elf && !lib_subpath.is_empty() {
+    if !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
             .map(|p| pkg.join(p).to_string_lossy().to_string())
@@ -119,6 +119,11 @@ pub fn setup_env(
             // bootstrap path, which drives no linker invocation of its own,
             // still sets the variable, and it does so on that command alone
             // (see interp::build_exec_command).
+
+            // For a script entrypoint to export as LD_LIBRARY_PATH.
+            unsafe {
+                env::set_var("ONELF_LIB_PATH", &lib_path);
+            }
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir
             // contains a dri/ subdirectory (both use the same paths). A
@@ -301,7 +306,11 @@ pub fn setup_env(
         }
     }
 
-    lib_path
+    if target_is_elf {
+        lib_path
+    } else {
+        String::new()
+    }
 }
 
 /// Check whether `path` is an ELF file (first four bytes `\x7fELF`).
@@ -345,8 +354,8 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
             })
             .find(|p| p.is_file())
     };
-    if let Some(path) = cache("lib/gdk-pixbuf-2.0", "loaders.cache")
-        .and_then(|c| absolutised(&c, pkg))
+    if let Some(path) =
+        cache("lib/gdk-pixbuf-2.0", "loaders.cache").and_then(|c| absolutised(&c, pkg))
     {
         set_if_unset("GDK_PIXBUF_MODULE_FILE", &path);
     }
@@ -603,5 +612,44 @@ mod set_var_tests {
         }
         set_var_checked("ONELF_TEST_SET_VAR_CHECKED", "ok");
         assert_eq!(env::var("ONELF_TEST_SET_VAR_CHECKED").as_deref(), Ok("ok"));
+    }
+}
+
+#[cfg(test)]
+mod setup_env_tests {
+    use super::*;
+
+    fn call(target_path: &str) -> String {
+        setup_env(
+            "/pkg",
+            "app",
+            "/exec",
+            "ep",
+            "test",
+            "lib",
+            target_path,
+            None,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    #[test]
+    fn a_script_entrypoint_publishes_the_path_but_returns_none() {
+        let dir = env::temp_dir().join(format!("onelf-setup-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("script");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let elf = dir.join("binary");
+        std::fs::write(&elf, b"\x7fELF").unwrap();
+
+        unsafe { env::remove_var("ONELF_LIB_PATH") };
+        let returned = call(script.to_str().unwrap());
+        assert!(returned.is_empty());
+        assert!(env::var("ONELF_LIB_PATH").unwrap().starts_with("/pkg/lib"));
+
+        let returned = call(elf.to_str().unwrap());
+        assert!(returned.starts_with("/pkg/lib"));
     }
 }

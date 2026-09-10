@@ -19,6 +19,7 @@ Reference for all environment variables onelf reads or sets.
 | Variable | Set when | Points to |
 |----------|----------|-----------|
 | `LD_LIBRARY_PATH` | `lib/` contains `.so` files | the resolver's link farm of chosen host libraries, then `<pkg>/lib` on explicit linker invocations |
+| `ONELF_LIB_PATH` | `lib/` contains `.so` files | the link farm, then the bundled lib dirs, for a script entrypoint to export as `LD_LIBRARY_PATH` |
 | `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
@@ -38,6 +39,11 @@ invocations. Both mechanisms cover the bundled lib search; the env
 var gets inherited by child processes the app spawns. No host directory
 appears in either: what the host supplies is chosen per library by the
 resolver and reached through its link farm.
+
+A script entrypoint (shebang target) runs under a host interpreter that
+must not see the bundled libraries, so it gets neither mechanism: the
+path is published as `ONELF_LIB_PATH` instead, and the script exports it
+as `LD_LIBRARY_PATH` itself before execing bundled binaries.
 
 ## Read by the runtime (user-settable)
 

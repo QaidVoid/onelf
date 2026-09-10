@@ -23,7 +23,7 @@ search-path string of the form:
 <resolver link farm>:<bundle lib dirs>:<previous LD_LIBRARY_PATH>
 ```
 
-That string is used two ways:
+That string is used three ways:
 
 1. Passed to the bundled dynamic linker via `--library-path` when the
    runtime invokes it explicitly.
@@ -33,6 +33,10 @@ That string is used two ways:
    still resolve correctly. A binary that got no `$ORIGIN` run path at
    bundle time (no slot and no `patchelf`) has no other way to the
    bundled libraries, so it receives the whole string instead.
+3. Published as `ONELF_LIB_PATH` for a script entrypoint, which drives
+   no linker invocation of ours and runs under the host interpreter. The
+   script exports it as `LD_LIBRARY_PATH` itself before execing bundled
+   binaries.
 
 The link farm holds the host libraries the runtime's resolver chose for
 this launch: the driver stack the bundle does not carry, and any library

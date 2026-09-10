@@ -61,11 +61,12 @@ pub fn exec(launch: &Launch) -> ! {
         .flat_map(|r| crate::sets::lib_dirs(r))
         .collect();
 
-    let target_is_elf = crate::env::is_elf_file(target_path_s);
-    let resolved = if target_is_elf && !lib_dirs.is_empty() {
-        resolve_for(launch.pkg, launch.pkg_root, &lib_dirs, &set_roots)
-    } else {
+    // The resolver judges the package, not the entrypoint: a script
+    // execs the bundled binaries too.
+    let resolved = if lib_dirs.is_empty() {
         Resolved::default()
+    } else {
+        resolve_for(launch.pkg, launch.pkg_root, &lib_dirs, &set_roots)
     };
     let resolution = &resolved.resolution;
     for name in &resolution.incomparable {
