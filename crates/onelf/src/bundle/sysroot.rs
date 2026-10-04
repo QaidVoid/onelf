@@ -1116,11 +1116,8 @@ mod tests {
     /// a musl host cannot be loaded into a glibc process at all.
     #[test]
     fn a_module_cache_is_rewritten_to_reach_the_bundles_own_copies() {
-        let root = std::env::temp_dir().join(format!(
-            "onelf-cache-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("onelf-cache-{}-{}", std::process::id(), line!()));
         let dir = root.join("lib/gdk-pixbuf-2.0/2.10.0");
         std::fs::create_dir_all(dir.join("loaders")).unwrap();
         std::fs::write(dir.join("loaders/libpixbufloader_svg.so"), b"elf").unwrap();
