@@ -1,4 +1,51 @@
 
+## [0.3.4](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.3...onelf-rt-v0.3.4) - 2026-10-04
+
+### ⛰️  Features
+
+- *(bundle)* Bring glibc's charset converters with libc - ([edebb21](https://github.com/QaidVoid/onelf/commit/edebb21c237a44630a3559ac124950ea73b37a9f))
+- *(pack)* Make the payload block size configurable - ([581728d](https://github.com/QaidVoid/onelf/commit/581728df2fa903feb0cddd361967ff4e7494b0d1))
+- *(rt)* Name the bundled Qt plugin directories - ([5183778](https://github.com/QaidVoid/onelf/commit/5183778c330bad6737fee24ee7d3c4dd6c47c957))
+- *(rt)* Serve a dependency set from its build instead of copying it - ([21797eb](https://github.com/QaidVoid/onelf/commit/21797ebc6d318cdba40ba6e4f4414b63e8708bf0))
+- *(rt)* Fetch and use the dependency sets a package pins - ([73503b5](https://github.com/QaidVoid/onelf/commit/73503b5c9118c2b801e5c1b7aa132f11d4fd2709))
+- *(rt)* Record a trace of opened files under ONELF_TRACE - ([e0b9381](https://github.com/QaidVoid/onelf/commit/e0b938147d28ec46d91e07afd3cc047dd2fc2dae))
+- *(rt)* Fetch the pinned GL build when the host has none - ([25abda3](https://github.com/QaidVoid/onelf/commit/25abda398c10692c9a7d75e9bfa1dbe98abb11f7))
+- *(rt)* Add the runtime-directory mode and make the cache opt-in - ([af70e21](https://github.com/QaidVoid/onelf/commit/af70e2163b8207f5f5c2a0fb23e1a6e3b3c19993))
+- *(rt)* Reclaim dead helper mounts on the next launch - ([1817e36](https://github.com/QaidVoid/onelf/commit/1817e368b2398b6597c5e234dde12d89fd0ec8c2))
+- *(rt)* Run under the host loader when its glibc is newer - ([1adf25c](https://github.com/QaidVoid/onelf/commit/1adf25cd5ffc276f3783c6219cdc3e900ae7ac61))
+- *(rt)* Choose host libraries per soname at launch - ([29856c6](https://github.com/QaidVoid/onelf/commit/29856c6c827f5598d5da8199b1d4cdc48dee1196))
+- *(run)* Resolve host libraries like the packed runtime - ([f2a9573](https://github.com/QaidVoid/onelf/commit/f2a95735792375fccd8aa3791344dbd07d52210c))
+- Make the bundle answer for a compiled-in path - ([723801f](https://github.com/QaidVoid/onelf/commit/723801f4f0ab7995ea72c7e2292e226517a02ea8))
+
+### 🐛 Bug Fixes
+
+- *(integrate)* Quote Exec paths in both integrators - ([259e09b](https://github.com/QaidVoid/onelf/commit/259e09be6896170e9d89d4331cc800d6e3f54eda))
+- *(pack)* Keep the resolver on for a package that pins a build - ([714c753](https://github.com/QaidVoid/onelf/commit/714c75327cf062dbf0f19aa3452b79059bbe3362))
+- *(rt)* Script entrypoints get the resolver's lib path - ([5e4009b](https://github.com/QaidVoid/onelf/commit/5e4009bcc1735aa689ac84ce3b1e72b75be2251b))
+- *(rt)* Find the bundle's own GLib and GTK modules - ([797b353](https://github.com/QaidVoid/onelf/commit/797b35381a008fb7ccc9646421fc38543c3cbada))
+- *(rt)* Fetch the GL build when the host stack is partial - ([8f71321](https://github.com/QaidVoid/onelf/commit/8f71321c043a724cbb9569ef3327e799e70162bf))
+- *(rt)* Put every library dir of a set on the path - ([b90812e](https://github.com/QaidVoid/onelf/commit/b90812e1c7248db9d174f6433706fb1c9076332b))
+- *(rt)* Keep the interp line inside the package - ([3be561a](https://github.com/QaidVoid/onelf/commit/3be561a9e40334efed4869c85054a3397763ac89))
+- *(rt)* Skip env lines std would abort on - ([5b214ce](https://github.com/QaidVoid/onelf/commit/5b214ce8525beb74b583ee5a6afc7b5cb7c24ede))
+- *(rt)* Guard FUSE read against inode zero - ([2b6a147](https://github.com/QaidVoid/onelf/commit/2b6a147194bdc011f5123bc6a3e8094f40ebc583))
+- *(rt)* Hand a binary without an RPATH the bundled library path - ([be38d0c](https://github.com/QaidVoid/onelf/commit/be38d0c589aadec987dc1fe01c71f1058ab66e4d))
+- *(rt)* Require a full BLAKE3 hash in a GL build pin - ([b55476b](https://github.com/QaidVoid/onelf/commit/b55476b6cbb8ba34d42a4a2b893bbea0c2f5efcb))
+- *(rt)* Carry argv as bytes so a non-UTF-8 argument launches - ([60dafba](https://github.com/QaidVoid/onelf/commit/60dafba72c8192b5fea5a6bbd01fbf55315fcb11))
+- *(rt)* Build the mountpoint name from path-safe characters - ([726c2e5](https://github.com/QaidVoid/onelf/commit/726c2e5d0cc5559a34ba47725d51b0ae958867db))
+- *(rt)* Bound every block decode to its manifest length - ([0dac24a](https://github.com/QaidVoid/onelf/commit/0dac24aa5a7c22033fecadcb314b7fa341b49342))
+- *(rt)* Size the userland exec stack like the kernel would - ([bb88286](https://github.com/QaidVoid/onelf/commit/bb882869c5c1c8dc40a3b9a8bbea44e63c80072c))
+- *(rt)* Key content store blobs by mode as well as hash - ([8aebee2](https://github.com/QaidVoid/onelf/commit/8aebee24db72f9afce2be996b100729c27db3271))
+- *(rt)* Validate the footer with the shared reader checks - ([81b69b9](https://github.com/QaidVoid/onelf/commit/81b69b9aab753c77086b794bb106f4aee1e77c38))
+- *(rt)* Close close-on-exec descriptors before userland exec - ([6907f56](https://github.com/QaidVoid/onelf/commit/6907f56975e64a5bd3002d39225b984f301959e4))
+- *(rt)* Keep serving the FUSE mount when the app is stopped - ([fa2ccf9](https://github.com/QaidVoid/onelf/commit/fa2ccf9d1b5cb32b2f8e332271c9ab580da219fc))
+- *(rt)* Key the GL build store by hash so builds coexist - ([907324a](https://github.com/QaidVoid/onelf/commit/907324a40b3bdf2ec87384715cb655a1874eff3d))
+- *(rt)* Keep the fusermount3 descriptor from the app - ([452aebd](https://github.com/QaidVoid/onelf/commit/452aebdf7db254bb2f627758e50eea1b02666d97))
+- *(rt)* Keep a GL build off the search path, refetch a moved pin - ([ea6faac](https://github.com/QaidVoid/onelf/commit/ea6faacbb84b7c97e316ecdbe09c25ab13715ac9))
+
+### ⚡ Performance
+
+- *(rt)* Negotiate FUSE_MAX_PAGES so a read covers a whole block - ([c05dd67](https://github.com/QaidVoid/onelf/commit/c05dd6723a7f6ddd27d24d8aefaac988cf86c05f))
+
 ## [0.3.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.2...onelf-rt-v0.3.3) - 2026-08-23
 
 ### ⛰️  Features

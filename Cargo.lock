@@ -667,7 +667,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onelf"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "blake3",
  "clap",
@@ -688,11 +688,11 @@ dependencies = [
 
 [[package]]
 name = "onelf-format"
-version = "0.3.3"
+version = "0.3.4"
 
 [[package]]
 name = "onelf-rt"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "blake3",
  "ed25519-compact",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "onelf-sysroot"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "glob",
  "tar",
