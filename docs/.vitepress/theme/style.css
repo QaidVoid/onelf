@@ -135,6 +135,18 @@
   font-weight: 600;
 }
 
+/* The slot container is fixed at 320x320 below 960px for a logo-sized
+   image; the terminal needs to set its own height. */
+@media (max-width: 959px) {
+  .VPHero .image-container {
+    width: 100%;
+    height: auto;
+  }
+  .VPHero .image {
+    margin: 0;
+  }
+}
+
 /* Feature cards: flat, bordered, brand top rule on hover. */
 .VPFeature {
   border: 1px solid var(--vp-c-divider);
