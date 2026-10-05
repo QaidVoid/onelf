@@ -141,10 +141,7 @@ impl Trace {
 /// The directories a distribution keeps flat and full: what a run opened
 /// there says nothing about what sits beside it.
 fn is_flat_system_dir(dir: &str) -> bool {
-    matches!(
-        dir,
-        "usr/bin" | "usr/sbin" | "bin" | "sbin" | "usr/lib" | "usr/lib64" | "lib" | "lib64"
-    )
+    matches!(dir, "usr/bin" | "usr/sbin" | "bin" | "sbin") || crate::LIB_DIRS.contains(&dir)
 }
 
 /// The topmost directory of the Python package `rel` belongs to: every

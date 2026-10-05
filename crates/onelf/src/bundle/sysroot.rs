@@ -132,12 +132,6 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     // other files, Mesa's gallium and DRI drivers say, serve that library
     // and nothing in the bundle, and so does what only it depended on.
     let full = db.closure(&owner.name, &opts.optional);
-    let is_top_level_object = |rel: &str| {
-        let Some((dir, name)) = rel.rsplit_once('/') else {
-            return false;
-        };
-        matches!(dir, "usr/lib" | "usr/lib64" | "lib" | "lib64") && name.contains(".so")
-    };
     let host_packages: std::collections::BTreeSet<String> = full
         .packages
         .iter()
@@ -146,7 +140,7 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         .filter(|p| {
             p.files
                 .iter()
-                .any(|f| is_top_level_object(f) && platform.matches(f))
+                .any(|f| onelf_sysroot::is_top_level_lib_object(f) && platform.matches(f))
         })
         .map(|p| p.name.clone())
         .collect();
@@ -249,7 +243,7 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
                         .iter()
                         .filter_map(|n| db.package(n))
                         .flat_map(|p| p.files.iter())
-                        .filter(|f| is_top_level_object(f))
+                        .filter(|f| onelf_sysroot::is_top_level_lib_object(f))
                         .filter_map(|f| f.rsplit('/').next().map(String::from)),
                 );
             }
@@ -520,14 +514,9 @@ fn populate_closure(
             .filter(|n| !packages.contains(n))
             .filter_map(|n| db.package(n))
             .filter(|p| {
-                p.files.iter().any(|f| {
-                    let Some((dir, name)) = f.rsplit_once('/') else {
-                        return false;
-                    };
-                    matches!(dir, "usr/lib" | "usr/lib64" | "lib" | "lib64")
-                        && name.contains(".so")
-                        && platform.matches(f)
-                })
+                p.files
+                    .iter()
+                    .any(|f| onelf_sysroot::is_top_level_lib_object(f) && platform.matches(f))
             })
             .map(|p| p.name.clone())
             .collect(),
@@ -1072,6 +1061,14 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
             "  {} {}",
             color::bold("Host packages:"),
             report.host_packages.join(", ")
+        );
+    } else if !report.packages.is_empty() {
+        // Silence here is a decision, not an accident: say that nothing
+        // on the platform line matched the closure, so a stale line is
+        // visible instead of looking like it never ran.
+        eprintln!(
+            "  {} none; the bundle ships every library in the closure",
+            color::bold("Host packages:")
         );
     }
     if !report.host_provided.is_empty() {

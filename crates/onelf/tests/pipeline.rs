@@ -3432,6 +3432,78 @@ fn a_tampered_block_is_refused_but_neighbours_still_read() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The same tampering, served through FUSE, must fail the read rather
+/// than hand the tampered bytes to the app.
+///
+/// Store mode skips decompression, and per-block hash checks used to be
+/// skipped with it, so a FUSE mount of a `--no-compress` package was the
+/// one path that served corrupt bytes silently. Forcing `ONELF_MODE=fuse`
+/// pins the serving path; soft-skip where FUSE cannot mount.
+#[test]
+fn a_tampered_stored_block_fails_the_fuse_read() {
+    if !fuse_available() {
+        return;
+    }
+    let td = workdir("blocktamperfuse");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\ncat data\n");
+
+    let mut data = Vec::new();
+    for i in 0..4u8 {
+        data.extend(std::iter::repeat_n(b'a' + i, 256 * 1024));
+    }
+    std::fs::write(app.join("data"), &data).unwrap();
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--no-compress"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let needle: Vec<u8> = std::iter::repeat_n(b'd', 4096).collect();
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("last block must be present verbatim in store mode");
+    bytes[at] = b'X';
+    let tampered = td.join("tampered.onelf");
+    std::fs::write(&tampered, &bytes).unwrap();
+    std::fs::set_permissions(
+        &tampered,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut run = Command::new(&tampered);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('X'),
+        "FUSE must not serve tampered stored bytes: {}",
+        &stdout[..stdout.len().min(200)]
+    );
+    assert!(
+        !out.status.success(),
+        "a read that lost bytes must fail the app, stdout: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Every inspection command parses whatever file it is handed, so a footer
 /// claiming regions the file cannot back must produce an error rather than
 /// an allocation sized by the claim.
@@ -5699,6 +5771,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         "usr/lib/fixture/backends",
         "usr/lib/qt6/plugins/platforms",
         "usr/lib/extra",
+        "usr/lib/x86_64-linux-gnu",
         "usr/share/doc/libfixture",
         "usr/share/fixture",
     ] {
@@ -5851,6 +5924,18 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         ],
         &rootfs.join("usr/lib/libGL.so.1"),
     ));
+    // A Debian multiarch library: its package is the host's by a
+    // top-level .so in a directory the flat four-dir list used to miss.
+    write(&src.join("egl.c"), "int egl_probe(void){return 0;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libEGL.so.1",
+            src.join("egl.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/x86_64-linux-gnu/libEGL.so.1"),
+    ));
     write(
         &src.join("app.c"),
         "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}return 0;}\n",
@@ -5954,7 +6039,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &rootfs,
         "libfixture",
         "1.0-1",
-        &["glibc>=2.30", "mesa-fake"],
+        &["glibc>=2.30", "mesa-fake", "egl-multi-fake"],
         &[],
         &[
             "usr/lib/libfixture.so.1",
@@ -5991,6 +6076,14 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
         &["glibc"],
         &[],
         &["usr/lib/libhelper.so.1"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "egl-multi-fake",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/x86_64-linux-gnu/libEGL.so.1"],
     );
     write_pacman_entry(
         &rootfs,
@@ -6033,7 +6126,10 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     assert!(st.success());
 
     let platform_line = td.join("platform-line.txt");
-    write(&platform_line, "# the host's GL stack\nlibGL.so\n");
+    write(
+        &platform_line,
+        "# the host's GL stack\nlibGL.so\nlibEGL.so\n",
+    );
     let policy = td.join("policy.txt");
     write(&policy, "usr/share/doc/**\n");
 
@@ -6139,7 +6235,12 @@ fn a_sysroot_closure_is_bundled_and_pruned() {
         "the platform line keeps the driver out"
     );
     assert!(
-        stderr.contains("Host packages: mesa-fake") && !stderr.contains("libfixture,"),
+        !dir.join("lib/x86_64-linux-gnu/libEGL.so.1").exists(),
+        "the platform line keeps the multiarch library out"
+    );
+    assert!(
+        stderr.contains("Host packages: egl-multi-fake, mesa-fake")
+            && !stderr.contains("libfixture,"),
         "a package is the host's by its top-level libraries only:\n{stderr}"
     );
     assert!(
@@ -6213,7 +6314,7 @@ fn a_sysroot_closure_is_bundled_and_pruned() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success()
-            && stdout.contains("packages: 7")
+            && stdout.contains("packages: 8")
             && stdout.contains("glibc:    2.99-1"),
         "{stdout}"
     );
@@ -8132,6 +8233,172 @@ fn a_package_shipping_fonts_gets_a_fontconfig_file() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("FC=/custom/my-fonts.conf"), "{stdout}");
     assert!(!stdout.contains("<fontconfig>"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+#[test]
+fn a_fifo_in_the_tree_warns_and_is_not_packed() {
+    let td = workdir("fifo");
+    let app = td.join("app");
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\nif [ -e pipe.fifo ]; then echo PRESENT; else echo ABSENT; fi\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let made = Command::new("mkfifo")
+        .arg(app.join("pipe.fifo"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        skip("cannot create a FIFO here");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("warning: dropping fifo"), "{stderr}");
+    assert!(stderr.contains("pipe.fifo"), "{stderr}");
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ABSENT"), "{stdout}");
+    assert!(!stdout.contains("PRESENT"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An external `fusermount3 -u -z` must end the detached server instead
+/// of leaving it spinning.
+///
+/// The unmount signals POLLERR/POLLHUP on the FUSE fd, never POLLIN, and
+/// the dead mount's directory (plus any process still sitting in it)
+/// keeps matching the /proc liveness scan. Between those two, the server
+/// used to loop forever at a full core. The test forces the fusermount3
+/// mount path, daemonizes a holder so the server goes detached, unmounts
+/// from outside, and requires the server to exit.
+#[test]
+fn an_external_unmount_ends_the_detached_server() {
+    if !fuse_available() {
+        return;
+    }
+    let td = workdir("extunmount");
+    let app = td.join("app");
+    // cd into the mount so the backgrounded sleep holds it via its cwd,
+    // keeping the server out of idle-exit until the unmount arrives.
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nnohup sleep 30 >/dev/null 2>&1 &\necho STARTED\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .env("ONELF_FUSE_NO_NAMESPACE", "1");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !stdout.contains("STARTED") {
+        skip("fusermount3 mount path unavailable here");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+
+    // The detached server: a process whose exe is the package file.
+    let server_pid = (1..60).find_map(|_| {
+        let entries = std::fs::read_dir("/proc").ok()?;
+        let mine = std::process::id();
+        entries.flatten().find_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            if pid == mine {
+                return None;
+            }
+            match std::fs::read_link(e.path().join("exe")) {
+                Ok(target) if target == pkg => Some(pid),
+                _ => None,
+            }
+        })
+    });
+    let Some(server_pid) = server_pid else {
+        skip("detached server not found");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    };
+
+    // Exactly one mountpoint under the test's private base.
+    let base = td.join("xdg-run");
+    let mountpoint = std::fs::read_dir(&base)
+        .unwrap()
+        .flatten()
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("onelf-"))
+        })
+        .expect("a mountpoint under the private base")
+        .path();
+
+    let um = Command::new("fusermount3")
+        .args(["-u", "-z", "--"])
+        .arg(&mountpoint)
+        .output()
+        .expect("spawn fusermount3");
+    assert!(
+        um.status.success(),
+        "fusermount3 -u -z failed: {}",
+        String::from_utf8_lossy(&um.stderr)
+    );
+
+    // The server must exit on its own; before the fix it spun forever.
+    let mut gone = false;
+    for _ in 0..300 {
+        if !std::path::Path::new(&format!("/proc/{server_pid}")).exists() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        gone,
+        "detached server (pid {server_pid}) survived an external unmount"
+    );
 
     let _ = std::fs::remove_dir_all(&td);
 }

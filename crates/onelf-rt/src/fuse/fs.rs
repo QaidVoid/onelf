@@ -369,6 +369,16 @@ impl<'a> FuseState<'a> {
                 return;
             }
 
+            // An external unmount (`fusermount3 -u -z`) signals ERR/HUP on
+            // the FUSE fd, never IN. The connection is gone; polling on is
+            // a 100%-core spin, since ERR is always ready.
+            if poll_fds[0]
+                .revents()
+                .intersects(PollFlags::ERR | PollFlags::HUP)
+            {
+                return;
+            }
+
             if !poll_fds[0].revents().intersects(PollFlags::IN) {
                 continue;
             }
@@ -412,7 +422,19 @@ impl<'a> FuseState<'a> {
             let mut poll_fds = [PollFd::new(fuse_fd, PollFlags::IN)];
             let timed_out = match poll(&mut poll_fds, Some(&wait)) {
                 Ok(0) => true,
-                Ok(_) => !poll_fds[0].revents().intersects(PollFlags::IN),
+                Ok(_) => {
+                    // An external unmount arrives as ERR/HUP, not IN.
+                    // The connection is gone; so is any reason to keep
+                    // polling (and, without this, ERR is always ready
+                    // and the loop spins a core flat).
+                    if poll_fds[0]
+                        .revents()
+                        .intersects(PollFlags::ERR | PollFlags::HUP)
+                    {
+                        return;
+                    }
+                    !poll_fds[0].revents().intersects(PollFlags::IN)
+                }
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => return,
             };

@@ -746,7 +746,7 @@ mod fontconfig_conf_tests {
         std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
         std::fs::create_dir_all(set.join("share/mime")).unwrap();
 
-        let conf = fontconfig_conf(&pkg, &[set.clone()]).expect("pkg ships fonts");
+        let conf = fontconfig_conf(&pkg, std::slice::from_ref(&set)).expect("pkg ships fonts");
 
         assert!(conf.contains("<include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"));
         assert!(conf.contains(&format!("<dir>{}</dir>", pkg.join("share/fonts").display())));
@@ -767,7 +767,7 @@ mod fontconfig_conf_tests {
         std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
         std::fs::create_dir_all(set.join("share/fonts")).unwrap();
 
-        let conf = fontconfig_conf(&pkg, &[set.clone()]).expect("both ship fonts");
+        let conf = fontconfig_conf(&pkg, std::slice::from_ref(&set)).expect("both ship fonts");
 
         let pkg_at = conf.find(&format!("<dir>{}</dir>", pkg.join("share/fonts").display()));
         let set_at = conf.find(&format!("<dir>{}</dir>", set.join("share/fonts").display()));

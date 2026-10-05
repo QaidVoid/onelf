@@ -14,7 +14,7 @@ use onelf_format::HostLibsPolicy;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -116,10 +116,43 @@ enum FileSource {
     Memory(Vec<u8>),
 }
 
+/// Open a file the walk recorded, refusing what the walk did not see.
+///
+/// Between the walk and this open the path can be anything: a symlink
+/// swapped in over the regular file, a FIFO that would block `open`
+/// forever with no writer, a device node that would read forever. The
+/// flags refuse the first two and the fstat after open refuses the
+/// rest, so what is read through the handle is a regular file, whatever
+/// the path now names.
+fn open_walked(path: &Path) -> io::Result<std::fs::File> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: changed while packing; no longer a regular file",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
 impl FileSource {
     fn read(&self) -> io::Result<Cow<'_, [u8]>> {
         match self {
-            FileSource::Disk(path) => Ok(Cow::Owned(fs::read(path)?)),
+            FileSource::Disk(path) => {
+                let mut file = open_walked(path)?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf)?;
+                Ok(Cow::Owned(buf))
+            }
             FileSource::Memory(bytes) => Ok(Cow::Borrowed(bytes)),
         }
     }
@@ -533,6 +566,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut dirs: Vec<CollectedDir> = Vec::new();
     let mut files: Vec<CollectedFile> = Vec::new();
     let mut symlinks: Vec<CollectedSymlink> = Vec::new();
+    // Entries the walk silently passes over: kinds the package format has
+    // no representation for, and scratch names that may or may not be
+    // crashed-pack leftovers. Both are reported after the walk.
+    let mut dropped_special: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut dropped_scratch: Vec<PathBuf> = Vec::new();
 
     // The output of a previous pack may sit inside the directory, as it
     // does for a recipe whose AppDir is the recipe's own directory. It is
@@ -564,6 +602,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
         // Scratch a crashed pack left beside its output, not content either.
         if is_scratch_name(&entry.file_name().to_string_lossy()) {
+            dropped_scratch.push(rel_path);
             continue;
         }
 
@@ -613,7 +652,47 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 mtime_secs,
                 mtime_nsec,
             });
+        } else {
+            use std::os::unix::fs::FileTypeExt;
+            let ft = symlink_meta.file_type();
+            let kind = if ft.is_fifo() {
+                "fifo"
+            } else if ft.is_socket() {
+                "socket"
+            } else if ft.is_char_device() {
+                "char device"
+            } else if ft.is_block_device() {
+                "block device"
+            } else {
+                "special file"
+            };
+            dropped_special.push((rel_path, kind));
         }
+    }
+
+    for (path, kind) in dropped_special.iter().take(10) {
+        eprintln!(
+            "warning: dropping {kind} {} (not representable in a package)",
+            path.display()
+        );
+    }
+    if dropped_special.len() > 10 {
+        eprintln!(
+            "warning: dropping {} more special files (not representable in a package)",
+            dropped_special.len() - 10
+        );
+    }
+    for path in dropped_scratch.iter().take(10) {
+        eprintln!(
+            "warning: dropping {} (scratch name left by a crashed pack; rename it if it is content)",
+            path.display()
+        );
+    }
+    if dropped_scratch.len() > 10 {
+        eprintln!(
+            "warning: dropping {} more scratch-named files",
+            dropped_scratch.len() - 10
+        );
     }
 
     // Injected .onelf metadata is synthetic (no filesystem mtime), so
@@ -1545,7 +1624,7 @@ fn bundle_needs_host_libs(files: &[CollectedFile]) -> bool {
             // files, and reading those in full to discover they are not ELF
             // costs more than the whole rest of this scan.
             FileSource::Disk(path) => {
-                let Ok(mut f) = std::fs::File::open(path) else {
+                let Ok(mut f) = open_walked(path) else {
                     continue;
                 };
                 let mut magic = [0u8; 4];
@@ -1613,6 +1692,34 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The walk saw a regular file; by read time the path is anything.
+    /// The open must refuse the impostors fast and read the genuine one.
+    #[test]
+    fn a_swapped_in_path_is_refused_not_hung() {
+        let dir = tmpdir("toctou");
+        let real = dir.join("real.bin");
+        fs::write(&real, b"content").unwrap();
+
+        // A symlink swapped in over the file: O_NOFOLLOW refuses it.
+        let link = dir.join("link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_walked(&link).is_err(), "a symlink must be refused");
+
+        // A socket standing where the file was: the open must fail fast,
+        // exactly like any other non-regular file, not block or spin.
+        let sock = dir.join("sock.bin");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(open_walked(&sock).is_err(), "a socket must be refused");
+
+        // The genuine article still reads through the handle.
+        let mut f = open_walked(&real).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"content");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A minimal, reproducible PackOptions for tests.

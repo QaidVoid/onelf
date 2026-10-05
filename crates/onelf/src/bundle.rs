@@ -308,21 +308,7 @@ const DEFAULT_EXCLUDES: &[&str] = &[
     "linux-vdso.so",
 ];
 
-const STANDARD_LIB_PATHS: &[&str] = &[
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/lib32",
-    "/usr/lib/x86_64-linux-gnu",
-    "/usr/lib/aarch64-linux-gnu",
-    "/usr/lib/i386-linux-gnu",
-    "/usr/lib/arm-linux-gnueabihf",
-    "/lib",
-    "/lib64",
-    "/lib32",
-    "/lib/x86_64-linux-gnu",
-    "/lib/aarch64-linux-gnu",
-    "/lib/i386-linux-gnu",
-];
+pub(crate) use onelf_sysroot::LIB_PATHS as STANDARD_LIB_PATHS;
 
 pub struct BundleOptions {
     pub directory: PathBuf,

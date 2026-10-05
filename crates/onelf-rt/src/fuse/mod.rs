@@ -178,6 +178,13 @@ fn exec_from_mount(
 /// reports "not in use", leaving the previous teardown behaviour in place
 /// rather than holding a mount forever on a guess.
 pub(crate) fn mount_in_use(mountpoint: &Path) -> bool {
+    // A forced unmount (`fusermount3 -u -z`) leaves the directory, and any
+    // process still sitting in it, in place: the path prefix matches even
+    // though nothing is mounted there any more, and this scan would then
+    // hold the dead mount open forever. Only a live mount has users.
+    if !is_live_mount(mountpoint) {
+        return false;
+    }
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
@@ -202,6 +209,23 @@ pub(crate) fn mount_in_use(mountpoint: &Path) -> bool {
         }
     }
     false
+}
+
+/// Whether `mountpoint` is still an actual mount.
+///
+/// `/proc/self/mounts` names mount points verbatim; onelf's mountpoint
+/// names come from `name_stem`, which keeps only characters `/proc` does
+/// not escape, so a plain text comparison is enough.
+fn is_live_mount(mountpoint: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        // Unknowable: claim the mount is live so the /proc scan runs and
+        // the previous behaviour stands.
+        return true;
+    };
+    let mp = mountpoint.to_string_lossy();
+    mounts
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(mp.as_ref()))
 }
 
 fn cleanup_mountpoint(mountpoint: &Path, used_namespace: bool) {
@@ -521,5 +545,34 @@ pub fn execute_fuse(
             eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_in_use_tests {
+    use super::mount_in_use;
+
+    #[test]
+    fn a_dead_mounts_directory_is_not_in_use() {
+        // A forced unmount leaves the directory behind, and any process
+        // still sitting in it keeps the path prefix matching. Before the
+        // live-mount check that read as "in use" and serve_detached held
+        // the corpse open forever.
+        let dir = std::env::temp_dir().join(format!("onelf-miu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inside = dir.join("bin");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&inside)
+            .spawn()
+            .expect("spawn holder");
+
+        assert!(!mount_in_use(&dir), "a non-mount directory has no users");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -103,8 +103,17 @@ pub fn read_payload_entry(
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
 
-    // Store mode: bytes are the file content verbatim, no zstd.
+    // Store mode: bytes are the file content verbatim, no zstd. The hash
+    // check still applies: a corrupt or tampered stored block must fail
+    // the read rather than serve garbage. The FUSE block cache makes
+    // this once per block, so read latency keeps its disk-bound shape.
     if footer.is_stored() {
+        if block.has_content_hash() && blake3::hash(&buf).as_bytes() != &block.content_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "onelf: block hash mismatch (tampered or corrupt package)",
+            ));
+        }
         return Ok(buf);
     }
     let original = onelf_format::reader::block_original_size(block)?;
