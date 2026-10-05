@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::desktop::{exec_arg, exec_arg_tail};
+use onelf_format::desktop::{exec_arg, patch_desktop_file};
 use onelf_format::{Footer, Manifest};
 
 use crate::extract::decompress_verified;
@@ -82,15 +82,21 @@ impl IntegrationContext {
 }
 
 fn xdg_data_home() -> io::Result<PathBuf> {
+    // A relative XDG_DATA_HOME is invalid per the basedir spec; honoring
+    // it would scatter icons under the working directory. Fall through
+    // to the HOME default instead.
     if let Some(val) = std::env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(val));
+        let path = PathBuf::from(val);
+        if path.is_absolute() {
+            return Ok(path);
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
         return Ok(PathBuf::from(home).join(".local/share"));
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "neither $XDG_DATA_HOME nor $HOME is set",
+        "neither a usable $XDG_DATA_HOME nor $HOME is set",
     ))
 }
 
@@ -132,17 +138,23 @@ fn install_icon(
 
     let icon_data = ctx.read_entry(icon_idx)?;
     let icon_path = ctx.manifest.entry_path(icon_idx);
-    let is_svg = icon_path.ends_with(".svg");
 
-    let dest = if is_svg {
+    let dest = if icon_path.ends_with(".svg") {
         let dir = data_home.join("icons/hicolor/scalable/apps");
         fs::create_dir_all(&dir)?;
         dir.join(format!("{int_name}.svg"))
-    } else {
-        let (w, h) = png_dimensions(&icon_data).unwrap_or((256, 256));
+    } else if let Some((w, h)) = png_dimensions(&icon_data) {
         let dir = data_home.join(format!("icons/hicolor/{w}x{h}/apps"));
         fs::create_dir_all(&dir)?;
         dir.join(format!("{int_name}.png"))
+    } else {
+        // An arbitrary file named .png is not a PNG: installing it under
+        // that name gives the theme a broken image.
+        eprintln!(
+            "  Icon {}: neither SVG nor a decodable PNG; not installed",
+            icon_path
+        );
+        return Ok(None);
     };
 
     fs::write(&dest, &icon_data)?;
@@ -183,58 +195,6 @@ fn install_desktop(
     Ok(())
 }
 
-/// Patch `Exec=`, `TryExec=`, and `Icon=` in an existing desktop file.
-fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    let quoted = exec_arg(exec_path);
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let mut has_exec = false;
-    let mut has_tryexec = false;
-
-    for line in &mut lines {
-        if line.starts_with("Exec=") {
-            // Replace the executable (the first argument), keeping the rest of
-            // the command line (arguments / field codes) verbatim.
-            let tail = exec_arg_tail(&line[5..]);
-            if tail.is_empty() {
-                *line = format!("Exec={quoted}");
-            } else {
-                *line = format!("Exec={quoted} {tail}");
-            }
-            has_exec = true;
-        } else if line.starts_with("TryExec=") {
-            *line = format!("TryExec={quoted}");
-            has_tryexec = true;
-        } else if line.starts_with("Icon=")
-            && let Some(name) = icon_name
-        {
-            *line = format!("Icon={name}");
-        }
-    }
-
-    // Insert any missing keys right after the `[Desktop Entry]` header, so
-    // they land in that group. A desktop file can have several groups
-    // (`[Desktop Action ...]`), and appending at EOF could put the key in a
-    // trailing group where it has no effect.
-    let mut insert_at = lines
-        .iter()
-        .position(|l| l.trim() == "[Desktop Entry]")
-        .map(|h| h + 1)
-        .unwrap_or(lines.len());
-    if !has_exec {
-        lines.insert(insert_at, format!("Exec={quoted}"));
-        insert_at += 1;
-    }
-    if !has_tryexec {
-        lines.insert(insert_at, format!("TryExec={quoted}"));
-    }
-
-    let mut result = lines.join("\n");
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
 /// Generate a minimal `.desktop` file.
 fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
     let quoted = exec_arg(exec_path);
@@ -243,7 +203,8 @@ fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -
         "Type=Application".to_string(),
         format!("Name={name}"),
         format!("Exec={quoted}"),
-        format!("TryExec={quoted}"),
+        // A literal path per the spec, not a quoted Exec field.
+        format!("TryExec={exec_path}"),
     ];
     if let Some(icon) = icon_name {
         lines.push(format!("Icon={icon}"));
@@ -364,8 +325,8 @@ mod tests {
         let out = generate_desktop_file("App", "/opt/has space/app", None);
         assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
         assert!(
-            out.contains("TryExec=\"/opt/has space/app\"\n"),
-            "got:\n{out}"
+            out.contains("TryExec=/opt/has space/app\n"),
+            "TryExec is a literal path, not a quoted field: {out}"
         );
     }
 

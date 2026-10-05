@@ -725,7 +725,7 @@ fn dispatch(
         FUSE_READDIRPLUS => handle_readdirplus(header, body, manifest, children),
         FUSE_READLINK => handle_readlink(header, manifest),
         FUSE_STATFS => handle_statfs(header, manifest),
-        FUSE_ACCESS => reply_ok(header, &[]),
+        FUSE_ACCESS => handle_access(header, body, manifest),
         _ => reply_err(header, -libc_enosys()),
     }
 }
@@ -814,6 +814,49 @@ fn handle_lookup(
     }
 
     reply_err(header, -libc_enoent())
+}
+
+/// ACCESS answered honestly instead of with a blanket yes.
+///
+/// Both mount paths set `default_permissions`, so the kernel re-checks
+/// every open against the recorded modes and a wrong answer here cannot
+/// widen what a process may open; this reply only feeds `faccessat(2)`
+/// and the shell's `[ -r ]`-style tests. The check mirrors what the
+/// kernel does for the owner — the mount presents every file as owned
+/// by the launching user — with one deliberate strictness: the mount is
+/// read-only, so a write-access question is denied even when the mode
+/// bits would allow it, matching the EROFS an actual open would get.
+fn handle_access(header: &FuseInHeader, body: &[u8], manifest: &Manifest) -> Vec<u8> {
+    // FUSE_ACCESS_IN carries the mask as one little-endian u32.
+    if body.len() < 4 {
+        return reply_err(header, -libc_eio());
+    }
+    let mask = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let inode = header.nodeid;
+    if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
+        return reply_err(header, -libc_enoent());
+    }
+    let entry = &manifest.entries[inode_to_entry(inode)];
+    if access_allowed(entry.mode, mask) {
+        reply_ok(header, &[])
+    } else {
+        reply_err(header, -libc_eacces())
+    }
+}
+
+/// The owner-bit check for one access question. `mask` is a POSIX access
+/// mask: 0 asks only for existence, otherwise R_OK|W_OK|X_OK bits, all
+/// of which must be granted.
+fn access_allowed(entry_mode: u32, mask: u32) -> bool {
+    const W_OK: u32 = 2;
+    if mask == 0 {
+        return true;
+    }
+    if mask & W_OK != 0 {
+        return false;
+    }
+    let owner = (entry_mode >> 6) & 0o7;
+    owner & mask == mask
 }
 
 fn handle_getattr(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
@@ -1133,6 +1176,9 @@ fn libc_eisdir() -> i32 {
 fn libc_enotdir() -> i32 {
     20
 }
+fn libc_eacces() -> i32 {
+    13
+}
 
 #[cfg(test)]
 mod tests {
@@ -1140,6 +1186,19 @@ mod tests {
 
     fn block(n: usize) -> Vec<u8> {
         vec![0u8; n]
+    }
+
+    #[test]
+    fn access_masks_are_checked_against_owner_bits() {
+        assert!(access_allowed(0o644, 0), "existence is always granted");
+        assert!(access_allowed(0o644, 4), "readable to the owner");
+        assert!(!access_allowed(0o644, 1), "not executable");
+        assert!(!access_allowed(0o644, 2), "the mount is read-only");
+        assert!(!access_allowed(0o644, 6), "R|W needs both, W is denied");
+        assert!(access_allowed(0o400, 4), "owner-only read is readable");
+        assert!(!access_allowed(0o400, 5), "R|X needs both, X is absent");
+        assert!(access_allowed(0o755, 5), "R|X on an executable");
+        assert!(!access_allowed(0o000, 4), "mode 000 grants nothing");
     }
 
     /// A sustained read never goes idle, so the byte budget is the only

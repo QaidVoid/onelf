@@ -45,6 +45,21 @@ pub fn enter_namespace() -> io::Result<()> {
     Ok(())
 }
 
+/// Mount options for the namespace mount: `fd` plus the root dir and
+/// owner, always with [`FUSE_PERM_OPTS`].
+fn namespace_mount_data(fd: i32, uid: u32, gid: u32) -> String {
+    format!("fd={fd},rootmode=40000,user_id={uid},group_id={gid},{FUSE_PERM_OPTS}")
+}
+
+/// The permission posture every mount path must carry.
+///
+/// `default_permissions` makes the kernel enforce the recorded modes
+/// itself, so neither mount path depends on the daemon's judgement to
+/// stay safe; the honest ACCESS reply in `fs.rs` is a second layer, not
+/// the gate. Both mount paths are required to set it, and the test at
+/// the bottom of this file locks that in.
+const FUSE_PERM_OPTS: &str = "default_permissions";
+
 /// Mount a FUSE filesystem directly, after entering a private user+mount
 /// namespace. Returns the /dev/fuse fd. No external helper required.
 ///
@@ -64,13 +79,8 @@ pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
         .open("/dev/fuse")?
         .into();
 
-    // rootmode=040000 = S_IFDIR. `default_permissions` has the kernel
-    // enforce the modes the package recorded, matching the fusermount3 path
-    // so an owner-only file behaves the same under either mount strategy.
-    let data = format!(
-        "fd={},rootmode=40000,user_id={real_uid},group_id={real_gid},default_permissions",
-        fuse_fd.as_raw_fd()
-    );
+    // rootmode=040000 = S_IFDIR.
+    let data = namespace_mount_data(fuse_fd.as_raw_fd(), real_uid, real_gid);
     let data_c = std::ffi::CString::new(data).unwrap();
 
     mount(
@@ -124,7 +134,11 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
 
     let status = unsafe {
         Command::new("fusermount3")
-            .args(["-o", "ro,nosuid,nodev,noatime,default_permissions", "--"])
+            .args([
+                "-o",
+                &format!("ro,nosuid,nodev,noatime,{FUSE_PERM_OPTS}"),
+                "--",
+            ])
             .arg(mountpoint)
             .env("_FUSE_COMMFD", child_fd.to_string())
             .pre_exec(move || {
@@ -195,4 +209,23 @@ pub fn fusermount3_available() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+#[cfg(test)]
+mod perm_opts_tests {
+    use super::{FUSE_PERM_OPTS, namespace_mount_data};
+
+    /// The permission invariant the ACCESS handler leans on: whatever
+    /// else changes, both mount paths must make the kernel enforce the
+    /// recorded modes, or `default_permissions` safety is gone.
+    #[test]
+    fn both_mount_paths_enforce_default_permissions() {
+        let data = namespace_mount_data(7, 1000, 1000);
+        assert!(data.starts_with("fd=7,rootmode=40000"), "{data}");
+        assert!(data.contains(FUSE_PERM_OPTS), "namespace mount: {data}");
+        assert!(
+            data.contains("user_id=1000") && data.contains("group_id=1000"),
+            "{data}"
+        );
+    }
 }

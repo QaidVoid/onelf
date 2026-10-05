@@ -10,17 +10,28 @@ use std::path::{Path, PathBuf};
 
 use crate::loader::PackageData;
 use crate::metadata::{resolve_desktop, resolve_icon};
+use onelf_format::desktop::patch_desktop_file;
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
     crate::loader::read_payload_blocks(&mut pkg.file, &pkg.footer, &blocks, pkg.dict.as_deref())
 }
 
-fn xdg_data_home() -> Option<PathBuf> {
-    if let Some(val) = std::env::var_os("XDG_DATA_HOME") {
-        return Some(PathBuf::from(val));
+fn xdg_data_home_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    // A relative XDG_DATA_HOME is invalid per the basedir spec; honoring
+    // it would scatter icons under the working directory. Fall through
+    // to the HOME default instead.
+    if let Some(val) = xdg {
+        let path = PathBuf::from(val);
+        if path.is_absolute() {
+            return Some(path);
+        }
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+    home.map(|h| PathBuf::from(h).join(".local/share"))
+}
+
+fn xdg_data_home() -> Option<PathBuf> {
+    xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
 fn integration_name(pkg_name: &str) -> String {
@@ -72,47 +83,6 @@ fn remove_icons(hicolor: &Path, int_name: &str) {
     }
 }
 
-fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    use onelf_format::desktop::{exec_arg, exec_arg_tail};
-
-    let quoted = exec_arg(exec_path);
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let mut has_exec = false;
-    let mut has_tryexec = false;
-
-    for line in &mut lines {
-        if line.starts_with("Exec=") {
-            let tail = exec_arg_tail(&line[5..]);
-            if tail.is_empty() {
-                *line = format!("Exec={quoted}");
-            } else {
-                *line = format!("Exec={quoted} {tail}");
-            }
-            has_exec = true;
-        } else if line.starts_with("TryExec=") {
-            *line = format!("TryExec={quoted}");
-            has_tryexec = true;
-        } else if line.starts_with("Icon=")
-            && let Some(name) = icon_name
-        {
-            *line = format!("Icon={name}");
-        }
-    }
-
-    if !has_exec {
-        lines.push(format!("Exec={quoted}"));
-    }
-    if !has_tryexec {
-        lines.push(format!("TryExec={quoted}"));
-    }
-
-    let mut result = lines.join("\n");
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
 fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
     let quoted = onelf_format::desktop::exec_arg(exec_path);
     let mut lines = vec![
@@ -120,7 +90,8 @@ fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -
         "Type=Application".to_string(),
         format!("Name={name}"),
         format!("Exec={quoted}"),
-        format!("TryExec={quoted}"),
+        // A literal path per the spec, not a quoted Exec field.
+        format!("TryExec={exec_path}"),
     ];
     if let Some(icon) = icon_name {
         lines.push(format!("Icon={icon}"));
@@ -163,25 +134,37 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
         match read_entry(pkg, icon_idx) {
             Ok(icon_data) => {
                 let icon_path = pkg.manifest.entry_path(icon_idx);
-                let is_svg = icon_path.ends_with(".svg");
-
-                let dest = if is_svg {
+                let dest = if icon_path.ends_with(".svg") {
                     let dir = data_home.join("icons/hicolor/scalable/apps");
                     let _ = fs::create_dir_all(&dir);
-                    dir.join(format!("{int_name}.svg"))
-                } else {
-                    let (w, h) = png_dimensions(&icon_data).unwrap_or((256, 256));
+                    Some(dir.join(format!("{int_name}.svg")))
+                } else if let Some((w, h)) = png_dimensions(&icon_data) {
                     let dir = data_home.join(format!("icons/hicolor/{w}x{h}/apps"));
                     let _ = fs::create_dir_all(&dir);
-                    dir.join(format!("{int_name}.png"))
+                    Some(dir.join(format!("{int_name}.png")))
+                } else {
+                    // An arbitrary file named .png is not a PNG: installing
+                    // it under that name gives the theme a broken image.
+                    eprintln!(
+                        "onelf-rt: icon {} is neither SVG nor a decodable PNG; not installed",
+                        icon_path
+                    );
+                    None
                 };
 
-                if let Err(e) = fs::write(&dest, &icon_data) {
-                    eprintln!("onelf-rt: failed to write icon: {e}");
-                } else {
-                    eprintln!("  Icon: {}", dest.display());
+                match dest {
+                    Some(dest) => match fs::write(&dest, &icon_data) {
+                        Ok(()) => {
+                            eprintln!("  Icon: {}", dest.display());
+                            Some(int_name.clone())
+                        }
+                        Err(e) => {
+                            eprintln!("onelf-rt: failed to write icon: {e}");
+                            None
+                        }
+                    },
+                    None => None,
                 }
-                Some(int_name.clone())
             }
             Err(e) => {
                 eprintln!("onelf-rt: failed to read icon: {e}");
@@ -289,18 +272,42 @@ pub fn handle_integrate_flags(
 
 #[cfg(test)]
 mod tests {
-    use super::patch_desktop_file;
+    use std::path::PathBuf;
+
+    use super::{generate_desktop_file, xdg_data_home_from};
 
     #[test]
-    fn patch_quotes_a_path_with_spaces_and_keeps_the_tail() {
-        let desktop = "[Desktop Entry]\nExec=\"/opt/my app/bin\" %F\nIcon=old\n";
-        let out = patch_desktop_file(desktop, "/home/me/My Apps/app.onelf", Some("new"));
+    fn generated_file_quotes_exec_and_keeps_tryexec_literal() {
+        let out = generate_desktop_file("App", "/opt/has space/app", Some("icon"));
+        assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
         assert!(
-            out.contains("Exec=\"/home/me/My Apps/app.onelf\" %F\n"),
-            "got:\n{out}"
+            out.contains("TryExec=/opt/has space/app\n"),
+            "TryExec is a literal path: {out}"
         );
-        assert!(out.contains("TryExec=\"/home/me/My Apps/app.onelf\"\n"));
-        assert!(!out.contains("app/bin"), "stale fragment left:\n{out}");
-        assert!(out.contains("Icon=new\n"));
+        assert!(out.contains("Icon=icon\n"));
+    }
+
+    #[test]
+    fn a_relative_xdg_data_home_falls_back_to_home() {
+        use std::ffi::OsString;
+        assert_eq!(
+            xdg_data_home_from(
+                Some(OsString::from("relative/path")),
+                Some(OsString::from("/home/me"))
+            )
+            .unwrap(),
+            PathBuf::from("/home/me/.local/share")
+        );
+        // An absolute one is honored.
+        assert_eq!(
+            xdg_data_home_from(
+                Some(OsString::from("/abs/data")),
+                Some(OsString::from("/home/me"))
+            )
+            .unwrap(),
+            PathBuf::from("/abs/data")
+        );
+        // No usable XDG and no HOME: nothing to install into.
+        assert!(xdg_data_home_from(Some(OsString::from("rel")), None).is_none());
     }
 }

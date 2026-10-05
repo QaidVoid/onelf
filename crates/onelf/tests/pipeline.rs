@@ -8402,3 +8402,81 @@ fn an_external_unmount_ends_the_detached_server() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// Permission tests through a running FUSE mount must reflect the
+/// recorded modes, and the read-only mount must not promise writes.
+///
+/// The kernel answers these (`default_permissions` is part of the
+/// mount invariant the unit test locks in), so this is the regression
+/// test for the `access()` honesty work: whichever layer answers, the
+/// observable answers stay true.
+#[test]
+fn fuse_permission_tests_reflect_recorded_modes() {
+    if !fuse_available() {
+        return;
+    }
+    let td = workdir("fuseaccess");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncd \"$(dirname \"$0\")/..\" || exit 1\n\
+         [ -r data/plain ] && echo R-plain\n\
+         [ -r data/secret ] && echo R-secret\n\
+         [ -w data/plain ] && echo W-plain\n\
+         [ -x data/plain ] && echo X-plain\n\
+         [ -x bin/run ] && echo X-run\n\
+         echo done\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(&app.join("data/plain"), "plain\n");
+    std::fs::set_permissions(
+        app.join("data/plain"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .unwrap();
+    write(&app.join("data/secret"), "secret\n");
+    std::fs::set_permissions(
+        app.join("data/secret"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+    )
+    .unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in ["R-plain", "R-secret", "X-run", "done"] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+    for refused in ["W-plain", "X-plain"] {
+        assert!(
+            !stdout.contains(refused),
+            "{refused} must be denied on a read-only mount: {stdout}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}

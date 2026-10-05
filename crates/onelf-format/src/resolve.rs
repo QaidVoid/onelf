@@ -538,19 +538,34 @@ fn fingerprint(
 
 const DECISION_FILE: &str = "decision";
 
-/// The link farm for one host state. Keyed by the fingerprint, so a
-/// launch after the host changed builds a new one beside the old rather
-/// than replacing it: an instance started earlier may still be loading
-/// through the old farm, and two instances starting together build the
-/// same one and race for nothing.
-fn farm_dir(store: &Path, fingerprint: &str) -> PathBuf {
-    // FNV-1a, so the name is stable across runs without a hash dependency.
+/// The link farm for one host state. Keyed by the fingerprint and the
+/// winners themselves: two decisions can share a fingerprint (an
+/// in-place library swap leaves the directory stamps alone) yet pick
+/// different winners, and a farm reused across them would serve the
+/// previous decision's stale links. A launch after the host changed
+/// builds a new one beside the old rather than replacing it: an
+/// instance started earlier may still be loading through the old farm,
+/// and two instances starting together build the same one and race for
+/// nothing.
+fn farm_dir(store: &Path, fingerprint: &str, winners: &BTreeMap<String, PathBuf>) -> PathBuf {
+    // FNV-1a, so the names are stable across runs without a hash
+    // dependency.
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0100_0000_01b3);
+    };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in fingerprint.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
+        mix(&mut h, b);
     }
-    store.join(format!("farm-{h:016x}"))
+    let mut w: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, path) in winners {
+        for b in name.bytes().chain(path.to_string_lossy().bytes()) {
+            mix(&mut w, b);
+        }
+        mix(&mut w, 0x1f);
+    }
+    store.join(format!("farm-{h:016x}-{w:016x}"))
 }
 
 /// The link farm for `fingerprint` holding `winners`, built if it does not
@@ -567,7 +582,7 @@ fn materialize(
     if winners.is_empty() {
         return Ok(None);
     }
-    let farm = farm_dir(store, fingerprint);
+    let farm = farm_dir(store, fingerprint, winners);
     if farm.is_dir() {
         return Ok(Some(farm));
     }
@@ -602,13 +617,19 @@ fn record(
 ) -> io::Result<()> {
     fs::create_dir_all(store)?;
     let mut text = String::new();
-    text.push_str("onelf-resolve 1\n");
+    text.push_str("onelf-resolve 2\n");
     text.push_str(&format!("fingerprint {fingerprint}\n"));
     if let Some(interp) = &resolution.host_interp {
         text.push_str(&format!("interp {}\n", interp.display()));
     }
     for (name, path) in winners {
         text.push_str(&format!("host {name}\t{}\n", path.display()));
+    }
+    // The identity of every winner, so the next launch can tell an
+    // in-place same-size swap (invisible to the directory stamps) from
+    // the host the decision was made about.
+    for (name, path) in winners {
+        text.push_str(&format!("stat {name}\t{}\n", stat_line(path)));
     }
     for name in &resolution.incomparable {
         text.push_str(&format!("incomparable {name}\n"));
@@ -618,19 +639,40 @@ fn record(
     fs::rename(&tmp, store.join(DECISION_FILE))
 }
 
+/// The identity of one file: size, inode, and both times, separated by
+/// colons. `missing` when the file cannot be stat'ed at all.
+fn stat_line(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(md) => {
+            use std::os::unix::fs::MetadataExt;
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                md.len(),
+                md.ino(),
+                md.mtime(),
+                md.mtime_nsec(),
+                md.ctime(),
+                md.ctime_nsec()
+            )
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
 /// The recorded decision, when it was made for this exact host state and
 /// everything it names still exists.
 fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
     let text = fs::read_to_string(store.join(DECISION_FILE)).ok()?;
     let mut lines = text.lines();
-    if lines.next()? != "onelf-resolve 1" {
+    if lines.next()? != "onelf-resolve 2" {
         return None;
     }
     if lines.next()?.strip_prefix("fingerprint ")? != fingerprint {
         return None;
     }
-    let farm = farm_dir(store, fingerprint);
     let mut resolution = Resolution::default();
+    let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut any_host = false;
     for line in lines {
         if let Some(interp) = line.strip_prefix("interp ") {
             let interp = PathBuf::from(interp);
@@ -640,16 +682,33 @@ fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
             resolution.host_interp = Some(interp);
         } else if let Some(rest) = line.strip_prefix("host ") {
             let (name, path) = rest.split_once('\t')?;
-            let link = farm.join(name);
-            if !Path::new(path).is_file() || fs::read_link(&link).ok()? != Path::new(path) {
+            winners.insert(name.to_string(), PathBuf::from(path));
+            any_host = true;
+        } else if let Some(rest) = line.strip_prefix("stat ") {
+            let (name, recorded) = rest.split_once('\t')?;
+            let path = winners.get(name)?;
+            if stat_line(path) != recorded {
                 return None;
             }
-            resolution.farm = Some(farm.clone());
         } else {
             let name = line.strip_prefix("incomparable ")?;
             resolution.incomparable.push(name.to_string());
         }
     }
+    if !any_host {
+        return Some(resolution);
+    }
+    // The farm is keyed by the winners as recorded, so the links are
+    // checked where this decision says they are, not where a stale
+    // earlier decision left them.
+    let farm = farm_dir(store, fingerprint, &winners);
+    for (name, path) in &winners {
+        match fs::read_link(farm.join(name)) {
+            Ok(target) if target == path.as_path() && path.is_file() => {}
+            _ => return None,
+        }
+    }
+    resolution.farm = Some(farm);
     Some(resolution)
 }
 
@@ -960,17 +1019,52 @@ mod tests {
         let first = w.resolve(HostLibsPolicy::Auto);
         assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
 
-        // Rewriting the file in place changes neither the cache nor the
-        // directory, so the recorded decision still stands.
-        fs::write(&host_foo, versioned(&["FOO_1.0"])).unwrap();
+        // Nothing changed: the recorded decision is reused as it stands.
         assert_eq!(w.resolve(HostLibsPolicy::Auto), first);
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+
+        // Rewriting the file in place changes neither the cache nor the
+        // directory, but the decision records the winner's own stat, so
+        // this is re-judged. The rewritten copy now matches the bundle's
+        // version exactly, and the bundle keeps its own.
+        fs::write(&host_foo, versioned(&["FOO_1.0"])).unwrap();
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(w.farm_link("libfoo.so.1").is_none());
 
         // A new entry in the directory is a host change; the fresh
-        // comparison now sees an equal host copy and keeps the bundle.
+        // comparison agrees with what the re-judgement found.
         fs::write(w.host_lib.join("libnew.so.1"), versioned(&[])).unwrap();
         bump_mtime(&w.host_lib);
         w.resolve(HostLibsPolicy::Auto);
         assert!(w.farm_link("libfoo.so.1").is_none());
+    }
+
+    #[test]
+    fn an_in_place_same_size_swap_is_not_served_stale() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+
+        // Same byte count, different versions: neither side's version set
+        // contains the other's, so the recorded decision is void. The
+        // directory stamps see nothing here. The mtime is pinned to a
+        // distinct instant because two writes in one kernel timestamp
+        // tick share ctime; a real swap always lands later.
+        fs::write(&host_foo, versioned(&["FOO_0.9", "FOO_1.1"])).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&host_foo)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(
+            w.farm_link("libfoo.so.1").is_none(),
+            "a swapped winner must be re-judged, not served from the record"
+        );
     }
 
     #[test]
