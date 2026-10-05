@@ -189,10 +189,11 @@ fn shadow_bundled_copies(farm: &Path, launch: &Launch, lib_dirs: &[&str]) {
 /// itself, so it is kernel-exec'd with `ONELF_INTERP` naming the host
 /// loader; the bootstrap honours that over its own relative path, and so
 /// does every re-exec the app performs. Anything else runs under the host
-/// loader directly: userland exec keeps `/proc/self/exe` pointing at the
-/// entrypoint, and a non-PIE binary, or one that carries a trailer the
-/// loader path cannot preserve, is handed to the loader on its command
-/// line instead.
+/// loader directly: userland exec never updates `/proc/self/exe`, so it
+/// keeps naming the packed file rather than the entrypoint, which ordinary
+/// binaries do not mind, and a non-PIE binary, or one that carries a
+/// trailer the loader path cannot preserve, is handed to the loader on its
+/// command line instead.
 fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, launch: &Launch) {
     let interp = crate::interp::read_elf_interp(target);
     // A self-extracting binary needs `/proc/self/exe` to be itself, which

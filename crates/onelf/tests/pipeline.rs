@@ -105,7 +105,7 @@ fn skip(reason: &str) {
     if std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
         panic!("skip under CI: {reason}");
     }
-    skip("{reason}");
+    eprintln!("skip: {reason}");
 }
 
 /// Spawn a packed binary, retrying briefly while the kernel reports the

@@ -14,7 +14,7 @@
 //! args = ["--no-gui"]
 //!
 //! [compression]
-//! level = 12
+//! level = 19
 //! dict = true
 //!
 //! [update]

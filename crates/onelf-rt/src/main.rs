@@ -132,7 +132,7 @@ fn main() {
     // `ONELF_MODE` forces a mode; the mode actually chosen is reported
     // separately as `ONELF_ACTIVE_MODE`, so a packed app that launches
     // another one does not hand it a directive. Default order:
-    // memfd (if eligible) -> fuse -> tmpfs -> cache.
+    // memfd (if eligible) -> fuse -> tmpfs -> rundir -> cache.
     let forced_mode = std::env::var("ONELF_MODE").ok();
     let force = forced_mode.as_deref();
 

@@ -15,6 +15,38 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
+/// Resolve an env-provided tool value to an existing binary: a bare name is
+/// looked up in `PATH`, a path must be an executable file.
+fn tool_exists(value: &str) -> Option<String> {
+    if value.contains('/') {
+        is_executable(Path::new(value)).then(|| value.to_string())
+    } else {
+        which(value).map(|p| p.to_string_lossy().into_owned())
+    }
+}
+
+/// Like `tool_exists`, but a miss panics: these variables are explicit
+/// human requests, and silently building with a different toolchain than
+/// asked for hides the mistake until the binary misbehaves.
+fn require_tool(var: &str, value: &str) -> String {
+    tool_exists(value)
+        .unwrap_or_else(|| panic!("{var}={value} does not name an existing executable"))
+}
+
+/// The archiver for the nested C build: the `ar` beside `cc`
+/// (`<prefix>-gcc` becomes `<prefix>-ar`), else a plain `ar` from `PATH`.
+fn ar_for(cc: &str) -> Option<String> {
+    let path = Path::new(cc);
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    if let Some((pre, _)) = name.split_once("gcc") {
+        let cand = path.parent()?.join(format!("{pre}ar"));
+        if is_executable(&cand) {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    which("ar").map(|p| p.to_string_lossy().into_owned())
+}
+
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -38,12 +70,18 @@ fn musl_target() -> String {
 fn find_musl_gcc(target: &str) -> Option<String> {
     let cc_env = format!("CC_{}", target.replace('-', "_"));
 
-    // Check explicit env override
+    // Explicit overrides. `ONELF_MUSL_CC` is a human request and a miss is
+    // a hard error; `CC_<target>` is often machine-injected (a cargo `[env]`
+    // table pointing at a toolchain this machine does not have), so a miss
+    // falls through to the next candidate.
     if let Ok(cc) = env::var("ONELF_MUSL_CC") {
-        return Some(cc);
+        return Some(require_tool("ONELF_MUSL_CC", &cc));
     }
     if let Ok(cc) = env::var(&cc_env) {
-        return Some(cc);
+        if let Some(cc) = tool_exists(&cc) {
+            return Some(cc);
+        }
+        println!("cargo:warning=ignoring {cc_env}={cc}: not found");
     }
 
     // Try architecture-specific and generic names in PATH
@@ -296,6 +334,17 @@ fn build_rt(
     cmd.env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"))
         .env("CC", musl_cc)
         .env(format!("CC_{}", target.replace('-', "_")), musl_cc)
+        // The same toolchain links the Rust half: an ambient
+        // `target.<triple>.linker` (config or env; `should_clear_for_nested`
+        // deliberately keeps `*_LINKER`) may name a toolchain this machine
+        // does not have, and env beats config.
+        .env(
+            format!(
+                "CARGO_TARGET_{}_LINKER",
+                target.replace('-', "_").to_uppercase()
+            ),
+            musl_cc,
+        )
         .current_dir(rt_dir)
         .arg("build")
         .arg("--locked")
@@ -316,6 +365,12 @@ fn build_rt(
     }
 
     eprintln!("Building onelf-rt ({variant}) for {target}...");
+    // cc-rs archives its objects with `ar`; a stale machine-level `AR_*`
+    // would fail the nested build even with a working compiler.
+    if let Some(ar) = ar_for(musl_cc) {
+        cmd.env("AR", &ar)
+            .env(format!("AR_{}", target.replace('-', "_")), &ar);
+    }
     let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("failed to build onelf-rt ({variant}): {e}"));
@@ -661,8 +716,9 @@ fn run_payload_cargo(
 /// `ONELF_PAYLOAD_CC_<ARCH>`, then the host `cc` for the native arch, then a
 /// Bootlin or `<triple>-gcc` cross compiler.
 fn payload_cc(arch: &str) -> Option<String> {
-    if let Ok(cc) = env::var(format!("ONELF_PAYLOAD_CC_{}", arch.to_uppercase())) {
-        return Some(cc);
+    let var = format!("ONELF_PAYLOAD_CC_{}", arch.to_uppercase());
+    if let Ok(cc) = env::var(&var) {
+        return Some(require_tool(&var, &cc));
     }
     // Use the host `cc` only for a native Linux match: the payloads are Linux
     // ELF objects, so a non-Linux host `cc` (e.g. macOS clang) would emit the
@@ -700,7 +756,7 @@ fn payload_cc(arch: &str) -> Option<String> {
 /// Locate `llvm-objcopy` / `rust-objcopy` from the installed `llvm-tools`.
 fn find_rust_objcopy() -> PathBuf {
     if let Ok(p) = env::var("ONELF_OBJCOPY") {
-        return PathBuf::from(p);
+        return PathBuf::from(require_tool("ONELF_OBJCOPY", &p));
     }
     if let Ok(out) = Command::new("rustc").arg("--print").arg("sysroot").output()
         && out.status.success()

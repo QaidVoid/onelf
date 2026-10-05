@@ -309,8 +309,9 @@ pub fn resolve(req: &Request) -> Resolution {
     resolution
 }
 
-/// A library that cannot be read is treated as defining nothing, so the
-/// bundled copy wins by default.
+/// A library that cannot be read is treated as defining nothing: an
+/// unreadable host library loses to the bundled copy, and an unreadable
+/// bundled library loses to the host copy.
 fn versions(path: &Path) -> VersionSet {
     verdef::read(path).unwrap_or_default()
 }
