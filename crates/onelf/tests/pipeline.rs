@@ -1336,6 +1336,240 @@ fn a_signature_verifies_against_the_key_the_package_embeds() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The freshness revision lives inside the package, so the detached
+/// signature covers it by construction: rewriting it means re-signing,
+/// and the runtime's downgrade veto is authenticated.
+#[test]
+fn a_revision_requested_at_pack_time_is_embedded_and_signature_covered() {
+    let td = workdir("revloop");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho REV\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let secret = td.join("k.key");
+    let public = td.join("k.pub");
+    let o = Command::new(onelf())
+        .args(["key", "new"])
+        .arg("--secret")
+        .arg(&secret)
+        .arg("--public")
+        .arg(&public)
+        .output()
+        .expect("spawn onelf key new");
+    assert!(o.status.success(), "key new failed");
+
+    let pkg = td.join("rev.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/rev.onelf.zsync"])
+        .arg("--update-key")
+        .arg(&public)
+        .args(["--update-revision", "7"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The revision must survive into the package as decimal bytes.
+    let out = td.join("rev.txt");
+    let o = Command::new(onelf())
+        .arg("extract")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&out)
+        .args(["--file", ".onelf/update-revision"])
+        .output()
+        .expect("spawn onelf extract");
+    assert!(
+        o.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "7");
+
+    // And flipping it must break the signature, since the revision sits
+    // inside the signed body rather than beside it.
+    let o = Command::new(onelf())
+        .arg("sign")
+        .arg(&pkg)
+        .arg("--key")
+        .arg(&secret)
+        .output()
+        .expect("spawn onelf sign");
+    assert!(
+        o.status.success(),
+        "sign failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let mut tampered = std::fs::read(&pkg).unwrap();
+    let needle = b".onelf/update-revision";
+    let at = tampered
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("revision entry name in package");
+    // Flip a byte in the entry payload region after the name.
+    let payload = at + needle.len() + 16;
+    tampered[payload] ^= 0xff;
+    let sig_bytes = std::fs::read(td.join("rev.onelf.zsync.sig")).expect("signature");
+    let pk = ed25519_compact::PublicKey::from_slice(&std::fs::read(&public).unwrap()).unwrap();
+    let sig = ed25519_compact::Signature::from_slice(&sig_bytes).unwrap();
+    assert!(
+        pk.verify(&tampered, &sig).is_err(),
+        "a mangled revision must not keep verifying"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A keyring of several trusted keys lets a release be signed with any
+/// of them. That is what makes key rotation and revocation recoverable
+/// instead of a permanent clobber of every package in the field.
+#[test]
+fn a_keyring_accepts_a_signature_from_any_embedded_key() {
+    let td = workdir("keyring");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho RING\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    // Two independent keypairs; the ring trusts both.
+    let key_new = |name: &str| {
+        let o = Command::new(onelf())
+            .args(["key", "new"])
+            .arg("--secret")
+            .arg(td.join(format!("{name}.key")))
+            .arg("--public")
+            .arg(td.join(format!("{name}.pub")))
+            .output()
+            .expect("spawn onelf key new");
+        assert!(o.status.success(), "key new {name} failed");
+    };
+    key_new("old");
+    key_new("new");
+    let mut ring = std::fs::read(td.join("old.pub")).unwrap();
+    ring.extend_from_slice(&std::fs::read(td.join("new.pub")).unwrap());
+    let ring_path = td.join("ring.pub");
+    std::fs::write(&ring_path, &ring).unwrap();
+
+    let pkg = td.join("ring.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/ring.onelf.zsync"])
+        .arg("--update-key")
+        .arg(&ring_path)
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // info reports the ring, not a single embedded key.
+    let o = Command::new(onelf())
+        .arg("info")
+        .arg(&pkg)
+        .output()
+        .expect("spawn onelf info");
+    assert!(String::from_utf8_lossy(&o.stdout).contains("keyring of 2 keys"));
+
+    // Signing with the SECOND key's secret must succeed: the runtime
+    // will accept it because the ring carries that key too.
+    let o = Command::new(onelf())
+        .arg("sign")
+        .arg(&pkg)
+        .arg("--key")
+        .arg(td.join("new.key"))
+        .output()
+        .expect("spawn onelf sign");
+    assert!(
+        o.status.success(),
+        "sign with the second ring key failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // And the produced signature verifies explicitly against the key
+    // that made it. `verify --key` checks one given key, not the
+    // package's ring; the ring is what the embedded runtime applies.
+    let sig = td.join("ring.onelf.zsync.sig");
+    assert!(sig.exists(), "signature not written next to the package");
+    let o = Command::new(onelf())
+        .arg("verify")
+        .arg(&pkg)
+        .args(["--key", td.join("new.pub").to_str().unwrap(), "--sig"])
+        .arg(&sig)
+        .output()
+        .expect("spawn onelf verify");
+    assert!(
+        o.status.success(),
+        "verify against new.pub failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let o = Command::new(onelf())
+        .arg("verify")
+        .arg(&pkg)
+        .args(["--key", td.join("old.pub").to_str().unwrap(), "--sig"])
+        .arg(&sig)
+        .output()
+        .expect("spawn onelf verify");
+    assert!(
+        !o.status.success(),
+        "verify --key is key-explicit; a signature from new.key must not verify against old.pub"
+    );
+
+    // A secret matching neither ring key is still refused.
+    key_new("other");
+    let o = Command::new(onelf())
+        .arg("sign")
+        .arg(&pkg)
+        .arg("--key")
+        .arg(td.join("other.key"))
+        .output()
+        .expect("spawn onelf sign");
+    assert!(!o.status.success(), "sign with an untrusted secret passed");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("embeds 2 update keys"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // A key file whose length is not a multiple of 32 is refused at
+    // pack time rather than embedded and fail-closed at update time.
+    let junk = td.join("junk.pub");
+    std::fs::write(&junk, vec![0u8; 40]).unwrap();
+    let bad = td.join("bad.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", bad.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/bad.onelf.zsync"])
+        .arg("--update-key")
+        .arg(&junk)
+        .output()
+        .expect("spawn onelf pack");
+    assert!(!o.status.success(), "pack embedded a 40-byte key file");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("multiple of 32"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Recording where a package updates from and embedding an updater are
 /// separate decisions. A package manager needs the first without paying
 /// for the second, and must not have the package replace itself.
@@ -1798,9 +2032,10 @@ fn an_absolute_needed_entry_is_bundled_by_basename() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// `--memfd` and `--no-memfd` contradict each other, and `--update-key`
-/// without `--update-url` names a key nothing will use; both were
-/// accepted silently.
+/// `--memfd` and `--no-memfd` contradict each other, `--update-key`
+/// without `--update-url` names a key nothing will use, and
+/// `--update-revision` without `--update-url` stamps a number nothing
+/// will read; all were accepted silently.
 #[test]
 fn contradictory_pack_flags_are_refused() {
     let td = workdir("flags");
@@ -1818,6 +2053,7 @@ fn contradictory_pack_flags_are_refused() {
     for extra in [
         vec!["--memfd", "--no-memfd"],
         vec!["--update-key", "/dev/null"],
+        vec!["--update-revision", "3"],
     ] {
         let o = Command::new(onelf())
             .args(base)
@@ -3594,7 +3830,10 @@ fn crafted_footer_is_refused_by_every_reader() {
 }
 
 /// Rewrite the manifest of a packed file in place, keeping every other
-/// region where it was. Returns the crafted package's path.
+/// region where it was. The footer checksum and the manifest's
+/// `footer_hash` are recomputed, so the container's structure chain stays
+/// intact and only what `edit` changes is out of place. Returns the
+/// crafted package's path.
 fn with_manifest(
     pkg: &Path,
     out: &Path,
@@ -3615,6 +3854,21 @@ fn with_manifest(
     let manifest = zstd::bulk::decompress(&bytes[m_off..m_off + m_comp], m_orig).unwrap();
     let mut m = onelf_format::Manifest::deserialize(&manifest).unwrap();
     edit(&mut m);
+
+    // The checksum excludes the footer_hash field, so it can be taken
+    // before that field's final value exists, exactly as the packer does.
+    m.header.footer_hash = [0; 32];
+    let manifest = m.serialize().unwrap();
+    let checksum = onelf_format::manifest::manifest_checksum(&manifest);
+
+    // Recompute the footer hash over the footer this rewrite produces,
+    // with the layout fields (unknown until the manifest is compressed)
+    // zeroed, again as the packer does.
+    let mut footer = bytes[f..].to_vec();
+    footer[64..68].copy_from_slice(&checksum);
+    let footer = onelf_format::Footer::from_bytes(&footer.try_into().unwrap()).unwrap();
+    m.header.footer_hash = footer.structure_hash();
+
     let manifest = m.serialize().unwrap();
     let compressed = zstd::bulk::compress(&manifest, 3).unwrap();
 
@@ -3633,7 +3887,7 @@ fn with_manifest(
     if d_size > 0 {
         footer[52..60].copy_from_slice(&(new_d_off as u64).to_le_bytes());
     }
-    footer[64..68].copy_from_slice(&xxhash_rust::xxh32::xxh32(&manifest, 0).to_le_bytes());
+    footer[64..68].copy_from_slice(&checksum);
     file.extend_from_slice(&footer);
     std::fs::write(out, &file).unwrap();
     std::fs::set_permissions(
@@ -3681,6 +3935,97 @@ fn verify_rejects_a_block_hash_the_runtime_would_reject() {
         "verify passed a package the runtime refuses:\n{}",
         String::from_utf8_lossy(&o.stdout)
     );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The runtime ELF prefix and the footer were covered by no hash at all,
+/// so `verify` printed OK after the executable body was swapped or the
+/// footer rewritten. Format version 2 chains both through the manifest.
+#[test]
+fn verify_rejects_a_replaced_runtime_prefix_and_a_rewritten_footer() {
+    let td = workdir("structauth");
+    let pkg = pack_script(&td, "auth", "#!/bin/sh\necho RAN\n");
+
+    // Untampered: the structure checks pass and say so.
+    let o = run_onelf(&["verify", pkg.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("Structure: OK"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+
+    // A byte flipped in the executable body: caught by the prefix hash.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let manifest_offset = u64::from_le_bytes(
+        bytes[bytes.len() - 76 + 12..bytes.len() - 76 + 20]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    bytes[manifest_offset - 100] ^= 0xff;
+    let bad = td.join("prefix.onelf");
+    std::fs::write(&bad, &bytes).unwrap();
+    let o = run_onelf(&["verify", bad.to_str().unwrap()], None);
+    assert!(
+        !o.status.success(),
+        "verify passed a replaced runtime prefix"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("runtime prefix hash mismatch"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // A byte flipped in the footer: caught by the footer hash. The
+    // reserved flags bit keeps every bounds check happy, so the hash is
+    // what catches it.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let f = bytes.len() - 76;
+    bytes[f + 11] ^= 0x80;
+    let bad = td.join("footer.onelf");
+    std::fs::write(&bad, &bytes).unwrap();
+    let o = run_onelf(&["verify", bad.to_str().unwrap()], None);
+    assert!(!o.status.success(), "verify passed a rewritten footer");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("footer hash mismatch"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A format 1 package carries no structure hashes, so there is nothing
+/// `verify` could check; it must say that plainly instead of printing OK.
+#[test]
+fn verify_reports_why_it_cannot_authenticate_a_format_one_package() {
+    let td = workdir("oldfmt");
+    let pkg = pack_script(&td, "old", "#!/bin/sh\necho RAN\n");
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let f = bytes.len() - 76;
+    bytes[f + 8..f + 10].copy_from_slice(&1u16.to_le_bytes());
+    let old = td.join("v1.onelf");
+    std::fs::write(&old, &bytes).unwrap();
+    std::fs::set_permissions(
+        &old,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let o = run_onelf(&["verify", old.to_str().unwrap()], None);
+    assert!(!o.status.success(), "verify OK'd an unauthenticated format");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("predates structural authentication"), "{err}");
+
+    // The package itself still runs: reading it was never the problem.
+    let mut run = Command::new(&old);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let o = run_package(&mut run);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -3753,55 +4098,16 @@ fn integrate_refuses_metadata_whose_hash_does_not_match() {
 fn a_crafted_entry_path_is_refused_by_every_writer() {
     let td = workdir("crafted-path");
     let pkg = pack_script(&td, "escape", "#!/bin/sh\necho RAN\n");
-    let bytes = std::fs::read(&pkg).unwrap();
-    let f = bytes.len() - 76;
-    let u64_at = |at: usize| u64::from_le_bytes(bytes[f + at..f + at + 8].try_into().unwrap());
-    let (m_off, m_comp, m_orig) = (
-        u64_at(12) as usize,
-        u64_at(20) as usize,
-        u64_at(28) as usize,
-    );
-    let (p_off, p_size) = (u64_at(36) as usize, u64_at(44) as usize);
-    let d_off = u64_at(52) as usize;
-    let d_size = u32::from_le_bytes(bytes[f + 60..f + 64].try_into().unwrap()) as usize;
-
-    let manifest = zstd::bulk::decompress(&bytes[m_off..m_off + m_comp], m_orig).unwrap();
-    let mut m = onelf_format::Manifest::deserialize(&manifest).unwrap();
     // The script's entry, `run`, becomes `..`. Same length, so nothing
     // else in the table moves.
-    let at = m
-        .string_table
-        .windows(4)
-        .position(|w| w == b"run\0")
-        .expect("the entry name");
-    m.string_table[at..at + 4].copy_from_slice(b"..\0\0");
-    let manifest = m.serialize().unwrap();
-    let compressed = zstd::bulk::compress(&manifest, 3).unwrap();
-
-    let mut out = bytes[..m_off].to_vec();
-    out.extend_from_slice(&compressed);
-    let new_p_off = out.len();
-    out.extend_from_slice(&bytes[p_off..p_off + p_size]);
-    let new_d_off = out.len();
-    if d_size > 0 {
-        out.extend_from_slice(&bytes[d_off..d_off + d_size]);
-    }
-    let mut footer = bytes[f..].to_vec();
-    footer[20..28].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
-    footer[28..36].copy_from_slice(&(manifest.len() as u64).to_le_bytes());
-    footer[36..44].copy_from_slice(&(new_p_off as u64).to_le_bytes());
-    if d_size > 0 {
-        footer[52..60].copy_from_slice(&(new_d_off as u64).to_le_bytes());
-    }
-    footer[64..68].copy_from_slice(&xxhash_rust::xxh32::xxh32(&manifest, 0).to_le_bytes());
-    out.extend_from_slice(&footer);
-    let bad = td.join("bad.onelf");
-    std::fs::write(&bad, &out).unwrap();
-    std::fs::set_permissions(
-        &bad,
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-    )
-    .unwrap();
+    let bad = with_manifest(&pkg, &td.join("bad.onelf"), |m| {
+        let at = m
+            .string_table
+            .windows(4)
+            .position(|w| w == b"run\0")
+            .expect("the entry name");
+        m.string_table[at..at + 4].copy_from_slice(b"..\0\0");
+    });
 
     // The crafted package still parses; only the write is refused.
     let o = run_onelf(&["list", bad.to_str().unwrap()], None);
@@ -8477,6 +8783,123 @@ fn fuse_permission_tests_reflect_recorded_modes() {
             "{refused} must be denied on a read-only mount: {stdout}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `verify --key --sig` checks a detached Ed25519 signature over the
+/// whole file, the same check the runtime's self-update applies, so a
+/// publisher can confirm their artifact is exactly what was signed.
+#[test]
+fn verify_checks_a_detached_signature_over_the_whole_file() {
+    let td = workdir("verifysig");
+    let sk = td.join("sk");
+    let pk = td.join("pk");
+    let o = Command::new(onelf())
+        .args([
+            "key",
+            "new",
+            "--secret",
+            sk.to_str().unwrap(),
+            "--public",
+            pk.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf key new");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let payload = "payload-for-the-signature-to-cover\n";
+    write(&app.join("data/blob"), payload);
+
+    let pkg = td.join("pkg.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://example.test/app.onelf"])
+        .args(["--update-key", pk.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let sig = td.join("pkg.sig");
+    let o = Command::new(onelf())
+        .args(["sign", pkg.to_str().unwrap(), "--key", sk.to_str().unwrap()])
+        .args(["-o", sig.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf sign");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    // The signed artifact passes both checks.
+    let o = Command::new(onelf())
+        .args([
+            "verify",
+            pkg.to_str().unwrap(),
+            "--key",
+            pk.to_str().unwrap(),
+            "--sig",
+            sig.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf verify");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("Signature: OK"));
+
+    // One flipped payload byte breaks the signature.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let at = bytes
+        .windows(payload.len())
+        .position(|w| w == payload.as_bytes())
+        .expect("payload present verbatim");
+    bytes[at] ^= 0xff;
+    let tampered = td.join("tampered.onelf");
+    std::fs::write(&tampered, &bytes).unwrap();
+    let o = Command::new(onelf())
+        .args([
+            "verify",
+            tampered.to_str().unwrap(),
+            "--key",
+            pk.to_str().unwrap(),
+            "--sig",
+            sig.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf verify");
+    assert!(!o.status.success(), "a flipped byte must fail verification");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+
+    // The integrity check is independent of the signature: the same
+    // tampered file fails even with no signature in play, because the
+    // per-entry hash no longer matches. Re-signing cannot paper over a
+    // content change; only re-packing can.
+    let o = Command::new(onelf())
+        .args(["verify", tampered.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf verify");
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("failed verification"),
+        "the entry hashes must catch it too"
+    );
+
+    // Half a specification is an error, not a guess.
+    let o = Command::new(onelf())
+        .args([
+            "verify",
+            pkg.to_str().unwrap(),
+            "--key",
+            pk.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf verify");
+    assert!(!o.status.success(), "--key without --sig must be refused");
 
     let _ = std::fs::remove_dir_all(&td);
 }

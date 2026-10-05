@@ -286,6 +286,7 @@ fn pack_tree(
             update_url: None,
             embed_updater: false,
             update_key: None,
+            update_revision: None,
             exclude: Vec::new(),
             package_info: None,
             mtime: Some(0),

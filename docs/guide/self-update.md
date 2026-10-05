@@ -16,9 +16,10 @@ onelf key new --secret myapp.key --public myapp.pub
 ```
 
 The secret key is written owner-only. Keep it out of the repository and
-back it up: replacing it later breaks self-update for every user already
-holding a package built with the old public key, and there is no recovery
-short of a manual re-download.
+back it up. Replacing it is a normal, recoverable operation with a
+keyring (see [Rotating the signing key](#rotating-the-signing-key)); a
+single-key package is the fragile special case where replacement strands
+every user holding one.
 
 The public key is 32 raw bytes, exactly the form `--update-key` embeds.
 If you lose your copy of it, re-derive it from the secret:
@@ -26,6 +27,10 @@ If you lose your copy of it, re-derive it from the secret:
 ```bash
 onelf key show --secret myapp.key -o myapp.pub
 ```
+
+A key file may also hold several public keys concatenated (a multiple of
+32 bytes), forming a keyring: the runtime then accepts an update signed
+with *any* key in it. That is the mechanism behind key rotation below.
 
 ## Opt in at pack time
 
@@ -41,6 +46,16 @@ key = "myapp.pub"
 On the CLI that is `--update-url` plus `--update-key`. A package built
 with a URL but no key cannot self-update: the runtime reports that
 self-update is disabled and does not contact the server.
+
+Give each release a number with `--update-revision N`. The number is
+embedded in the package as `.onelf/update-revision`, so the signature
+covers it like any other byte. At update time the runtime reads the
+revision out of the downloaded package and refuses to install one that
+is not strictly newer than the revision of the running binary: a
+compromised server can then offer only packages you signed, and a
+signed-but-old package cannot roll a client back. Packages without a
+revision keep the older freshness rule (install whenever the SHA1
+differs), so the flag is optional.
 
 When `[update]` is present, onelf links the larger update-capable
 runtime (1.36 MB extra for the HTTPS, zsync and signature code). Without
@@ -89,6 +104,49 @@ Upload all three: `myapp.onelf`, `myapp.onelf.zsync`, and
 `sign` refuses if the secret does not match the public key embedded in
 the package. That mismatch is otherwise invisible, since such a package
 installs and runs normally and only its update path is dead.
+
+## Rotating the signing key
+
+A public key is baked into every package you have published, so a new
+keypair cannot simply replace the old one: installed clients verify
+against the keys they embed. Rotation works through a keyring, in three
+steps.
+
+1. **Introduce the new key.** Generate a new keypair, build a keyring
+   file holding the old and the new public keys concatenated, pack a
+   release with `--update-key myapp-ring.pub`, and sign it with the OLD
+   secret. Installed clients verify it against their embedded old key,
+   and the ring hands them the new key inside the signature-covered
+   body.
+2. **Switch the signer.** From the next release on, sign with the new
+   secret. Every client that took the ring release verifies it.
+3. **Retire the old key.** Drop it from the ring in a later release once
+   clients have moved. If the old secret leaked, do this immediately:
+   clients that install that release stop trusting the compromised key.
+
+Releases signed with the old secret keep updating clients whose ring
+still carries it, so a client that skips a release is never stranded;
+only when the key leaves the ring does its signature stop being
+accepted. A single-key package has no such grace period: there, signing
+with a new secret deadens self-update for everyone until they manually
+install a package carrying the new key.
+
+:::info
+`onelf key new` refuses to overwrite an existing key file. That is the
+rotation path working: keep both keypairs, build the ring with `cat
+myapp.pub myapp-new.pub > myapp-ring.pub`, and use `--key` on `sign` to
+choose which secret signs a given release.
+:::
+
+`onelf info` shows what a package trusts:
+
+```
+Update:
+  URL:          https://releases.example.com/myapp.onelf.zsync
+  Revision:     12
+  Signing key:  keyring of 2 keys
+  Updater:      embedded
+```
 
 :::info
 `zsyncmake` comes from the [zsync-rs](https://crates.io/crates/zsync-rs)
@@ -151,10 +209,17 @@ The update-apply flow:
    as a seed (most blocks match, so typical downloads are tiny).
 4. Fetch the detached signature and verify it over the assembled binary
    against the key embedded at pack time.
-5. Only then, atomically `rename(2)` the new file over the old one.
+5. If both the running binary and the download carry a
+   `.onelf/update-revision`, refuse unless the download is strictly
+   newer. This check sits after the signature, so the revision it reads
+   is authenticated.
+6. Only then, atomically `rename(2)` the new file over the old one.
 
 Any failure in step 4 removes the downloaded file and leaves the running
-executable untouched.
+executable untouched. Before the rename, the old binary is also copied
+to a sibling `<name>.onelf-prev` and forced to the disk as a rollback
+point; on the rare failure of the rename itself, that copy is moved back
+into place.
 
 Exit codes:
 
@@ -216,8 +281,10 @@ without the code.
   during the transfer. It is not a signature and is not what makes the
   update safe.
 - Compromising your server is not enough to push a malicious update,
-  since the attacker would also need the signing key. Compromising the
-  signing key is enough, so treat it accordingly.
+  since the attacker would also need a signing key. Compromising a
+  signing key is enough, so treat it accordingly, and remove a
+  compromised key from the keyring in your next release: clients that
+  install it stop trusting the leaked key.
 - Serve everything over HTTPS. The runtime enforces this for every
   request the update makes, so no redirect can downgrade the transfer to
   cleartext. The signature fetch follows no redirects at all; the

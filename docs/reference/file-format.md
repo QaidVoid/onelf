@@ -8,7 +8,7 @@ A packed onelf file is up to five concatenated sections:
 │  670 KB (slim) or ~2 MB (update)   │
 ├────────────────────────────────────┤
 │ Manifest (zstd-compressed)         │
-│  - header (50 bytes)               │
+│  - header (114 bytes)              │
 │  - entrypoints                     │
 │  - file/dir/symlink entries        │
 │  - lib_dir_offsets                 │
@@ -34,7 +34,7 @@ manifest, payload, and dictionary begin.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
-| 8 | 2 | format_version | `1` |
+| 8 | 2 | format_version | `2` (format 1 files have `1`) |
 | 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 reserved (never set), bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
@@ -43,7 +43,7 @@ manifest, payload, and dictionary begin.
 | 44 | 8 | payload_size | Payload total size |
 | 52 | 8 | dict_offset | Dictionary offset (0 if absent) |
 | 60 | 4 | dict_size | Dictionary size (0 if absent) |
-| 64 | 4 | manifest_checksum | XXH32 of uncompressed manifest |
+| 64 | 4 | manifest_checksum | XXH32 of uncompressed manifest, see below |
 | 68 | 8 | end_magic | `"FLENONE\0"` |
 
 ## Manifest
@@ -52,7 +52,7 @@ Compressed with zstd. After decompression:
 
 ```
 ┌────────────────┐
-│ Header (50 B)  │
+│ Header (114 B) │
 ├────────────────┤
 │ Entrypoints    │  14 bytes each * entrypoint_count
 ├────────────────┤
@@ -64,11 +64,11 @@ Compressed with zstd. After decompression:
 └────────────────┘
 ```
 
-### Header (50 bytes)
+### Header (114 bytes in version 3)
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 2 | manifest_version (currently 2) |
+| 0 | 2 | manifest_version (currently 3) |
 | 2 | 4 | entry_count |
 | 6 | 4 | string_table_size |
 | 10 | 2 | entrypoint_count |
@@ -76,6 +76,10 @@ Compressed with zstd. After decompression:
 | 14 | 2 | lib_dir_count |
 | 16 | 2 | name_offset (into string_table) |
 | 18 | 32 | package_id (BLAKE3 of the serialized manifest bytes minus this field) |
+| 50 | 32 | prefix_hash (BLAKE3 over file bytes `[0, manifest_offset)`; zeros in version 1/2) |
+| 82 | 32 | footer_hash (BLAKE3 over the footer, see below; zeros in version 1/2) |
+
+Version 1 headers end at 50 bytes and carry no structure hashes.
 
 ### Entrypoint (14 bytes each)
 
@@ -153,7 +157,9 @@ footer = read 76 bytes, validate magic
 file.seek(footer.manifest_offset)
 compressed = read footer.manifest_compressed bytes
 manifest_bytes = zstd::decompress(compressed)
-assert XXH32(manifest_bytes) == footer.manifest_checksum
+checksum = version >= 3 ? XXH32(manifest_bytes with footer_hash zeroed)
+                         : XXH32(manifest_bytes)
+assert checksum == footer.manifest_checksum
 manifest = parse(manifest_bytes)
 ```
 
@@ -162,25 +168,51 @@ Then the manifest tells you how to read entrypoints, files, etc.
 ## Integrity
 
 - **XXH32** over the uncompressed manifest bytes catches accidental
-  corruption of the manifest itself.
+  corruption of the manifest itself. From footer format 2 / manifest
+  version 3 on, the `footer_hash` header field is zeroed for this
+  checksum, because that field is pinned by the footer hash instead.
 - **BLAKE3** over each file's concatenated content bytes is stored in
   the entry. `onelf verify` recomputes and compares.
 - **BLAKE3** over each block's decompressed bytes is stored alongside the
   block from manifest version 2 onward. This is what a random-access
   reader checks, so a single byte can be served and verified without
   reassembling the file it came from.
+- **BLAKE3** over the runtime prefix, `prefix_hash` in the manifest from
+  version 3 on, covers the executable body in front of the manifest,
+  which nothing else hashed before.
+- **BLAKE3** over the footer, `footer_hash` in the manifest, covers the
+  footer itself with four layout fields zeroed: `manifest_compressed`,
+  `manifest_original`, `payload_offset` and `dict_offset`. Those four
+  cannot take part in the chain, because the packer learns them only
+  after compressing the manifest, and the manifest can only be compressed
+  after the footer hash exists. Their honesty is enforced indirectly: a
+  bogus region is caught by the bounds checks or by the hashes of what
+  the region is supposed to hold.
 - The **package_id** (BLAKE3 of the manifest) uniquely identifies the
   package and drives cache-mode directory names.
 
+The three hashes chain: the manifest checksum covers the manifest, and
+the manifest carries both `prefix_hash` and `footer_hash`, so replacing
+the executable body or rewriting the footer shows up in `onelf verify`.
+Because `manifest_checksum` is part of the hashed footer bytes, a
+consistent rewrite of the whole file requires inverting BLAKE3, not just
+recomputing checksums. An external detached signature over the file
+remains the stronger guarantee.
+
 ## Format compatibility
 
-The footer's `format_version` must be `1`. It has not moved.
+The footer's `format_version` accepts `1` and `2`; writers emit `2`.
+Format 1 means manifest version 1 or 2: no `prefix_hash`, no
+`footer_hash`, and nothing authenticates the container structure.
+`onelf verify` refuses such a file with a clear message instead of
+printing OK, but it still runs, as it always did.
 
-The manifest version has. Readers accept `1` and `2` and reject anything
-higher with a clear error, so a package written by an older onelf still
-runs. The only difference between the two is the `content_hash` on each
-block, so a version 1 manifest has 24-byte blocks and falls back to the
-whole-entry hash for verification.
+The manifest version has moved with the footer. Readers accept `1`, `2`
+and `3` and reject anything higher with a clear error, so a package
+written by an older onelf still runs. Version 2 added the per-block
+`content_hash` (24-byte blocks in version 1, 56 bytes from version 2).
+Version 3 extended the header from 50 to 114 bytes with the two structure
+hashes; a version 3 manifest requires footer format 2.
 
 Footer flags are decoded with `from_bits_retain`, so a bit a reader does
 not recognise is kept and ignored rather than treated as corruption. That

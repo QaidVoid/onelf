@@ -104,7 +104,19 @@ fn main() {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
             std::process::exit(1);
         };
-        std::process::exit(update::run(flag, &self_path, &url, &key_bytes));
+        let current_revision =
+            read_package_file(&mut pkg, ".onelf/update-revision").and_then(|b| {
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
+        std::process::exit(update::run(
+            flag,
+            &self_path,
+            &url,
+            &key_bytes,
+            current_revision,
+        ));
     }
 
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
@@ -341,7 +353,7 @@ fn main() {
     })
 }
 
-fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
     let idx = (0..pkg.manifest.entries.len()).find(|&i| {
         pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
             && pkg.manifest.entry_path(i) == path

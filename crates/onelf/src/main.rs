@@ -96,10 +96,18 @@ enum Commands {
         #[arg(long)]
         update_url: Option<String>,
 
-        /// Path to a file holding the raw 32-byte Ed25519 public key used
-        /// to verify signed self-updates (stored in .onelf/update-key)
+        /// Path to a file holding one or more raw 32-byte Ed25519 public
+        /// keys used to verify signed self-updates (stored in
+        /// .onelf/update-key). Several concatenated keys form a keyring:
+        /// the runtime accepts an update signed with any of them.
         #[arg(long, requires = "update_url")]
         update_key: Option<PathBuf>,
+
+        /// Monotonic revision for rollback protection (stored in
+        /// .onelf/update-revision); bump it for every release, the
+        /// runtime refuses an update that is not newer
+        #[arg(long, requires = "update_url")]
+        update_revision: Option<u64>,
 
         /// What the launch resolver may take from the host: `never`
         /// nothing, `auto` the driver stack's closure, `always` any
@@ -195,6 +203,14 @@ enum Commands {
     Verify {
         /// Path to the onelf binary
         binary: PathBuf,
+        /// Ed25519 public key, raw 32 bytes as `key new` writes it; with
+        /// --sig, also check a detached signature over the whole file
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Detached signature over the whole binary, raw 64 bytes as
+        /// `sign` writes them; requires --key
+        #[arg(long)]
+        sig: Option<PathBuf>,
     },
 
     /// Obtain and inspect pinned sysroots
@@ -637,6 +653,7 @@ fn main() {
             working_dir,
             update_url,
             update_key,
+            update_revision,
             no_embed_updater,
             host_libs,
             cache,
@@ -693,6 +710,7 @@ fn main() {
                         update_url: update_url.clone(),
                         embed_updater: !no_embed_updater,
                         update_key,
+                        update_revision,
                         exclude,
                         package_info: None,
                         mtime,
@@ -731,7 +749,9 @@ fn main() {
             bundle,
             &args,
         ),
-        Commands::Verify { binary } => verify::verify(&binary),
+        Commands::Verify { binary, key, sig } => {
+            verify::verify(&binary, key.as_deref(), sig.as_deref())
+        }
         Commands::Info { binary } => info::info(&binary),
         Commands::List { binary } => list::list(&binary),
         Commands::Extract {
@@ -1160,6 +1180,7 @@ fn run_build(
         .map(|k| if k.is_absolute() { k } else { dir.join(k) })
         .map(std::fs::read)
         .transpose()?;
+    let update_revision = recipe.update.as_ref().and_then(|u| u.revision);
     let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
     let runtime: &[u8] = if (update_url.is_some() && embed_updater) || pins_https_build(&dir) {
         RUNTIME_BINARY_UPDATE
@@ -1193,6 +1214,7 @@ fn run_build(
             update_url,
             embed_updater,
             update_key,
+            update_revision,
             exclude: recipe.package.exclude,
             package_info,
             mtime: recipe.package.mtime,

@@ -51,12 +51,25 @@ pub fn symlink_target_within_root(link_rel: &std::path::Path, target: &str) -> b
 /// Manifest version this build writes.
 ///
 /// Version 2 added a BLAKE3 per payload block, so a reader can verify what
-/// it serves without reassembling the whole entry. Version 1 remains
-/// readable; entries from it carry no per-block hash and fall back to the
-/// whole-entry check.
-pub const MANIFEST_VERSION: u16 = 2;
+/// it serves without reassembling the whole entry. Version 3 added the two
+/// structure hashes in the header: `prefix_hash` over the runtime ELF the
+/// package prepends, and `footer_hash` over the file's footer. Together
+/// they make the whole container verifiable, which version 1 and 2
+/// manifests lack. Both remain readable; their hash fields read as zeros.
+pub const MANIFEST_VERSION: u16 = 3;
 
-pub const MANIFEST_HEADER_SIZE: usize = 2 + 4 + 4 + 2 + 2 + 2 + 2 + 32; // 50 bytes
+/// Byte range of the `footer_hash` header field inside a serialized
+/// version-3-or-later manifest. The manifest checksum is computed over the
+/// manifest with this range zeroed, because the field is pinned by the
+/// footer hash instead; see [`crate::footer::Footer::structure_hash`].
+pub const FOOTER_HASH_RANGE: std::ops::Range<usize> = 82..114;
+
+/// Manifest header size at [`MANIFEST_VERSION`]: the 50-byte version 1
+/// header plus the two 32-byte structure hashes.
+pub const MANIFEST_HEADER_SIZE: usize = 114;
+
+/// Size of the version 1/2 header, which carried no structure hashes.
+const V1_HEADER_SIZE: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct ManifestHeader {
@@ -76,6 +89,13 @@ pub struct ManifestHeader {
     pub name_offset: u16,
     /// Unique package identifier (BLAKE3 hash).
     pub package_id: [u8; 32],
+    /// BLAKE3 over the runtime ELF prefix, the file bytes
+    /// `[0, manifest_offset)`. Zero in manifests written before version 3.
+    pub prefix_hash: [u8; 32],
+    /// BLAKE3 over the file's footer with the manifest-derived layout
+    /// fields zeroed, per [`crate::footer::Footer::structure_hash`]. Zero
+    /// in manifests written before version 3.
+    pub footer_hash: [u8; 32],
 }
 
 impl ManifestHeader {
@@ -88,17 +108,19 @@ impl ManifestHeader {
         w.write_all(&self.lib_dir_count.to_le_bytes())?;
         w.write_all(&self.name_offset.to_le_bytes())?;
         w.write_all(&self.package_id)?;
+        w.write_all(&self.prefix_hash)?;
+        w.write_all(&self.footer_hash)?;
         Ok(())
     }
 
     pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut buf = [0u8; MANIFEST_HEADER_SIZE];
+        let mut buf = [0u8; V1_HEADER_SIZE];
         r.read_exact(&mut buf)?;
 
         let mut package_id = [0u8; 32];
         package_id.copy_from_slice(&buf[18..50]);
 
-        Ok(ManifestHeader {
+        let mut header = ManifestHeader {
             version: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
             entry_count: u32::from_le_bytes(buf[2..6].try_into().unwrap()),
             string_table_size: u32::from_le_bytes(buf[6..10].try_into().unwrap()),
@@ -107,8 +129,37 @@ impl ManifestHeader {
             lib_dir_count: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
             name_offset: u16::from_le_bytes(buf[16..18].try_into().unwrap()),
             package_id,
-        })
+            prefix_hash: [0; 32],
+            footer_hash: [0; 32],
+        };
+
+        // Version 3 extended the header with the structure hashes. Older
+        // manifests simply have no such fields, which reads as zeros.
+        if header.version >= 3 {
+            let mut hashes = [0u8; 64];
+            r.read_exact(&mut hashes)?;
+            header.prefix_hash.copy_from_slice(&hashes[..32]);
+            header.footer_hash.copy_from_slice(&hashes[32..]);
+        }
+
+        Ok(header)
     }
+}
+
+/// The xxh32 checksum a footer carries over `manifest`'s uncompressed
+/// bytes: plain xxh32 for version 1/2 manifests, xxh32 with the
+/// `footer_hash` header field zeroed from version 3 on, since that field
+/// is pinned by [`crate::footer::Footer::structure_hash`] instead. The
+/// packer, the runtime loader and `verify` must all agree on this, so it
+/// lives here rather than at each call site.
+pub fn manifest_checksum(manifest: &[u8]) -> [u8; 4] {
+    let version = u16::from_le_bytes(manifest[..2].try_into().expect("u16 version"));
+    if version < 3 {
+        return xxhash_rust::xxh32::xxh32(manifest, 0).to_le_bytes();
+    }
+    let mut zeroed = manifest.to_vec();
+    zeroed[FOOTER_HASH_RANGE].fill(0);
+    xxhash_rust::xxh32::xxh32(&zeroed, 0).to_le_bytes()
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +471,7 @@ mod tests {
     fn manifest(entries: Vec<Entry>, string_table: Vec<u8>) -> Manifest {
         Manifest {
             header: ManifestHeader {
-                version: 1,
+                version: MANIFEST_VERSION,
                 entry_count: entries.len() as u32,
                 string_table_size: string_table.len() as u32,
                 entrypoint_count: 0,
@@ -428,6 +479,8 @@ mod tests {
                 lib_dir_count: 0,
                 name_offset: 0,
                 package_id: [0u8; 32],
+                prefix_hash: [0u8; 32],
+                footer_hash: [0u8; 32],
             },
             entrypoints: Vec::new(),
             entries,
@@ -493,11 +546,18 @@ mod tests {
         }];
         let m = manifest(vec![file], b"\0a\0".to_vec());
 
-        // Hand-assemble the v1 encoding: the current writer only emits v2.
+        // Hand-assemble the v1 encoding: the current writer only emits v3,
+        // whose header carries the two structure hashes v1 lacked.
         let mut bytes = Vec::new();
-        let mut header = m.header.clone();
-        header.version = 1;
-        header.write_to(&mut bytes).unwrap();
+        let header = &m.header;
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&header.entry_count.to_le_bytes());
+        bytes.extend_from_slice(&header.string_table_size.to_le_bytes());
+        bytes.extend_from_slice(&header.entrypoint_count.to_le_bytes());
+        bytes.extend_from_slice(&header.default_entrypoint.to_le_bytes());
+        bytes.extend_from_slice(&header.lib_dir_count.to_le_bytes());
+        bytes.extend_from_slice(&header.name_offset.to_le_bytes());
+        bytes.extend_from_slice(&header.package_id);
         let e = &m.entries[0];
         bytes.push(e.kind as u8);
         bytes.extend_from_slice(&e.parent.to_le_bytes());
@@ -521,6 +581,50 @@ mod tests {
         assert_eq!(block.compressed_size, 11);
         assert_eq!(block.original_size, 13);
         assert!(!block.has_content_hash(), "v1 carries no per-block hash");
+        // A pre-v3 manifest has no structure hashes; they read as zeros.
+        assert_eq!(back.header.prefix_hash, [0u8; 32]);
+        assert_eq!(back.header.footer_hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn structure_hashes_roundtrip_through_serialization() {
+        let mut m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        m.header.prefix_hash = [1u8; 32];
+        m.header.footer_hash = [2u8; 32];
+        let bytes = m.serialize().unwrap();
+        let back = Manifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.header.prefix_hash, [1u8; 32]);
+        assert_eq!(back.header.footer_hash, [2u8; 32]);
+        // Re-serializing the decoded manifest must reproduce the bytes.
+        assert_eq!(back.serialize().unwrap(), bytes);
+    }
+
+    #[test]
+    fn manifest_checksum_zeroes_the_footer_hash_field_from_v3() {
+        let mut m = manifest(vec![entry(1, u32::MAX)], b"\0a\0".to_vec());
+        m.header.prefix_hash = [3u8; 32];
+        m.header.footer_hash = [4u8; 32];
+        let bytes = m.serialize().unwrap();
+
+        let mut zeroed = bytes.clone();
+        zeroed[FOOTER_HASH_RANGE].fill(0);
+        assert_eq!(
+            manifest_checksum(&bytes),
+            xxhash_rust::xxh32::xxh32(&zeroed, 0).to_le_bytes()
+        );
+        // The prefix hash is covered by the checksum, only footer_hash is
+        // excluded.
+        assert_ne!(
+            manifest_checksum(&bytes),
+            xxhash_rust::xxh32::xxh32(&bytes, 0).to_le_bytes()
+        );
+
+        // Version 1 bytes checksum plainly: the field does not exist there.
+        let v1 = [0u8, 0, 1, 2, 3];
+        assert_eq!(
+            manifest_checksum(&v1),
+            xxhash_rust::xxh32::xxh32(&v1, 0).to_le_bytes()
+        );
     }
 
     #[test]

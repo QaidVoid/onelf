@@ -1,10 +1,13 @@
 //! Publisher-side Ed25519 signing for self-update.
 //!
 //! The runtime verifies a detached signature over the whole downloaded
-//! binary against a public key embedded at pack time. Both sides are raw
-//! fixed-width encodings: a 32-byte public key, a 64-byte signature. The
-//! commands here produce exactly those bytes so no conversion step sits
-//! between generating a key and embedding it with `pack --update-key`.
+//! binary against the public keys embedded at pack time. Both sides are
+//! raw fixed-width encodings: 32-byte public keys, a 64-byte signature.
+//! The commands here produce exactly those bytes so no conversion step
+//! sits between generating a key and embedding it with `pack
+//! --update-key`. A key file may hold several keys concatenated (N*32
+//! bytes), forming a keyring: the runtime accepts an update signed with
+//! any key in it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -15,15 +18,27 @@ use ed25519_compact::{KeyPair, PublicKey, SecretKey};
 
 use onelf_format::EntryKind;
 
-/// Path inside a package holding the raw update public key.
+/// Path inside a package holding the raw update public keys: one or more
+/// 32-byte Ed25519 public keys concatenated.
 const EMBEDDED_KEY_PATH: &str = ".onelf/update-key";
 
 /// Generate a keypair, writing the public key where `pack --update-key`
 /// can take it directly and the secret key owner-only.
 ///
 /// Refuses to overwrite either file. Replacing a secret that is already
-/// embedded in published packages permanently breaks self-update for
-/// every user holding one, so clobbering is never the helpful default.
+/// embedded in published packages silently deadens self-update for every
+/// user holding one, so clobbering is never the helpful default.
+///
+/// Rotation uses a keyring, in three steps. First pack a release whose
+/// `--update-key` file holds the old and the new public keys
+/// concatenated, signed with the OLD secret: every installed client
+/// verifies it against its embedded old key, and the ring hands it the
+/// new key, signature-covered. From the next release on, sign with the
+/// new secret. Finally, drop the old key from the ring once clients have
+/// moved (or immediately, if it leaked). A package whose ring still
+/// carries the old key keeps updating throughout, so unlike a
+/// single-key crossover, no client is ever stranded by skipping a
+/// release.
 pub fn generate(pub_path: &Path, secret_path: &Path) -> io::Result<()> {
     for path in [pub_path, secret_path] {
         if path.exists() {
@@ -139,11 +154,14 @@ fn embedded_file(file: &Path, path: &str) -> Option<Vec<u8>> {
     crate::extract::decompress_verified(&mut f, &footer, entry, dict.as_deref()).ok()
 }
 
-/// Compare the package's embedded update key against the signing key.
+/// Compare the package's embedded update keys against the signing key.
 ///
 /// Signing with the wrong key is the one mistake nothing else catches:
 /// the package packs, installs and runs normally, and only the update
-/// path is dead, with no local symptom for the publisher.
+/// path is dead, with no local symptom for the publisher. The embedded
+/// bytes may be a keyring of several keys; the signature is accepted when
+/// it matches any of them, which is what makes rotation work: a release
+/// signed with the old secret while the ring already carries the new key.
 fn check_key_against_package(file: &Path, public: &PublicKey) -> io::Result<KeyMatch> {
     let is_package = crate::info::read_footer_and_manifest(file).is_ok();
     if !is_package {
@@ -151,17 +169,24 @@ fn check_key_against_package(file: &Path, public: &PublicKey) -> io::Result<KeyM
     }
     match embedded_file(file, EMBEDDED_KEY_PATH) {
         None => Ok(KeyMatch::NoEmbeddedKey),
-        Some(embedded) if embedded == public.as_ref() => Ok(KeyMatch::Matches),
-        Some(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} embeds a different update key than this secret produces, so the \
-                 signature would be rejected by every client. Sign with the secret \
-                 matching the key passed to `pack --update-key`, or repack with the \
-                 public key for this secret.",
-                file.display()
-            ),
-        )),
+        Some(embedded) if embedded.chunks(32).any(|k| k == public.as_ref()) => {
+            Ok(KeyMatch::Matches)
+        }
+        Some(embedded) => {
+            let keys = (embedded.len() / 32).max(1);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} embeds {} update key{} that this secret does not produce, so \
+                     the signature would be rejected by every client. Sign with the \
+                     secret matching any key passed to `pack --update-key`, or repack \
+                     with the public key for this secret.",
+                    file.display(),
+                    keys,
+                    if keys == 1 { "" } else { "s" }
+                ),
+            ))
+        }
     }
 }
 

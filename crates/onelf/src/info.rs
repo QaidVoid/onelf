@@ -124,19 +124,24 @@ pub fn info(path: &Path) -> io::Result<()> {
     println!();
 
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {
-        let has_key =
-            read_metadata_string(path, &footer, &manifest, ".onelf/update-key")?.is_some();
+        let embedded_key = read_metadata_bytes(path, &footer, &manifest, ".onelf/update-key")?;
+        let key_desc = match embedded_key.as_deref().map(|b| b.len() / 32) {
+            None => "none".to_string(),
+            Some(n) if n <= 1 => "embedded".to_string(),
+            Some(n) => format!("keyring of {n} keys"),
+        };
         println!("Update:");
         println!("  URL:          {url}");
-        println!(
-            "  Signing key:  {}",
-            if has_key { "embedded" } else { "none" }
-        );
+        if let Some(rev) = read_metadata_string(path, &footer, &manifest, ".onelf/update-revision")?
+        {
+            println!("  Revision:     {}", rev.trim());
+        }
+        println!("  Signing key:  {key_desc}");
         println!(
             "  Updater:      {}",
             if footer.flags.contains(Flags::EXTERNAL_UPDATER) {
                 "external (this package does not update itself)"
-            } else if has_key {
+            } else if embedded_key.is_some() {
                 "embedded"
             } else {
                 "embedded, but disabled without a signing key"
@@ -221,7 +226,7 @@ fn read_manifest<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<
             )
         })?;
 
-    if xxhash_rust::xxh32::xxh32(&bytes, 0).to_le_bytes() != footer.manifest_checksum {
+    if onelf_format::manifest::manifest_checksum(&bytes) != footer.manifest_checksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "manifest checksum mismatch",
@@ -292,6 +297,19 @@ fn read_metadata_string(
     manifest: &Manifest,
     entry_path: &str,
 ) -> io::Result<Option<String>> {
+    Ok(read_metadata_bytes(path, footer, manifest, entry_path)?
+        .map(|data| String::from_utf8_lossy(&data).trim().to_string()))
+}
+
+/// The raw bytes of a metadata entry, without the UTF-8 decoding
+/// `read_metadata_string` applies. Binary metadata (the update keyring)
+/// needs the exact length.
+fn read_metadata_bytes(
+    path: &Path,
+    footer: &Footer,
+    manifest: &Manifest,
+    entry_path: &str,
+) -> io::Result<Option<Vec<u8>>> {
     use crate::extract::decompress_verified;
 
     let idx = (0..manifest.entries.len()).find(|&i| {
@@ -301,8 +319,12 @@ fn read_metadata_string(
 
     let mut file = File::open(path)?;
     let dict = read_dict(&mut file, footer)?;
-    let data = decompress_verified(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
-    Ok(Some(String::from_utf8_lossy(&data).trim().to_string()))
+    Ok(Some(decompress_verified(
+        &mut file,
+        footer,
+        &manifest.entries[idx],
+        dict.as_deref(),
+    )?))
 }
 
 fn read_package_info(

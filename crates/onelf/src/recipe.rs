@@ -247,6 +247,10 @@ pub struct Update {
     /// Path to a file with the raw 32-byte Ed25519 public key used to
     /// verify signed self-updates.
     pub key: Option<PathBuf>,
+    /// Release number stamped into the package as
+    /// `.onelf/update-revision`. The runtime refuses downloads that are
+    /// not strictly newer than the running revision.
+    pub revision: Option<u64>,
     /// Embed the update-capable runtime. Defaults to true. False records
     /// the URL and key but links the slim runtime, for packages updated
     /// by a package manager rather than by themselves.

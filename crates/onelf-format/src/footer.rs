@@ -27,13 +27,23 @@
 //! 68     8        End magic: "FLENONE\x00"
 //! ```
 //!
+//! The magic bytes stay "ONELF\0\x01\x00" across versions; the version
+//! field itself distinguishes formats.
+//!
+//! # Versions
+//!
+//! Version 2 means the manifest (version 3) carries `prefix_hash` and
+//! `footer_hash`, so the runtime prefix and this footer are covered by a
+//! hash chain rooted in the manifest; see [`crate::manifest`]. Version 1
+//! files carry no such fields and cannot be structurally authenticated.
+//!
 //! # Example
 //!
 //! ```ignore
 //! use onelf_format::Footer;
 //!
 //! let footer = Footer {
-//!     format_version: 1,
+//!     format_version: 2,
 //!     // ... other fields
 //! };
 //! ```
@@ -43,6 +53,15 @@ use std::io::{self, Read, Write};
 pub const FOOTER_SIZE: usize = 76;
 pub const MAGIC: [u8; 8] = *b"ONELF\x00\x01\x00";
 pub const END_MAGIC: [u8; 8] = *b"FLENONE\x00";
+
+/// Footer format this build writes.
+///
+/// Version 2 files carry a manifest (version 3) whose header holds a
+/// BLAKE3 of the runtime prefix and a BLAKE3 of this footer, making the
+/// whole container structure verifiable. Version 1 remains readable so
+/// old packages still run, but its prefix and footer are covered by no
+/// hash at all.
+pub const FORMAT_VERSION: u16 = 2;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +152,7 @@ impl HostLibsPolicy {
 
 #[derive(Debug, Clone)]
 pub struct Footer {
-    /// Format version number (currently 1).
+    /// Format version: 1 (legacy, unauthenticated structure) or 2.
     pub format_version: u16,
     /// Feature flags describing optional sections and capabilities.
     pub flags: Flags,
@@ -161,6 +180,30 @@ impl Footer {
     /// must skip decompression and use payload bytes directly.
     pub fn is_stored(&self) -> bool {
         self.flags.contains(Flags::STORED)
+    }
+
+    /// BLAKE3 over this footer's exact 76 bytes, with the four
+    /// manifest-derived layout fields (`manifest_compressed`,
+    /// `manifest_original`, `payload_offset`, `dict_offset`) zeroed.
+    ///
+    /// This is the value a format-2 manifest carries in its `footer_hash`
+    /// field. The layout fields are excluded because the packer cannot
+    /// know them before compressing the manifest, and the manifest cannot
+    /// be compressed before this hash exists: their values are pinned
+    /// indirectly instead, by the bounds checks and the entry hashes the
+    /// manifest carries. The `manifest_checksum` field is included, which
+    /// closes the loop: rewriting the manifest changes the checksum the
+    /// footer must carry, which changes this hash, which is pinned inside
+    /// the manifest itself. A consistent rewrite requires inverting
+    /// BLAKE3, not just recomputing hashes.
+    pub fn structure_hash(&self) -> [u8; 32] {
+        let mut buf = [0u8; FOOTER_SIZE];
+        let mut sink: &mut [u8] = &mut buf;
+        // write_to cannot fail on an in-memory sink.
+        self.write_to(&mut sink).ok();
+        buf[20..44].fill(0);
+        buf[52..60].fill(0);
+        *blake3::hash(&buf).as_bytes()
     }
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -200,7 +243,7 @@ impl Footer {
         }
 
         let format_version = u16::from_le_bytes(buf[8..10].try_into().unwrap());
-        if format_version != 1 {
+        if format_version != 1 && format_version != FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported format version: {}", format_version),
@@ -231,7 +274,7 @@ mod tests {
 
     fn sample() -> Footer {
         Footer {
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             flags: Flags::HAS_DICT | Flags::STORED,
             manifest_offset: 0x1122,
             manifest_compressed: 0x33,
@@ -273,10 +316,48 @@ mod tests {
         bad[68] ^= 0xff;
         assert!(Footer::from_bytes(&bad.clone().try_into().unwrap()).is_err());
 
-        // Unsupported version.
-        let mut bad = buf.clone();
-        bad[8..10].copy_from_slice(&2u16.to_le_bytes());
-        assert!(Footer::from_bytes(&bad.try_into().unwrap()).is_err());
+        // Unsupported version: 0 and anything past the current one.
+        for version in [0u16, 3u16, 99u16] {
+            let mut bad = buf.clone();
+            bad[8..10].copy_from_slice(&version.to_le_bytes());
+            assert!(Footer::from_bytes(&bad.try_into().unwrap()).is_err());
+        }
+
+        // Both readable versions decode.
+        for version in [1u16, FORMAT_VERSION] {
+            let mut ok = buf.clone();
+            ok[8..10].copy_from_slice(&version.to_le_bytes());
+            assert!(Footer::from_bytes(&ok.try_into().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn structure_hash_pins_everything_but_the_size_fields() {
+        let f = sample();
+        let h = f.structure_hash();
+
+        // The three manifest-derived layout fields may differ (the packer
+        // fills them in after this hash is taken) without moving the hash.
+        let mut grown = f.clone();
+        grown.manifest_compressed += 7;
+        grown.manifest_original += 7;
+        grown.payload_offset += 7;
+        grown.dict_offset += 7;
+        assert_eq!(grown.structure_hash(), h);
+
+        // Every other field is pinned: a change to any of them shows up.
+        let mut other = f.clone();
+        other.payload_size += 1;
+        assert_ne!(other.structure_hash(), h);
+        let mut other = f.clone();
+        other.manifest_checksum = [9, 9, 9, 9];
+        assert_ne!(other.structure_hash(), h);
+        let mut other = f.clone();
+        other.flags = Flags::empty();
+        assert_ne!(other.structure_hash(), h);
+        let mut other = f.clone();
+        other.manifest_offset += 1;
+        assert_ne!(other.structure_hash(), h);
     }
 
     #[test]

@@ -73,7 +73,8 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--mtime SECS` | | Pin every entry's mtime to a Unix timestamp for reproducible output |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
 | `--update-url URL` | | zsync URL; enables update runtime |
-| `--update-key PATH` | | 32-byte Ed25519 public key; required for self-update |
+| `--update-key PATH` | | File with one or more 32-byte Ed25519 public keys concatenated; a multi-key file is a keyring and any of its keys can sign updates. Required for self-update |
+| `--update-revision N` | | Stamp release number N into the package; the runtime refuses downloads that are not strictly newer. Requires `--update-url` |
 | `--no-embed-updater` | `false` | Record the update URL without embedding the updater (saves 1.36 MB) |
 | `--host-libs MODE` | `auto` | `auto`, `always`, or `never`: expose the host's library dirs |
 | `--exclude GLOB` | | Exclude paths matching glob (repeatable) |
@@ -159,11 +160,28 @@ With one `--file` and `-o -`, pipes that file to stdout.
 
 ## `onelf verify`
 
-Recompute BLAKE3 of each file entry and compare against the manifest.
+Check a packed binary's integrity: the container structure first, then
+every file entry.
 
 ```
-onelf verify BINARY
+onelf verify BINARY [--key KEYFILE --sig SIGFILE]
 ```
+
+For format 2 packages the structure check covers the runtime ELF prefix
+and the footer, both hashed into the manifest. Format 1 packages carry
+no such hashes and are refused with a clear message; they cannot be
+authenticated at all.
+
+The entry sweep recomputes a BLAKE3 for each file and compares it
+against the manifest.
+
+With `--key` and `--sig` (always together), also check a detached
+Ed25519 signature over the whole file — the same check the runtime's
+self-update applies before installing. `KEYFILE` is the raw 32-byte
+public key `onelf key new` writes; `SIGFILE` is the raw 64-byte
+signature `onelf sign` writes. A signature over a modified file fails,
+and re-signing a modified file does not help, because the per-entry
+hashes still fail; only a fresh pack and a fresh signature do.
 
 Exit `0` on match, `1` on mismatch.
 

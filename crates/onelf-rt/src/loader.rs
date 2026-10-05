@@ -56,8 +56,9 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
         )?;
 
     // Verify the footer's XXH32 checksum over the uncompressed manifest
-    // (matches what the packer writes) before trusting the bytes.
-    if xxhash_rust::xxh32::xxh32(&manifest_bytes, 0).to_le_bytes() != footer.manifest_checksum {
+    // (with the footer_hash header field excluded; matches what the
+    // packer writes) before trusting the bytes.
+    if onelf_format::manifest::manifest_checksum(&manifest_bytes) != footer.manifest_checksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "manifest checksum mismatch",

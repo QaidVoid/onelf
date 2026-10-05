@@ -100,12 +100,16 @@ small and separate from the payload).
 [update]
 url = "https://releases.example.com/myapp.onelf.zsync"
 key = "myapp.pub"      # optional path, required for self-update
+revision = 7           # optional release number; the runtime refuses non-newer downloads
 embed = true           # optional, false for an external updater
 ```
 
 When present, onelf selects the update-capable runtime, 1.36 MB larger
 than slim. `key` is the 32-byte Ed25519 public key from `onelf key new`;
-the runtime refuses to self-update without it. `embed = false` records
+the runtime refuses to self-update without it. `revision` is embedded as
+`.onelf/update-revision` and covered by the signature; at update time the
+runtime refuses a download whose revision is not strictly newer than the
+running one. `embed = false` records
 the URL and key but links the slim runtime, for packages updated by a
 package manager.
 

@@ -81,8 +81,16 @@ pub struct PackOptions {
     /// packages updated by a package manager rather than by themselves.
     pub embed_updater: bool,
     /// Raw Ed25519 public key bytes embedded as `.onelf/update-key`; the
-    /// runtime requires it (and a valid signature) before self-updating.
+    /// runtime requires at least one key (and a valid signature) before
+    /// self-updating. The length must be a multiple of 32: one key is the
+    /// classic case, several concatenated keys form a keyring, and the
+    /// runtime accepts an update signature made with any key in it.
     pub update_key: Option<Vec<u8>>,
+    /// Monotonic revision embedded as `.onelf/update-revision`; the
+    /// runtime refuses an update whose revision is not newer, so a
+    /// rolled-back build cannot be reinstalled. The detached signature
+    /// covers it.
+    pub update_revision: Option<u64>,
     pub exclude: Vec<String>,
     /// Optional TOML-formatted metadata written to `.onelf/package-info.toml`.
     pub package_info: Option<String>,
@@ -745,13 +753,29 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         );
     }
 
-    // Inject .onelf/update-key (raw Ed25519 public key) if provided.
+    // Inject .onelf/update-revision if requested. The detached signature
+    // covers the whole package, so this number is authenticated, and the
+    // runtime refuses an update that is not newer than what it runs.
+    if let Some(rev) = opts.update_revision {
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/update-revision",
+            rev.to_string().into_bytes(),
+            inject_mtime,
+        );
+    }
+
+    // Inject .onelf/update-key (raw Ed25519 public keys) if provided.
+    // One key is the common case; a concatenation of N keys is a keyring
+    // and the runtime accepts a signature from any of them.
     if let Some(ref key) = opts.update_key {
-        if key.len() != 32 {
+        if key.is_empty() || key.len() % 32 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "update key must be a 32-byte Ed25519 public key, got {} bytes",
+                    "update key must be one or more 32-byte Ed25519 public keys \
+                     (a multiple of 32 bytes), got {} bytes",
                     key.len()
                 ),
             ));
@@ -1306,6 +1330,14 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     let string_table = strings.finish();
 
+    // Patch ELF header with ONELF signature in e_ident padding (bytes 9-14)
+    let mut runtime_patched = runtime_binary.to_vec();
+    if runtime_patched.len() >= 16 {
+        // Bytes 9-14 are EI_PAD (padding), we can use them for signature
+        // Signature: "ONELF\x00" (6 bytes)
+        runtime_patched[9..15].copy_from_slice(b"ONELF\x00");
+    }
+
     // Build manifest and compute package_id
     let manifest = Manifest {
         header: ManifestHeader {
@@ -1317,6 +1349,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             lib_dir_count: lib_dir_offsets.len() as u16,
             name_offset,
             package_id: [0; 32], // placeholder, computed below
+            // Authenticated container structure, format version 2: the
+            // manifest pins the runtime prefix and (once its bytes exist)
+            // the footer, so `verify` can check both.
+            prefix_hash: blake3::hash(&runtime_patched).into(),
+            footer_hash: [0; 32], // placeholder, patched below
         },
         entrypoints,
         entries,
@@ -1331,11 +1368,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Patch the package_id in the serialized manifest (bytes 18..50 in header)
     manifest_bytes[18..50].copy_from_slice(&package_id);
 
-    // Compress manifest
-    let manifest_compressed = compress::compress_manifest(&manifest_bytes)?;
-
-    // Compute manifest checksum (xxhash32 of uncompressed manifest)
-    let manifest_checksum = xxhash_rust::xxh32::xxh32(&manifest_bytes, 0).to_le_bytes();
+    // Compute manifest checksum (xxhash32 of uncompressed manifest, with
+    // the footer_hash field excluded; it is pinned by the footer hash
+    // instead, see Footer::structure_hash).
+    let manifest_checksum = onelf_format::manifest::manifest_checksum(&manifest_bytes);
 
     // Compute total payload size
     // What was actually written, which after dedup is less than the sum of
@@ -1373,30 +1409,36 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     let runtime_size = runtime_binary.len() as u64;
     let manifest_offset = runtime_size;
-    let payload_start = manifest_offset + manifest_compressed.len() as u64;
-    let dict_offset;
-    let dict_size;
+    let dict_size = dict.as_ref().map(|d| d.len() as u32).unwrap_or(0);
 
-    if let Some(ref d) = dict {
-        dict_offset = payload_start + total_payload;
-        dict_size = d.len() as u32;
-    } else {
-        dict_offset = 0;
-        dict_size = 0;
-    }
-
-    let footer = Footer {
-        format_version: 1,
+    // The footer is hashed into the manifest, and the manifest's
+    // compressed size is only known after that hash is in, so the hash
+    // covers the footer with the three manifest-derived size fields
+    // zeroed (Footer::structure_hash). They are filled in afterwards,
+    // from the final compressed manifest.
+    let mut footer = Footer {
+        format_version: onelf_format::footer::FORMAT_VERSION,
         flags,
         manifest_offset,
-        manifest_compressed: manifest_compressed.len() as u64,
-        manifest_original: manifest_bytes.len() as u64,
-        payload_offset: payload_start,
+        manifest_compressed: 0,
+        manifest_original: 0,
+        payload_offset: 0,
         payload_size: total_payload,
-        dict_offset,
+        dict_offset: 0,
         dict_size,
         manifest_checksum,
     };
+    let footer_hash = footer.structure_hash();
+    manifest_bytes[82..114].copy_from_slice(&footer_hash);
+
+    // Compress manifest
+    let manifest_compressed = compress::compress_manifest(&manifest_bytes)?;
+    footer.manifest_compressed = manifest_compressed.len() as u64;
+    footer.manifest_original = manifest_bytes.len() as u64;
+    footer.payload_offset = manifest_offset + manifest_compressed.len() as u64;
+    if dict.is_some() {
+        footer.dict_offset = footer.payload_offset + total_payload;
+    }
 
     // Written beside the output and renamed over it at the end, so a
     // reader never sees a partial package and an instance still running
@@ -1405,14 +1447,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let out = File::create(&staged)?;
     let mut w = BufWriter::new(out);
 
-    // [Runtime ELF]
-    // Patch ELF header with ONELF signature in e_ident padding (bytes 9-14)
-    let mut runtime_patched = runtime_binary.to_vec();
-    if runtime_patched.len() >= 16 {
-        // Bytes 9-14 are EI_PAD (padding), we can use them for signature
-        // Signature: "ONELF\x00" (6 bytes)
-        runtime_patched[9..15].copy_from_slice(b"ONELF\x00");
-    }
+    // [Runtime ELF], already patched above and hashed into the manifest
     w.write_all(&runtime_patched)?;
     // [Manifest (compressed)]
     w.write_all(&manifest_compressed)?;
@@ -1744,6 +1779,7 @@ mod tests {
             update_url: None,
             embed_updater: true,
             update_key: None,
+            update_revision: None,
             exclude: Vec::new(),
             package_info: None,
             mtime: Some(0),
