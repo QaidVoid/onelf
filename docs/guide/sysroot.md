@@ -12,12 +12,29 @@ package declares what it depends on. The bundle's contents become the
 closure of your application's package, minus what you declare should stay
 out. Nothing from the machine you pack on is consulted.
 
+The rules this page encodes:
+
+- ✅ Pin a sysroot when the bundle must not depend on your machine. The
+  bundle is the closure of your application's package, and two builds
+  from the same archive and recipe produce the same bytes.
+- ✅ Prune that closure with the three tiers: platform line for what the
+  host supplies, policy for what never ships, trace and keep file for
+  what only a run proves.
+- ✅ Expect a sysroot build to stop on an unresolved `DT_NEEDED`. The
+  universe was complete, so the omission is a policy or platform-line
+  mistake you can fix.
+- ⚠️ Keep the sysroot outside the AppDir. `onelf build` refuses one
+  inside it, because everything under the AppDir is packed.
+- ⚠️ Name the drivers nothing depends on when you `pack-gl`, Vulkan ICDs
+  and `libva` included. A build without `libva` leaves a video player
+  without it on a host that has none.
+
 ## Getting a sysroot
 
-A sysroot is an Arch Linux lineage rootfs, chosen because its package
-database is a few plain-text files per package and because debloated
-builds of the heavy packages (Mesa, LLVM, Qt, ffmpeg) already exist for
-it. Any archive of such a rootfs works, `.tar` or `.tar.zst`:
+✅ An Arch Linux lineage rootfs. Its package database is a few plain-text
+files per package, and debloated builds of the heavy packages (Mesa,
+LLVM, Qt, ffmpeg) already exist for it. Any archive of such a rootfs
+works, `.tar` or `.tar.zst`:
 
 ```bash
 onelf sysroot fetch https://example.com/platform-1.tar.zst ./sysroot
@@ -29,14 +46,12 @@ ownership is not restored and setuid bits are dropped, since the bundle
 never needs either, and an archive whose entries reach outside the
 directory is refused.
 
-The quickest way to make one yourself is a container: install the
+✅ The quickest way to make one yourself is a container: install the
 application with `pacman` inside an `archlinux` image and export the
 container's filesystem.
 
-::: warning
-Keep the sysroot outside the AppDir. `onelf build` refuses one inside it,
-because everything under the AppDir is packed.
-:::
+⚠️ Keep the sysroot outside the AppDir. `onelf build` refuses one inside
+it, because everything under the AppDir is packed.
 
 ## Declaring it in the recipe
 
@@ -53,12 +68,13 @@ policy = "../policy.txt"
 trace = "../trace.txt"               # optional
 ```
 
+✅ Use `optional` for packages the closure misses on its own: an optional
+dependency of something bundled, or a package nothing depends on at all,
+such as a Vulkan driver. Each enters with its own dependencies.
+
 `onelf build` then finds the package owning `usr/bin/myapp`, takes its
 transitive dependencies, prunes them, and copies the result into the
 AppDir with `usr/` flattened into the usual `bin/`, `lib/` and `share/`.
-`optional` names packages to add: an optional dependency of something in
-the closure, or a package nothing depends on at all, such as a Vulkan
-driver. Each enters with its own dependencies.
 
 The normal `bundle-libs` steps follow: run paths, the bootstrap, the
 loader scrub. Their dependency lookup never leaves the sysroot: its
@@ -92,20 +108,23 @@ libcuda.so
 ```
 
 A library on the line is left out of the bundle and reported as
-host-provided. At run time the resolver takes it from the host; see
-[Bundling](./bundling#libraries-that-come-from-the-host). Without a
-platform line the GPU driver families are the line, so a closure that
-includes Mesa ships without it. To bundle Mesa, write a platform line
-that leaves it out of the list.
+host-provided; at run time the resolver takes it from the host; see
+[Bundling](./bundling#libraries-that-come-from-the-host).
 
-A package whose top-level library is on the line is the host's package,
-and it stays out whole: Mesa's gallium and DRI drivers serve the
-`libGL` the host supplies and nothing in the bundle. So does whatever
-only such packages depended on, LLVM when nothing else needs it. The
-report lists them under "Host packages". A file of theirs that
-something bundled does need is reported as left out, and the verifier
-names the needer, so the choice is yours: put the library on the
-platform line, or leave the package out of the line.
+- ❌ Expecting a closure that includes Mesa to ship Mesa. Without a
+  platform line the GPU driver families are the line, so it ships
+  without Mesa.
+- ✅ To bundle Mesa, write a platform line that leaves it out of the
+  list.
+- ⚠️ A package whose top-level library is on the line is the host's
+  package and stays out whole: Mesa's gallium and DRI drivers serve the
+  `libGL` the host supplies and nothing in the bundle, and so does
+  whatever only such packages depended on, LLVM when nothing else needs
+  it. The report lists them under "Host packages".
+- ✅ When a file of a host package's that something bundled does need is
+  reported as left out, the verifier names the needer, so the choice is
+  yours: put the library on the platform line, or leave the package out
+  of the line.
 
 **The policy** names what never ships, as globs over paths relative to
 the sysroot root:
@@ -117,16 +136,19 @@ usr/include/**
 usr/lib/*.a
 ```
 
-It holds for dependencies too. A library the policy prunes is not
-copied back because something bundled needs it; the build reports it
-under "Left out by policy" and the verifier names the file that needed
-it, which is the next thing to prune. A distribution's closure carries
-plugins whose own dependencies were never installed, Qt modules and
-Python bindings for optional stacks, and this is how they are cut.
+- ✅ Cut a distribution's closure down with it. It carries plugins whose
+  own dependencies were never installed, Qt modules and Python bindings
+  for optional stacks, and this is how they are cut.
+- ✅ It holds for dependencies too. A library the policy prunes is not
+  copied back because something bundled needs it; the build reports it
+  under "Left out by policy" and the verifier names the file that needed
+  it, which is the next thing to prune.
+
 A build records what it put into the AppDir in `.onelf/generated` and
 removes those files first the next time, so a changed policy or
 closure takes effect on its own while anything you added by hand
 stays.
+
 **A trace**, when you have one, lists the paths a test run opened, one per
 line. A file survives when it was opened, when any file in its directory
 was opened, or when some surviving object names it in `DT_NEEDED`,
@@ -135,12 +157,14 @@ what keeps a plugin loaded by name from vanishing because the test run
 did not happen to load it; it does not apply to the flat `bin/` and
 `lib/` directories, where every run touches something and it would
 keep everything. A Python package is kept whole once the run touched
-anything in it, since its modules are imported lazily. Without a trace
-nothing is pruned this way.
+anything in it, since its modules are imported lazily.
 
-Some data is loaded lazily too, icons and scripts an application reads
-on demand, and no test run opens all of it. **A keep file** names globs
-the trace may not prune, in the policy's format:
+- ❌ Skipping the trace because the recipe builds fine without one.
+  Without a trace nothing is pruned this way.
+- ⚠️ A trace only knows what the run opened. Some data is loaded lazily
+  too, icons and scripts an application reads on demand, and no test
+  run opens all of it. **A keep file** names globs the trace may not
+  prune, in the policy's format:
 
 ```
 usr/share/blender/**
@@ -174,12 +198,12 @@ an error:
 error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure nor on the platform line
 ```
 
-The universe was complete, so the omission is a policy or platform-line
-mistake you can fix. From a host scan the same finding stays a warning,
-because there the universe was a guess.
-
-A dependency the database names but the sysroot does not hold is
-reported, not fatal. A debloated rootfs drops metapackages on purpose.
+- ✅ A sysroot build stops, and that is the point. The universe was
+  complete, so the omission is a policy or platform-line mistake you can
+  fix. From a host scan the same finding stays a warning, because there
+  the universe was a guess.
+- ☑️ A dependency the database names but the sysroot does not hold is
+  reported, not fatal. A debloated rootfs drops metapackages on purpose.
 
 ## What the report tells you
 
@@ -192,7 +216,7 @@ Sysroot: ../sysroot
 
 The package list is the bundle's provenance, and it travels with the
 package: `bundle-libs` writes it to `.onelf/provenance.toml` under the
-`platform` label from the recipe, and `onelf info` prints it. Two builds
+`platform` label from the recipe, and `onelf info` prints it. ✅ Two builds
 from the same archive and recipe produce the same bytes, so the list can
 be checked against the archive later.
 
@@ -202,13 +226,14 @@ A toolkit the size of Qt or GTK is most of a bundle, and every package
 carries its own copy. A shared set is that copy made once: the closure
 of the named sysroot packages, packed as a build and fetched by any
 package that pins it, so ten Qt applications share one download and one
-extraction on a machine. Unlike the GL build it is never conditional on
-the host: the host's toolkit is not consulted, because no loader can
-tell whether it is the right version, and the application behaves the
-same everywhere.
+extraction on a machine.
 
-Build the set from the sysroot the application is built on, so the two
-agree on every version:
+- ❌ Consulting the host's toolkit. Unlike the GL build a set is never
+  conditional on the host: the host's toolkit is not consulted, because
+  no loader can tell whether it is the right version, and the
+  application behaves the same everywhere.
+- ✅ Build the set from the sysroot the application is built on, so the
+  two agree on every version:
 
 ```bash
 onelf sysroot pack-set ./qt-tree -o qt-6.7.onelf --name qt --sysroot ../sysroot \
@@ -232,7 +257,7 @@ The build leaves the closure of those packages out of the bundle, along
 with whatever only they depended on, reports what it left to the set,
 and accepts what the set provides when it verifies the bundle. The
 package records each set's URL and hash in `.onelf/sets`, which `onelf
-info` prints. The hash is the trust story, as for the GL build.
+info` prints. ✅ The hash is the trust story, as for the GL build.
 
 ### At launch
 
@@ -251,14 +276,14 @@ by the mountpoint lock rather than guessed at. `ONELF_SET_MODE=extract`
 asks for a copy through the ordinary package cache instead, and a host
 that cannot mount falls back to that on its own.
 
-Mounting needs `fusermount3`, even on a host whose user namespaces work.
-The namespace mount the FUSE execution mode uses is private to the
-process that made it, so no other package could join it and the
-application, being a different process, would not see it either; and
-making one would put every launch with a set into a user namespace,
-which is what a `needs-setuid` package and a rootless podman or
-distrobox host ask the runtime not to do. Where the helper is missing the
-set is copied out instead, which costs disk but behaves the same.
+- ⚠️ Mounting needs `fusermount3`, even on a host whose user namespaces
+  work. The namespace mount the FUSE execution mode uses is private to
+  the process that made it, so no other package could join it and the
+  application, being a different process, would not see it either; and
+  making one would put every launch with a set into a user namespace,
+  which is what a `needs-setuid` package and a rootless podman or
+  distrobox host ask the runtime not to do. Where the helper is missing
+  the set is copied out instead, which costs disk but behaves the same.
 
 Every directory of a set that holds a shared object goes on the launch's
 library path after the bundle's own, so a name the bundle kept stays the
@@ -267,7 +292,7 @@ bundle's and the set supplies the rest. Its `share/` joins
 `QT_PLUGIN_PATH`, and its libraries are compared against the host
 exactly as bundled copies are.
 
-A toolkit that locates its own parts relative to the executable is the
+⚠️ A toolkit that locates its own parts relative to the executable is the
 one thing a set changes for the application, since the toolkit is no
 longer beside it. Qt is the common case and the runtime handles it. An
 application that hardcodes an absolute data path has the same problem
@@ -287,7 +312,7 @@ carries none. Most hosts do. A minimal container, a headless CI runner
 or an image built without Mesa does not, and there a GL application
 would fail to load.
 
-A sysroot can name a build to fetch in that case, in
+✅ A sysroot can name a build to fetch in that case, in
 `etc/onelf/platform.toml`:
 
 ```toml
@@ -309,7 +334,7 @@ platform-url = "https://mirror.example.org/platform-1/gl.onelf"
 platform-hash = "3f1c...a9e2"
 ```
 
-A mirror that serves a different file fails the hash check, so an
+✅ A mirror that serves a different file fails the hash check, so an
 override can move the download but never change what is downloaded.
 
 ### Making the build
@@ -329,16 +354,18 @@ Built from ../sysroot: 812 files from libdrm 2.4.134-1, libglvnd 1.7.0-3, ...
 blake3 = "3f1c...a9e2"
 ```
 
-Name the drivers nothing depends on, Vulkan ICDs in particular, and
-every family the platform line names that your applications use: a
-build without `libva` leaves a video player without it on a host that
-has none. Without `--sysroot`, `pack-gl` packs a tree you built by
+- ⚠️ Name the drivers nothing depends on, Vulkan ICDs in particular, and
+  every family the platform line names that your applications use. A
+  build without `libva` leaves a video player without it on a host that
+  has none.
+
+Without `--sysroot`, `pack-gl` packs a tree you built by
 hand; either way it refuses a tree carrying glibc, then runs the
 verifier over it, so everything it needs apart from glibc and the
 driver families it exists to provide has to be inside. It prints the
 hash to put in `platform.toml`.
 
-The hash is the whole trust story. The package that carries it is
+✅ The hash is the whole trust story. The package that carries it is
 already the thing you distribute, so whoever can alter the hash can
 alter the package, and no key is needed to say who built the GL build.
 
@@ -364,12 +391,11 @@ by name (glvnd vendors, gallium, ICDs) included. `onelf cache list` shows the
 store and `onelf cache gc` collects a build no package has used past
 the age threshold.
 
-Anything that prevents a fetch, including a missing pin, is a warning
-naming the reason, and the application is launched anyway.
-
-A pin over `https://` needs the runtime that carries the HTTPS client,
-and `onelf pack` picks it when the AppDir carries such a pin. A
-`file://` pin works with the slim runtime as well. Three variables
-adjust the behaviour at launch: `ONELF_NO_PLATFORM_FETCH`,
-`ONELF_PLATFORM_URL` and `ONELF_PLATFORM_STORE`, listed under
-[Environment Variables](../reference/env-vars).
+- ⚠️ Anything that prevents a fetch, including a missing pin, is a
+  warning naming the reason, and the application is launched anyway.
+- ☑️ A `file://` pin works with the slim runtime as well. A pin over
+  `https://` needs the runtime that carries the HTTPS client, which
+  `onelf pack` picks when the AppDir carries such a pin. Three variables
+  adjust the behaviour at launch: `ONELF_NO_PLATFORM_FETCH`,
+  `ONELF_PLATFORM_URL` and `ONELF_PLATFORM_STORE`, listed under
+  [Environment Variables](../reference/env-vars).

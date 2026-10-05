@@ -77,6 +77,7 @@ export default defineConfig({
           text: "Development",
           items: [
             { text: "Developing Packages", link: "/guide/developing" },
+            { text: "Building and Testing onelf", link: "/guide/building-onelf" },
             { text: "Inspecting Packages", link: "/guide/inspecting" },
           ],
         },

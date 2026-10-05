@@ -4,6 +4,15 @@ A packed onelf binary can ship with its own config, cache, and data
 directories. This lets users carry the app on a USB stick (or similar)
 without polluting their home directory, like "portable apps" on Windows.
 
+The rules this page encodes:
+
+- ✅ Sibling marker files redirect `$HOME` and the XDG variables.
+- ✅ Make the marker a directory when the app stores files there.
+- ⚠️ Ship the markers with the binary. Without them the app runs
+  against the real `$HOME`.
+- ❌ Expecting `${VAR}` expansion in the env file. Values are
+  exported literally.
+
 ## How it works
 
 The runtime checks for files with specific suffixes next to the packed
@@ -17,9 +26,9 @@ binary:
 | `myapp.onelf.cache` | `$XDG_CACHE_HOME` | `$REAL_XDG_CACHE_HOME` |
 | `myapp.onelf.env` | additional env vars | n/a |
 
-The file can be empty (just a marker) or can be a directory. When the
-runtime finds any of these, it points the corresponding XDG variable at
-the sibling file/directory.
+☑️ An empty file works as a bare marker. When the runtime finds any
+of these, it points the corresponding XDG variable at the sibling
+file/directory.
 
 ## Example
 
@@ -36,7 +45,7 @@ Now running `./myapp.onelf`:
 - Reads `myapp.onelf.env` and exports each `KEY=VALUE` line
 
 The app's dot-config, dot-cache, etc. all live inside
-`~/Applications/myapp.onelf.home/`. You can copy `myapp.onelf` plus
+`~/Applications/myapp.onelf.home/`. ✅ Copy `myapp.onelf` plus
 `myapp.onelf.home` to another machine and the app keeps its state.
 
 ## Creating the portable marker
@@ -60,12 +69,12 @@ MY_APP_THEME=dark
 EXTRA_PATH=${HOME}/bin
 ```
 
-Leading/trailing whitespace is trimmed. Blank lines and `#` comments are
-ignored. `${VAR}` is not expanded; literal values only.
+Leading/trailing whitespace is trimmed. Blank lines and `#` comments
+are ignored. ❌ `${VAR}` is not expanded. The `EXTRA_PATH` line above
+therefore exports the literal string `${HOME}/bin`.
 
 ## Use cases
 
-- Distributing a tool on a shared drive where each user wants isolated
-  state without shelling out to wrappers.
-- Testing app behavior with a fresh `$HOME` without touching the real one.
-- Apps that misbehave when their config already exists.
+- ✅ Per-user isolated state on a shared drive, without wrappers.
+- ✅ Testing with a fresh `$HOME` without touching the real one.
+- ✅ Apps that misbehave when their config already exists.

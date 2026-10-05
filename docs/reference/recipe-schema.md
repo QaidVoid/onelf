@@ -18,8 +18,14 @@ user-facing guide.
 [update]
 # optional, enables self-update
 
+[sysroot]
+# optional, take the bundle from a package database
+
 [bundle]
 # optional, passes to bundle-libs
+
+[paths]
+# optional, maps an absolute path the app opens onto a bundled directory
 
 [env]
 # optional, custom environment variables set before exec
@@ -40,6 +46,8 @@ working-dir = "inherit"           # "inherit" | "package" | "command"
 memfd = true                      # Option<bool>, overrides auto-detect
 host-libs = "auto"                # "auto" | "always" | "never": what the resolver may take from the host
 cache = false                     # bool, allow the persistent cache as the last execution mode
+needs-setuid = false              # bool, the app runs setuid binaries (sudo, pkexec); keeps it out of user namespaces
+mtime = 1735689600                # Option<u64>, pin every entry's mtime to this Unix timestamp (reproducible output; overrides SOURCE_DATE_EPOCH)
 exclude = ["*.a", "__pycache__"]  # Vec<String>, path globs
 version = "1.2.3"                 # Option<String>
 description = "..."               # Option<String>
@@ -63,8 +71,14 @@ args = ["--daemon"]     # Vec<String>, prepended to invocation
 default = false         # bool, mark as default entrypoint
 ```
 
-The `[package].command` entrypoint is always added first and implicitly
-default unless another entry has `default = true`.
+`[package].command` does not add an entrypoint of its own. It supplies
+the package's default entrypoint: when no declared entrypoint has
+`default = true`, entrypoint 0 is the command under its basename, with
+the command's path and no args. When a declared entrypoint is marked
+`default = true`, that entrypoint takes the default slot instead, under
+its own name, path, and args, and the command contributes only the
+package name fallback (`[package].name` defaults to the command's
+basename).
 
 ## `[compression]`
 
@@ -104,8 +118,10 @@ revision = 7           # optional release number; the runtime refuses non-newer 
 embed = true           # optional, false for an external updater
 ```
 
-When present, onelf selects the update-capable runtime, 1.36 MB larger
-than slim. `key` is the 32-byte Ed25519 public key from `onelf key new`;
+When present, onelf selects the update-capable runtime, much larger
+than slim (sizes in the
+[Self-Update size table](../guide/self-update.md#size-tradeoff)). `key`
+is the 32-byte Ed25519 public key from `onelf key new`;
 the runtime refuses to self-update without it. `revision` is embedded as
 `.onelf/update-revision` and covered by the signature; at update time the
 runtime refuses a download whose revision is not strictly newer than the
@@ -207,8 +223,15 @@ tmpfs, or cache dir). Other `${VAR}` expand at **recipe-load** time
 against the packer's environment; `$$` is an escape for a literal `$`,
 so `$${VAR}` reaches the package as `${VAR}` and expands against the
 **live** environment at runtime. Use this to prepend instead of
-replace. POSIX `${VAR:-word}` is supported (use `word` if `VAR` is
-unset or empty).
+replace.
+
+Expansion timing matters for defaults: at pack time only plain `${VAR}`
+of a variable the packer's environment actually has is substituted.
+`${VAR:-word}` is left literal by the packer and evaluated by the
+runtime just before `exec`, against the live environment, with POSIX
+semantics (`word` applies when `VAR` is unset **or empty**). Write
+defaults in the `$${VAR:-word}` escaped form unless you want them
+resolved on the build machine.
 
 `PATH` defaults to `${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}` (the
 package's `bin/` prepended, re-exec-safe; falls back to `/usr/bin:/bin`

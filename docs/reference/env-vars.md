@@ -31,6 +31,10 @@ Reference for all environment variables onelf reads or sets.
 | `DRIRC_CONFIGDIR` | `share/drirc.d/` exists | that dir |
 | `XKB_CONFIG_ROOT` | `share/X11/xkb/` exists | that dir |
 | `XDG_DATA_DIRS` | `share/` exists | `<pkg>/share` (prepended) |
+| `QT_PLUGIN_PATH` | the package or a set has `lib/qt6/plugins` or `lib/qt5/plugins` | colon-joined list of every such dir, so relocatable Qt finds its platform plugin. Only set when the caller has not set it. |
+| `GIO_EXTRA_MODULES` | `lib/gio/modules/` exists in the package or a set | colon-joined list of those dirs, so GLib loads the bundle's GIO modules rather than the host's (whose GLib they do not match). Only set when the caller has not set it. |
+| `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Only set when the caller has not set it. |
+| `GTK_IM_MODULE_FILE` | `lib/gtk-3.0/immodules.cache` exists | that cache, absolutised the same way, so the bundle's input-method modules are used. Only set when the caller has not set it. |
 
 `LD_LIBRARY_PATH` is set as a fallback for AT_EXECFN-bootstrapped
 binaries that do not drive an explicit linker invocation. The runtime
@@ -44,6 +48,11 @@ A script entrypoint (shebang target) runs under a host interpreter that
 must not see the bundled libraries, so it gets neither mechanism: the
 path is published as `ONELF_LIB_PATH` instead, and the script exports it
 as `LD_LIBRARY_PATH` itself before execing bundled binaries.
+
+`VK_ADD_DRIVER_FILES` is never set by the runtime, but it is honored as
+a guard: if the app or the user sets it, the runtime stays out of
+Vulkan's way entirely and does not build `VK_DRIVER_FILES`, keeping the
+Vulkan loader's append semantics and the host's GPU drivers reachable.
 
 ## Read by the runtime (user-settable)
 
@@ -86,3 +95,23 @@ See [Portable Directories](../guide/portable-dirs) for the full story.
 |----------|--------|
 | `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to add a fresh `DT_RUNPATH` to binaries without an existing slot and to inject the re-exec-safe `onelf-env` constructor as a `DT_NEEDED` on the entrypoint. Falls back to looking up `patchelf` in `PATH`. |
 | `SOURCE_DATE_EPOCH` | Clamp file mtimes for reproducible output. See [Reproducible Builds](../guide/reproducible). |
+| `ONELF_PACK_CHUNK_BYTES` | In-flight compression chunk budget in bytes (default 64 MiB). Purely a memory bound: it caps how many files are compressed before their blocks are written back; output bytes are unaffected. A value that does not parse or is zero keeps the default. |
+| `NO_COLOR` | When set (any value, per the NO_COLOR convention), disables the bundler's ANSI colorized status output in `bundle-libs` and `sysroot`. Color also requires a terminal stderr. |
+
+## Build-time (compiling the `onelf` crate)
+
+These are read by `onelf`'s build script, not by the tools or the
+runtime. They exist to cross-compile the embedded runtimes and payloads
+and to offer escape hatches for toolchain-less builds; a plain
+`cargo build` on Linux needs none of them beyond the prerequisites in
+[Building and Testing onelf](../guide/building-onelf).
+
+| Variable | Effect |
+|----------|--------|
+| `ONELF_MUSL_CC` | Names the musl cross C compiler used to build the embedded `onelf-rt` runtimes (e.g. `x86_64-linux-musl-gcc`). When set, a miss is a hard error; without it the build script searches `CC_<triple>`, `<arch>-linux-musl-gcc` and `musl-gcc` on `PATH`, then common Nix and Bootlin locations, and fails with instructions if nothing is found. |
+| `ONELF_RT_PATH` | Embed a prebuilt slim `onelf-rt` binary instead of building one from source. The file must exist and pass ELF and architecture checks. This is how `cargo install` builds without a musl toolchain. |
+| `ONELF_RT_UPDATE_PATH` | Same, for the update-capable runtime variant. Defaults to `ONELF_RT_PATH` when unset, so a toolchain-less build ships the slim binary for both slots (self-update packages then carry a runtime without update code). |
+| `ONELF_PAYLOAD_DIR` | Directory of prebuilt payload artifacts (`bootstrap_<arch>.bin`, `onelf_env_<arch>.so` for x86_64/aarch64/i686), embedded instead of compiling the payloads. Architectures with no file get an inert placeholder. |
+| `ONELF_PAYLOAD_ALL` | When set (`=1`), build payloads for all three architectures instead of only the host's. Needs a working cross toolchain per architecture (`ONELF_PAYLOAD_CC_<ARCH>`). |
+| `ONELF_PAYLOAD_CC_<ARCH>` | C compiler that links one architecture's freestanding payloads; suffixes are `X86_64`, `AARCH64`, `I686` (e.g. `ONELF_PAYLOAD_CC_AARCH64=/opt/bootlin/.../aarch64-linux-gcc`). A set name is a hard requirement; unset names fall back to the host `cc` for a native Linux host, then Bootlin paths. |
+| `ONELF_OBJCOPY` | Path to an `objcopy` used to flatten the bootstrap payload ELF into a raw binary. Falls back to the rustc sysroot's `llvm-objcopy`, then `rust-objcopy`/`llvm-objcopy` on `PATH` (`rustup component add llvm-tools` supplies it). |

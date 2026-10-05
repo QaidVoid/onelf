@@ -3,6 +3,20 @@
 `onelf bundle-libs` walks the ELF files in an AppDir, resolves their
 dependencies, and copies the shared libraries into `lib/`.
 
+The rules this page encodes:
+
+- ✅ Run `bundle-libs` on every AppDir before packing. It is idempotent;
+  run it again whenever the tree changes.
+- ❌ Never put a host directory on the library search path. Not with
+  `LD_LIBRARY_PATH`, not with an `RPATH` pointing outside the tree. The
+  resolver decides host access one library at a time; you cannot do
+  better by hand.
+- ✅ Reach for `--scan-dlopen` or `--trace-run` when the app loads
+  plugins. `DT_NEEDED` alone does not see a `dlopen`.
+- ❌ Do not bundle Mesa "to be safe". The driver that works is the
+  user's; the host's driver stack is taken at launch unless you say
+  otherwise.
+
 ## Basic usage
 
 ```bash
@@ -40,14 +54,16 @@ With no flags, this:
 
 ## Two ways to decide what goes in
 
+✅ Host scan (this page) for a quick bundle of the app on your machine.
+✅ A pinned sysroot when the result must not depend on your machine.
+
 The walk above takes its universe from the machine you pack on: the
 `ldconfig` cache, the Nix store, and the search paths you add. It cannot
 see a `dlopen` by computed name, a plugin directory or a data file, and
-what it finds is what your distribution installs. For those cases a
-pinned sysroot with a package database is the other source: the bundle
-becomes the closure of your application's package, pruned by what you
-declare, with nothing taken from your machine. See
-[Bundling from a Sysroot](./sysroot).
+what it finds is what your distribution installs. A pinned sysroot with
+a package database is the other source: the bundle becomes the closure
+of your application's package, pruned by what you declare, with nothing
+taken from your machine. See [Bundling from a Sysroot](./sysroot).
 
 Both sources end in the same verifier. Every `DT_NEEDED` of every bundled
 ELF must resolve inside the bundle or name something the host provides.
@@ -57,9 +73,23 @@ universe was a guess.
 
 ## Libraries that come from the host
 
-A library the bundle does not provide is not a hard error at runtime, but
-what the host may supply is decided one library at a time, at launch, by
-the runtime's resolver. No host directory is ever placed on the search
+The problem: some libraries must come from the host, most of the bundle
+must not, and both land in the same process.
+
+- ❌ `LD_LIBRARY_PATH` with host directories. It is inherited by every
+  process the app spawns, so host libraries get loaded next to the
+  bundled libc and break in ways that are miserable to trace. Never.
+- ❌ Host directories before the bundle's on any search path. The host's
+  libstdc++ loads beside a bundled glibc built against a different one.
+- ❌ Host directories after the bundle's. The bundled copies win
+  everywhere, and a host driver that must match the user's hardware
+  fails to bind.
+- ✅ Per-library resolution by the runtime's launch resolver. It
+  compares versions and picks the superset, per soname.
+
+A library the bundle does not provide is not a hard error at runtime,
+but what the host may supply is decided one library at a time, at launch,
+by the runtime's resolver. No host directory is ever placed on the search
 path.
 
 The problem the resolver exists for is a host GPU driver. Mesa and the
@@ -68,14 +98,12 @@ hardware, so they come from the host, and they bring their own
 dependencies with them: the host's libstdc++, libdrm, LLVM and, at the
 bottom, the host's glibc. Whether those can share a process with the
 bundled copies depends on which side is newer, and that differs per
-library. Putting host directories after the bundle's on the search path
-loads the bundled copies first and the driver fails to bind; putting them
-before loads host copies next to a bundled libc built against something
-else. Neither order is right for every library.
+library. Neither blanket order above is right for every library, which
+is why comparing per soname is the design.
 
-So the runtime compares. For each soname present both in the bundle and
-on the host, it reads the versions each copy defines and picks the
-superset. Under symbol versioning a newer build only ever adds versions,
+For each soname present both in the bundle and on the host, the runtime
+reads the versions each copy defines and picks the superset. Under
+symbol versioning a newer build only ever adds versions,
 so the winner can stand in for the loser. Equal sets keep the bundled
 copy. Two copies that each define a version the other lacks cannot be
 ordered; the bundled one is kept and the soname is reported on stderr:
@@ -113,14 +141,11 @@ quickest way to tell whether a failure is the resolver's doing.
 
 ### What the resolver may consider
 
-The package records a policy, and `pack` decides its default from the
-bundle's contents:
-
-| Mode | Meaning |
-|------|---------|
-| `auto` (default when the bundle references a driver stack) | The driver stack's host closure: the driver families, what the host's Vulkan and EGL vendor files name, and everything they need |
-| `never` (default otherwise) | Nothing from the host |
-| `always` | Every bundled soname is compared as well |
+| Verdict | Mode | Meaning |
+|---------|------|---------|
+| default when the bundle references a driver stack | `auto` | The driver stack's host closure: the driver families, what the host's Vulkan and EGL vendor files name, and everything they need |
+| default otherwise | `never` | Nothing from the host |
+| ✅ for apps that load a host library under a name they never mention | `always` | Every bundled soname is compared as well |
 
 ```bash
 onelf pack app -o app.onelf --command bin/app --host-libs always
@@ -142,21 +167,27 @@ warning: 1 librar(ies) are not in the bundle:
   - libm.so.6 (needed by myapp)
 ```
 
-Some entries are expected. GL, DRI, Vulkan and NSS libraries are meant to
-come from the host, because they have to match the user's drivers and
-system configuration. The warning lists them so you can tell the
-deliberate ones from the accidental ones; nothing fails.
+How to read that warning:
 
-For the accidental ones, point `--search-path` at a directory holding the
-library and repack. A library reached only through `dlopen` will not
-appear in `DT_NEEDED` at all, so `--scan-dlopen` is what finds those.
+- ✅ GL, DRI, Vulkan and NSS entries are expected. They are meant to
+  come from the host, because they have to match the user's drivers and
+  system configuration.
+- ❌ Anything else means the library exists on your machine but did not
+  make the bundle, and the app will rely on the host for it. Fix it by
+  pointing `--search-path` at a directory holding the library and
+  repacking.
+
+A library reached only through `dlopen` will not appear in `DT_NEEDED`
+at all, so `--scan-dlopen` is what finds those.
 
 ## Self-extracting binaries (Bun, etc.)
 
-Some binaries embed their payload at the end of the file. The most
-common case is pre-1.3.12 Bun-compiled apps, which look for the
-trailer `\n---- Bun! ----\n` at `-16` from end-of-file. These need
-special handling. `bundle-libs` detects them automatically and:
+- ⚠️ Binaries that embed their payload at the end of the file break
+  under naive post-processing. The most common case is pre-1.3.12
+  Bun-compiled apps, which look for the trailer `\n---- Bun! ----\n` at
+  `-16` from end-of-file.
+
+`bundle-libs` detects them automatically and:
 
 - Skips bootstrap injection. The bootstrap appends bytes to the
   binary, which would clobber the trailer and break payload
@@ -172,9 +203,10 @@ patches the binary's PT_INTERP in-place. Either way,
 `/proc/self/exe` resolves to the binary itself and Bun finds its
 embedded JS bundle.
 
-Bun 1.3.12 and newer uses a dedicated `.bun` ELF section instead of
+✅ Bun 1.3.12 and newer uses a dedicated `.bun` ELF section instead of
 the end-of-file trailer. Those binaries are unaffected by file-end
-appending and get normal bootstrap injection treatment.
+appending and get normal bootstrap injection treatment. Prefer it when
+you control the Bun version.
 
 ## Starting from a bare binary
 
@@ -187,22 +219,24 @@ Copies `/usr/bin/myapp` into `./myapp/bin/myapp`, then runs the normal flow.
 ## Detecting dlopen'd libs
 
 Some libraries are loaded at runtime via `dlopen` and don't appear in
-`DT_NEEDED`. `--scan-dlopen` searches the binary strings for common
-candidates (GL, Wayland, Vulkan, X11, audio, DBus, and so on) and bundles
-any matches.
+`DT_NEEDED`.
+
+- ✅ `--scan-dlopen` when the app loads known plugins. It searches the
+  binary strings for common candidates (GL, Wayland, Vulkan, X11,
+  audio, DBus, and so on) and bundles any matches.
 
 ```bash
 onelf bundle-libs ./myapp --scan-dlopen
 ```
 
-You can extend the allow-list with extra sonames:
+✅ Extend the allow-list with a vendor soname the scan cannot know:
 
 ```bash
 onelf bundle-libs ./myapp --scan-dlopen --dlopen libmyvendor.so.1
 ```
 
-The scan only knows names. For what it cannot know, run the application
-and let the loader say what it loaded:
+✅ When even the scan is not enough, run the application and let the
+loader say what it loaded:
 
 ```bash
 onelf bundle-libs ./myapp --target bin/myapp --trace-run --trace-seconds 5 --trace-arg --version
@@ -213,10 +247,10 @@ and every shared object it loaded from outside the tree joins the bundle,
 subject to the same exclusions as everything else. glibc's loader reports
 this on its own through `LD_DEBUG`, per process, so helpers the app
 spawns count too; a musl target is watched with `strace`, which has to
-be installed. A GUI app needs a display for the run; an app that reads
+be installed. ⚠️ A GUI app needs a display for the run; an app that reads
 its arguments needs `--trace-arg` to make it exercise the path you care
-about. The run is against this machine, so it does not apply to a
-sysroot build, which records a trace with `ONELF_TRACE` instead.
+about. ❌ A trace does not apply to a sysroot build, which records a
+trace with `ONELF_TRACE` instead.
 
 ## Framework auto-detection
 
@@ -226,29 +260,31 @@ that is only `dlopen`'d at runtime (Blender loading `libwayland-cursor.so`
 after checking `$XDG_SESSION_TYPE`, for example) is found without a
 `DT_NEEDED` entry.
 
-Detection only flags a framework when it finds a properly versioned soname
-such as `libEGL.so.1` or `libwayland-client.so.0`. This keeps Rust binaries
-honest. Their string tables merge literals together without NUL separators,
-so a real dlopen soname shows up glued to its neighbours like
+✅ Detection only flags a framework when it finds a properly versioned
+soname such as `libEGL.so.1` or `libwayland-client.so.0`. This keeps Rust
+binaries honest. Their string tables merge literals together without NUL
+separators, so a real dlopen soname shows up glued to its neighbours like
 `...eglWaitSynclibEGL.so.1libEGL.so...`. The version suffix is what tells a
 genuine soname apart from prose like `"Library libwayland-client.so could
 not be loaded."`.
 
-What detection does with a hit depends on the framework. Wayland and GTK
-are client-side, so they are bundled. GL, DRI and Vulkan are the driver
-stack, and the driver that works is the host's, so detection there does
-not bundle anything: it sets the package's host-library policy to `auto`
-and the launch resolver takes the stack from the host. The scan reports
-which it found:
+The verdict per framework:
+
+- ✅ Wayland, GTK: bundled. Client-side, they must match the bundle.
+- ✅ GL, DRI, Vulkan: not bundled. The driver that works is the host's,
+  so detection sets the package's host-library policy to `auto` and the
+  launch resolver takes the stack from the host. The scan reports
+  which it found:
 
 ```
   Frameworks: gl, vulkan detected; the host's drivers are used at launch.
   Pass --gl, --dri or --vulkan to bundle Mesa instead.
 ```
 
-Bundle Mesa when the package must run where the host has no GL at all.
-Bundling it for a host that has its own means two copies of the driver
-stack, and the resolver then takes the host's wherever it is newer.
+- ❌ Bundling Mesa "to be safe": for a host that has its own GL this
+  means two copies of the driver stack, and the resolver then takes the
+  host's wherever it is newer. ✅ Bundle Mesa only when the package
+  must run where the host has no GL at all.
 
 You can still force any of these explicitly:
 
@@ -256,10 +292,11 @@ You can still force any of these explicitly:
 onelf bundle-libs ./myapp --gl --vulkan --wayland --gtk
 ```
 
-You can also opt out of a framework that detection or an explicit flag would
-otherwise pull in. This matters for a binary built with optional GUI support
-that you only ship as a TUI. `amdgpu_top`, for example, links the wgpu and
-wayland stacks even though its default mode is a terminal UI:
+✅ Opt out of a framework that detection or an explicit flag would
+otherwise pull in. This matters for a binary built with optional GUI
+support that you only ship as a TUI. `amdgpu_top`, for example, links
+the wgpu and wayland stacks even though its default mode is a terminal
+UI:
 
 ```bash
 onelf bundle-libs ./amdgpu_top --no-gl --no-wayland
@@ -284,10 +321,10 @@ best way to pin a specific library version.
 
 ## Packing on NixOS
 
-NixOS ships a stub loader at `/lib64/ld-linux-x86-64.so.2` that exists
-but refuses to run foreign binaries, printing
-`NixOS cannot run dynamically linked executables...`. bundle-libs
-handles this automatically:
+✅ Do nothing special. bundle-libs handles the NixOS stub loader
+(`/lib64/ld-linux-x86-64.so.2`, which exists but refuses to run foreign
+binaries, printing `NixOS cannot run dynamically linked executables...`)
+automatically:
 
 - Any candidate loader whose canonical path contains `stub-ld` is
   rejected at every resolution tier, so a real glibc from the Nix
@@ -299,25 +336,25 @@ handles this automatically:
   scrubbed so it can't reach back to a store path that doesn't exist
   on another machine.
 
-You shouldn't need to do anything special. If you see the stub-ld
-error anyway, delete the AppDir's `lib/` and re-run `bundle-libs`
-with the current `onelf`.
+⚠️ If you see the stub-ld error anyway, your `lib/` predates the fix:
+delete it and re-run `bundle-libs` with the current `onelf`.
 
 ## Cross-libc hygiene
 
-When the target binary is musl and the host is glibc (or vice versa),
-bundle-libs can end up copying libraries built against the wrong libc.
-Those fail at runtime with confusing "symbol not found" errors.
+❌ Mixing libc families in one bundle. When the target binary is musl
+and the host is glibc (or vice versa), bundle-libs can end up copying
+libraries built against the wrong libc. Those fail at runtime with
+confusing "symbol not found" errors.
 
-`--strict-libc` refuses to bundle libraries whose `DT_NEEDED` points at
-the wrong libc family, and instead lists them under "Not found":
+✅ `--strict-libc` refuses to bundle libraries whose `DT_NEEDED` points
+at the wrong libc family, and instead lists them under "Not found":
 
 ```bash
 onelf bundle-libs ./myapp --strict-libc
 ```
 
-Combine with `--search-path` pointing at the right-libc versions to make
-the bundle clean.
+✅ Combine with `--search-path` pointing at the right-libc versions to
+make the bundle clean.
 
 ## Excluding and including
 
@@ -340,6 +377,8 @@ Runs `strip --strip-unneeded` on each copied library. Saves disk space
 
 ## Dry run
 
+✅ Check a bundle plan before committing to it:
+
 ```bash
 onelf bundle-libs ./myapp --dry-run
 ```
@@ -358,9 +397,10 @@ The granular framework flags:
 | `--wayland` | `libwayland-*`, `libdecor-0`, `libxkbcommon`, Wayland client |
 | `--gtk` | GSettings schemas under `share/glib-2.0/schemas` |
 
-`--wayland` and `--gtk` are enabled by detection; pass them to force-on
-when detection misses something. `--gl`, `--dri` and `--vulkan` are
-opt-in, since the driver stack comes from the host unless you say
-otherwise. Each has a `--no-*` counterpart (`--no-gl`, `--no-dri`,
-`--no-vulkan`, `--no-wayland`, `--no-gtk`) that forces-off, overriding
-both detection and the matching `--*` flag.
+- ✅ `--wayland` and `--gtk` are enabled by detection; pass them to
+  force-on when detection misses something.
+- ☑️ `--gl`, `--dri` and `--vulkan` are opt-in, since the driver stack
+  comes from the host unless you say otherwise.
+- Each has a `--no-*` counterpart (`--no-gl`, `--no-dri`,
+  `--no-vulkan`, `--no-wayland`, `--no-gtk`) that forces-off, overriding
+  both detection and the matching `--*` flag.

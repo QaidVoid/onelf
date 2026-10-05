@@ -3,6 +3,22 @@
 The runtime sets a handful of environment variables before executing the
 entrypoint. Packaged apps can read these to discover their own context.
 
+The rules this page encodes:
+
+- ✅ Read the app's context from the `ONELF_*` variables. The runtime sets
+  them before the entrypoint runs.
+- ✅ Set a data directory with `[env]` when the app offers a variable for
+  it. A variable costs nothing and works everywhere.
+- ☑️ Use `[paths]` only when there is no variable to set. It needs a
+  private mount namespace, and two launch cases fall back with a message
+  on the terminal.
+- ⚠️ Test in a container that does not have the app installed. A
+  hardcoded `/usr` data path silently reads the host's copy where the
+  package happens to be installed and fails where it is not.
+- ⚠️ The environment does not survive a `clearenv()` re-exec. onelf
+  moves the guarantee into the ELF; without the `onelf-env` constructor,
+  `[env]` applies only on the first launch.
+
 ## Set by the runtime
 
 | Variable | Value | Example |
@@ -42,9 +58,13 @@ The link farm holds the host libraries the runtime's resolver chose for
 this launch: the driver stack the bundle does not carry, and any library
 whose host copy is newer than the bundled one. See
 [Bundling](./bundling#libraries-that-come-from-the-host) for how the
-choice is made. No host directory is ever placed on the path, so a
-library the bundle lacks and the resolver did not choose fails by name
-instead of being satisfied from the host.
+choice is made.
+
+❌ Do not count on a host library directory appearing on the path. No
+host directory ever goes on the search path: what the host supplies is
+chosen per library by the resolver and reached through its link farm,
+and a library the bundle lacks and the resolver did not choose fails by
+name instead of being satisfied from the host.
 
 If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
 
@@ -64,31 +84,34 @@ data directory exists:
 - `DRIRC_CONFIGDIR` for `share/drirc.d/`
 - `XKB_CONFIG_ROOT` for `share/X11/xkb/`
 
-`QT_PLUGIN_PATH` names every `lib/qt6/plugins` and `lib/qt5/plugins`
+✅ `QT_PLUGIN_PATH` names every `lib/qt6/plugins` and `lib/qt5/plugins`
 the package and its [shared sets](./sysroot#sharing-a-dependency-set)
-carry, unless the caller already set it. A relocatable Qt finds its
-plugins relative to the executable, which holds while the toolkit sits
-in the package, and stops holding the moment a set moves it elsewhere.
-Qt then finds no platform plugin and aborts, and because it logs to the
-journal rather than stderr the abort prints nothing at all.
+carry, unless the caller already set it.
+
+⚠️ The moment a set moves Qt elsewhere, plugin discovery breaks and the
+abort prints nothing at all. A relocatable Qt finds its plugins relative
+to the executable, which holds while the toolkit sits in the package and
+stops holding when it does not. Qt then finds no platform plugin and
+aborts, and it logs to the journal rather than stderr.
 
 Finally, the package's own `share/` is prepended to `XDG_DATA_DIRS`,
 so GLib/GTK discover bundled GSettings schemas and icon themes.
 
 ## Data paths compiled into a library
 
-The variables above cover the toolkits. An application that hardcodes an
-absolute data path is a different matter, and the runtime cannot help it:
-the path names the host's filesystem, so on a machine that happens to
-have the same package installed the app silently reads the host's copy,
-and on one that does not it fails. The bundled copy goes unused either
-way.
+The problem: the variables above cover the toolkits, but an application
+that hardcodes an absolute data path cannot be helped. The path names the
+host's filesystem, so on a machine that happens to have the same package
+installed the app silently reads the host's copy, and on one that does
+not it fails. The bundled copy goes unused either way.
 
 The symptom is a package that works on the machine that built it and
 fails in a container with a message about a missing file under `/usr`.
-`libqalculate` reading `/usr/share/qalculate` is one example. Test in a
-container that does not have the app installed, and where the app offers
-an environment variable for the directory, set it from the recipe:
+`libqalculate` reading `/usr/share/qalculate` is one example.
+
+- ✅ Test in a container that does not have the app installed.
+- ✅ Where the app offers an environment variable for the directory, set
+  it from the recipe:
 
 ```toml
 [env]
@@ -99,8 +122,9 @@ An app with no such variable needs `[paths]`, below.
 
 ## Making the bundle answer for a compiled-in path
 
-When the application offers no variable, the recipe can name the path
-outright and the runtime makes the bundle's own directory answer for it:
+The problem: the application offers no variable for the path it opens.
+✅ Name the path in the recipe and the runtime makes the bundle's own
+directory answer for it:
 
 ```toml
 [paths]
@@ -124,14 +148,14 @@ terminal rather than a silent difference:
   namespace, because a setuid bit does nothing inside one onelf made,
   and the mounts have to go where the namespace goes.
 
-Reach for this only when there is no environment variable to set. A
-variable costs nothing and works everywhere; this needs a namespace.
+☑️ Reach for this only when there is no environment variable to set.
+A variable costs nothing and works everywhere; this needs a namespace.
 
 ## Custom environment variables
 
-The recipe's `[env]` section lets the package declare extra env vars
-the runtime should set. `${ONELF_DIR}` in values expands to the
-package root at runtime, so paths follow the running app:
+✅ Declare extra env vars in the recipe's `[env]` section.
+`${ONELF_DIR}` in values expands to the package root at runtime, so
+paths follow the running app:
 
 ```toml
 [env]
@@ -150,21 +174,21 @@ See [Recipe File](./recipe#env) for details.
 
 ## Surviving a sandboxed re-exec
 
-Some apps re-exec themselves with a wiped environment (Chromium and
-Electron zygotes, Steam, `bwrap`-based sandboxes). Anything the runtime
-exported via `LD_LIBRARY_PATH` or `[env]` is lost across that
-`clearenv()` + `execve()`, because the runtime is no longer in the
-loop on the re-exec.
+The problem: some apps re-exec themselves with a wiped environment
+(Chromium and Electron zygotes, Steam, `bwrap`-based sandboxes). Anything
+the runtime exported via `LD_LIBRARY_PATH` or `[env]` is lost across that
+`clearenv()` + `execve()`, because the runtime is no longer in the loop
+on the re-exec.
 
-onelf makes this survive by moving the guarantee into the ELF itself,
-not the environment:
+❌ Do not look for the fix in the environment. onelf moves the guarantee
+into the ELF itself:
 
 - **Libraries**: `bundle-libs` bakes an `$ORIGIN` `DT_RPATH` into every
   binary, the one entry that reaches `lib/` from the binary's own depth,
-  so bundled libs resolve relative to its location on every exec. Executables that could not get one (no
-  in-place slot and no `patchelf`, or self-extract binaries) are
-  reported at pack time. They fall back to `LD_LIBRARY_PATH` and are
-  not re-exec-safe.
+  so bundled libs resolve relative to its location on every exec.
+  ⚠️ Executables that could not get one (no in-place slot and no
+  `patchelf`, or self-extract binaries) are reported at pack time. They
+  fall back to `LD_LIBRARY_PATH` and are not re-exec-safe.
 - **`[env]` and `preload`**: a tiny freestanding `onelf-env`
   constructor is bundled into `lib/` and injected as a `DT_NEEDED` of
   the entrypoint. Because `DT_NEEDED` lives in the ELF and is resolved
@@ -172,11 +196,11 @@ not the environment:
   constructor re-applies `.onelf/env` and `.onelf/preload` before
   `main()`, no matter how the app cleared the environment.
 
-The `onelf-env` injection requires `patchelf` at pack time (set
+⚠️ The `onelf-env` injection requires `patchelf` at pack time (set
 `ONELF_PATCHELF` to override its location) and a prebuilt `onelf-env`
-blob for the target architecture. When either is missing, packing
-prints a warning and `[env]` is applied only on the first launch (the
-runtime layer), not after a re-exec.
+blob for the target architecture. When either is missing, packing prints
+a warning and `[env]` is applied only on the first launch (the runtime
+layer), not after a re-exec.
 
 ## Set by the user
 

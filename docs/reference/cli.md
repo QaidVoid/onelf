@@ -61,7 +61,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--entrypoint NAME=PATH` | | Add extra entrypoint (repeatable) |
 | `--default-entrypoint NAME` | | Select default entrypoint |
 | `--lib-dir DIR` | `[auto]` | Library dir for `LD_LIBRARY_PATH` (repeatable) |
-| `--level N` | `12` | Zstd compression level (0 to 22) |
+| `--level N` | `19` | Zstd compression level (0 to 22) |
 | `--block-size SIZE` | `256K` | Bytes per payload block, `K`/`M` suffix allowed (4K to 32M) |
 | `--dict` | `false` | Train shared zstd dictionary |
 | `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
@@ -75,7 +75,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--update-url URL` | | zsync URL; enables update runtime |
 | `--update-key PATH` | | File with one or more 32-byte Ed25519 public keys concatenated; a multi-key file is a keyring and any of its keys can sign updates. Required for self-update |
 | `--update-revision N` | | Stamp release number N into the package; the runtime refuses downloads that are not strictly newer. Requires `--update-url` |
-| `--no-embed-updater` | `false` | Record the update URL without embedding the updater (saves 1.36 MB) |
+| `--no-embed-updater` | `false` | Record the update URL without embedding the updater (keeps the slim runtime; see the self-update guide's size table) |
 | `--host-libs MODE` | `auto` | `auto`, `always`, or `never`: expose the host's library dirs |
 | `--exclude GLOB` | | Exclude paths matching glob (repeatable) |
 

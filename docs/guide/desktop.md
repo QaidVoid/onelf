@@ -4,6 +4,21 @@ onelf can ship a `.desktop` entry and icon inside the package and
 install them into XDG directories so the app shows up in the desktop
 menu.
 
+The rules this page encodes:
+
+- ✅ Put integration input under `.onelf/`: icons in `.onelf/icons/`,
+  desktop files in `.onelf/desktop/`. That is what the extraction and
+  desktop integration commands read.
+- ✅ Reference the packed binary in the desktop file (`Exec=myapp`,
+  `Icon=myapp`); `onelf integrate` rewrites `Exec=` to the binary's
+  absolute path and sets `Icon=` to the installed icon's theme name.
+- ✅ Pick among several entrypoints with `--entrypoint`;
+  `{entrypoint}`-named files win over the `default.*` fallbacks.
+- ✅ Name a multi-entrypoint `Exec=` after the entrypoint's argv[0] and
+  ship the matching symlink (`myapp-daemon -> myapp.onelf`).
+- ☑️ No bundled desktop file: `integrate` generates a minimal one with
+  the package name.
+
 ## Bundling icons and desktop files
 
 Place them under `.onelf/` in your AppDir:
@@ -35,11 +50,10 @@ Resolution order for desktop files:
 1. `.onelf/desktop/{entrypoint}.desktop`
 2. `.onelf/desktop/default.desktop`
 
-::: tip
-You can also put icons and desktop files under `share/` for the running
-app's own use (e.g. GTK icon theme lookups). The `.onelf/` convention
-is specifically for extraction and desktop integration commands.
-:::
+☑️ Copies under `share/` serve the running app itself (e.g. GTK icon
+theme lookups). ✅ For the menu entry and icon, put them under
+`.onelf/` instead: that is the location the extraction and desktop
+integration commands read.
 
 ## Integrate with the desktop
 
@@ -60,8 +74,8 @@ This installs:
 The `Exec=` and `Icon=` fields are automatically patched to point to
 the binary's absolute path and installed icon name.
 
-If the package has no bundled `.desktop` file, a minimal one is
-generated with the package name.
+☑️ A package with no bundled `.desktop` file still integrates: a
+minimal one is generated with the package name.
 
 ## Remove desktop integration
 
@@ -74,7 +88,8 @@ onelf unintegrate ./myapp.onelf
 
 ## Selecting an entrypoint
 
-For packages with multiple entrypoints:
+✅ For a package with multiple entrypoints, `--entrypoint` picks which
+entrypoint's icon and desktop file resolve:
 
 ```bash
 onelf integrate ./myapp.onelf --entrypoint myapp-daemon
@@ -103,7 +118,7 @@ Runtime-side equivalents:
 
 ## Desktop file tips
 
-The `.desktop` file should reference the packed binary:
+✅ Reference the packed binary in the `.desktop` file:
 
 ```ini
 [Desktop Entry]
@@ -118,7 +133,7 @@ When you run `onelf integrate`, the `Exec=` line is rewritten to the
 binary's absolute path automatically. The `Icon=` field is set to the
 installed icon's theme name.
 
-If you have multiple entrypoints, use their argv[0] names:
+✅ Multiple entrypoints: use their argv[0] names:
 
 ```ini
 Exec=myapp-daemon

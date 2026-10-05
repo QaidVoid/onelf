@@ -3,6 +3,21 @@
 `onelf.toml` is a declarative recipe that replaces long CLI invocations.
 One file captures everything needed to reproduce a pack.
 
+The rules this page encodes:
+
+- ✅ Write the pack as a recipe and run `onelf build`. One file
+  reproduces it, with no long CLI invocation to retype.
+- ✅ `${ONELF_DIR}` for values that must follow the package. Any other
+  `${VAR}` is expanded at pack time against the packer's environment.
+- ✅ `$ONELF_DIR/bin` is prepended to `PATH` by default. Set
+  `[env] PATH` to take full control.
+- ⚠️ `[update]` switches the package to the considerably larger
+  update-capable runtime; set `embed = false` when a package manager
+  does the updating.
+- ⚠️ Env values survive a sandboxed re-exec only when `patchelf` was
+  available at pack time. Without it they apply to the first launch
+  only.
+
 ## Minimal recipe
 
 ```toml
@@ -105,11 +120,17 @@ entrypoint automatically.
 | `key` | path | none | 32-byte Ed25519 public key; required for self-update |
 | `embed` | bool | `true` | Embed the updater. `false` records the URL for an external updater |
 
-Setting `[update]` selects the update-capable runtime, which is 1.36 MB
-larger than the slim runtime. Self-update also needs `key`: without it
-the runtime refuses to update. Set `embed = false` to keep the metadata
-and the slim runtime, for packages a package manager updates. See
-[Self-Update](./self-update).
+The problem: `[update]` selects the update-capable runtime, which is
+considerably larger than the slim runtime (exact sizes in the
+[Self-Update size table](./self-update#size-tradeoff)), and self-update
+also needs `key`.
+
+- ❌ Self-update without `key`. The runtime refuses to update.
+- ✅ `embed = false` when a package manager updates the package: the
+  URL is recorded for an external updater and the slim runtime is kept.
+- ✅ The default `embed = true` when the package updates itself.
+
+See [Self-Update](./self-update).
 
 ### `[bundle]`
 
@@ -159,16 +180,21 @@ QT_PLUGIN_PATH = "${ONELF_DIR}/lib/qt6/plugins"
 GST_PLUGIN_PATH_1_0 = "${ONELF_DIR}/lib/gstreamer-1.0"
 ```
 
-`${ONELF_DIR}` expands to the package root at runtime (the FUSE
-mount, tmpfs, or cache dir depending on execution mode), so values
-follow the running app wherever it lives. Other `${VAR}` references
-expand at recipe-load time against the **packer's** environment.
+The problem: the package root exists only once the app runs, and a
+plain `${VAR}` is expanded while the recipe loads, against the
+**packer's** environment.
 
-To defer a reference to **runtime** instead, escape the `$` with `$$`:
-`$${VAR}` reaches the package as `${VAR}` and is expanded against the
-**live** process environment when the app runs. POSIX
-`${VAR:-word}` is supported: if `VAR` is unset *or empty*, the literal
-`word` is used instead. This is how you *prepend* rather than replace:
+- ✅ `${ONELF_DIR}` for anything under the package root. It expands at
+  runtime to the FUSE mount, tmpfs, or cache dir the app runs from
+  (depending on execution mode), so values follow the running app
+  wherever it lives.
+- ⚠️ Any other `${VAR}` expands at recipe-load time against the
+  **packer's** environment.
+- ✅ `$${VAR}` (escape the `$`) to defer a reference to **runtime**.
+  It reaches the package as `${VAR}` and is expanded against the
+  **live** process environment when the app runs.
+- ✅ POSIX `${VAR:-word}` to *prepend* rather than replace: if `VAR`
+  is unset *or empty*, the literal `word` is used instead.
 
 ```toml
 [env]
@@ -183,28 +209,32 @@ behaves as if it had:
 PATH = "${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}"
 ```
 
-so bundled helpers resolve even when the app or a sandbox clears
-`PATH`. (glibc's `_CS_PATH` fallback of `/bin:/usr/bin` only applies
-when `PATH` is *unset*; the moment onelf sets `PATH` it no longer
-kicks in, so the `:-/usr/bin:/bin` default substitutes it explicitly
-when the inherited `PATH` is empty, instead of leaving a dangling
-empty element.) Set `[env] PATH` yourself to take full control (the
-default is then skipped); use `PATH = "$${PATH}"` to opt out of the
-`bin/` prefix entirely.
+✅ That default is why bundled helpers resolve even when the app or a
+sandbox clears `PATH`. glibc's `_CS_PATH` fallback of `/bin:/usr/bin`
+only applies when `PATH` is *unset*; the moment onelf sets `PATH` it no
+longer kicks in, so the `:-/usr/bin:/bin` default substitutes it
+explicitly when the inherited `PATH` is empty, instead of leaving a
+dangling empty element.
+
+- ✅ Set `[env] PATH` yourself to take full control; the default is
+  then skipped.
+- ✅ `PATH = "$${PATH}"` to opt out of the `bin/` prefix entirely.
 
 These variables are **re-exec-safe**: a small `onelf-env` constructor
 is bundled into `lib/` and injected as a `DT_NEEDED` of the entrypoint,
 so `.onelf/env` is re-applied on every exec, including after an app
 re-execs itself in a sandbox that calls `clearenv()` (Chromium/Electron
-zygotes, Steam, bwrap, etc.). This requires `patchelf` at pack time;
+zygotes, Steam, bwrap, etc.). ⚠️ This requires `patchelf` at pack time;
 without it the values are only set for the first launch. See
 [Environment › Surviving a sandboxed re-exec](./environment#surviving-a-sandboxed-re-exec).
 
 ### `preload`
 
 A top-level list of libraries to `dlopen` on every exec, via the same
-`onelf-env` constructor. Unlike `LD_PRELOAD` (an env var, wiped by a
-sandboxed re-exec), this is baked into the ELF and survives.
+`onelf-env` constructor.
+
+- ✅ `preload` over `LD_PRELOAD`. `LD_PRELOAD` is an env var, wiped by
+  a sandboxed re-exec; this is baked into the ELF and survives.
 
 ```toml
 preload = ["${ONELF_DIR}/lib/libfoo.so", "libbar.so"]
@@ -223,13 +253,13 @@ Any string in `[bundle] search-paths` (and other path fields) expands
 search-paths = ["${MUSL_LIBDRM}/lib", "${HOME}/my-libs"]
 ```
 
-Missing variables expand to empty strings.
+⚠️ Missing variables expand to empty strings.
 
 ## Path resolution
 
-Relative paths in the recipe resolve against the recipe's directory,
-not the caller's cwd. This means running `onelf build` from anywhere
-always produces the same result.
+✅ Run `onelf build` from anywhere; the result is the same. Relative
+paths in the recipe resolve against the recipe's directory, not the
+caller's cwd.
 
 ```bash
 onelf build             # looks for ./onelf.toml
@@ -245,4 +275,4 @@ A few flags override recipe values:
 onelf build -o custom-output.onelf    # overrides [package] output
 ```
 
-For anything more specific, edit the recipe directly.
+✅ For anything more specific, edit the recipe directly.

@@ -59,7 +59,7 @@ of the packer's machine.
 
 ```
 +-------------------------------------+
-| onelf-rt (static musl runtime)      |  670 KB slim, 2 MB with updates
+| onelf-rt (static musl runtime)      |  slim, or the larger update build
 +-------------------------------------+
 | Manifest (zstd-compressed)          |  File tree, entrypoints, metadata
 +-------------------------------------+

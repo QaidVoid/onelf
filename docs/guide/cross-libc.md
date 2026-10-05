@@ -10,7 +10,18 @@ against one cannot run on the other without bundled pieces, because:
 2. Libraries linked against one libc can't satisfy the other's symbols.
    Glibc's fortify `__printf_chk` doesn't exist in musl, for example.
 
-onelf handles both concerns automatically.
+The rules this page encodes:
+
+- ✅ Let onelf handle both concerns. A musl binary runs on a glibc host
+  and vice versa without any host-level setup.
+- ❌ Wrong-family libraries in a bundle. Their symbols can't satisfy the
+  other libc. `--strict-libc` refuses them.
+- ✅ A musl app on a glibc host needs musl-built libraries on the
+  `--search-path`; the host's `libdrm`, `libgcc_s` and `libpthread` are
+  glibc-linked and unusable here.
+- ⚠️ A wrong-libc warning after `bundle-libs` means the bundle may not
+  work at runtime. Find a musl-built replacement.
+- ❌ Expecting glibc-specific APIs (like `obstack_*`) to run on musl.
 
 ## What happens at pack time
 
@@ -38,16 +49,21 @@ to map the bundled loader directly. Non-PIE (`ET_EXEC`) binaries go
 through the kernel exec path with the bootstrap doing the loader
 hand-off.
 
-The bootstrap approach has no path-length constraint. Earlier
-versions of onelf rewrote `PT_INTERP` to a relative path, which
-broke when the new path didn't fit in the original slot. The
-bootstrap stores the relative path as appended metadata, so deeply
-nested binaries work the same as shallow ones.
+- ❌ Rewriting `PT_INTERP` to a relative path, which earlier versions of
+  onelf did. It broke when the new path didn't fit in the original slot.
+- ✅ The bootstrap stores the relative path as appended metadata, so
+  there is no path-length constraint; deeply nested binaries work the
+  same as shallow ones.
 
 ## Packaging musl apps on glibc hosts
 
-The host's `libdrm`, `libgcc_s`, `libpthread`, etc. are all glibc-linked,
-so bundle-libs can't use them directly. You need musl-built versions.
+The problem: the host's `libdrm`, `libgcc_s`, `libpthread`, etc. are all
+glibc-linked, so bundle-libs can't use them for a musl app.
+
+- ❌ The host's copies. Wrong family, and with `--strict-libc` they are
+  refused outright.
+- ✅ Musl-built versions on the `--search-path`: from Nix, or from the
+  musl sysroot you built the app against.
 
 ### With Nix
 
@@ -78,7 +94,7 @@ search-paths = ["${MUSL_LIBDRM}", "${MUSL_GCC}"]
 strict-libc = true
 ```
 
-Export the env vars in your CI or `direnv` and `onelf build` does the rest.
+✅ Export the env vars in your CI or `direnv`. `onelf build` does the rest.
 
 ## Verifying the bundle is clean
 
@@ -96,14 +112,15 @@ Not found (1)
   libfoo.so.1 (needed by bin/app (libfoo.so.1 links against Glibc libc but target is Musl))
 ```
 
-Either way, the warning is your signal that you need a musl-built
-replacement on the `--search-path`.
+⚠️ Either way, the warning means the bundle may not work at runtime. It
+is your signal to put a musl-built replacement on the `--search-path`.
 
 ## Limitations
 
-- We can't cross-libc arbitrary system calls. A binary that directly uses
-  glibc-specific APIs (like `obstack_*`) won't magically work on musl.
-- Name service modules. The host's `nsswitch.conf` is read, and a
+- ❌ A binary that directly uses glibc-specific APIs (like `obstack_*`)
+  won't magically work on musl. We can't cross-libc arbitrary system
+  calls.
+- ⚠️ Name service modules. The host's `nsswitch.conf` is read, and a
   service it names that the bundle lacks (`systemd`, `sss`, `resolve`) is
   skipped, so a user from LDAP or SSSD is not visible and hostnames go
   through `files` and `dns` as they would without those services. A
@@ -111,7 +128,7 @@ replacement on the `--search-path`.
   older one `bundle-libs` brings those two modules along. `compat`, which
   some distributions name instead of `files`, is a module on every glibc
   and is always brought along. Anything else stays out.
-- Before glibc 2.34, `dlopen` lives in `libdl.so.2`. A bundle of such a
-  glibc applies `.onelf/env` as usual, but `.onelf/preload` only when
+- ☑️ Before glibc 2.34, `dlopen` lives in `libdl.so.2`. A bundle of such
+  a glibc applies `.onelf/env` as usual, but `.onelf/preload` only when
   something in the bundle links `libdl.so.2`; otherwise it says so on
   stderr and goes on.

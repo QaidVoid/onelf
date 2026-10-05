@@ -1,12 +1,19 @@
 # Integrity Verification
 
 `onelf verify` recomputes content hashes in a packed binary and checks
-them against the manifest. Useful for:
+them against the manifest.
 
-- Detecting bit-rot on long-lived packages.
-- Catching tampering (not a signature; see the
-  [self-update](./self-update) caveat, but catches unintentional changes).
-- Validating download artifacts in CI before shipping.
+The rules this page encodes:
+
+- ✅ Verify every artifact in CI before it ships. Exit code `0` means
+  every file entry matched; `1` means at least one did not.
+- ⚠️ It catches tampering and bit-rot, but it is not a signature; see the
+  [self-update](./self-update) caveat. For bit-rot and accidental edits
+  to the covered files it is exactly what you want.
+- ❌ Do not expect directories and symlinks to be covered. They have no
+  content to hash and are skipped.
+- ✅ A corrupted manifest never reaches `verify`. The manifest is checked
+  via XXH32 during the normal load path and fails to parse first.
 
 ## Basic usage
 
@@ -38,12 +45,14 @@ Every file entry's compressed blocks are decompressed, concatenated, and
 re-hashed with BLAKE3. The result must match the `content_hash` field in
 the manifest.
 
-Directories and symlinks have no content to hash; they're skipped.
-
-The manifest itself is checked via XXH32 during the normal load path,
-so a corrupted manifest will fail to parse before `verify` runs.
+- ❌ Do not count entries without content. Directories and symlinks have
+  nothing to hash and are skipped.
+- ✅ A corrupted manifest never reaches `verify`. The manifest is checked
+  via XXH32 during the normal load path and fails to parse first.
 
 ## Typical CI check
+
+✅ Build, then verify, before the artifact ships:
 
 ```yaml
 - name: Verify

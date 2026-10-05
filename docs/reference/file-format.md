@@ -5,7 +5,7 @@ A packed onelf file is up to five concatenated sections:
 ```
 ┌────────────────────────────────────┐  offset 0
 │ Runtime (static musl ELF)          │
-│  670 KB (slim) or ~2 MB (update)   │
+│  slim, or the larger update build  │
 ├────────────────────────────────────┤
 │ Manifest (zstd-compressed)         │
 │  - header (114 bytes)              │
@@ -128,9 +128,13 @@ the whole-entry hash as the only check.
 ## Payload
 
 Contiguous sequence of blocks. Block boundaries are defined entirely by
-the `blocks` arrays in the manifest. The format allows two entries to
-point at the same block, but pack.rs currently emits per-entry block
-lists with no content-level deduplication.
+the `blocks` arrays in the manifest. Entries whose whole-file BLAKE3
+matches share one set of blocks: the packer keeps a map from content
+hash to block list, and a repeated file points at the first copy rather
+than writing its own. Identical content therefore costs once per
+package, and pack reports the total under `Dedup:` when it saved
+anything. Two entries still get independent block lists in the manifest
+when their content differs, even if individual blocks were to match.
 
 Block size defaults to 256 KB uncompressed. Each block is compressed
 independently, which lets the runtime decompress them lazily as the
