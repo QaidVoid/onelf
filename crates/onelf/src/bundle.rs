@@ -32,7 +32,7 @@ use onelf_sysroot::{Database, PlatformLine, Policy};
 pub(crate) mod ui;
 pub(crate) use ui::{color, format_size};
 mod discover;
-mod gpu;
+pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod resolve;
 pub(crate) use resolve::*;

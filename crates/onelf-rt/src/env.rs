@@ -194,6 +194,7 @@ pub fn setup_env(
     // so system themes, schemas, and desktop integrations still work.
     setup_qt_plugin_path(pkg, set_roots);
     setup_glib_modules(pkg, set_roots);
+    setup_fontconfig(pkg, set_roots);
     setup_xdg_data_dirs(pkg, platform_root, set_roots);
 
     // EGL vendor discovery: merge bundled, fetched and host dirs so both
@@ -374,6 +375,82 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
     }
 }
 
+/// Point fontconfig at the package's fonts without hiding the host's.
+///
+/// A package shipping `share/fonts` would otherwise be invisible: the
+/// host fontconfig only knows host directories, so bundled fonts never
+/// render and apps fall back to whatever the host has. The generated
+/// config includes the host's own `fonts.conf` first, then names the
+/// package directories, so host fonts stay and package fonts win ties.
+///
+/// The config lives under the 0700 per-uid base because fontconfig
+/// reads whatever `FONTCONFIG_FILE` names, and a shared /tmp file would
+/// let another local user choose fonts for this app. Font caches need
+/// no management: fontconfig writes per-directory caches under the
+/// user's cache home, keyed by directory path, and the mount paths are
+/// stable across launches.
+fn setup_fontconfig(pkg: &Path, set_roots: &[PathBuf]) {
+    if env::var_os("FONTCONFIG_FILE").is_some() {
+        return;
+    }
+    let conf = fontconfig_conf(pkg, set_roots);
+    let Some(conf) = conf else { return };
+    let Some(name) = pkg.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Some(base) = crate::paths::private_dir() else {
+        return;
+    };
+    // No `onelf-` prefix, so the mountpoint sweep leaves it alone.
+    let dir = base.join(format!("fontconfig-{name}"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let dest = dir.join("fonts.conf");
+    if std::fs::write(&dest, conf).is_err() {
+        return;
+    }
+    set_if_unset("FONTCONFIG_FILE", &dest);
+}
+
+/// The text of the generated fonts.conf: host config first, then every
+/// root whose `share/fonts` exists. `None` when no root ships fonts.
+fn fontconfig_conf(pkg: &Path, set_roots: &[PathBuf]) -> Option<String> {
+    let dirs = [pkg]
+        .into_iter()
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .map(|root| root.join("share/fonts"))
+        .filter(|d| d.is_dir());
+    let mut conf = String::from(
+        "<?xml version=\"1.0\"?>\n\
+         <!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
+         <fontconfig>\n\
+         \x20 <include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>\n",
+    );
+    let mut any = false;
+    for dir in dirs {
+        any = true;
+        conf.push_str(&format!(
+            "  <dir>{}</dir>\n",
+            escape_xml(&dir.to_string_lossy())
+        ));
+    }
+    if !any {
+        return None;
+    }
+    conf.push_str("</fontconfig>\n");
+    Some(conf)
+}
+
+/// Escape the five XML specials; everything else passes through.
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// A copy of `cache` whose module paths are absolute, written where the
 /// launch can reach it.
 ///
@@ -405,13 +482,15 @@ fn absolutised(cache: &Path, pkg: &Path) -> Option<PathBuf> {
     if !rewrote {
         return Some(cache.to_path_buf());
     }
-    // Named after the package root, which carries the package's hash, so
-    // a second launch of the same package reuses this rather than
-    // leaving another copy behind.
-    let dest_dir = env::temp_dir().join(format!(
-        "onelf-modules-{}",
-        pkg.file_name()?.to_string_lossy()
-    ));
+    // Under the 0700 per-uid base, not shared /tmp: another local user
+    // could otherwise swap the cache between this write and GTK's read,
+    // and the rewritten cache names modules GTK dlopens. Named after the
+    // package root, which carries the package's hash, so a second launch
+    // of the same package reuses this rather than leaving another copy
+    // behind. No `onelf-` prefix, so the mountpoint sweep leaves it
+    // alone (same rule as `resolve_store`).
+    let base = crate::paths::private_dir()?;
+    let dest_dir = base.join(format!("modules-{}", pkg.file_name()?.to_string_lossy()));
     std::fs::create_dir_all(&dest_dir).ok()?;
     let dest = dest_dir.join(cache.file_name()?);
     std::fs::write(&dest, out).ok()?;
@@ -651,5 +730,104 @@ mod setup_env_tests {
 
         let returned = call(elf.to_str().unwrap());
         assert!(returned.starts_with("/pkg/lib"));
+    }
+}
+
+#[cfg(test)]
+mod fontconfig_conf_tests {
+    use super::{escape_xml, fontconfig_conf};
+
+    #[test]
+    fn lists_only_roots_that_ship_fonts_and_keeps_host_first() {
+        let work = std::env::temp_dir().join(format!("onelf-fc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let pkg = work.join("pkg-a");
+        let set = work.join("set-b");
+        std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
+        std::fs::create_dir_all(set.join("share/mime")).unwrap();
+
+        let conf = fontconfig_conf(&pkg, &[set.clone()]).expect("pkg ships fonts");
+
+        assert!(conf.contains("<include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"));
+        assert!(conf.contains(&format!("<dir>{}</dir>", pkg.join("share/fonts").display())));
+        assert!(
+            !conf.contains("set-b"),
+            "a root without fonts is not listed"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn package_dir_is_listed_before_set_dirs() {
+        let work = std::env::temp_dir().join(format!("onelf-fc2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let pkg = work.join("pkg-a");
+        let set = work.join("set-b");
+        std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
+        std::fs::create_dir_all(set.join("share/fonts")).unwrap();
+
+        let conf = fontconfig_conf(&pkg, &[set.clone()]).expect("both ship fonts");
+
+        let pkg_at = conf.find(&format!("<dir>{}</dir>", pkg.join("share/fonts").display()));
+        let set_at = conf.find(&format!("<dir>{}</dir>", set.join("share/fonts").display()));
+        assert!(pkg_at.is_some() && set_at.is_some());
+        assert!(pkg_at.unwrap() < set_at.unwrap(), "package fonts win ties");
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn no_root_ships_fonts_means_no_config() {
+        let empty = std::env::temp_dir().join(format!("onelf-fc3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(fontconfig_conf(&empty, &[]).is_none());
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn xml_specials_in_paths_are_escaped() {
+        assert_eq!(escape_xml("a&b<c>\"d'e"), "a&amp;b&lt;c&gt;&quot;d&apos;e");
+    }
+}
+
+#[cfg(test)]
+mod absolutised_tests {
+    use super::absolutised;
+
+    #[test]
+    fn lands_under_private_base_not_shared_tmp() {
+        // Shared /tmp would let another user swap the cache between the
+        // write and GTK's read, so the rewritten copy must live under the
+        // 0700 per-uid base.
+        let pkg_dir = std::env::temp_dir().join(format!("onelf-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pkg_dir);
+        let payload_dir = pkg_dir.join("pkg-abcdef01");
+        let cache_dir = payload_dir.join("lib/gtk-3.0/3.0.0");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("loaders.cache"),
+            "# comment\n\"../loaders/libpixbuf-png.so\"\n",
+        )
+        .unwrap();
+
+        let got = absolutised(&cache_dir.join("loaders.cache"), &payload_dir).expect("rewritten");
+
+        let base = crate::paths::private_dir().expect("private base exists in tests");
+        let expected = base.join("modules-pkg-abcdef01/loaders.cache");
+        assert_eq!(got, expected);
+        let text = std::fs::read_to_string(&got).unwrap();
+        assert!(
+            text.contains(
+                cache_dir
+                    .join("../loaders/libpixbuf-png.so")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(!text.contains("\"../loaders"));
+
+        let _ = std::fs::remove_dir_all(&pkg_dir);
     }
 }

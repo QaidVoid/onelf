@@ -144,11 +144,18 @@ fn place(source: &Path, target: &Path) -> io::Result<()> {
 /// the bundle's copy. Used as the upper layer of the overlay, so only
 /// that one name is added to the parent.
 fn staging_dir(name: &std::ffi::OsStr, source: &Path) -> io::Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!(
-        "onelf-paths-{}",
-        rustix::process::getpid().as_raw_nonzero()
-    ));
-    let dir = base.join(name);
+    // Under the 0700 per-uid base: a shared /tmp name keyed only on the
+    // pid is predictable across users, and the symlink becomes an overlay
+    // lowerdir the kernel resolves at mount time. No `onelf-` prefix, so
+    // the mountpoint sweep leaves it alone.
+    let base = crate::paths::private_dir()
+        .ok_or_else(|| io::Error::other("no private runtime directory for overlay staging"))?;
+    let dir = base
+        .join(format!(
+            "paths-{}",
+            rustix::process::getpid().as_raw_nonzero()
+        ))
+        .join(name);
     std::fs::create_dir_all(&dir)?;
     let link = dir.join(name);
     let _ = std::fs::remove_file(&link);

@@ -375,6 +375,88 @@ fn inject_onelf_file(
     });
 }
 
+/// Compile GSettings schemas when the tree ships schema XML without the
+/// compiled blob. The bundle flow does the same inside the AppDir; plain
+/// `pack` must not fall behind, or an app reading GSettings crashes on its
+/// first settings access. The blob is injected as an in-memory entry, so
+/// the input tree is never written to. A missing or failing compiler only
+/// warns: the app may ship schemas without using GSettings.
+fn compile_gsettings_schemas(
+    dirs: &[CollectedDir],
+    files: &mut Vec<CollectedFile>,
+    directory: &Path,
+    inject_mtime: u64,
+) {
+    const SCHEMAS_DIR: &str = "share/glib-2.0/schemas";
+    let schemas_rel = Path::new(SCHEMAS_DIR);
+    let compiled_rel = schemas_rel.join("gschemas.compiled");
+    if !dirs.iter().any(|d| d.rel_path == schemas_rel) {
+        return;
+    }
+    if files.iter().any(|f| f.rel_path == compiled_rel) {
+        return;
+    }
+    let xml_count = files
+        .iter()
+        .filter(|f| {
+            f.rel_path.parent() == Some(schemas_rel)
+                && f.rel_path.extension().is_some_and(|e| e == "xml")
+        })
+        .count();
+    if xml_count == 0 {
+        return;
+    }
+
+    let compiler = crate::bundle::gpu::find_glib_compile_schemas();
+    let tmp = std::env::temp_dir().join(format!("onelf-schemas-{}.tmp", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let run = fs::create_dir_all(&tmp).and_then(|()| {
+        std::process::Command::new(&compiler)
+            .arg("--targetdir")
+            .arg(&tmp)
+            .arg(directory.join(schemas_rel))
+            .output()
+    });
+    let blob = match run {
+        Ok(out) if out.status.success() => fs::read(tmp.join("gschemas.compiled")),
+        Ok(out) => {
+            eprintln!(
+                "warning: glib-compile-schemas failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok(Vec::new())
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: glib-compile-schemas not runnable ({e}); ship a compiled \
+                 gschemas.compiled or install glib development tools"
+            );
+            Ok(Vec::new())
+        }
+    };
+    let _ = fs::remove_dir_all(&tmp);
+    match blob {
+        Ok(bytes) if !bytes.is_empty() => {
+            eprintln!(
+                "  Compiled GSettings schemas ({} bytes, {} sources)",
+                bytes.len(),
+                xml_count
+            );
+            let size = bytes.len() as u64;
+            files.push(CollectedFile {
+                rel_path: compiled_rel,
+                source: FileSource::Memory(bytes),
+                size,
+                mode: 0o644,
+                mtime_secs: inject_mtime,
+                mtime_nsec: 0,
+            });
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: could not read compiled schemas: {e}"),
+    }
+}
+
 /// A path as the walk records it: `./bin/app` and `bin/app` name the same
 /// entry, and a shell completion or a recipe writes either.
 fn package_relative(path: &str) -> PathBuf {
@@ -622,6 +704,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Detect bundled ELF interpreter for cross-libc portability.
     // When a matching interpreter is bundled (e.g. via bundle-libs), record its
+    // Compile GSettings schemas when only the XML sources are shipped.
+    compile_gsettings_schemas(&dirs, &mut files, &opts.directory, inject_mtime);
+
     // relative path in .onelf/interp so the runtime can use userland-exec with
     // the bundled interpreter instead of the system one.
     {
@@ -1635,6 +1720,126 @@ mod tests {
         let opts = base_opts(&app, &out, "bin/run");
         let err = pack(&opts, b"stub-runtime").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const SCHEMA_XML: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<schemalist>\n",
+        "  <schema id=\"com.example.pack-test\" path=\"/com/example/pack-test/\">\n",
+        "    <key name=\"greeting\" type=\"s\">\n",
+        "      <default>'hi'</default>\n",
+        "      <summary>Greeting</summary>\n",
+        "    </key>\n",
+        "  </schema>\n",
+        "</schemalist>\n",
+    );
+
+    /// A tree holding only a schema dir with one XML source, plus the walk
+    /// results that would correspond to it.
+    fn schemas_tree(tag: &str) -> (PathBuf, Vec<CollectedDir>, Vec<CollectedFile>) {
+        let dir = tmpdir(tag);
+        let schemas = dir.join("share/glib-2.0/schemas");
+        fs::create_dir_all(&schemas).unwrap();
+        fs::write(
+            schemas.join("com.example.pack-test.gschema.xml"),
+            SCHEMA_XML,
+        )
+        .unwrap();
+        let dirs = vec![CollectedDir {
+            rel_path: PathBuf::from("share/glib-2.0/schemas"),
+            mode: 0o755,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        }];
+        let files = vec![CollectedFile {
+            rel_path: PathBuf::from("share/glib-2.0/schemas/com.example.pack-test.gschema.xml"),
+            source: FileSource::Disk(schemas.join("com.example.pack-test.gschema.xml")),
+            size: SCHEMA_XML.len() as u64,
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        }];
+        (dir, dirs, files)
+    }
+
+    fn glib_tool_available() -> bool {
+        std::process::Command::new("which")
+            .arg("glib-compile-schemas")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn pack_compiles_missing_gsettings_schemas() {
+        if !glib_tool_available() {
+            eprintln!("skip: glib-compile-schemas not available");
+            return;
+        }
+        let (dir, dirs, mut files) = schemas_tree("compile");
+        compile_gsettings_schemas(&dirs, &mut files, &dir, 0);
+
+        let blob = files
+            .iter()
+            .find(|f| f.rel_path == Path::new("share/glib-2.0/schemas/gschemas.compiled"))
+            .expect("compiled schemas entry injected");
+        let FileSource::Memory(bytes) = &blob.source else {
+            panic!("compiled schemas must be an in-memory entry");
+        };
+        assert!(!bytes.is_empty());
+        assert!(
+            !dir.join("share/glib-2.0/schemas/gschemas.compiled")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pack_keeps_shipped_gsettings_blob() {
+        if !glib_tool_available() {
+            eprintln!("skip: glib-compile-schemas not available");
+            return;
+        }
+        let (dir, dirs, mut files) = schemas_tree("shipped");
+        let sentinel = b"packager-provided blob".to_vec();
+        let blob_path = dir.join("share/glib-2.0/schemas/gschemas.compiled");
+        fs::write(&blob_path, &sentinel).unwrap();
+        files.push(CollectedFile {
+            rel_path: PathBuf::from("share/glib-2.0/schemas/gschemas.compiled"),
+            source: FileSource::Disk(blob_path.clone()),
+            size: sentinel.len() as u64,
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
+
+        compile_gsettings_schemas(&dirs, &mut files, &dir, 0);
+
+        assert_eq!(files.len(), 2, "no entry injected past the shipped blob");
+        assert_eq!(fs::read(&blob_path).unwrap(), sentinel);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pack_ignores_schema_dir_without_xml() {
+        let (dir, dirs, mut files) = schemas_tree("noxml");
+        files.clear();
+        let readme = dir.join("share/glib-2.0/schemas/README");
+        fs::write(&readme, b"not a schema").unwrap();
+        files.push(CollectedFile {
+            rel_path: PathBuf::from("share/glib-2.0/schemas/README"),
+            source: FileSource::Disk(readme),
+            size: 12,
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        });
+
+        compile_gsettings_schemas(&dirs, &mut files, &dir, 0);
+        assert!(files.len() == 1, "nothing injected without schema XML");
 
         let _ = fs::remove_dir_all(&dir);
     }

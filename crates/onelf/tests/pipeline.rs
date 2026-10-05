@@ -961,8 +961,10 @@ fn cache_gc_spares_a_running_package() {
     let td = workdir("gclive");
     let app = td.join("app");
     std::fs::create_dir_all(app.join("bin")).unwrap();
-    // Holds the package open long enough for gc to run against it.
-    write(&app.join("bin/run"), "#!/bin/sh\necho STARTED\nsleep 2\n");
+    // Holds the package open long enough for gc to run against it. Long,
+    // because a loaded machine can take seconds to reach STARTED; the
+    // child is killed, so the sleep itself costs nothing.
+    write(&app.join("bin/run"), "#!/bin/sh\necho STARTED\nsleep 15\n");
     std::fs::set_permissions(
         app.join("bin/run"),
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
@@ -1047,6 +1049,8 @@ fn cache_gc_spares_a_running_package() {
 fn cache_clear_spares_a_running_package() {
     let td = workdir("clearlive");
     let app = td.join("app");
+    // The instance must exit cleanly for the cache to consider it idle,
+    // so the test waits out the sleep rather than killing it.
     write(&app.join("bin/run"), "#!/bin/sh\necho STARTED\nsleep 2\n");
     std::fs::set_permissions(
         app.join("bin/run"),
@@ -8044,6 +8048,90 @@ fn a_malformed_provenance_record_is_reported_not_fatal() {
     assert!(info.status.success());
     assert!(stdout.contains("malformed record"), "{stdout}");
     assert!(stdout.contains("Entrypoints:"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+#[test]
+fn a_package_shipping_fonts_gets_a_fontconfig_file() {
+    let td = workdir("fontconfig");
+    let app = td.join("app");
+    // Print the variable and the config it names; `true` keeps the exit
+    // status clean even when the config is a caller's own, unreadable one.
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\necho \"FC=$FONTCONFIG_FILE\"\ncat \"$FONTCONFIG_FILE\" 2>/dev/null\ntrue\n",
+    );
+    let script = app.join("bin/run");
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir_all(app.join("share/fonts/truetype")).unwrap();
+    write(
+        &app.join("share/fonts/truetype/demo.ttf"),
+        "not a real font",
+    );
+
+    let pkg = td.join("probe.onelf");
+    let packed = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The generated config lives under the private base, includes the
+    // host's config, and names the package's font directory as mounted.
+    let xdg_run = td.join("xdg-run");
+    let fc = stdout
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("FC=")
+        .expect("FONTCONFIG_FILE printed");
+    let conf = std::fs::read_to_string(fc).expect("generated fonts.conf readable");
+    assert!(
+        conf.contains("<include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"),
+        "{conf}"
+    );
+    let dir_line = conf
+        .lines()
+        .find(|l| l.starts_with("  <dir>"))
+        .expect("a dir line");
+    assert!(dir_line.ends_with("/share/fonts</dir>"), "{conf}");
+    assert!(dir_line.contains(xdg_run.to_str().unwrap()), "{conf}");
+
+    // A caller's own FONTCONFIG_FILE is left alone.
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("FONTCONFIG_FILE", "/custom/my-fonts.conf");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("FC=/custom/my-fonts.conf"), "{stdout}");
+    assert!(!stdout.contains("<fontconfig>"), "{stdout}");
 
     let _ = std::fs::remove_dir_all(&td);
 }

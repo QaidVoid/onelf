@@ -834,7 +834,7 @@ pub(crate) fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()>
 
 /// Find `glib-compile-schemas` binary. On NixOS it's in glib-dev which may
 /// not be in PATH, so we search the nix store.
-fn find_glib_compile_schemas() -> PathBuf {
+pub(crate) fn find_glib_compile_schemas() -> PathBuf {
     // Try PATH first
     if let Ok(output) = Command::new("which").arg("glib-compile-schemas").output()
         && output.status.success()

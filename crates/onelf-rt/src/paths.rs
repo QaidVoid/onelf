@@ -475,6 +475,29 @@ mod tests {
     }
 
     #[test]
+    fn sweep_leaves_unprefixed_dirs_alone() {
+        // `modules-*` (rewritten caches) and `paths-*` (overlay staging)
+        // deliberately lack the `onelf-` prefix the sweep treats as a
+        // mountpoint, so live state is never reclaimed.
+        let base = std::env::temp_dir().join(format!("onelf-sweep-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let modules = base.join("modules-pkg-abcdef01");
+        let staging = base.join("paths-424242");
+        std::fs::create_dir_all(modules.join("sub")).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(modules.join("sub/loaders.cache"), b"x").unwrap();
+
+        sweep_in(&base);
+
+        assert!(modules.join("sub/loaders.cache").is_file());
+        assert!(staging.is_dir());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn rejects_non_directory_and_missing() {
         assert!(!is_safe_owned_dir(std::path::Path::new(
             "/nonexistent/onelf/private/xyz"
