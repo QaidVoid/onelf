@@ -77,8 +77,10 @@ defines and takes the superset. A newer build of a library only ever adds
 versions, so the superset can stand in for the other copy. The loader and
 libc are compared first, as a pair, and if the host's glibc is newer the
 whole process runs under the host loader. The chosen host libraries are
-placed over their bundled counterparts inside a private mount namespace,
-so every process the app starts sees the same choice.
+placed over their bundled counterparts, by a bind mount inside a private
+mount namespace or by a symlink in a tree that belongs to this launch
+alone, so every process the app starts sees the same choice. A launch
+that can do neither never takes the host's glibc.
 
 What the resolver may touch is bounded by the package's **host-libs
 policy**: `never` takes nothing, `auto` considers the driver stack and
@@ -137,7 +139,8 @@ Detail: [Inspecting Packages](./inspecting#provenance).
 
 A packed file is a small static runtime with the bundle appended. When
 run, it tries a ladder of ways to expose the bundle and uses the first
-the host supports. Every rung but the last leaves nothing behind.
+the host supports. Every rung but the last removes its copy of the
+package when the app exits.
 
 ```
 memfd                 a static single binary, straight from memory

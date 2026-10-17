@@ -14,7 +14,7 @@ The rules this page encodes:
 - ✅ Trust memfd auto-detection for a truly static binary. Set `memfd =
   false` only when it gets something wrong.
 - ⚠️ `memfd` covers the default entrypoint only. Extra entrypoints
-  always take the normal FUSE/tmpfs path.
+  always start at the FUSE rung of the ladder.
 - ✅ `working-dir = "package"` for apps that read relative paths,
   `"command"` for apps that look for siblings, `inherit` otherwise.
 
@@ -38,7 +38,8 @@ path = "bin/myapp"
 args = ["--cli"]
 ```
 
-`onelf info` shows them:
+The default entrypoint is named after the command's file name, `myapp`
+here. `onelf info` shows them:
 
 ```
 Entrypoints:
@@ -49,8 +50,13 @@ Entrypoints:
 
 ## Invoking an entrypoint
 
-Each entrypoint is selected by matching `argv[0]` at runtime. ✅ The
-simplest way is via a symlink:
+The runtime picks the entrypoint in this order:
+
+1. `ONELF_ENTRYPOINT`, when it names an entrypoint of this package.
+2. The file name of `argv[0]`, when it names an entrypoint.
+3. The default entrypoint.
+
+✅ The simplest way to select one is a symlink:
 
 ```bash
 ./myapp.onelf             # runs the default entrypoint
@@ -60,6 +66,14 @@ ln -s myapp.onelf myapp-daemon
 
 This pattern is called **multicall**, and it's how BusyBox and some
 toolkits ship many tools in one binary.
+
+```bash
+ONELF_ENTRYPOINT=myapp-cli ./myapp.onelf   # select without a symlink
+```
+
+⚠️ The runtime sets `ONELF_ENTRYPOINT` for the app it starts. A packed
+app that launches another package hands that name on, and it wins over
+`argv[0]` when the other package has an entrypoint of the same name.
 
 ## Memfd eligibility per entrypoint
 
@@ -77,17 +91,19 @@ memfd = true
 ```
 
 ⚠️ The memfd flag only matters for the default entrypoint. Extra
-entrypoints always go through the normal FUSE/tmpfs path.
+entrypoints always start at the FUSE rung. See
+[Execution Modes](./execution-modes#mode-1-memfd-fastest-most-limited)
+for what memfd mode leaves out.
 
 ## Working directory
 
-The `[package] working-dir` setting controls what cwd the exec'd
-entrypoint sees:
+The `[package] working-dir` setting (`--working-dir` on `onelf pack`)
+controls what cwd every entrypoint sees:
 
 | Value | Cwd |
 |-------|-----|
 | `inherit` (default) | Whatever directory the user launched from |
-| `package` | The AppDir root (the FUSE mount) |
+| `package` | The package root, `$ONELF_DIR` |
 | `command` | The directory containing the entrypoint binary |
 
 - ✅ `package` for apps that expect resources at relative paths like

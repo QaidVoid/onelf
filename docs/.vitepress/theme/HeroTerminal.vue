@@ -4,8 +4,8 @@ const lines = [
   { kind: "out", text: "Copied 52 libraries (177.7 MB) to ./app/lib" },
   { kind: "out", text: "Injected AT_EXECFN bootstrap into 1 binaries" },
   { kind: "cmd", text: "onelf pack ./app -o app.onelf --command bin/app" },
-  { kind: "out", text: "Payload: 63.0 MB (zstd level 12)" },
-  { kind: "out", text: "Output:  79.8 MB" },
+  { kind: "out", text: "Payload: 63.0 MB (zstd level 19)" },
+  { kind: "out", text: "Output:  63.9 MB" },
   { kind: "cmd", text: "./app.onelf" },
   { kind: "ok", text: "mounted privately, running, nothing left behind" },
 ];

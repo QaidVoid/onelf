@@ -12,7 +12,9 @@ cd myapp/
 onelf init --binary /path/to/mybinary
 ```
 
-This writes `myapp/onelf.toml` seeded with sensible defaults.
+This writes `myapp/onelf.toml` with `command = "bin/mybinary"` and
+commented defaults. It does not copy the binary, so put it at
+`myapp/bin/mybinary` yourself, or let `bundle-libs --from-binary` do it.
 
 Then run it, bundling libs on the first pass:
 
@@ -69,7 +71,10 @@ onelf run --entrypoint myapp-daemon -- --port 8080
 
 Same as a real packed run, minus the mount:
 
-- `ONELF_DIR`, `ONELF_ACTIVE_MODE=dev`, `ONELF_ARGV0`, etc.
+- `ONELF_DIR`, `ONELF_ACTIVE_MODE=dev`, `ONELF_ARGV0`, `ONELF_EXEC` and
+  `ONELF_ENTRYPOINT`. `ONELF_LAUNCH_DIR` is not set. When the recipe's
+  `working-dir` moves the app away from your shell's directory, that
+  directory is passed as `ONELF_USER_CWD` instead.
 - `LD_LIBRARY_PATH` prepended with the resolver's link farm and the
   AppDir's lib directories. The same per-library decision as a packed
   run decides what the host supplies (see
@@ -81,9 +86,10 @@ Same as a real packed run, minus the mount:
 - `LIBGL_DRIVERS_PATH`, `LIBVA_DRIVERS_PATH`, `GBM_BACKENDS_PATH`
   if the corresponding subdirs exist
 
-For cross-libc packages, `onelf run` detects a missing `PT_INTERP` and
-invokes the bundled `ld-musl` or `ld-linux` directly, just like the
-packed runtime does.
+A binary whose bootstrap `bundle-libs` injected maps its bundled loader
+itself and is executed as is. A binary that still names a loader in
+`PT_INTERP` is started through the bundled `ld-musl` or `ld-linux` when
+the AppDir carries one, just like the packed runtime does.
 
 ## Packing for distribution
 
@@ -103,3 +109,7 @@ start fresh, delete them:
 rm -rf myapp/lib myapp/.onelf myapp/myapp.onelf
 onelf build
 ```
+
+`bundle-libs` also rewrites the binaries in the AppDir in place: their
+`RUNPATH`, and the loader bootstrap it injects. For a truly clean start,
+copy fresh binaries into `bin/` as well.

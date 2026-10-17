@@ -20,8 +20,9 @@ The rules this page encodes:
 - ✅ Sign after `zsyncmake` and publish the signature at the update URL
   plus `.sig`. A signature published under any other name is never
   requested, and the update fails closed.
-- ❌ Never publish over plain HTTP. A plain-HTTP URL is rejected before
-  any request is made.
+- ❌ Never publish over plain HTTP. `onelf pack` refuses an update URL
+  that is not `https://`, and the runtime refuses one before any request
+  is made.
 - ⚠️ Rotate keys through a keyring. A single-key package signed with a
   new secret deadens self-update for everyone until they manually
   install a package carrying the new key.
@@ -43,15 +44,22 @@ onelf key new --secret myapp.key --public myapp.pub
   key is a normal, recoverable operation.
 
 The public key is 32 raw bytes, exactly the form `--update-key` embeds.
-If you lose your copy of it, re-derive it from the secret:
+The secret key is 64 raw bytes.
+
+- ❌ Never pass the secret key to `--update-key`. It would ship inside
+  every package, so `onelf pack` recognises a secret key and refuses it.
+
+If you lose your copy of the public key, re-derive it from the secret:
 
 ```bash
 onelf key show --secret myapp.key -o myapp.pub
 ```
 
-A key file may also hold several public keys concatenated (a multiple of
-32 bytes), forming a keyring: the runtime then accepts an update signed
-with *any* key in it. That is the mechanism behind key rotation below.
+A key file may also hold several distinct public keys concatenated (a
+multiple of 32 bytes), forming a keyring. The runtime then accepts an
+update signed with *any* key in it. That is the mechanism behind key
+rotation below. `onelf pack` refuses a key file of any other length, or
+one that repeats a key.
 
 ## Opt in at pack time
 
@@ -87,8 +95,8 @@ On the CLI that is `--update-url` plus `--update-key`.
   (1.35 MB extra for the HTTPS, zsync and signature code); without it,
   the slim runtime is used and `--onelf-update` is unrecognized. See
   [Updating from outside the package](#updating-from-outside-the-package).
-- ❌ A plain-HTTP URL. The URL must be `https://`; it is rejected before
-  any request is made.
+- ❌ A plain-HTTP URL. The URL must be `https://`. `onelf pack` refuses
+  anything else.
 
 ## Publish
 
@@ -236,14 +244,14 @@ The update-apply flow:
    as a seed (most blocks match, so typical downloads are tiny).
 4. Fetch the detached signature and verify it over the assembled binary
    against the key embedded at pack time.
-5. If both the running binary and the download carry a
-   `.onelf/update-revision`, refuse unless the download is strictly
-   newer. This check sits after the signature, so the revision it reads
-   is authenticated.
+5. If the running binary carries a `.onelf/update-revision`, refuse
+   unless the download carries one too and it is strictly newer. A
+   running binary without a revision skips this step. This check sits
+   after the signature, so the revision it reads is authenticated.
 6. Only then, atomically `rename(2)` the new file over the old one.
 
-Any failure in step 4 removes the downloaded file and leaves the running
-executable untouched. Before the rename, the old binary is also copied
+Any failure in steps 3 to 5 removes the downloaded file and leaves the
+running executable untouched. Before the rename, the old binary is also copied
 to a sibling `<name>.onelf-prev` and forced to the disk as a rollback
 point; on the rare failure of the rename itself, that copy is moved back
 into place.
@@ -253,7 +261,7 @@ Exit codes:
 | Code | Meaning |
 |------|---------|
 | 0 | Up to date, or update applied successfully |
-| 1 | Update available (for `--onelf-check-update`) |
+| 1 | Update available (for `--onelf-check-update`), or the package has no update URL or no signing key |
 | 2 | Error (network, parse, write, verify) |
 
 ## Example CI workflow
@@ -299,7 +307,10 @@ Measured on rustc 1.98.1, x86_64 musl, release profile. This table is
 the one source of these numbers; other pages link here rather than
 restating them.
 
-The default is slim.
+The default is slim. A package that pins a GL build or a shared set at
+an `https://` URL also takes the update runtime, whatever `[update]`
+says, because only that runtime carries the HTTPS client that fetches
+it. See [Pinning a GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one).
 
 - ✅ Take the update runtime only if the package should update itself.
 - ☑️ The middle row when something else does the updating: it keeps the

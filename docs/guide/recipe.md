@@ -8,7 +8,7 @@ The rules this page encodes:
 - ✅ Write the pack as a recipe and run `onelf build`. One file
   reproduces it, with no long CLI invocation to retype.
 - ✅ `${ONELF_DIR}` for values that must follow the package. Any other
-  `${VAR}` is expanded at pack time against the packer's environment.
+  `${VAR}` the packer's environment sets is expanded at pack time.
 - ✅ `$ONELF_DIR/bin` is prepended to `PATH` by default. Set
   `[env] PATH` to take full control.
 - ⚠️ `[update]` switches the package to the considerably larger
@@ -85,6 +85,8 @@ runtime behavior, and metadata.
 | `host-libs` | string | `auto` | `auto`, `always`, `never`: what the launch resolver may take from the host. See [Bundling](./bundling#libraries-that-come-from-the-host) |
 | `cache` | bool | `false` | Allow the persistent cache as the last execution mode. See [Execution Modes](./execution-modes#mode-6-persistent-cache-only-on-request) |
 | `memfd` | bool | auto | Force memfd-eligible (auto-detected otherwise) |
+| `needs-setuid` | bool | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
+| `mtime` | int | none | Pin every entry's mtime to this Unix timestamp. See [Reproducible Builds](./reproducible) |
 | `exclude` | array | `[]` | Glob patterns to exclude from the pack |
 | `version` | string | none | Shown by `onelf info` |
 | `description` | string | none | Shown by `onelf info` |
@@ -109,6 +111,7 @@ entrypoint automatically.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `level` | int | `19` | Zstd level, 0 to 22 |
+| `block-size` | int | `262144` | Bytes per payload block, 4 KiB to 32 MiB |
 | `dict` | bool | `false` | Train a shared dictionary for better ratio |
 | `store` | bool | `false` | Store payload raw, no zstd (overrides `dict`/`level`) |
 
@@ -116,8 +119,9 @@ entrypoint automatically.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | none | zsync control file URL |
-| `key` | path | none | 32-byte Ed25519 public key; required for self-update |
+| `url` | string | required | `https://` URL of the zsync control file |
+| `key` | path | none | 32-byte Ed25519 public key, or several concatenated as a keyring. Required for self-update. A secret key is refused |
+| `revision` | int | none | Release number. The runtime refuses an update that is not strictly newer |
 | `embed` | bool | `true` | Embed the updater. `false` records the URL for an external updater |
 
 The problem: `[update]` selects the update-capable runtime, which is
@@ -142,12 +146,16 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `search-paths` | array | `[]` | Extra lib search paths (highest priority) |
 | `exclude` | array | `[]` | Excluded soname prefixes |
 | `include` | array | `[]` | Force-included sonames |
-| `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack; off by default, the host's is used |
+| `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack. Off by default, so the host's is used |
 | `wayland` / `gtk` | bool | auto | Client-side framework bundlers, enabled on detection |
+| `no-gl` / `no-dri` / `no-vulkan` / `no-wayland` / `no-gtk` | bool | `false` | Force a framework off, overriding detection and the matching key |
 | `strip` | bool | `false` | Run `strip` on bundled libs |
 | `strict-libc` | bool | `false` | Refuse wrong-family libc libs |
 | `scan-dlopen` | bool | `false` | Scan for dlopen'd libs in binary strings |
 | `dlopen` | array | `[]` | Extra sonames for `scan-dlopen` allow-list |
+| `trace-run` | bool | `false` | Run the command and bundle every library it loaded. See [Bundling](./bundling#detecting-dlopen-d-libs) |
+| `trace-seconds` | int | `5` | How long the traced run may go |
+| `trace-args` | array | `[]` | Arguments for the traced run |
 | `skip` | bool | `false` | Don't run bundle-libs at all |
 
 ### `[sysroot]`
@@ -159,15 +167,34 @@ packer's machine. Paths are relative to the recipe. See
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `path` | path | required | The materialized rootfs, outside the AppDir |
-| `archive` | path | none | `.tar` or `.tar.zst` materialized into `path` when it does not exist |
+| `archive` | path | none | `.tar` or `.tar.zst` materialized into `path` when it does not exist, a path or an `https://` URL |
+| `hash` | string | none | BLAKE3 the archive must have before it is unpacked |
 | `platform` | string | archive or directory name | Label recorded as the package's platform in its provenance |
 | `optional` | array | `[]` | Optional dependencies to include, by package name |
 | `platform-line` | path | none | File of soname prefixes the host provides |
 | `policy` | path | none | File of glob patterns that never ship |
 | `trace` | path | none | File of paths a test run opened |
+| `keep` | path | none | File of glob patterns the trace may not prune |
+| `platform-url` / `platform-hash` | string | none | Override the GL build the sysroot pins |
+
+Shared dependency sets go in `[sysroot.sets.<name>]` tables. See the
+[Recipe Schema](../reference/recipe-schema#sysroot-sets-name).
 
 When this section is present, `bundle-libs` runs even if `[bundle] skip`
-is set, since it is what applies the sysroot.
+is set, since it is what applies the sysroot. The build also pins every
+mtime to 0 unless `[package] mtime` or `SOURCE_DATE_EPOCH` is set.
+
+### `[paths]`
+
+Maps an absolute path the application compiled into itself onto a
+directory in the bundle. Prefer `[env]` when the application reads a
+variable for that path. See
+[Environment](./environment#making-the-bundle-answer-for-a-compiled-in-path).
+
+```toml
+[paths]
+"/usr/share/galculator" = "share/galculator"
+```
 
 ### `[env]`
 
@@ -193,8 +220,8 @@ plain `${VAR}` is expanded while the recipe loads, against the
 - ✅ `$${VAR}` (escape the `$`) to defer a reference to **runtime**.
   It reaches the package as `${VAR}` and is expanded against the
   **live** process environment when the app runs.
-- ✅ POSIX `${VAR:-word}` to *prepend* rather than replace: if `VAR`
-  is unset *or empty*, the literal `word` is used instead.
+- ✅ POSIX `$${VAR:-word}` for a runtime default: if `VAR` is unset
+  *or empty*, the literal `word` is used instead.
 
 ```toml
 [env]
@@ -245,15 +272,17 @@ preload = ["${ONELF_DIR}/lib/libfoo.so", "libbar.so"]
 
 ## Environment variable expansion
 
-Any string in `[bundle] search-paths` (and other path fields) expands
-`${VAR}` references at parse time:
+Every string value in the recipe expands `${VAR}` references from the
+packer's environment when the recipe loads:
 
 ```toml
 [bundle]
 search-paths = ["${MUSL_LIBDRM}/lib", "${HOME}/my-libs"]
 ```
 
-⚠️ Missing variables expand to empty strings.
+⚠️ A variable the packer's environment does not set is kept as written,
+not replaced with an empty string. That is how `${ONELF_DIR}` reaches
+the runtime, but it also means a typo survives into the package.
 
 ## Path resolution
 

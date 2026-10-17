@@ -10,9 +10,10 @@ The rules this page encodes:
   desktop files in `.onelf/desktop/`. That is what the extraction and
   desktop integration commands read.
 - ✅ Reference the packed binary in the desktop file (`Exec=myapp`,
-  `Icon=myapp`); `onelf integrate` rewrites `Exec=` to the binary's
-  absolute path and sets `Icon=` to the installed icon's theme name.
-- ✅ Pick among several entrypoints with `--entrypoint`;
+  `Icon=myapp`). `onelf integrate` rewrites `Exec=` and `TryExec=` to
+  the binary's absolute path and sets `Icon=` to the installed icon's
+  theme name.
+- ✅ Integrate a second entrypoint through its symlink. Its
   `{entrypoint}`-named files win over the `default.*` fallbacks.
 - ✅ Name a multi-entrypoint `Exec=` after the entrypoint's argv[0] and
   ship the matching symlink (`myapp-daemon -> myapp.onelf`).
@@ -68,11 +69,19 @@ onelf integrate ./myapp.onelf
 ```
 
 This installs:
-- The icon to `$XDG_DATA_HOME/icons/hicolor/.../apps/onelf-myapp.{svg,png}`
+- The icon to `$XDG_DATA_HOME/icons/hicolor/scalable/apps/onelf-myapp.svg`,
+  or for a PNG to `hicolor/<W>x<H>/apps/onelf-myapp.png` at the size its
+  header gives. An icon that is neither SVG nor a readable PNG is not
+  installed.
 - A `.desktop` file to `$XDG_DATA_HOME/applications/onelf-myapp.desktop`
 
-The `Exec=` and `Icon=` fields are automatically patched to point to
-the binary's absolute path and installed icon name.
+`$XDG_DATA_HOME` defaults to `~/.local/share`. `myapp` here is the
+package name, with any character other than a letter, digit, `-` or `_`
+replaced by `-`. `update-desktop-database` is run afterwards when it is
+installed.
+
+The `Exec=`, `TryExec=` and `Icon=` fields are automatically patched to
+point to the binary's absolute path and installed icon name.
 
 ☑️ A package with no bundled `.desktop` file still integrates: a
 minimal one is generated with the package name.
@@ -88,18 +97,30 @@ onelf unintegrate ./myapp.onelf
 
 ## Selecting an entrypoint
 
-✅ For a package with multiple entrypoints, `--entrypoint` picks which
-entrypoint's icon and desktop file resolve:
+✅ For a package with multiple entrypoints, integrate through the
+entrypoint's symlink:
 
 ```bash
-onelf integrate ./myapp.onelf --entrypoint myapp-daemon
+ln -s myapp.onelf myapp-daemon
+onelf integrate ./myapp-daemon
 ```
 
-☑️ Integrating through the entrypoint's symlink (`onelf integrate
-./myapp-daemon`) selects it the same way, and `Exec=` keeps the
-symlink, so the menu entry launches that entrypoint. An entrypoint
-other than the default installs `onelf-myapp-myapp-daemon.desktop` and
-its icon beside the default's files rather than over them.
+The symlink's name selects the entrypoint, as it does at launch, so that
+entrypoint's icon and desktop file resolve. `Exec=` keeps the symlink,
+so the menu entry launches that entrypoint. An entrypoint other than the
+default installs `onelf-myapp-myapp-daemon.desktop` and its icon beside
+the default's files rather than over them, and `onelf unintegrate
+./myapp-daemon` removes only those.
+
+⚠️ `--entrypoint` picks which entrypoint's files resolve, but `Exec=`
+still names the path you pass. `onelf integrate ./myapp.onelf
+--entrypoint myapp-daemon` warns that `myapp.onelf` launches another
+entrypoint, and the menu entry would start that one.
+
+⚠️ `./myapp-daemon --onelf-integrate` also selects the entrypoint by
+name, but writes the resolved path of `myapp.onelf` into `Exec=`, so
+the menu entry starts the default entrypoint. Use `onelf integrate`
+through the symlink for a second entrypoint.
 
 ## Extract without installing
 
@@ -136,8 +157,12 @@ Categories=Utility;
 ```
 
 When you run `onelf integrate`, the `Exec=` line is rewritten to the
-binary's absolute path automatically. The `Icon=` field is set to the
-installed icon's theme name.
+binary's absolute path automatically, keeping any arguments and field
+codes after it. The `Icon=` field is set to the installed icon's theme
+name.
+
+⚠️ Only the `[Desktop Entry]` group is patched. An `Exec=` inside a
+`[Desktop Action ...]` group is left as written.
 
 ✅ Multiple entrypoints: use their argv[0] names:
 

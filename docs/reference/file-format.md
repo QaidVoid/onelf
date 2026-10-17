@@ -15,7 +15,7 @@ A packed onelf file is up to five concatenated sections:
 │  - string_table                    │
 ├────────────────────────────────────┤
 │ Payload                            │
-│  256 KB blocks, zstd or raw        │
+│  blocks, zstd or raw               │
 ├────────────────────────────────────┤
 │ Dictionary (optional, raw)         │
 ├────────────────────────────────────┤
@@ -79,7 +79,7 @@ Compressed with zstd. After decompression:
 | 50 | 32 | prefix_hash (BLAKE3 over file bytes `[0, manifest_offset)`; zeros in version 1/2) |
 | 82 | 32 | footer_hash (BLAKE3 over the footer, see below; zeros in version 1/2) |
 
-Version 1 headers end at 50 bytes and carry no structure hashes.
+Version 1 and 2 headers end at 50 bytes and carry no structure hashes.
 
 ### Entrypoint (14 bytes each)
 
@@ -93,9 +93,8 @@ Version 1 headers end at 50 bytes and carry no structure hashes.
 
 ### Entry (variable)
 
-Represents a file, directory, or symlink. Fields:
-
-Fields are serialized in this order (65-byte header, then the blocks):
+Represents a file, directory, or symlink. Fields are serialized in this
+order (65-byte header, then the blocks):
 
 ```text
 kind:           u8        (0=dir, 1=file, 2=symlink)
@@ -136,12 +135,14 @@ package, and pack reports the total under `Dedup:` when it saved
 anything. Two entries still get independent block lists in the manifest
 when their content differs, even if individual blocks were to match.
 
-Block size defaults to 256 KB uncompressed. Each block is compressed
-independently, which lets the runtime decompress them lazily as the
-entrypoint reads files.
+Block size defaults to 256 KiB uncompressed and can be set from 4 KiB to
+32 MiB with `--block-size` or `[compression] block-size`. Each block is
+compressed independently, which lets the runtime decompress them lazily
+as the entrypoint reads files.
 
 If a dictionary is present (`dict_size > 0`), each block is decompressed
-against that dictionary.
+against that dictionary. The packer trains it only with `--dict`, at up
+to 1 MiB.
 
 When the `STORED` footer flag is set (`onelf pack --no-compress` or
 `[compression] store = true`), blocks are written raw with no zstd:
@@ -216,7 +217,7 @@ and `3` and reject anything higher with a clear error, so a package
 written by an older onelf still runs. Version 2 added the per-block
 `content_hash` (24-byte blocks in version 1, 56 bytes from version 2).
 Version 3 extended the header from 50 to 114 bytes with the two structure
-hashes; a version 3 manifest requires footer format 2.
+hashes. onelf writes a version 3 manifest only behind a format 2 footer.
 
 Footer flags are decoded with `from_bits_retain`, so a bit a reader does
 not recognise is kept and ignored rather than treated as corruption. That

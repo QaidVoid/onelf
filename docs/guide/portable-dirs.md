@@ -6,17 +6,18 @@ without polluting their home directory, like "portable apps" on Windows.
 
 The rules this page encodes:
 
-- ✅ Sibling marker files redirect `$HOME` and the XDG variables.
-- ✅ Make the marker a directory when the app stores files there.
-- ⚠️ Ship the markers with the binary. Without them the app runs
+- ✅ Sibling directories redirect `$HOME` and the XDG variables.
+- ❌ An empty file is not a marker. Only a directory redirects its
+  variable.
+- ⚠️ Ship the directories with the binary. Without them the app runs
   against the real `$HOME`.
 - ❌ Expecting `${VAR}` expansion in the env file. Values are
   exported literally.
 
 ## How it works
 
-The runtime checks for files with specific suffixes next to the packed
-binary:
+The runtime checks for directories with specific suffixes next to the
+packed binary:
 
 | File | Redirects | Original kept at |
 |------|-----------|------------------|
@@ -24,11 +25,16 @@ binary:
 | `myapp.onelf.config` | `$XDG_CONFIG_HOME` | `$REAL_XDG_CONFIG_HOME` |
 | `myapp.onelf.share` | `$XDG_DATA_HOME` | `$REAL_XDG_DATA_HOME` |
 | `myapp.onelf.cache` | `$XDG_CACHE_HOME` | `$REAL_XDG_CACHE_HOME` |
-| `myapp.onelf.env` | additional env vars | n/a |
+| `myapp.onelf.env` (a file) | additional env vars | n/a |
 
-☑️ An empty file works as a bare marker. When the runtime finds any
-of these, it points the corresponding XDG variable at the sibling
-file/directory.
+When the runtime finds one of these directories, it points the
+corresponding variable at it and keeps the old value in the `REAL_*`
+variable. Where an XDG variable was unset, `REAL_*` holds the XDG
+default under `$HOME`, such as `$HOME/.config`.
+
+☑️ The name is that of the packed file itself, as the kernel reports
+it. A multicall symlink such as `myapp-daemon` uses the directories of
+`myapp.onelf`, the file it points to.
 
 ## Example
 
@@ -45,7 +51,9 @@ Now running `./myapp.onelf`:
 - Reads `myapp.onelf.env` and exports each `KEY=VALUE` line
 
 The app's dot-config, dot-cache, etc. all live inside
-`~/Applications/myapp.onelf.home/`. ✅ Copy `myapp.onelf` plus
+`~/Applications/myapp.onelf.home/`, unless the session sets
+`XDG_CONFIG_HOME` and friends explicitly. Add the matching `.config`,
+`.share` and `.cache` directories to redirect those as well. ✅ Copy `myapp.onelf` plus
 `myapp.onelf.home` to another machine and the app keeps its state.
 
 ## Creating the portable marker
@@ -70,7 +78,8 @@ EXTRA_PATH=${HOME}/bin
 ```
 
 Leading/trailing whitespace is trimmed. Blank lines and `#` comments
-are ignored. ❌ `${VAR}` is not expanded. The `EXTRA_PATH` line above
+are ignored. A line `unset NAME` removes `NAME` from the environment.
+❌ `${VAR}` is not expanded. The `EXTRA_PATH` line above
 therefore exports the literal string `${HOME}/bin`.
 
 ## Use cases

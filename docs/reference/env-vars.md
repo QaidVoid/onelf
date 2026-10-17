@@ -11,8 +11,13 @@ Reference for all environment variables onelf reads or sets.
 | `ONELF_INTERP` | Set only when the host's glibc is newer than the bundled one: the host loader every bootstrapped binary in the process tree runs under. Another packed app launched from that tree drops the inherited value and decides for itself. Ignored by a set-uid, set-gid, or capability-raised executable, as glibc ignores `LD_PRELOAD` there |
 | `ONELF_ARGV0` | Original `argv[0]` before multicall resolution |
 | `ONELF_EXEC` | Absolute path to the packed binary |
-| `ONELF_ENTRYPOINT` | Resolved entrypoint name |
+| `ONELF_ENTRYPOINT` | Resolved entrypoint name. The runtime also reads it to select an entrypoint, so it reaches another package the app launches |
 | `ONELF_LAUNCH_DIR` | Original cwd at launch time |
+
+`onelf run` sets `ONELF_DIR` (the AppDir), `ONELF_ACTIVE_MODE=dev`,
+`ONELF_ARGV0`, `ONELF_EXEC` and `ONELF_ENTRYPOINT`, but not
+`ONELF_LAUNCH_DIR`. When the recipe's `working-dir` moves the app to
+another directory, it passes the original one as `ONELF_USER_CWD`.
 
 ## Library and GPU paths (auto-set if applicable)
 
@@ -31,6 +36,7 @@ Reference for all environment variables onelf reads or sets.
 | `DRIRC_CONFIGDIR` | `share/drirc.d/` exists | that dir |
 | `XKB_CONFIG_ROOT` | `share/X11/xkb/` exists | that dir |
 | `XDG_DATA_DIRS` | `share/` exists | `<pkg>/share` (prepended) |
+| `FONTCONFIG_FILE` | the package or a set has `share/fonts/` | a generated config in the private runtime directory that includes the host's `fonts.conf`, then the bundled font dirs. Only set when the caller has not set it. |
 | `QT_PLUGIN_PATH` | the package or a set has `lib/qt6/plugins` or `lib/qt5/plugins` | colon-joined list of every such dir, so relocatable Qt finds its platform plugin. Only set when the caller has not set it. |
 | `GIO_EXTRA_MODULES` | `lib/gio/modules/` exists in the package or a set | colon-joined list of those dirs, so GLib loads the bundle's GIO modules rather than the host's (whose GLib they do not match). Only set when the caller has not set it. |
 | `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Only set when the caller has not set it. |
@@ -58,20 +64,21 @@ Vulkan loader's append semantics and the host's GPU drivers reachable.
 
 | Variable | Effect |
 |----------|--------|
-| `ONELF_MODE` | Force a specific execution mode. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
+| `ONELF_MODE` | Force a specific execution mode: `memfd`, `fuse`, `tmpfs`, `rundir` or `cache`. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
-| `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` fallback path even when user namespaces are available. Useful for debugging mount visibility. |
+| `ONELF_ENTRYPOINT` | Select the entrypoint by name, ahead of `argv[0]` and the default. See [Entrypoints](../guide/entrypoints). |
+| `ONELF_FUSE_NO_NAMESPACE` | Any value other than empty or `0` forces the `fusermount3` fallback path even when user namespaces are available, and keeps `[paths]` from being mounted. Useful for debugging mount visibility. |
 | `ONELF_FUSE_CACHE_BYTES` | Byte ceiling for the FUSE server's cache of decompressed blocks. Default 32 MiB; a value that does not parse or is zero keeps the default. |
-| `ONELF_CACHE` | `1` allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |
+| `ONELF_CACHE` | `1` (any value other than empty or `0`) allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |
 | `ONELF_NO_RESOLVER` | `1` launches with nothing taken from the host, as if the package were packed with `host-libs = never`. The way to tell whether a failure is the resolver's doing. |
 | `ONELF_LD_CACHE` | Path of the loader cache image the resolver reads instead of `/etc/ld.so.cache`, so a fixture can describe a host of its own. |
-| `ONELF_TRACE` | Path of a file to record the sysroot path of every file this run opens, for capturing a trace to prune a sysroot build. Appended, so runs accumulate. Records on the FUSE path only. |
+| `ONELF_TRACE` | Path of a file to record the sysroot path of every file the app opens, for capturing a trace to prune a sysroot build. Recording starts when the app is launched, so the runtime's own reads are left out. Appended, so runs accumulate. Records in `fuse` mode only, so set `ONELF_MODE=fuse` when capturing. |
 | `ONELF_NO_PLATFORM_FETCH` | `1` stops the runtime from fetching the pinned GL build or dependency set on a host without one. A build already in the store is still used. The launch warns and continues. |
 | `ONELF_PLATFORM_URL` | Fetch the pinned GL build from this URL instead of the package's. The pinned hash still has to match, so a mirror cannot substitute content. |
-| `ONELF_PLATFORM_STORE` | Directory holding fetched GL builds and dependency sets instead of `platform/` under the cache root. |
+| `ONELF_PLATFORM_STORE` | Directory holding fetched GL builds and dependency sets instead of `platform/` under the cache root. `bundle-libs` also looks there for a set's build. |
 | `ONELF_SET_MODE` | `mount` serves a dependency set from its stored build, the default; `extract` copies it out through the package cache. A host that cannot mount falls back to `extract`. |
-| `XDG_RUNTIME_DIR` | Where to create mountpoint dirs (falls back to `/tmp`) |
-| `XDG_CACHE_HOME` | Where the persistent cache mode stores packages (falls back to `$HOME/.cache`) |
+| `XDG_RUNTIME_DIR` | The private per-user directory for mountpoints and rundir trees. Without a usable one the runtime creates `/tmp/onelf-<uid>` with mode `0700` |
+| `XDG_CACHE_HOME` | The onelf cache lives in its `onelf/` subdirectory: the cache mode's packages and the fetched GL builds and dependency sets. Falls back to `$HOME/.cache`. A relative value is ignored |
 | `XDG_DATA_HOME` | Where `onelf integrate` installs `.desktop` files and icons (falls back to `$HOME/.local/share`) |
 
 ## Portable directory redirection
@@ -94,7 +101,7 @@ See [Portable Directories](../guide/portable-dirs) for the full story.
 | Variable | Effect |
 |----------|--------|
 | `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to add a fresh `DT_RUNPATH` to binaries without an existing slot and to inject the re-exec-safe `onelf-env` constructor as a `DT_NEEDED` on the entrypoint. Falls back to looking up `patchelf` in `PATH`. |
-| `SOURCE_DATE_EPOCH` | Clamp file mtimes for reproducible output. See [Reproducible Builds](../guide/reproducible). |
+| `SOURCE_DATE_EPOCH` | An integer Unix timestamp that clamps file mtimes for reproducible output. A value that is not an integer is ignored. `--mtime` overrides it. See [Reproducible Builds](../guide/reproducible). |
 | `ONELF_PACK_CHUNK_BYTES` | In-flight compression chunk budget in bytes (default 64 MiB). Purely a memory bound: it caps how many files are compressed before their blocks are written back; output bytes are unaffected. A value that does not parse or is zero keeps the default. |
 | `NO_COLOR` | When set (any value, per the NO_COLOR convention), disables the bundler's ANSI colorized status output in `bundle-libs` and `sysroot`. Color also requires a terminal stderr. |
 

@@ -1,14 +1,14 @@
 # Execution Modes
 
 When you run a packed file, the runtime tries a ladder of modes and uses
-the first one the host supports. Every rung but the last leaves nothing
-behind when the app exits.
+the first one the host supports. Every rung but the last leaves no copy
+of the package behind when the app exits.
 
 The rules this page encodes:
 
 - ✅ Let the ladder run. It takes the first mode the host supports and
-  cleans up after itself: every rung but the cache leaves nothing
-  behind.
+  cleans up after itself: every rung but the cache removes its copy of
+  the package when the app exits.
 - ❌ Do not opt into the cache casually. It is the one mode that leaves
   the package's full size on disk, which is why the runtime never
   enters it without a request.
@@ -47,13 +47,21 @@ mount, no extraction, no temp dir.
 
 **Requirements:**
 
-- The entrypoint is a single self-contained binary (no bundled `lib/`).
-- The binary is truly static, or the `[package] memfd = true` flag was
-  set explicitly at pack time.
+- It is the default entrypoint. Other entrypoints start at the next
+  rung.
+- Its binary is an ELF with no `DT_NEEDED` entries, or the publisher
+  set `[package] memfd = true` (`--memfd`) at pack time. A binary that
+  `bundle-libs` linked against `libonelf-env.so` is refused at pack
+  time, because that library exists only inside the package.
 
 onelf auto-detects static binaries (no `DT_NEEDED`) and marks them
 memfd-eligible. You'll see `[memfd]` next to the entrypoint in `onelf
-info`.
+info`. The binary is checked against its recorded hash before it runs,
+and a binary that fails the check falls through to the next rung.
+
+⚠️ There is no package tree in this mode. `ONELF_DIR` is empty, the app
+cannot read any other file from the package, and the recipe's `[env]`
+and `[paths]` are not applied.
 
 ## Mode 2: FUSE via user namespace (default for most packages)
 
@@ -80,6 +88,10 @@ Why:
   ⚠️ Ubuntu 23.10 and later restrict them through AppArmor for binaries
   without an installed profile, which a downloaded file never has, so
   Ubuntu desktops usually land on the next rung.
+- The package was not built with `needs-setuid`, and
+  `ONELF_FUSE_NO_NAMESPACE` is not set. Either one sends the launch
+  straight to `fusermount3`, because a setuid bit does nothing inside a
+  user namespace.
 
 ## Mode 3: FUSE via fusermount3 (compat fallback)
 
@@ -118,6 +130,8 @@ and execs the entrypoint.
 **Requirements:**
 
 - Unprivileged user namespaces enabled.
+- The package was not built with `needs-setuid`. Such a package skips
+  this rung.
 
 ## Mode 5: Runtime directory (no namespaces, no helper)
 
@@ -126,14 +140,19 @@ without `fusermount3` there is nothing left to mount with, so the
 runtime extracts the package into its private per-user directory and
 runs it from there. On a systemd host that directory is
 `$XDG_RUNTIME_DIR`, a RAM-backed tmpfs that is cleared at logout.
+Without one it is `/tmp/onelf-<uid>`, created with mode `0700`.
 
 **Properties:**
 
 - ✅ Needs nothing from the host beyond a writable private directory.
 - Visible to other processes of the same user, like any file there.
-- The tree is removed when the last process using it exits. A launch
-  killed before it could clean up leaves a tree that the next launch of
-  any package removes.
+- ✅ Each launch extracts its own tree, named after the package with the
+  process id appended. Two launches of one package never share a tree
+  or edit each other's files.
+- The tree is removed when the last process using it exits. An app
+  that leaves processes running after it exits keeps its tree until
+  the last of them is gone. A launch killed before it could clean up
+  leaves a tree that the next launch of any package removes.
 - Every block is verified against its recorded hash before the
   entrypoint runs, as in every other mode.
 - Uses space in the runtime directory equal to the uncompressed package
@@ -173,8 +192,8 @@ so, with `ONELF_CACHE=1` named as the way to allow the extraction.
 
 ## How the entrypoint is launched
 
-Regardless of which mode is active, the runtime first decides what the
-host supplies (see [Bundling](./bundling#libraries-that-come-from-the-host)).
+In every mode but memfd, the runtime first decides what the host
+supplies (see [Bundling](./bundling#libraries-that-come-from-the-host)).
 A host with no GL stack at all gets the build the package pins, if it
 pins one (see [Pinning a GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one)).
 Then it picks an exec strategy based on what the binary needs:
@@ -190,10 +209,11 @@ Then it picks an exec strategy based on what the binary needs:
    jumps into that instead, for this process and every one it execs.
 
 2. **Userland-execve.** For binaries without bootstrap injection that
-   are PIE (`ET_DYN`), the runtime can map the bundled loader into
-   the current process and jump to its entry, skipping the kernel
-   loader entirely. This is used to bring up a glibc binary on a
-   musl host where the binary's `PT_INTERP` doesn't exist on disk.
+   are PIE (`ET_DYN`), when the package records its bundled loader in
+   `.onelf/interp`, the runtime maps that loader into the current
+   process and jumps to its entry, skipping the kernel loader entirely.
+   This is what brings up a glibc binary on a musl host, where the
+   binary's `PT_INTERP` doesn't exist on disk.
 
 3. ⚠️ **Loader invocation (fallback).** When neither of the above fits,
    the runtime invokes the bundled loader explicitly:
@@ -205,11 +225,13 @@ Then it picks an exec strategy based on what the binary needs:
 4. **Self-extract fast path.** Binaries that embed their payload at
    end-of-file (pre-1.3.12 Bun, etc.) cannot tolerate
    `/proc/self/exe` pointing at the loader. The runtime detects them
-   and arranges for a real kernel-exec of the binary itself. In FUSE
-   and tmpfs modes, it bind-mounts the bundled loader over the
-   binary's PT_INTERP path inside the private mount namespace. In
-   cache mode, it creates a short `/tmp` symlink and patches the
-   binary's PT_INTERP in-place.
+   and arranges for a real kernel-exec of the binary itself. Inside a
+   private mount namespace (namespace FUSE and tmpfs modes), it
+   bind-mounts the bundled loader over the binary's PT_INTERP path. In
+   the rundir and cache modes, it places a short symlink to the
+   bundled loader in the private runtime directory and patches the
+   binary's PT_INTERP in place to point at it. Where neither works,
+   as on a `fusermount3` mount, it falls back to loader invocation.
 
 ## Forcing a mode
 

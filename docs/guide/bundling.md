@@ -38,9 +38,11 @@ With no flags, this:
    for `bin/app`, `$ORIGIN/../../../lib` for `opt/tool/bin/app`. No entry
    ever resolves outside the tree, so the bundled binaries find their
    libs relative to their own location without `LD_LIBRARY_PATH` and
-   without a host directory ever being searched. For binaries without an
-   existing slot, `bundle-libs` falls back to `patchelf --set-rpath`
-   (when patchelf is in `PATH`) to add a fresh entry.
+   without a host directory ever being searched. A `RUNPATH` is retagged
+   as `RPATH`, which the loader passes down the dependency chain. For an
+   executable without an existing slot, `bundle-libs` falls back to
+   `patchelf --set-rpath` (when patchelf is in `PATH`, or named by
+   `ONELF_PATCHELF`) to add a fresh entry.
 5. Injects an AT_EXECFN bootstrap into each bundled executable. At
    runtime, the bootstrap reads `AT_EXECFN`, computes the bundled
    interpreter path relative to the binary's own location, and jumps
@@ -48,9 +50,10 @@ With no flags, this:
    which is important for Python's stdlib detection, Electron's ASAR
    locator, and Qt's plugin loader.
 6. Scrubs `/usr/`, `/etc/`, `/nix/`, `/lib/`, and `/lib64/` strings
-   inside the bundled dynamic loader to `/XXX/`, so it won't pick up
+   inside the bundled glibc loader to `/XXX/`, so it won't pick up
    the host's `ld.so.preload`, `ld.so.cache`, or hardcoded fallback
-   library dirs.
+   library dirs. A bundled musl loader has its default library path
+   scrubbed the same way.
 
 ## Two ways to decide what goes in
 
@@ -185,31 +188,32 @@ at all, so `--scan-dlopen` is what finds those.
 
 ## Self-extracting binaries (Bun, etc.)
 
-- ⚠️ Binaries that embed their payload at the end of the file break
-  under naive post-processing. The most common case is pre-1.3.12
-  Bun-compiled apps, which look for the trailer `\n---- Bun! ----\n` at
-  `-16` from end-of-file.
+- ⚠️ Binaries that embed a payload break under naive post-processing.
+  The common case is Bun-compiled apps. Before 1.3.12 Bun looks for the
+  trailer `\n---- Bun! ----\n` at the end of the file. From 1.3.12 it
+  keeps the payload in a `.bun` ELF section that it finds by parsing its
+  own program headers, so a rewritten layout makes it crash.
 
-`bundle-libs` detects them automatically and:
+`bundle-libs` detects both kinds automatically and:
 
-- Skips bootstrap injection. The bootstrap appends bytes to the
-  binary, which would clobber the trailer and break payload
-  detection.
-- Skips `patchelf --set-rpath` for binaries lacking a DT_RUNPATH
-  slot. patchelf can grow the file.
+- Skips bootstrap injection. The bootstrap appends bytes and repurposes
+  a program header, which would clobber the trailer or the section
+  lookup.
+- Skips `patchelf --set-rpath` for binaries lacking a RUNPATH slot,
+  and leaves them out of `--strip`. Both rewrite the file.
 
-At runtime, the onelf-rt arranges for the kernel to handle PT_INTERP
-directly. In FUSE and tmpfs modes, it bind-mounts the bundled linker
-over the binary's existing PT_INTERP path inside a private mount
-namespace. In cache mode, it creates a short `/tmp` symlink and
-patches the binary's PT_INTERP in-place. Either way,
-`/proc/self/exe` resolves to the binary itself and Bun finds its
-embedded JS bundle.
+At runtime, onelf-rt has the kernel resolve the PT_INTERP of a binary
+with the end-of-file trailer directly. Inside a private mount namespace
+it bind-mounts the bundled linker over the binary's existing PT_INTERP
+path. Without one, as in cache mode, it creates a short symlink in the
+private runtime directory and patches the binary's PT_INTERP in place
+to point at it. Either way, `/proc/self/exe` resolves to the binary
+itself and Bun finds its embedded JS bundle.
 
-✅ Bun 1.3.12 and newer uses a dedicated `.bun` ELF section instead of
-the end-of-file trailer. Those binaries are unaffected by file-end
-appending and get normal bootstrap injection treatment. Prefer it when
-you control the Bun version.
+☑️ `bundle-libs` warns about each such executable that is left without
+an `$ORIGIN` entry. It finds its libraries only through the
+`LD_LIBRARY_PATH` the runtime sets, which an app that clears its
+environment and re-execs itself loses.
 
 ## Starting from a bare binary
 
@@ -280,10 +284,10 @@ not be loaded."`.
 The verdict per framework:
 
 - ✅ Wayland, GTK: bundled. Client-side, they must match the bundle.
-- ✅ GL, DRI, Vulkan: not bundled. The driver that works is the host's,
-  so detection sets the package's host-library policy to `auto` and the
-  launch resolver takes the stack from the host. The scan reports
-  which it found:
+- ✅ GL, DRI, Vulkan: not bundled. The driver that works is the host's.
+  `pack` sees the driver references under its default `--host-libs auto`
+  and the launch resolver takes the stack from the host. The scan
+  reports which it found:
 
 ```
   Frameworks: gl, vulkan detected; the host's drivers are used at launch.
@@ -375,6 +379,11 @@ onelf bundle-libs ./myapp --include libsomething.so.1
 `--exclude` skips libraries by prefix. `--include` forces a soname into
 the resolution queue.
 
+☑️ Some prefixes are always excluded: `libnss_` (apart from the name
+service modules a bundled glibc needs), the vendor GPU and compute
+runtimes `libcuda.so`, `libnvidia`, `libamdhip64.so` and
+`libze_loader.so`, and `linux-vdso.so`.
+
 ## Stripping
 
 ```bash
@@ -400,11 +409,11 @@ The granular framework flags:
 
 | Flag | What it bundles |
 |------|-----------------|
-| `--gl` | `libGL.so`, `libEGL.so`, `libGBM`, `libGLX_mesa`, `libEGL_mesa` |
-| `--dri` | Mesa DRI drivers (filtered to your architecture) |
-| `--vulkan` | Vulkan ICD drivers + `libvulkan.so.1` |
-| `--wayland` | `libwayland-*`, `libdecor-0`, `libxkbcommon`, Wayland client |
-| `--gtk` | GSettings schemas under `share/glib-2.0/schemas` |
+| `--gl` | The glvnd dispatch libraries (`libGL`, `libGLX`, `libEGL`, `libGLESv2`, `libOpenGL`, `libGLdispatch`), Mesa's `libGLX_mesa`, `libEGL_mesa`, `libglapi`, `libgbm` and `libxatracker`, GBM backends, EGL vendor files, and Mesa's `drirc.d` and `libdrm` data |
+| `--dri` | Mesa DRI drivers into `lib/dri` (filtered to your architecture) |
+| `--vulkan` | Vulkan ICD files into `share/vulkan/icd.d` and the drivers they name (filtered to your architecture) |
+| `--wayland` | `libwayland-client`, `-server`, `-cursor` and `-egl`, `libdecor-0` with its plugins, and `libxkbcommon` |
+| `--gtk` | GSettings schemas, compiled into `share/glib-2.0/schemas` |
 
 - ✅ `--wayland` and `--gtk` are enabled by detection; pass them to
   force-on when detection misses something.
@@ -413,3 +422,6 @@ The granular framework flags:
 - Each has a `--no-*` counterpart (`--no-gl`, `--no-dri`,
   `--no-vulkan`, `--no-wayland`, `--no-gtk`) that forces-off, overriding
   both detection and the matching `--*` flag.
+- ☑️ None of them apply to a [sysroot](./sysroot) build. On the command
+  line they are refused with `--sysroot`, and in a recipe with a
+  `[sysroot]` they do nothing.

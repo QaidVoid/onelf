@@ -1,13 +1,16 @@
 # Runtime Flags
 
-Flags consumed by the runtime before the entrypoint sees `argv`. All
-start with `--onelf-` and are namespace-safe: the app never has to care.
+Flags the runtime acts on instead of starting the entrypoint. All start
+with `--onelf-`. The runtime looks for each one anywhere on the command
+line, performs the action and exits without running the app. Icons,
+desktop files and integration apply to the entrypoint the launch
+selected (see [Entrypoints](../guide/entrypoints)).
 
 ## Information
 
 | Flag | Action |
 |------|--------|
-| `--onelf-icon` | Print the bundled icon (PNG) to stdout, then exit |
+| `--onelf-icon` | Print the bundled icon (SVG or PNG) to stdout, then exit |
 | `--onelf-desktop` | Print the bundled `.desktop` file to stdout, then exit |
 
 ## Desktop integration
@@ -19,12 +22,14 @@ start with `--onelf-` and are namespace-safe: the app never has to care.
 
 ## Self-update
 
-Only available when the package was built with a `[update] url`.
+Only available when the package embeds the updater: it was built with
+an `[update] url` and without `embed = false` (`--no-embed-updater`).
+The slim runtime does not know these flags and passes them to the app.
 
 | Flag | Action |
 |------|--------|
-| `--onelf-check-update` | Print status, exit 0 if up to date, 1 if update available |
-| `--onelf-update` | Delta-download + atomically replace self |
+| `--onelf-check-update` | Print status, exit 0 if up to date, 1 if an update is available, 2 on error |
+| `--onelf-update` | Delta-download, verify the signature, and atomically replace self. Refused when the package embeds no update key |
 
 ## Portable directory setup
 
@@ -40,7 +45,10 @@ portable install.
 | `--onelf-portable-cache` | `<binary>.cache/` |
 
 After running one of these, future invocations of the binary redirect
-the corresponding XDG variable at the new directory.
+the corresponding variable at the new directory. `<binary>` is the
+name of the packed file itself, so a multicall symlink uses the
+directories of the file it points to. See
+[Portable Directories](../guide/portable-dirs).
 
 ## Execution mode override
 
@@ -50,6 +58,7 @@ without forcing it. See [Execution Modes](../guide/execution-modes).
 
 ## Passing flags through
 
-All other arguments are forwarded to the entrypoint unchanged. If you
-need to pass `--onelf-something` through to the app, it would be
-shadowed by the runtime. There's no way to escape this currently.
+All other arguments are forwarded to the entrypoint unchanged,
+including any `--onelf-*` argument not listed on this page. An argument
+that matches a flag above is always taken by the runtime, and there is
+no way to escape it.

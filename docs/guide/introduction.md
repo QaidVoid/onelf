@@ -12,44 +12,50 @@ at a time, which of the two copies is the newer one.
 
 ## How it compares
 
-"AppImage" means two different things today. The classic one is built
-with AppImageKit's `appimagetool` and the stock type 2 runtime, which
-needs `libfuse2` on the host. "Anylinux" is the AppImage built with
-pkgforge's `sharun`, `uruntime`, and their own Rust `appimagetool` that
-defaults to DwarFS and the uruntime: it works on musl hosts, needs no
-helper installed, and falls back to namespaces or extraction on its
-own. They are listed separately because they behave
-very differently. onelf's helper, `fusermount3`, is only a fallback for
-hosts that deny user namespaces, and its persistent cache is opt-in; the
-classic runtime mounts under `/tmp/.mount_*` and leaves that directory
-behind on a crash. For GPU drivers, Anylinux bundles Mesa and takes the
-NVIDIA blob from the host. onelf takes the whole stack from the host by
-default and decides at every launch, for each library the driver needs
-that the bundle also carries, whether the host's copy or the bundled one
-is the newer, by the symbol versions each defines. Bundling Mesa is a
-publisher opt-in for hosts that have no GL at all; the concepts page
-explains why.
+"AppImage" means two different things today, so the table lists them
+separately:
 
-|  | onelf | Anylinux | AppImage | Flatpak | Static |
+- **AppImage** is the classic one, built with AppImageKit's
+  `appimagetool` and the stock type 2 runtime, which needs `libfuse2` on
+  the host. It mounts under `/tmp/.mount_*` and leaves that directory
+  behind on a crash.
+- **AnyLinux AppImages** are AppImages built with pkgforge's tooling:
+  `sharun` to bundle the libraries, `uruntime` as the runtime, and their
+  own Rust `appimagetool`, which defaults to DwarFS. They work on musl
+  hosts, need no helper installed, and fall back to namespaces or
+  extraction on their own.
+
+onelf needs no helper either. It mounts inside a private user namespace,
+uses `fusermount3` only on hosts that deny user namespaces, and extracts
+into the per-user runtime directory when neither works. Its persistent
+cache is opt-in. For GPU drivers, AnyLinux AppImages bundle Mesa and take
+the NVIDIA blob from the host. onelf takes the whole stack from the host
+by default. At every launch it decides, for each library the driver
+needs that the bundle also carries, whether the host's copy or the
+bundled one is newer, by the symbol versions each defines. Bundling Mesa
+is a publisher opt-in for hosts that have no GL at all, and the concepts
+page explains why.
+
+|  | onelf | AnyLinux AppImage | AppImage | Flatpak | Static |
 | --- | --- | --- | --- | --- | --- |
 | One file, no install | yes | yes | yes | no | yes |
 | Bundles libraries | yes | yes | yes | shared runtime | no |
 | musl hosts | yes | yes | no | no | yes |
 | No helper needed | yes | yes | `fusermount` | `bwrap` | yes |
-| Invisible mount | yes | no, reused | no | n/a | n/a |
-| Nothing on disk | yes | `/tmp` fallback | mount dir on crash | installs | yes |
+| Invisible mount | yes, with user namespaces | no, reused | no | n/a | n/a |
+| Nothing on disk | no copy left, cache opt-in | `/tmp` fallback | mount dir on crash | installs | yes |
 | GPU drivers | host, per library; bundling opt-in | bundles Mesa | host dirs on path | runtime extension | n/a |
 | Bundle source | scan or package DB | `lib4bin`, `strace` | `linuxdeploy` | build in SDK | compiler |
-| Delta updates | built in | zsync hook | external tool | OSTree | no |
+| Delta updates | built in, signed | zsync hook | external tool | OSTree | no |
 | Sandbox | no | no | no | `bwrap`, as permitted | no |
 
-The honest summary: the Anylinux AppImages are excellent single files
-and the closest relative to onelf. Flatpak's shared runtime is shared in
-principle; in practice apps pin different runtimes and versions, so a
-machine ends up holding several of them at hundreds of megabytes each,
-and the sandbox is as tight as the permissions an app asks for, which
-browsers and anything that works on the whole filesystem tend to open
-wide. Its real strength is the store and its update model. onelf's
+The honest summary: AnyLinux AppImages are excellent single files and
+the closest relative to onelf. Flatpak's shared runtime is shared in
+principle. In practice apps pin different runtimes and versions, so a
+machine ends up holding several of them at hundreds of megabytes each.
+Its sandbox is as tight as the permissions an app asks for, and browsers
+and anything that works on the whole filesystem tend to open it wide.
+Flatpak's real strength is the store and its update model. onelf's
 difference is in two places. It never puts a host directory on the
 library path, choosing each host library on its merits instead, and it
 can take a bundle's contents from a package database rather than a scan
@@ -59,11 +65,12 @@ of the packer's machine.
 
 ```
 +-------------------------------------+
-| onelf-rt (static musl runtime)      |  slim, or the larger update build
+| onelf-rt (static musl runtime)      |  896 KB slim, 2.2 MB with the updater
 +-------------------------------------+
 | Manifest (zstd-compressed)          |  File tree, entrypoints, metadata
 +-------------------------------------+
-| Payload                             |  File contents in 256 KB blocks (zstd or raw)
+| Payload                             |  File contents in blocks, 256 KB by
+|                                     |  default (zstd or raw)
 |  - block 0                          |
 |  - block 1                          |
 |  - ...                              |
@@ -75,16 +82,18 @@ of the packer's machine.
 When you execute the file:
 
 1. The runtime reads its own footer to find the manifest and payload.
-2. It picks the best [execution mode](./execution-modes). The default is a
-   private user+mount namespace with FUSE.
+2. It picks the best [execution mode](./execution-modes). On most hosts
+   that is a FUSE mount inside a private user and mount namespace.
 3. The target entrypoint is `exec`'d from the mount. When it exits, the
-   kernel tears the namespace down along with any mount. No cleanup code
-   runs, and no filesystem artifacts remain.
+   kernel tears the namespace down along with the mount. No cleanup code
+   runs, and no filesystem artifacts remain. The fallback modes for hosts
+   without user namespaces are described on the same page.
 
 ## When to use onelf
 
 - You want to distribute a Linux app as one file without `.deb`/`.rpm`/flathub/etc.
-- You're okay with the 700 KB runtime overhead per package.
+- You're okay with about 900 KB of runtime per package, or 2.2 MB with
+  the self-updater.
 - You want the app to leave no trace when it exits.
 - You want delta self-updates without bundling `zsync`.
 - You want cross-libc portability (ship a musl binary, run on glibc hosts).

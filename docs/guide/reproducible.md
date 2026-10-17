@@ -5,8 +5,9 @@ caveat: file modification times.
 
 The rules this page encodes:
 
-- ✅ Set `SOURCE_DATE_EPOCH` for every build. File mtimes are the one
-  input that is not deterministic out of the box.
+- ✅ Set `SOURCE_DATE_EPOCH` for every build, or pin `--mtime`. File
+  mtimes are the one input that is not deterministic out of the box.
+- ☑️ A recipe build from a `[sysroot]` pins mtimes to 0 by default.
 - ❌ Different rust toolchains between builds. The toolchain is part of
   the input.
 - ❌ Reordering `--search-path` between builds. Same soname in two paths,
@@ -45,15 +46,33 @@ SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) onelf build
 Two builds from the same commit on different machines then produce the
 same bytes.
 
+## Pinning every mtime
+
+✅ `--mtime SECS` (or `mtime` under `[package]` in the recipe) stamps
+every entry with the same timestamp, whatever the filesystem says. It
+overrides `SOURCE_DATE_EPOCH`, and unlike the epoch it also moves files
+older than the timestamp.
+
+```bash
+onelf pack ./AppDir -o app.onelf --command bin/app --mtime 0
+```
+
+☑️ A recipe build with a `[sysroot]` section is reproducible from the
+archive and the recipe alone, so `onelf build` pins every mtime to 0
+unless the recipe sets `mtime` or `SOURCE_DATE_EPOCH` is set. The time
+the AppDir happened to be written never reaches the package.
+
 ## CI example
 
 ```yaml
 # .github/workflows/release.yml
 - name: Pack
-  env:
-    SOURCE_DATE_EPOCH: ${{ github.event.head_commit.timestamp || '1' }}
-  run: onelf build
+  run: SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) onelf build
 ```
+
+❌ `github.event.head_commit.timestamp` is an ISO 8601 date, not a Unix
+timestamp. onelf ignores a `SOURCE_DATE_EPOCH` that is not a whole
+number of seconds.
 
 ✅ Any CI that checks out the same commit produces byte-identical output,
 which in turn makes the zsync delta size predictable.

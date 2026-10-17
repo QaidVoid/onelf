@@ -122,7 +122,7 @@ enum Commands {
         cache: bool,
 
         /// Record the update URL but do not embed the updater, linking the
-        /// slim runtime instead. Saves about 1.3 MB per package. For
+        /// slim runtime instead. Saves about 1.4 MB per package. For
         /// packages updated by a package manager or deployment system,
         /// where the package must not replace itself.
         #[arg(long)]
@@ -284,7 +284,8 @@ enum Commands {
         /// Path to the onelf binary
         binary: PathBuf,
 
-        /// Entrypoint name (default: default entrypoint)
+        /// Entrypoint name (default: the one BINARY launches, which for a
+        /// symlink is the entrypoint its name selects)
         #[arg(long)]
         entrypoint: Option<String>,
     },
@@ -294,7 +295,8 @@ enum Commands {
         /// Path to the onelf binary
         binary: PathBuf,
 
-        /// Entrypoint name (default: default entrypoint)
+        /// Entrypoint name (default: the one BINARY launches, which for a
+        /// symlink is the entrypoint its name selects)
         #[arg(long)]
         entrypoint: Option<String>,
     },

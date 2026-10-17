@@ -23,8 +23,9 @@ The rules this page encodes:
 - ✅ Expect a sysroot build to stop on an unresolved `DT_NEEDED`. The
   universe was complete, so the omission is a policy or platform-line
   mistake you can fix.
-- ⚠️ Keep the sysroot outside the AppDir. `onelf build` refuses one
-  inside it, because everything under the AppDir is packed.
+- ⚠️ Keep the sysroot outside the AppDir. `onelf build` and
+  `bundle-libs` refuse one inside it, because everything under the
+  AppDir is packed.
 - ⚠️ Name the drivers nothing depends on when you `pack-gl`, Vulkan ICDs
   and `libva` included. A build without `libva` leaves a video player
   without it on a host that has none.
@@ -41,7 +42,9 @@ onelf sysroot fetch https://example.com/platform-1.tar.zst ./sysroot
 onelf sysroot info ./sysroot
 ```
 
-`fetch` also takes a local path. Materializing needs no privileges:
+`fetch` also takes a local path, and refuses a plain `http://` URL,
+since a sysroot is executable code. With `--hash`, an archive whose
+BLAKE3 does not match is not unpacked. Materializing needs no privileges:
 ownership is not restored and setuid bits are dropped, since the bundle
 never needs either, and an archive whose entries reach outside the
 directory is refused. The directory appears only once the whole archive
@@ -52,8 +55,8 @@ for a sysroot.
 application with `pacman` inside an `archlinux` image and export the
 container's filesystem.
 
-⚠️ Keep the sysroot outside the AppDir. `onelf build` refuses one inside
-it, because everything under the AppDir is packed.
+⚠️ Keep the sysroot outside the AppDir. `onelf build` and `bundle-libs`
+refuse one inside it, because everything under the AppDir is packed.
 
 ## Declaring it in the recipe
 
@@ -176,7 +179,9 @@ usr/share/blender/**
 
 To capture a trace, run the packed application under `ONELF_TRACE`
 pointing at a file. The runtime records the sysroot path of every file
-the run opens, already in the form the trace tier reads:
+the application opens after launch, already in the form the trace tier
+reads. What the runtime itself reads before handing over, such as the
+resolver's pass over every bundled library, is not recorded:
 
 ```bash
 ONELF_TRACE=trace.txt ./myapp.onelf
@@ -188,9 +193,14 @@ frame, click through the interface, exercise the plugins you ship. Then
 name the file in the recipe and rebuild.
 
 Recording happens on the FUSE execution path, which sees every open, so
-it needs a host where FUSE is available; that is the default on desktop
-Linux. Build the package once without a trace, capture, then add the
-`trace` line and build again.
+it needs a host where FUSE is available. That is the default on desktop
+Linux. Under any other mode nothing is recorded, so set `ONELF_MODE=fuse`
+to make sure the run takes this path. Build the package once without a
+trace, capture, then add the `trace` line and build again.
+
+❌ `--trace-run` on a sysroot build. It runs the target against the
+packing machine, which a sysroot build does not use, so `bundle-libs`
+refuses the combination. Record a trace with `ONELF_TRACE` instead.
 
 ## The verifier
 
@@ -199,7 +209,7 @@ the bundle or name something on the platform line. From a sysroot that is
 an error:
 
 ```
-error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure nor on the platform line
+error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure, on the platform line, nor in a shared set
 ```
 
 - ✅ A sysroot build stops, and that is the point. The universe was
@@ -208,6 +218,10 @@ error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure nor 
   the universe was a guess.
 - ☑️ A dependency the database names but the sysroot does not hold is
   reported, not fatal. A debloated rootfs drops metapackages on purpose.
+- ☑️ A file the build copied whose need no package in the sysroot holds
+  is dropped and listed under "Dropped", since nothing could load it: a
+  plugin for a stack that was never installed, say. The entrypoint and
+  files you placed by hand are never dropped. They stay findings.
 
 ## What the report tells you
 
@@ -388,13 +402,12 @@ and the package carries a pin. A package that bundles Mesa never
 fetches, and neither does one on a host with a working driver.
 
 The file lands in `<cache root>/platform/<label>/<hash>.onelf` once its
-hash matches, with the hash beside it so a label whose pin moves on to
-a new build is fetched again; a mismatch or a broken download leaves
-nothing behind. It is then extracted through the package cache and its
-libraries are indexed ahead of the host's, so two packages pinning the
-same label share one download and one extraction. The name is the build's own
-hash, so a label whose pin later moves to a new build keeps both rather
-than overwriting the old one and forcing a refetch. The build's
+hash matches. A mismatch or a broken download leaves nothing behind. It
+is then extracted through the package cache and its libraries are
+indexed ahead of the host's, so two packages pinning the same build
+share one download and one extraction. The name is the build's own hash,
+so a label whose pin later moves to a new build keeps both rather than
+overwriting the old one and forcing a refetch. The build's
 directories are never put on the search path, where every process the
 application spawns would inherit them. Its libraries reach the
 application through the link farm by name, the ones the drivers open

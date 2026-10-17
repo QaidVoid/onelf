@@ -40,9 +40,11 @@ When bundle-libs sees a musl binary (PT_INTERP matches `ld-musl-*`), it:
 `bundle-libs` injects an AT_EXECFN bootstrap into each bundled
 executable. The bootstrap reads `AT_EXECFN` at startup, computes the
 bundled loader's path relative to the binary's own location, maps it
-into memory, and jumps into it. The host's own loader is never
-consulted, so a musl binary runs on a glibc host and vice versa
-without any host-level setup.
+into memory, and jumps into it. The host's loader is used only when the
+launch resolver picks the host's newer glibc for a glibc package (see
+[Bundling Libraries](./bundling#libraries-that-come-from-the-host)),
+never across libc families, so a musl binary runs on a glibc host and
+vice versa without any host-level setup.
 
 For PIE (`ET_DYN`) binaries the runtime can also use `userland-execve`
 to map the bundled loader directly. Non-PIE (`ET_EXEC`) binaries go
@@ -101,8 +103,7 @@ strict-libc = true
 After `bundle-libs`, watch for warnings:
 
 ```
-warning: libfoo.so.1 links against Glibc libc but target is Musl;
-         this bundle may not work at runtime
+warning: libfoo.so.1 links against Glibc libc but target is Musl; this bundle may not work at runtime
 ```
 
 With `--strict-libc` those are skipped and listed under "Not found":

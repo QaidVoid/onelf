@@ -47,7 +47,7 @@ memfd = true                      # Option<bool>, overrides auto-detect
 host-libs = "auto"                # "auto" | "always" | "never": what the resolver may take from the host
 cache = false                     # bool, allow the persistent cache as the last execution mode
 needs-setuid = false              # bool, the app runs setuid binaries (sudo, pkexec); keeps it out of user namespaces
-mtime = 1735689600                # Option<u64>, pin every entry's mtime to this Unix timestamp (reproducible output; overrides SOURCE_DATE_EPOCH)
+mtime = 1735689600                # Option<u64>, pin every entry's mtime to this Unix timestamp (overrides SOURCE_DATE_EPOCH)
 exclude = ["*.a", "__pycache__"]  # Vec<String>, path globs
 version = "1.2.3"                 # Option<String>
 description = "..."               # Option<String>
@@ -112,7 +112,7 @@ small and separate from the payload).
 
 ```toml
 [update]
-url = "https://releases.example.com/myapp.onelf.zsync"
+url = "https://releases.example.com/myapp.onelf.zsync"   # must be https://
 key = "myapp.pub"      # optional path, required for self-update
 revision = 7           # optional release number; the runtime refuses non-newer downloads
 embed = true           # optional, false for an external updater
@@ -120,14 +120,16 @@ embed = true           # optional, false for an external updater
 
 When present, onelf selects the update-capable runtime, much larger
 than slim (sizes in the
-[Self-Update size table](../guide/self-update.md#size-tradeoff)). `key`
-is the 32-byte Ed25519 public key from `onelf key new`;
-the runtime refuses to self-update without it. `revision` is embedded as
-`.onelf/update-revision` and covered by the signature; at update time the
+[Self-Update size table](../guide/self-update.md#size-tradeoff)). `url`
+must be `https://`, or the pack fails. `key` is the 32-byte Ed25519
+public key from `onelf key new`, or several concatenated into a keyring,
+and the runtime refuses to self-update without it. A file that holds a
+secret key is refused. `revision` is embedded as
+`.onelf/update-revision` and covered by the signature. At update time the
 runtime refuses a download whose revision is not strictly newer than the
-running one. `embed = false` records
-the URL and key but links the slim runtime, for packages updated by a
-package manager.
+running one, and a running package that has a revision refuses a
+download without one. `embed = false` records the URL and key but links
+the slim runtime, for packages updated by a package manager.
 
 ## `[bundle]`
 
@@ -140,16 +142,16 @@ search-paths = [
 ]                                # Vec<String>, supports ${VAR}
 exclude = ["libpthread"]         # Vec<String>, soname prefixes to skip
 include = ["libfoo.so.1"]        # Vec<String>, force-include sonames
-gl = false                       # auto-enabled from DT_NEEDED
-dri = false                      # auto-enabled
-vulkan = false                   # auto-enabled
-wayland = false                  # auto-enabled
-gtk = false                      # auto-enabled
-no-gl = false                    # force-off, overrides auto-detect + gl
-no-dri = false                   # force-off
-no-vulkan = false                # force-off
-no-wayland = false               # force-off
-no-gtk = false                   # force-off
+gl = false                       # opt-in, never enabled by detection
+dri = false                      # opt-in
+vulkan = false                   # opt-in
+wayland = false                  # also enabled when detected
+gtk = false                      # also enabled when detected
+no-gl = false                    # force-off, overrides gl
+no-dri = false                   # force-off, overrides dri
+no-vulkan = false                # force-off, overrides vulkan
+no-wayland = false               # force-off, overrides detection and wayland
+no-gtk = false                   # force-off, overrides detection and gtk
 strip = false                    # run strip --strip-unneeded
 strict-libc = false              # skip wrong-family libc libs
 scan-dlopen = false              # scan strings for common dlopen'd libs
@@ -159,6 +161,12 @@ trace-seconds = 5                # how long the traced run may go
 trace-args = ["--version"]       # arguments for the traced run
 skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
 ```
+
+The GPU stack (`gl`, `dri`, `vulkan`) is bundled only when asked for,
+because the host's driver is the one that works. Wayland and GTK data
+are bundled when the binary needs them, and `no-*` turns either off.
+With a `[sysroot]` the framework bundlers are not used at all, and
+`skip` is ignored because the sysroot is applied by `bundle-libs`.
 
 ## `[sysroot]`
 
@@ -179,7 +187,11 @@ platform-hash = "3f1c...a9e2"         # Option<String>, its BLAKE3 hash; overrid
 
 `platform-url` and `platform-hash` override what the sysroot's
 `etc/onelf/platform.toml` names, field by field. A URL is `https://` or
-`file://`. See [Pinning a GL build](../guide/sysroot#pinning-a-gl-build-for-hosts-without-one).
+`file://`. An `archive` URL must be `https://`.
+
+A build with `[sysroot]` pins every entry's mtime to 0 unless
+`[package].mtime` or `SOURCE_DATE_EPOCH` is set, so the package depends
+on the archive and the recipe alone. See [Pinning a GL build](../guide/sysroot#pinning-a-gl-build-for-hosts-without-one).
 
 ### `[sysroot.sets.<name>]`
 

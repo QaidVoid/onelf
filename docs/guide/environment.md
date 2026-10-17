@@ -23,20 +23,22 @@ The rules this page encodes:
 
 | Variable | Value | Example |
 |----------|-------|---------|
-| `ONELF_DIR` | Mount/extract root | `/run/user/1000/onelf-myapp-ab12cd34` |
-| `ONELF_ACTIVE_MODE` | Active mode | `fuse`, `tmpfs`, `memfd`, `cache`, `dev` |
+| `ONELF_DIR` | Mount/extract root (empty in memfd mode) | `/run/user/1000/onelf-myapp-ab12cd34` |
+| `ONELF_ACTIVE_MODE` | Active mode | `memfd`, `fuse`, `tmpfs`, `rundir`, `cache`, or `dev` under `onelf run` |
 | `ONELF_ARGV0` | Original argv[0] | `myapp` |
 | `ONELF_EXEC` | Path to the packed binary | `/home/alice/bin/myapp.onelf` |
 | `ONELF_ENTRYPOINT` | Active entrypoint name | `myapp-daemon` |
 | `ONELF_LAUNCH_DIR` | Caller's original cwd | `/home/alice/project` |
+| `ONELF_LIB_PATH` | The library search path below, for script entrypoints | `/run/user/1000/onelf-myapp-ab12cd34/lib` |
 
 ## Library paths
 
-The runtime walks the AppDir's `lib` subdirectories and builds a
-search-path string of the form:
+The runtime takes the library directories recorded at pack time
+(`--lib-dir`, by default every directory that holds a `.so`) and builds
+a search-path string of the form:
 
 ```
-<resolver link farm>:<bundle lib dirs>:<previous LD_LIBRARY_PATH>
+<resolver link farm>:<bundle lib dirs>:<shared set lib dirs>:<previous LD_LIBRARY_PATH>
 ```
 
 That string is used three ways:
@@ -44,9 +46,10 @@ That string is used three ways:
 1. Passed to the bundled dynamic linker via `--library-path` when the
    runtime invokes it explicitly.
 2. Set as `LD_LIBRARY_PATH` for AT_EXECFN-bootstrapped binaries, which
-   reach the bundled libraries through their own run path and only need
-   the farm from the environment, so that nested execs the app does
-   still resolve correctly. A binary that got no `$ORIGIN` run path at
+   reach the bundled libraries through their own run path and only get
+   the entries outside the package (the farm, set directories and the
+   previous value), so that nested execs the app does still resolve
+   correctly. A binary that got no `$ORIGIN` run path at
    bundle time (no slot and no `patchelf`) has no other way to the
    bundled libraries, so it receives the whole string instead.
 3. Published as `ONELF_LIB_PATH` for a script entrypoint, which drives
@@ -66,23 +69,38 @@ chosen per library by the resolver and reached through its link farm,
 and a library the bundle lacks and the resolver did not choose fails by
 name instead of being satisfied from the host.
 
-If the AppDir has `lib/dri/` or `lib/gbm/` it also sets:
+Each variable below is set only when the caller has not set it and
+the directory it names exists. "A lib dir" means one of the bundle's
+library directories or, on a host that received a
+[GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one), one of
+the build's.
 
-- `LIBGL_DRIVERS_PATH` and `LIBVA_DRIVERS_PATH` to `lib/dri/`
-- `GBM_BACKENDS_PATH` to `lib/gbm/`
-
-If the AppDir has `share/vulkan/icd.d/` it sets:
-
-- `VK_DRIVER_FILES` to the colon-joined list of ICD json files
-
-The runtime also auto-sets a few more vars when the corresponding
-data directory exists:
-
-- `__EGL_VENDOR_LIBRARY_DIRS` for `share/glvnd/egl_vendor.d/`
-- `LIBDRM_IDS_PATH` for `share/libdrm/`
+- `LIBGL_DRIVERS_PATH` and `LIBVA_DRIVERS_PATH` to every `dri/` in a
+  lib dir
+- `GBM_BACKENDS_PATH` to every `gbm/` in a lib dir
+- `GCONV_PATH` to every `gconv/` in a bundle lib dir, the bundled
+  glibc's charset converters
+- `VK_DRIVER_FILES` to the ICD json files in the package's
+  `share/vulkan/icd.d/` and in the host's
+  `/run/opengl-driver/share/vulkan/icd.d`, `/etc/vulkan/icd.d` and
+  `/usr/share/vulkan/icd.d` (skipped when `VK_ADD_DRIVER_FILES` is set)
+- `__EGL_VENDOR_LIBRARY_DIRS` to the package's, the GL build's and the
+  host's `glvnd/egl_vendor.d` directories
+- `LIBDRM_IDS_PATH` and `DRIRC_CONFIGDIR` for `share/libdrm/` and
+  `share/drirc.d/`, from the package or else the GL build
 - `LIBDECOR_PLUGIN_DIR` for `share/libdecor/plugins-1/`
-- `DRIRC_CONFIGDIR` for `share/drirc.d/`
 - `XKB_CONFIG_ROOT` for `share/X11/xkb/`
+- `GDK_PIXBUF_MODULE_FILE` and `GTK_IM_MODULE_FILE` for the
+  `loaders.cache` under `lib/gdk-pixbuf-2.0/*/` and the
+  `immodules.cache` under `lib/gtk-3.0/*/`, rewritten with absolute
+  module paths
+- `GIO_EXTRA_MODULES` for `lib/gio/modules/`
+- `FONTCONFIG_FILE` to a generated config that includes the host's
+  `/etc/fonts/fonts.conf` and adds the package's `share/fonts/`, so
+  bundled fonts render and host fonts stay available
+
+The GLib, GTK, Qt and font entries also look in the package's
+[shared sets](./sysroot#sharing-a-dependency-set).
 
 ✅ `QT_PLUGIN_PATH` names every `lib/qt6/plugins` and `lib/qt5/plugins`
 the package and its [shared sets](./sysroot#sharing-a-dependency-set)
@@ -94,8 +112,10 @@ to the executable, which holds while the toolkit sits in the package and
 stops holding when it does not. Qt then finds no platform plugin and
 aborts, and it logs to the journal rather than stderr.
 
-Finally, the package's own `share/` is prepended to `XDG_DATA_DIRS`,
-so GLib/GTK discover bundled GSettings schemas and icon themes.
+Finally, the package's own `share/`, then the GL build's and the sets',
+are prepended to `XDG_DATA_DIRS`, so GLib/GTK discover bundled
+GSettings schemas and icon themes. An unset `XDG_DATA_DIRS` is treated
+as the XDG default, `/usr/local/share:/usr/share`.
 
 ## Data paths compiled into a library
 
@@ -163,12 +183,15 @@ PYTHONHOME = "${ONELF_DIR}/python"
 GST_PLUGIN_SYSTEM_PATH = "${ONELF_DIR}/lib/gstreamer-1.0"
 ```
 
-`${ONELF_DIR}` and `$${VAR}` (escaped, expanded against the **live**
-environment at runtime, with POSIX `${VAR:-word}` defaults) let values
-prepend instead of replace. `PATH` defaults to
-`${ONELF_DIR}/bin:$${PATH:-/usr/bin:/bin}`, so the package's `bin/` is
-always on `PATH` (re-exec-safe), falling back to `/usr/bin:/bin` when
-the inherited PATH is empty, unless `[env]` sets `PATH` itself.
+In a recipe value, `${VAR}` expands from the packer's environment at
+build time and is kept as written when the packer does not have it.
+Write `$${VAR}` to defer a reference to launch, where it expands
+against the **live** environment, with POSIX `${VAR:-word}` defaults.
+That is how a value prepends instead of replacing. Every package gets
+`PATH=${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}` by default, so the
+package's `bin/` is always on `PATH` (re-exec-safe), falling back to
+`/usr/bin:/bin` when the inherited PATH is empty. A recipe that sets
+`PATH` in `[env]` replaces the default.
 
 See [Recipe File](./recipe#env) for details.
 
@@ -192,7 +215,7 @@ into the ELF itself:
 - **`[env]` and `preload`**: a tiny freestanding `onelf-env`
   constructor is bundled into `lib/` and injected as a `DT_NEEDED` of
   the entrypoint. Because `DT_NEEDED` lives in the ELF and is resolved
-  via the `$ORIGIN` RUNPATH above, it loads on *every* exec; its
+  via the `$ORIGIN` run path above, it loads on *every* exec; its
   constructor re-applies `.onelf/env` and `.onelf/preload` before
   `main()`, no matter how the app cleared the environment.
 
@@ -207,8 +230,13 @@ layer), not after a re-exec.
 | Variable | Effect |
 |----------|--------|
 | `ONELF_MODE` | Force a specific [execution mode](./execution-modes) |
+| `ONELF_CACHE` | `1` allows the persistent cache for this launch without forcing it |
+| `ONELF_ENTRYPOINT` | Select an [entrypoint](./entrypoints) by name |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30, `0` disables) |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` path even when user namespaces work |
+| `ONELF_NO_RESOLVER` | Take nothing from the host for this launch, to tell whether a failure is the resolver's |
+
+The full list is in the [environment variable reference](../reference/env-vars).
 
 ## Portable directory redirection
 
