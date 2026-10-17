@@ -515,7 +515,7 @@ fn icd_library_paths_in(
 /// The string value of the first `"library_path"` key in `text`. The files
 /// are small and regular enough that a scan is safer than a parser the
 /// runtime would otherwise not need.
-fn json_library_path(text: &str) -> Option<&str> {
+pub fn json_library_path(text: &str) -> Option<&str> {
     let at = text.find("\"library_path\"")?;
     let rest = &text[at + "\"library_path\"".len()..];
     let rest = rest.trim_start().strip_prefix(':')?.trim_start();

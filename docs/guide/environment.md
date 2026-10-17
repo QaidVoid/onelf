@@ -124,10 +124,8 @@ variable; see [Which values the caller can override](#which-values-the-caller-ca
 - `GBM_BACKENDS_PATH` to every `gbm/` in a lib dir
 - `GCONV_PATH` to every `gconv/` in a bundle lib dir, the bundled
   glibc's charset converters
-- `VK_DRIVER_FILES` to the ICD json files in the package's
-  `share/vulkan/icd.d/` and in the host's
-  `/run/opengl-driver/share/vulkan/icd.d`, `/etc/vulkan/icd.d` and
-  `/usr/share/vulkan/icd.d` (skipped when `VK_ADD_DRIVER_FILES` is set)
+- `VK_DRIVER_FILES`, only when the loader's own search would not do;
+  see [Vulkan drivers](#vulkan-drivers)
 - `__EGL_VENDOR_LIBRARY_DIRS` to the package's, the GL build's and the
   host's `glvnd/egl_vendor.d` directories
 - `LIBDRM_IDS_PATH` and `DRIRC_CONFIGDIR` for `share/libdrm/` and
@@ -138,13 +136,78 @@ variable; see [Which values the caller can override](#which-values-the-caller-ca
   `loaders.cache` under `lib/gdk-pixbuf-2.0/*/` and the
   `immodules.cache` under `lib/gtk-3.0/*/`, rewritten with absolute
   module paths
-- `GIO_EXTRA_MODULES` for `lib/gio/modules/`
+- `GIO_MODULE_DIR` for `lib/gio/modules/`, which replaces GLib's default
+  module directory so the host's modules never load into the bundled
+  GLib. A set's modules go on `GIO_EXTRA_MODULES`. A package without GIO
+  modules leaves the default alone, so the host's dconf settings backend
+  and gvfs keep working, and `bundle-libs` warns when it bundles GIO
+  without them.
 - `GTK_PATH` for `lib/gtk-3.0/`, where GTK 3 finds its modules, theme
   engines and print backends
 - `FONTCONFIG_FILE` to a generated config that includes the host's
   `/etc/fonts/fonts.conf`, or the caller's own `FONTCONFIG_FILE` in its
   place, and adds the package's `share/fonts/`, so bundled fonts render
   and host fonts stay available
+
+Plugin directories other libraries load from are found the same way,
+in every library directory of the package and of its
+[shared sets](./sysroot#sharing-a-dependency-set), so both `lib/` and
+a multiarch `lib/x86_64-linux-gnu/` count:
+
+- `GST_PLUGIN_SYSTEM_PATH_1_0` and `GST_PLUGIN_SYSTEM_PATH` for
+  `gstreamer-1.0/`, and `GST_PLUGIN_SCANNER_1_0` and
+  `GST_PLUGIN_SCANNER` for the bundled `gst-plugin-scanner`, looked for
+  in that directory, in Debian's `gstreamer1.0/gstreamer-1.0/` and in
+  the package's `libexec/gstreamer-1.0/`
+- `PIPEWIRE_MODULE_DIR` for `pipewire-0.3/` and `SPA_PLUGIN_DIR` for
+  `spa-0.2/`
+- `ALSA_PLUGIN_DIR` for `alsa-lib/`, the first one found
+- `GI_TYPELIB_PATH` for `girepository-1.0/`
+- `LIBHEIF_PLUGIN_PATH` for `libheif/plugins/`, or `libheif/` itself
+  where it has no `plugins/`
+- `BABL_PATH` for `babl-0.1/` and `GEGL_PATH` for `gegl-0.4/`
+- `TCL_LIBRARY` and `TK_LIBRARY` for a `tcl<version>/` holding
+  `init.tcl` and a `tk<version>/` holding `tk.tcl`, below a library
+  directory or under Debian's `share/tcltk/`
+
+Data a library reads from a fixed path is looked for in the package's
+root, then in the sets':
+
+- `ALSA_CONFIG_DIR` for `share/alsa/` and `ALSA_CONFIG_PATH` for
+  `share/alsa/alsa.conf`
+- `XLOCALEDIR` for `share/X11/locale/`, the X11 compose and locale
+  tables
+- `MAGIC` for `share/file/misc/magic.mgc` or `share/misc/magic.mgc`,
+  libmagic's database
+- `TEXTDOMAINDIR` for `share/locale/`, where `gettext.sh` scripts look
+  up their translations
+- `TERMINFO_DIRS` gets `share/terminfo/` and `lib/terminfo/` added at
+  the end. The caller's list stays in front, or when there is none the
+  host's `/etc/terminfo`, `/lib/terminfo`, `/usr/share/terminfo` and
+  `/usr/lib/terminfo`, so a terminal the host knows keeps the host's
+  description and the package only fills in for a host without one.
+
+`LOCPATH` names every `locale/` in a bundle lib dir that holds the
+`C.UTF-8` locale `bundle-libs` carries. It is set only when the host has
+no `/usr/lib/locale/locale-archive` and the caller did not set it,
+because glibc stops reading the archive once `LOCPATH` is set, and a
+host with an archive keeps every locale it has that way. On a host
+without one, a musl host or a minimal container, the bundled glibc can
+then set `C.UTF-8`, and it still looks in the host's `/usr/lib/locale`
+after the package's.
+
+`SSL_CERT_FILE` and `CURL_CA_BUNDLE` name the package's CA bundle, at
+one of the paths distributions use such as
+`etc/ssl/certs/ca-certificates.crt` or `etc/pki/tls/certs/ca-bundle.crt`,
+only when the host has no bundle at any of those paths and the caller
+set neither variable. A bundled TLS library looks where its packaging
+distribution keeps the file, so a host that keeps it there or anywhere
+else usual is left alone, and a minimal container without one can still
+verify a connection.
+
+GSettings schemas need no variable of their own: GLib finds them under
+`glib-2.0/schemas` in every `XDG_DATA_DIRS` entry, and the package's
+`share/` is one of those (see below).
 
 The GLib, GTK, Qt and font entries also look in the package's
 [shared sets](./sysroot#sharing-a-dependency-set).
@@ -164,6 +227,40 @@ are prepended to `XDG_DATA_DIRS`, so GLib/GTK discover bundled
 GSettings schemas and icon themes. An unset `XDG_DATA_DIRS` is treated
 as the XDG default, `/usr/local/share:/usr/share`.
 
+### Vulkan drivers
+
+The Vulkan loader finds the package's ICD files without help: the
+package's `share/`, a GL build's and the sets' are on `XDG_DATA_DIRS`,
+which the loader searches along with the host's `/etc/vulkan/icd.d`,
+`/usr/local/share` and the rest of its usual places. The runtime leaves
+the loader to that search when it is the host's, which is the case when
+the resolver chose the host's `libvulkan.so.1` or the package carries
+none.
+
+It steps in with `VK_DRIVER_FILES` in two cases, listing the ICD files of
+the package, a GL build and the sets, then those of the loader's usual
+places in its order, `/usr/share/vulkan/icd.d` and
+`/run/opengl-driver/share/vulkan/icd.d`:
+
+- The package and the host both describe one driver, the same driver
+  library named in an ICD file on each side. The loader would open it
+  twice and show every device twice, so only one side's file stays: the
+  package's when its own copy of the driver is the one that loads, and
+  the host's when the resolver chose the host's copy or the package
+  carries no copy. A host's 32-bit and 64-bit files for one driver are
+  both kept.
+- The package carries its own `libvulkan.so.1` and the resolver kept it.
+  It was built for another system and may search other directories than
+  this host uses, so it always gets the list.
+
+❌ The runtime never sets `VK_ADD_DRIVER_FILES`. The package's files are
+already on the loader's search through `XDG_DATA_DIRS`, and adding them
+again would list them twice on the loaders distributions ship, which do
+not drop a file found by two routes.
+
+A caller's `VK_DRIVER_FILES`, `VK_ICD_FILENAMES` or `VK_ADD_DRIVER_FILES`
+stops all of this, and the caller's choice reaches the loader untouched.
+
 ### Which values the caller can override
 
 A variable naming modules that a bundled library loads into the app
@@ -171,9 +268,15 @@ takes the package's value whenever the package carries the component,
 replacing one the caller set. Those modules were built against the
 package's copy of the library, and a host value names modules built
 against the host's, which the bundled library cannot load or loads to
-crash. These are `QT_PLUGIN_PATH`, `GIO_EXTRA_MODULES`,
+crash. These are `QT_PLUGIN_PATH`, `GIO_MODULE_DIR`, `GIO_EXTRA_MODULES`,
 `GDK_PIXBUF_MODULE_FILE`, `GTK_IM_MODULE_FILE`, `GTK_PATH`,
-`GCONV_PATH`, `LIBDECOR_PLUGIN_DIR` and `FONTCONFIG_FILE`. A caller's
+`GCONV_PATH`, `LIBDECOR_PLUGIN_DIR`, `FONTCONFIG_FILE`, the GStreamer
+plugin path and scanner variables, `PIPEWIRE_MODULE_DIR`,
+`SPA_PLUGIN_DIR`, `ALSA_PLUGIN_DIR`, `GI_TYPELIB_PATH`,
+`LIBHEIF_PLUGIN_PATH`, `BABL_PATH`, `GEGL_PATH`, `TCL_LIBRARY` and
+`TK_LIBRARY`. Typelibs and Tcl's scripts are not modules, but they are
+written for one version of the library that reads them, which makes
+them the package's in the same way. A caller's
 `FONTCONFIG_FILE` is not lost: the generated config includes it where it
 would otherwise include the host's `fonts.conf`.
 
@@ -181,9 +284,16 @@ The driver and data variables keep a value the caller set, because
 picking a driver, a driver configuration or a keymap is what a user sets
 them for, and the drivers they name are the host's by design. These are
 `LIBGL_DRIVERS_PATH`, `LIBVA_DRIVERS_PATH`, `GBM_BACKENDS_PATH`,
-`__EGL_VENDOR_LIBRARY_DIRS`, `VK_DRIVER_FILES` (and `VK_ADD_DRIVER_FILES`,
-which stops the runtime from building `VK_DRIVER_FILES` at all),
-`DRIRC_CONFIGDIR`, `LIBDRM_IDS_PATH` and `XKB_CONFIG_ROOT`.
+`__EGL_VENDOR_LIBRARY_DIRS`, `VK_DRIVER_FILES` (and `VK_ICD_FILENAMES`
+and `VK_ADD_DRIVER_FILES`, which stop the runtime from building
+`VK_DRIVER_FILES` at all),
+`DRIRC_CONFIGDIR`, `LIBDRM_IDS_PATH` and `XKB_CONFIG_ROOT`. So do
+the data variables a user sets to choose other data: `ALSA_CONFIG_DIR`,
+`ALSA_CONFIG_PATH`, `XLOCALEDIR`, `MAGIC` and `TEXTDOMAINDIR`.
+`TERMINFO_DIRS` is extended rather than replaced, as described above.
+`SSL_CERT_FILE` and `CURL_CA_BUNDLE` are set only when the caller set
+neither.
+`LOCPATH` is set only when the caller did not set it.
 
 Any of these variables that arrives pointing into another onelf package
 is dropped before the launch, whichever kind it is. Such a value is that
@@ -204,6 +314,9 @@ not it fails. The bundled copy goes unused either way.
 The symptom is a package that works on the machine that built it and
 fails in a container with a message about a missing file under `/usr`.
 `libqalculate` reading `/usr/share/qalculate` is one example.
+`bundle-libs` reports the known components whose compiled-in
+directory the bundle carries no copy of; see
+[Bundling](./bundling#plugin-and-data-paths-compiled-into-a-library).
 
 - ✅ Test in a container that does not have the app installed.
 - ✅ Where the app offers an environment variable for the directory, set
@@ -260,7 +373,7 @@ paths follow the running app:
 ```toml
 [env]
 PYTHONHOME = "${ONELF_DIR}/python"
-GST_PLUGIN_SYSTEM_PATH = "${ONELF_DIR}/lib/gstreamer-1.0"
+MYAPP_PLUGIN_DIR = "${ONELF_DIR}/lib/myapp/plugins"
 ```
 
 In a recipe value, `${VAR}` expands from the packer's environment at

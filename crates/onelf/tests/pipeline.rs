@@ -836,6 +836,7 @@ int main(void) {
         return None;
     }
     write(&app.join("lib/qt6/plugins/platforms/README"), "plugins");
+    write(&app.join("lib/gio/modules/README"), "modules");
     write(
         &app.join("onelf.toml"),
         "[package]\nname=\"hyg\"\ncommand=\"bin/harness\"\n",
@@ -991,8 +992,16 @@ fn a_module_path_into_another_package_is_replaced() {
         app_qt.ends_with("/lib/qt6/plugins") && !app_qt.contains("/other/"),
         "{app_qt}"
     );
+    // The package carries GIO modules, so they replace GLib's default
+    // directory and the other package's extra modules are dropped.
+    let app_gio = var(&app, "GIO_MODULE_DIR").unwrap_or_default();
+    assert!(
+        app_gio.ends_with("/lib/gio/modules") && !app_gio.contains("/other/"),
+        "{app_gio}"
+    );
     assert_eq!(var(&app, "GIO_EXTRA_MODULES"), None);
     assert_eq!(var(&host, "QT_PLUGIN_PATH"), None);
+    assert_eq!(var(&host, "GIO_MODULE_DIR"), None);
     assert_eq!(var(&host, "GIO_EXTRA_MODULES"), None);
 
     let _ = std::fs::remove_dir_all(&td);

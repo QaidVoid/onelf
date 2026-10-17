@@ -76,6 +76,12 @@ pub fn setup_env(
     }
 
     let pkg = Path::new(onelf_dir);
+    let all_lib_dirs: Vec<PathBuf> = lib_subpath
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(|p| pkg.join(p))
+        .chain(set_lib_dirs.iter().cloned())
+        .collect();
 
     let target_is_elf = is_elf_file(target_path);
 
@@ -199,6 +205,10 @@ pub fn setup_env(
     setup_qt_plugin_path(pkg, set_roots);
     setup_glib_modules(pkg, set_roots);
     setup_fontconfig(pkg, set_roots);
+    setup_plugin_dirs(pkg, &all_lib_dirs, set_roots);
+    setup_terminfo(pkg, set_roots);
+    setup_ca_bundle(pkg, set_roots);
+    setup_locale(&all_lib_dirs);
     setup_xdg_data_dirs(pkg, platform_root, set_roots);
 
     // EGL vendor discovery: merge bundled, fetched and host dirs so both
@@ -266,49 +276,7 @@ pub fn setup_env(
         }
     }
 
-    // Vulkan ICD discovery: use VK_ADD_DRIVER_FILES to *append* our
-    // bundled ICD configs to the loader's default search. Setting
-    // VK_DRIVER_FILES would *replace* the search and cut off host GPU
-    // drivers (e.g. NVIDIA's ICD on NixOS at /run/opengl-driver/...).
-    // Also include well-known host ICD paths that the bundled loader
-    // can't find on its own (its compiled-in /etc and /usr paths are
-    // scrubbed).
-    if env::var("VK_DRIVER_FILES").is_err() && env::var("VK_ADD_DRIVER_FILES").is_err() {
-        let mut icd_dirs: Vec<String> = Vec::new();
-
-        let vk_dir = pkg.join("share/vulkan/icd.d");
-        if vk_dir.is_dir() {
-            icd_dirs.push(vk_dir.to_string_lossy().into_owned());
-        }
-        // Host ICD locations that the scrubbed loader can't reach.
-        for d in &[
-            "/run/opengl-driver/share/vulkan/icd.d",
-            "/etc/vulkan/icd.d",
-            "/usr/share/vulkan/icd.d",
-        ] {
-            if Path::new(d).is_dir() {
-                icd_dirs.push((*d).to_string());
-            }
-        }
-
-        if !icd_dirs.is_empty() {
-            let mut all_files: Vec<String> = Vec::new();
-            for dir in &icd_dirs {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for e in entries.filter_map(|e| e.ok()) {
-                        if e.path().extension().is_some_and(|ext| ext == "json") {
-                            all_files.push(e.path().to_string_lossy().into_owned());
-                        }
-                    }
-                }
-            }
-            if !all_files.is_empty() {
-                unsafe {
-                    env::set_var("VK_DRIVER_FILES", all_files.join(":"));
-                }
-            }
-        }
-    }
+    setup_vulkan(pkg, platform_root, set_roots, &all_lib_dirs, farm);
 
     if target_is_elf {
         lib_path
@@ -368,17 +336,32 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
         set_path("GTK_IM_MODULE_FILE", path.as_os_str());
     }
 
-    let dirs = |rel: &str| -> Option<std::ffi::OsString> {
-        let found: Vec<PathBuf> = roots()
+    let found = |rel: &str| -> Vec<PathBuf> {
+        roots()
             .map(|root| root.join(rel))
             .filter(|d| d.is_dir())
-            .collect();
+            .collect()
+    };
+    let dirs = |rel: &str| -> Option<std::ffi::OsString> {
+        let found = found(rel);
         (!found.is_empty())
             .then(|| env::join_paths(found).ok())
             .flatten()
     };
-    if let Some(gio) = dirs("lib/gio/modules") {
-        set_path("GIO_EXTRA_MODULES", &gio);
+    // GIO_MODULE_DIR replaces GLib's default module directory, so the
+    // host's modules, built against the host's GLib, never load into the
+    // bundled one. It takes one directory: a set's modules come after the
+    // package's on GIO_EXTRA_MODULES. A bundle with no modules leaves the
+    // default alone, and the host's dconf and gvfs serve it.
+    let mut gio = found("lib/gio/modules").into_iter();
+    if let Some(first) = gio.next() {
+        set_path("GIO_MODULE_DIR", first.as_os_str());
+        let rest: Vec<PathBuf> = gio.collect();
+        if let Ok(rest) = env::join_paths(rest)
+            && !rest.is_empty()
+        {
+            set_path("GIO_EXTRA_MODULES", &rest);
+        }
     }
     // GTK 3's modules, theme engines and print backends. Only GTK 3's:
     // GTK 2 reads the same variable and would take GTK 3's modules for
@@ -550,6 +533,431 @@ fn setup_qt_plugin_path(pkg: &Path, set_roots: &[PathBuf]) {
     if !dirs.is_empty() {
         // SAFETY: the runtime is single-threaded at this point (before exec)
         unsafe { env::set_var("QT_PLUGIN_PATH", dirs.join(":")) };
+    }
+}
+
+/// Module directories below a library directory, by the variable their
+/// library reads in place of the directory compiled into it. Every one
+/// of these takes a `:`-separated list.
+///
+/// The compiled-in directory is the packaging distribution's, and on
+/// another host it holds modules built against that host's copy of the
+/// library, or nothing. The package's modules were built against its own
+/// copy, so its directories replace an inherited value, as with
+/// `QT_PLUGIN_PATH`.
+const LIB_MODULE_DIRS: &[(&str, &str)] = &[
+    ("GST_PLUGIN_SYSTEM_PATH_1_0", "gstreamer-1.0"),
+    ("GST_PLUGIN_SYSTEM_PATH", "gstreamer-1.0"),
+    ("PIPEWIRE_MODULE_DIR", "pipewire-0.3"),
+    ("SPA_PLUGIN_DIR", "spa-0.2"),
+    ("GI_TYPELIB_PATH", "girepository-1.0"),
+    ("BABL_PATH", "babl-0.1"),
+    ("GEGL_PATH", "gegl-0.4"),
+];
+
+/// Where a bundled GStreamer keeps its plugin scanner: below a library
+/// directory on Arch and Debian, under `libexec/` on Fedora and Alpine.
+const GST_SCANNER_IN_LIB: &[&str] = &[
+    "gstreamer-1.0/gst-plugin-scanner",
+    "gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
+];
+const GST_SCANNER_IN_ROOT: &str = "libexec/gstreamer-1.0/gst-plugin-scanner";
+
+/// Data a library reads from a compiled-in path, by the variable that
+/// names it instead, with where a package may carry it. A user sets these
+/// to choose other data, so a value the caller set is kept.
+const DATA_PATHS: &[(&str, &[&str])] = &[
+    ("TEXTDOMAINDIR", &["share/locale"]),
+    ("XLOCALEDIR", &["share/X11/locale"]),
+    ("ALSA_CONFIG_DIR", &["share/alsa"]),
+    ("ALSA_CONFIG_PATH", &["share/alsa/alsa.conf"]),
+    (
+        "MAGIC",
+        &["share/file/misc/magic.mgc", "share/misc/magic.mgc"],
+    ),
+];
+
+/// Point the libraries that load plugins or read data from a compiled-in
+/// directory at the copies the package and its sets carry. See
+/// [`LIB_MODULE_DIRS`] and [`DATA_PATHS`] for which value wins.
+fn setup_plugin_dirs(pkg: &Path, lib_dirs: &[PathBuf], set_roots: &[PathBuf]) {
+    let roots: Vec<&Path> = std::iter::once(pkg)
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .collect();
+    let below_libs = |rel: &str| -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = Vec::new();
+        for dir in lib_dirs.iter().map(|d| d.join(rel)) {
+            if dir.exists() && !found.contains(&dir) {
+                found.push(dir);
+            }
+        }
+        found
+    };
+
+    for (var, rel) in LIB_MODULE_DIRS {
+        let found = below_libs(rel);
+        if let Some(joined) = (!found.is_empty())
+            .then(|| env::join_paths(found).ok())
+            .flatten()
+        {
+            set_path(var, &joined);
+        }
+    }
+    // libheif keeps its plugins in `libheif/plugins/` on Debian and in
+    // `libheif/` itself on Arch.
+    let heif: Vec<PathBuf> = below_libs("libheif")
+        .into_iter()
+        .map(|dir| {
+            let plugins = dir.join("plugins");
+            if plugins.is_dir() { plugins } else { dir }
+        })
+        .collect();
+    if let Some(joined) = (!heif.is_empty())
+        .then(|| env::join_paths(heif).ok())
+        .flatten()
+    {
+        set_path("LIBHEIF_PLUGIN_PATH", &joined);
+    }
+    // alsa-lib takes a single directory.
+    if let Some(dir) = below_libs("alsa-lib").first() {
+        set_path("ALSA_PLUGIN_DIR", dir.as_os_str());
+    }
+    let scanner = GST_SCANNER_IN_LIB
+        .iter()
+        .flat_map(|rel| below_libs(rel))
+        .chain(roots.iter().map(|root| root.join(GST_SCANNER_IN_ROOT)))
+        .find(|p| p.is_file());
+    if let Some(scanner) = scanner {
+        set_path("GST_PLUGIN_SCANNER_1_0", scanner.as_os_str());
+        set_path("GST_PLUGIN_SCANNER", scanner.as_os_str());
+    }
+    let (tcl, tk) = tcl_tk_libraries(lib_dirs, &roots);
+    if let Some(dir) = tcl {
+        set_path("TCL_LIBRARY", dir.as_os_str());
+    }
+    if let Some(dir) = tk {
+        set_path("TK_LIBRARY", dir.as_os_str());
+    }
+
+    for (var, rels) in DATA_PATHS {
+        if env::var_os(var).is_some() {
+            continue;
+        }
+        let found = roots
+            .iter()
+            .flat_map(|root| rels.iter().map(|rel| root.join(rel)))
+            .find(|p| p.exists());
+        if let Some(path) = found {
+            set_path(var, path.as_os_str());
+        }
+    }
+}
+
+/// The script libraries of a bundled Tcl and Tk, `tcl8.6/` holding
+/// `init.tcl` and `tk8.6/` holding `tk.tcl`, below a library directory
+/// or under Debian's `share/tcltk/`. The scripts must match the bundled
+/// interpreter's version, so these replace an inherited value.
+fn tcl_tk_libraries(lib_dirs: &[PathBuf], roots: &[&Path]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut places: Vec<PathBuf> = lib_dirs.to_vec();
+    places.extend(roots.iter().map(|root| root.join("share/tcltk")));
+    let find = |prefix: &str, script: &str| {
+        places.iter().find_map(|place| {
+            let mut names: Vec<PathBuf> = std::fs::read_dir(place)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.strip_prefix(prefix)
+                        .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .map(|e| e.path())
+                .filter(|dir| dir.join(script).is_file())
+                .collect();
+            names.sort();
+            names.pop()
+        })
+    };
+    (find("tcl", "init.tcl"), find("tk", "tk.tcl"))
+}
+
+/// Leave the Vulkan loader one ICD file per driver.
+///
+/// The loader finds the package's ICD files on its own: the package's
+/// `share/` is on `XDG_DATA_DIRS`, which it searches after the host's
+/// `/etc/vulkan/icd.d`. A host loader, the one the resolver took when the
+/// host's `libvulkan` won or the package carries none, is left to that
+/// search, which also covers `/usr/local` and whatever else the host
+/// configured. The search lists a driver twice when the package and the
+/// host both describe it, though, and the loader then opens it twice and
+/// shows every device twice. Only then is `VK_DRIVER_FILES` set, to the
+/// search's own files less the copy the resolver did not choose.
+///
+/// A bundled loader was built for another system and may search other
+/// directories than this host uses, so it always gets the list.
+///
+/// A caller's `VK_DRIVER_FILES`, `VK_ICD_FILENAMES` or
+/// `VK_ADD_DRIVER_FILES` leaves the choice to the caller.
+fn setup_vulkan(
+    pkg: &Path,
+    platform_root: Option<&Path>,
+    set_roots: &[PathBuf],
+    lib_dirs: &[PathBuf],
+    farm: Option<&Path>,
+) {
+    if ["VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES"]
+        .iter()
+        .any(|var| env::var_os(var).is_some())
+    {
+        return;
+    }
+    let packaged: Vec<PathBuf> = std::iter::once(pkg)
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .map(|root| root.join(VK_ICD_DIR))
+        .collect();
+    let outside: Vec<PathBuf> = platform_root
+        .map(|root| root.join(VK_ICD_DIR))
+        .into_iter()
+        .chain(loader_search_dirs(|var| env::var_os(var)))
+        .collect();
+    let in_farm = |name: &str| farm.is_some_and(|f| f.join(name).symlink_metadata().is_ok());
+    let carried = |name: &str| lib_dirs.iter().any(|d| d.join(name).exists());
+    let host_loader = in_farm(VK_LOADER) || !carried(VK_LOADER);
+    let chosen = |driver: &str| !in_farm(driver) && carried(driver);
+    if let Some(files) = vulkan_driver_files(&packaged, &outside, host_loader, chosen)
+        && let Ok(joined) = env::join_paths(files)
+    {
+        set_path("VK_DRIVER_FILES", &joined);
+    }
+}
+
+const VK_ICD_DIR: &str = "share/vulkan/icd.d";
+const VK_LOADER: &str = "libvulkan.so.1";
+
+/// The ICD directories the Vulkan loader searches on Linux, in its order,
+/// with `var` reading the environment. `/usr/share` and NixOS's
+/// `/run/opengl-driver/share` follow, for a loader built elsewhere that
+/// knows neither.
+fn loader_search_dirs(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let list = |name: &str, default: &str| -> Vec<PathBuf> {
+        let value = var(name).filter(|v| !v.is_empty());
+        let value = value.unwrap_or_else(|| default.into());
+        env::split_paths(&value)
+            .filter(|p| p.is_absolute())
+            .collect()
+    };
+    let home = var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let user = |name: &str, below_home: &str| {
+        var(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(below_home)))
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(user("XDG_CONFIG_HOME", ".config"));
+    dirs.extend(list("XDG_CONFIG_DIRS", "/etc/xdg"));
+    dirs.push(PathBuf::from("/etc"));
+    dirs.extend(user("XDG_DATA_HOME", ".local/share"));
+    dirs.extend(list("XDG_DATA_DIRS", "/usr/local/share:/usr/share"));
+    dirs.push(PathBuf::from("/usr/share"));
+    dirs.push(PathBuf::from("/run/opengl-driver/share"));
+    dirs.into_iter().map(|d| d.join("vulkan/icd.d")).collect()
+}
+
+/// The ICD files to name in `VK_DRIVER_FILES`, or `None` when the loader
+/// is better left to its own search.
+///
+/// `packaged` are the package's and its sets' ICD directories, `outside`
+/// the rest in the loader's order. A file from the package and one from
+/// outside it that name the same driver library describe one driver:
+/// the package's file stays when `chosen` says the package's copy of that
+/// driver loads, and the outside ones otherwise. Files on the same side
+/// are never merged, since a host describes its 32-bit and 64-bit builds
+/// of a driver under one file name.
+fn vulkan_driver_files(
+    packaged: &[PathBuf],
+    outside: &[PathBuf],
+    host_loader: bool,
+    chosen: impl Fn(&str) -> bool,
+) -> Option<Vec<PathBuf>> {
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    let mut icd_files = |dirs: &[PathBuf]| -> Vec<(PathBuf, Option<String>)> {
+        let mut out = Vec::new();
+        for dir in dirs {
+            if seen_dirs.contains(dir) {
+                continue;
+            }
+            seen_dirs.push(dir.clone());
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .collect();
+            files.sort();
+            out.extend(files.into_iter().map(|path| {
+                let driver = std::fs::read_to_string(&path).ok().and_then(|text| {
+                    let lib = onelf_format::resolve::json_library_path(&text)?;
+                    Some(Path::new(lib).file_name()?.to_string_lossy().into_owned())
+                });
+                (path, driver)
+            }));
+        }
+        out
+    };
+    let mut ours = icd_files(packaged);
+    let theirs = icd_files(outside);
+
+    let mut kept_theirs = Vec::new();
+    let mut dropped = false;
+    for (path, driver) in theirs {
+        let Some(driver) = driver.filter(|d| ours.iter().any(|(_, o)| o.as_ref() == Some(d)))
+        else {
+            kept_theirs.push(path);
+            continue;
+        };
+        dropped = true;
+        if !chosen(&driver) {
+            ours.retain(|(_, o)| o.as_ref() != Some(&driver));
+            kept_theirs.push(path);
+        }
+    }
+    let files: Vec<PathBuf> = ours
+        .into_iter()
+        .map(|(path, _)| path)
+        .chain(kept_theirs)
+        .collect();
+    if files.is_empty() || (host_loader && !dropped) {
+        return None;
+    }
+    Some(files)
+}
+
+/// Where glibc looks for locales unless `LOCPATH` says otherwise: the
+/// `locale-archive` file there first, then a directory per locale.
+const HOST_LOCALE_DIR: &str = "/usr/lib/locale";
+
+/// Let a bundled glibc find the `C.UTF-8` locale the package carries on a
+/// host whose locale data it cannot read.
+///
+/// glibc searches `LOCPATH` ahead of its compiled-in directory and stops
+/// reading the archive altogether, so it is set only where there is no
+/// archive to lose: a musl host, a minimal container. The host's
+/// per-locale directories are still searched after the package's, and a
+/// caller's own value is kept.
+fn setup_locale(lib_dirs: &[PathBuf]) {
+    if env::var_os("LOCPATH").is_some() {
+        return;
+    }
+    if let Some(value) = locale_path(lib_dirs, Path::new(HOST_LOCALE_DIR)) {
+        set_path("LOCPATH", &value);
+    }
+}
+
+/// The `LOCPATH` for a package with `lib_dirs` on a host keeping its
+/// locales in `host`, or `None` when the host's archive serves.
+fn locale_path(lib_dirs: &[PathBuf], host: &Path) -> Option<std::ffi::OsString> {
+    if host.join("locale-archive").is_file() {
+        return None;
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in lib_dirs.iter().map(|d| d.join("locale")) {
+        let carried = ["C.utf8", "C.UTF-8"].iter().any(|n| dir.join(n).is_dir());
+        if carried && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    (!dirs.is_empty())
+        .then(|| env::join_paths(dirs).ok())
+        .flatten()
+}
+
+/// Where distributions keep the CA bundle, relative to the root.
+const CA_BUNDLES: &[&str] = &[
+    "etc/ssl/certs/ca-certificates.crt",
+    "etc/pki/tls/certs/ca-bundle.crt",
+    "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "etc/ca-certificates/extracted/tls-ca-bundle.pem",
+    "etc/ssl/ca-bundle.pem",
+    "etc/pki/tls/cacert.pem",
+    "etc/ssl/cert.pem",
+    "var/lib/ca-certificates/ca-bundle.pem",
+];
+
+/// Name the package's CA bundle when the host has none.
+///
+/// A bundled TLS library looks for the bundle where its packaging
+/// distribution keeps it, and a host that keeps it elsewhere or not at
+/// all, a minimal container for one, leaves every connection
+/// unverifiable. A host bundle anywhere usual is left to the library, and
+/// a caller's `SSL_CERT_FILE` or `CURL_CA_BUNDLE` stops this altogether,
+/// since either names the trust the user chose.
+fn setup_ca_bundle(pkg: &Path, set_roots: &[PathBuf]) {
+    if env::var_os("SSL_CERT_FILE").is_some() || env::var_os("CURL_CA_BUNDLE").is_some() {
+        return;
+    }
+    let roots: Vec<&Path> = std::iter::once(pkg)
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .collect();
+    if let Some(bundle) = fallback_ca_bundle(Path::new("/"), &roots) {
+        set_path("SSL_CERT_FILE", bundle.as_os_str());
+        set_path("CURL_CA_BUNDLE", bundle.as_os_str());
+    }
+}
+
+/// The first CA bundle `roots` carry, when `host` has none of its own.
+fn fallback_ca_bundle(host: &Path, roots: &[&Path]) -> Option<PathBuf> {
+    if CA_BUNDLES.iter().any(|rel| host.join(rel).is_file()) {
+        return None;
+    }
+    roots
+        .iter()
+        .flat_map(|root| CA_BUNDLES.iter().map(|rel| root.join(rel)))
+        .find(|p| p.is_file())
+}
+
+/// Terminal descriptions searched ahead of the package's when the caller
+/// names none, so a terminal the host knows keeps the host's entry.
+const HOST_TERMINFO: &[&str] = &[
+    "/etc/terminfo",
+    "/lib/terminfo",
+    "/usr/share/terminfo",
+    "/usr/lib/terminfo",
+];
+
+/// Add the package's terminfo after the host's, for a host that has none.
+///
+/// ncurses searches `TERMINFO_DIRS` before its compiled-in directory,
+/// which belongs to the packaging distribution and may not be where this
+/// host keeps its descriptions. The caller's own list, or the host's
+/// usual directories, stay first, so `TERMINFO` and `~/.terminfo` keep
+/// working and the package only fills in what the host lacks.
+fn setup_terminfo(pkg: &Path, set_roots: &[PathBuf]) {
+    let bundled: Vec<PathBuf> = std::iter::once(pkg)
+        .chain(set_roots.iter().map(PathBuf::as_path))
+        .flat_map(|root| ["share/terminfo", "lib/terminfo"].map(|d| root.join(d)))
+        .filter(|d| d.is_dir())
+        .collect();
+    if bundled.is_empty() {
+        return;
+    }
+    let mut dirs: Vec<PathBuf> = match env::var_os("TERMINFO_DIRS").filter(|v| !v.is_empty()) {
+        Some(value) => env::split_paths(&value).collect(),
+        None => HOST_TERMINFO
+            .iter()
+            .map(PathBuf::from)
+            .filter(|d| d.is_dir())
+            .collect(),
+    };
+    for dir in bundled {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if let Ok(joined) = env::join_paths(dirs) {
+        set_path("TERMINFO_DIRS", &joined);
     }
 }
 
@@ -934,6 +1342,270 @@ mod fontconfig_conf_tests {
     #[test]
     fn xml_specials_in_paths_are_escaped() {
         assert_eq!(escape_xml("a&b<c>\"d'e"), "a&amp;b&lt;c&gt;&quot;d&apos;e");
+    }
+}
+
+#[cfg(test)]
+mod plugin_dir_tests {
+    use super::*;
+
+    fn tree(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("onelf-plugins-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    /// Module directories replace what the caller set, data paths fill
+    /// only what the caller left unset, and a set's modules follow the
+    /// package's.
+    #[test]
+    fn modules_replace_and_data_fills() {
+        let work = tree("rule");
+        let pkg = work.join("pkg");
+        let set = work.join("set");
+        let lib = pkg.join("lib");
+        let arch = pkg.join("lib/x86_64-linux-gnu");
+        let set_lib = set.join("lib");
+        for dir in [
+            lib.join("gstreamer-1.0"),
+            set_lib.join("gstreamer-1.0"),
+            arch.join("girepository-1.0"),
+            lib.join("alsa-lib"),
+            pkg.join("share/alsa"),
+            pkg.join("share/X11/locale"),
+            lib.join("tcl8.6"),
+            lib.join("libheif"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        touch(&pkg.join("share/alsa/alsa.conf"));
+        touch(&lib.join("gstreamer-1.0/gst-plugin-scanner"));
+        touch(&lib.join("tcl8.6/init.tcl"));
+        unsafe {
+            env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", "/usr/lib/gstreamer-1.0");
+            env::set_var("ALSA_CONFIG_PATH", "/home/a/my-alsa.conf");
+            env::remove_var("ALSA_CONFIG_DIR");
+            env::remove_var("XLOCALEDIR");
+            env::remove_var("PIPEWIRE_MODULE_DIR");
+        }
+
+        setup_plugin_dirs(&pkg, &[lib.clone(), arch.clone(), set_lib.clone()], &[set]);
+
+        let var = |name| env::var(name).unwrap_or_default();
+        assert_eq!(
+            var("GST_PLUGIN_SYSTEM_PATH_1_0"),
+            format!(
+                "{}:{}",
+                lib.join("gstreamer-1.0").display(),
+                set_lib.join("gstreamer-1.0").display()
+            )
+        );
+        assert_eq!(
+            var("GST_PLUGIN_SCANNER"),
+            lib.join("gstreamer-1.0/gst-plugin-scanner")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            var("GI_TYPELIB_PATH"),
+            arch.join("girepository-1.0").to_string_lossy()
+        );
+        assert_eq!(
+            var("ALSA_PLUGIN_DIR"),
+            lib.join("alsa-lib").to_string_lossy()
+        );
+        assert_eq!(var("TCL_LIBRARY"), lib.join("tcl8.6").to_string_lossy());
+        assert_eq!(
+            var("LIBHEIF_PLUGIN_PATH"),
+            lib.join("libheif").to_string_lossy()
+        );
+        assert!(env::var_os("PIPEWIRE_MODULE_DIR").is_none());
+        assert_eq!(var("ALSA_CONFIG_PATH"), "/home/a/my-alsa.conf");
+        assert_eq!(
+            var("ALSA_CONFIG_DIR"),
+            pkg.join("share/alsa").to_string_lossy()
+        );
+        assert_eq!(
+            var("XLOCALEDIR"),
+            pkg.join("share/X11/locale").to_string_lossy()
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The caller's terminfo stays ahead of the package's, which is added
+    /// once however often the package is launched from itself.
+    #[test]
+    fn terminfo_comes_after_the_callers() {
+        let work = tree("terminfo");
+        let pkg = work.join("pkg");
+        std::fs::create_dir_all(pkg.join("share/terminfo")).unwrap();
+        unsafe { env::set_var("TERMINFO_DIRS", ":/home/a/.local/terminfo") };
+
+        setup_terminfo(&pkg, &[]);
+        setup_terminfo(&pkg, &[]);
+
+        assert_eq!(
+            env::var("TERMINFO_DIRS").unwrap(),
+            format!(
+                ":/home/a/.local/terminfo:{}",
+                pkg.join("share/terminfo").display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod vulkan_tests {
+    use super::*;
+
+    fn icd(dir: &Path, file: &str, library: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            format!("{{\"ICD\": {{\"library_path\": \"{library}\"}}}}"),
+        )
+        .unwrap();
+        path
+    }
+
+    /// A driver the package and the host both describe is listed once,
+    /// from whichever side the resolver chose, and a host loader with no
+    /// such driver is left to its own search.
+    #[test]
+    fn one_icd_per_driver_and_the_loaders_search_otherwise() {
+        let work = env::temp_dir().join(format!("onelf-vk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let (pkg, host) = (work.join("pkg"), work.join("host"));
+        let pkg_radeon = icd(&pkg, "radeon_icd.json", "libvulkan_radeon.so");
+        let host_radeon = icd(&host, "radeon_icd.json", "/usr/lib/libvulkan_radeon.so");
+        let nvidia = icd(&host, "nvidia_icd.json", "libGLX_nvidia.so.0");
+        let (packaged, outside) = ([pkg.clone()], [host.clone(), pkg.clone()]);
+
+        let bundled_radeon = |d: &str| d == "libvulkan_radeon.so";
+        assert_eq!(
+            vulkan_driver_files(&packaged, &outside, true, bundled_radeon),
+            Some(vec![pkg_radeon.clone(), nvidia.clone()])
+        );
+        assert_eq!(
+            vulkan_driver_files(&packaged, &outside, true, |_| false),
+            Some(vec![nvidia.clone(), host_radeon])
+        );
+
+        let host_radeon_32 = icd(
+            &host,
+            "radeon_icd.i686.json",
+            "/usr/lib32/libvulkan_radeon.so",
+        );
+        assert_eq!(
+            vulkan_driver_files(&packaged, &outside, true, bundled_radeon),
+            Some(vec![pkg_radeon.clone(), nvidia.clone()])
+        );
+        std::fs::remove_file(&host_radeon_32).unwrap();
+
+        std::fs::remove_file(&pkg_radeon).unwrap();
+        let lvp = icd(&pkg, "lvp_icd.json", "libvulkan_lvp.so");
+        assert_eq!(
+            vulkan_driver_files(&packaged, &outside, true, |_| true),
+            None
+        );
+        assert_eq!(
+            vulkan_driver_files(&packaged, &outside, false, |_| true).map(|f| f.len()),
+            Some(3)
+        );
+        assert!(
+            vulkan_driver_files(&packaged, &outside, false, |_| true)
+                .unwrap()
+                .starts_with(&[lvp])
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A bundled loader is given what the host's loader would search,
+    /// `/usr/local` and the XDG directories included.
+    #[test]
+    fn the_search_follows_the_xdg_directories() {
+        let vars = |name: &str| match name {
+            "HOME" => Some("/home/a".into()),
+            "XDG_DATA_DIRS" => Some("/pkg/share:/usr/local/share:/usr/share".into()),
+            _ => None,
+        };
+        let dirs: Vec<String> = loader_search_dirs(vars)
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                "/home/a/.config/vulkan/icd.d",
+                "/etc/xdg/vulkan/icd.d",
+                "/etc/vulkan/icd.d",
+                "/home/a/.local/share/vulkan/icd.d",
+                "/pkg/share/vulkan/icd.d",
+                "/usr/local/share/vulkan/icd.d",
+                "/usr/share/vulkan/icd.d",
+                "/usr/share/vulkan/icd.d",
+                "/run/opengl-driver/share/vulkan/icd.d",
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+
+    /// The package's locales are named only for a host without an
+    /// archive.
+    #[test]
+    fn locpath_only_without_a_host_archive() {
+        let work = env::temp_dir().join(format!("onelf-locpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let (host, lib) = (work.join("host/usr/lib/locale"), work.join("pkg/lib"));
+        std::fs::create_dir_all(lib.join("locale/C.utf8")).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let libs = [lib.clone(), work.join("pkg/lib/x86_64-linux-gnu")];
+
+        assert_eq!(
+            locale_path(&libs, &host),
+            Some(lib.join("locale").into_os_string())
+        );
+
+        std::fs::write(host.join("locale-archive"), "").unwrap();
+        assert_eq!(locale_path(&libs, &host), None);
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod ca_bundle_tests {
+    use super::*;
+
+    /// The package's bundle stands in only for a host without one.
+    #[test]
+    fn only_a_host_without_a_bundle_gets_the_packages() {
+        let work = env::temp_dir().join(format!("onelf-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let (host, pkg) = (work.join("host"), work.join("pkg"));
+        let carried = pkg.join("etc/ssl/certs/ca-certificates.crt");
+        std::fs::create_dir_all(carried.parent().unwrap()).unwrap();
+        std::fs::write(&carried, "pem").unwrap();
+        std::fs::create_dir_all(host.join("etc/ssl")).unwrap();
+
+        assert_eq!(fallback_ca_bundle(&host, &[&pkg]), Some(carried));
+
+        std::fs::write(host.join("etc/ssl/cert.pem"), "pem").unwrap();
+        assert_eq!(fallback_ca_bundle(&host, &[&pkg]), None);
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
 

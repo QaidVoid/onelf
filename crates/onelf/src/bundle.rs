@@ -31,6 +31,7 @@ use onelf_sysroot::{Database, PlatformLine, Policy};
 
 pub(crate) mod ui;
 pub(crate) use ui::{color, format_size};
+mod datadirs;
 mod discover;
 pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
@@ -328,6 +329,51 @@ fn bundle_gconv(libc: &Path, lib_dest: &Path, strip: bool) -> io::Result<Vec<Str
         copy(&entry.path(), &name)?;
         if strip {
             strip_debug(&dest.join(&*name));
+        }
+    }
+    copied.sort();
+    Ok(copied)
+}
+
+/// Copy glibc's `C.UTF-8` locale from where `libc`'s distribution keeps
+/// it into `locale/` under `lib_dest`. Returns the files copied, relative
+/// to `lib_dest`.
+///
+/// A bundled glibc reads locales from the host's locale archive, and a
+/// host without one (a musl host, a minimal container) leaves it unable
+/// to set any UTF-8 locale. `C.UTF-8` is not built into glibc, so the
+/// package carries it, and the runtime points `LOCPATH` here on such a
+/// host. Arch keeps it beside libc, Debian one level up from its
+/// multiarch directory, Fedora in `lib/` beside `lib64/`.
+fn bundle_c_utf8(libc: &Path, lib_dest: &Path) -> io::Result<Vec<String>> {
+    let Some(libc_dir) = libc.parent() else {
+        return Ok(Vec::new());
+    };
+    let found = ["locale", "../locale", "../lib/locale"]
+        .iter()
+        .flat_map(|rel| ["C.utf8", "C.UTF-8"].map(|name| (libc_dir.join(rel).join(name), name)))
+        .find(|(dir, _)| dir.join("LC_CTYPE").is_file());
+    let Some((src, name)) = found else {
+        return Ok(Vec::new());
+    };
+    let mut copied = Vec::new();
+    let mut pending = vec![(src, PathBuf::from("locale").join(name))];
+    while let Some((from, rel)) = pending.pop() {
+        for entry in fs::read_dir(&from)?.flatten() {
+            let rel = rel.join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push((entry.path(), rel));
+            } else if kind.is_file() {
+                let to = lib_dest.join(&rel);
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                ensure_writable(&to);
+                fs::copy(entry.path(), &to)?;
+                normalize_mtime(&to);
+                copied.push(rel.to_string_lossy().into_owned());
+            }
         }
     }
     copied.sort();
@@ -998,7 +1044,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Without them every user, group, host and service lookup fails on a
     // host whose own glibc did not win.
     let mut nss_allow: HashSet<String> = HashSet::new();
-    let mut gconv_files: Vec<String> = Vec::new();
+    let mut libc_data_files: Vec<String> = Vec::new();
 
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
@@ -1220,11 +1266,22 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                                 color::bold_green("Copied"),
                                 files.len()
                             );
-                            gconv_files = files;
+                            libc_data_files = files;
                         }
                         Ok(_) => {}
                         Err(e) => eprintln!(
                             "  {} could not copy gconv modules: {e}",
+                            color::bold_red("warning:")
+                        ),
+                    }
+                    match bundle_c_utf8(&resolved, &lib_dest) {
+                        Ok(files) if !files.is_empty() => {
+                            eprintln!("  {} the C.UTF-8 locale", color::bold_green("Copied"));
+                            libc_data_files.extend(files);
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "  {} could not copy the C.UTF-8 locale: {e}",
                             color::bold_red("warning:")
                         ),
                     }
@@ -1296,7 +1353,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .iter()
             .map(|(soname, _, _, _)| opts.lib_dir.join(soname).to_string_lossy().into_owned())
             .chain(
-                gconv_files
+                libc_data_files
                     .iter()
                     .map(|f| opts.lib_dir.join(f).to_string_lossy().into_owned()),
             )
@@ -1435,6 +1492,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 color::bold_red("warning:"),
             ),
         }
+        datadirs::report(&datadirs::unanswered(
+            &opts.directory,
+            &find_elf_files(&opts.directory),
+        ));
         // After injection, so the audit sees the final DT_NEEDED set.
         verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
     }
@@ -2509,5 +2570,40 @@ mod gpu_stack_tests {
         let (app, host) = split_gpu_stack(paths.iter().map(PathBuf::from).collect());
         assert_eq!(app, vec![PathBuf::from("/usr/lib/libSDL2-2.0.so.0")]);
         assert_eq!(host.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+
+    /// Debian keeps the locale one level above its multiarch libc.
+    #[test]
+    fn c_utf8_is_carried_from_beside_a_multiarch_libc() {
+        let work = std::env::temp_dir().join(format!("onelf-cutf8-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let libc_dir = work.join("usr/lib/x86_64-linux-gnu");
+        let locale = work.join("usr/lib/locale/C.utf8");
+        fs::create_dir_all(&libc_dir).unwrap();
+        fs::create_dir_all(locale.join("LC_MESSAGES")).unwrap();
+        fs::write(libc_dir.join("libc.so.6"), "").unwrap();
+        fs::write(locale.join("LC_CTYPE"), "ctype").unwrap();
+        fs::write(locale.join("LC_MESSAGES/SYS_LC_MESSAGES"), "msg").unwrap();
+        let dest = work.join("tree/lib");
+
+        let copied = bundle_c_utf8(&libc_dir.join("libc.so.6"), &dest).unwrap();
+
+        assert_eq!(
+            copied,
+            [
+                "locale/C.utf8/LC_CTYPE",
+                "locale/C.utf8/LC_MESSAGES/SYS_LC_MESSAGES"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("locale/C.utf8/LC_CTYPE")).unwrap(),
+            "ctype"
+        );
+        let _ = fs::remove_dir_all(&work);
     }
 }

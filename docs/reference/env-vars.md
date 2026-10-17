@@ -32,7 +32,7 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `GBM_BACKENDS_PATH` | `lib/gbm/` exists | `<pkg>/lib/gbm` |
 | `__EGL_VENDOR_LIBRARY_DIRS` | `share/glvnd/egl_vendor.d/` exists or host has one | merged list of dirs |
-| `VK_DRIVER_FILES` | `share/vulkan/icd.d/` has ICD JSONs | colon-joined list |
+| `VK_DRIVER_FILES` | the package and the host both describe one Vulkan driver, or the package's own `libvulkan.so.1` loads, and the caller set none of `VK_DRIVER_FILES`, `VK_ICD_FILENAMES` and `VK_ADD_DRIVER_FILES` | colon-joined list of ICD files, one per driver; see [Vulkan drivers](../guide/environment#vulkan-drivers) |
 | `LIBDRM_IDS_PATH` | `share/libdrm/` exists | that dir |
 | `LIBDECOR_PLUGIN_DIR` | `share/libdecor/plugins-1/` exists | that dir. Replaces a value the caller set. |
 | `DRIRC_CONFIGDIR` | `share/drirc.d/` exists | that dir |
@@ -40,10 +40,26 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `XDG_DATA_DIRS` | `share/` exists | `<pkg>/share` (prepended) |
 | `FONTCONFIG_FILE` | the package or a set has `share/fonts/` | a generated config in the private runtime directory that includes the host's `fonts.conf`, or the caller's `FONTCONFIG_FILE` in its place, then the bundled font dirs |
 | `QT_PLUGIN_PATH` | the package or a set has `lib/qt6/plugins` or `lib/qt5/plugins` | colon-joined list of every such dir, so relocatable Qt finds its platform plugin. Replaces a value the caller set. |
-| `GIO_EXTRA_MODULES` | `lib/gio/modules/` exists in the package or a set | colon-joined list of those dirs, so GLib loads the bundle's GIO modules rather than the host's (whose GLib they do not match). Replaces a value the caller set. |
+| `GIO_MODULE_DIR` | `lib/gio/modules/` exists in the package | that dir. It replaces GLib's default module directory, so the host's modules, built for the host's GLib, never load. Replaces a value the caller set. |
+| `GIO_EXTRA_MODULES` | a set carries `lib/gio/modules/` too | colon-joined list of the sets' module dirs. Replaces a value the caller set. |
 | `GTK_PATH` | `lib/gtk-3.0/` exists in the package or a set | colon-joined list of those dirs, for GTK 3's modules, theme engines and print backends. Replaces a value the caller set. |
 | `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Replaces a value the caller set. |
 | `GTK_IM_MODULE_FILE` | `lib/gtk-3.0/immodules.cache` exists | that cache, absolutised the same way, so the bundle's input-method modules are used. Replaces a value the caller set. |
+| `GST_PLUGIN_SYSTEM_PATH_1_0`, `GST_PLUGIN_SYSTEM_PATH` | a library directory of the package or a set has `gstreamer-1.0/` | colon-joined list of those dirs. Replaces a value the caller set. |
+| `GST_PLUGIN_SCANNER_1_0`, `GST_PLUGIN_SCANNER` | the bundle carries `gst-plugin-scanner` in `gstreamer-1.0/`, `gstreamer1.0/gstreamer-1.0/` or `libexec/gstreamer-1.0/` | that scanner. Replaces a value the caller set. |
+| `PIPEWIRE_MODULE_DIR`, `SPA_PLUGIN_DIR` | a library directory has `pipewire-0.3/` or `spa-0.2/` | colon-joined list of those dirs. Replaces a value the caller set. |
+| `ALSA_PLUGIN_DIR` | a library directory has `alsa-lib/` | the first such dir. Replaces a value the caller set. |
+| `GI_TYPELIB_PATH` | a library directory has `girepository-1.0/` | colon-joined list of those dirs. Replaces a value the caller set. |
+| `LIBHEIF_PLUGIN_PATH` | a library directory has `libheif/` | colon-joined list of their `plugins/` subdirs, or of the dirs themselves where they have none. Replaces a value the caller set. |
+| `BABL_PATH`, `GEGL_PATH` | a library directory has `babl-0.1/` or `gegl-0.4/` | colon-joined list of those dirs. Replaces a value the caller set. |
+| `TCL_LIBRARY`, `TK_LIBRARY` | a library directory or `share/tcltk/` has `tcl<version>/init.tcl` or `tk<version>/tk.tcl` | that dir. Replaces a value the caller set. |
+| `ALSA_CONFIG_DIR`, `ALSA_CONFIG_PATH` | the package or a set has `share/alsa/` with `alsa.conf` | that dir and that file |
+| `XLOCALEDIR` | `share/X11/locale/` exists | that dir |
+| `MAGIC` | `share/file/misc/magic.mgc` or `share/misc/magic.mgc` exists | that file |
+| `TEXTDOMAINDIR` | `share/locale/` exists | that dir |
+| `LOCPATH` | a bundle lib dir has `locale/C.utf8/`, the host has no `/usr/lib/locale/locale-archive`, and the caller did not set it | colon-joined list of those `locale/` dirs |
+| `SSL_CERT_FILE`, `CURL_CA_BUNDLE` | the host has no CA bundle at the usual paths, the package or a set carries one, and the caller set neither | the carried bundle |
+| `TERMINFO_DIRS` | the package or a set has `share/terminfo/` or `lib/terminfo/` | the caller's list, or else the host's usual terminfo dirs, then the bundled ones |
 
 The driver and data variables in this table keep a value the caller
 set; the module variables replace it. Any of them that arrives pointing
@@ -72,9 +88,9 @@ bundled binaries it runs find their libraries on their own.
 `ONELF_LIB_PATH` is still published for scripts written to export it.
 
 `VK_ADD_DRIVER_FILES` is never set by the runtime, but it is honored as
-a guard: if the app or the user sets it, the runtime stays out of
-Vulkan's way entirely and does not build `VK_DRIVER_FILES`, keeping the
-Vulkan loader's append semantics and the host's GPU drivers reachable.
+a guard, as are `VK_DRIVER_FILES` and `VK_ICD_FILENAMES`: if the app or
+the user sets one, the runtime stays out of Vulkan's way entirely and
+does not build `VK_DRIVER_FILES`.
 
 ## Private to onelf
 

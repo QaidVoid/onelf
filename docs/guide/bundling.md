@@ -32,7 +32,11 @@ With no flags, this:
    ISO Latin, and common East Asian ones with the configuration that names
    them. `iconv` loads those by name from beside its own libc, and on a
    host with another glibc none would load, so a bundled app could not
-   convert text at all. The runtime points `GCONV_PATH` at them.
+   convert text at all. The runtime points `GCONV_PATH` at them. The
+   `C.UTF-8` locale comes too, into `lib/locale/`, when the source
+   system has it. It is not built into glibc, and a bundled glibc reads
+   the host's locale archive, which a musl host or a minimal container
+   does not have.
 4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to the one `$ORIGIN`
    entry that reaches `lib/` from where the file sits: `$ORIGIN/../lib`
    for `bin/app`, `$ORIGIN/../../../lib` for `opt/tool/bin/app`. No entry
@@ -188,6 +192,38 @@ How to read that warning:
 
 A library reached only through `dlopen` will not appear in `DT_NEEDED`
 at all, so `--scan-dlopen` is what finds those.
+
+## Plugin and data paths compiled into a library
+
+The problem: GStreamer, PipeWire, ALSA, libheif, Tcl, libX11 and
+libmagic load plugins or read data from a directory built into them,
+such as `/usr/lib/gstreamer-1.0` or `/usr/share/alsa`. The runtime
+points each at the bundle's copy through a variable, but only when the
+bundle carries that copy (see
+[Environment](./environment#library-paths)). Without one, the library
+reads the host's directory, whose plugins were built against the host's
+libraries, or finds nothing on a host without the package.
+
+`bundle-libs` looks through every bundled file for the paths of a fixed
+list of such components and reports each one the bundle has no copy
+for:
+
+```
+warning: 2 compiled-in plugin or data path(s) have no copy in the bundle:
+  - lib/libasound.so.2 reads /usr/lib/alsa-lib (carry alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR)
+  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR)
+```
+
+- ✅ Copy the directory into the bundle where the line says, and the
+  warning goes away.
+- ☑️ Leave it when the app never uses that part of the library, such as
+  an app that links libasound but plays no sound.
+- ⚠️ Only paths stored whole in a library are found. GLib, GTK,
+  gdk-pixbuf and gobject-introspection join theirs at run time, and a
+  compiler may build a short path from pieces, so no warning is no
+  proof. The driver stack, which comes from the host by design, and
+  directories the runtime extends rather than replaces, such as
+  terminfo and locales, are not reported.
 
 ## Self-extracting binaries (Bun, etc.)
 
