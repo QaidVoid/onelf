@@ -486,7 +486,8 @@ fn remove_conflicting_gl_libs(directory: &Path, lib_dest: &Path, dry_run: bool) 
 }
 
 /// An ELF program: it has an interpreter and no soname. glibc's libc
-/// carries `PT_INTERP` too, and the soname is what tells them apart.
+/// carries `PT_INTERP` too, and the soname is what tells them apart. A
+/// program bundled before carries its interpreter in the bootstrap.
 fn is_program(path: &Path) -> bool {
     let Ok(data) = fs::read(path) else {
         return false;
@@ -495,10 +496,11 @@ fn is_program(path: &Path) -> bool {
         return false;
     };
     elf.soname.is_none()
-        && elf
+        && (elf
             .program_headers
             .iter()
             .any(|p| p.p_type == goblin::elf::program_header::PT_INTERP)
+            || super::elf::injected_interp(&data, &elf).is_some())
 }
 
 /// Recursively find GL-related files and symlinks to remove, skipping
@@ -1135,6 +1137,24 @@ mod gl_conflict_tests {
         let mut out = Vec::new();
         collect_gl_conflicts(&app, &app.join("lib"), &mut out);
         assert_eq!(out, vec![app.join("plugins/libGLX_mesa.so.0")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_program_bundled_before_is_still_a_program() {
+        let root = std::env::temp_dir().join(format!("onelf-glinj-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let exe = root.join("electron");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let rel = "../lib/ld-linux-x86-64.so.2";
+        if !inject_relative_interp(&exe, rel).unwrap() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(parse_interp(&exe).is_none());
+        assert!(is_program(&exe));
+        assert_eq!(program_interp(&exe).as_deref(), Some(rel));
         let _ = fs::remove_dir_all(&root);
     }
 }

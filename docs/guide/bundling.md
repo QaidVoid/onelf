@@ -247,7 +247,13 @@ and every shared object it loaded from outside the tree joins the bundle,
 subject to the same exclusions as everything else. glibc's loader reports
 this on its own through `LD_DEBUG`, per process, so helpers the app
 spawns count too; a musl target is watched with `strace`, which has to
-be installed. ⚠️ A GUI app needs a display for the run; an app that reads
+be installed. Only the tree's own programs count: a host program the app
+starts, a shell or `xdg-open`, does not. The run gets a scratch `HOME`
+and XDG directories, runs in its own process group, and the whole group
+is stopped at the end; it keeps the display and the D-Bus session. The
+GPU stack it maps (Mesa, libLLVM, vendor GL and Vulkan drivers) is left
+to the host as on detection. A run that fails on its own is reported
+with the end of its stderr. ⚠️ A GUI app needs a display for the run; an app that reads
 its arguments needs `--trace-arg` to make it exercise the path you care
 about. ❌ A trace does not apply to a sysroot build, which records a
 trace with `ONELF_TRACE` instead.

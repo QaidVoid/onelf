@@ -9280,3 +9280,533 @@ fn verify_checks_a_detached_signature_over_the_whole_file() {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A dry run leaves the records of an earlier sysroot build alone. The
+/// next pack reads them to pin the GL build the bundle was made against.
+#[test]
+fn a_dry_run_keeps_the_sysroot_records() {
+    let td = workdir("dryrecords");
+    let app = td.join("app");
+    let records = [".onelf/provenance.toml", ".onelf/platform", ".onelf/sets"];
+    for rel in records {
+        write(&app.join(rel), "kept\n");
+    }
+
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap(), "--dry-run"], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for rel in records {
+        assert!(app.join(rel).is_file(), "{rel} was removed by a dry run");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A musl bundle's loader has the host's library path scrubbed, whichever
+/// of libc's two names the bundler copies first. musl's `libc.so` is its
+/// loader as well, and `ld-musl-*` becomes a link to it.
+#[test]
+fn a_bundled_musl_libc_has_its_search_path_scrubbed() {
+    if !have("musl-gcc") {
+        skip("no musl-gcc to build a musl binary");
+        return;
+    }
+    let td = workdir("muslscrub");
+    let src = td.join("hello.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void) { puts(\"hi\"); return 0; }\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let st = Command::new("musl-gcc")
+        .arg("-o")
+        .arg(app.join("bin/hello"))
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let Some(musl_dir) = std::fs::canonicalize("/lib/ld-musl-x86_64.so.1")
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    else {
+        skip("no musl loader at /lib/ld-musl-x86_64.so.1");
+        return;
+    };
+
+    let o = run_onelf(
+        &[
+            "bundle-libs",
+            app.to_str().unwrap(),
+            "--search-path",
+            musl_dir.to_str().unwrap(),
+        ],
+        None,
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    let loader = app.join("lib/ld-musl-x86_64.so.1");
+    let bytes = std::fs::read(&loader).unwrap_or_else(|e| panic!("{e}:\n{err}"));
+    let host_path = b"/lib:/usr/local/lib:/usr/lib";
+    assert!(
+        !bytes.windows(host_path.len()).any(|w| w == host_path),
+        "the bundled loader still searches the host:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An earlier output inside the packed directory is never content, under
+/// whatever name it was built with.
+#[test]
+fn an_earlier_output_in_the_tree_is_not_packed() {
+    let td = workdir("earlierout");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    for name in ["a.onelf", "b.onelf"] {
+        let out = app.join(name);
+        let o = run_onelf(
+            &[
+                "pack",
+                app.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--command",
+                "bin/run",
+            ],
+            None,
+        );
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let o = run_onelf(&["list", app.join("b.onelf").to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let listing = String::from_utf8_lossy(&o.stdout);
+    assert!(listing.contains("bin/run"), "{listing}");
+    assert!(
+        !listing.contains("a.onelf"),
+        "packed an earlier output:\n{listing}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A pack that fails leaves no scratch beside its output. A missing
+/// command is one such failure, and is caught before anything is written.
+#[test]
+fn a_failed_pack_leaves_no_scratch() {
+    let td = workdir("packscratch");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho hi\n");
+    let out_dir = td.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    for (command, entrypoint) in [("bin/missing", "x=bin/run"), ("bin/run", "x=bin/missing")] {
+        let o = run_onelf(
+            &[
+                "pack",
+                app.to_str().unwrap(),
+                "-o",
+                out_dir.join("app.onelf").to_str().unwrap(),
+                "--command",
+                command,
+                "--entrypoint",
+                entrypoint,
+            ],
+            None,
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success());
+        assert!(err.contains("bin/missing"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "scratch left behind: {left:?}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Run `bundle-libs --trace-run` on `app` for `bin/app` with `args`, from
+/// `cwd` when given, and return its stderr after asserting success.
+fn trace_bundle(app: &str, cwd: Option<&Path>, extra: &[&str]) -> String {
+    let mut args = vec![
+        "bundle-libs",
+        app,
+        "--target",
+        "bin/app",
+        "--trace-run",
+        "--trace-seconds",
+        "2",
+    ];
+    args.extend_from_slice(extra);
+    let o = run_onelf(&args, cwd);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "{err}");
+    err
+}
+
+/// A plugin the tree ships is the tree's, also when the tree is named by
+/// a relative path, as `onelf build` names it.
+#[test]
+fn a_traced_plugin_in_a_relative_tree_stays_where_it_is() {
+    let td = workdir("tracerel");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("plugins")).unwrap();
+    write(&td.join("plug.c"), "int plug(void) { return 7; }\n");
+    write(
+        &td.join("app.c"),
+        r#"
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    char exe[PATH_MAX], path[PATH_MAX + 32];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n < 0) return 1;
+    exe[n] = 0;
+    *strrchr(exe, '/') = 0;
+    snprintf(path, sizeof path, "%s/../plugins/libplug.so", exe);
+    return dlopen(path, RTLD_NOW) ? 0 : 2;
+}
+"#,
+    );
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("plug.c").to_str().unwrap()],
+        &app.join("plugins/libplug.so"),
+    ) || !cc(&td.join("app.c"), &app.join("bin/app"))
+    {
+        return;
+    }
+
+    let err = trace_bundle(".", Some(&app), &[]);
+    assert!(
+        !app.join("lib/libplug.so").exists(),
+        "the tree's own plugin was copied into lib/:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A library the tree ships wins over a host copy during the run, as it
+/// does once packed, so what only the host copy needs is not bundled.
+#[test]
+fn a_traced_run_loads_the_trees_own_copy_first() {
+    let td = workdir("traceown");
+    let app = td.join("app");
+    let host = td.join("host");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::create_dir_all(&host).unwrap();
+    write(&td.join("bar.c"), "int bar(void) { return 1; }\n");
+    write(
+        &td.join("foo_host.c"),
+        "int bar(void);\nint foo(void) { return bar(); }\n",
+    );
+    write(&td.join("foo_tree.c"), "int foo(void) { return 2; }\n");
+    write(
+        &td.join("app.c"),
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    char name[32];
+    snprintf(name, sizeof name, "%s%s", "libfoo", ".so.1");
+    return dlopen(name, RTLD_NOW) ? 0 : 2;
+}
+"#,
+    );
+    let so = |src: &str, out: &Path, more: &[&str]| {
+        let mut args = vec!["-shared", "-fPIC", "-Wl,-soname,"];
+        let soname = format!("-Wl,-soname,{}", out.file_name().unwrap().to_str().unwrap());
+        args[2] = &soname;
+        let src = td.join(src);
+        args.push(src.to_str().unwrap());
+        args.extend_from_slice(more);
+        cc_with(&args, out)
+    };
+    let host_dir = format!("-L{}", host.display());
+    if !so("bar.c", &host.join("libbar.so.1"), &[])
+        || !so(
+            "foo_host.c",
+            &host.join("libfoo.so.1"),
+            &[&host_dir, "-l:libbar.so.1"],
+        )
+        || !so("foo_tree.c", &app.join("lib/libfoo.so.1"), &[])
+        || !cc_with(
+            &[
+                td.join("app.c").to_str().unwrap(),
+                "-ldl",
+                "-Wl,-rpath,$ORIGIN/../lib",
+            ],
+            &app.join("bin/app"),
+        )
+    {
+        return;
+    }
+
+    let err = trace_bundle(
+        app.to_str().unwrap(),
+        None,
+        &["--search-path", host.to_str().unwrap()],
+    );
+    assert!(
+        !app.join("lib/libbar.so.1").exists(),
+        "the host's libfoo was loaded over the tree's:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A run that fails on its own says so, rather than reporting that it
+/// found nothing new.
+#[test]
+fn a_traced_run_that_fails_is_reported() {
+    let td = workdir("tracefail");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &td.join("app.c"),
+        "#include <stdio.h>\nint main(void) { fputs(\"no display here\\n\", stderr); return 3; }\n",
+    );
+    if !cc(&td.join("app.c"), &app.join("bin/app")) {
+        return;
+    }
+    let err = trace_bundle(app.to_str().unwrap(), None, &[]);
+    assert!(err.contains("ended by itself"), "{err}");
+    assert!(err.contains("no display here"), "{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The traced run writes to a scratch home, not the user's, and nothing
+/// it started outlives `bundle-libs`.
+#[test]
+fn a_traced_run_is_kept_off_the_users_state() {
+    let td = workdir("tracehome");
+    let app = td.join("app");
+    let home = td.join("home");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let pidfile = td.join("child.pid");
+    write(
+        &td.join("app.c"),
+        &format!(
+            r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {{
+    char path[4096];
+    snprintf(path, sizeof path, "%s/marker", getenv("HOME"));
+    FILE *f = fopen(path, "w");
+    if (f) fclose(f);
+    pid_t child = fork();
+    if (child == 0) {{
+        for (;;) pause();
+    }}
+    f = fopen("{}", "w");
+    fprintf(f, "%d\n", (int)child);
+    fclose(f);
+    return 0;
+}}
+"#,
+            pidfile.display()
+        ),
+    );
+    if !cc(&td.join("app.c"), &app.join("bin/app")) {
+        return;
+    }
+
+    let o = Command::new(onelf())
+        .args([
+            "bundle-libs",
+            app.to_str().unwrap(),
+            "--target",
+            "bin/app",
+            "--trace-run",
+            "--trace-seconds",
+            "2",
+        ])
+        .env("HOME", &home)
+        .output()
+        .expect("spawn onelf");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        !home.join("marker").exists(),
+        "the run wrote to the real home"
+    );
+
+    let pid = std::fs::read_to_string(&pidfile).expect("the app ran");
+    let status = format!("/proc/{}/status", pid.trim());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let alive = loop {
+        let running = std::fs::read_to_string(&status).is_ok_and(|s| {
+            !s.lines()
+                .any(|l| l.starts_with("State:") && l.contains('Z'))
+        });
+        if !running || std::time::Instant::now() > deadline {
+            break running;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!alive, "the app's child outlived the traced run");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A musl target whose interpreter is not where it says is started under
+/// one found on the search path, and traced.
+#[test]
+fn a_musl_target_without_its_interpreter_is_still_traced() {
+    if !have("musl-gcc") {
+        skip("no musl-gcc to build a musl binary");
+        return;
+    }
+    if !have("strace") {
+        skip("no strace to trace a musl binary");
+        return;
+    }
+    let Some(musl_dir) = std::fs::canonicalize("/lib/ld-musl-x86_64.so.1")
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    else {
+        skip("no musl loader at /lib/ld-musl-x86_64.so.1");
+        return;
+    };
+    let td = workdir("tracemusl");
+    let app = td.join("app");
+    let host = td.join("host");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(&host).unwrap();
+    write(&td.join("plug.c"), "int plug(void) { return 7; }\n");
+    write(
+        &td.join("app.c"),
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    char name[32];
+    snprintf(name, sizeof name, "%s%s", "libplug", ".so");
+    return dlopen(name, RTLD_NOW) ? 0 : 2;
+}
+"#,
+    );
+    let musl = |args: &[&str], out: &Path| {
+        let st = Command::new("musl-gcc")
+            .arg("-o")
+            .arg(out)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    musl(
+        &["-shared", "-fPIC", td.join("plug.c").to_str().unwrap()],
+        &host.join("libplug.so"),
+    );
+    musl(&[td.join("app.c").to_str().unwrap()], &app.join("bin/app"));
+    // Point the interpreter somewhere that does not exist, keeping its
+    // length and name.
+    let mut bytes = std::fs::read(app.join("bin/app")).unwrap();
+    let interp = b"/lib/ld-musl-x86_64.so.1";
+    let at = bytes
+        .windows(interp.len())
+        .position(|w| w == interp)
+        .unwrap();
+    bytes[at..at + 5].copy_from_slice(b"/nxx/");
+    std::fs::write(app.join("bin/app"), &bytes).unwrap();
+
+    let err = trace_bundle(
+        app.to_str().unwrap(),
+        None,
+        &[
+            "--search-path",
+            host.to_str().unwrap(),
+            "--search-path",
+            musl_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(app.join("lib/libplug.so").is_file(), "not traced:\n{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Bundling rewrites its input's binaries in place, and a hardlinked one
+/// must not change the file it was linked from.
+#[test]
+fn bundling_leaves_a_hardlinked_source_alone() {
+    let td = workdir("hardlink");
+    let src = td.join("app.c");
+    write(&src, "int main(void) { return 0; }\n");
+    let built = td.join("built");
+    if !cc(&src, &built) {
+        return;
+    }
+    let before = std::fs::read(&built).unwrap();
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::hard_link(&built, app.join("bin/app")).unwrap();
+
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_ne!(std::fs::read(app.join("bin/app")).unwrap(), before);
+    assert_eq!(std::fs::read(&built).unwrap(), before, "the source changed");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Integrating an entrypoint through its symlink launches that entrypoint,
+/// and its files sit beside the default entrypoint's rather than over them.
+#[test]
+fn a_second_entrypoint_integrates_beside_the_first() {
+    let td = workdir("integrateep");
+    let app = td.join("app");
+    for bin in ["bin/run", "bin/daemon"] {
+        write(&app.join(bin), "#!/bin/sh\necho RAN\n");
+        std::fs::set_permissions(
+            app.join(bin),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let pkg = td.join("myapp.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--name", "myapp"])
+        .args(["--entrypoint", "myapp-daemon=bin/daemon"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let link = td.join("myapp-daemon");
+    std::os::unix::fs::symlink("myapp.onelf", &link).unwrap();
+
+    let data_home = td.join("share");
+    for binary in [&pkg, &link] {
+        let o = Command::new(onelf())
+            .args(["integrate", binary.to_str().unwrap()])
+            .env("XDG_DATA_HOME", &data_home)
+            .env("HOME", &td)
+            .output()
+            .expect("spawn onelf integrate");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let apps = data_home.join("applications");
+    let main = std::fs::read_to_string(apps.join("onelf-myapp.desktop")).unwrap();
+    let daemon = std::fs::read_to_string(apps.join("onelf-myapp-myapp-daemon.desktop")).unwrap();
+    let td_canon = td.canonicalize().unwrap();
+    assert!(
+        main.contains(&format!(
+            "Exec={}\n",
+            td_canon.join("myapp.onelf").display()
+        )),
+        "{main}"
+    );
+    assert!(
+        daemon.contains(&format!(
+            "Exec={}\n",
+            td_canon.join("myapp-daemon").display()
+        )),
+        "{daemon}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}

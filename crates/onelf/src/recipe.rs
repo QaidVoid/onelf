@@ -312,18 +312,19 @@ pub struct Bundle {
     pub skip: bool,
 }
 
-/// Load a recipe from a file path. `${VAR}` references anywhere in
-/// the TOML text are expanded from environment variables before
-/// parsing, so any field can use them:
+/// Load a recipe from a file path. `${VAR}` references in string
+/// values are expanded from environment variables after parsing, so
+/// any string field can use them:
 ///
 /// ```toml
 /// [package]
 /// version = "${PKG_VERSION}"
 /// ```
 ///
-/// Missing variables expand to an empty string (matches shell
-/// default). Returns an io::Error with a descriptive message on
-/// failure (parse errors are converted via `InvalidData`).
+/// A variable that is not set is kept as written, so the runtime can
+/// still expand it (see [`expand_env`]). Returns an io::Error with a
+/// descriptive message on failure (parse errors are converted via
+/// `InvalidData`).
 pub fn load(path: &Path) -> std::io::Result<Recipe> {
     let raw = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::InvalidData => std::io::Error::new(

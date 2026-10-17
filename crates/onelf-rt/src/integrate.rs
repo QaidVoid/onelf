@@ -34,18 +34,30 @@ fn xdg_data_home() -> Option<PathBuf> {
     xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
-fn integration_name(pkg_name: &str) -> String {
-    let sanitized: String = pkg_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("onelf-{sanitized}")
+/// `onelf-{name}`, or `onelf-{name}-{entrypoint}` for an entrypoint other
+/// than the default, matching the packer's `onelf integrate`.
+fn integration_name(pkg: &PackageData, pkg_name: &str, ep_name: &str) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let default = pkg
+        .manifest
+        .entrypoints
+        .get(pkg.manifest.header.default_entrypoint as usize)
+        .map(|ep| pkg.manifest.get_string(ep.name));
+    if default == Some(ep_name) {
+        format!("onelf-{}", sanitize(pkg_name))
+    } else {
+        format!("onelf-{}-{}", sanitize(pkg_name), sanitize(ep_name))
+    }
 }
 
 fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
@@ -121,7 +133,7 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
     } else {
         name.to_string()
     };
-    let int_name = integration_name(&pkg_name);
+    let int_name = integration_name(pkg, &pkg_name, ep_name);
 
     // Clean stale icons first
     let hicolor = data_home.join("icons/hicolor");
@@ -217,7 +229,7 @@ fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
     } else {
         name.to_string()
     };
-    let int_name = integration_name(&pkg_name);
+    let int_name = integration_name(pkg, &pkg_name, ep_name);
 
     let mut removed = false;
 

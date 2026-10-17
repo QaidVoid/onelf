@@ -95,6 +95,12 @@ entrypoint's icon and desktop file resolve:
 onelf integrate ./myapp.onelf --entrypoint myapp-daemon
 ```
 
+☑️ Integrating through the entrypoint's symlink (`onelf integrate
+./myapp-daemon`) selects it the same way, and `Exec=` keeps the
+symlink, so the menu entry launches that entrypoint. An entrypoint
+other than the default installs `onelf-myapp-myapp-daemon.desktop` and
+its icon beside the default's files rather than over them.
+
 ## Extract without installing
 
 To extract the raw icon or desktop file without installing them:

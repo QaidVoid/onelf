@@ -72,6 +72,52 @@ pub(crate) fn parse_interp(path: &Path) -> Option<String> {
         .map(|s| s.trim_end_matches('\0').to_string())
 }
 
+/// The loader an executable runs under: its `PT_INTERP`, or the one an
+/// injected bootstrap carries.
+///
+/// The bootstrap injection turns `PT_INTERP` into the `PT_LOAD` holding
+/// the bootstrap, so [`parse_interp`] finds nothing in a tree that was
+/// bundled before. The executable is still one, and still bound to the
+/// libc family of the loader the bootstrap names.
+pub(crate) fn program_interp(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let elf = goblin::elf::Elf::parse(&data).ok()?;
+    match elf.interpreter {
+        Some(interp) => Some(interp.trim_end_matches('\0').to_string()),
+        None => injected_interp(&data, &elf),
+    }
+}
+
+/// The relative loader path an injected bootstrap carries, or `None` when
+/// `elf` has no bootstrap.
+///
+/// [`inject_relative_interp`] points the entry at the start of a `PT_LOAD`
+/// that ends with the path's `u16` length, the path, and a NUL. Reading
+/// it from the end keeps the check independent of the bootstrap code,
+/// which differs between onelf versions.
+pub(crate) fn injected_interp(data: &[u8], elf: &goblin::elf::Elf) -> Option<String> {
+    let seg = elf
+        .program_headers
+        .iter()
+        .find(|p| p.p_type == goblin::elf::program_header::PT_LOAD && p.p_vaddr == elf.entry)?;
+    let start = usize::try_from(seg.p_offset).ok()?;
+    let end = start.checked_add(usize::try_from(seg.p_filesz).ok()?)?;
+    let seg = data.get(start..end)?;
+    let (&0, body) = seg.split_last()? else {
+        return None;
+    };
+    (1..=body.len().saturating_sub(2).min(4096)).find_map(|len| {
+        let at = body.len() - len;
+        let recorded = u16::from_le_bytes([body[at - 2], body[at - 1]]);
+        let path = &body[at..];
+        if usize::from(recorded) != len || path.contains(&0) {
+            return None;
+        }
+        let path = std::str::from_utf8(path).ok()?;
+        is_dynamic_loader(Path::new(path).file_name()?.to_str()?).then(|| path.to_string())
+    })
+}
+
 /// Map an ELF interpreter basename to the libc filename that serves it.
 /// On musl, `ld-musl-<arch>.so.1` and `libc.musl-<arch>.so.1` are both
 /// names for the same file. Returns None if no mapping is known.
@@ -240,8 +286,9 @@ pub(crate) enum RunpathOutcome {
     Set,
     /// No RUNPATH needed: static binary, bare lib, or no DT_NEEDED.
     NotNeeded,
-    /// Executable with deps but RUNPATH could not be guaranteed (no
-    /// in-place slot and patchelf missing or failed). Relies on
+    /// RUNPATH could not be guaranteed: an executable with deps and no
+    /// in-place slot, or a library whose own directory did not fit its
+    /// slot, with patchelf missing or failing. Relies on
     /// `LD_LIBRARY_PATH`; not sandbox-re-exec-safe.
     Unguaranteed,
     /// Executable with a self-extract trailer: patchelf would clobber
@@ -347,10 +394,6 @@ pub(crate) fn origin_runpath_for(root: &Path, path: &Path, lib_rel: &Path) -> St
     }
 }
 
-/// Rewrite RUNPATH within `data`, reporting what the caller still owes.
-///
-/// Returns [`RunpathOutcome::NeedsPatchelf`] when no in-place slot is big
-/// enough, since patchelf has to run against the file rather than the image.
 /// File range of the dynamic string table.
 ///
 /// From the `.dynstr` section header when there is one, else from
@@ -381,12 +424,18 @@ fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     Some((off as usize, (off + strsz) as usize))
 }
 
+/// Rewrite RUNPATH within `data`, reporting what the caller still owes and
+/// whether the image changed.
+///
+/// Returns [`RunpathOutcome::NeedsPatchelf`] when no in-place slot is big
+/// enough, since patchelf has to run against the file rather than the image.
+/// The image can change even then: every slot is scrubbed and retagged.
 fn rewrite_origin_runpath_in(
     data: &mut [u8],
     path: &Path,
     runpath: &str,
     origin_only: &str,
-) -> io::Result<RunpathOutcome> {
+) -> io::Result<(RunpathOutcome, bool)> {
     let new_bytes = runpath.as_bytes();
     let is_self_extract = has_embedded_payload(data);
 
@@ -434,6 +483,7 @@ fn rewrite_origin_runpath_in(
     drop(elf);
 
     let mut rewritten = 0usize;
+    let mut changed = false;
     let total = slots.len();
     let limit = dynstr_end.min(data.len());
     for file_pos in slots {
@@ -461,6 +511,7 @@ fn rewrite_origin_runpath_in(
         for b in &mut data[file_pos + write.len()..file_pos + slot_size] {
             *b = 0;
         }
+        changed = true;
         if write.len() >= new_bytes.len() {
             rewritten += 1;
         }
@@ -484,11 +535,12 @@ fn rewrite_origin_runpath_in(
             } else {
                 data[at..at + 4].copy_from_slice(&(tag as u32).to_le_bytes());
             }
+            changed = true;
         }
     }
 
     if total > 0 && rewritten == total {
-        return Ok(RunpathOutcome::Set);
+        return Ok((RunpathOutcome::Set, changed));
     }
     // A slot too small for the full string was overwritten with the
     // longest safe `$ORIGIN` fallback instead, and retagged RPATH, so it
@@ -497,29 +549,30 @@ fn rewrite_origin_runpath_in(
     // directory of its own: that one is the only way its dependency is
     // reached, so the write has to happen even at the cost of patchelf.
     if total > 0 && !is_executable {
-        return Ok(if runpath == origin_only {
+        let outcome = if runpath == origin_only {
             RunpathOutcome::Set
         } else {
             RunpathOutcome::NeedsPatchelf
-        });
+        };
+        return Ok((outcome, changed));
     }
 
     // Nothing to resolve: a static binary, or a bottom-of-stack library
     // like libc itself, which has no DT_NEEDED of its own.
     if !dynamic_present || !has_needed {
-        return Ok(RunpathOutcome::NotNeeded);
+        return Ok((RunpathOutcome::NotNeeded, changed));
     }
     // A library with no slot of its own resolves through the executable's
     // `DT_RPATH`, which the loader inherits down the dependency chain. Only
     // executables are worth growing a file for.
     if !is_executable {
-        return Ok(RunpathOutcome::NotNeeded);
+        return Ok((RunpathOutcome::NotNeeded, changed));
     }
     if is_self_extract {
-        return Ok(RunpathOutcome::SelfExtract);
+        return Ok((RunpathOutcome::SelfExtract, changed));
     }
     let _ = path;
-    Ok(RunpathOutcome::NeedsPatchelf)
+    Ok((RunpathOutcome::NeedsPatchelf, changed))
 }
 
 /// Run `patchelf --set-rpath` against `path`, reporting whether the RUNPATH
@@ -672,6 +725,9 @@ pub(crate) fn finalize_tree(
     let patchelf = which_patchelf();
 
     for path in find_elf_files(directory) {
+        // Every later edit, here and in the bootstrap injection, writes
+        // the file in place.
+        break_hardlink(&path);
         let perms = fs::metadata(&path)
             .map(|m| m.permissions().mode())
             .unwrap_or(0o755);
@@ -707,6 +763,27 @@ pub(crate) fn finalize_tree(
     (rewritten, scrubbed, unguaranteed, self_extract)
 }
 
+/// Give `path` an inode of its own before it is rewritten in place.
+///
+/// A hardlinked input shares its inode with the file it was linked from,
+/// often the build's own output, and an in-place write would change that
+/// too. The copy keeps the mode bits; a failure leaves the link as it was.
+fn break_hardlink(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || meta.nlink() < 2 {
+        return;
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".onelf-unlink.tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::copy(path, &tmp).is_err() || fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 /// Apply every in-place rewrite to one binary with a single read and a
 /// single write.
 ///
@@ -722,11 +799,11 @@ fn finalize_one(
 ) -> io::Result<(RunpathOutcome, bool)> {
     let mut data = fs::read(path)?;
 
-    let outcome = rewrite_origin_runpath_in(&mut data, path, runpath, origin_only)?;
+    let (outcome, rewritten) = rewrite_origin_runpath_in(&mut data, path, runpath, origin_only)?;
     let scrubbed = scrub_nix_store_paths_in(&mut data);
     let stripped = strip_absolute_needed_in(&mut data);
 
-    if outcome == RunpathOutcome::Set || scrubbed || stripped {
+    if rewritten || scrubbed || stripped {
         fs::write(path, &data)?;
     }
 
@@ -790,7 +867,7 @@ pub(crate) fn report_unbundled_needs(findings: &[(PathBuf, Vec<String>)]) {
 pub(crate) fn report_unguaranteed_runpath(unguaranteed: &[PathBuf], self_extract: &[PathBuf]) {
     if !unguaranteed.is_empty() {
         eprintln!(
-            "{} {} executable(s) have no baked-in $ORIGIN RUNPATH and rely \
+            "{} {} file(s) have no baked-in $ORIGIN RUNPATH and rely \
              on LD_LIBRARY_PATH:",
             color::bold_red("warning:"),
             unguaranteed.len()
@@ -1286,7 +1363,7 @@ pub(crate) fn inject_relative_interp(path: &Path, rel_interp: &str) -> io::Resul
 /// Outcome of trying to make an entrypoint load the onelf-env
 /// constructor (re-exec-safe `.onelf/env` / `.onelf/preload`).
 pub(crate) enum EnvNeededOutcome {
-    /// `libonelf-env.so` is now a DT_NEEDED of the binary.
+    /// The onelf-env constructor is now a DT_NEEDED of the binary.
     Added,
     /// Already a DT_NEEDED (idempotent repack).
     AlreadyPresent,
@@ -1299,7 +1376,7 @@ pub(crate) enum EnvNeededOutcome {
     Skipped,
 }
 
-/// Stage the arch-appropriate `libonelf-env.so` into `lib_dest` and add
+/// Stage the arch-appropriate onelf-env constructor into `lib_dest` and add
 /// it as a `DT_NEEDED` of `path`. Run on the pristine binary *before*
 /// bootstrap injection so patchelf operates on a normal ELF (the
 /// bootstrap later only repurposes PT_INTERP and appends at EOF, which
@@ -1319,16 +1396,17 @@ pub(crate) fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<E
     let Some(blob) = crate::payload::onelf_env_blob(e_machine) else {
         return Ok(EnvNeededOutcome::NoBlobForArch);
     };
+    let soname = crate::payload::onelf_env_soname(e_machine);
 
     // Skip if this binary already lists the constructor (idempotent).
     if let Ok(elf) = goblin::elf::Elf::parse(&data)
-        && elf.libraries.contains(&crate::payload::ONELF_ENV_SONAME)
+        && elf.libraries.contains(&soname)
     {
         return Ok(EnvNeededOutcome::AlreadyPresent);
     }
 
     // Stage the blob into lib/ (write once; idempotent across binaries).
-    let dest = lib_dest.join(crate::payload::ONELF_ENV_SONAME);
+    let dest = lib_dest.join(soname);
     let need_write = match fs::read(&dest) {
         Ok(existing) => existing != blob,
         Err(_) => true,
@@ -1345,7 +1423,7 @@ pub(crate) fn add_onelf_env_needed(path: &Path, lib_dest: &Path) -> io::Result<E
     };
     let out = std::process::Command::new(&patchelf)
         .arg("--add-needed")
-        .arg(crate::payload::ONELF_ENV_SONAME)
+        .arg(soname)
         .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1560,6 +1638,35 @@ mod embedded_payload_tests {
 }
 
 #[cfg(test)]
+mod env_class_tests {
+    use super::*;
+
+    /// Only meaningful in a build that embeds the i686 constructor, as
+    /// `ONELF_PAYLOAD_ALL=1` builds do.
+    #[test]
+    fn each_elf_class_gets_its_own_env_constructor() {
+        let Some(blob32) = crate::payload::onelf_env_blob(goblin::elf::header::EM_386) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("onelf-envclass-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lib = dir.join("lib");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), dir.join("bin/app64")).unwrap();
+        // Any 32-bit object stands in for an i686 executable here.
+        fs::write(dir.join("bin/app32"), blob32).unwrap();
+        for bin in ["bin/app64", "bin/app32"] {
+            let _ = add_onelf_env_needed(&dir.join(bin), &lib);
+        }
+        let class = |name: &str| fs::read(lib.join(name)).ok().map(|b| b[4]);
+        let (class64, class32) = (class("libonelf-env.so"), class("libonelf-env32.so"));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(class64, Some(2));
+        assert_eq!(class32, Some(1));
+    }
+}
+
+#[cfg(test)]
 mod runpath_tests {
     use super::*;
 
@@ -1715,6 +1822,34 @@ mod runpath_tests {
                 .all(|&b| b == GUARD)
         );
         assert!(!out.windows(old.len()).any(|w| w == old));
+    }
+
+    #[test]
+    fn a_slot_left_for_patchelf_is_still_scrubbed() {
+        let old = b"/usr/lib/tinysparql-3.0";
+        let (bytes, _) = elf_with_runpath(old);
+        let dir = std::env::temp_dir().join(format!("onelf-runpath-owed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.so");
+        fs::write(&path, &bytes).unwrap();
+        // The full run path names a directory of the library's own and
+        // does not fit, so patchelf is owed, and there is none.
+        let (outcome, _) = finalize_one(
+            &path,
+            "$ORIGIN/../lib:$ORIGIN/../lib/tinysparql-3.0",
+            "$ORIGIN/../lib",
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, RunpathOutcome::Unguaranteed);
+        let out = fs::read(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!out.windows(old.len()).any(|w| w == old));
+        let elf = goblin::elf::Elf::parse(&out).unwrap();
+        let tags: Vec<u64> = elf.dynamic.unwrap().dyns.iter().map(|d| d.d_tag).collect();
+        assert!(tags.contains(&goblin::elf::dynamic::DT_RPATH));
+        assert!(!tags.contains(&goblin::elf::dynamic::DT_RUNPATH));
     }
 
     #[test]

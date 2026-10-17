@@ -245,13 +245,13 @@ pub(crate) fn locate_lib(
         return None;
     }
 
-    // 2. ldconfig cache. Sort candidates so the first acceptable match is
-    // stable when several store paths ship the same soname (the cache is
-    // filled from unordered HashSet + walk order).
+    // 2. ldconfig cache, in the order it lists candidates. `ldconfig -p`
+    // prints the cache in the loader's own preference, so `/usr/local/lib`
+    // wins over `/usr/lib/x86_64-linux-gnu` here as it does at runtime. A
+    // cache scanned from the Nix store is filled from sorted closures and
+    // sorted walks, which is stable already.
     if let Some(paths) = ldconfig_cache.get(soname) {
-        let mut sorted: Vec<&PathBuf> = paths.iter().collect();
-        sorted.sort();
-        for path in sorted {
+        for path in paths {
             if path.exists() && acceptable(path) {
                 return Some(path.clone());
             }
@@ -433,5 +433,24 @@ mod tests {
             "the packer's file is not the sysroot's"
         );
         let _ = fs::remove_dir_all(&td);
+    }
+
+    #[test]
+    fn the_cache_order_decides_between_copies() {
+        let root = std::env::temp_dir().join(format!("onelf-cacheorder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let local = root.join("usr/local/lib");
+        let multiarch = root.join("usr/lib/x86_64-linux-gnu");
+        for dir in [&local, &multiarch] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("libfoo.so.1"), b"lib").unwrap();
+        }
+        let cache = HashMap::from([(
+            "libfoo.so.1".to_string(),
+            vec![local.join("libfoo.so.1"), multiarch.join("libfoo.so.1")],
+        )]);
+        let found = locate_lib("libfoo.so.1", &cache, &[], None, None, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(found, Some(local.join("libfoo.so.1")));
     }
 }

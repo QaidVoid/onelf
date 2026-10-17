@@ -52,6 +52,41 @@ fn ensure_writable(path: &Path) {
     }
 }
 
+/// A fresh directory under the system temp dir that only this user can
+/// enter, for scratch a host tool writes into.
+///
+/// A predictable name there can be planted by any local user beforehand,
+/// as a directory they own or a symlink to somewhere of the victim's.
+/// `mkdir` creates the final component itself or fails, never following
+/// what is already there, so a name that is taken is simply passed over,
+/// and the directory it does create is this process's with mode 0700.
+pub(crate) fn private_temp_dir(tag: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..100 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!(
+            "onelf-{tag}-{}-{nanos:08x}{n:x}",
+            std::process::id()
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free scratch directory name under {}", base.display()),
+    ))
+}
+
 fn verb_str(dry_run: bool) -> String {
     if dry_run {
         color::bold("Would copy")
@@ -414,10 +449,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
         None => {
             // A record from an earlier sysroot build would describe a
-            // bundle this run is about to change.
-            let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
-            let _ = fs::remove_file(opts.directory.join(sysroot::PLATFORM_FILE));
-            let _ = fs::remove_file(opts.directory.join(sysroot::SETS_FILE));
+            // bundle this run is about to change. A dry run changes
+            // nothing, so the record still holds.
+            if !opts.dry_run {
+                let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
+                let _ = fs::remove_file(opts.directory.join(sysroot::PLATFORM_FILE));
+                let _ = fs::remove_file(opts.directory.join(sysroot::SETS_FILE));
+            }
             None
         }
     };
@@ -650,7 +688,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 "--trace-run needs --target to name what to run",
             ));
         };
-        let family = parse_interp(&target)
+        let family = program_interp(&target)
             .as_deref()
             .and_then(libc_family_from_interp);
         eprintln!(
@@ -662,21 +700,52 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 .display(),
             opts.trace_seconds
         );
-        let host_dirs: Vec<PathBuf> = onelf_format::drivers::cache_dirs()
+        // The tree's own library directories come first: `LD_LIBRARY_PATH`
+        // is searched before any run path, and a host copy found there
+        // would stand in for a library the tree ships. `--search-path`
+        // follows, then the host's directories, which a tree bundled
+        // before needs because its loader has them scrubbed out.
+        let tree = opts.directory.canonicalize()?;
+        let mut library_path: Vec<PathBuf> = Vec::new();
+        let tree_dirs = std::iter::once(opts.directory.join(&opts.lib_dir))
+            .chain(elf_files.iter().flat_map(|f| parse_rpaths(f)))
+            .filter_map(|d| d.canonicalize().ok())
+            .filter(|d| d.starts_with(&tree));
+        let host_dirs = onelf_format::drivers::cache_dirs()
             .into_iter()
             .map(PathBuf::from)
-            .chain(STANDARD_LIB_PATHS.iter().map(PathBuf::from))
+            .chain(STANDARD_LIB_PATHS.iter().map(PathBuf::from));
+        for dir in tree_dirs
             .chain(opts.search_path.iter().cloned())
-            .filter(|d| d.is_dir())
-            .collect();
+            .chain(host_dirs)
+        {
+            if dir.is_dir() && !library_path.contains(&dir) {
+                library_path.push(dir);
+            }
+        }
+        let loader = trace_loader(&target, &library_path, target_class, target_machine)?;
         let loaded = discover::loaded_libraries(
             &target,
             &opts.trace_args,
             opts.trace_seconds,
             family,
             &opts.directory,
-            &host_dirs,
+            &library_path,
+            loader.as_deref(),
         )?;
+        let (loaded, gpu_stack) = split_gpu_stack(loaded);
+        if !gpu_stack.is_empty() {
+            let names: Vec<&str> = gpu_stack
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+                .collect();
+            eprintln!(
+                "  {} the host's GPU stack: {}. Pass --gl, --dri or --vulkan \
+                 to bundle Mesa instead.",
+                color::bold("Left to"),
+                names.join(", ")
+            );
+        }
         let mut traced = 0usize;
         for path in loaded {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -806,13 +875,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // in libc.so.6 + ld-linux, which can't be used by a musl-linked binary).
     let target_libc = primary
         .as_deref()
-        .and_then(parse_interp)
+        .and_then(program_interp)
         .as_deref()
         .and_then(libc_family_from_interp)
         .or_else(|| {
-            elf_files
-                .iter()
-                .find_map(|f| parse_interp(f).as_deref().and_then(libc_family_from_interp))
+            elf_files.iter().find_map(|f| {
+                program_interp(f)
+                    .as_deref()
+                    .and_then(libc_family_from_interp)
+            })
         });
 
     // A tree spanning two libc families has its minority dependencies
@@ -822,7 +893,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         let others: Vec<&PathBuf> = elf_files
             .iter()
             .filter(|f| {
-                parse_interp(f)
+                program_interp(f)
                     .as_deref()
                     .and_then(libc_family_from_interp)
                     .is_some_and(|fam| fam != chosen)
@@ -1116,7 +1187,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     // real files (e.g. /nix/store/.../glibc/etc/ld.so.cache);
                     // on someone else's system they're dead paths at best and
                     // wrong-content paths at worst. Scrub before shipping.
-                    if is_dynamic_loader(&soname)
+                    // musl's libc is its loader too, and whichever of its
+                    // names is copied first is the file the other links to.
+                    let is_loader = is_dynamic_loader(&soname)
+                        || libc_family_of_soname(&soname) == Some(LibcFamily::Musl);
+                    if is_loader
                         && let Err(e) = scrub_loader_paths(
                             &dest,
                             libc_family_of_soname(&soname).unwrap_or(LibcFamily::Glibc),
@@ -1586,6 +1661,115 @@ fn resolve_target_elfs(opts: &BundleOptions) -> io::Result<Vec<PathBuf>> {
         Ok(vec![path])
     } else {
         Ok(find_elf_files(&opts.directory))
+    }
+}
+
+/// Split traced libraries into the application's and the host's GPU
+/// stack, which a traced run maps on whatever machine it runs on: the
+/// driver families the launch resolver leaves to the host, the Mesa and
+/// vendor implementations behind them, and what the run loaded only as
+/// their dependency. On Mesa that is libGLX_mesa, libgallium, libLLVM and
+/// radeonsi_dri.so, on NVIDIA libGLX_nvidia. None of it is the app's to
+/// ship: the driver that works is the host's, and bundling Mesa is what
+/// `--gl`, `--dri` and `--vulkan` are for.
+fn split_gpu_stack(libs: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    const IMPLEMENTATIONS: &[&str] = &[
+        "libGLX_",
+        "libEGL_",
+        "libglapi.so",
+        "libgallium",
+        "libLLVM",
+        "libvulkan_",
+        "libVkLayer_",
+        "libxatracker",
+        "libvdpau",
+    ];
+    const DRIVER_SUFFIXES: &[&str] = &["_dri.so", "_drv_video.so"];
+    let name = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut gpu: HashSet<String> = libs
+        .iter()
+        .map(|p| name(p))
+        .filter(|n| {
+            onelf_format::drivers::DRIVER_FAMILIES
+                .iter()
+                .chain(IMPLEMENTATIONS)
+                .any(|f| n.starts_with(f))
+                || DRIVER_SUFFIXES.iter().any(|s| n.ends_with(s))
+        })
+        .collect();
+    let needs: Vec<(String, Vec<String>)> = libs
+        .iter()
+        .map(|p| (name(p), parse_needed(p).unwrap_or_default()))
+        .collect();
+    // A library only GPU libraries asked for came with them. One nothing
+    // traced asked for was opened by the application itself.
+    loop {
+        let more: Vec<String> = needs
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| !gpu.contains(*n))
+            .filter(|n| {
+                let mut needers = needs.iter().filter(|(_, deps)| deps.contains(n)).peekable();
+                needers.peek().is_some() && needers.all(|(m, _)| gpu.contains(m))
+            })
+            .cloned()
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        gpu.extend(more);
+    }
+    libs.into_iter().partition(|p| !gpu.contains(&name(p)))
+}
+
+/// The loader to start `target` under for a traced run, when the one its
+/// `PT_INTERP` names is not on this machine. A tree built elsewhere names
+/// `/lib/ld-musl-x86_64.so.1` on a glibc host, say, and the kernel cannot
+/// start it at all. The loader is looked for by name in `dirs`, as musl's
+/// libc too, since that is the same file.
+fn trace_loader(
+    target: &Path,
+    dirs: &[PathBuf],
+    class: Option<u8>,
+    machine: Option<u16>,
+) -> io::Result<Option<PathBuf>> {
+    let Some(interp) = parse_interp(target) else {
+        return Ok(None);
+    };
+    if Path::new(&interp).exists() {
+        return Ok(None);
+    }
+    let Some(name) = Path::new(&interp).file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    let mut names = vec![name.to_string()];
+    names.extend(libc_alias_for(name));
+    if libc_family_from_interp(name) == Some(LibcFamily::Musl) {
+        names.push("libc.so".to_string());
+    }
+    let found = dirs
+        .iter()
+        .flat_map(|d| names.iter().map(move |n| d.join(n)))
+        .find(|c| {
+            c.is_file()
+                && read_elf_class(c).is_some_and(|k| class.is_none_or(|t| k == t))
+                && read_elf_machine(c).is_some_and(|m| machine.is_none_or(|t| m == t))
+        });
+    match found {
+        Some(loader) => Ok(Some(loader)),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "--trace-run cannot start {}: its interpreter {interp} is not on this \
+                 machine; pass --search-path with a directory that holds it",
+                target.display()
+            ),
+        )),
     }
 }
 
@@ -2287,5 +2471,44 @@ mod dangling_link_tests {
             "an unrelated link stays"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod private_temp_dir_tests {
+    use super::*;
+
+    #[test]
+    fn each_scratch_directory_is_new_and_private() {
+        let a = private_temp_dir("probe").unwrap();
+        let b = private_temp_dir("probe").unwrap();
+        assert_ne!(a, b);
+        for dir in [&a, &b] {
+            let meta = fs::symlink_metadata(dir).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        let _ = fs::remove_dir(&a);
+        let _ = fs::remove_dir(&b);
+    }
+}
+
+#[cfg(test)]
+mod gpu_stack_tests {
+    use super::*;
+
+    #[test]
+    fn a_traced_gpu_stack_is_left_to_the_host() {
+        let paths = [
+            "/usr/lib/libGLX_mesa.so.0",
+            "/usr/lib/libEGL_nvidia.so.0",
+            "/usr/lib/libgallium-25.2.so",
+            "/usr/lib/dri/radeonsi_dri.so",
+            "/usr/lib/libvulkan_radeon.so",
+            "/usr/lib/libSDL2-2.0.so.0",
+        ];
+        let (app, host) = split_gpu_stack(paths.iter().map(PathBuf::from).collect());
+        assert_eq!(app, vec![PathBuf::from("/usr/lib/libSDL2-2.0.so.0")]);
+        assert_eq!(host.len(), 5);
     }
 }

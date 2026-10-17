@@ -21,12 +21,38 @@ struct IntegrationContext {
     binary: PathBuf,
     pkg_name: String,
     ep_name: String,
+    /// The entrypoint is not the package's default, so its files are
+    /// named after it as well and do not replace the default's.
+    secondary: bool,
 }
 
 impl IntegrationContext {
     fn load(binary: &Path, entrypoint: Option<&str>) -> io::Result<Self> {
-        let binary = binary.canonicalize()?;
+        // The directory is resolved and the name kept: a symlink such as
+        // `myapp-daemon -> myapp.onelf` is how an entrypoint is launched,
+        // by its argv[0], and `Exec=` has to go through it.
+        let binary = match (binary.parent(), binary.file_name()) {
+            (Some(dir), Some(name)) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                dir.canonicalize()?.join(name)
+            }
+            _ => binary.canonicalize()?,
+        };
         let (footer, manifest) = read_footer_and_manifest(&binary)?;
+        let launched = binary
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| {
+                manifest
+                    .entrypoints
+                    .iter()
+                    .position(|ep| manifest.get_string(ep.name) == n)
+            })
+            .unwrap_or(manifest.header.default_entrypoint as usize);
 
         let ep_name = match entrypoint {
             Some(name) => {
@@ -44,8 +70,7 @@ impl IntegrationContext {
                 name.to_string()
             }
             None => {
-                let idx = manifest.header.default_entrypoint as usize;
-                let ep = manifest.entrypoints.get(idx).ok_or_else(|| {
+                let ep = manifest.entrypoints.get(launched).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "package declares no entrypoints",
@@ -54,6 +79,24 @@ impl IntegrationContext {
                 manifest.get_string(ep.name).to_string()
             }
         };
+
+        let ep_index = manifest
+            .entrypoints
+            .iter()
+            .position(|ep| manifest.get_string(ep.name) == ep_name);
+        if ep_index != Some(launched) {
+            eprintln!(
+                "warning: {} launches entrypoint '{}', not '{ep_name}'; integrate \
+                 through a symlink named '{ep_name}' to it instead",
+                binary.display(),
+                manifest
+                    .entrypoints
+                    .get(launched)
+                    .map(|ep| manifest.get_string(ep.name))
+                    .unwrap_or_default(),
+            );
+        }
+        let secondary = ep_index != Some(manifest.header.default_entrypoint as usize);
 
         let name = manifest.name();
         let pkg_name = if name.is_empty() {
@@ -68,6 +111,7 @@ impl IntegrationContext {
             binary,
             pkg_name,
             ep_name,
+            secondary,
         })
     }
 
@@ -100,19 +144,35 @@ fn xdg_data_home() -> io::Result<PathBuf> {
     ))
 }
 
-/// Sanitize package name into a safe desktop entry name: `onelf-{name}`.
-fn integration_name(pkg_name: &str) -> String {
-    let sanitized: String = pkg_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("onelf-{sanitized}")
+/// Sanitize the package name into a safe desktop entry name:
+/// `onelf-{name}`, or `onelf-{name}-{entrypoint}` for an entrypoint other
+/// than the default, so integrating a second entrypoint does not replace
+/// the first.
+fn integration_name(pkg_name: &str, entrypoint: Option<&str>) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    match entrypoint {
+        Some(ep) => format!("onelf-{}-{}", sanitize(pkg_name), sanitize(ep)),
+        None => format!("onelf-{}", sanitize(pkg_name)),
+    }
+}
+
+impl IntegrationContext {
+    fn integration_name(&self) -> String {
+        integration_name(
+            &self.pkg_name,
+            self.secondary.then_some(self.ep_name.as_str()),
+        )
+    }
 }
 
 /// Read width and height from a PNG IHDR chunk.
@@ -257,7 +317,7 @@ fn update_desktop_database(data_home: &Path) {
 pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
     let ctx = IntegrationContext::load(binary, entrypoint)?;
     let data_home = xdg_data_home()?;
-    let int_name = integration_name(&ctx.pkg_name);
+    let int_name = ctx.integration_name();
 
     // Remove any stale icons first (handles format changes on re-integrate)
     let hicolor = data_home.join("icons/hicolor");
@@ -276,7 +336,7 @@ pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
 pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
     let ctx = IntegrationContext::load(binary, entrypoint)?;
     let data_home = xdg_data_home()?;
-    let int_name = integration_name(&ctx.pkg_name);
+    let int_name = ctx.integration_name();
 
     let mut removed = false;
 
@@ -308,6 +368,15 @@ pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_entrypoint_has_files_of_its_own() {
+        assert_eq!(integration_name("My App", None), "onelf-My-App");
+        assert_eq!(
+            integration_name("My App", Some("my-daemon")),
+            "onelf-My-App-my-daemon"
+        );
+    }
 
     #[test]
     fn patch_replaces_quoted_exec_without_fragments() {

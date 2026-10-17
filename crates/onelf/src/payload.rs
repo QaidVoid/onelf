@@ -25,6 +25,21 @@ pub const ONELF_ENV_I686: &[u8] = include_bytes!(env!("ONELF_ENV_I686"));
 /// Soname / bundled filename of the onelf-env constructor library.
 pub const ONELF_ENV_SONAME: &str = "libonelf-env.so";
 
+/// Soname / bundled filename of the 32-bit onelf-env constructor. A tree
+/// can hold executables of both classes, and the loader refuses a library
+/// of the other class, so each class has a file of its own.
+pub const ONELF_ENV32_SONAME: &str = "libonelf-env32.so";
+
+/// The onelf-env soname for `e_machine` (ELF `EM_*`).
+pub fn onelf_env_soname(e_machine: u16) -> &'static str {
+    const EM_386: u16 = 3;
+    if e_machine == EM_386 {
+        ONELF_ENV32_SONAME
+    } else {
+        ONELF_ENV_SONAME
+    }
+}
+
 /// Return the flat bootstrap binary for `e_machine` (ELF `EM_*`), or `None` if
 /// that arch's payload was not built into this onelf (an empty placeholder,
 /// e.g. the non-native arch of a single-arch build). The relative-interpreter

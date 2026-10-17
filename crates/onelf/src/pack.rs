@@ -9,7 +9,7 @@
 //! 6. Writes the final binary: `[runtime ELF][manifest][payload][dict?][footer]`
 
 use crate::bundle::format_size;
-use crate::payload::ONELF_ENV_SONAME;
+use crate::payload::{ONELF_ENV_SONAME, ONELF_ENV32_SONAME};
 use onelf_format::HostLibsPolicy;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -449,15 +449,18 @@ fn compile_gsettings_schemas(
     }
 
     let compiler = crate::bundle::gpu::find_glib_compile_schemas();
-    let tmp = std::env::temp_dir().join(format!("onelf-schemas-{}.tmp", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
-    let run = fs::create_dir_all(&tmp).and_then(|()| {
-        std::process::Command::new(&compiler)
-            .arg("--targetdir")
-            .arg(&tmp)
-            .arg(directory.join(schemas_rel))
-            .output()
-    });
+    let tmp = match crate::bundle::private_temp_dir("schemas") {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            eprintln!("warning: no scratch directory to compile GSettings schemas in: {e}");
+            return;
+        }
+    };
+    let run = std::process::Command::new(&compiler)
+        .arg("--targetdir")
+        .arg(&tmp)
+        .arg(directory.join(schemas_rel))
+        .output();
     let blob = match run {
         Ok(out) if out.status.success() => fs::read(tmp.join("gschemas.compiled")),
         Ok(out) => {
@@ -515,6 +518,40 @@ fn sibling_tmp(output: &Path, tag: &str) -> PathBuf {
     let mut name = output.as_os_str().to_os_string();
     name.push(format!(".onelf-{tag}-{}.tmp", std::process::id()));
     PathBuf::from(name)
+}
+
+/// True when `path`, `len` bytes long, is itself a onelf package: the
+/// runtime's ELF header carries the `ONELF` signature and the file ends in
+/// the footer's magic. An earlier output left in a recipe's own directory
+/// is one, under whatever name it was built with.
+fn is_onelf_package(path: &Path, len: u64) -> bool {
+    use std::io::{Seek, SeekFrom};
+    if len < onelf_format::FOOTER_SIZE as u64 {
+        return false;
+    }
+    let Ok(mut f) = open_walked(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    if f.read_exact(&mut head).is_err() || head[0..4] != *b"\x7fELF" || head[9..15] != *b"ONELF\0" {
+        return false;
+    }
+    let mut tail = [0u8; 8];
+    f.seek(SeekFrom::End(-8)).is_ok()
+        && f.read_exact(&mut tail).is_ok()
+        && tail == onelf_format::END_MAGIC
+}
+
+/// Scratch files beside the output, removed when the pack ends, however it
+/// ends. The payload alone can be gigabytes.
+struct Scratch(Vec<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// True for a name [`sibling_tmp`] produces, whichever pack produced it.
@@ -590,6 +627,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // crashed-pack leftovers. Both are reported after the walk.
     let mut dropped_special: Vec<(PathBuf, &'static str)> = Vec::new();
     let mut dropped_scratch: Vec<PathBuf> = Vec::new();
+    let mut dropped_packages: Vec<PathBuf> = Vec::new();
 
     // The output of a previous pack may sit inside the directory, as it
     // does for a recipe whose AppDir is the recipe's own directory. It is
@@ -663,6 +701,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 mtime_nsec,
             });
         } else if symlink_meta.is_file() {
+            if is_onelf_package(&abs_path, symlink_meta.len()) {
+                dropped_packages.push(rel_path);
+                continue;
+            }
             files.push(CollectedFile {
                 rel_path,
                 source: FileSource::Disk(abs_path.clone()),
@@ -711,6 +753,12 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         eprintln!(
             "warning: dropping {} more scratch-named files",
             dropped_scratch.len() - 10
+        );
+    }
+    for path in &dropped_packages {
+        eprintln!(
+            "warning: dropping {} (a onelf package, such as an earlier output)",
+            path.display()
         );
     }
 
@@ -937,6 +985,60 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         symlinks.len()
     ));
 
+    // Two entrypoints answering to one name would leave which of them runs
+    // up to resolution order, so the ambiguity is refused at pack time.
+    if let Some(dup) = opts
+        .entrypoints
+        .iter()
+        .enumerate()
+        .find(|(i, (n, _, _))| opts.entrypoints[..*i].iter().any(|(m, _, _)| m == n))
+        .map(|(_, (n, _, _))| n)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("duplicate entrypoint name '{dup}'"),
+        ));
+    }
+
+    // A default naming no declared entrypoint used to fall back to the
+    // package command under the typed name, silently producing something the
+    // recipe never described.
+    if let Some(name) = opts.default_entrypoint.as_deref()
+        && !opts.entrypoints.iter().any(|(n, _, _)| n == name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("default entrypoint '{name}' matches no declared entrypoint"),
+        ));
+    }
+
+    // Every path the entrypoints name is in the tree. Checked before
+    // compressing, which for a large tree is most of the run.
+    {
+        let walked: std::collections::HashSet<&Path> = files
+            .iter()
+            .map(|f| f.rel_path.as_path())
+            .chain(dirs.iter().map(|d| d.rel_path.as_path()))
+            .chain(symlinks.iter().map(|s| s.rel_path.as_path()))
+            .collect();
+        if !walked.contains(package_relative(&opts.command).as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("command path '{}' not found in directory", opts.command),
+            ));
+        }
+        if let Some((_, path, _)) = opts
+            .entrypoints
+            .iter()
+            .find(|(_, p, _)| !walked.contains(package_relative(p).as_path()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("entrypoint path '{}' not found in directory", path),
+            ));
+        }
+    }
+
     let total_content_size: u64 = files
         .iter()
         .map(|f| match &f.source {
@@ -986,6 +1088,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     });
 
     let payload_tmp_path = sibling_tmp(&opts.output, "payload");
+    let staged = sibling_tmp(&opts.output, "staged");
+    let _scratch = Scratch(vec![payload_tmp_path.clone(), staged.clone()]);
     let mut payload_tmp = BufWriter::new(File::create(&payload_tmp_path)?);
     let mut payload_offset: u64 = 0;
     let mut compressed_files: Vec<CompressedFile> = Vec::with_capacity(files.len());
@@ -1061,10 +1165,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         payload_tmp.flush()
     })();
     drop(payload_tmp);
-    if let Err(e) = result {
-        let _ = fs::remove_file(&payload_tmp_path);
-        return Err(e);
-    }
+    result?;
 
     pb.finish_with_message(if opts.no_compress {
         "Files stored (uncompressed)"
@@ -1187,21 +1288,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         )
     })?;
 
-    // Two entrypoints answering to one name would leave which of them runs
-    // up to resolution order, so the ambiguity is refused at pack time.
-    if let Some(dup) = opts
-        .entrypoints
-        .iter()
-        .enumerate()
-        .find(|(i, (n, _, _))| opts.entrypoints[..*i].iter().any(|(m, _, _)| m == n))
-        .map(|(_, (n, _, _))| n)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("duplicate entrypoint name '{dup}'"),
-        ));
-    }
-
     let default_name = opts
         .default_entrypoint
         .as_deref()
@@ -1216,18 +1302,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         .default_entrypoint
         .as_deref()
         .and_then(|dn| opts.entrypoints.iter().find(|(n, _, _)| n == dn));
-
-    // A default naming no declared entrypoint used to fall back to the
-    // package command under the typed name, silently producing something the
-    // recipe never described.
-    if let Some(name) = opts.default_entrypoint.as_deref()
-        && default_decl.is_none()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("default entrypoint '{name}' matches no declared entrypoint"),
-        ));
-    }
 
     let ep_name = strings.add(default_name);
     let empty_args = strings.add("");
@@ -1444,7 +1518,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Written beside the output and renamed over it at the end, so a
     // reader never sees a partial package and an instance still running
     // the previous one keeps its file.
-    let staged = sibling_tmp(&opts.output, "staged");
     let out = File::create(&staged)?;
     let mut w = BufWriter::new(out);
 
@@ -1470,10 +1543,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Make output executable
     let perms = fs::Permissions::from_mode(0o755);
     fs::set_permissions(&staged, perms)?;
-    if let Err(e) = fs::rename(&staged, &opts.output) {
-        let _ = fs::remove_file(&staged);
-        return Err(e);
-    }
+    fs::rename(&staged, &opts.output)?;
 
     let output_size = fs::metadata(&opts.output).map(|m| m.len()).unwrap_or(0);
 
@@ -1636,7 +1706,10 @@ fn elf_needs_bundled_lib(data: &[u8]) -> bool {
         return false;
     }
     match goblin::elf::Elf::parse(data) {
-        Ok(elf) => elf.libraries.contains(&ONELF_ENV_SONAME),
+        Ok(elf) => elf
+            .libraries
+            .iter()
+            .any(|l| *l == ONELF_ENV_SONAME || *l == ONELF_ENV32_SONAME),
         Err(_) => false,
     }
 }

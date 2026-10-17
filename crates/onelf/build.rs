@@ -632,7 +632,14 @@ fn build_env(cargo: &Path, payloads_dir: &Path, out_dir: &Path, p: &Payload, cc:
         "-Crelocation-model=pic".to_string(),
         format!("-Clinker={cc}"),
         "-Clink-arg=-nostdlib".to_string(),
-        "-Clink-arg=-Wl,-soname,libonelf-env.so".to_string(),
+        format!(
+            "-Clink-arg=-Wl,-soname,{}",
+            if p.arch == "i686" {
+                "libonelf-env32.so"
+            } else {
+                "libonelf-env.so"
+            }
+        ),
         "-Clink-arg=-Wl,--build-id=none".to_string(),
     ]);
     run_payload_cargo(
