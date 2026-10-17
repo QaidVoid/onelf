@@ -306,11 +306,11 @@ Exit codes:
 
 | Runtime | Size | Self-update | Records an update URL |
 |---------|------|-------------|----------------------|
-| slim | 896 KB | no | no |
-| slim, `embed = false` | 896 KB | no | yes |
-| update | 2.22 MB | yes | yes |
+| slim | 1092 KB | no | no |
+| slim, `embed = false` | 1092 KB | no | yes |
+| update | 2.37 MB | yes | yes |
 
-Measured on rustc 1.98.1, x86_64 musl, release profile. This table is
+Measured on rustc 1.99.1, x86_64 musl, release profile. This table is
 the one source of these numbers; other pages link here rather than
 restating them.
 

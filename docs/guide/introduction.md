@@ -71,7 +71,7 @@ rather than a scan of the packer's machine.
 
 ```
 +-------------------------------------+
-| onelf-rt (static musl runtime)      |  896 KB slim, 2.2 MB with the updater
+| onelf-rt (static musl runtime)      |  1.1 MB slim, 2.4 MB with the updater
 +-------------------------------------+
 | Manifest (zstd-compressed)          |  File tree, entrypoints, metadata
 +-------------------------------------+
@@ -98,7 +98,7 @@ When you execute the file:
 ## When to use onelf
 
 - You want to distribute a Linux app as one file without `.deb`/`.rpm`/flathub/etc.
-- You're okay with about 900 KB of runtime per package, or 2.2 MB with
+- You're okay with about 1.1 MB of runtime per package, or 2.4 MB with
   the self-updater.
 - You want the app to leave no trace when it exits.
 - You want delta self-updates without bundling `zsync`.
