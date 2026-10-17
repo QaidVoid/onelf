@@ -97,6 +97,7 @@ by anything else.
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
 | `ONELF_ENTRYPOINT` | Select the entrypoint by name, ahead of `argv[0]` and the default, unless it equals the inherited `ONELF_ENTRYPOINT_EXPORTED`. See [Entrypoints](../guide/entrypoints). |
 | `ONELF_FUSE_NO_NAMESPACE` | Any value other than empty or `0` forces the `fusermount3` fallback path even when user namespaces are available, and keeps `[paths]` from being mounted. Useful for debugging mount visibility. |
+| `FUSERMOUNT_PROG` | Path or name of the setuid helper the FUSE mode mounts through when it cannot use a user namespace, instead of `fusermount3` or a setuid `fusermount` on `PATH`. The AppImage runtime reads the same variable. |
 | `ONELF_FUSE_CACHE_BYTES` | Byte ceiling for the FUSE server's cache of decompressed blocks. Default 32 MiB; a value that does not parse or is zero keeps the default. |
 | `ONELF_CACHE` | `1` (any value other than empty or `0`) allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |
 | `ONELF_NO_RESOLVER` | `1` launches with nothing taken from the host, as if the package were packed with `host-libs = never`. The way to tell whether a failure is the resolver's doing. |

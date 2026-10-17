@@ -115,7 +115,9 @@ and removed. A mount whose owner is alive is never touched.
 
 **Requirements:**
 
-- `fusermount3` binary on `$PATH`.
+- `fusermount3` on `$PATH`. Without it, FUSE 2's `fusermount` is used
+  when it is setuid root, since it passes `/dev/fuse` back the same way.
+  `FUSERMOUNT_PROG` names a helper outright.
 
 ## Mode 4: Ephemeral tmpfs (no FUSE available)
 

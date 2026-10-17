@@ -4,15 +4,18 @@
 //! directly on /dev/fuse. No external helper, mount is invisible outside
 //! our namespace, and the kernel tears it down automatically on exit.
 //!
-//! Fallback: the legacy fusermount3 helper protocol (socketpair + SCM_RIGHTS)
-//! for systems where unprivileged user namespaces are disabled.
+//! Fallback: the setuid helper protocol of `fusermount3` (socketpair +
+//! SCM_RIGHTS) for systems where unprivileged user namespaces are disabled.
+//! [`helper`] picks the helper.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rustix::io::FdFlags;
@@ -163,12 +166,53 @@ pub fn fuse_unmount_direct(mountpoint: &Path) {
     let _ = unmount(mountpoint, UnmountFlags::DETACH);
 }
 
-/// Mount a FUSE filesystem via fusermount3 and return the /dev/fuse fd.
+/// The setuid helper that mounts for an unprivileged process: the one
+/// `FUSERMOUNT_PROG` names, else `fusermount3`, else a `fusermount` that
+/// is setuid root, each looked up on `PATH`.
 ///
-/// Uses the fusermount3 protocol: create a socketpair, pass one end to
-/// fusermount3 via `_FUSE_COMMFD`, then receive the /dev/fuse fd via
-/// SCM_RIGHTS on the other end.
+/// `fusermount` from FUSE 2 speaks the same protocol as `fusermount3`. It
+/// takes the socket from `_FUSE_COMMFD`, opens `/dev/fuse`, mounts, sends
+/// the descriptor back with `SCM_RIGHTS`, and knows the same mount options
+/// and `-u -z -q`. The kernel protocol is negotiated by the server once it
+/// holds the descriptor, so the helper's major version does not matter.
+/// Only a setuid one can mount for an ordinary user, and on some hosts
+/// `fusermount` is a leftover without the bit.
+pub fn helper() -> Option<PathBuf> {
+    helper_in(
+        std::env::var_os("FUSERMOUNT_PROG"),
+        std::env::var_os("PATH"),
+        rustix::process::geteuid().is_root(),
+    )
+}
+
+fn helper_in(prog: Option<OsString>, path: Option<OsString>, root: bool) -> Option<PathBuf> {
+    if let Some(prog) = prog.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(prog));
+    }
+    let path = path.unwrap_or_else(|| "/usr/bin:/bin".into());
+    let find = |name: &str| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+    };
+    find("fusermount3").or_else(|| {
+        find("fusermount").filter(|p| {
+            root || std::fs::metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o4000 != 0)
+        })
+    })
+}
+
+/// Mount a FUSE filesystem through [`helper`] and return the /dev/fuse fd.
+///
+/// Create a socketpair, pass one end to the helper via `_FUSE_COMMFD`,
+/// then receive the /dev/fuse fd via SCM_RIGHTS on the other end.
 pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
+    let helper = helper().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no fusermount3 or setuid fusermount",
+        )
+    })?;
     let (sock_parent, sock_child) = socketpair(
         AddressFamily::UNIX,
         SocketType::STREAM,
@@ -180,7 +224,7 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
     let child_fd = sock_child.as_raw_fd();
 
     let status = unsafe {
-        Command::new("fusermount3")
+        Command::new(&helper)
             .args([
                 "-o",
                 &format!("ro,nosuid,nodev,noatime,{FUSE_PERM_OPTS}"),
@@ -189,7 +233,7 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
             .arg(mountpoint)
             .env("_FUSE_COMMFD", child_fd.to_string())
             .pre_exec(move || {
-                // Clear CLOEXEC so fusermount3 inherits this fd
+                // Clear CLOEXEC so the helper inherits this fd
                 let fd = BorrowedFd::borrow_raw(child_fd);
                 let flags = rustix::io::fcntl_getfd(fd).map_err(io::Error::other)?;
                 rustix::io::fcntl_setfd(fd, flags.difference(FdFlags::CLOEXEC))
@@ -198,14 +242,15 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
             })
             .status()
     }
-    .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("fusermount3: {e}")))?;
+    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", helper.display())))?;
 
-    // Drop child end so recvmsg doesn't block forever if fusermount3 failed
+    // Drop child end so recvmsg doesn't block forever if the helper failed
     drop(sock_child);
 
     if !status.success() {
         return Err(io::Error::other(format!(
-            "fusermount3 exited with {status}"
+            "{} exited with {status}",
+            helper.display()
         )));
     }
 
@@ -236,26 +281,67 @@ pub fn fuse_mount(mountpoint: &Path) -> io::Result<OwnedFd> {
         }
     }
 
-    Err(io::Error::other("fusermount3 did not send /dev/fuse fd"))
+    Err(io::Error::other(format!(
+        "{} did not send /dev/fuse fd",
+        helper.display()
+    )))
 }
 
-/// Unmount a FUSE filesystem via fusermount3 -u.
+/// Unmount a FUSE filesystem via [`helper`] `-u`.
 /// Uses lazy unmount (-z) to handle dead mounts where the FUSE daemon exited.
 pub fn fuse_unmount(mountpoint: &Path) {
-    let _ = Command::new("fusermount3")
+    let Some(helper) = helper() else {
+        return;
+    };
+    let _ = Command::new(helper)
         .args(["-u", "-z", "-q", "--"])
         .arg(mountpoint)
         .status();
 }
 
-/// Check if fusermount3 is available on the system.
+/// Whether a mount helper is available: `fusermount3`, or one of the
+/// others [`helper`] accepts.
 pub fn fusermount3_available() -> bool {
-    Command::new("fusermount3")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    helper().is_some()
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::helper_in;
+
+    /// `fusermount` was never tried, so a host with only FUSE 2's helper
+    /// had no mount helper at all. It is taken when nothing better is
+    /// there and it can mount: setuid root, or a caller that is root.
+    #[test]
+    fn fusermount_is_the_fallback_when_it_can_mount() {
+        let dir = std::env::temp_dir().join(format!("onelf-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Some(dir.clone().into_os_string());
+        let legacy = dir.join("fusermount");
+        std::fs::write(&legacy, "").unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            helper_in(None, path.clone(), false),
+            None,
+            "a fusermount without the setuid bit cannot mount for a user"
+        );
+        assert_eq!(helper_in(None, path.clone(), true), Some(legacy));
+
+        let current = dir.join("fusermount3");
+        std::fs::write(&current, "").unwrap();
+        assert_eq!(helper_in(None, path.clone(), false), Some(current));
+
+        assert_eq!(
+            helper_in(Some("/opt/fuse/fusermount".into()), path, false),
+            Some("/opt/fuse/fusermount".into()),
+            "FUSERMOUNT_PROG names the helper"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
