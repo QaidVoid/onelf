@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::loader::PackageData;
 use crate::metadata::{resolve_desktop, resolve_icon};
-use onelf_format::desktop::patch_desktop_file;
+use onelf_format::desktop::{entry_icon, icon_set, patch_desktop_file};
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
@@ -58,15 +58,6 @@ fn integration_name(pkg: &PackageData, pkg_name: &str, ep_name: &str) -> String 
     } else {
         format!("onelf-{}-{}", sanitize(pkg_name), sanitize(ep_name))
     }
-}
-
-fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    if data.len() < 24 || data[0..8] != *b"\x89PNG\r\n\x1a\n" {
-        return None;
-    }
-    let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
-    Some((w, h))
 }
 
 fn remove_icons(hicolor: &Path, int_name: &str) -> bool {
@@ -168,51 +159,39 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
         remove_icons(&hicolor, &int_name);
     }
 
-    // Install icon
-    let icon_name = if let Some(icon_idx) = resolve_icon(&pkg.manifest, ep_name) {
-        match read_entry(pkg, icon_idx) {
-            Ok(icon_data) => {
-                let icon_path = pkg.manifest.entry_path(icon_idx);
-                let dest = if icon_path.ends_with(".svg") {
-                    let dir = data_home.join("icons/hicolor/scalable/apps");
-                    let _ = fs::create_dir_all(&dir);
-                    Some(dir.join(format!("{int_name}.svg")))
-                } else if let Some((w, h)) = png_dimensions(&icon_data) {
-                    let dir = data_home.join(format!("icons/hicolor/{w}x{h}/apps"));
-                    let _ = fs::create_dir_all(&dir);
-                    Some(dir.join(format!("{int_name}.png")))
-                } else {
-                    // An arbitrary file named .png is not a PNG: installing
-                    // it under that name gives the theme a broken image.
-                    eprintln!(
-                        "onelf-rt: icon {} is neither SVG nor a decodable PNG; not installed",
-                        icon_path
-                    );
-                    None
-                };
+    let desktop = resolve_desktop(&pkg.manifest, ep_name)
+        .and_then(|idx| read_entry(pkg, idx).ok())
+        .map(|raw| String::from_utf8(raw).unwrap_or_default());
 
-                match dest {
-                    Some(dest) => match fs::write(&dest, &icon_data) {
-                        Ok(()) => {
-                            eprintln!("  Icon: {}", dest.display());
-                            Some(int_name.clone())
-                        }
-                        Err(e) => {
-                            eprintln!("onelf-rt: failed to write icon: {e}");
-                            None
-                        }
-                    },
-                    None => None,
-                }
-            }
-            Err(e) => {
-                eprintln!("onelf-rt: failed to read icon: {e}");
-                None
-            }
-        }
-    } else {
-        None
+    let mut names = vec![ep_name, pkg_name.as_str()];
+    if let Some(icon) = desktop.as_deref().and_then(entry_icon) {
+        names.insert(0, icon);
+    }
+    let bundled = resolve_icon(&pkg.manifest, ep_name);
+    let read = |i: usize| {
+        crate::loader::read_verified_entry(
+            &mut pkg.file,
+            &pkg.footer,
+            &pkg.manifest.entries[i],
+            pkg.dict.as_deref(),
+        )
     };
+    let icons = icon_set(&pkg.manifest, &names, bundled, read).unwrap_or_else(|e| {
+        eprintln!("onelf-rt: failed to read icon: {e}");
+        Vec::new()
+    });
+    let mut icon_name = None;
+    for icon in icons {
+        let dir = hicolor.join(&icon.size).join("apps");
+        let dest = dir.join(format!("{int_name}.{}", icon.ext));
+        match fs::create_dir_all(&dir).and_then(|()| fs::write(&dest, &icon.data)) {
+            Ok(()) => {
+                eprintln!("  Icon: {}", dest.display());
+                icon_name = Some(int_name.clone());
+            }
+            Err(e) => eprintln!("onelf-rt: failed to write icon: {e}"),
+        }
+    }
 
     // Install desktop file
     let desktop_dir = data_home.join("applications");
@@ -222,18 +201,9 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
     }
     let dest = desktop_dir.join(format!("{int_name}.desktop"));
 
-    let content = if let Some(desktop_idx) = resolve_desktop(&pkg.manifest, ep_name) {
-        match read_entry(pkg, desktop_idx) {
-            Ok(raw) => {
-                let text = String::from_utf8(raw).unwrap_or_default();
-                patch_desktop_file(&text, exec_path, exec_entrypoint, icon_name.as_deref())
-            }
-            Err(_) => {
-                generate_desktop_file(&pkg_name, exec_path, exec_entrypoint, icon_name.as_deref())
-            }
-        }
-    } else {
-        generate_desktop_file(&pkg_name, exec_path, exec_entrypoint, icon_name.as_deref())
+    let content = match desktop {
+        Some(text) => patch_desktop_file(&text, exec_path, exec_entrypoint, icon_name.as_deref()),
+        None => generate_desktop_file(&pkg_name, exec_path, exec_entrypoint, icon_name.as_deref()),
     };
 
     if let Err(e) = fs::write(&dest, content.as_bytes()) {

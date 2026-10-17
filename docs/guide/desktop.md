@@ -52,9 +52,10 @@ Resolution order for desktop files:
 2. `.onelf/desktop/default.desktop`
 
 ☑️ Copies under `share/` serve the running app itself (e.g. GTK icon
-theme lookups). ✅ For the menu entry and icon, put them under
+theme lookups). ✅ For the menu entry, put the desktop file under
 `.onelf/` instead: that is the location the extraction and desktop
-integration commands read.
+integration commands read. Integration also installs the app's theme
+icons at every size it ships, as described below.
 
 ## Integrate with the desktop
 
@@ -69,10 +70,16 @@ onelf integrate ./myapp.onelf
 ```
 
 This installs:
-- The icon to `$XDG_DATA_HOME/icons/hicolor/scalable/apps/onelf-myapp.svg`,
-  or for a PNG to `hicolor/<W>x<H>/apps/onelf-myapp.png` at the size its
-  header gives. An icon that is neither SVG nor a readable PNG is not
-  installed.
+- Every icon size the package carries into
+  `$XDG_DATA_HOME/icons/hicolor/`, each named `onelf-myapp`:
+  - each `icons/hicolor/<size>/apps/<icon>.png` or `.svg` the package
+    ships anywhere in its tree, at that `<size>`. `<icon>` is the bundled
+    desktop file's `Icon=` name, or failing that the entrypoint or
+    package name.
+  - the `.onelf/icons` icon, an SVG to `scalable/` and a PNG at the
+    `<W>x<H>` its header gives. It replaces a theme icon of that size.
+
+  An icon that is neither SVG nor a readable PNG is not installed.
 - A `.desktop` file to `$XDG_DATA_HOME/applications/onelf-myapp.desktop`
 
 `$XDG_DATA_HOME` defaults to `~/.local/share`. `myapp` here is the
@@ -94,6 +101,8 @@ onelf unintegrate ./myapp.onelf
 # Or:
 ./myapp.onelf --onelf-unintegrate
 ```
+
+This removes the desktop file and the icon at every size.
 
 ## Selecting an entrypoint
 
@@ -168,8 +177,17 @@ binary's absolute path automatically, keeping any arguments and field
 codes after it. The `Icon=` field is set to the installed icon's theme
 name.
 
-⚠️ Only the `[Desktop Entry]` group is patched. An `Exec=` inside a
-`[Desktop Action ...]` group is left as written.
+✅ Actions work the same way. The `Exec=` of every `[Desktop Action ...]`
+group is rewritten to launch the package the same way as the entry's,
+and the action's own arguments are kept:
+
+```ini
+[Desktop Action new-window]
+Name=New Window
+Exec=myapp --new-window
+```
+
+becomes `Exec=/path/to/myapp.onelf --new-window`.
 
 ✅ Multiple entrypoints: use their argv[0] names:
 

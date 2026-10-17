@@ -10293,6 +10293,99 @@ fn a_second_entrypoint_integrates_beside_the_first() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Integration installs every icon size the package carries, from the
+/// theme it ships and from `.onelf/icons`, and unintegration removes them
+/// all. Only the one `.onelf/icons` file used to be installed.
+#[test]
+fn integration_installs_every_icon_size() {
+    let td = workdir("iconsizes");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let png = |side: u32| {
+        let mut data = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        data.extend(side.to_be_bytes());
+        data.extend(side.to_be_bytes());
+        data
+    };
+    for side in [48, 256] {
+        let dir = app.join(format!("share/icons/hicolor/{side}x{side}/apps"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("viewer.png"), png(side)).unwrap();
+    }
+    write(
+        &app.join("share/icons/hicolor/scalable/apps/viewer.svg"),
+        "<svg/>",
+    );
+    write(&app.join("share/icons/hicolor/32x32/apps/other.png"), "x");
+    std::fs::create_dir_all(app.join(".onelf/icons")).unwrap();
+    std::fs::write(app.join(".onelf/icons/default.png"), png(64)).unwrap();
+    write(
+        &app.join(".onelf/desktop/default.desktop"),
+        "[Desktop Entry]\nName=My App\nExec=run\nIcon=viewer\n",
+    );
+    let pkg = td.join("myapp.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--name", "myapp"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let data_home = td.join("share");
+    let hicolor = data_home.join("icons/hicolor");
+    let installed = [
+        "48x48/apps/onelf-myapp.png",
+        "256x256/apps/onelf-myapp.png",
+        "64x64/apps/onelf-myapp.png",
+        "scalable/apps/onelf-myapp.svg",
+    ];
+    for runtime in [false, true] {
+        for flag in ["integrate", "unintegrate"] {
+            let mut cmd = if runtime {
+                let mut cmd = Command::new(&pkg);
+                cmd.arg(format!("--onelf-{flag}"));
+                isolate(&mut cmd, &td);
+                cmd
+            } else {
+                let mut cmd = Command::new(onelf());
+                cmd.args([flag, pkg.to_str().unwrap()]);
+                cmd
+            };
+            cmd.env("XDG_DATA_HOME", &data_home).env("HOME", &td);
+            let out = run_package(&mut cmd);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            for rel in installed {
+                assert_eq!(
+                    hicolor.join(rel).is_file(),
+                    flag == "integrate",
+                    "{flag} (runtime: {runtime}): {rel}"
+                );
+            }
+            if flag == "integrate" {
+                let desktop =
+                    std::fs::read_to_string(data_home.join("applications/onelf-myapp.desktop"))
+                        .unwrap();
+                assert!(desktop.contains("Icon=onelf-myapp\n"), "{desktop}");
+                assert_eq!(
+                    std::fs::read(hicolor.join("64x64/apps/onelf-myapp.png")).unwrap(),
+                    png(64)
+                );
+                assert!(!hicolor.join("32x32").exists(), "another icon's size");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Unintegrating a package that was never integrated removes nothing, and
 /// an icon theme other packages put there does not make it look otherwise.
 #[test]

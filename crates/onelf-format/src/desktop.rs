@@ -1,6 +1,8 @@
-//! Desktop Entry `Exec=` quoting, shared by the packer's and the runtime's
-//! integrators so a binary under a path with a space gets one menu entry
-//! that launches, from either side.
+//! Desktop Entry `Exec=` quoting and the icon set, shared by the packer's
+//! and the runtime's integrators so a binary under a path with a space
+//! gets one menu entry that launches, from either side.
+
+use crate::{EntryKind, Manifest, is_safe_component};
 
 /// Quote one `Exec=` field argument per the Desktop Entry spec, ready to
 /// write into the file: a value containing whitespace or a reserved
@@ -138,9 +140,10 @@ fn without_entrypoint_prefix(value: &str) -> &str {
 /// `Icon=` becomes `icon_name` when given. `entrypoint` is passed to
 /// [`exec_command`].
 ///
-/// Only `[Desktop Entry]` is touched. A desktop file may carry further
-/// groups (`[Desktop Action ...]`) with `Exec=` lines of their own, and
-/// neither their commands nor their presence may decide what the entry
+/// Each `[Desktop Action ...]` group's `Exec=` is rewritten the same way,
+/// keeping the action's own arguments, so a menu action launches the
+/// package as the entry does. Nothing else in an action is touched, and
+/// neither an action's command nor its presence decides what the entry
 /// group gets. Missing keys are inserted right after the
 /// `[Desktop Entry]` header, so they land in that group even when it is
 /// not the last one.
@@ -156,14 +159,16 @@ pub fn patch_desktop_file(
     let mut has_exec = false;
     let mut has_tryexec = false;
     let mut in_entry = false;
+    let mut in_action = false;
 
     for line in &mut lines {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_entry = trimmed == "[Desktop Entry]";
+            in_action = trimmed.starts_with("[Desktop Action ");
             continue;
         }
-        if !in_entry {
+        if !in_entry && !in_action {
             continue;
         }
         if line.starts_with("Exec=") {
@@ -175,7 +180,9 @@ pub fn patch_desktop_file(
             } else {
                 *line = format!("Exec={quoted} {tail}");
             }
-            has_exec = true;
+            has_exec |= in_entry;
+        } else if in_action {
+            continue;
         } else if line.starts_with("TryExec=") {
             *line = format!("TryExec={try_exec}");
             has_tryexec = true;
@@ -204,6 +211,117 @@ pub fn patch_desktop_file(
         result.push('\n');
     }
     result
+}
+
+/// The `Icon=` of the `[Desktop Entry]` group, when it names a theme icon
+/// rather than a file.
+pub fn entry_icon(content: &str) -> Option<&str> {
+    let mut in_entry = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_entry = trimmed == "[Desktop Entry]";
+        } else if in_entry && let Some(value) = line.strip_prefix("Icon=") {
+            let value = value.trim();
+            return (!value.is_empty() && !value.contains('/')).then_some(value);
+        }
+    }
+    None
+}
+
+/// One icon to install into the user's hicolor theme.
+pub struct ThemeIcon {
+    /// The theme's size directory, such as `48x48` or `scalable`.
+    pub size: String,
+    /// `png` or `svg`.
+    pub ext: &'static str,
+    pub data: Vec<u8>,
+}
+
+/// Every icon a package carries for one desktop entry.
+///
+/// That is each `icons/hicolor/<size>/apps/<name>.png` or `.svg` the
+/// package ships, for the first of `names` that has any, and the
+/// `.onelf/icons` icon `bundled` at the size its file gives. The latter is
+/// the one published for integration, so it wins over a theme icon of the
+/// same size. `read` returns an entry's verified bytes. A file that is
+/// neither SVG nor PNG is left out, since the theme would show a broken
+/// image.
+pub fn icon_set(
+    manifest: &Manifest,
+    names: &[&str],
+    bundled: Option<usize>,
+    mut read: impl FnMut(usize) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Vec<ThemeIcon>> {
+    let paths: Vec<(usize, String)> = (0..manifest.entries.len())
+        .filter(|&i| manifest.entries[i].kind == EntryKind::File)
+        .map(|i| (i, manifest.entry_path(i)))
+        .collect();
+    let mut found: Vec<(String, &'static str, usize)> = Vec::new();
+    for name in names {
+        for (i, path) in &paths {
+            if let Some((size, ext)) = theme_slot(path, name)
+                && !found.iter().any(|(s, ..)| *s == size)
+            {
+                found.push((size.to_string(), ext, *i));
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    let mut icons = Vec::new();
+    for (size, ext, i) in found {
+        let data = read(i)?;
+        if ext == "svg" || png_dimensions(&data).is_some() {
+            icons.push(ThemeIcon { size, ext, data });
+        }
+    }
+    if let Some(i) = bundled {
+        let data = read(i)?;
+        let path = manifest.entry_path(i);
+        let slot = if path.ends_with(".svg") {
+            Some(("scalable".to_string(), "svg"))
+        } else {
+            png_dimensions(&data).map(|(w, h)| (format!("{w}x{h}"), "png"))
+        };
+        match slot {
+            Some((size, ext)) => {
+                icons.retain(|icon| icon.size != size);
+                icons.push(ThemeIcon { size, ext, data });
+            }
+            None => eprintln!("  Icon {path}: neither SVG nor a decodable PNG; not installed"),
+        }
+    }
+    Ok(icons)
+}
+
+/// The size directory and extension of `path` when it is
+/// `icons/hicolor/<size>/apps/<name>.png` or `.svg`, anywhere in the tree.
+fn theme_slot<'p>(path: &'p str, name: &str) -> Option<(&'p str, &'static str)> {
+    const THEME: &str = "icons/hicolor/";
+    let at = if path.starts_with(THEME) {
+        0
+    } else {
+        path.find("/icons/hicolor/")? + 1
+    };
+    let (size, file) = path[at + THEME.len()..].split_once("/apps/")?;
+    let ext = match file.strip_prefix(name)? {
+        ".png" => "png",
+        ".svg" => "svg",
+        _ => return None,
+    };
+    is_safe_component(size).then_some((size, ext))
+}
+
+/// Width and height from a PNG's IHDR chunk.
+fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 || data[0..8] != *b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
+    Some((w, h))
 }
 
 #[cfg(test)]
@@ -278,9 +396,8 @@ mod tests {
 
     #[test]
     fn an_exec_in_an_action_group_does_not_speak_for_the_entry() {
-        // The entry carries no Exec; the action does. The action's Exec
-        // must survive untouched, and the missing keys must land in the
-        // entry group, not at EOF inside the action.
+        // The entry carries no Exec; the action does. The missing keys
+        // must land in the entry group, not at EOF inside the action.
         let desktop = "[Desktop Entry]\nType=Application\nName=App\n\
                       [Desktop Action new-window]\nExec=/opt/old/app --new\n";
         let out = patch_desktop_file(desktop, "/opt/new/app", None, None);
@@ -296,9 +413,73 @@ mod tests {
             "the entry got its TryExec: {out}"
         );
         assert!(
-            action.contains("Exec=/opt/old/app --new"),
-            "the action's own Exec survives: {out}"
+            action.contains("Exec=/opt/new/app --new\n"),
+            "the action launches the package with its own arguments: {out}"
         );
+        assert!(!action.contains("TryExec"), "{out}");
+    }
+
+    /// An action's Exec still named the command it was written with, so
+    /// every menu action of an integrated package failed to start.
+    #[test]
+    fn actions_launch_the_package_through_the_entrypoint() {
+        let desktop = "[Desktop Entry]\nExec=myapp %U\nActions=new;private;\n\
+                       [Desktop Action new]\nName=New\nExec=myapp --new-window %U\nIcon=keep\n\
+                       [Desktop Action private]\nExec=\"/opt/my app/app\" --private\n\
+                       [X-Other]\nExec=leave me\n";
+        let out = patch_desktop_file(desktop, "/opt/app.onelf", Some("daemon"), Some("icon"));
+        let launch = "env ONELF_ENTRYPOINT=daemon /opt/app.onelf";
+        assert!(out.contains(&format!("Exec={launch} %U\n")), "{out}");
+        assert!(
+            out.contains(&format!("Exec={launch} --new-window %U\n")),
+            "{out}"
+        );
+        assert!(out.contains(&format!("Exec={launch} --private\n")), "{out}");
+        assert!(
+            out.contains("Icon=keep\n"),
+            "an action's icon is its own: {out}"
+        );
+        assert!(
+            out.contains("Exec=leave me\n"),
+            "other groups are left: {out}"
+        );
+        assert_eq!(out.matches("TryExec=").count(), 1, "{out}");
+
+        let again = patch_desktop_file(&out, "/new/app.onelf", None, None);
+        assert!(
+            again.contains("Exec=/new/app.onelf --new-window %U\n"),
+            "{again}"
+        );
+        assert!(again.contains("Exec=/new/app.onelf --private\n"), "{again}");
+    }
+
+    #[test]
+    fn theme_icons_are_found_at_every_size() {
+        assert_eq!(
+            theme_slot("share/icons/hicolor/48x48/apps/app.png", "app"),
+            Some(("48x48", "png"))
+        );
+        assert_eq!(
+            theme_slot("icons/hicolor/scalable/apps/app.svg", "app"),
+            Some(("scalable", "svg"))
+        );
+        assert_eq!(
+            theme_slot("usr/share/icons/hicolor/32x32/apps/app.xpm", "app"),
+            None
+        );
+        assert_eq!(
+            theme_slot("share/icons/hicolor/48x48/apps/app2.png", "app"),
+            None
+        );
+        assert_eq!(
+            theme_slot("share/icons/hicolor/../apps/app.png", "app"),
+            None
+        );
+        assert_eq!(
+            entry_icon("[Desktop Entry]\nIcon=app\n[Desktop Action a]\nIcon=b\n"),
+            Some("app")
+        );
+        assert_eq!(entry_icon("[Desktop Entry]\nIcon=/opt/app.png\n"), None);
     }
 
     #[test]

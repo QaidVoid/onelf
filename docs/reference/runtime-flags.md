@@ -17,8 +17,8 @@ selected (see [Entrypoints](../guide/entrypoints)).
 
 | Flag | Action |
 |------|--------|
-| `--onelf-integrate` | Install icon and `.desktop` file to XDG directories, then exit |
-| `--onelf-unintegrate` | Remove icon and `.desktop` file installed by integrate, then exit |
+| `--onelf-integrate` | Install every icon size and the `.desktop` file to XDG directories, then exit |
+| `--onelf-unintegrate` | Remove the icons and `.desktop` file installed by integrate, then exit |
 
 ## Self-update
 

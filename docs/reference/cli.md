@@ -219,12 +219,15 @@ Install desktop shortcut and icon for a packed binary.
 onelf integrate BINARY [--entrypoint NAME]
 ```
 
-Installs the icon to `$XDG_DATA_HOME/icons/hicolor/` and a `.desktop`
-file to `$XDG_DATA_HOME/applications/`. Both are named `onelf-<name>`,
+Installs every icon size the package carries to
+`$XDG_DATA_HOME/icons/hicolor/` and a `.desktop` file to
+`$XDG_DATA_HOME/applications/` (see
+[Desktop Integration](../guide/desktop#integrate-with-the-desktop)). Both are named `onelf-<name>`,
 or `onelf-<name>-<entrypoint>` for an entrypoint other than the default,
 so integrating a second entrypoint does not replace the first. The
-`Exec=`, `TryExec=`, and `Icon=` fields are patched automatically. If
-the package has no bundled desktop file, a minimal one is generated.
+`Exec=`, `TryExec=`, and `Icon=` fields are patched automatically, and
+so is the `Exec=` of every desktop action. If the package has no bundled
+desktop file, a minimal one is generated.
 
 | Flag | Description |
 |------|-------------|
@@ -237,7 +240,7 @@ not start on its own, `Exec=` runs it as
 
 ## `onelf unintegrate`
 
-Remove desktop shortcut and icon installed by `integrate`. Pass the same
+Remove desktop shortcut and icons installed by `integrate`. Pass the same
 `--entrypoint` that was integrated.
 
 ```

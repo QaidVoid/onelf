@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::desktop::{exec_command, patch_desktop_file, string_value};
+use onelf_format::desktop::{entry_icon, exec_command, icon_set, patch_desktop_file, string_value};
 use onelf_format::{Footer, Manifest};
 
 use crate::extract::decompress_verified;
@@ -170,57 +170,53 @@ impl IntegrationContext {
     }
 }
 
-/// Read width and height from a PNG IHDR chunk.
-fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    if data.len() < 24 || data[0..8] != *b"\x89PNG\r\n\x1a\n" {
-        return None;
-    }
-    let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
-    Some((w, h))
+/// The bundled desktop file, if the package carries one.
+fn bundled_desktop(ctx: &IntegrationContext) -> io::Result<Option<String>> {
+    let Some(idx) = resolve_desktop(&ctx.manifest, &ctx.ep_name) else {
+        return Ok(None);
+    };
+    String::from_utf8(ctx.read_entry(idx)?)
+        .map(Some)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "desktop file is not valid UTF-8",
+            )
+        })
 }
 
-/// Install the icon and return the icon theme name for the `Icon=` field.
-fn install_icon(
+/// Install every icon size the package carries and return the icon theme
+/// name for the `Icon=` field.
+fn install_icons(
     ctx: &IntegrationContext,
+    desktop: Option<&str>,
     data_home: &Path,
     int_name: &str,
 ) -> io::Result<Option<String>> {
-    let icon_idx = match resolve_icon(&ctx.manifest, &ctx.ep_name) {
-        Some(idx) => idx,
-        None => return Ok(None),
-    };
-
-    let icon_data = ctx.read_entry(icon_idx)?;
-    let icon_path = ctx.manifest.entry_path(icon_idx);
-
-    let dest = if icon_path.ends_with(".svg") {
-        let dir = data_home.join("icons/hicolor/scalable/apps");
+    let mut names = vec![ctx.ep_name.as_str(), ctx.pkg_name.as_str()];
+    if let Some(icon) = desktop.and_then(entry_icon) {
+        names.insert(0, icon);
+    }
+    let bundled = resolve_icon(&ctx.manifest, &ctx.ep_name);
+    let icons = icon_set(&ctx.manifest, &names, bundled, |i| ctx.read_entry(i))?;
+    let installed = !icons.is_empty();
+    for icon in icons {
+        let dir = data_home
+            .join("icons/hicolor")
+            .join(&icon.size)
+            .join("apps");
         fs::create_dir_all(&dir)?;
-        dir.join(format!("{int_name}.svg"))
-    } else if let Some((w, h)) = png_dimensions(&icon_data) {
-        let dir = data_home.join(format!("icons/hicolor/{w}x{h}/apps"));
-        fs::create_dir_all(&dir)?;
-        dir.join(format!("{int_name}.png"))
-    } else {
-        // An arbitrary file named .png is not a PNG: installing it under
-        // that name gives the theme a broken image.
-        eprintln!(
-            "  Icon {}: neither SVG nor a decodable PNG; not installed",
-            icon_path
-        );
-        return Ok(None);
-    };
-
-    fs::write(&dest, &icon_data)?;
-    eprintln!("  Icon: {}", dest.display());
-
-    Ok(Some(int_name.to_string()))
+        let dest = dir.join(format!("{int_name}.{}", icon.ext));
+        fs::write(&dest, &icon.data)?;
+        eprintln!("  Icon: {}", dest.display());
+    }
+    Ok(installed.then(|| int_name.to_string()))
 }
 
 /// Install the desktop file, patching or generating as needed.
 fn install_desktop(
     ctx: &IntegrationContext,
+    desktop: Option<&str>,
     data_home: &Path,
     int_name: &str,
     icon_name: Option<&str>,
@@ -231,16 +227,9 @@ fn install_desktop(
 
     let exec_path = ctx.binary.to_str().unwrap_or("");
 
-    let content = match resolve_desktop(&ctx.manifest, &ctx.ep_name) {
-        Some(idx) => {
-            let raw = ctx.read_entry(idx)?;
-            let text = String::from_utf8(raw).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "desktop file is not valid UTF-8",
-                )
-            })?;
-            patch_desktop_file(&text, exec_path, ctx.exec_entrypoint.as_deref(), icon_name)
+    let content = match desktop {
+        Some(text) => {
+            patch_desktop_file(text, exec_path, ctx.exec_entrypoint.as_deref(), icon_name)
         }
         None => generate_desktop_file(
             &ctx.pkg_name,
@@ -330,8 +319,15 @@ pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
         let _ = remove_icons(&hicolor, &int_name);
     }
 
-    let icon_name = install_icon(&ctx, &data_home, &int_name)?;
-    install_desktop(&ctx, &data_home, &int_name, icon_name.as_deref())?;
+    let desktop = bundled_desktop(&ctx)?;
+    let icon_name = install_icons(&ctx, desktop.as_deref(), &data_home, &int_name)?;
+    install_desktop(
+        &ctx,
+        desktop.as_deref(),
+        &data_home,
+        &int_name,
+        icon_name.as_deref(),
+    )?;
     update_desktop_database(&data_home);
 
     eprintln!("Integrated '{}'", ctx.pkg_name);
