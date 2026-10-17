@@ -203,7 +203,14 @@ impl BlockCache {
 struct TraceRecorder {
     file: File,
     seen: HashSet<usize>,
+    /// Set once the launcher looks up [`TRACE_ARM`], just before it
+    /// hands over to the app. Until then the reads are the runtime's.
+    armed: bool,
 }
+
+/// The name the launcher looks up in the mount's root to start a trace.
+/// No package entry has it: the lookup arms the recorder and fails.
+pub(crate) const TRACE_ARM: &str = ".onelf-trace-arm";
 
 impl TraceRecorder {
     /// A recorder when `ONELF_TRACE` names a writable file, else none.
@@ -218,13 +225,14 @@ impl TraceRecorder {
         Some(Self {
             file,
             seen: HashSet::new(),
+            armed: false,
         })
     }
 
     /// Write entry `idx`'s sysroot path once. Directories are skipped:
     /// only files and symlinks appear in a package database's file list.
     fn record(&mut self, idx: usize, manifest: &Manifest) {
-        if !self.seen.insert(idx) {
+        if !self.armed || !self.seen.insert(idx) {
             return;
         }
         let entry = &manifest.entries[idx];
@@ -787,6 +795,13 @@ fn handle_lookup(
         Ok(s) => s,
         Err(_) => return reply_err(header, -libc_enoent()),
     };
+
+    if parent_inode == entry_to_inode(0) && name_str == TRACE_ARM {
+        if let Some(rec) = recorder {
+            rec.armed = true;
+        }
+        return reply_err(header, -libc_enoent());
+    }
 
     let ch = &children[parent_inode as usize];
     for &child_inode in ch {

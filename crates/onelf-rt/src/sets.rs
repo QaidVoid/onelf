@@ -187,8 +187,10 @@ fn mount(file: &Path, hash: &str) -> Result<Obtained, String> {
             // The inherited lock is the parent's claim, not the server's:
             // closing this descriptor leaves the parent's open file
             // description holding it, and lets the server ask whether
-            // anyone still does.
+            // anyone still does. The creation lock goes too, or the server
+            // would hold it for as long as it serves.
             drop(lock);
+            drop(_creating);
             serve(file, &mountpoint);
         }
         Ok(Fork::ParentOf(child)) => {
@@ -252,9 +254,15 @@ fn serve(file: &Path, mountpoint: &Path) -> ! {
             &pkg.footer,
             pkg.dict.as_deref(),
         );
+        // Opened now, while the file is certain to exist: if the runtime
+        // directory is cleaned out from under the server, this is what
+        // still says whether a launch holds the claim.
+        let original = lock_path.as_deref().and_then(|p| fs::File::open(p).ok());
         let mut buf = vec![0u8; 1024 * 1024 + 4096];
         state.serve_detached(&fuse_fd, &mut buf, || {
-            lock_path.as_deref().is_none_or(unclaimed)
+            lock_path
+                .as_deref()
+                .is_none_or(|p| unclaimed(p, original.as_ref()))
         });
         drop(fuse_fd);
         Ok(())
@@ -270,12 +278,20 @@ fn serve(file: &Path, mountpoint: &Path) -> ! {
 /// Whether nobody holds the mountpoint's shared lock any more, which is
 /// what says the last package using this set is gone. Tested on a fresh
 /// descriptor each time, since a lock belongs to the open file
-/// description that took it.
-fn unclaimed(lock_path: &Path) -> bool {
-    let Ok(lock) = fs::File::open(lock_path) else {
-        return false;
+/// description that took it and a later launch may have made the file
+/// anew. A lock file that is gone is asked through `original`, the
+/// descriptor the server opened at the start: the launches holding the
+/// claim hold it on that file, so a cleaned-out runtime directory neither
+/// keeps the server forever nor ends it under a running app.
+fn unclaimed(lock_path: &Path, original: Option<&fs::File>) -> bool {
+    let probe = |lock: &fs::File| {
+        rustix::fs::flock(lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
     };
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok()
+    match fs::File::open(lock_path) {
+        Ok(lock) => probe(&lock),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => original.is_none_or(probe),
+        Err(_) => false,
+    }
 }
 
 /// Every directory in the set that holds a shared object, `lib` first.
@@ -317,6 +333,33 @@ pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_file_cleaned_away_is_asked_through_the_original() {
+        let dir = std::env::temp_dir().join(format!("onelf-unclaimed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("set.lock");
+        fs::write(&path, b"").unwrap();
+        let original = fs::File::open(&path).unwrap();
+        let claim = fs::File::open(&path).unwrap();
+        rustix::fs::flock(&claim, rustix::fs::FlockOperation::LockShared).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            !unclaimed(&path, Some(&original)),
+            "a launch still holds the claim on the removed file"
+        );
+        drop(claim);
+        assert!(
+            unclaimed(&path, Some(&original)),
+            "the last claim is gone, so the server may go"
+        );
+        assert!(
+            unclaimed(&path, None),
+            "nothing to ask means nobody claims it"
+        );
+    }
 
     #[test]
     fn a_record_yields_one_pin_per_table() {

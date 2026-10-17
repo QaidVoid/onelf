@@ -108,6 +108,13 @@ pub fn exec(launch: &Launch) -> ! {
         onelf_format::WorkingDir::Inherit => {}
     }
 
+    // Everything above read the mount for the runtime's own sake: the
+    // resolver lists and reads every bundled library. A trace starts
+    // here, so it holds what the app opens and not what onelf did.
+    if launch.mode == "fuse" && std::env::var_os("ONELF_TRACE").is_some_and(|v| !v.is_empty()) {
+        let _ = std::fs::symlink_metadata(launch.pkg_root.join(crate::fuse::TRACE_ARM));
+    }
+
     let bundled_interp_rel = launch
         .interp_data
         .and_then(crate::interp::parse_bundled_interp_rel);

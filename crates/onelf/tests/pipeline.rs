@@ -5621,6 +5621,74 @@ fn onelf_trace_records_what_the_run_opened() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The resolver lists and reads every bundled library before the app
+/// starts. Those reads are the runtime's, so a trace leaves them out:
+/// a library the run never loaded is not recorded.
+#[test]
+fn onelf_trace_leaves_out_what_the_runtime_read() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("trace-runtime");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    let src = td.join("unused.c");
+    write(&src, "int unused(void) { return 1; }\n");
+    if !cc_with(
+        &["-shared", "-fPIC", src.to_str().unwrap()],
+        &app.join("lib/libunused.so.1"),
+    ) {
+        return;
+    }
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args([
+            "--command",
+            "bin/run",
+            "--mtime",
+            "0",
+            "--host-libs",
+            "always",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let trace = td.join("trace.txt");
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .env("ONELF_TRACE", &trace);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    if !out.status.success() {
+        skip("FUSE cannot mount here");
+        return;
+    }
+
+    let recorded = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        recorded.lines().any(|l| l == "/usr/bin/run"),
+        "the entrypoint is recorded:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("libunused"),
+        "a library only the resolver read is not recorded:\n{recorded}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The runtime directory mode runs the package from the private per-user/// The runtime directory mode runs the package from the private per-user
 /// directory and leaves nothing behind when it exits.
 #[test]
@@ -7632,6 +7700,7 @@ fn a_shared_set_is_served_from_its_build_rather_than_copied() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(copies_of_the_set() > 0, "extract mode copied nothing");
+
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -8693,9 +8762,15 @@ fn an_external_unmount_ends_the_detached_server() {
     );
 
     // The server must exit on its own; before the fix it spun forever.
+    // An exited server whose new parent never reaps it, as under a
+    // container whose PID 1 is not an init, stays a zombie: that is gone.
     let mut gone = false;
     for _ in 0..300 {
-        if !std::path::Path::new(&format!("/proc/{server_pid}")).exists() {
+        let stat = std::fs::read_to_string(format!("/proc/{server_pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next());
+        if matches!(state, None | Some('Z' | 'X')) {
             gone = true;
             break;
         }

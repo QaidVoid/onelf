@@ -6,6 +6,7 @@
 //! child exit for reliable cleanup.
 
 pub(crate) mod fs;
+pub(crate) use fs::TRACE_ARM;
 pub(crate) mod mount;
 mod protocol;
 

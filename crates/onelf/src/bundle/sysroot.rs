@@ -288,6 +288,33 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
                 keep_names.extend(needed);
             }
         }
+        // And a link to a kept file is kept: the app asks the loader for
+        // `libX11.so.6` and the run records `libX11.so.6.4.0`, since the
+        // runtime followed the link before the app started and the
+        // kernel does not ask again.
+        let kept: HashSet<&str> = pruned.kept.iter().map(String::as_str).collect();
+        for rel in &files {
+            if kept.contains(rel.as_str()) {
+                continue;
+            }
+            let Ok(target) = fs::read_link(root.join(rel)) else {
+                continue;
+            };
+            let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let Some(target) = target.to_str() else {
+                continue;
+            };
+            let resolved = match target.strip_prefix('/') {
+                Some(absolute) => absolute.to_string(),
+                None if dir.is_empty() => target.to_string(),
+                None => format!("{dir}/{target}"),
+            };
+            if kept.contains(resolved.as_str())
+                && let Some(name) = rel.rsplit('/').next()
+            {
+                keep_names.insert(name.to_string());
+            }
+        }
         if keep_names.len() == before {
             break pruned;
         }
