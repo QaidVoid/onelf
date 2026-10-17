@@ -195,6 +195,9 @@ fn main() {
                 &[],
             );
             portable::setup_portable(exe_dir, exe_name);
+            if let Some(env_data) = read_package_file(&mut pkg, ".onelf/env") {
+                env::apply_custom_env(&env_data, "");
+            }
 
             if let Err(e) = memfd::execute_memfd(&data, argv0, &final_args)
                 && force == Some("memfd")
@@ -248,6 +251,14 @@ fn main() {
     // Ephemeral tmpfs mode: private namespace + tmpfs + extract. Invisible
     // to the host, no persistent on-disk artifacts. Preferred over cache
     // mode whenever user namespaces are available.
+    if force == Some("tmpfs") && needs_setuid {
+        eprintln!(
+            "onelf-rt: tmpfs mode needs a user namespace, and this package \
+             runs setuid binaries, so it does not use one. Unset ONELF_MODE \
+             to let the runtime pick a mode that can."
+        );
+        std::process::exit(1);
+    }
     if matches!(force, None | Some("tmpfs")) && !needs_setuid {
         ephemeral::execute_tmpfs(
             &mut pkg,

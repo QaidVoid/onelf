@@ -53,13 +53,13 @@ command = "{command}"
 
 [compression]
 # Zstd compression level, 0..=22. Higher = smaller file, slower pack.
-level = 12
+level = 19
 # Train a shared dictionary across blocks for better ratios.
 dict = false
 
 # Uncomment to enable self-updates. Host the .zsync file (produced by
 # `zsyncmake`) at this URL. Packages with updates enabled use a larger
-# runtime (~2 MB extra).
+# runtime (about 1.4 MB more).
 # [update]
 # url = "https://example.com/{name}.onelf.zsync"
 
@@ -80,10 +80,12 @@ dict = false
 # Extra sonames added to the --scan-dlopen allow-list.
 # dlopen = ["libmyvendor.so.1"]
 
-# Framework bundlers (auto-enabled from DT_NEEDED if the binary links them).
+# Framework bundlers. GL, DRI and Vulkan are opt-in, since the host's driver
+# is the one that works: bundle Mesa only for hosts without a GL stack.
 # gl = false
 # dri = false
 # vulkan = false
+# Wayland and GTK data are also bundled when the binary needs them.
 # wayland = false
 # gtk = false
 
@@ -107,4 +109,22 @@ dict = false
     f.write_all(body.as_bytes())?;
     eprintln!("Wrote {}", output.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The template writes `level` out, so it has to be the level a recipe
+    /// without one gets.
+    #[test]
+    fn the_template_parses_and_keeps_the_default_level() {
+        let dir = std::env::temp_dir().join(format!("onelf-init-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("onelf.toml");
+        super::init(&path, None, true).unwrap();
+        let written = crate::recipe::load(&path).unwrap();
+        std::fs::write(&path, "[package]\ncommand = \"bin/myapp\"\n").unwrap();
+        let bare = crate::recipe::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(written.compression.level, bare.compression.level);
+    }
 }

@@ -966,15 +966,16 @@ fn main() {
                 package,
                 platform_line,
             } => {
-                let line = match &platform_line {
-                    Some(p) => onelf_sysroot::PlatformLine::load(p),
-                    None => Ok(onelf_sysroot::PlatformLine::from_prefixes(
-                        onelf_format::drivers::DRIVER_FAMILIES
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    )),
-                };
+                let line =
+                    bundle::sysroot::check_set_name(&name).and_then(|()| match &platform_line {
+                        Some(p) => onelf_sysroot::PlatformLine::load(p),
+                        None => Ok(onelf_sysroot::PlatformLine::from_prefixes(
+                            onelf_format::drivers::DRIVER_FAMILIES
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect(),
+                        )),
+                    });
                 let built = line.and_then(|line| match &sysroot {
                     Some(root) => std::fs::create_dir_all(&dir)
                         .and_then(|()| bundle::sysroot::populate_set(&dir, root, &package, &line))
@@ -1099,6 +1100,32 @@ fn run_build(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    // A sysroot build does not use the framework bundlers, so their flags
+    // would do nothing. `--sysroot` refuses them, and so does a recipe.
+    let b = &recipe.bundle;
+    let frameworks: Vec<&str> = [
+        ("gl", b.gl),
+        ("dri", b.dri),
+        ("vulkan", b.vulkan),
+        ("wayland", b.wayland),
+        ("gtk", b.gtk),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    if recipe.sysroot.is_some() && !frameworks.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{}: [bundle] {} cannot be used with [sysroot]. A sysroot \
+                 build takes the bundle's contents from the sysroot and does \
+                 not use the framework bundlers",
+                recipe_path.display(),
+                frameworks.join(", ")
+            ),
+        ));
+    }
+
     let sysroot = match &recipe.sysroot {
         Some(sr) => Some(sysroot_from_recipe(&dir, &recipe.package.command, sr)?),
         None => None,
@@ -1107,9 +1134,10 @@ fn run_build(
     // A sysroot build is reproducible from its archive and recipe alone,
     // so the time the AppDir was written does not reach the package
     // unless the recipe or SOURCE_DATE_EPOCH asks for a time.
-    let mtime = recipe.package.mtime.or((recipe.sysroot.is_some()
-        && std::env::var_os("SOURCE_DATE_EPOCH").is_none())
-    .then_some(0));
+    let mtime = recipe
+        .package
+        .mtime
+        .or((recipe.sysroot.is_some() && pack::source_date_epoch().is_none()).then_some(0));
 
     // Stage 1: bundle-libs. A sysroot is applied by bundle-libs, so it
     // runs even when the recipe would otherwise skip bundling.

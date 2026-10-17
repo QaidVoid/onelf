@@ -127,12 +127,7 @@ pub fn pack_set(
     sysroot: Option<&Path>,
     runtime: &[u8],
 ) -> io::Result<()> {
-    if name.is_empty() || name.contains('/') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a set name is a non-empty name without slashes",
-        ));
-    }
+    crate::bundle::sysroot::check_set_name(name)?;
     pack_tree(
         dir,
         output,

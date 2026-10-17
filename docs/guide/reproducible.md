@@ -59,8 +59,8 @@ onelf pack ./AppDir -o app.onelf --command bin/app --mtime 0
 
 ☑️ A recipe build with a `[sysroot]` section is reproducible from the
 archive and the recipe alone, so `onelf build` pins every mtime to 0
-unless the recipe sets `mtime` or `SOURCE_DATE_EPOCH` is set. The time
-the AppDir happened to be written never reaches the package.
+unless the recipe sets `mtime` or `SOURCE_DATE_EPOCH` holds a time. The
+time the AppDir happened to be written never reaches the package.
 
 ## CI example
 
@@ -71,8 +71,8 @@ the AppDir happened to be written never reaches the package.
 ```
 
 ❌ `github.event.head_commit.timestamp` is an ISO 8601 date, not a Unix
-timestamp. onelf ignores a `SOURCE_DATE_EPOCH` that is not a whole
-number of seconds.
+timestamp. onelf warns once about a `SOURCE_DATE_EPOCH` that is not a
+whole number of seconds and then treats it as unset.
 
 ✅ Any CI that checks out the same commit produces byte-identical output,
 which in turn makes the zsync delta size predictable.

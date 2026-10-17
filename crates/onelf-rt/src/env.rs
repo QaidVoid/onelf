@@ -622,6 +622,10 @@ fn expand_env_value(val: &str, onelf_dir: &str) -> String {
 /// for packages where the constructor could not be wired (patchelf
 /// unavailable at pack time, no onelf-env blob for the target arch, or
 /// self-extract binaries that can't take a DT_NEEDED).
+///
+/// An empty `onelf_dir` means there is no package tree, as in memfd
+/// mode. A value naming `${ONELF_DIR}` is then skipped, since it would
+/// name a path under the filesystem root instead.
 pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
     let Ok(text) = std::str::from_utf8(env_data) else {
         return;
@@ -633,6 +637,11 @@ pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
         }
         if let Some((key, val)) = line.split_once('=') {
             let (key, val) = (key.trim(), val.trim());
+            if onelf_dir.is_empty()
+                && (val.contains("${ONELF_DIR}") || val.contains("${ONELF_DIR:-"))
+            {
+                continue;
+            }
             if already_applied(key, val, onelf_dir) {
                 continue;
             }
@@ -757,6 +766,22 @@ mod apply_custom_env_tests {
             std::env::var("ONELF_T_SELF_b2").as_deref(),
             Ok("/bin:/R/extra")
         );
+    }
+
+    /// Without a package tree a value naming it is skipped, and the rest
+    /// are still applied.
+    #[test]
+    fn without_a_tree_only_values_naming_it_are_skipped() {
+        unsafe {
+            std::env::set_var("ONELF_T_TREE_c3", "kept");
+            std::env::remove_var("ONELF_T_TREE_d4");
+        }
+        apply_custom_env(
+            b"ONELF_T_TREE_c3=${ONELF_DIR}/bin:${ONELF_T_TREE_c3}\nONELF_T_TREE_d4=plain\n",
+            "",
+        );
+        assert_eq!(std::env::var("ONELF_T_TREE_c3").as_deref(), Ok("kept"));
+        assert_eq!(std::env::var("ONELF_T_TREE_d4").as_deref(), Ok("plain"));
     }
 }
 

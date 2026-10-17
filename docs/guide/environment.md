@@ -169,6 +169,10 @@ terminal rather than a silent difference:
   namespace, because a setuid bit does nothing inside one onelf made,
   and the mounts have to go where the namespace goes.
 
+Memfd mode does not apply `[paths]` at all, since no directory of the
+package exists on disk there. See
+[Execution Modes](./execution-modes#mode-1-memfd-fastest-most-limited).
+
 ☑️ Reach for this only when there is no environment variable to set.
 A variable costs nothing and works everywhere; this needs a namespace.
 
@@ -193,6 +197,9 @@ That is how a value prepends instead of replacing. Every package gets
 package's `bin/` is always on `PATH` (re-exec-safe), falling back to
 `/usr/bin:/bin` when the inherited PATH is empty. A recipe that sets
 `PATH` in `[env]` replaces the default.
+
+Memfd mode has no package tree, so it skips every value that names
+`${ONELF_DIR}`, the default `PATH` among them, and applies the rest.
 
 See [Recipe File](./recipe#env) for details.
 

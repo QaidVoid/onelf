@@ -364,7 +364,7 @@ pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
     if removed {
         eprintln!("Unintegrated '{}'", ctx.pkg_name);
     } else {
-        eprintln!("Nothing to unintegrate for '{}'", ctx.pkg_name);
+        eprintln!("Nothing was installed for '{}'", ctx.pkg_name);
     }
 
     Ok(())

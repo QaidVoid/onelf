@@ -47,7 +47,7 @@ pub fn run(
         return 2;
     }
     match flag {
-        UpdateFlag::Check => check(self_path, update_url),
+        UpdateFlag::Check => check(self_path, update_url, pubkey, current_revision),
         UpdateFlag::Apply => apply(self_path, update_url, pubkey, current_revision),
     }
 }
@@ -162,24 +162,38 @@ impl Drop for Mmap {
     }
 }
 
-fn check(self_path: &Path, url: &str) -> i32 {
-    match fetch_control(url) {
-        Ok(ctl) => {
-            let current_sha = sha1_file_hex(self_path).unwrap_or_default();
-            let remote_sha = ctl.sha1.clone().unwrap_or_default();
-            if !remote_sha.is_empty() && current_sha == remote_sha {
-                println!("up to date ({current_sha})");
-                0
-            } else {
-                println!("update available: {current_sha} -> {remote_sha}");
-                1
-            }
-        }
+fn check(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u64>) -> i32 {
+    let ctl = match fetch_control(url) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("onelf-rt: check update: {e}");
-            2
+            return 2;
+        }
+    };
+    let current_sha = sha1_file_hex(self_path).unwrap_or_default();
+    let remote_sha = ctl.sha1.clone().unwrap_or_default();
+    if !remote_sha.is_empty() && current_sha == remote_sha {
+        println!("up to date ({current_sha})");
+        return 0;
+    }
+
+    // Only the remote package's own bytes carry its revision, so a running
+    // package with one has the update fetched and verified as an apply
+    // would, and an update the apply would refuse is not offered.
+    if current_revision.is_some() {
+        let staged = match fetch_verified(self_path, url, pubkey) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        let permitted = revision_permits(current_revision, staged_revision(&staged));
+        let _ = std::fs::remove_file(&staged);
+        if let Err(why) = permitted {
+            println!("no update offered: {why}");
+            return 0;
         }
     }
+    println!("update available: {current_sha} -> {remote_sha}");
+    1
 }
 
 /// An unpredictable staging path beside the binary being updated.
@@ -287,6 +301,72 @@ fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(),
     }
 }
 
+/// Download the update beside `self_path` and verify its signature,
+/// returning the staged file. On failure nothing is left behind, and the
+/// error is the exit code, already explained on stderr.
+fn fetch_verified(self_path: &Path, url: &str, pubkey: &[u8]) -> Result<PathBuf, i32> {
+    let tmp_path = match staged_path(self_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("onelf-rt: staging path: {e}");
+            return Err(2);
+        }
+    };
+    // Exclusive create: ours alone, whatever the directory holds.
+    if let Err(e) = claim_staging(&tmp_path) {
+        eprintln!(
+            "onelf-rt: cannot claim staging file {}: {e}",
+            tmp_path.display()
+        );
+        return Err(2);
+    }
+    eprintln!("onelf-rt: downloading update to {}", tmp_path.display());
+
+    let mut assembly =
+        match ZsyncAssembly::from_url_with_client(url, &tmp_path, update_http_client()) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("onelf-rt: init assembly: {e}");
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(2);
+            }
+        };
+
+    // Seed from our own file: most blocks usually match.
+    if let Err(e) = assembly.submit_source_file(self_path) {
+        eprintln!("onelf-rt: warning: seeding failed: {e}");
+    }
+
+    while !assembly.is_complete() {
+        match assembly.download_missing_blocks() {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("onelf-rt: download error: {e}");
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(2);
+            }
+        }
+    }
+
+    if let Err(e) = assembly.complete() {
+        eprintln!("onelf-rt: verify failed: {e}");
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(2);
+    }
+
+    // Verify a detached Ed25519 signature over the fully-assembled binary
+    // against the pack-time public key before it is ever installed. Fails
+    // closed: on any problem the temp file is removed and the running
+    // executable is left unchanged.
+    if let Err(e) = verify_update_signature(&tmp_path, url, pubkey) {
+        eprintln!("onelf-rt: update signature check failed: {e}");
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(2);
+    }
+    Ok(tmp_path)
+}
+
 fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u64>) -> i32 {
     let ctl = match fetch_control(url) {
         Ok(c) => c,
@@ -303,64 +383,10 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
         return 0;
     }
 
-    let tmp_path = match staged_path(self_path) {
+    let tmp_path = match fetch_verified(self_path, url, pubkey) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("onelf-rt: staging path: {e}");
-            return 2;
-        }
+        Err(code) => return code,
     };
-    // Exclusive create: ours alone, whatever the directory holds.
-    if let Err(e) = claim_staging(&tmp_path) {
-        eprintln!(
-            "onelf-rt: cannot claim staging file {}: {e}",
-            tmp_path.display()
-        );
-        return 2;
-    }
-    eprintln!("onelf-rt: downloading update to {}", tmp_path.display());
-
-    let mut assembly =
-        match ZsyncAssembly::from_url_with_client(url, &tmp_path, update_http_client()) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("onelf-rt: init assembly: {e}");
-                return 2;
-            }
-        };
-
-    // Seed from our own file: most blocks usually match.
-    if let Err(e) = assembly.submit_source_file(self_path) {
-        eprintln!("onelf-rt: warning: seeding failed: {e}");
-    }
-
-    while !assembly.is_complete() {
-        match assembly.download_missing_blocks() {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("onelf-rt: download error: {e}");
-                let _ = std::fs::remove_file(&tmp_path);
-                return 2;
-            }
-        }
-    }
-
-    if let Err(e) = assembly.complete() {
-        eprintln!("onelf-rt: verify failed: {e}");
-        let _ = std::fs::remove_file(&tmp_path);
-        return 2;
-    }
-
-    // Verify a detached Ed25519 signature over the fully-assembled binary
-    // against the pack-time public key before it is ever installed. Fails
-    // closed: on any problem the temp file is removed and the running
-    // executable is left unchanged.
-    if let Err(e) = verify_update_signature(&tmp_path, url, pubkey) {
-        eprintln!("onelf-rt: update signature check failed: {e}");
-        let _ = std::fs::remove_file(&tmp_path);
-        return 2;
-    }
 
     // The revision is the freshness gate once the running package carries
     // one: it lives inside the package, so the signature just checked
@@ -685,8 +711,8 @@ mod tests {
         assert_eq!(keys[0], &[1u8; 32]);
         assert_eq!(keys[2], &[3u8; 32]);
 
-        // A hand-crafted 40-byte blob yields two usable keys, not a
-        // mangled one; the packer refuses this length outright.
+        // A hand-crafted 104-byte blob yields three usable keys, not a
+        // mangled fourth; the packer refuses this length outright.
         let mut partial = three.clone();
         partial.extend_from_slice(&[9u8; 8]);
         assert_eq!(keyring(&partial).count(), 3);

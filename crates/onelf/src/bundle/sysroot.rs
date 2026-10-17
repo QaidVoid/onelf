@@ -149,20 +149,7 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     let mut set_packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut set_report: Vec<(String, Vec<String>)> = Vec::new();
     for set in &opts.sets {
-        if set.name.is_empty()
-            || !set
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "set {}: a set name is letters, digits, - and _ only",
-                    set.name
-                ),
-            ));
-        }
+        check_set_name(&set.name)?;
         let Some((first, rest)) = set.packages.split_first() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -414,6 +401,22 @@ pub fn refuse_inside(root: &Path, appdir: &Path) -> io::Result<()> {
                 root.display(),
                 appdir.display()
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a shared set name a recipe could not refer to: a set is named
+/// in `[sysroot.sets.<name>]` and in the paths built from it.
+pub fn check_set_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("set {name}: a set name is letters, digits, - and _ only"),
         ));
     }
     Ok(())

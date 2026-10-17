@@ -59,9 +59,13 @@ memfd-eligible. You'll see `[memfd]` next to the entrypoint in `onelf
 info`. The binary is checked against its recorded hash before it runs,
 and a binary that fails the check falls through to the next rung.
 
-⚠️ There is no package tree in this mode. `ONELF_DIR` is empty, the app
-cannot read any other file from the package, and the recipe's `[env]`
-and `[paths]` are not applied.
+⚠️ There is no package tree in this mode. `ONELF_DIR` is empty and the
+app cannot read any other file from the package. The recipe's `[env]` is
+applied, except a value that names `${ONELF_DIR}`, which would point at
+the filesystem root. That includes the default `bin/` prefix on `PATH`,
+so `PATH` stays as the caller set it. `[paths]` is not applied: it makes
+a directory of the package answer for an absolute path, and no directory
+of the package exists on disk here to mount.
 
 ## Mode 2: FUSE via user namespace (default for most packages)
 
@@ -131,7 +135,7 @@ and execs the entrypoint.
 
 - Unprivileged user namespaces enabled.
 - The package was not built with `needs-setuid`. Such a package skips
-  this rung.
+  this rung, and `ONELF_MODE=tmpfs` on one is an error that says so.
 
 ## Mode 5: Runtime directory (no namespaces, no helper)
 

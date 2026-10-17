@@ -146,8 +146,8 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `search-paths` | array | `[]` | Extra lib search paths (highest priority) |
 | `exclude` | array | `[]` | Excluded soname prefixes |
 | `include` | array | `[]` | Force-included sonames |
-| `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack. Off by default, so the host's is used |
-| `wayland` / `gtk` | bool | auto | Client-side framework bundlers, enabled on detection |
+| `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack. Off by default, so the host's is used. An error with `[sysroot]` |
+| `wayland` / `gtk` | bool | auto | Client-side framework bundlers, enabled on detection. An error with `[sysroot]` |
 | `no-gl` / `no-dri` / `no-vulkan` / `no-wayland` / `no-gtk` | bool | `false` | Force a framework off, overriding detection and the matching key |
 | `strip` | bool | `false` | Run `strip` on bundled libs |
 | `strict-libc` | bool | `false` | Refuse wrong-family libc libs |

@@ -9858,3 +9858,204 @@ fn a_second_entrypoint_integrates_beside_the_first() {
     );
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// Unintegrating a package that was never integrated removes nothing, and
+/// an icon theme other packages put there does not make it look otherwise.
+#[test]
+fn unintegrating_what_was_never_integrated_says_so() {
+    let td = workdir("unintegrate");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("myapp.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--name", "myapp"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let data_home = td.join("share");
+    std::fs::create_dir_all(data_home.join("icons/hicolor/48x48/apps")).unwrap();
+    let mut run = Command::new(&pkg);
+    run.arg("--onelf-unintegrate")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("HOME", &td);
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("Nothing was installed") && !err.contains("Unintegrated"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Forcing tmpfs mode on a `needs-setuid` package names the reason it
+/// cannot run, not the absence of every mode.
+#[test]
+fn forcing_tmpfs_on_a_setuid_package_says_why() {
+    let td = workdir("tmpfssetuid");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--needs-setuid"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut run = Command::new(&pkg);
+    run.env("ONELF_MODE", "tmpfs");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("tmpfs mode needs a user namespace"), "{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `pack-set` refuses a name a recipe's `[sysroot.sets.<name>]` would
+/// refuse, rather than building a set nothing can name.
+#[test]
+fn pack_set_refuses_a_name_a_recipe_cannot_use() {
+    let td = workdir("setname");
+    let tree = td.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let out = td.join("set.onelf");
+    let o = Command::new(onelf())
+        .args(["sysroot", "pack-set", tree.to_str().unwrap()])
+        .args(["-o", out.to_str().unwrap(), "--name", "qt.6"])
+        .output()
+        .expect("spawn onelf sysroot pack-set");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("letters, digits, - and _ only"), "{err}");
+    assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A recipe with a `[sysroot]` refuses the framework flags the way
+/// `bundle-libs --sysroot` does, instead of building without them.
+#[test]
+fn a_sysroot_recipe_refuses_framework_flags() {
+    let td = workdir("sysroot-gpu");
+    let dir = td.join("app");
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"../absent\"\n\n[bundle]\ngl = true\nwayland = true\n",
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("[bundle] gl, wayland cannot be used with [sysroot]"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A `SOURCE_DATE_EPOCH` that is not a whole number of seconds is unset
+/// for the whole build: the sysroot pin to 0 still holds, so two builds a
+/// second apart agree, and the value is reported once.
+#[test]
+fn an_unparsable_source_date_epoch_is_ignored_with_one_warning() {
+    let td = workdir("sysroot-bad-epoch");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let mut outputs = Vec::new();
+    for name in ["one", "two"] {
+        let dir = td.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        sysroot_recipe(&dir, &fixture, "");
+        let recipe = std::fs::read_to_string(dir.join("onelf.toml")).unwrap();
+        write(&dir.join("onelf.toml"), &recipe.replace("mtime = 0\n", ""));
+        let out = Command::new(onelf())
+            .arg("build")
+            .current_dir(&dir)
+            .env("SOURCE_DATE_EPOCH", "2024-01-01T00:00:00Z")
+            .output()
+            .expect("spawn onelf build");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(stderr.matches("SOURCE_DATE_EPOCH").count(), 1, "{stderr}");
+        outputs.push(std::fs::read(dir.join("app.onelf")).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    assert!(outputs[0] == outputs[1], "two builds differ");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Memfd mode applies the recipe's `[env]`, except a value naming the
+/// package tree it does not have, the default `PATH` prefix among them.
+#[test]
+fn memfd_mode_applies_the_recipe_env_it_can() {
+    let td = workdir("memfd-env");
+    let app = td.join("app");
+    let src = td.join("show.c");
+    write(
+        &src,
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(){\
+         const char *v=getenv(\"MEMFD_T_VALUE\");\
+         printf(\"value=%s\\npath=%s\\n\",v?v:\"unset\",getenv(\"PATH\"));return 0;}\n",
+    );
+    let bin = app.join("bin/show");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        skip("no C compiler available");
+        return;
+    };
+    let built = Command::new(compiler)
+        .args(["-O0", "-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !built {
+        skip("no static libc available to link against");
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/show\"\noutput = \"../show.onelf\"\n\n\
+         [bundle]\nskip = true\n\n[env]\nMEMFD_T_VALUE = \"from-recipe\"\n",
+    );
+    let out = onelf_build(&app);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut c = Command::new(td.join("show.onelf"));
+    c.env("ONELF_MODE", "memfd").env("PATH", "/usr/bin:/bin");
+    isolate(&mut c, &td);
+    let run = run_package(&mut c);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("value=from-recipe\n"), "{stdout}");
+    assert!(stdout.contains("path=/usr/bin:/bin\n"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}

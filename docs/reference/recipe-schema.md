@@ -165,7 +165,8 @@ skip = false                     # don't run bundle-libs at all (pre-bundled App
 The GPU stack (`gl`, `dri`, `vulkan`) is bundled only when asked for,
 because the host's driver is the one that works. Wayland and GTK data
 are bundled when the binary needs them, and `no-*` turns either off.
-With a `[sysroot]` the framework bundlers are not used at all, and
+With a `[sysroot]` the framework bundlers are not used at all, so
+setting `gl`, `dri`, `vulkan`, `wayland` or `gtk` is an error, and
 `skip` is ignored because the sysroot is applied by `bundle-libs`.
 
 ## `[sysroot]`
@@ -204,7 +205,7 @@ blake3 = "3f1c...a9e2"                       # String, the set's BLAKE3
 
 A dependency set shared between packages. The closure of `packages` is
 left out of the bundle and expected from the build at `url`, made with
-`onelf sysroot pack-set`. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set).
+`onelf sysroot pack-set`. `<name>` is letters, digits, `-` and `_` only. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set).
 
 ## `[paths]`
 

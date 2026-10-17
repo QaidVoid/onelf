@@ -69,13 +69,14 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-fn remove_icons(hicolor: &Path, int_name: &str) {
+fn remove_icons(hicolor: &Path, int_name: &str) -> bool {
     let entries = match fs::read_dir(hicolor) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let target_svg = format!("{int_name}.svg");
     let target_png = format!("{int_name}.png");
+    let mut removed = false;
 
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
@@ -87,12 +88,13 @@ fn remove_icons(hicolor: &Path, int_name: &str) {
         }
         for name in [&target_svg, &target_png] {
             let path = apps_dir.join(name);
-            if path.exists() {
-                let _ = fs::remove_file(&path);
+            if path.exists() && fs::remove_file(&path).is_ok() {
                 eprintln!("  Removed: {}", path.display());
+                removed = true;
             }
         }
     }
+    removed
 }
 
 fn generate_desktop_file(
@@ -274,8 +276,7 @@ fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
 
     let hicolor = data_home.join("icons/hicolor");
     if hicolor.exists() {
-        remove_icons(&hicolor, &int_name);
-        removed = true;
+        removed |= remove_icons(&hicolor, &int_name);
     }
 
     update_desktop_database(&data_home);
@@ -283,7 +284,7 @@ fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
     if removed {
         eprintln!("Unintegrated '{pkg_name}'");
     } else {
-        eprintln!("Nothing to unintegrate for '{pkg_name}'");
+        eprintln!("Nothing was installed for '{pkg_name}'");
     }
 }
 

@@ -1673,10 +1673,21 @@ fn get_mtime(meta: &fs::Metadata, pin: Option<u64>) -> (u64, u32) {
     (raw, 0)
 }
 
-fn source_date_epoch() -> Option<u64> {
-    std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
+/// `SOURCE_DATE_EPOCH` as whole seconds. A value that is not one is
+/// treated as unset everywhere it is read, and said so once.
+pub(crate) fn source_date_epoch() -> Option<u64> {
+    let value = std::env::var("SOURCE_DATE_EPOCH").ok()?;
+    let parsed = value.trim().parse().ok();
+    if parsed.is_none() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "warning: SOURCE_DATE_EPOCH={value:?} is not a whole number of \
+                 seconds, so it is ignored"
+            )
+        });
+    }
+    parsed
 }
 
 /// True if the data is an ELF binary with zero DT_NEEDED dependencies.

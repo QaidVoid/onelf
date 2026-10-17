@@ -1622,9 +1622,8 @@ fn verify_needs(
 /// metadata-identical trees (`fs::copy` otherwise stamps "now"). Honors
 /// `SOURCE_DATE_EPOCH`, else the Unix epoch. Best-effort: errors ignored.
 pub(crate) fn normalize_mtime(path: &Path) {
-    let secs = std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+    let secs = crate::pack::source_date_epoch()
+        .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(0);
     let t = rustix::fs::Timespec {
         tv_sec: secs,

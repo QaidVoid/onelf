@@ -73,3 +73,10 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The self-update code builds only into the update runtime, so the
+      # workspace build above never compiles its tests.
+      - name: Lint and test the update runtime
+        run: |
+          cargo clippy -p onelf-rt --features update --all-targets --locked -- -D warnings
+          cargo test -p onelf-rt --features update --locked

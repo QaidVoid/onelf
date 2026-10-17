@@ -236,6 +236,13 @@ from the package and the `.sig` from the server.
 ./myapp.onelf --onelf-update         # download delta, atomically replace self
 ```
 
+The check compares the `.zsync` control file against the running binary.
+When the running binary carries a `.onelf/update-revision`, a difference
+is not enough, because only the new package's own bytes say its
+revision. The check then downloads and verifies the update the way the
+apply does (steps 3 to 5 below) and removes it again. An update the
+apply would refuse is reported as `no update offered`, with the reason.
+
 The update-apply flow:
 
 1. Fetch the `.zsync` control file over HTTPS.
@@ -260,7 +267,7 @@ Exit codes:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Up to date, or update applied successfully |
+| 0 | Up to date, update applied successfully, or (for `--onelf-check-update`) no update offered |
 | 1 | Update available (for `--onelf-check-update`), or the package has no update URL or no signing key |
 | 2 | Error (network, parse, write, verify) |
 
