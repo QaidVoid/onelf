@@ -7,8 +7,12 @@ use std::io;
 
 /// Block size used when a package does not choose one. Blocks compress
 /// independently, so this is both the window zstd gets and the unit the
-/// runtime decompresses to serve a read. 256 KiB keeps random reads cheap.
-pub const DEFAULT_BLOCK_SIZE: u64 = 256 * 1024;
+/// runtime decompresses to serve a read. Starting an app reads scattered
+/// pages of its libraries, so most of a large block is decompressed for
+/// nothing: on a Blender startup 64 KiB launched 17 percent faster from a
+/// cold cache than 256 KiB, for a package 5 percent larger, and 32 KiB was
+/// slower again.
+pub const DEFAULT_BLOCK_SIZE: u64 = 64 * 1024;
 
 /// Smallest block a package may choose. Below this the per-block manifest
 /// entry (56 bytes plus its hash) starts to rival the data it describes.

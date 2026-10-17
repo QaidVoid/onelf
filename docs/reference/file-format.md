@@ -135,7 +135,7 @@ package, and pack reports the total under `Dedup:` when it saved
 anything. Two entries still get independent block lists in the manifest
 when their content differs, even if individual blocks were to match.
 
-Block size defaults to 256 KiB uncompressed and can be set from 4 KiB to
+Block size defaults to 64 KiB uncompressed and can be set from 4 KiB to
 32 MiB with `--block-size` or `[compression] block-size`. Each block is
 compressed independently, which lets the runtime decompress them lazily
 as the entrypoint reads files.

@@ -85,7 +85,7 @@ basename).
 ```toml
 [compression]
 level = 19            # i32, 0..=22, default 19
-block-size = 262144   # u64 bytes, 4 KiB..=32 MiB, default 256 KiB
+block-size = 65536    # u64 bytes, 4 KiB..=32 MiB, default 64 KiB
 dict = false          # bool, default false
 store = false         # bool, default false
 prefetch = "profile.txt"   # path, relative to the recipe, optional
@@ -96,12 +96,14 @@ zstd dictionary across blocks, which helps ratios for packages with many
 small text files.
 
 `block-size` sets how much data each payload block holds. Blocks are
-compressed independently, so the block size is the window zstd gets: a
-package of large, sequentially-read files (shared libraries, game assets)
-packs noticeably smaller at 1 MiB or 4 MiB. It is also the unit the runtime
-decompresses to serve a read, so a package read at random pays for the
-whole block to answer a few bytes. Leave it at the default unless the
-package is big and read front-to-back.
+compressed independently, so the block size is the window zstd gets, and
+larger blocks pack smaller. It is also the unit the runtime decompresses
+to serve a read, so a read pays for its whole block. Starting an app reads
+scattered pages of its shared libraries: on Blender, 64 KiB started 17
+percent faster from a cold cache than 256 KiB for a package 5 percent
+larger, and 1 MiB was slower than 256 KiB by a further 40 percent. Leave
+it at the default unless the package's large files are read front to
+back, as game assets and media are.
 
 `store = true` writes the payload raw with no zstd at all, trading
 package size for zero decompression at runtime. It overrides `dict` and

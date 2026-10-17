@@ -92,7 +92,7 @@ const DETACHED_PROBE_SECS: u64 = 5;
 
 /// Default ceiling on decompressed blocks held in memory.
 ///
-/// At the packer's default 256 KiB block size this is 128 blocks, far more
+/// At the packer's default 64 KiB block size this is 512 blocks, far more
 /// than the reads in flight need, while keeping the server itself from
 /// becoming the memory problem it exists to avoid. The packer caps
 /// `--block-size` at this budget so a single block always fits.
@@ -978,7 +978,7 @@ impl<'a> FuseState<'a> {
         let size = read_in.size as usize;
         let num_blocks = entry.blocks.len();
 
-        // Build block offset map, stack-allocated for files <=32 blocks (8MB @ 256KB)
+        // Build block offset map, stack-allocated for files <=32 blocks (2MB @ 64KB)
         const MAX_STACK: usize = 32;
         let use_stack = num_blocks <= MAX_STACK;
         let mut offsets_stack = [0usize; MAX_STACK];
@@ -1191,8 +1191,8 @@ fn handle_init(header: &FuseInHeader, body: &[u8]) -> Vec<u8> {
 
     let mut flags = FUSE_ASYNC_READ | FUSE_BIG_WRITES;
     // FUSE_MAX_PAGES is what makes `max_pages` below count. Without it the
-    // kernel caps every read at 32 pages, 128 KiB, so each 256 KiB block
-    // takes two requests and a 1 MiB readahead takes eight.
+    // kernel caps every read at 32 pages, 128 KiB, so a block larger than
+    // that takes two requests and a 1 MiB readahead takes eight.
     flags |= init_in.flags
         & (FUSE_DO_READDIRPLUS
             | FUSE_READDIRPLUS_AUTO

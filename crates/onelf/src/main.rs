@@ -68,7 +68,7 @@ enum Commands {
         level: i32,
 
         /// Bytes per payload block, with an optional K/M suffix (4K to 32M)
-        #[arg(long, value_parser = parse_block_size, default_value = "256K")]
+        #[arg(long, value_parser = parse_block_size, default_value = "64K")]
         block_size: u64,
 
         /// Build a shared zstd dictionary

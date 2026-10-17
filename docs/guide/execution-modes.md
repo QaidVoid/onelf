@@ -259,8 +259,8 @@ onelf pack ./myapp -o myapp.onelf --command bin/myapp --prefetch profile.txt
 In a recipe, set `prefetch = "profile.txt"` under `[compression]`.
 
 - ✅ Record the startup your users wait on. On Blender 5.2 a profiled
-  package started headless in 1.1 s instead of 2.4 s with a cold page
-  cache, and printed `--version` in 0.7 s instead of 1.9 s.
+  package started headless in 0.9 s instead of 2.4 s with a cold page
+  cache, and printed `--version` in 0.5 s instead of 1.9 s.
 - ✅ Record again when the app changes. A profile names files and byte
   offsets, so it survives a new block size, and the packer skips what
   the tree no longer has.

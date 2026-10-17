@@ -99,10 +99,10 @@ pub fn block_original_size(block: &Block) -> io::Result<usize> {
         .map_err(|_| invalid("block larger than this address space"))
 }
 
-/// Ceiling on one block's decompressed size. The packer emits 256 KiB
-/// blocks, so this sits three orders of magnitude above anything real; it
-/// exists only to bound the allocation. zstd then rejects any block whose
-/// actual output does not match what the header claimed.
+/// Ceiling on one block's decompressed size. The packer emits blocks of
+/// 64 KiB by default and 32 MiB at most, so this sits well above anything
+/// real; it exists only to bound the allocation. zstd then rejects any
+/// block whose actual output does not match what the header claimed.
 const MAX_BLOCK_ORIGINAL: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]

@@ -3973,7 +3973,7 @@ fn a_tampered_block_is_refused_but_neighbours_still_read() {
     std::fs::create_dir_all(app.join("bin")).unwrap();
     write(&app.join("bin/run"), "#!/bin/sh\ncat data\n");
 
-    // Several 256 KiB blocks, each filled distinctly so a corrupted one is
+    // Several 256 KiB runs, each filled distinctly so a corrupted one is
     // identifiable in the output.
     let mut data = Vec::new();
     for i in 0..4u8 {
