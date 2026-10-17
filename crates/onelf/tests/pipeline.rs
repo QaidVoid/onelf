@@ -7253,6 +7253,12 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     write(&rootfs.join("usr/share/fixture/data.txt"), "data\n");
     write(&rootfs.join("usr/share/fixture/icons/a.svg"), "<svg/>\n");
     write(&rootfs.join("usr/share/fixture/icons/b.svg"), "<svg/>\n");
+    // Absolute, the way Arch links `X11/xkb` to `xkeyboard-config-2`.
+    std::os::unix::fs::symlink(
+        "/usr/share/fixture/icons",
+        rootfs.join("usr/share/fixture/theme"),
+    )
+    .unwrap();
     write(
         &rootfs.join("usr/lib/fixture/py/pkg/__init__.py"),
         "import pkg.sub\n",
@@ -7350,6 +7356,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
             "usr/share/fixture/data.txt",
             "usr/share/fixture/icons/a.svg",
             "usr/share/fixture/icons/b.svg",
+            "usr/share/fixture/theme",
             "usr/lib/fixture/py/pkg/__init__.py",
             "usr/lib/fixture/py/pkg/sub/__init__.py",
             "usr/lib/fixture/py/pkg/sub/lazy.py",
@@ -7721,6 +7728,10 @@ fn a_trace_prunes_unopened_files_but_keeps_siblings_and_needs() {
     assert!(
         dir.join("share/fixture/icons/b.svg").is_file(),
         "a keep glob protects data the run never opened"
+    );
+    assert!(
+        dir.join("share/fixture/theme/b.svg").is_file(),
+        "a link to a directory holding kept files stays, pointing inside"
     );
 
     let plain = td.join("plain");

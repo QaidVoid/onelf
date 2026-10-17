@@ -279,11 +279,19 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         // And a link to a kept file is kept: the app asks the loader for
         // `libX11.so.6` and the run records `libX11.so.6.4.0`, since the
         // runtime followed the link before the app started and the
-        // kernel does not ask again.
+        // kernel does not ask again. So is a link to a directory holding
+        // one, such as `X11/xkb -> /usr/share/xkeyboard-config-2`.
         let kept: HashSet<&str> = pruned.kept.iter().map(String::as_str).collect();
+        let kept_dirs: HashSet<&str> = pruned
+            .kept
+            .iter()
+            .flat_map(|rel| Path::new(rel).ancestors().skip(1))
+            .filter_map(Path::to_str)
+            .collect();
         for rel in &files {
             if !kept.contains(rel.as_str())
-                && link_target(root, rel).is_some_and(|t| kept.contains(t.as_str()))
+                && link_target(root, rel)
+                    .is_some_and(|t| kept.contains(t.as_str()) || kept_dirs.contains(t.as_str()))
             {
                 keep_names.insert(rel.clone());
             }
