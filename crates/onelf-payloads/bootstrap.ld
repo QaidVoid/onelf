@@ -12,6 +12,10 @@ SECTIONS {
     .rodata : { *(.rodata .rodata.*) }
     .data : { *(.data .data.*) }
     .bss : { *(.bss .bss.*) }
+    /* Declared so the asserts below can measure them on every target:
+       ld refuses SIZEOF of a section that does not exist. */
+    .got : { *(.got .got.*) }
+    .dynamic : { *(.dynamic) }
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr) }
     /* Anything the flattening would silently drop or that needs a runtime
        relocation is a bootstrap that crashes on the user's machine with
