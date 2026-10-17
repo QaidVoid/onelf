@@ -11,8 +11,14 @@
 //! `setenv`/`dlopen`/`getenv` are left UNDEFINED and resolve from the
 //! application's own libc at load time, so one per-arch blob serves both
 //! glibc and musl. Ported from the former `payload/onelf_env.c`.
+//!
+//! It also carries the exec and spawn hooks in [`exec`], which start a
+//! program outside the package with the environment the runtime was
+//! started with.
 #![no_std]
 #![allow(unsafe_op_in_unsafe_fn)]
+
+mod exec;
 
 use core::panic::PanicInfo;
 
@@ -91,6 +97,29 @@ mod sys {
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         sys3(1, 2, buf as i64, n as i64);
     }
+
+    pub const O_DIRECTORY: i64 = 0o200000;
+
+    pub unsafe fn open(path: *const u8, flags: i64) -> i64 {
+        sys4(257, -100, path as i64, flags, 0)
+    }
+    pub unsafe fn readlink(path: *const u8, buf: *mut u8, n: usize) -> i64 {
+        sys4(267, -100, path as i64, buf as i64, n as i64)
+    }
+    pub unsafe fn access_x(path: *const u8) -> i64 {
+        sys3(269, -100, path as i64, 1)
+    }
+    pub unsafe fn mmap_anon(len: usize) -> i64 {
+        let ret;
+        asm!("syscall", inlateout("rax") 9i64 => ret,
+            in("rdi") 0i64, in("rsi") len as i64, in("rdx") 3i64,
+            in("r10") 0x22i64, in("r8") -1i64, in("r9") 0i64,
+            out("rcx") _, out("r11") _);
+        ret
+    }
+    pub unsafe fn munmap(addr: *mut u8, len: usize) {
+        sys3(11, addr as i64, len as i64, 0);
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -118,6 +147,28 @@ mod sys {
     }
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         svc4(64, 2, buf as i64, n as i64, 0);
+    }
+
+    pub const O_DIRECTORY: i64 = 0o40000;
+
+    pub unsafe fn open(path: *const u8, flags: i64) -> i64 {
+        svc4(56, -100, path as i64, flags, 0)
+    }
+    pub unsafe fn readlink(path: *const u8, buf: *mut u8, n: usize) -> i64 {
+        svc4(78, -100, path as i64, buf as i64, n as i64)
+    }
+    pub unsafe fn access_x(path: *const u8) -> i64 {
+        svc4(48, -100, path as i64, 1, 0)
+    }
+    pub unsafe fn mmap_anon(len: usize) -> i64 {
+        let ret;
+        asm!("svc #0", inlateout("x0") 0i64 => ret,
+            in("x1") len as i64, in("x2") 3i64, in("x3") 0x22i64,
+            in("x4") -1i64, in("x5") 0i64, in("x8") 222i64);
+        ret
+    }
+    pub unsafe fn munmap(addr: *mut u8, len: usize) {
+        svc4(215, addr as i64, len as i64, 0, 0);
     }
 }
 
@@ -157,6 +208,36 @@ mod sys {
     }
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         sys3(4, 2, buf as i32, n as i32);
+    }
+
+    // The path-based calls rather than the `*at` ones, which take a
+    // fourth argument in `esi`; every path given here is absolute or
+    // meant relative to the working directory anyway.
+    pub const O_DIRECTORY: i64 = 0o200000;
+
+    pub unsafe fn open(path: *const u8, flags: i64) -> i64 {
+        sys3(5, path as i32, flags as i32, 0) as i64
+    }
+    pub unsafe fn readlink(path: *const u8, buf: *mut u8, n: usize) -> i64 {
+        sys3(85, path as i32, buf as i32, n as i32) as i64
+    }
+    pub unsafe fn access_x(path: *const u8) -> i64 {
+        sys3(33, path as i32, 1, 0) as i64
+    }
+    /// The old `mmap`, which takes its six arguments through memory.
+    pub unsafe fn mmap_anon(len: usize) -> i64 {
+        let args: [u32; 6] = [0, len as u32, 3, 0x22, u32::MAX, 0];
+        let ret = sys3(90, args.as_ptr() as i32, 0, 0);
+        // An address in the upper half is still an address; only the
+        // last page's worth of values are errors.
+        if (-4095..0).contains(&ret) {
+            ret as i64
+        } else {
+            ret as u32 as i64
+        }
+    }
+    pub unsafe fn munmap(addr: *mut u8, len: usize) {
+        sys3(91, addr as i32, len as i32, 0);
     }
 }
 
@@ -662,6 +743,7 @@ unsafe fn apply_preload() {
 
 extern "C" fn onelf_env_init() {
     unsafe {
+        exec::resolve();
         if !find_root() {
             return;
         }

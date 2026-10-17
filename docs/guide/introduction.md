@@ -48,6 +48,7 @@ page explains why.
 | Bundle source | scan or package DB | `lib4bin`, `strace` | `linuxdeploy` | build in SDK | compiler |
 | Delta updates | built in, signed | zsync hook | external tool | OSTree | no |
 | Sandbox | no | no | no | `bwrap`, as permitted | no |
+| Host programs the app starts | get the caller's environment back | bundle paths unset, home restored | inherit the bundle's | run in the sandbox | n/a |
 
 The honest summary: AnyLinux AppImages are excellent single files and
 the closest relative to onelf. Flatpak's shared runtime is shared in

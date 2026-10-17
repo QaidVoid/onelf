@@ -2,6 +2,7 @@ mod cache;
 mod env;
 mod ephemeral;
 mod fuse;
+mod hostenv;
 mod hostpaths;
 mod integrate;
 mod interp;
@@ -24,6 +25,8 @@ mod update;
 use std::ffi::OsString;
 
 fn main() {
+    hostenv::capture_starting_env();
+
     // Bytes, not text: a file manager hands a GUI app whatever name the
     // file has, and `args()` would abort the launch on one that is not UTF-8.
     let args: Vec<OsString> = std::env::args_os().collect();

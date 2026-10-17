@@ -163,21 +163,17 @@ pub fn setup_env(
 
             // The bundled glibc's charset converters. They bind to that
             // glibc's private symbols, so they are the only ones it can
-            // load, and the host's are the only ones a host program can:
-            // a host program the app spawns inherits this and loses every
-            // conversion but UTF-8. A leak of the same shape as the driver
-            // paths above, and a bundled app that cannot convert text at
-            // all is the worse of the two.
-            if env::var("GCONV_PATH").is_err() {
-                let gconv: Vec<String> = lib_paths
-                    .iter()
-                    .map(|p| Path::new(p).join("gconv").to_string_lossy().to_string())
-                    .filter(|p| Path::new(p).is_dir())
-                    .collect();
-                if !gconv.is_empty() {
-                    unsafe {
-                        env::set_var("GCONV_PATH", gconv.join(":"));
-                    }
+            // load, and an inherited value naming any others is replaced.
+            // A host program the app spawns gets the caller's value back
+            // from the exec hooks (see `crate::hostenv`).
+            let gconv: Vec<String> = lib_paths
+                .iter()
+                .map(|p| Path::new(p).join("gconv").to_string_lossy().to_string())
+                .filter(|p| Path::new(p).is_dir())
+                .collect();
+            if !gconv.is_empty() {
+                unsafe {
+                    env::set_var("GCONV_PATH", gconv.join(":"));
                 }
             }
 
@@ -258,16 +254,15 @@ pub fn setup_env(
         }
     }
 
-    // Auto-set LIBDECOR_PLUGIN_DIR if package has libdecor plugins
-    if env::var("LIBDECOR_PLUGIN_DIR").is_err() {
-        let libdecor_dir = pkg.join("share/libdecor/plugins-1");
-        if libdecor_dir.is_dir() {
-            unsafe {
-                env::set_var(
-                    "LIBDECOR_PLUGIN_DIR",
-                    libdecor_dir.to_string_lossy().as_ref(),
-                );
-            }
+    // The package's libdecor plugins, which only its own libdecor can
+    // load, replace an inherited directory.
+    let libdecor_dir = pkg.join("share/libdecor/plugins-1");
+    if libdecor_dir.is_dir() {
+        unsafe {
+            env::set_var(
+                "LIBDECOR_PLUGIN_DIR",
+                libdecor_dir.to_string_lossy().as_ref(),
+            );
         }
     }
 
@@ -346,7 +341,8 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
 /// the host's image loaders, input methods and GIO modules, which are
 /// built against the host's libc: on a musl host they cannot be loaded
 /// into a glibc process at all, and on a glibc host they are simply the
-/// wrong versions.
+/// wrong versions. An inherited value names exactly those modules, so
+/// the package's replaces it.
 fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
     let roots = || std::iter::once(pkg).chain(set_roots.iter().map(PathBuf::as_path));
 
@@ -366,20 +362,29 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
     if let Some(path) =
         cache("lib/gdk-pixbuf-2.0", "loaders.cache").and_then(|c| absolutised(&c, pkg))
     {
-        set_if_unset("GDK_PIXBUF_MODULE_FILE", &path);
+        set_path("GDK_PIXBUF_MODULE_FILE", path.as_os_str());
     }
     if let Some(path) = cache("lib/gtk-3.0", "immodules.cache").and_then(|c| absolutised(&c, pkg)) {
-        set_if_unset("GTK_IM_MODULE_FILE", &path);
+        set_path("GTK_IM_MODULE_FILE", path.as_os_str());
     }
 
-    let gio: Vec<String> = roots()
-        .map(|root| root.join("lib/gio/modules"))
-        .filter(|d| d.is_dir())
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
-    if !gio.is_empty() && env::var_os("GIO_EXTRA_MODULES").is_none() {
-        // SAFETY: the runtime is single-threaded at this point
-        unsafe { env::set_var("GIO_EXTRA_MODULES", gio.join(":")) };
+    let dirs = |rel: &str| -> Option<std::ffi::OsString> {
+        let found: Vec<PathBuf> = roots()
+            .map(|root| root.join(rel))
+            .filter(|d| d.is_dir())
+            .collect();
+        (!found.is_empty())
+            .then(|| env::join_paths(found).ok())
+            .flatten()
+    };
+    if let Some(gio) = dirs("lib/gio/modules") {
+        set_path("GIO_EXTRA_MODULES", &gio);
+    }
+    // GTK 3's modules, theme engines and print backends. Only GTK 3's:
+    // GTK 2 reads the same variable and would take GTK 3's modules for
+    // its own.
+    if let Some(gtk) = dirs("lib/gtk-3.0") {
+        set_path("GTK_PATH", &gtk);
     }
 }
 
@@ -391,6 +396,10 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
 /// config includes the host's own `fonts.conf` first, then names the
 /// package directories, so host fonts stay and package fonts win ties.
 ///
+/// A caller's own `FONTCONFIG_FILE` takes the place of the host's
+/// `fonts.conf` in the generated config, so it still applies and the
+/// package's fonts are still found.
+///
 /// The config lives under the 0700 per-uid base because fontconfig
 /// reads whatever `FONTCONFIG_FILE` names, and a shared /tmp file would
 /// let another local user choose fonts for this app. Font caches need
@@ -398,10 +407,11 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
 /// user's cache home, keyed by directory path, and the mount paths are
 /// stable across launches.
 fn setup_fontconfig(pkg: &Path, set_roots: &[PathBuf]) {
-    if env::var_os("FONTCONFIG_FILE").is_some() {
-        return;
-    }
-    let conf = fontconfig_conf(pkg, set_roots);
+    let inherited = env::var_os("FONTCONFIG_FILE").filter(|f| !f.is_empty());
+    let include = inherited
+        .as_deref()
+        .map_or(Path::new(SYSTEM_FONTS_CONF), Path::new);
+    let conf = fontconfig_conf(pkg, set_roots, include);
     let Some(conf) = conf else { return };
     let Some(name) = pkg.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return;
@@ -414,26 +424,37 @@ fn setup_fontconfig(pkg: &Path, set_roots: &[PathBuf]) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let dest = dir.join("fonts.conf");
+    // One file per included config, so two launches given different
+    // ones do not overwrite each other's.
+    let dest = match &inherited {
+        None => dir.join("fonts.conf"),
+        Some(file) => dir.join(format!(
+            "fonts-{:016x}.conf",
+            crate::hostenv::fnv1a(file.as_encoded_bytes())
+        )),
+    };
     if std::fs::write(&dest, conf).is_err() {
         return;
     }
-    set_if_unset("FONTCONFIG_FILE", &dest);
+    set_path("FONTCONFIG_FILE", dest.as_os_str());
 }
 
-/// The text of the generated fonts.conf: host config first, then every
+const SYSTEM_FONTS_CONF: &str = "/etc/fonts/fonts.conf";
+
+/// The text of the generated fonts.conf: `include` first, then every
 /// root whose `share/fonts` exists. `None` when no root ships fonts.
-fn fontconfig_conf(pkg: &Path, set_roots: &[PathBuf]) -> Option<String> {
+fn fontconfig_conf(pkg: &Path, set_roots: &[PathBuf], include: &Path) -> Option<String> {
     let dirs = [pkg]
         .into_iter()
         .chain(set_roots.iter().map(PathBuf::as_path))
         .map(|root| root.join("share/fonts"))
         .filter(|d| d.is_dir());
-    let mut conf = String::from(
+    let mut conf = format!(
         "<?xml version=\"1.0\"?>\n\
          <!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n\
          <fontconfig>\n\
-         \x20 <include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>\n",
+         \x20 <include ignore_missing=\"yes\">{}</include>\n",
+        escape_xml(&include.to_string_lossy())
     );
     let mut any = false;
     for dir in dirs {
@@ -505,11 +526,9 @@ fn absolutised(cache: &Path, pkg: &Path) -> Option<PathBuf> {
     Some(dest)
 }
 
-fn set_if_unset(name: &str, value: &Path) {
-    if env::var_os(name).is_none() {
-        // SAFETY: the runtime is single-threaded at this point
-        unsafe { env::set_var(name, value) };
-    }
+fn set_path(name: &str, value: &std::ffi::OsStr) {
+    // SAFETY: the runtime is single-threaded at this point
+    unsafe { env::set_var(name, value) };
 }
 
 /// Point Qt at the plugin directories the package and its sets carry.
@@ -518,11 +537,10 @@ fn set_if_unset(name: &str, value: &Path) {
 /// holds while the toolkit sits in the same tree as the application. A
 /// shared set moves it out, and Qt then looks under the application's own
 /// root, finds no platform plugin and aborts before its first window.
-/// Naming the directories outright is what survives either layout.
+/// Naming the directories outright is what survives either layout. An
+/// inherited value is replaced: the plugins it names were built against
+/// some other Qt.
 fn setup_qt_plugin_path(pkg: &Path, set_roots: &[PathBuf]) {
-    if env::var_os("QT_PLUGIN_PATH").is_some() {
-        return;
-    }
     let dirs: Vec<String> = std::iter::once(pkg)
         .chain(set_roots.iter().map(PathBuf::as_path))
         .flat_map(|root| ["lib/qt6/plugins", "lib/qt5/plugins"].map(|d| root.join(d)))
@@ -851,7 +869,8 @@ mod setup_env_tests {
 
 #[cfg(test)]
 mod fontconfig_conf_tests {
-    use super::{escape_xml, fontconfig_conf};
+    use super::{SYSTEM_FONTS_CONF, escape_xml, fontconfig_conf};
+    use std::path::Path;
 
     #[test]
     fn lists_only_roots_that_ship_fonts_and_keeps_host_first() {
@@ -862,7 +881,12 @@ mod fontconfig_conf_tests {
         std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
         std::fs::create_dir_all(set.join("share/mime")).unwrap();
 
-        let conf = fontconfig_conf(&pkg, std::slice::from_ref(&set)).expect("pkg ships fonts");
+        let conf = fontconfig_conf(
+            &pkg,
+            std::slice::from_ref(&set),
+            Path::new(SYSTEM_FONTS_CONF),
+        )
+        .expect("pkg ships fonts");
 
         assert!(conf.contains("<include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"));
         assert!(conf.contains(&format!("<dir>{}</dir>", pkg.join("share/fonts").display())));
@@ -883,7 +907,12 @@ mod fontconfig_conf_tests {
         std::fs::create_dir_all(pkg.join("share/fonts")).unwrap();
         std::fs::create_dir_all(set.join("share/fonts")).unwrap();
 
-        let conf = fontconfig_conf(&pkg, std::slice::from_ref(&set)).expect("both ship fonts");
+        let conf = fontconfig_conf(
+            &pkg,
+            std::slice::from_ref(&set),
+            Path::new(SYSTEM_FONTS_CONF),
+        )
+        .expect("both ship fonts");
 
         let pkg_at = conf.find(&format!("<dir>{}</dir>", pkg.join("share/fonts").display()));
         let set_at = conf.find(&format!("<dir>{}</dir>", set.join("share/fonts").display()));
@@ -898,7 +927,7 @@ mod fontconfig_conf_tests {
         let empty = std::env::temp_dir().join(format!("onelf-fc3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(fontconfig_conf(&empty, &[]).is_none());
+        assert!(fontconfig_conf(&empty, &[], Path::new(SYSTEM_FONTS_CONF)).is_none());
         let _ = std::fs::remove_dir_all(&empty);
     }
 

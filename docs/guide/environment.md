@@ -18,6 +18,10 @@ The rules this page encodes:
 - ⚠️ The environment does not survive a `clearenv()` re-exec. onelf
   moves the guarantee into the ELF; without the `onelf-env` constructor,
   `[env]` applies only on the first launch.
+- ✅ Start host programs as usual. A program outside the package gets
+  the environment the app was launched with, not the app's.
+- ⚠️ `system()`, `popen()` and the `execl` family pass the app's
+  environment on unchanged. See [Programs the app starts](#programs-the-app-starts).
 
 ## Set by the runtime
 
@@ -108,11 +112,12 @@ resolver and linked by name, and a library the bundle lacks and the
 resolver did not choose fails by name instead of being satisfied from
 the host.
 
-Each variable below is set only when the caller has not set it and
-the directory it names exists. "A lib dir" means one of the bundle's
-library directories or, on a host that received a
+Each variable below is set only when the directory it names exists.
+"A lib dir" means one of the bundle's library directories or, on a host
+that received a
 [GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one), one of
-the build's.
+the build's. Whether a value the caller set wins depends on the
+variable; see [Which values the caller can override](#which-values-the-caller-can-override).
 
 - `LIBGL_DRIVERS_PATH` and `LIBVA_DRIVERS_PATH` to every `dri/` in a
   lib dir
@@ -134,16 +139,19 @@ the build's.
   `immodules.cache` under `lib/gtk-3.0/*/`, rewritten with absolute
   module paths
 - `GIO_EXTRA_MODULES` for `lib/gio/modules/`
+- `GTK_PATH` for `lib/gtk-3.0/`, where GTK 3 finds its modules, theme
+  engines and print backends
 - `FONTCONFIG_FILE` to a generated config that includes the host's
-  `/etc/fonts/fonts.conf` and adds the package's `share/fonts/`, so
-  bundled fonts render and host fonts stay available
+  `/etc/fonts/fonts.conf`, or the caller's own `FONTCONFIG_FILE` in its
+  place, and adds the package's `share/fonts/`, so bundled fonts render
+  and host fonts stay available
 
 The GLib, GTK, Qt and font entries also look in the package's
 [shared sets](./sysroot#sharing-a-dependency-set).
 
 ✅ `QT_PLUGIN_PATH` names every `lib/qt6/plugins` and `lib/qt5/plugins`
 the package and its [shared sets](./sysroot#sharing-a-dependency-set)
-carry, unless the caller already set it.
+carry.
 
 ⚠️ The moment a set moves Qt elsewhere, plugin discovery breaks and the
 abort prints nothing at all. A relocatable Qt finds its plugins relative
@@ -155,6 +163,35 @@ Finally, the package's own `share/`, then the GL build's and the sets',
 are prepended to `XDG_DATA_DIRS`, so GLib/GTK discover bundled
 GSettings schemas and icon themes. An unset `XDG_DATA_DIRS` is treated
 as the XDG default, `/usr/local/share:/usr/share`.
+
+### Which values the caller can override
+
+A variable naming modules that a bundled library loads into the app
+takes the package's value whenever the package carries the component,
+replacing one the caller set. Those modules were built against the
+package's copy of the library, and a host value names modules built
+against the host's, which the bundled library cannot load or loads to
+crash. These are `QT_PLUGIN_PATH`, `GIO_EXTRA_MODULES`,
+`GDK_PIXBUF_MODULE_FILE`, `GTK_IM_MODULE_FILE`, `GTK_PATH`,
+`GCONV_PATH`, `LIBDECOR_PLUGIN_DIR` and `FONTCONFIG_FILE`. A caller's
+`FONTCONFIG_FILE` is not lost: the generated config includes it where it
+would otherwise include the host's `fonts.conf`.
+
+The driver and data variables keep a value the caller set, because
+picking a driver, a driver configuration or a keymap is what a user sets
+them for, and the drivers they name are the host's by design. These are
+`LIBGL_DRIVERS_PATH`, `LIBVA_DRIVERS_PATH`, `GBM_BACKENDS_PATH`,
+`__EGL_VENDOR_LIBRARY_DIRS`, `VK_DRIVER_FILES` (and `VK_ADD_DRIVER_FILES`,
+which stops the runtime from building `VK_DRIVER_FILES` at all),
+`DRIRC_CONFIGDIR`, `LIBDRM_IDS_PATH` and `XKB_CONFIG_ROOT`.
+
+Any of these variables that arrives pointing into another onelf package
+is dropped before the launch, whichever kind it is. Such a value is that
+package's, and a program it started passed it on. A path counts as
+another package's when a directory above it holds `.onelf/`, or when it
+is a file a runtime generated in the private runtime directory, such as
+a rewritten module cache or font config. The package's own value then
+takes its place, or the variable stays unset.
 
 ## Data paths compiled into a library
 
@@ -261,7 +298,7 @@ into the ELF itself:
   fall back to `LD_LIBRARY_PATH` and are not re-exec-safe.
 - **`[env]` and `preload`**: a tiny freestanding `onelf-env`
   constructor is bundled into `lib/` and injected as a `DT_NEEDED` of
-  the entrypoint. Because `DT_NEEDED` lives in the ELF and is resolved
+  every executable that runs under the bundled loader. Because `DT_NEEDED` lives in the ELF and is resolved
   via the `$ORIGIN` run path above, it loads on *every* exec; its
   constructor re-applies `.onelf/env` and `.onelf/preload` before
   `main()`, no matter how the app cleared the environment.
@@ -271,6 +308,59 @@ into the ELF itself:
 blob for the target architecture. When either is missing, packing prints
 a warning and `[env]` is applied only on the first launch (the runtime
 layer), not after a re-exec.
+
+## Programs the app starts
+
+The problem: everything above is set for the app, and every process
+inherits its parent's environment. Left alone, the browser `xdg-open`
+starts would get the package's `bin/` first on its `PATH`, the
+package's Qt plugins, and with a [portable home](./portable-dirs) a
+fresh profile instead of the user's.
+
+✅ A program outside the package gets the environment the app was
+launched with. The `onelf-env` constructor that `bundle-libs` injects
+into every executable that runs under the bundled loader, helpers kept
+under `lib/` included, defines `execve`, `execv`, `execvp`, `execvpe`, `posix_spawn` and
+`posix_spawnp`. Just before it runs the entrypoint, the runtime records
+in `ONELF_HOST_ENV` the starting value of every variable it set, changed
+or removed: `[env]`, the portable directories, the toolkit and driver
+variables above, `PATH`, and its own `ONELF_*`. When the app starts a
+program, the hook resolves it the way the call will, searching `PATH`
+for the `p` variants and following symlinks, and then:
+
+| Program | Starts with |
+|---------|-------------|
+| Under the package root or one of its [shared sets](./sysroot#sharing-a-dependency-set) | the environment it was given, unchanged |
+| Anywhere else, and `xdg-open` or `gio-launch-desktop` wherever they are | every recorded variable back as the caller had it, set to its original value or unset, and none of onelf's private variables |
+
+A recorded variable is put back only while it still holds what the
+runtime set. ✅ A value the app changes on purpose, in its own
+environment or in the one it hands to the call, reaches the program as
+the app wrote it.
+
+⚠️ A host shell is a host program. `sh -c '$ONELF_DIR/bin/tool'` sees
+no `ONELF_DIR` and expands it to nothing. Expand the path in the app, or
+start the bundled program directly. A bundled program started from a
+host shell gets the host environment plus what its own `onelf-env`
+constructor applies from `[env]`, but not the toolkit variables above.
+
+❌ Not covered:
+
+- `system()`, `popen()` and the `execl` family. glibc and musl implement
+  them through internal entry points that no definition outside libc
+  can replace, so the shell or program they start keeps the app's
+  environment.
+- `fexecve` and `execveat`, which name the program by descriptor.
+- A statically linked executable, and any executable without the
+  `onelf-env` constructor: a package packed without `bundle-libs`, one
+  packed without `patchelf`, or a self-extracting binary. None of them
+  has the hooks.
+- `onelf run`, which makes no record, so the hooks pass every
+  environment through.
+
+When a program started one of these ways is another onelf package, its
+runtime still starts clean: it applies the record it inherited before
+anything else, as the hook would have.
 
 ## Set by the user
 

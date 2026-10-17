@@ -7,6 +7,8 @@ without polluting their home directory, like "portable apps" on Windows.
 The rules this page encodes:
 
 - ✅ Sibling directories redirect `$HOME` and the XDG variables.
+- ✅ The redirect is the app's alone. A host program it starts, such
+  as the browser behind `xdg-open`, gets the real `$HOME` back.
 - ❌ An empty file is not a marker. Only a directory redirects its
   variable.
 - ⚠️ Ship the directories with the binary. Without them the app runs
@@ -31,6 +33,14 @@ When the runtime finds one of these directories, it points the
 corresponding variable at it and keeps the old value in the `REAL_*`
 variable. Where an XDG variable was unset, `REAL_*` holds the XDG
 default under `$HOME`, such as `$HOME/.config`.
+
+The redirect, the `REAL_*` variables and every line of the env file
+apply to the app and to the programs of the package it starts. A
+program outside the package gets each of these variables back as the
+caller had it, so a link the app opens lands in the user's browser
+profile rather than a fresh one under `myapp.onelf.home`. See
+[Programs the app starts](./environment#programs-the-app-starts) for
+how, and for the calls that are not covered.
 
 ☑️ The name is that of the packed file itself, as the kernel reports
 it. A multicall symlink such as `myapp-daemon` uses the directories of

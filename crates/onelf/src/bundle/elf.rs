@@ -72,6 +72,19 @@ pub(crate) fn parse_interp(path: &Path) -> Option<String> {
         .map(|s| s.trim_end_matches('\0').to_string())
 }
 
+/// Whether `path` names itself with a `DT_SONAME`, as a shared library
+/// does and an executable does not.
+fn has_soname(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|data| {
+            goblin::elf::Elf::parse(&data)
+                .ok()
+                .map(|elf| elf.soname.is_some())
+        })
+        .unwrap_or(true)
+}
+
 /// The loader an executable runs under: its `PT_INTERP`, or the one an
 /// injected bootstrap carries.
 ///
@@ -1464,9 +1477,13 @@ pub(crate) fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<u
         if !bundled.exists() {
             continue;
         }
-        // Skip everything in lib/ (shared libs, the ld, libc, etc).
-        // Only inject into application binaries outside the lib dir.
-        if path.starts_with(lib_dest) {
+        // Shared objects in lib/ (the libraries, libc, which has a
+        // PT_INTERP of its own) are left alone. An executable there, a
+        // helper a toolkit keeps beside its libraries such as
+        // QtWebEngineProcess or WebKit's processes, is an application
+        // binary like any other: it needs the bundled loader, and the
+        // onelf-env hooks for whatever it spawns.
+        if path.starts_with(lib_dest) && has_soname(&path) {
             continue;
         }
 

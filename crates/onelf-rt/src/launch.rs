@@ -132,6 +132,7 @@ fn run(launch: &Launch) {
     if let Some(data) = launch.env_data {
         crate::env::apply_custom_env(data, pkg_root_s);
     }
+    crate::hostenv::record_host_env(launch.pkg_root, &set_roots);
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
     crate::hostpaths::apply(launch.pkg_root);

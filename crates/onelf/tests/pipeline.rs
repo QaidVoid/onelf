@@ -767,6 +767,237 @@ int main(int argc, char **argv) {{
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Build `hyg.onelf` from an app whose entrypoint prints its environment
+/// as `app:` lines and then, by its first argument, runs the host's `env`
+/// through `execvp` (`execvp`) or `posix_spawnp` (`spawnp`), or spawns a
+/// bundled helper kept under `lib/` (`helper`) that prints `helper:`
+/// lines and `execvp`s `env` itself. The package carries Qt plugins, so
+/// the runtime sets `QT_PLUGIN_PATH`. `None` when a tool is missing.
+fn build_spawn_fixture(td: &Path) -> Option<PathBuf> {
+    let Some(pe) = patchelf() else {
+        skip("no patchelf to inject the onelf-env hooks");
+        return None;
+    };
+    let app = td.join("app");
+    let harness = td.join("harness.c");
+    write(
+        &harness,
+        r#"#define _GNU_SOURCE
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+extern char **environ;
+static int spawn(int search, const char *file, char *const *argv) {
+    pid_t pid;
+    int r = search ? posix_spawnp(&pid, file, NULL, NULL, argv, environ)
+                   : posix_spawn(&pid, file, NULL, NULL, argv, environ);
+    if (r) { printf("spawn %s failed: %d\n", file, r); return 1; }
+    waitpid(pid, &r, 0);
+    return 0;
+}
+int main(int argc, char **argv) {
+    const char *mode = argc > 1 ? argv[1] : "";
+    for (char **e = environ; *e; e++) printf("app:%s\n", *e);
+    fflush(stdout);
+    char *env_argv[] = {"env", NULL};
+    if (!strcmp(mode, "spawnp")) return spawn(1, "env", env_argv);
+    if (!strcmp(mode, "helper")) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/lib/libexec/helper", getenv("ONELF_DIR"));
+        char *helper_argv[] = {"helper", NULL};
+        return spawn(0, path, helper_argv);
+    }
+    execvp("env", env_argv);
+    return 3;
+}
+"#,
+    );
+    let helper = td.join("helper.c");
+    write(
+        &helper,
+        r#"#include <stdio.h>
+#include <unistd.h>
+extern char **environ;
+int main(void) {
+    for (char **e = environ; *e; e++) printf("helper:%s\n", *e);
+    fflush(stdout);
+    char *env_argv[] = {"env", NULL};
+    execvp("env", env_argv);
+    return 3;
+}
+"#,
+    );
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib/libexec")).unwrap();
+    if !cc(&harness, &app.join("bin/harness")) || !cc(&helper, &app.join("lib/libexec/helper")) {
+        return None;
+    }
+    write(&app.join("lib/qt6/plugins/platforms/README"), "plugins");
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname=\"hyg\"\ncommand=\"bin/harness\"\n",
+    );
+    let out = Command::new(onelf())
+        .arg("build")
+        .current_dir(&app)
+        .env("ONELF_PATCHELF", pe)
+        .output()
+        .expect("spawn onelf build");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "build failed:\n{log}");
+    assert!(log.contains("Injected onelf-env"), "{log}");
+    Some(app.join("hyg.onelf"))
+}
+
+/// Run the fixture in `mode` with `vars` as its whole environment, and
+/// split what it printed into the app's, the helper's and the host
+/// program's variables.
+fn run_spawn_fixture(
+    pkg: &Path,
+    td: &Path,
+    mode: &str,
+    vars: &[(&str, &str)],
+) -> [Vec<(String, String)>; 3] {
+    let mut run = Command::new(pkg);
+    run.arg(mode).env_clear().envs(vars.iter().copied());
+    isolate(&mut run, td);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut seen: [Vec<(String, String)>; 3] = Default::default();
+    for line in stdout.lines() {
+        let (who, var) = match line.split_once(':') {
+            Some(("app", var)) => (0, var),
+            Some(("helper", var)) => (1, var),
+            _ => (2, line),
+        };
+        if let Some((k, v)) = var.split_once('=') {
+            seen[who].push((k.to_string(), v.to_string()));
+        }
+    }
+    seen
+}
+
+fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    vars.iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// A host program the app runs, through `execvp` or `posix_spawnp`,
+/// starts with the caller's environment: the original `PATH`, `HOME` and
+/// toolkit variables, none of onelf's own, and none of the portable
+/// directories. The app itself sees the package's values.
+#[test]
+fn a_host_program_gets_the_callers_environment_back() {
+    let td = workdir("hostenv");
+    let Some(pkg) = build_spawn_fixture(&td) else {
+        return;
+    };
+    let home = td.to_str().unwrap();
+    let vars = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", home),
+        ("QT_PLUGIN_PATH", "/host/qt/plugins"),
+    ];
+    for mode in ["execvp", "spawnp"] {
+        let [app, _, host] = run_spawn_fixture(&pkg, &td, mode, &vars);
+        let app_qt = var(&app, "QT_PLUGIN_PATH").unwrap_or_default();
+        assert!(app_qt.ends_with("/lib/qt6/plugins"), "{mode}: app {app_qt}");
+        assert!(
+            var(&app, "PATH").is_some_and(|p| p.ends_with("/bin:/usr/bin:/bin")),
+            "{mode}: {app:?}"
+        );
+
+        assert!(!host.is_empty(), "{mode}: the host program printed nothing");
+        assert_eq!(var(&host, "PATH"), Some("/usr/bin:/bin"), "{mode}");
+        assert_eq!(var(&host, "HOME"), Some(home), "{mode}");
+        assert_eq!(
+            var(&host, "QT_PLUGIN_PATH"),
+            Some("/host/qt/plugins"),
+            "{mode}"
+        );
+        let onelf: Vec<_> = host
+            .iter()
+            .filter(|(k, _)| k.starts_with("ONELF_"))
+            .collect();
+        assert!(onelf.is_empty(), "{mode}: {onelf:?}");
+    }
+
+    // A portable home is the app's alone.
+    let portable = pkg.with_extension("onelf.home");
+    std::fs::create_dir_all(&portable).unwrap();
+    let [app, _, host] = run_spawn_fixture(&pkg, &td, "execvp", &vars);
+    assert_eq!(var(&app, "HOME"), portable.to_str());
+    assert_eq!(var(&host, "HOME"), Some(home));
+    assert_eq!(var(&host, "REAL_HOME"), None);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A helper inside the package keeps the package's environment, and the
+/// hooks reach an executable kept under `lib/` too: what the helper runs
+/// on the host gets the caller's environment back.
+#[test]
+fn a_bundled_helper_keeps_the_bundled_environment() {
+    let td = workdir("helperenv");
+    let Some(pkg) = build_spawn_fixture(&td) else {
+        return;
+    };
+    let vars = [("PATH", "/usr/bin:/bin"), ("HOME", td.to_str().unwrap())];
+    let [app, helper, host] = run_spawn_fixture(&pkg, &td, "helper", &vars);
+    for name in ["PATH", "QT_PLUGIN_PATH", "ONELF_DIR", "ONELF_HOST_ENV"] {
+        assert!(var(&app, name).is_some(), "app lacks {name}");
+        assert_eq!(var(&helper, name), var(&app, name), "{name}");
+    }
+    assert_eq!(var(&host, "PATH"), Some("/usr/bin:/bin"));
+    assert_eq!(var(&host, "QT_PLUGIN_PATH"), None);
+    assert_eq!(var(&host, "ONELF_DIR"), None);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A module path inherited from another package is that package's. The
+/// package's own replaces it, and one the package does not carry is
+/// dropped rather than handed to the app or its host programs.
+#[test]
+fn a_module_path_into_another_package_is_replaced() {
+    let td = workdir("foreignmod");
+    let Some(pkg) = build_spawn_fixture(&td) else {
+        return;
+    };
+    let other = td.join("other");
+    std::fs::create_dir_all(other.join(".onelf")).unwrap();
+    std::fs::create_dir_all(other.join("lib/qt6/plugins")).unwrap();
+    std::fs::create_dir_all(other.join("lib/gio/modules")).unwrap();
+    let qt = other.join("lib/qt6/plugins");
+    let gio = other.join("lib/gio/modules");
+    let vars = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", td.to_str().unwrap()),
+        ("QT_PLUGIN_PATH", qt.to_str().unwrap()),
+        ("GIO_EXTRA_MODULES", gio.to_str().unwrap()),
+    ];
+    let [app, _, host] = run_spawn_fixture(&pkg, &td, "execvp", &vars);
+    let app_qt = var(&app, "QT_PLUGIN_PATH").unwrap_or_default();
+    assert!(
+        app_qt.ends_with("/lib/qt6/plugins") && !app_qt.contains("/other/"),
+        "{app_qt}"
+    );
+    assert_eq!(var(&app, "GIO_EXTRA_MODULES"), None);
+    assert_eq!(var(&host, "QT_PLUGIN_PATH"), None);
+    assert_eq!(var(&host, "GIO_EXTRA_MODULES"), None);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Identical content is compressed and stored once, and every path that
 /// shares it still extracts correctly.
 #[test]
@@ -9143,7 +9374,8 @@ fn a_package_shipping_fonts_gets_a_fontconfig_file() {
     assert!(dir_line.ends_with("/share/fonts</dir>"), "{conf}");
     assert!(dir_line.contains(xdg_run.to_str().unwrap()), "{conf}");
 
-    // A caller's own FONTCONFIG_FILE is left alone.
+    // A caller's own FONTCONFIG_FILE takes the host config's place, and
+    // the package's fonts are still listed.
     let mut run = Command::new(&pkg);
     run.env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -9153,8 +9385,13 @@ fn a_package_shipping_fonts_gets_a_fontconfig_file() {
     let out = run_package(&mut run);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("FC=/custom/my-fonts.conf"), "{stdout}");
-    assert!(!stdout.contains("<fontconfig>"), "{stdout}");
+    assert!(!stdout.contains("FC=/custom/my-fonts.conf"), "{stdout}");
+    assert!(
+        stdout.contains("<include ignore_missing=\"yes\">/custom/my-fonts.conf</include>"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("/etc/fonts/fonts.conf"), "{stdout}");
+    assert!(stdout.contains("/share/fonts</dir>"), "{stdout}");
 
     let _ = std::fs::remove_dir_all(&td);
 }

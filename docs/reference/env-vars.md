@@ -27,22 +27,28 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 |----------|----------|-----------|
 | `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs, then the previous value |
 | `ONELF_LIB_PATH` | `lib/` contains `.so` files | the bundled lib dirs, kept for scripts that export it as `LD_LIBRARY_PATH` |
-| `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters |
+| `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters. Replaces a value the caller set. |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `GBM_BACKENDS_PATH` | `lib/gbm/` exists | `<pkg>/lib/gbm` |
 | `__EGL_VENDOR_LIBRARY_DIRS` | `share/glvnd/egl_vendor.d/` exists or host has one | merged list of dirs |
 | `VK_DRIVER_FILES` | `share/vulkan/icd.d/` has ICD JSONs | colon-joined list |
 | `LIBDRM_IDS_PATH` | `share/libdrm/` exists | that dir |
-| `LIBDECOR_PLUGIN_DIR` | `share/libdecor/plugins-1/` exists | that dir |
+| `LIBDECOR_PLUGIN_DIR` | `share/libdecor/plugins-1/` exists | that dir. Replaces a value the caller set. |
 | `DRIRC_CONFIGDIR` | `share/drirc.d/` exists | that dir |
 | `XKB_CONFIG_ROOT` | `share/X11/xkb/` exists | that dir |
 | `XDG_DATA_DIRS` | `share/` exists | `<pkg>/share` (prepended) |
-| `FONTCONFIG_FILE` | the package or a set has `share/fonts/` | a generated config in the private runtime directory that includes the host's `fonts.conf`, then the bundled font dirs. Only set when the caller has not set it. |
-| `QT_PLUGIN_PATH` | the package or a set has `lib/qt6/plugins` or `lib/qt5/plugins` | colon-joined list of every such dir, so relocatable Qt finds its platform plugin. Only set when the caller has not set it. |
-| `GIO_EXTRA_MODULES` | `lib/gio/modules/` exists in the package or a set | colon-joined list of those dirs, so GLib loads the bundle's GIO modules rather than the host's (whose GLib they do not match). Only set when the caller has not set it. |
-| `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Only set when the caller has not set it. |
-| `GTK_IM_MODULE_FILE` | `lib/gtk-3.0/immodules.cache` exists | that cache, absolutised the same way, so the bundle's input-method modules are used. Only set when the caller has not set it. |
+| `FONTCONFIG_FILE` | the package or a set has `share/fonts/` | a generated config in the private runtime directory that includes the host's `fonts.conf`, or the caller's `FONTCONFIG_FILE` in its place, then the bundled font dirs |
+| `QT_PLUGIN_PATH` | the package or a set has `lib/qt6/plugins` or `lib/qt5/plugins` | colon-joined list of every such dir, so relocatable Qt finds its platform plugin. Replaces a value the caller set. |
+| `GIO_EXTRA_MODULES` | `lib/gio/modules/` exists in the package or a set | colon-joined list of those dirs, so GLib loads the bundle's GIO modules rather than the host's (whose GLib they do not match). Replaces a value the caller set. |
+| `GTK_PATH` | `lib/gtk-3.0/` exists in the package or a set | colon-joined list of those dirs, for GTK 3's modules, theme engines and print backends. Replaces a value the caller set. |
+| `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Replaces a value the caller set. |
+| `GTK_IM_MODULE_FILE` | `lib/gtk-3.0/immodules.cache` exists | that cache, absolutised the same way, so the bundle's input-method modules are used. Replaces a value the caller set. |
+
+The driver and data variables in this table keep a value the caller
+set; the module variables replace it. Any of them that arrives pointing
+into another onelf package is dropped first. See
+[Which values the caller can override](../guide/environment#which-values-the-caller-can-override).
 
 The runtime leaves `LD_LIBRARY_PATH` as the caller set it. Bundled
 binaries find their libraries through their `$ORIGIN` run path, and the
@@ -69,6 +75,19 @@ bundled binaries it runs find their libraries on their own.
 a guard: if the app or the user sets it, the runtime stays out of
 Vulkan's way entirely and does not build `VK_DRIVER_FILES`, keeping the
 Vulkan loader's append semantics and the host's GPU drivers reachable.
+
+## Private to onelf
+
+The runtime sets these for the `onelf-env` exec hooks, which give a
+program outside the package the environment the app was launched with
+(see [Programs the app starts](../guide/environment#programs-the-app-starts)).
+Neither reaches such a program, and neither is meant to be read or set
+by anything else.
+
+| Variable | Value |
+|----------|-------|
+| `ONELF_HOST_ENV` | One entry per variable the runtime set, changed or removed, in the form `NAME=<applied><original>;`. `<applied>` is the 64-bit FNV-1a hash of the value the runtime set, as 16 lowercase hex digits, `-` when the runtime removed the variable, or `*` to restore it whatever it holds (`ONELF_INTERP`, which the launch may set on the exec itself). `<original>` is `<len>:<bytes>`, the value the runtime was started with and its length in bytes, or `-` when it was unset. A hook restores a variable only while its value still hashes to `<applied>`. A runtime that inherits this variable applies it before anything else. |
+| `ONELF_ROOTS` | The canonical package root and dependency set roots, `:`-separated. A program below one of them is the package's own and gets the app's environment unchanged. |
 
 ## Read by the runtime (user-settable)
 
@@ -110,7 +129,7 @@ See [Portable Directories](../guide/portable-dirs) for the full story.
 
 | Variable | Effect |
 |----------|--------|
-| `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to add a fresh `DT_RUNPATH` to binaries without an existing slot and to inject the re-exec-safe `onelf-env` constructor as a `DT_NEEDED` on the entrypoint. Falls back to looking up `patchelf` in `PATH`. |
+| `ONELF_PATCHELF` | Path to a `patchelf` binary, used by `bundle-libs` to add a fresh `DT_RUNPATH` to binaries without an existing slot and to inject the `onelf-env` constructor as a `DT_NEEDED` of every executable that runs under the bundled loader. Falls back to looking up `patchelf` in `PATH`. |
 | `SOURCE_DATE_EPOCH` | An integer Unix timestamp that clamps file mtimes for reproducible output. A value that is not an integer is ignored. `--mtime` overrides it. See [Reproducible Builds](../guide/reproducible). |
 | `ONELF_PACK_CHUNK_BYTES` | In-flight compression chunk budget in bytes (default 64 MiB). Purely a memory bound: it caps how many files are compressed before their blocks are written back; output bytes are unaffected. A value that does not parse or is zero keeps the default. |
 | `NO_COLOR` | When set (any value, per the NO_COLOR convention), disables the bundler's ANSI colorized status output in `bundle-libs` and `sysroot`. Color also requires a terminal stderr. |
