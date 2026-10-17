@@ -1,4 +1,10 @@
 
+## [0.4.1](https://github.com/QaidVoid/onelf/compare/0.4.0...0.4.1) - 2026-10-17
+
+### 🧪 Testing
+
+- Retry reclaiming a killed shared mount until its group is gone - ([b55fbd5](https://github.com/QaidVoid/onelf/commit/b55fbd5970b5a7da31ad7052e34b7d6e515e1fda))
+
 ## [0.4.0](https://github.com/QaidVoid/onelf/compare/0.3.3...0.4.0) - 2026-10-17
 
 ### ⛰️  Features
