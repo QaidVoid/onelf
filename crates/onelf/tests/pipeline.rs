@@ -5422,6 +5422,9 @@ fn helper_mount_under(run_dir: &Path) -> Option<PathBuf> {
 /// Launch `pkg` through the host's FUSE helper and wait for its mount to
 /// appear. `None` when the helper cannot mount here, which is a documented
 /// soft-skip like the other environment probes.
+///
+/// The launch does not share its mount, so the server is the launcher
+/// itself and killing the launch's process group kills the server too.
 fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, PathBuf)> {
     use std::os::unix::process::CommandExt;
 
@@ -5431,6 +5434,7 @@ fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, Path
         .env("HOME", td.to_str().unwrap())
         .env("ONELF_MODE", "fuse")
         .env("ONELF_FUSE_NO_NAMESPACE", "1")
+        .env("ONELF_FUSE_NO_SHARE", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0);
@@ -5923,6 +5927,346 @@ fn kill_group(child: &std::process::Child) {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+/// The app of the sharing tests. It prints its user namespace, the package
+/// directory and its data, waits for `$RELEASE` to appear, and prints its
+/// data again.
+const SHARE_APP: &str = r#"#!/bin/sh
+echo "ns=$(readlink /proc/self/ns/user) dir=$ONELF_DIR data=$(cat "$ONELF_DIR/data.txt")"
+i=0
+while [ ! -e "$RELEASE" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
+echo "data=$(cat "$ONELF_DIR/data.txt")"
+"#;
+
+/// Pack [`SHARE_APP`] with `data` as its data to `out`. Every package it
+/// makes has the same name, so only the content tells them apart.
+fn pack_share_app(td: &Path, data: &str, out: &Path) {
+    let app = td.join("share-app");
+    write(&app.join("data.txt"), data);
+    write(&app.join("bin/run"), SHARE_APP);
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", "shareapp"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Start [`SHARE_APP`] packed at `pkg` and return it with the first line
+/// it printed, which it prints once it runs.
+fn start_share_app(pkg: &Path, td: &Path, envs: &[(&str, &str)]) -> (std::process::Child, String) {
+    use std::io::BufRead;
+
+    let mut cmd = Command::new(pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse")
+        .env("RELEASE", td.join("release"))
+        .envs(envs.iter().copied())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut cmd, td);
+    let mut child = spawn_package(&mut cmd);
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    (child, line)
+}
+
+/// Let every [`SHARE_APP`] started under `td` finish, and return what
+/// each printed after its first line.
+fn release_share_apps(td: &Path, apps: Vec<std::process::Child>) -> Vec<String> {
+    std::fs::write(td.join("release"), "").unwrap();
+    apps.into_iter()
+        .map(|app| {
+            let out = app.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        })
+        .collect()
+}
+
+/// The processes running the packed file at `pkg` itself, whether it is
+/// still there or was replaced: the FUSE servers of its launches, and a
+/// launch that has not yet started its app.
+fn servers_of(pkg: &Path) -> Vec<u32> {
+    let replaced = format!("{} (deleted)", pkg.display());
+    let mine = std::process::id();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+            let exe = std::fs::read_link(e.path().join("exe")).ok()?;
+            (pid != mine && (exe == pkg || exe.to_str() == Some(replaced.as_str()))).then_some(pid)
+        })
+        .collect()
+}
+
+/// Wait for every server of `pkg` to leave. False when one is still
+/// running after twice the time a server takes to notice it is unused.
+fn servers_gone(pkg: &Path) -> bool {
+    for _ in 0..300 {
+        if servers_of(pkg).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// What a mount leaves in the test's runtime directory: its mountpoint,
+/// and the record and lease of a shared one. The mountpoints' claim locks
+/// are reclaimed by a later sweep and are not counted.
+fn mount_leftovers(td: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(td.join("xdg-run"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("onelf-") || n.ends_with(".share") || n.ends_with(".lease"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A second launch of a package that is already running runs from the
+/// same mount, served by the same server, instead of mounting the package
+/// again and decompressing all of it a second time. Through a namespace
+/// that means joining the first launch's. The server leaves once both
+/// are done, and takes its mount and files with it.
+#[test]
+fn concurrent_launches_share_one_mount_and_server() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share");
+    let pkg = td.join("share.onelf");
+    pack_share_app(&td, "one", &pkg);
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let envs: &[(&str, &str)] = if helper {
+            &[("ONELF_FUSE_NO_NAMESPACE", "1")]
+        } else {
+            &[]
+        };
+        let _ = std::fs::remove_file(td.join("release"));
+        let (a, a_line) = start_share_app(&pkg, &td, envs);
+        let (b, b_line) = start_share_app(&pkg, &td, envs);
+        let servers = servers_of(&pkg);
+        let rest = release_share_apps(&td, vec![a, b]);
+
+        assert!(a_line.contains("data=one"), "helper={helper}: {a_line}");
+        assert_eq!(
+            a_line, b_line,
+            "helper={helper}: both launches run in one namespace from one mount"
+        );
+        assert_eq!(
+            servers.len(),
+            1,
+            "helper={helper}: one server for both launches, found {servers:?}"
+        );
+        assert!(rest.iter().all(|r| r.contains("data=one")), "{rest:?}");
+        assert!(servers_gone(&pkg), "helper={helper}: the server stays");
+        assert_eq!(
+            mount_leftovers(&td),
+            Vec::<String>::new(),
+            "helper={helper}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The server leaves after the last launch, and the next launch starts a
+/// server of its own rather than finding the old one's files.
+#[test]
+fn a_launch_after_the_last_has_left_starts_a_fresh_server() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share-again");
+    let pkg = td.join("again.onelf");
+    pack_share_app(&td, "one", &pkg);
+
+    let (a, _) = start_share_app(&pkg, &td, &[]);
+    let first = servers_of(&pkg);
+    release_share_apps(&td, vec![a]);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(servers_gone(&pkg), "the server stays after its last launch");
+    assert_eq!(mount_leftovers(&td), Vec::<String>::new());
+
+    std::fs::remove_file(td.join("release")).unwrap();
+    let (b, b_line) = start_share_app(&pkg, &td, &[]);
+    let second = servers_of(&pkg);
+    let rest = release_share_apps(&td, vec![b]);
+    assert!(b_line.contains("data=one"), "{b_line}");
+    assert!(rest[0].contains("data=one"), "{rest:?}");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_ne!(first, second, "the old server was found again");
+    assert!(servers_gone(&pkg));
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package file replaced while it runs, as a self-update does, is a new
+/// package. A launch of the new file never runs from the mount serving the
+/// old one, and the running instance keeps reading the old contents.
+#[test]
+fn a_replaced_package_is_not_served_from_the_old_mount() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share-replaced");
+    let pkg = td.join("replaced.onelf");
+    pack_share_app(&td, "one", &pkg);
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let envs: &[(&str, &str)] = if helper {
+            &[("ONELF_FUSE_NO_NAMESPACE", "1")]
+        } else {
+            &[]
+        };
+        let _ = std::fs::remove_file(td.join("release"));
+        let (old, old_line) = start_share_app(&pkg, &td, envs);
+
+        let staged = td.join("replaced.onelf.new");
+        pack_share_app(&td, "two", &staged);
+        std::fs::rename(&staged, &pkg).unwrap();
+        let (new, new_line) = start_share_app(&pkg, &td, envs);
+        let servers = servers_of(&pkg);
+        let rest = release_share_apps(&td, vec![old, new]);
+
+        assert!(old_line.contains("data=one"), "helper={helper}: {old_line}");
+        assert!(
+            new_line.contains("data=two"),
+            "helper={helper}: the new file was served from the old mount: {new_line}"
+        );
+        let dir = |line: &str| {
+            line.split_whitespace()
+                .find(|w| w.starts_with("dir="))
+                .map(String::from)
+        };
+        assert_ne!(dir(&old_line), dir(&new_line), "helper={helper}");
+        assert_eq!(servers.len(), 2, "helper={helper}: {servers:?}");
+        assert!(rest[0].contains("data=one"), "helper={helper}: {rest:?}");
+        assert!(rest[1].contains("data=two"), "helper={helper}: {rest:?}");
+        assert!(servers_gone(&pkg), "helper={helper}");
+        assert_eq!(
+            mount_leftovers(&td),
+            Vec::<String>::new(),
+            "helper={helper}"
+        );
+        pack_share_app(&td, "one", &pkg);
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `ONELF_FUSE_NO_SHARE` gives every launch a mount and a server of its
+/// own, as before mounts were shared.
+#[test]
+fn the_share_opt_out_gives_each_launch_its_own_mount() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share-optout");
+    let pkg = td.join("optout.onelf");
+    pack_share_app(&td, "one", &pkg);
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let mut envs = vec![("ONELF_FUSE_NO_SHARE", "1")];
+        if helper {
+            envs.push(("ONELF_FUSE_NO_NAMESPACE", "1"));
+        }
+        let _ = std::fs::remove_file(td.join("release"));
+        let (a, a_line) = start_share_app(&pkg, &td, &envs);
+        let (b, b_line) = start_share_app(&pkg, &td, &envs);
+        let servers = servers_of(&pkg);
+        release_share_apps(&td, vec![a, b]);
+
+        assert_ne!(a_line, b_line, "helper={helper}: the launches shared");
+        assert_eq!(servers.len(), 2, "helper={helper}: {servers:?}");
+        assert!(servers_gone(&pkg), "helper={helper}");
+        assert_eq!(
+            mount_leftovers(&td),
+            Vec::<String>::new(),
+            "helper={helper}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A shared server that is killed leaves its mountpoint, its record and
+/// its lease, and through the helper a mount as well. The next launch of
+/// any package reclaims all of it.
+#[test]
+fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share-killed");
+    let pkg = td.join("killed.onelf");
+    pack_share_app(&td, "one", &pkg);
+    let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let envs: &[(&str, &str)] = if helper {
+            &[("ONELF_FUSE_NO_NAMESPACE", "1")]
+        } else {
+            &[]
+        };
+        let (mut app, _) = start_share_app(&pkg, &td, envs);
+        for pid in servers_of(&pkg) {
+            let st = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        app.kill().unwrap();
+        app.wait().unwrap();
+        assert!(servers_gone(&pkg));
+        assert!(
+            !mount_leftovers(&td).is_empty(),
+            "helper={helper}: a killed server leaves its files"
+        );
+
+        let mut run = Command::new(&other);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        isolate(&mut run, &td);
+        assert!(
+            reclaimed_by(&mut run, &td),
+            "helper={helper}: the mount stays"
+        );
+        // The reclaiming launch shares a mount of its own, gone once its
+        // server has noticed nothing uses it.
+        assert!(servers_gone(&other), "helper={helper}");
+        assert_eq!(
+            mount_leftovers(&td),
+            Vec::<String>::new(),
+            "helper={helper}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// `ONELF_TRACE` records the sysroot-space path of every file the run
@@ -8305,14 +8649,32 @@ fn host_and_set_libraries_load_without_a_library_path() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// A launch that finds another instance's helper mount reuses it only when
-/// the mount shows the library links this launch resolved. One that
-/// resolved differently takes another mode rather than load what the
-/// first launch chose.
-#[test]
-fn a_mount_showing_other_library_links_is_not_reused() {
-    use std::os::unix::process::CommandExt;
+/// Wait for a shared mount's server under `td` to record itself. False
+/// when none has after a while.
+fn share_recorded(td: &Path) -> bool {
+    for _ in 0..200 {
+        let recorded = std::fs::read_dir(td.join("xdg-run"))
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name().to_string_lossy().ends_with(".share")
+                    && e.metadata().is_ok_and(|m| m.len() > 0)
+            });
+        if recorded {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
 
+/// A launch that finds another instance's mount runs from it only when
+/// the mount shows the library links this launch resolved. One that
+/// resolved differently mounts the package for itself rather than load
+/// what the first launch chose, through the helper and in a namespace
+/// alike, and leaves the shared mount as it was.
+#[test]
+fn a_launch_whose_library_links_differ_gets_its_own_mount() {
     if !fuse_available() || !have("fusermount3") {
         return; // documented soft-skip
     }
@@ -8322,73 +8684,79 @@ fn a_mount_showing_other_library_links_is_not_reused() {
     };
     let pkg = build_set_app(&td, &fixture);
 
-    let mut holder = set_app_launch(&pkg, &td, &fixture);
-    holder
-        .env("ONELF_MODE", "fuse")
-        .env("ONELF_FUSE_NO_NAMESPACE", "1")
-        .env("HOLD", "30")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0);
-    let mut child = spawn_package(&mut holder);
-    // The package's own mount, not the set's, once it shows the links.
-    let prefix = format!("{}/onelf-", td.join("xdg-run").display());
-    let package_mount = || {
-        let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-        info.lines()
-            .filter_map(|line| line.split(' ').nth(4))
-            .map(|mp| PathBuf::from(mp.replace("\\040", " ")))
-            .find(|mp| {
-                let mp = mp.to_string_lossy();
-                mp.starts_with(&prefix) && !mp.contains("onelf-set-")
-            })
-            .filter(|mp| mp.join("lib/libGL.so.1").exists())
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mount = loop {
-        let mount = package_mount();
-        if mount.is_some() || std::time::Instant::now() > deadline {
-            break mount;
+    for helper in [true, false] {
+        let mut holder = set_app_launch(&pkg, &td, &fixture);
+        holder
+            .env("ONELF_MODE", "fuse")
+            .env("HOLD", "30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if helper {
+            holder.env("ONELF_FUSE_NO_NAMESPACE", "1");
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    };
-    let Some(mount) = mount else {
-        kill_group(&child);
+        let mut child = spawn_package(&mut holder);
+        // A launch that finds the record waits until the holder has placed
+        // its links and started the app.
+        assert!(
+            share_recorded(&td),
+            "helper={helper}: the holder's server did not record itself"
+        );
+        // The package's server and the set's, once the holder runs its app.
+        let holder_exe = format!("/proc/{}/exe", child.id());
+        for _ in 0..200 {
+            if std::fs::read_link(&holder_exe).is_ok_and(|exe| exe != pkg) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let servers = servers_of(&pkg);
+
+        // Resolved the same way: the mount is reused, forced FUSE and all,
+        // and no server of its own is left behind.
+        let same = || {
+            let mut same = set_app_launch(&pkg, &td, &fixture);
+            same.env("ONELF_MODE", "fuse");
+            let out = run_package(&mut same);
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+                "helper={helper}: {stderr}"
+            );
+            assert!(!stderr.contains("its own"), "helper={helper}: {stderr}");
+            assert_eq!(servers_of(&pkg), servers, "helper={helper}");
+        };
+        same();
+
+        // Without the resolver nothing supplies libGL.so.1. The mount
+        // still links it, so running from it would hide that.
+        let mut other = set_app_launch(&pkg, &td, &fixture);
+        other.env("ONELF_NO_RESOLVER", "1");
+        let out = run_package(&mut other);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("mounting its own"),
+            "helper={helper}: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("value="),
+            "helper={helper}: the first launch's links reached a launch that resolved none: {stderr}"
+        );
+        assert!(entrypoint_ran(&stderr), "helper={helper}: {stderr}");
+
+        // The shared mount is unchanged, once the server of the other
+        // launch's own mount has left.
+        for _ in 0..300 {
+            if servers_of(&pkg) == servers {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        same();
+
+        let _ = child.kill();
         let _ = child.wait();
-        skip("the FUSE helper mount did not appear");
-        return;
-    };
-
-    // Resolved the same way: the mount is reused, forced FUSE and all.
-    let mut same = set_app_launch(&pkg, &td, &fixture);
-    same.env("ONELF_MODE", "fuse");
-    let out = run_package(&mut same);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("another mode"), "{stderr}");
-
-    // Without the resolver nothing supplies libGL.so.1. The mount still
-    // links it, so reusing the mount would hide that.
-    let mut other = set_app_launch(&pkg, &td, &fixture);
-    other.env("ONELF_NO_RESOLVER", "1");
-    let out = run_package(&mut other);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("another mode"), "{stderr}");
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("value="),
-        "the first launch's links reached a launch that resolved none: {stderr}"
-    );
-    assert!(entrypoint_ran(&stderr), "{stderr}");
-    assert!(
-        mount.join("lib/libGL.so.1").exists(),
-        "the mount is unchanged"
-    );
-
-    kill_group(&child);
-    let _ = child.wait();
+        assert!(servers_gone(&pkg), "helper={helper}");
+    }
     let _ = std::fs::remove_dir_all(&td);
 }
 

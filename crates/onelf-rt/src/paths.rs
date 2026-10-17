@@ -135,6 +135,37 @@ pub fn create_launch_dir(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
     Some(Mountpoint { path, _lock: lock })
 }
 
+/// The mountpoint concurrent launches of a package share (see
+/// `fuse::share`), claimed the way [`create_mountpoint`] claims one.
+pub fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {
+    let (path, lock) = claim_mountpoint(dir_name)?;
+    Some(Mountpoint { path, _lock: lock })
+}
+
+/// `onelf-<name prefix>-<longer id prefix>`, the shared mountpoint's
+/// name. It carries more of the id than [`package_dir_name`], so it is
+/// never the directory a launch that does not share mounts at.
+pub fn shared_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
+    let hash_suffix = crate::cache::hex(&package_id[0..8]);
+    format!("onelf-{}-{hash_suffix}", name_stem(package_name))
+}
+
+/// The record and the lease of the shared mountpoint `dir_name` under
+/// `base`. The record names the server and is locked by every launch
+/// deciding whether to start one. The lease is held shared by every
+/// launch running from the mount.
+pub fn share_files_in(base: &Path, dir_name: &str) -> (PathBuf, PathBuf) {
+    (
+        base.join(format!(".{dir_name}.share")),
+        base.join(format!(".{dir_name}.lease")),
+    )
+}
+
+/// [`share_files_in`] under the private runtime directory.
+pub fn share_files(dir_name: &str) -> Option<(PathBuf, PathBuf)> {
+    Some(share_files_in(&private_dir()?, dir_name))
+}
+
 /// `onelf-<name prefix>-<id prefix>`, shared by every launch of a package.
 fn package_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
     let hash_suffix = crate::cache::hex(&package_id[0..4]);
@@ -282,13 +313,17 @@ fn sweep_in(base: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        match name
-            .strip_prefix('.')
-            .and_then(|rest| rest.strip_suffix(".lock"))
-        {
-            Some(owner) if owner.starts_with("onelf-") => reclaim_orphan_lock(base, owner),
-            _ if name.starts_with("onelf-") => reclaim_mountpoint(base, name, &entry.path()),
-            _ => {}
+        let hidden = |suffix: &str| {
+            name.strip_prefix('.')
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .filter(|owner| owner.starts_with("onelf-"))
+        };
+        if let Some(owner) = hidden(".lock") {
+            reclaim_orphan_lock(base, owner);
+        } else if let Some(owner) = hidden(".share") {
+            crate::fuse::share::reclaim_stale(base, owner);
+        } else if name.starts_with("onelf-") {
+            reclaim_mountpoint(base, name, &entry.path());
         }
     }
 }

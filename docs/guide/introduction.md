@@ -46,7 +46,7 @@ page explains why.
 | musl hosts | yes | yes | no | no | yes |
 | No helper needed | yes | yes | `fusermount` | `bwrap` | yes |
 | Invisible mount | yes, with user namespaces | no, `/tmp/.mount_*` | no | n/a | n/a |
-| Instances share a mount | no, one each | yes | no | n/a | n/a |
+| Instances share a mount | yes | yes | no | n/a | n/a |
 | Nothing on disk | no copy left, cache opt-in | extraction removed on exit | mount dir on crash | installs | yes |
 | GPU drivers | host, per library; bundling opt-in | bundled Mesa, NVIDIA from the host | host dirs on path | runtime extension | n/a |
 | Bundle source | scan or package DB | `lib4bin` and `strace`, or debloated Arch packages | `linuxdeploy` | build in SDK | compiler |

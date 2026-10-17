@@ -154,6 +154,9 @@ runtime directory     extract into the per-user runtime dir
 persistent cache      only when the publisher or the user asks
 ```
 
+A second launch of a package that is already running joins the first
+one's FUSE mount rather than mount and decompress the package again.
+
 The persistent cache is the one rung that leaves an extraction on disk,
 so the runtime never falls into it on its own. A package that cannot run
 any other way says so and names the variable that would allow it.

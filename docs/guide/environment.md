@@ -66,10 +66,11 @@ exist depends on the [mode](./execution-modes):
 | `tmpfs`, `rundir` | symlinks in the launch's own tree |
 | `cache` | symlinks in the shared cache tree, made to match what each launch resolved |
 
-A FUSE mount another instance is serving, which only the `fusermount3`
-path allows, is reused only when it shows the links this launch
-resolved. A launch that resolved differently, because the host changed
-or `ONELF_NO_RESOLVER` was set, says so and takes the next mode. In the
+A FUSE mount another instance is serving (see
+[Instances share a mount](./execution-modes#instances-share-a-mount)) is
+reused only when it shows the links this launch resolved. A launch that
+resolved differently, because the host changed or `ONELF_NO_RESOLVER` was
+set, says so and mounts the package for itself. In the
 cache mode a launch under a different host state rewrites the links,
 and an instance still running from that tree loads the new targets for
 anything it opens afterwards.
@@ -484,6 +485,7 @@ anything else, as the hook would have.
 | `ONELF_ENTRYPOINT` | Select an [entrypoint](./entrypoints) by name |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30, `0` disables) |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` path even when user namespaces work |
+| `ONELF_FUSE_NO_SHARE` | Mount the package for this launch alone rather than run from a running instance's mount |
 | `ONELF_NO_RESOLVER` | Take nothing from the host for this launch, to tell whether a failure is the resolver's |
 
 The full list is in the [environment variable reference](../reference/env-vars).

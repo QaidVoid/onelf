@@ -1,14 +1,17 @@
 //! FUSE-based execution mode.
 //!
 //! Mounts the package contents as a read-only FUSE filesystem and executes
-//! the entrypoint directly from the mount. The parent process serves FUSE
-//! requests while the child runs the target binary. A death pipe detects
-//! child exit for reliable cleanup.
+//! the entrypoint directly from the mount. Concurrent launches of one
+//! package share a mount and the server behind it (see [`share`]). A
+//! launch that does not share serves its own mount from the parent process
+//! while the child runs the target binary, and a death pipe detects child
+//! exit for reliable cleanup.
 
 pub(crate) mod fs;
 pub(crate) use fs::TRACE_ARM;
 pub(crate) mod mount;
 mod protocol;
+pub(crate) mod share;
 
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
@@ -128,54 +131,78 @@ pub(crate) fn install_signal_handlers() {
     }
 }
 
-/// Execute directly from an existing FUSE mount (another instance is serving).
-/// This process becomes the child, so no fork or FUSE loop is needed.
-/// Returns `false` when that mount cannot serve this launch, so the caller
-/// falls back to another mode.
-// Threads the launch context straight to the exec call; grouping it
-// would add a type used at one call site.
-#[allow(clippy::too_many_arguments)]
-fn exec_from_mount(
-    pkg: &mut PackageData,
-    ep_idx: usize,
-    argv0: &str,
-    exec_path: &str,
-    args: &[OsString],
-    interp_data: Option<&[u8]>,
-    env_data: Option<&[u8]>,
-    mountpoint: &Path,
-) -> bool {
-    let exe_path = std::path::Path::new(exec_path);
-    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
-    let exe_name = exe_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("onelf");
-    crate::portable::setup_portable(exe_dir, exe_name);
+/// What a launch runs, carried unchanged from the caller to the exec.
+pub(crate) struct Request<'a> {
+    pub ep_idx: usize,
+    pub argv0: &'a str,
+    pub exec_path: &'a str,
+    pub args: &'a [OsString],
+    pub interp_data: Option<&'a [u8]>,
+    pub env_data: Option<&'a [u8]>,
+}
 
-    crate::launch::exec_served(&crate::launch::Launch {
-        pkg,
-        pkg_root: mountpoint,
-        mode: "fuse",
-        ep_idx,
-        argv0,
-        exec_path,
-        args,
-        interp_data,
-        env_data,
-        // Another instance's mount is only reachable from here when that
-        // instance mounted it through fusermount3, in the host namespace.
-        private_ns: false,
-        tree_writable: false,
-        links: crate::launch::Links::Served,
-    });
-    // The links that mount serves were placed for a launch that resolved
-    // the host differently, and only its own server could change them.
-    eprintln!(
-        "onelf-rt: fuse: the running instance's mount serves other host \
-         libraries than this launch needs; using another mode"
-    );
-    false
+impl Request<'_> {
+    /// The launch of this request from the package tree at `pkg_root`.
+    fn launch<'b>(
+        &'b self,
+        pkg: &'b PackageData,
+        pkg_root: &'b Path,
+        private_ns: bool,
+        links: crate::launch::Links<'b>,
+    ) -> crate::launch::Launch<'b> {
+        crate::launch::Launch {
+            pkg,
+            pkg_root,
+            mode: "fuse",
+            ep_idx: self.ep_idx,
+            argv0: self.argv0,
+            exec_path: self.exec_path,
+            args: self.args,
+            interp_data: self.interp_data,
+            env_data: self.env_data,
+            private_ns,
+            tree_writable: false,
+            links,
+        }
+    }
+
+    /// Point the app at the portable directories beside the packed file.
+    fn setup_portable(&self) {
+        let exe_path = Path::new(self.exec_path);
+        let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
+        let exe_name = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("onelf");
+        crate::portable::setup_portable(exe_dir, exe_name);
+    }
+}
+
+/// Leave the launcher's session and let go of its standard streams, as a
+/// server that outlives the launcher has to.
+///
+/// A Ctrl-C aimed at the launcher must not take down the filesystem a
+/// daemon is still reading from. Holding the streams keeps the write end
+/// of whatever pipe the caller set up open, so `$(app)`, `app | head` and
+/// every other reader would block until the server exits rather than
+/// until the app is done.
+fn detach_from_caller() {
+    let _ = rustix::process::setsid();
+    if let Ok(null) = rustix::fs::open(
+        "/dev/null",
+        rustix::fs::OFlags::RDWR,
+        rustix::fs::Mode::empty(),
+    ) {
+        for target in 0..=2 {
+            // `dup2` wants to own the descriptor it replaces, but 0, 1 and 2
+            // are not ours to close: the dup is what puts /dev/null there,
+            // and dropping the wrapper afterwards would close it again.
+            use std::os::fd::FromRawFd;
+            let mut slot =
+                std::mem::ManuallyDrop::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(target) });
+            let _ = rustix::io::dup2(&null, &mut slot);
+        }
+    }
 }
 
 /// Whether any process other than this one is still running out of `mountpoint`.
@@ -263,12 +290,69 @@ fn cleanup_mountpoint(claim: crate::paths::Mountpoint, used_namespace: bool) {
     claim.release();
 }
 
+/// Whether this launch stays out of a user namespace of its own: the
+/// package runs setuid binaries, or `ONELF_FUSE_NO_NAMESPACE` asks.
+///
+/// The variable is for packages that expect to stay in the host's user
+/// namespace. The specific use case is rootless podman / distrobox: they
+/// rely on setuid `newuidmap` / `newgidmap` to build their own nested user
+/// namespace, and setuid bits do not survive a CLONE_NEWUSER unshare.
+/// A package built with `needs-setuid` asks for the same thing for its
+/// own reason: it runs sudo or pkexec.
+fn skips_namespace(needs_setuid: bool) -> bool {
+    needs_setuid
+        || std::env::var_os("ONELF_FUSE_NO_NAMESPACE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+}
+
+/// Mount at `mountpoint` inside a private user and mount namespace this
+/// process enters. No external helper, private to us, torn down by the
+/// kernel on exit. The error says why it was not done.
+fn mount_in_namespace(mountpoint: &Path, needs_setuid: bool) -> std::io::Result<OwnedFd> {
+    if skips_namespace(needs_setuid) {
+        let why = if needs_setuid {
+            "package needs setuid; using fusermount3"
+        } else {
+            "ONELF_FUSE_NO_NAMESPACE set; using fusermount3"
+        };
+        return Err(std::io::Error::other(why));
+    }
+    mount::fuse_mount_unshare(mountpoint)
+}
+
+/// Mount at `mountpoint` through `fusermount3`, the fallback where the
+/// kernel disallows unprivileged user namespaces or the launch stays out
+/// of one. `ns_err` is why the namespace mount was not made.
+fn mount_with_helper(
+    mountpoint: &Path,
+    ns_err: &std::io::Error,
+    needs_setuid: bool,
+) -> Option<OwnedFd> {
+    if !mount::fusermount3_available() {
+        // Expected where the package asked to stay in the host's
+        // namespace: without fusermount3 there is no way to mount
+        // outside one, so extraction takes over. Not a failure.
+        if !needs_setuid {
+            eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
+            eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
+        }
+        return None;
+    }
+    match mount::fuse_mount(mountpoint) {
+        Ok(fd) => Some(fd),
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: mount failed: {e}");
+            None
+        }
+    }
+}
+
 /// Execute the package via FUSE mount.
 ///
 /// On success, exits the process with the child's exit code (never returns).
 /// Returns `false` if FUSE is unavailable and caller should fall back.
-// Threads the launch context straight to the exec call; grouping it
-// would add a type used at one call site.
+// The caller's arguments, grouped into a `Request` on the way in.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_fuse(
     pkg: &mut PackageData,
@@ -282,101 +366,61 @@ pub fn execute_fuse(
 ) -> bool {
     crate::paths::sweep_stale_mountpoints();
 
+    let req = Request {
+        ep_idx,
+        argv0,
+        exec_path,
+        args,
+        interp_data,
+        env_data,
+    };
+    if share::wanted() {
+        match share::launch(pkg, &req, needs_setuid) {
+            share::Declined::Private => {}
+            share::Declined::Unmountable => return false,
+        }
+    }
+    execute_private(pkg, &req, needs_setuid)
+}
+
+/// Mount the package for this launch alone, serve it from this process
+/// while the child runs the app, and hand the mount to a background
+/// server if anything is still using it when the child exits.
+fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> bool {
     // Held by the parent, which serves the filesystem and outlives the
     // child, so no concurrent sweep can reclaim the directory.
-    let claim =
-        match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
-        {
-            Some(m) => m,
-            None => return false,
-        };
-    let mountpoint = claim.path().to_path_buf();
-
-    // If already mounted by another instance, reuse it and exec directly.
-    // (Only reachable via the fusermount3 path; namespace mounts are private.)
-    if crate::paths::is_mountpoint(&mountpoint) {
-        if mountpoint.read_dir().is_ok() {
-            return exec_from_mount(
-                pkg,
-                ep_idx,
-                argv0,
-                exec_path,
-                args,
-                interp_data,
-                env_data,
-                &mountpoint,
-            );
-        }
-        // Dead mount (FUSE daemon exited). Clean up and proceed with fresh mount.
-        mount::fuse_unmount(&mountpoint);
-    }
-
-    // Prefer the namespace-based mount. No external helper, private to us,
-    // tears down automatically on exit. Fall back to fusermount3 if the
-    // kernel disallows unprivileged user namespaces (e.g. restricted distros).
-    //
-    // Setting `ONELF_FUSE_NO_NAMESPACE=1` forces the fusermount3 path,
-    // which is needed for packages that expect to stay in the host's
-    // user namespace. The specific use case is rootless podman /
-    // distrobox: they rely on setuid `newuidmap` / `newgidmap` to
-    // build their own nested user namespace, and setuid bits do not
-    // survive a CLONE_NEWUSER unshare. Staying in the host userns
-    // keeps those helpers working.
-    //
-    // A package built with `needs-setuid` asks for the same thing for its own
-    // reason: it runs sudo or pkexec, and a setuid bit does nothing inside a
-    // namespace we made ourselves.
-    let skip_namespace = needs_setuid
-        || std::env::var_os("ONELF_FUSE_NO_NAMESPACE")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
-
-    let ns_result = if skip_namespace {
-        let why = if needs_setuid {
-            "package needs setuid; using fusermount3"
-        } else {
-            "ONELF_FUSE_NO_NAMESPACE set; using fusermount3"
-        };
-        Err(std::io::Error::other(why))
-    } else {
-        mount::fuse_mount_unshare(&mountpoint)
+    let name = pkg.manifest.name();
+    let id = &pkg.manifest.header.package_id;
+    let Some(claim) = crate::paths::create_mountpoint(name, id) else {
+        return false;
     };
 
-    let (fuse_fd, used_namespace) = match ns_result {
-        Ok(fd) => (fd, true),
+    // Prefer the namespace mount. A helper mount is visible on the host,
+    // so it goes in a directory of this launch's own: another launch of
+    // the package that also does not share would otherwise stack its
+    // mount on this one.
+    let (claim, fuse_fd, used_namespace) = match mount_in_namespace(claim.path(), needs_setuid) {
+        Ok(fd) => (claim, fd, true),
         Err(ns_err) => {
-            if !mount::fusermount3_available() {
-                // Expected where the package asked to stay in the host's
-                // namespace: without fusermount3 there is no way to mount
-                // outside one, so extraction takes over. Not a failure.
-                if !needs_setuid {
-                    eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
-                    eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
-                }
-                claim.release();
+            claim.release();
+            let Some(claim) = crate::paths::create_launch_dir(name, id) else {
                 return false;
-            }
-            match mount::fuse_mount(&mountpoint) {
-                Ok(fd) => (fd, false),
-                Err(e) => {
-                    eprintln!("onelf-rt: fuse: mount failed: {e}");
+            };
+            match mount_with_helper(claim.path(), &ns_err, needs_setuid) {
+                Some(fd) => (claim, fd, false),
+                None => {
                     claim.release();
                     return false;
                 }
             }
         }
     };
+    let mountpoint = claim.path().to_path_buf();
     // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
     let _ = rustix::io::fcntl_setfd(&fuse_fd, FdFlags::CLOEXEC);
 
     // Set up portable directories (doesn't access FUSE mount)
-    let exe_path = std::path::Path::new(exec_path);
-    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
-    let exe_name = exe_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("onelf");
-    crate::portable::setup_portable(exe_dir, exe_name);
+    req.setup_portable();
 
     // Death pipe: when the child (and all its descendants) exit, the write end
     // closes and poll() on the read end returns POLLHUP.
@@ -408,20 +452,12 @@ pub fn execute_fuse(
             // Everything that reads the mount has to happen in the child,
             // after the fork: the parent's FUSE event loop is what serves
             // it, and that loop is only now starting.
-            crate::launch::exec(&crate::launch::Launch {
+            crate::launch::exec(&req.launch(
                 pkg,
-                pkg_root: &mountpoint,
-                mode: "fuse",
-                ep_idx,
-                argv0,
-                exec_path,
-                args,
-                interp_data,
-                env_data,
-                private_ns: used_namespace,
-                tree_writable: false,
-                links: crate::launch::Links::Server(&links_tx),
-            })
+                &mountpoint,
+                used_namespace,
+                crate::launch::Links::Server(&links_tx),
+            ))
         }
         Ok(Fork::ParentOf(child_pid)) => {
             // Close write end in parent -- only child holds it now
@@ -519,32 +555,7 @@ pub fn execute_fuse(
             // server ask once things have settled.
             let handed_off = match unsafe { kernel_fork() } {
                 Ok(Fork::Child(_)) => {
-                    // Leave the launcher's session so a Ctrl-C aimed at it
-                    // does not take down the filesystem a daemon is still
-                    // reading from.
-                    let _ = rustix::process::setsid();
-                    // Let go of the launcher's standard streams. Holding them
-                    // keeps the write end of whatever pipe the caller set up
-                    // open, so `$(app)`, `app | head` and every other reader
-                    // would block until this server exits rather than until
-                    // the app is done.
-                    if let Ok(null) = rustix::fs::open(
-                        "/dev/null",
-                        rustix::fs::OFlags::RDWR,
-                        rustix::fs::Mode::empty(),
-                    ) {
-                        for target in 0..=2 {
-                            // `dup2` wants to own the descriptor it replaces,
-                            // but 0, 1 and 2 are not ours to close: the dup is
-                            // what puts /dev/null there, and dropping the
-                            // wrapper afterwards would close it again.
-                            use std::os::fd::FromRawFd;
-                            let mut slot = std::mem::ManuallyDrop::new(unsafe {
-                                std::os::fd::OwnedFd::from_raw_fd(target)
-                            });
-                            let _ = rustix::io::dup2(&null, &mut slot);
-                        }
-                    }
+                    detach_from_caller();
                     state.serve_detached(&fuse_fd, &mut fuse_buf, || !mount_in_use(&mountpoint));
                     drop(fuse_fd);
                     cleanup_mountpoint(claim, used_namespace);

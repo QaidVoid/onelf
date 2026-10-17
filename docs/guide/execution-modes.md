@@ -12,7 +12,10 @@ The rules this page encodes:
 - ❌ Do not opt into the cache casually. It is the one mode that leaves
   the package's full size on disk, which is why the runtime never
   enters it without a request.
-- ⚠️ A `fusermount3` mount outlives a runtime killed outright. Nothing
+- ✅ Let a second launch of a running package share the first one's
+  mount. It skips mounting and decompressing again, and
+  `ONELF_FUSE_NO_SHARE=1` turns it off.
+- ⚠️ A `fusermount3` mount outlives a server killed outright. Nothing
   tears it down at the time; the next launch of any package sweeps it.
 - ✅ Force a mode with `ONELF_MODE` when you need one pinned. A forced
   mode that fails is an error, not a fallback.
@@ -106,7 +109,7 @@ socketpair-passed back from a `fusermount3` subprocess.
 The mount lives in the host namespace in this mode, so it is visible to
 other processes. It is still lazy, which matters for large packages.
 
-⚠️ A runtime that is killed outright cannot unmount what it served, and
+⚠️ A server that is killed outright cannot unmount what it served, and
 the kernel does not do it either. Such a mount answers every request
 with a disconnected transport. Every launch of any package sweeps the
 private runtime directory for those: a mountpoint whose owner lock is
@@ -118,6 +121,60 @@ and removed. A mount whose owner is alive is never touched.
 - `fusermount3` on `$PATH`. Without it, FUSE 2's `fusermount` is used
   when it is setuid root, since it passes `/dev/fuse` back the same way.
   `FUSERMOUNT_PROG` names a helper outright.
+
+## Instances share a mount
+
+✅ A second launch of a package that is already running does not mount
+it again. It runs from the first launch's mount, served by the same
+process, so nothing the first instance has read is decompressed a second
+time, and the kernel's cache of the package's pages is shared between
+them. This holds on both FUSE rungs.
+
+How it works:
+
+- The first launch mounts the package and starts a server for it that
+  belongs to no one instance. The server records itself in the private
+  runtime directory, in `.onelf-<name>-<id>.share`, under the package's
+  whole id. The id is a hash of the manifest, which covers the content of
+  every file and the runtime.
+- Every instance holds a lease, `.onelf-<name>-<id>.lease`, which the app
+  and everything it starts inherit. The server leaves once nobody holds
+  the lease and no process runs out of the mount. It first asks a second
+  after the launch that started it runs its app, and then whenever the
+  mount has gone five seconds without a request. It takes its mount, its
+  record and its lease with it.
+- Launches that start together take turns on the record. The first one
+  holds it until its app runs, so the others find a finished mount and
+  never start a second server.
+- On the `fusermount3` rung the mount is in the host's namespace, and a
+  later launch runs from it as it is. On the namespace rung a later launch
+  enters the server's user and mount namespace, and then a copy of that
+  mount namespace of its own, so the host libraries it places over bundled
+  ones stay its own.
+
+A launch mounts the package for itself instead when:
+
+- the library links it resolved differ from those the mount shows,
+  because the host changed or `ONELF_NO_RESOLVER` is set. It says so on
+  its error output;
+- on the namespace rung, it would not see the same files there: it sees
+  other mounts than the server does, which a launch from inside another
+  app's namespace or a container does, and so does one after the host
+  mounted something that it does not propagate into copies; its root is
+  not `/`; or its working directory is not the same directory there;
+- it stays out of user namespaces (`needs-setuid` or
+  `ONELF_FUSE_NO_NAMESPACE`) and the running instance mounted in one;
+- `ONELF_TRACE` is set, since the trace is recorded by the server;
+- `ONELF_FUSE_NO_SHARE` is set to anything other than empty or `0`.
+
+A package file replaced on disk, as a [self-update](./self-update) does,
+has a new id. Its launches get a server of their own, and instances
+started from the old file keep reading the old contents.
+
+⚠️ A process that inherited the lease keeps the server running even when
+it runs nothing from the package, as a host program the app started can.
+A daemon that closes what it inherited is seen only while it runs a file
+from the package or sits in its directory.
 
 ## Mode 4: Ephemeral tmpfs (no FUSE available)
 
