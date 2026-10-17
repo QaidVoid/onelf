@@ -44,7 +44,9 @@ onelf sysroot info ./sysroot
 `fetch` also takes a local path. Materializing needs no privileges:
 ownership is not restored and setuid bits are dropped, since the bundle
 never needs either, and an archive whose entries reach outside the
-directory is refused.
+directory is refused. The directory appears only once the whole archive
+is unpacked, so a failed fetch leaves nothing a later build could take
+for a sysroot.
 
 ✅ The quickest way to make one yourself is a container: install the
 application with `pacman` inside an `archlinux` image and export the
@@ -70,7 +72,8 @@ trace = "../trace.txt"               # optional
 
 ✅ Use `optional` for packages the closure misses on its own: an optional
 dependency of something bundled, or a package nothing depends on at all,
-such as a Vulkan driver. Each enters with its own dependencies.
+such as a Vulkan driver. Each enters with its own dependencies, and a
+name no package in the sysroot provides stops the build.
 
 `onelf build` then finds the package owning `usr/bin/myapp`, takes its
 transitive dependencies, prunes them, and copies the result into the
@@ -127,7 +130,8 @@ host-provided; at run time the resolver takes it from the host; see
   of the line.
 
 **The policy** names what never ships, as globs over paths relative to
-the sysroot root:
+the sysroot root. `*` stays within one directory and `**` crosses them,
+so `usr/lib/*.a` leaves the subdirectories of `usr/lib` alone:
 
 ```
 usr/share/doc/**
@@ -218,7 +222,10 @@ The package list is the bundle's provenance, and it travels with the
 package: `bundle-libs` writes it to `.onelf/provenance.toml` under the
 `platform` label from the recipe, and `onelf info` prints it. ✅ Two builds
 from the same archive and recipe produce the same bytes, so the list can
-be checked against the archive later.
+be checked against the archive later. A sysroot build pins every mtime
+to the Unix epoch unless the recipe's `mtime` or `SOURCE_DATE_EPOCH`
+names a time, since the time the AppDir was written says nothing about
+the bundle.
 
 ## Sharing a dependency set
 
@@ -361,9 +368,13 @@ blake3 = "3f1c...a9e2"
 
 Without `--sysroot`, `pack-gl` packs a tree you built by
 hand; either way it refuses a tree carrying glibc, then runs the
-verifier over it, so everything it needs apart from glibc and the
-driver families it exists to provide has to be inside. It prints the
-hash to put in `platform.toml`.
+verifier over it. A library in `lib/` that needs anything apart from
+glibc and the driver families the build exists to provide has to find
+it inside, or the build stops naming what is missing, so the package
+that provides it can be added. An object elsewhere with an unmet need, a
+binding for a stack outside the closure, is dropped and listed, and so
+is a library whose need the sysroot holds nowhere, since no build could
+load it. It prints the hash to put in `platform.toml`.
 
 ✅ The hash is the whole trust story. The package that carries it is
 already the thing you distribute, so whoever can alter the hash can

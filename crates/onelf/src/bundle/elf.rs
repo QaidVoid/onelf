@@ -145,7 +145,7 @@ pub(crate) fn resolve_runpath_dirs<'a>(
     resolve_runpath_dirs_under(raw, origin, None)
 }
 
-/// As [`resolve_runpath_dirs`], with an absolute entry taken as a path
+/// As [`resolve_runpath_dirs`], with an absolute entry resolved as a path
 /// inside `root` when one is given: a sysroot's binaries name the
 /// sysroot's directories, which need not exist on the packer's machine.
 pub(crate) fn resolve_runpath_dirs_under<'a>(
@@ -156,11 +156,11 @@ pub(crate) fn resolve_runpath_dirs_under<'a>(
     raw.flat_map(|s| s.split(':'))
         .filter(|s| !s.is_empty())
         .map(|entry| expand_runpath_entry(entry, origin))
-        .map(|dir| match root {
+        .filter_map(|dir| match root {
             Some(root) if dir.is_absolute() && !dir.starts_with(root) => {
-                root.join(dir.strip_prefix("/").unwrap_or(&dir))
+                onelf_sysroot::path::in_root(root, &dir).ok()
             }
-            _ => dir,
+            _ => Some(dir),
         })
         .filter(|p| p.is_dir())
         .collect()

@@ -92,10 +92,13 @@ impl Policy {
         Ok(Policy { patterns })
     }
 
+    /// Whether `rel` matches a pattern. `*` stays within one directory
+    /// and `**` crosses them, so `usr/lib/*.so` names nothing in a
+    /// subdirectory of `usr/lib`.
     pub fn matches(&self, rel: &str) -> bool {
         let options = glob::MatchOptions {
             case_sensitive: true,
-            require_literal_separator: false,
+            require_literal_separator: true,
             require_literal_leading_dot: false,
         };
         self.patterns.iter().any(|p| p.matches_with(rel, options))
@@ -160,8 +163,9 @@ fn package_root<'a>(rel: &'a str, init_dirs: &HashSet<&str>) -> Option<&'a str> 
 }
 
 /// Apply the tiers to `files`, relative paths in any order. `keep_names`
-/// are basenames that survive the trace regardless, the sonames some
-/// bundled object needs; `keep` are globs the trace may not prune.
+/// survive the trace regardless: a basename, the soname some bundled
+/// object needs, keeps every file so named, and a path, holding a slash,
+/// keeps that one file. `keep` are globs the trace may not prune.
 ///
 /// A Python package is kept whole once the trace opened anything in it:
 /// its modules are imported lazily, so file granularity there would cut
@@ -206,6 +210,7 @@ pub fn prune(
         if let Some(trace) = trace
             && !trace.keeps(rel)
             && !keep_names.contains(name)
+            && !keep_names.contains(rel.as_str())
             && !keep.is_some_and(|k| k.matches(rel))
             && !package_root(rel, &init_dirs).is_some_and(|root| opened_packages.contains(root))
         {
@@ -268,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn a_star_stays_within_one_directory() {
+        let root = temp_root("policystar");
+        let path = root.join("policy.txt");
+        std::fs::write(&path, "usr/lib/lib*.so\nusr/share/**/*.mo\n").unwrap();
+        let policy = Policy::load(&path).unwrap();
+        assert!(policy.matches("usr/lib/libfoo.so"));
+        assert!(!policy.matches("usr/lib/libreoffice/program/libmergedlo.so"));
+        assert!(policy.matches("usr/share/locale/de/LC_MESSAGES/app.mo"));
+    }
+
+    #[test]
     fn a_bad_pattern_names_the_file_and_line() {
         let root = temp_root("badpolicy");
         let path = root.join("policy.txt");
@@ -295,6 +311,23 @@ mod tests {
             "unopened removed"
         );
         assert_eq!(out.removed_trace, files().len() - 4);
+    }
+
+    #[test]
+    fn a_kept_path_keeps_that_file_alone() {
+        let files: Vec<String> = [
+            "usr/share/icons/a/index.theme",
+            "usr/share/icons/b/index.theme",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let trace = Trace::from_paths(vec!["/usr/bin/app".into()]);
+        let keep: HashSet<String> = ["usr/share/icons/a/index.theme".to_string()]
+            .into_iter()
+            .collect();
+        let out = prune(&files, None, None, Some(&trace), &keep, None);
+        assert_eq!(out.kept, ["usr/share/icons/a/index.theme"]);
     }
 
     #[test]

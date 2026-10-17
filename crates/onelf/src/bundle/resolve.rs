@@ -195,15 +195,17 @@ pub(crate) fn expand_nix_cache(
     }
 }
 
-/// `confined` limits the search to `search_paths`: in sysroot mode the
-/// packer's own machine is never consulted.
+/// `sysroot` limits the search to `search_paths`: in sysroot mode the
+/// packer's own machine is never consulted, and a candidate under the
+/// sysroot is read with its links resolved inside it. The candidate is
+/// returned as found, a soname link say, not what it resolves to.
 pub(crate) fn locate_lib(
     soname: &str,
     ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
     search_paths: &[PathBuf],
     target_class: Option<u8>,
     target_machine: Option<u16>,
-    confined: bool,
+    sysroot: Option<&Path>,
 ) -> Option<PathBuf> {
     let class_matches = |path: &Path| -> bool {
         match target_class {
@@ -227,12 +229,19 @@ pub(crate) fn locate_lib(
     // 1. --search-path directories (user-provided: highest priority)
     for dir in search_paths {
         let candidate = dir.join(soname);
-        if candidate.exists() && acceptable(&candidate) {
+        let real = match sysroot.and_then(|root| Some((root, candidate.strip_prefix(root).ok()?))) {
+            Some((root, rel)) => match onelf_sysroot::path::in_root(root, rel) {
+                Ok(real) => real,
+                Err(_) => continue,
+            },
+            None => candidate.clone(),
+        };
+        if real.exists() && acceptable(&real) {
             return Some(candidate);
         }
     }
 
-    if confined {
+    if sysroot.is_some() {
         return None;
     }
 
@@ -388,4 +397,41 @@ pub(crate) fn nix_closure_roots() -> Vec<String> {
     let mut result: Vec<String> = store_paths.into_iter().collect();
     result.sort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A distribution's absolute soname link names the sysroot's file.
+    /// Followed on the packer's machine it names the packer's instead, or
+    /// nothing at all.
+    #[test]
+    fn a_sysroot_candidate_is_read_through_links_inside_the_sysroot() {
+        let td = std::env::temp_dir().join(format!("onelf-locate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&td);
+        let root = td.join("sysroot");
+        let host = td.join("host");
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("libhost.so.1"), b"host").unwrap();
+        fs::write(root.join("usr/lib/libfoo.so.1.2"), b"sysroot").unwrap();
+        std::os::unix::fs::symlink("/usr/lib/libfoo.so.1.2", root.join("usr/lib/libfoo.so.1"))
+            .unwrap();
+        std::os::unix::fs::symlink(host.join("libhost.so.1"), root.join("usr/lib/libhost.so.1"))
+            .unwrap();
+        let dirs = [root.join("usr/lib")];
+        let locate = |soname| locate_lib(soname, &HashMap::new(), &dirs, None, None, Some(&root));
+
+        assert_eq!(
+            locate("libfoo.so.1"),
+            Some(root.join("usr/lib/libfoo.so.1"))
+        );
+        assert_eq!(
+            locate("libhost.so.1"),
+            None,
+            "the packer's file is not the sysroot's"
+        );
+        let _ = fs::remove_dir_all(&td);
+    }
 }

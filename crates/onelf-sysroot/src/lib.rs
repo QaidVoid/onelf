@@ -17,6 +17,7 @@ pub mod archive;
 pub mod closure;
 pub mod db;
 pub mod ldconf;
+pub mod path;
 pub mod platform;
 pub mod prune;
 

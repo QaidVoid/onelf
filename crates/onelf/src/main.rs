@@ -953,7 +953,7 @@ fn main() {
                             named.join(", ")
                         );
                     }
-                    sysroot_cmd::pack_gl(&dir, &output, RUNTIME_BINARY_SLIM)
+                    sysroot_cmd::pack_gl(&dir, &output, sysroot.as_deref(), RUNTIME_BINARY_SLIM)
                 })
             }
             SysrootAction::PackSet {
@@ -991,7 +991,13 @@ fn main() {
                             selection.packages.len(),
                         );
                     }
-                    sysroot_cmd::pack_set(&dir, &output, &name, RUNTIME_BINARY_SLIM)
+                    sysroot_cmd::pack_set(
+                        &dir,
+                        &output,
+                        &name,
+                        sysroot.as_deref(),
+                        RUNTIME_BINARY_SLIM,
+                    )
                 })
             }
         },
@@ -1019,6 +1025,7 @@ fn sysroot_from_recipe(
         }
     };
     let root = resolve(&sr.path);
+    bundle::sysroot::refuse_inside(&root, dir)?;
     if !root.is_dir() {
         let Some(archive) = &sr.archive else {
             return Err(std::io::Error::new(
@@ -1094,6 +1101,13 @@ fn run_build(
         Some(sr) => Some(sysroot_from_recipe(&dir, &recipe.package.command, sr)?),
         None => None,
     };
+
+    // A sysroot build is reproducible from its archive and recipe alone,
+    // so the time the AppDir was written does not reach the package
+    // unless the recipe or SOURCE_DATE_EPOCH asks for a time.
+    let mtime = recipe.package.mtime.or((recipe.sysroot.is_some()
+        && std::env::var_os("SOURCE_DATE_EPOCH").is_none())
+    .then_some(0));
 
     // Stage 1: bundle-libs. A sysroot is applied by bundle-libs, so it
     // runs even when the recipe would otherwise skip bundling.
@@ -1220,7 +1234,7 @@ fn run_build(
             update_revision,
             exclude: recipe.package.exclude,
             package_info,
-            mtime: recipe.package.mtime,
+            mtime,
             env: recipe.env.into_iter().collect(),
             paths: recipe.paths.into_iter().collect(),
             preload: recipe.preload,

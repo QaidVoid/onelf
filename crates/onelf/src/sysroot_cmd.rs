@@ -7,7 +7,6 @@ use onelf_sysroot::{Database, archive};
 
 use crate::bundle::elf::audit_unbundled_needs;
 use crate::bundle::remove_dangling_links_beside;
-use crate::bundle::ui::color;
 use crate::pack::{HostLibs, PackOptions};
 
 /// Materialize the rootfs archive at `source`, a local path or an
@@ -98,20 +97,36 @@ const GL_ENTRYPOINT: &str = "bin/onelf-gl";
 const SET_ENTRYPOINT: &str = "bin/onelf-set";
 
 /// Pack the GL tree at `dir` into `output` and print the hash to pin.
+/// `sysroot` is the sysroot the tree was built from, if any.
 ///
 /// The tree has to be self-contained apart from glibc, which the package
 /// that uses it carries, and the driver families it exists to provide.
-/// Anything else it needs and does not carry is an error here rather
-/// than a silent failure on a host with nothing to fall back on.
-pub fn pack_gl(dir: &Path, output: &Path, runtime: &[u8]) -> io::Result<()> {
-    pack_tree(dir, output, runtime, GL_ENTRYPOINT, "onelf-gl")
+/// A library in `lib/` needing anything else the tree does not carry is
+/// an error here rather than a silent failure on a host with nothing to
+/// fall back on, unless the sysroot holds that need nowhere, which makes
+/// the library unloadable from any build. Other objects with an unmet
+/// need are dropped and listed: a closure carries bindings for stacks
+/// outside it, and nothing loads those from a build.
+pub fn pack_gl(
+    dir: &Path,
+    output: &Path,
+    sysroot: Option<&Path>,
+    runtime: &[u8],
+) -> io::Result<()> {
+    pack_tree(dir, output, sysroot, runtime, GL_ENTRYPOINT, "onelf-gl")
 }
 
 /// Pack the shared set tree at `dir` into `output` under `name` and print
 /// the hash to pin. The same rules as a GL build: glibc stays out, and
-/// anything the set needs beyond glibc and the driver families has to be
-/// inside it.
-pub fn pack_set(dir: &Path, output: &Path, name: &str, runtime: &[u8]) -> io::Result<()> {
+/// a library the set needs beyond glibc and the driver families has to
+/// be inside it.
+pub fn pack_set(
+    dir: &Path,
+    output: &Path,
+    name: &str,
+    sysroot: Option<&Path>,
+    runtime: &[u8],
+) -> io::Result<()> {
     if name.is_empty() || name.contains('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -121,6 +136,7 @@ pub fn pack_set(dir: &Path, output: &Path, name: &str, runtime: &[u8]) -> io::Re
     pack_tree(
         dir,
         output,
+        sysroot,
         runtime,
         SET_ENTRYPOINT,
         &format!("onelf-set-{name}"),
@@ -155,6 +171,7 @@ fn write_shipped_sonames(dir: &Path) -> io::Result<()> {
 fn pack_tree(
     dir: &Path,
     output: &Path,
+    sysroot: Option<&Path>,
     runtime: &[u8],
     entrypoint: &str,
     name: &str,
@@ -220,31 +237,50 @@ fn pack_tree(
         });
     }
     findings.retain(|(_, libs)| !libs.is_empty());
-    // A closure carries bindings for stacks outside it, a Python module
-    // of util-linux say. Nothing loads those from a GL build, so they go,
-    // by name, rather than failing the build.
-    if !findings.is_empty() {
-        // A library directly in lib/ is one a package elsewhere resolves
-        // by soname. Dropping it is still right, since an optional
-        // dependency the sysroot does not hold makes it unloadable
-        // wherever it sits, but it is worth naming: a set meant to carry
-        // it is one package short. What keeps a package from leaving out
-        // a library on the strength of a build that dropped it is the
-        // record written below, not this.
-        for (object, libs) in findings.iter().filter(|(object, _)| {
-            object.parent() == Some(&dir.join("lib"))
-                && object
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains(".so"))
-        }) {
-            eprintln!(
-                "  {} {} is dropped for want of {}; name the package that provides it if the build should carry it",
-                color::bold_red("warning:"),
+    // A library directly in lib/ is one a package elsewhere resolves by
+    // soname, a driver the build exists to provide say, so missing it is
+    // the build being one package short. It is dropped only when the
+    // sysroot holds its need nowhere, an optional dependency never
+    // installed, since then no build could load it.
+    let held: Option<std::collections::HashSet<String>> = sysroot
+        .map(|root| {
+            Database::read(root).map(|db| {
+                db.packages()
+                    .flat_map(|p| p.files.iter())
+                    .filter_map(|f| f.rsplit('/').next())
+                    .map(String::from)
+                    .collect()
+            })
+        })
+        .transpose()?;
+    for (object, libs) in &findings {
+        let in_lib = object.parent() == Some(&dir.join("lib"))
+            && object
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".so"));
+        if !in_lib
+            || held
+                .as_ref()
+                .is_some_and(|h| libs.iter().any(|s| !h.contains(s)))
+        {
+            continue;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} needs {}, which the build does not carry; name the package that provides it",
                 object.strip_prefix(dir).unwrap_or(object).display(),
                 libs[0]
-            );
-        }
+            ),
+        ));
+    }
+    // A closure carries bindings for stacks outside it, a Python module
+    // of util-linux say. Nothing loads those from a build, so they go, by
+    // name, rather than failing it. What keeps a package from leaving out
+    // a library on the strength of a build that dropped it is the record
+    // written below.
+    if !findings.is_empty() {
         eprintln!(
             "Dropped {} object(s) needing libraries outside the build:",
             findings.len()

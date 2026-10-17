@@ -6964,6 +6964,34 @@ fn sysroot_builds_are_reproducible_and_traversal_is_refused() {
     }
     assert!(outputs[0] == outputs[1], "two builds differ");
 
+    // The recipe need not pin a time: the AppDirs written a second
+    // apart still pack to the same bytes.
+    let mut outputs = Vec::new();
+    for name in ["three", "four"] {
+        let dir = td.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        sysroot_recipe(&dir, &fixture, "");
+        let recipe = std::fs::read_to_string(dir.join("onelf.toml")).unwrap();
+        write(&dir.join("onelf.toml"), &recipe.replace("mtime = 0\n", ""));
+        let out = Command::new(onelf())
+            .arg("build")
+            .current_dir(&dir)
+            .env_remove("SOURCE_DATE_EPOCH")
+            .output()
+            .expect("spawn onelf build");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(std::fs::read(dir.join("app.onelf")).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    assert!(
+        outputs[0] == outputs[1],
+        "two builds without a pinned time differ"
+    );
+
     let bad = td.join("bad.tar");
     std::fs::write(&bad, raw_tar_entry("../escape", b"x")).unwrap();
     let out = Command::new(onelf())
@@ -7090,6 +7118,68 @@ fn pack_gl_builds_its_tree_from_the_sysroot() {
 /// A bundled object whose need no package in the sysroot provides can
 /// never load, so the build drops it and everything that needed it, and
 /// says so, instead of failing on each in turn.
+/// A library a build carries in `lib/` that needs one the sysroot holds
+/// outside the closure stops the build: dropping it would ship a GL
+/// build without the driver it exists for.
+#[test]
+fn pack_gl_stops_on_a_library_needing_one_it_does_not_carry() {
+    let td = workdir("packglshort");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let sysroot = td.join("sysroot");
+    let st = Command::new("cp")
+        .arg("-a")
+        .arg(&fixture.rootfs)
+        .arg(&sysroot)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let src = td.join("needer.c");
+    write(
+        &src,
+        "int helper(void);\nint driver(void){return helper();}\n",
+    );
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdriver.so.1",
+            src.to_str().unwrap(),
+            &format!("-L{}", sysroot.join("usr/lib").display()),
+            "-l:libhelper.so.1",
+        ],
+        &sysroot.join("usr/lib/libdriver.so.1"),
+    ));
+    // The package forgets to depend on what provides libhelper.
+    write_pacman_entry(
+        &sysroot,
+        "driver",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libdriver.so.1"],
+    );
+    let out = Command::new(onelf())
+        .args(["sysroot", "pack-gl"])
+        .arg(td.join("gl-tree-short"))
+        .arg("-o")
+        .arg(td.join("gl-short.onelf"))
+        .arg("--sysroot")
+        .arg(&sysroot)
+        .args(["--package", "driver"])
+        .output()
+        .expect("spawn onelf sysroot pack-gl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("lib/libdriver.so.1 needs libhelper.so.1"),
+        "{stderr}"
+    );
+    assert!(!td.join("gl-short.onelf").exists());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 #[test]
 fn objects_the_sysroot_cannot_satisfy_are_dropped_not_fatal() {
     let td = workdir("unloadable");
@@ -7213,7 +7303,7 @@ fn a_recipe_sysroot_archive_may_be_a_url() {
     let dir = td.join("app");
     write(
         &dir.join("onelf.toml"),
-        "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"fresh\"\narchive = \"https://onelf.invalid/root.tar.zst\"\n",
+        "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"../fresh\"\narchive = \"https://onelf.invalid/root.tar.zst\"\n",
     );
     let out = onelf_build(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -7581,6 +7671,20 @@ fn a_package_believes_the_set_build_about_what_it_ships() {
         !String::from_utf8_lossy(&out.stderr).contains("is not at hand"),
         "the build was read, not inferred"
     );
+
+    // A file that is not the pinned build is not believed either.
+    let sets = format!(
+        "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{}\"\n",
+        set_pkg.display(),
+        "0".repeat(64)
+    );
+    sysroot_recipe(&dir, &fixture, &sets);
+    let out = onelf_build(&dir);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not at hand"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -7916,6 +8020,89 @@ fn pinning_a_build_keeps_the_resolver_on() {
 /// the bundle's library directory where the runtime's RPATH reaches it.
 /// The policy holds for such copies too: a pruned library is not brought
 /// back, and the verifier names what needed it.
+/// An optional package nothing in the sysroot provides stops the build
+/// rather than leaving the bundle without it.
+#[test]
+fn an_optional_package_the_sysroot_lacks_is_an_error() {
+    let td = workdir("sysrootoptional");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "optional = [\"extra\", \"no-such\"]\n");
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("optional no-such"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A recipe naming a sysroot inside the AppDir is refused before its
+/// archive is materialized, so the rootfs never lands where it is packed.
+#[test]
+fn a_recipe_sysroot_inside_the_appdir_is_never_materialized() {
+    let td = workdir("sysrootinside");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"sysroot\"\narchive = \"{}\"\n",
+            fixture.archive.display(),
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("must not be inside the AppDir"), "{stderr}");
+    assert!(!dir.join("sysroot").exists(), "nothing was materialized");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A policy naming the versioned file a soname link points to holds in
+/// the dependency walk too, which finds the library by its link.
+#[test]
+fn a_policy_naming_a_linked_library_holds_for_dependencies() {
+    let td = workdir("policylink");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let sysroot = td.join("sysroot");
+    let st = Command::new("cp")
+        .arg("-a")
+        .arg(&fixture.rootfs)
+        .arg(&sysroot)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let lib = sysroot.join("opt/vendor/lib");
+    std::fs::rename(lib.join("libvendor.so.1"), lib.join("libvendor.so.1.0")).unwrap();
+    std::os::unix::fs::symlink("libvendor.so.1.0", lib.join("libvendor.so.1")).unwrap();
+    write(
+        &fixture.policy,
+        "usr/share/doc/**\nopt/vendor/lib/libvendor.so.1.0\n",
+    );
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        "optional = [\"vendor\"]\n\n[[entrypoint]]\nname = \"vtool\"\npath = \"bin/vtool\"\n",
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Left out by policy"), "{stderr}");
+    assert!(
+        !dir.join("lib/libvendor.so.1").exists(),
+        "the pruned library is not copied back:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 #[test]
 fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
     let td = workdir("ldconf");
@@ -8160,8 +8347,9 @@ fn two_builds_under_one_label_coexist() {
 }
 
 /// The sysroot's pin travels into the package as `.onelf/platform`,
-/// under the package's label, with the recipe overriding it field by
-/// field; a sysroot without the file yields no pin.
+/// under the sysroot's label whatever the recipe calls its platform,
+/// with the recipe overriding it field by field; a sysroot without the
+/// file yields no pin.
 #[test]
 fn a_sysroot_pin_is_carried_into_the_package() {
     let td = workdir("pin");
@@ -8170,7 +8358,7 @@ fn a_sysroot_pin_is_carried_into_the_package() {
     };
     let dir = td.join("app");
     std::fs::create_dir_all(&dir).unwrap();
-    sysroot_recipe(&dir, &fixture, "platform = \"platform-test\"\n");
+    sysroot_recipe(&dir, &fixture, "platform = \"recipe/label\"\n");
     let out = onelf_build(&dir);
     assert!(
         out.status.success(),
@@ -8243,6 +8431,21 @@ fn a_sysroot_pin_is_carried_into_the_package() {
         .output()
         .expect("spawn onelf list");
     assert!(!String::from_utf8_lossy(&list.stdout).contains(".onelf/platform"));
+
+    // A pin the recipe supplies whole takes the recipe's label, which has
+    // to be a name the runtime's store accepts.
+    sysroot_recipe(
+        &dir,
+        &fixture,
+        &format!(
+            "platform = \".hidden\"\nplatform-url = \"file:///elsewhere/gl.onelf\"\nplatform-hash = \"{}\"\n",
+            fixture.gl_hash
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("leading dot"), "{stderr}");
 
     let _ = std::fs::remove_dir_all(&td);
 }

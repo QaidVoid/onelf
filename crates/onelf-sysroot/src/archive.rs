@@ -4,8 +4,13 @@
 //! setgid bits are dropped, since the bundle never needs either. Such a
 //! file also gains owner read, because a mode like `---s--x---` leaves
 //! the packer unable to read the sysroot it just wrote. Every
-//! entry path is checked before anything is written, so an archive cannot
+//! entry path is checked before the entry is written, so an archive cannot
 //! reach outside the directory it is unpacked into.
+//!
+//! The archive is unpacked into a sibling directory that takes the
+//! target's name only once every entry is in place. A refused or broken
+//! archive leaves nothing at the target, so a later build never mistakes
+//! a truncated rootfs for a materialized one.
 //!
 //! Directory permissions are applied last. A rootfs holds directories a
 //! distribution made read-only, and giving one its archived mode as soon
@@ -20,8 +25,38 @@ use std::path::{Component, Path, PathBuf};
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
 /// Unpack the `.tar` or `.tar.zst` archive at `archive` into `into`,
-/// which is created if needed.
+/// which must not exist yet or be empty.
 pub fn materialize(archive: &Path, into: &Path) -> io::Result<()> {
+    let Some(name) = into.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: not a directory name to materialize into",
+                into.display()
+            ),
+        ));
+    };
+    let staging = into.with_file_name(format!(
+        ".{}.partial-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&staging);
+    let result = unpack(archive, &staging).and_then(|()| {
+        std::fs::rename(&staging, into).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{}: cannot put the sysroot in place: {e}", into.display()),
+            )
+        })
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn unpack(archive: &Path, into: &Path) -> io::Result<()> {
     let mut file = BufReader::new(File::open(archive)?);
     let mut magic = [0u8; 4];
     let n = file.read(&mut magic)?;
@@ -252,5 +287,27 @@ mod tests {
         let err = materialize(&archive, &into).unwrap_err();
         assert!(err.to_string().contains("escape"), "{err}");
         assert!(!root.join("escape").exists());
+    }
+
+    /// An archive that fails partway leaves no sysroot behind, so the
+    /// next build cannot take a truncated rootfs for a complete one.
+    #[test]
+    fn a_failed_archive_leaves_nothing_at_the_target() {
+        let root = temp_root("tarpartial");
+        let bytes = archive_with(
+            &[("usr/bin/app", b"elf", 0o755), ("../escape", b"x", 0o644)],
+            &[],
+        );
+        let archive = root.join("bad.tar");
+        std::fs::write(&archive, &bytes).unwrap();
+        let into = root.join("sysroot");
+        assert!(materialize(&archive, &into).is_err());
+        assert!(!into.exists(), "nothing is left at the target");
+        let left: Vec<_> = std::fs::read_dir(&*root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["bad.tar"], "the staging directory is gone");
     }
 }

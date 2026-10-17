@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use onelf_sysroot::path::{entry_in_root, in_root};
 use onelf_sysroot::platform::{self, Pin};
 use onelf_sysroot::prune::prune;
 use onelf_sysroot::{Database, PlatformLine, Policy, Trace};
@@ -88,21 +89,7 @@ pub struct SysrootReport {
 /// the report and the platform line, which the dependency walk needs too.
 pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootReport, PlatformLine)> {
     let root = &opts.root;
-    // A sysroot inside the AppDir would be packed along with the bundle,
-    // and its library directories would be found by every walk that
-    // looks for `.so` files.
-    if let (Ok(root_abs), Ok(appdir_abs)) = (root.canonicalize(), appdir.canonicalize())
-        && root_abs.starts_with(&appdir_abs)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{}: the sysroot must not be inside the AppDir {}",
-                root.display(),
-                appdir.display()
-            ),
-        ));
-    }
+    refuse_inside(root, appdir)?;
     let db = Database::read(root)?;
     let command = opts
         .command
@@ -118,6 +105,19 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             ),
         )
     })?;
+
+    // A name the recipe asks for that nothing provides is a typo or a
+    // package the sysroot lacks, and either way the bundle would ship
+    // without it.
+    if let Some(name) = opts.optional.iter().find(|n| db.satisfier(n).is_none()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{}: optional {name}: no package in the sysroot provides it",
+                root.display()
+            ),
+        ));
+    }
 
     let platform = match &opts.platform_line {
         Some(p) => PlatformLine::load(p)?,
@@ -232,7 +232,7 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
             None => {
                 eprintln!(
                     "  {} set {}: its build is not at hand, so what it holds is \
-                     inferred from the sysroot; put the build beside the recipe \
+                     inferred from the sysroot; put the build at its file:// URL \
                      or in ONELF_PLATFORM_STORE to read it instead",
                     color::bold("note:"),
                     set.name
@@ -274,14 +274,15 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         }
         let before = keep_names.len();
         for rel in &pruned.kept {
-            let path = root.join(rel);
             // A kept link keeps what it points to: `libtbb.so.12` is what
-            // the loader asks for, `libtbb.so.12.14` is what it gets.
-            if let Ok(target) = fs::read_link(&path)
-                && let Some(name) = target.file_name()
-            {
-                keep_names.insert(name.to_string_lossy().into_owned());
+            // the loader asks for, `libtbb.so.12.14` is what it gets. By
+            // path, so a link to one `index.theme` keeps no other.
+            if let Some(target) = link_target(root, rel) {
+                keep_names.insert(target);
             }
+            let Ok(path) = in_root(root, Path::new(rel)) else {
+                continue;
+            };
             if is_elf(&path)
                 && let Ok(needed) = parse_needed(&path)
             {
@@ -294,25 +295,10 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         // kernel does not ask again.
         let kept: HashSet<&str> = pruned.kept.iter().map(String::as_str).collect();
         for rel in &files {
-            if kept.contains(rel.as_str()) {
-                continue;
-            }
-            let Ok(target) = fs::read_link(root.join(rel)) else {
-                continue;
-            };
-            let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-            let Some(target) = target.to_str() else {
-                continue;
-            };
-            let resolved = match target.strip_prefix('/') {
-                Some(absolute) => absolute.to_string(),
-                None if dir.is_empty() => target.to_string(),
-                None => format!("{dir}/{target}"),
-            };
-            if kept.contains(resolved.as_str())
-                && let Some(name) = rel.rsplit('/').next()
+            if !kept.contains(rel.as_str())
+                && link_target(root, rel).is_some_and(|t| kept.contains(t.as_str()))
             {
-                keep_names.insert(name.to_string());
+                keep_names.insert(rel.clone());
             }
         }
         if keep_names.len() == before {
@@ -399,6 +385,65 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         super::normalize_mtime(&sets_path);
     }
     Ok((report, platform))
+}
+
+/// The sysroot path the link at `rel` points to, with the directories on
+/// the way resolved inside the sysroot, or `None` when `rel` is no link.
+fn link_target(root: &Path, rel: &str) -> Option<String> {
+    let target = fs::read_link(entry_in_root(root, Path::new(rel)).ok()?).ok()?;
+    let named = Path::new(rel)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(target);
+    let resolved = entry_in_root(root, &named).ok()?;
+    Some(resolved.strip_prefix(root).ok()?.to_str()?.to_string())
+}
+
+/// Refuse a sysroot at `root` inside `appdir`. It would be packed along
+/// with the bundle, and its library directories would be found by every
+/// walk that looks for `.so` files. The check holds before the sysroot
+/// exists, so an archive is never materialized there either.
+pub fn refuse_inside(root: &Path, appdir: &Path) -> io::Result<()> {
+    if let (Some(root_abs), Ok(appdir_abs)) = (absolute(root), appdir.canonicalize())
+        && root_abs.starts_with(&appdir_abs)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: the sysroot must not be inside the AppDir {}",
+                root.display(),
+                appdir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `path` canonicalized through its deepest existing ancestor, with the
+/// rest appended, so a path not created yet can still be compared.
+fn absolute(path: &Path) -> Option<PathBuf> {
+    let mut base = path.to_path_buf();
+    let mut rest = Vec::new();
+    let mut abs = loop {
+        let probe = if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base.as_path()
+        };
+        if let Ok(abs) = probe.canonicalize() {
+            break abs;
+        }
+        rest.push(base.components().next_back()?.as_os_str().to_os_string());
+        base.pop();
+    };
+    for part in rest.iter().rev() {
+        if part == ".." {
+            abs.pop();
+        } else {
+            abs.push(part);
+        }
+    }
+    Some(abs)
 }
 
 /// Where the package records the shared sets it needs at launch,
@@ -578,7 +623,9 @@ fn populate_closure(
 ///
 /// Looked for where a build plausibly sits without going to the network:
 /// a `file://` URL names one outright, and a store keyed by hash holds
-/// the ones already fetched. Anything else leaves the caller to infer.
+/// the ones already fetched. A file counts only when its hash is the
+/// pinned one, since that is the build the launch will use. Anything
+/// else leaves the caller to infer.
 fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(path) = set.url.strip_prefix("file://") {
@@ -591,12 +638,19 @@ fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
                 .join(format!("{}.onelf", set.blake3)),
         );
     }
-    let text = candidates.iter().filter(|p| p.is_file()).find_map(|path| {
-        crate::metadata::read_packed_file(path, SHIPPED_FILE)
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-    })?;
+    let text = candidates
+        .iter()
+        .filter(|p| {
+            p.is_file()
+                && crate::sysroot_cmd::hash_file(p)
+                    .is_ok_and(|h| h.eq_ignore_ascii_case(&set.blake3))
+        })
+        .find_map(|path| {
+            crate::metadata::read_packed_file(path, SHIPPED_FILE)
+                .ok()
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        })?;
     Some(
         text.lines()
             .filter(|l| !l.is_empty())
@@ -606,7 +660,8 @@ fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
 }
 
 /// Rewrite the absolute module paths in a copied cache to paths relative
-/// to the cache itself.
+/// to the cache itself, and drop the entries for modules the tree does
+/// not carry.
 ///
 /// A distribution generates these caches with the paths its own
 /// filesystem uses, `/usr/lib/gdk-pixbuf-2.0/...` and the like. Copied
@@ -616,7 +671,10 @@ fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
 /// says so, repeatedly, while quietly losing its image loaders and input
 /// methods. Both gdk-pixbuf and GTK resolve a relative path against the
 /// directory the cache sits in, which is what makes the bundle's own
-/// copies findable wherever the bundle ends up.
+/// copies findable wherever the bundle ends up. A module the bundle left
+/// out has no copy to name, and its absolute path would load the host's,
+/// so its entry goes: each starts with a line holding only the module's
+/// quoted path and runs to the next blank line.
 fn relocate_cache(cache: &Path, tree: &Path) -> io::Result<()> {
     let Ok(text) = fs::read_to_string(cache) else {
         return Ok(()); // a binary cache has no paths to rewrite
@@ -625,8 +683,42 @@ fn relocate_cache(cache: &Path, tree: &Path) -> io::Result<()> {
         return Ok(());
     };
     let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    let mut changed = false;
+    let mut dropping = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end();
+        if dropping {
+            dropping = !body.is_empty();
+            continue;
+        }
+        let module = body
+            .strip_prefix('"')
+            .and_then(|b| b.strip_suffix('"'))
+            .filter(|m| m.starts_with('/') && !m.contains('"'));
+        if let Some(module) = module {
+            match relative_in_tree(module, dir, tree) {
+                Some(relative) => {
+                    out.push('"');
+                    out.push_str(&relative);
+                    out.push('"');
+                    out.push_str(&line[body.len()..]);
+                }
+                None => dropping = true,
+            }
+            continue;
+        }
+        out.push_str(&relocate_paths(line, dir, tree));
+    }
+    if out != text {
+        fs::write(cache, out)?;
+    }
+    Ok(())
+}
+
+/// `line` with every quoted absolute path the tree holds made relative
+/// to `dir`.
+fn relocate_paths(line: &str, dir: &Path, tree: &Path) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
     while let Some(start) = rest.find("\"/") {
         let (before, after) = rest.split_at(start + 1);
         out.push_str(before);
@@ -636,19 +728,13 @@ fn relocate_cache(cache: &Path, tree: &Path) -> io::Result<()> {
         };
         let (path, tail) = after.split_at(end);
         match relative_in_tree(path, dir, tree) {
-            Some(relative) => {
-                out.push_str(&relative);
-                changed = true;
-            }
+            Some(relative) => out.push_str(&relative),
             None => out.push_str(path),
         }
         rest = tail;
     }
     out.push_str(rest);
-    if changed {
-        fs::write(cache, out)?;
-    }
-    Ok(())
+    out
 }
 
 /// The path `absolute` names, as the cache in `dir` should spell it, when
@@ -754,7 +840,7 @@ fn copy_generated_caches(root: &Path, tree: &Path) -> io::Result<Vec<String>> {
             // either shape in the sysroot.
             let src = ["usr", ""]
                 .iter()
-                .map(|prefix| root.join(prefix).join(rel).join(name))
+                .filter_map(|prefix| in_root(root, &Path::new(prefix).join(rel).join(name)).ok())
                 .find(|p| p.is_file());
             let Some(src) = src else { continue };
             fs::copy(&src, &dest)?;
@@ -782,7 +868,15 @@ pub fn remove_generated(appdir: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for line in text.lines().filter(|l| !l.is_empty()) {
+    // The record sits in the AppDir and anyone can edit it, so a line
+    // that is not a plain path inside the AppDir is no file of ours.
+    let inside = |line: &&str| {
+        !line.is_empty()
+            && Path::new(line)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+    };
+    for line in text.lines().filter(inside) {
         let path = appdir.join(line);
         let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {
@@ -827,7 +921,9 @@ pub fn record_generated(appdir: &Path, paths: Vec<String>) -> io::Result<()> {
 pub const PLATFORM_FILE: &str = ".onelf/platform";
 
 /// The pin the package carries: the sysroot's, with the recipe's URL and
-/// hash overriding field by field, under the package's own label.
+/// hash overriding field by field. The label is the sysroot's, so every
+/// package built on it shares one store directory; only a pin the recipe
+/// supplies whole takes the package's platform label.
 fn resolve_pin(opts: &SysrootOptions) -> io::Result<Option<Pin>> {
     let from_sysroot = platform::read(&opts.root)?;
     let url = opts
@@ -848,13 +944,14 @@ fn resolve_pin(opts: &SysrootOptions) -> io::Result<Option<Pin>> {
         }
         return Ok(None);
     };
-    platform::check_url(&url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    platform::check_hash(&blake3).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    Ok(Some(Pin {
-        label: opts.platform.clone(),
-        url,
-        blake3,
-    }))
+    let label = from_sysroot
+        .map(|p| p.label)
+        .unwrap_or_else(|| opts.platform.clone());
+    platform::check_label(&label)
+        .and_then(|()| platform::check_url(&url))
+        .and_then(|()| platform::check_hash(&blake3))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(Some(Pin { label, url, blake3 }))
 }
 
 /// The `.onelf/platform` record: three `key = "value"` lines the runtime
@@ -918,8 +1015,6 @@ fn appdir_path(rel: &str) -> &str {
     rel.strip_prefix("usr/").unwrap_or(rel)
 }
 
-/// Copy one file or symlink. Returns false when the sysroot lacks it,
-/// which a debloated rootfs does for files its database still lists.
 /// Copy one sysroot entry into the AppDir, returning its AppDir-relative
 /// path, or `None` for an entry the sysroot lacks or a link that folds
 /// onto itself.
@@ -940,7 +1035,9 @@ fn copy_entry(root: &Path, rel: &str, appdir: &Path) -> io::Result<Option<PathBu
             format!("{rel}: package database path leaves the sysroot"),
         ));
     }
-    let src = root.join(rel);
+    // Every directory on the way is resolved inside the sysroot, so a
+    // link among them that names an absolute path names the sysroot's.
+    let src = entry_in_root(root, Path::new(rel))?;
     let Ok(md) = fs::symlink_metadata(&src) else {
         return Ok(None);
     };
@@ -1137,7 +1234,8 @@ mod tests {
 
     /// A module cache names the packaging distribution's own filesystem.
     /// Left that way it sends the bundle to the host's modules, which on
-    /// a musl host cannot be loaded into a glibc process at all.
+    /// a musl host cannot be loaded into a glibc process at all, and so
+    /// does the entry of a module the bundle left out.
     #[test]
     fn a_module_cache_is_rewritten_to_reach_the_bundles_own_copies() {
         let root =
@@ -1148,24 +1246,27 @@ mod tests {
         let cache = dir.join("loaders.cache");
         std::fs::write(
             &cache,
-            "\"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so\"\n\
-             \"svg\" 6 \"gdk-pixbuf\"\n\
-             \"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/absent.so\"\n",
+            "# LoaderDir = /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders\n\
+             \"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/absent.so\"\n\
+             \"absent\" 6 \"gdk-pixbuf\" \"/usr/share/locale\"\n\
+             \n\
+             \"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader_svg.so\" \n\
+             \"svg\" 6 \"gdk-pixbuf\" \"/usr/share/locale\"\n\
+             \n",
         )
         .unwrap();
 
         relocate_cache(&cache, &root).unwrap();
 
         let got = std::fs::read_to_string(&cache).unwrap();
-        assert!(
-            got.contains("\"loaders/libpixbufloader_svg.so\""),
-            "the bundle's own copy is named: {got}"
+        assert_eq!(
+            got,
+            "# LoaderDir = /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders\n\
+             \"loaders/libpixbufloader_svg.so\" \n\
+             \"svg\" 6 \"gdk-pixbuf\" \"/usr/share/locale\"\n\
+             \n",
+            "the bundle's own copy is named, and a module it lacks loses its entry"
         );
-        assert!(
-            got.contains("\"/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/absent.so\""),
-            "a path the tree does not hold is left alone: {got}"
-        );
-        assert!(got.contains("\"svg\" 6"), "the rest is untouched: {got}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1221,6 +1322,109 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A directory link in the sysroot that names an absolute path names
+    /// the sysroot's directory, so a database path through it never reads
+    /// the packer's files.
+    #[test]
+    fn a_database_path_through_an_absolute_link_stays_in_the_sysroot() {
+        let root = std::env::temp_dir().join(format!("onelf-dblink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        fs::create_dir_all(sysroot.join("usr/share")).unwrap();
+        fs::create_dir_all(root.join("home/me")).unwrap();
+        fs::create_dir_all(root.join("appdir")).unwrap();
+        fs::write(root.join("home/me/secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(root.join("home"), sysroot.join("usr/share/x")).unwrap();
+
+        let copied = copy_entry(&sysroot, "usr/share/x/me/secret", &root.join("appdir")).unwrap();
+        assert!(copied.is_none(), "{copied:?}");
+        assert!(!root.join("appdir/share/x/me/secret").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sysroot_inside_the_appdir_is_refused_before_it_exists() {
+        let root = std::env::temp_dir().join(format!("onelf-inside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(&appdir).unwrap();
+        for sysroot in [
+            "appdir/sysroot",
+            "appdir/a/b/../sysroot",
+            "other/../appdir/x",
+        ] {
+            assert!(
+                refuse_inside(&root.join(sysroot), &appdir).is_err(),
+                "{sysroot}"
+            );
+        }
+        for sysroot in ["sysroot", "appdir/../sysroot", "appdir-2/sysroot"] {
+            assert!(
+                refuse_inside(&root.join(sysroot), &appdir).is_ok(),
+                "{sysroot}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_generated_record_never_reaches_outside_the_appdir() {
+        let root = std::env::temp_dir().join(format!("onelf-generated-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib/sub")).unwrap();
+        fs::create_dir_all(root.join("outside/empty")).unwrap();
+        fs::write(appdir.join("lib/sub/libfoo.so"), b"elf").unwrap();
+        fs::write(root.join("outside/keep"), b"keep").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        fs::write(
+            appdir.join(GENERATED_FILE),
+            format!(
+                "lib/sub/libfoo.so\n../outside/keep\nlib/../../outside/empty/x\n{}\n",
+                root.join("outside/keep").display()
+            ),
+        )
+        .unwrap();
+
+        remove_generated(&appdir).unwrap();
+        assert!(!appdir.join("lib").exists(), "the emptied directories go");
+        assert!(appdir.is_dir(), "the AppDir stays");
+        assert!(root.join("outside/keep").is_file());
+        assert!(root.join("outside/empty").is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_link_target_is_the_sysroot_path_it_names() {
+        let root = std::env::temp_dir().join(format!("onelf-linktarget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(root.join("usr/share/icons/a")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::os::unix::fs::symlink("libtbb.so.12.14", root.join("usr/lib/libtbb.so.12")).unwrap();
+        std::os::unix::fs::symlink("/lib/libz.so.1.3", root.join("usr/lib/libz.so.1")).unwrap();
+        std::os::unix::fs::symlink(
+            "../b/index.theme",
+            root.join("usr/share/icons/a/index.theme"),
+        )
+        .unwrap();
+        let target = |rel| link_target(&root, rel);
+        assert_eq!(
+            target("usr/lib/libtbb.so.12").as_deref(),
+            Some("usr/lib/libtbb.so.12.14")
+        );
+        assert_eq!(
+            target("usr/lib/libz.so.1").as_deref(),
+            Some("usr/lib/libz.so.1.3")
+        );
+        assert_eq!(
+            target("usr/share/icons/a/index.theme").as_deref(),
+            Some("usr/share/icons/b/index.theme")
+        );
+        assert_eq!(target("usr/lib"), None);
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -57,9 +57,7 @@ pub fn parse(text: &str) -> Result<Pin, String> {
         .ok_or("no label")?
         .trim()
         .to_string();
-    if label.is_empty() || label.contains('/') {
-        return Err("label must be a non-empty name without slashes".into());
-    }
+    check_label(&label)?;
     let gl = value.get("gl").ok_or("no [gl] table")?;
     let url = gl
         .get("url")
@@ -74,6 +72,17 @@ pub fn parse(text: &str) -> Result<Pin, String> {
     check_hash(&blake3)?;
     check_url(&url)?;
     Ok(Pin { label, url, blake3 })
+}
+
+/// A label names the build's directory in the runtime's store, so it is a
+/// plain directory name: not empty, no slash, no leading dot.
+pub fn check_label(label: &str) -> Result<(), String> {
+    if label.is_empty() || label.contains('/') || label.starts_with('.') {
+        return Err(format!(
+            "{label:?}: a label is a non-empty name without slashes or a leading dot"
+        ));
+    }
+    Ok(())
 }
 
 /// A BLAKE3 hash is 64 hex characters, nothing else.
@@ -145,5 +154,7 @@ mod tests {
         assert!(check_hash(HASH).is_ok());
         let text = format!("label = \"a/b\"\n[gl]\nurl = \"https://e/gl\"\nblake3 = \"{HASH}\"\n");
         assert!(parse(&text).is_err(), "a label is a directory name");
+        assert!(check_label(".hidden").is_err());
+        assert!(check_label("platform-1.tar.zst").is_ok());
     }
 }

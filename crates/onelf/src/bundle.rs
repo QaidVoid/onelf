@@ -866,7 +866,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .flat_map(|sr| {
             ["usr/lib", "usr/lib64", "lib", "lib64"]
                 .into_iter()
-                .map(move |d| sr.root.join(d))
+                .filter_map(move |d| onelf_sysroot::path::in_root(&sr.root, Path::new(d)).ok())
                 .filter(|d| d.is_dir())
                 .chain(onelf_sysroot::ldconf::search_dirs(&sr.root))
         })
@@ -901,6 +901,17 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 .ok()
                 .is_some_and(|rel| host_files.contains(rel.to_string_lossy().as_ref()))
         })
+    };
+    // What a found library is: inside a sysroot its links resolve there,
+    // never on the packer's machine.
+    let sysroot_root = opts.sysroot.as_ref().map(|sr| sr.root.as_path());
+    let real_path = |src: &Path| -> PathBuf {
+        match sysroot_root.and_then(|root| Some((root, src.strip_prefix(root).ok()?))) {
+            Some((root, rel)) => {
+                onelf_sysroot::path::in_root(root, rel).unwrap_or_else(|_| src.to_path_buf())
+            }
+            None => fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf()),
+        }
     };
     let mut left_out: Vec<(String, String)> = Vec::new();
     let mut left_with_host: Vec<(String, String)> = Vec::new();
@@ -939,7 +950,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 &search_paths,
                 target_class,
                 target_machine,
-                opts.sysroot.is_some(),
+                None,
             ) {
                 let resolved = fs::canonicalize(&src).unwrap_or(src);
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
@@ -971,16 +982,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             &search_paths,
             target_class,
             target_machine,
-            opts.sysroot.is_some(),
-        ) {
-            Some(src) if pruned_by_policy(&src) => {
+            sysroot_root,
+        )
+        .map(|src| {
+            let resolved = real_path(&src);
+            (src, resolved)
+        }) {
+            // The soname link and the file it names are both checked: a
+            // policy may name either.
+            Some((src, resolved)) if pruned_by_policy(&src) || pruned_by_policy(&resolved) => {
                 left_out.push((soname, requirer));
             }
-            Some(src) if with_host_package(&src) => {
+            Some((src, resolved)) if with_host_package(&src) || with_host_package(&resolved) => {
                 left_with_host.push((soname, requirer));
             }
-            Some(src) => {
-                let resolved = fs::canonicalize(&src).unwrap_or(src.clone());
+            Some((_, resolved)) => {
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
                 let dest = lib_dest.join(&soname);
 
@@ -1533,12 +1549,23 @@ fn verify_needs(
 pub(crate) fn normalize_mtime(path: &Path) {
     let secs = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
-        let _ = f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t));
-    }
+    let t = rustix::fs::Timespec {
+        tv_sec: secs,
+        tv_nsec: 0,
+    };
+    // By path rather than through an open for writing, which a read-only
+    // copy refuses.
+    let _ = rustix::fs::utimensat(
+        rustix::fs::CWD,
+        path,
+        &rustix::fs::Timestamps {
+            last_access: t,
+            last_modification: t,
+        },
+        rustix::fs::AtFlags::empty(),
+    );
 }
 
 /// Resolve the set of target binaries to bundle: just `--target` when set
@@ -2199,6 +2226,40 @@ mod correctness_tests {
         assert_eq!(before, after, "a self-copy must not truncate the file");
 
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod mtime_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A sysroot's files arrive read-only, and a directory cannot be
+    /// opened for writing at all: neither may keep the time it was made.
+    #[test]
+    fn read_only_files_and_directories_are_pinned() {
+        let dir = std::env::temp_dir().join(format!("onelf-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("ro");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let expected = std::env::var("SOURCE_DATE_EPOCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        for path in [&file, &dir.join("sub")] {
+            normalize_mtime(path);
+            let mtime = fs::metadata(path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(mtime, expected, "{}", path.display());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
