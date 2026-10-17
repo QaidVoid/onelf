@@ -141,6 +141,22 @@ sudo nsenter -t $PID -m ls /run/user/$UID/onelf-myapp-*/
 But for 99% of cases, `onelf extract` is the right tool: it unpacks the
 package as a regular directory you can browse normally.
 
+## From the package itself
+
+A package answers the same questions without the `onelf` tool:
+
+```bash
+./myapp.onelf --onelf-version              # runtime and package versions
+./myapp.onelf --onelf-extract out 'lib/*'  # extract the package, or part of it
+./myapp.onelf --onelf-mount                # mount it and print where, until Ctrl-C
+./myapp.onelf --onelf-doctor               # what a launch would do on this host
+```
+
+`--onelf-doctor` names the execution mode a launch would pick and why
+the modes before it were skipped, the resolver's verdict for each
+library it compares, and the GL, dependency set and update setup. See
+[Runtime Flags](../reference/runtime-flags).
+
 ## Provenance
 
 A package built from a [sysroot](./sysroot) records the platform label

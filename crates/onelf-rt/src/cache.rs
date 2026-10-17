@@ -63,13 +63,23 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Used for ephemeral tmpfs-backed extraction inside a private namespace,
 /// where dedup has no value and the whole tree is thrown away on exit.
 pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()> {
+    extract_matching(pkg, target_dir, |_| true)
+}
+
+/// [`extract_direct`] for the entries whose path `keep` accepts. A kept
+/// entry's parent directories are created whether or not they are kept.
+pub fn extract_matching(
+    pkg: &mut PackageData,
+    target_dir: &Path,
+    keep: impl Fn(&Path) -> bool,
+) -> io::Result<()> {
     let manifest = &pkg.manifest;
 
     // Dirs first
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind == EntryKind::Dir {
             let rel = manifest.validated_entry_path(i)?;
-            if rel.as_os_str().is_empty() {
+            if rel.as_os_str().is_empty() || !keep(&rel) {
                 continue;
             }
             fs::create_dir_all(target_dir.join(&rel))?;
@@ -82,6 +92,9 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
             continue;
         }
         let rel = manifest.validated_entry_path(i)?;
+        if !keep(&rel) {
+            continue;
+        }
         let out_path = target_dir.join(&rel);
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
@@ -111,6 +124,9 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
             continue;
         }
         let rel = manifest.validated_entry_path(i)?;
+        if !keep(&rel) {
+            continue;
+        }
         let target = manifest.get_string(entry.symlink_target);
         if !symlink_target_within_root(&rel, target) {
             return Err(io::Error::new(

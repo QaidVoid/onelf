@@ -233,6 +233,72 @@ pub fn resolve(req: &Request) -> Resolution {
         return recorded;
     }
 
+    let decision = decide_on(req, &host);
+    let winners = &decision.winners;
+    let farm = match materialize(req.store, &fingerprint, winners) {
+        Ok(farm) => farm,
+        Err(e) => {
+            eprintln!(
+                "onelf-rt: resolver: cannot write {}: {e}",
+                req.store.display()
+            );
+            return Resolution::default();
+        }
+    };
+    let resolution = Resolution {
+        farm,
+        host_interp: decision.host_interp,
+        incomparable: decision.incomparable,
+    };
+    if let Err(e) = record(req.store, &fingerprint, &resolution, winners) {
+        eprintln!(
+            "onelf-rt: resolver: cannot record {}: {e}",
+            req.store.display()
+        );
+    }
+    resolution
+}
+
+/// What the resolver decides for a request, worked out afresh and with
+/// nothing written.
+#[derive(Debug, Default)]
+pub struct Decision {
+    /// Every soname weighed, in order, with the copy that won: `None` for
+    /// one the bundle lacks, which only the host can supply.
+    pub compared: Vec<(String, Option<Choice>)>,
+    /// The host libraries chosen, by soname.
+    pub winners: BTreeMap<String, PathBuf>,
+    pub host_interp: Option<PathBuf>,
+    pub incomparable: Vec<String>,
+    /// Where in the store the link farm for these winners lives.
+    pub farm: Option<PathBuf>,
+}
+
+/// [`resolve`] without the store: neither the recorded decision is read
+/// nor a farm or record written. For reporting what a launch would do.
+pub fn decide(req: &Request) -> Decision {
+    if req.policy == HostLibsPolicy::Never {
+        return Decision::default();
+    }
+    let host = HostIndex::load(req.ld_cache, req.icd_dirs, req.extra_root);
+    if host.libs.is_empty() {
+        return Decision::default();
+    }
+    let mut decision = decide_on(req, &host);
+    if !decision.winners.is_empty() {
+        let fingerprint = fingerprint(
+            req.ld_cache,
+            req.icd_dirs,
+            req.policy,
+            req.extra_root,
+            req.host_libc,
+        );
+        decision.farm = Some(farm_dir(req.store, &fingerprint, &decision.winners));
+    }
+    decision
+}
+
+fn decide_on(req: &Request, host: &HostIndex) -> Decision {
     let mut bundled = bundled_libs(req.pkg_root, req.lib_dirs);
     // A name the bundle carries itself wins: the set supplies what was
     // left out, not a second copy of what was kept.
@@ -241,14 +307,14 @@ pub fn resolve(req: &Request) -> Resolution {
             bundled.entry(name).or_insert(path);
         }
     }
-    let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut incomparable = Vec::new();
-    let mut host_interp = None;
+    let mut decision = Decision::default();
 
     if let (true, Some(bundled_libc), Some(host_libc)) =
         (req.host_libc, bundled.get(LIBC), host.libs.get(LIBC))
     {
-        match verdef::compare(&versions(bundled_libc), &versions(host_libc)) {
+        let choice = verdef::compare(&versions(bundled_libc), &versions(host_libc));
+        decision.compared.push((LIBC.to_string(), Some(choice)));
+        match choice {
             Choice::Host => {
                 if let Some(interp) = host.loader_for(host_libc) {
                     for name in bundled.keys().filter(|n| is_libc_family(n)) {
@@ -258,13 +324,13 @@ pub fn resolve(req: &Request) -> Resolution {
                             host.libs.get(name).cloned()
                         };
                         if let Some(path) = path {
-                            winners.insert(name.clone(), path);
+                            decision.winners.insert(name.clone(), path);
                         }
                     }
-                    host_interp = Some(interp);
+                    decision.host_interp = Some(interp);
                 }
             }
-            Choice::Incomparable => incomparable.push(LIBC.to_string()),
+            Choice::Incomparable => decision.incomparable.push(LIBC.to_string()),
             Choice::Bundle => {}
         }
     }
@@ -286,41 +352,19 @@ pub fn resolve(req: &Request) -> Resolution {
         let Some(host_path) = host.libs.get(&name) else {
             continue;
         };
-        let choice = match bundled.get(&name) {
-            Some(bundled_path) => verdef::compare(&versions(bundled_path), &versions(host_path)),
-            None => Choice::Host,
-        };
-        match choice {
+        let choice = bundled
+            .get(&name)
+            .map(|bundled_path| verdef::compare(&versions(bundled_path), &versions(host_path)));
+        decision.compared.push((name.clone(), choice));
+        match choice.unwrap_or(Choice::Host) {
             Choice::Host => {
-                winners.insert(name, host_path.clone());
+                decision.winners.insert(name, host_path.clone());
             }
-            Choice::Incomparable => incomparable.push(name),
+            Choice::Incomparable => decision.incomparable.push(name),
             Choice::Bundle => {}
         }
     }
-
-    let farm = match materialize(req.store, &fingerprint, &winners) {
-        Ok(farm) => farm,
-        Err(e) => {
-            eprintln!(
-                "onelf-rt: resolver: cannot write {}: {e}",
-                req.store.display()
-            );
-            return Resolution::default();
-        }
-    };
-    let resolution = Resolution {
-        farm,
-        host_interp,
-        incomparable,
-    };
-    if let Err(e) = record(req.store, &fingerprint, &resolution, &winners) {
-        eprintln!(
-            "onelf-rt: resolver: cannot record {}: {e}",
-            req.store.display()
-        );
-    }
-    resolution
+    decision
 }
 
 /// A library that cannot be read is treated as defining nothing: an
@@ -897,6 +941,52 @@ mod tests {
         assert_eq!(w.farm_link("libGL.so.1"), Some(host_gl));
         assert!(r.host_interp.is_none());
         assert!(r.incomparable.is_empty());
+    }
+
+    /// A report has to show each verdict and where the farm would be,
+    /// and must not leave a farm or a recorded decision behind.
+    #[test]
+    fn deciding_names_every_verdict_and_writes_nothing() {
+        let w = World::new();
+        let host_gl = w.host(
+            "libGL.so.1",
+            &driver_needing(&["libfoo.so.1", "libbar.so.1"]),
+        );
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.host("libbar.so.1", &versioned(&["BAR_1.0"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        w.bundle("libbar.so.1", &versioned(&["BAR_1.0", "BAR_1.1"]));
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let req = Request {
+            pkg_root: &w.pkg,
+            lib_dirs: &["lib"],
+            policy: HostLibsPolicy::Auto,
+            store: &w.store,
+            ld_cache: &w.cache,
+            icd_dirs: &[icd_dir.as_str()],
+            extra_root: None,
+            set_roots: &[],
+            host_libc: true,
+        };
+
+        let d = decide(&req);
+        assert_eq!(
+            d.compared,
+            vec![
+                ("libGL.so.1".to_string(), None),
+                ("libbar.so.1".to_string(), Some(Choice::Bundle)),
+                ("libfoo.so.1".to_string(), Some(Choice::Host)),
+            ]
+        );
+        assert_eq!(d.winners.get("libfoo.so.1"), Some(&host_foo));
+        assert_eq!(d.winners.get("libGL.so.1"), Some(&host_gl));
+        assert!(!w.store.exists(), "deciding wrote the store");
+
+        let r = resolve(&req);
+        assert_eq!(
+            r.farm, d.farm,
+            "the farm a launch builds is the one reported"
+        );
     }
 
     #[test]

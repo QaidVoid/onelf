@@ -180,7 +180,7 @@ fn tree_quiet(pipe_read: &rustix::fd::OwnedFd, tree: &Path, timeout_ms: u32) -> 
 }
 
 /// Bytes available to this user on the filesystem holding `path`.
-fn free_space(path: &Path) -> Option<u64> {
+pub(crate) fn free_space(path: &Path) -> Option<u64> {
     rustix::fs::statvfs(path)
         .ok()
         .map(|s| s.f_bavail.saturating_mul(s.f_frsize))

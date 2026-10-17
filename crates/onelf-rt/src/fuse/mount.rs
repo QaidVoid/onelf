@@ -66,7 +66,7 @@ fn unshare_and_map() -> io::Result<()> {
 
 /// Whether a forked child can unshare, map its ids and mount a tmpfs.
 /// The mount lands in the child's own namespace and goes with it.
-fn namespace_usable() -> bool {
+pub(crate) fn namespace_usable() -> bool {
     use rustix::runtime::{Fork, kernel_fork};
 
     match unsafe { kernel_fork() } {

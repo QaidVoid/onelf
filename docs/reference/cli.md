@@ -166,6 +166,9 @@ masked to `0o777` unless `--preserve-mode` is given, which keeps the
 setuid, setgid and sticky bits. Do not use it on a package you do not
 trust.
 
+A package extracts itself the same way with
+[`--onelf-extract`](./runtime-flags#inspecting-the-contents).
+
 ## `onelf verify`
 
 Check a packed binary's integrity: the container structure first, then

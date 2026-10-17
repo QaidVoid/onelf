@@ -103,9 +103,9 @@ pub fn extract_build(file: &Path) -> Result<(PathBuf, fs::File), String> {
         .map_err(|e| format!("{}: cannot extract: {e}", file.display()))
 }
 
-/// The build `pin` names, in the shared store: fetched and verified if
-/// the store lacks it. Returns the stored file.
-pub fn store_build(pin: &Pin) -> Result<PathBuf, String> {
+/// Where the shared store keeps the build `pin` names, whether or not it
+/// is there yet.
+pub fn stored_path(pin: &Pin) -> Result<PathBuf, String> {
     let store = match std::env::var_os("ONELF_PLATFORM_STORE").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => crate::cache::base_dir()
@@ -116,8 +116,14 @@ pub fn store_build(pin: &Pin) -> Result<PathBuf, String> {
     // its lifetime coexist rather than overwrite each other and force a
     // refetch on every launch. The name is the hash the bytes were
     // verified against, so an existing file needs no re-check.
-    let dir = store.join(&pin.label);
-    let file = dir.join(format!("{}.onelf", pin.blake3));
+    Ok(store.join(&pin.label).join(format!("{}.onelf", pin.blake3)))
+}
+
+/// The build `pin` names, in the shared store: fetched and verified if
+/// the store lacks it. Returns the stored file.
+pub fn store_build(pin: &Pin) -> Result<PathBuf, String> {
+    let file = stored_path(pin)?;
+    let dir = file.parent().unwrap_or(&file).to_path_buf();
 
     if !file.is_file() {
         if env_set("ONELF_NO_PLATFORM_FETCH") {

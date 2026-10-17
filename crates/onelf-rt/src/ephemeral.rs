@@ -37,7 +37,7 @@ pub(crate) fn tmpfs_size_for(pkg: &PackageData) -> u64 {
 /// caller can still fall back to on-disk extraction. An unreadable or
 /// unparseable `meminfo` is treated as "no objection", leaving behaviour
 /// unchanged on kernels that do not report it.
-fn fits_in_memory(needed: u64) -> bool {
+pub(crate) fn fits_in_memory(needed: u64) -> bool {
     let Ok(info) = std::fs::read_to_string("/proc/meminfo") else {
         return true;
     };

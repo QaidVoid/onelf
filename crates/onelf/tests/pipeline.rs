@@ -10386,6 +10386,213 @@ fn integration_installs_every_icon_size() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A script package with a readme and a link to it, built from a recipe
+/// so it carries a version.
+fn inspectable_package(td: &Path) -> PathBuf {
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(&app.join("share/doc/readme.txt"), "hello\n");
+    std::os::unix::fs::symlink("readme.txt", app.join("share/doc/link.txt")).unwrap();
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname = \"myapp\"\nversion = \"1.2.3\"\ncommand = \"bin/run\"\n",
+    );
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(&app)
+        .output()
+        .expect("spawn onelf build");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    app.join("myapp.onelf")
+}
+
+/// The package answers for itself: its versions, its flags, and its
+/// contents, extracted whole or by pattern, without the `onelf` tool.
+#[test]
+fn a_package_extracts_itself_and_reports_its_version() {
+    let td = workdir("selfextract");
+    let pkg = inspectable_package(&td);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(&pkg);
+        cmd.args(args).current_dir(&td);
+        isolate(&mut cmd, &td);
+        run_package(&mut cmd)
+    };
+
+    let out = run(&["--onelf-version"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.starts_with("onelf-rt "), "{stdout}");
+    assert!(stdout.contains("\nmyapp 1.2.3\n"), "{stdout}");
+
+    let out = run(&["--onelf-help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success() && !stdout.contains("RAN"), "{stdout}");
+    for flag in ["--onelf-extract", "--onelf-mount", "--onelf-version"] {
+        assert!(stdout.contains(flag), "{flag} missing from:\n{stdout}");
+    }
+
+    let out = run(&["--onelf-extract"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let all = td.join("onelf_extracted");
+    assert_eq!(
+        std::fs::read_to_string(all.join("bin/run")).unwrap(),
+        "#!/bin/sh\necho RAN\n"
+    );
+    assert_eq!(
+        std::fs::read_link(all.join("share/doc/link.txt")).unwrap(),
+        Path::new("readme.txt")
+    );
+
+    let out = run(&["--onelf-extract", "some", "share/*.txt"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let some = td.join("some");
+    assert_eq!(
+        std::fs::read_to_string(some.join("share/doc/link.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(!some.join("bin").exists(), "only what the pattern names");
+
+    let out = run(&["--onelf-extract", "none", "share/doc/missing"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not in the package: share/doc/missing"));
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `--onelf-mount` serves the package at the path it prints until it is
+/// interrupted, then takes the mount and its directory down again.
+#[test]
+fn a_package_mounts_itself_until_interrupted() {
+    use std::io::BufRead;
+
+    if !fuse_available() {
+        return;
+    }
+    let td = workdir("selfmount");
+    let pkg = inspectable_package(&td);
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-mount")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut cmd, &td);
+    let mut child = spawn_package(&mut cmd);
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let shown = PathBuf::from(line.trim_end());
+    let readme = std::fs::read_to_string(shown.join("share/doc/readme.txt"));
+
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-INT", &pid]).status();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(readme.ok().as_deref(), Some("hello\n"), "served at {line}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let proc_root = format!("/proc/{pid}/root");
+    let dir = shown
+        .strip_prefix(&proc_root)
+        .map_or(shown.clone(), |d| Path::new("/").join(d));
+    assert!(!dir.exists(), "{} was left behind", dir.display());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `--onelf-doctor` reports the mode, the resolver and the update setup
+/// without starting the app, and leaves nothing behind: the library
+/// directories it reads are extracted to a scratch directory it removes.
+#[test]
+fn the_doctor_reports_without_running_or_leaving_anything() {
+    let td = workdir("doctor");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let src = td.join("hello.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"RAN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/hello")) {
+        return;
+    }
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let keys = td.join("keys");
+    std::fs::write(&keys, (0..64u8).collect::<Vec<u8>>()).unwrap();
+    let pkg = td.join("hello.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/hello", "--name", "hello"])
+        .args(["--host-libs", "always"])
+        .args(["--update-url", "https://example.invalid/hello.zsync"])
+        .args(["--update-key", keys.to_str().unwrap()])
+        .args(["--update-revision", "7"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    fn listing(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                out.extend(listing(&entry.path()));
+            }
+            out.push(entry.path());
+        }
+        out.sort();
+        out
+    }
+    for (mode, expect) in [(None, "Libraries"), (Some("cache"), "cache: would run")] {
+        let mut cmd = Command::new(&pkg);
+        cmd.arg("--onelf-doctor");
+        if let Some(mode) = mode {
+            cmd.env("ONELF_MODE", mode);
+        }
+        isolate(&mut cmd, &td);
+        let before = (listing(&td.join("xdg-run")), listing(&td.join("xdg-cache")));
+        let out = run_package(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout.contains("RAN"), "the app ran:\n{stdout}");
+        assert!(stdout.contains(expect), "{expect} missing:\n{stdout}");
+        assert!(
+            stdout.contains("Execution mode\n  memfd: skipped"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("would run"), "{stdout}");
+        assert!(
+            stdout.contains("url: https://example.invalid/hello.zsync")
+                && stdout.contains("signing keys: 2")
+                && stdout.contains("revision: 7"),
+            "{stdout}"
+        );
+        if mode.is_none() {
+            assert!(stdout.contains("host-libs: always"), "{stdout}");
+        }
+        let after = (listing(&td.join("xdg-run")), listing(&td.join("xdg-cache")));
+        assert_eq!(before, after, "the doctor left something behind");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Unintegrating a package that was never integrated removes nothing, and
 /// an icon theme other packages put there does not make it look otherwise.
 #[test]

@@ -1,9 +1,11 @@
 mod cache;
+mod doctor;
 mod env;
 mod ephemeral;
 mod fuse;
 mod hostenv;
 mod hostpaths;
+mod inspect;
 mod integrate;
 mod interp;
 mod launch;
@@ -44,6 +46,10 @@ fn main() {
         .and_then(|n| n.to_str())
         .unwrap_or("onelf");
 
+    if inspect::handle_help(&args) {
+        return;
+    }
+
     // Handle --onelf-portable-* flags (create dirs and exit)
     if portable::handle_portable_flags(&args, exe_dir, exe_name) {
         return;
@@ -77,6 +83,10 @@ fn main() {
     // Handle --onelf-integrate / --onelf-unintegrate
     if integrate::handle_integrate_flags(&args, &mut pkg, &ep_name, &exec_path) {
         return;
+    }
+
+    if let Some(code) = inspect::handle_flags(&args, &mut pkg, ep_idx) {
+        std::process::exit(code);
     }
 
     // Handle --onelf-update / --onelf-check-update (only when built with the
