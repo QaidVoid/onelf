@@ -135,7 +135,7 @@ the slim runtime, for packages updated by a package manager.
 
 ```toml
 [bundle]
-lib-dirs = ["auto"]              # default ["auto"]; listed dirs become LD_LIBRARY_PATH
+lib-dirs = ["auto"]              # default ["auto"]; the bundle's library dirs
 search-paths = [
   "${MUSL_LIBDRM}/lib",
   "/opt/custom/lib",

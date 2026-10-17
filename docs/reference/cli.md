@@ -64,7 +64,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--name` | command basename | Package name |
 | `--entrypoint NAME=PATH` | | Add extra entrypoint (repeatable) |
 | `--default-entrypoint NAME` | | Select default entrypoint |
-| `--lib-dir DIR` | `[auto]` | Library dir for `LD_LIBRARY_PATH` (repeatable) |
+| `--lib-dir DIR` | `[auto]` | Library dir of the bundle (repeatable) |
 | `--level N` | `19` | Zstd compression level (0 to 22) |
 | `--block-size SIZE` | `256K` | Bytes per payload block, `K`/`M` suffix allowed (4K to 32M) |
 | `--dict` | `false` | Train shared zstd dictionary |

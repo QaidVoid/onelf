@@ -58,7 +58,7 @@ enum Commands {
         #[arg(long)]
         default_entrypoint: Option<String>,
 
-        /// Library directories to add to LD_LIBRARY_PATH (repeatable).
+        /// Library directories of the bundle (repeatable).
         /// Pass "auto" (default) to detect directories containing .so files.
         #[arg(long, default_values_t = [String::from("auto")])]
         lib_dir: Vec<String>,

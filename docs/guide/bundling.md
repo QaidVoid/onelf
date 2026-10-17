@@ -129,8 +129,11 @@ that has neither, the cache and a `fusermount3` mount, keeps the bundled
 glibc, since the bundled executables would still find their own libc
 under the host loader. Host
 libraries the bundle does not carry at all, the driver itself for one,
-are reached through a link farm the runtime puts first on the library
-path. A soname that is neither bundled nor chosen fails by name:
+are shown as symlinks in the bundle's library directory, where the run
+path `bundle-libs` wrote finds them. No `LD_LIBRARY_PATH` is set, so the
+programs the app runs never see them (see
+[Environment](./environment#library-paths)). A soname that is neither
+bundled nor chosen fails by name:
 
 ```
 error while loading shared libraries: libm.so.6: cannot open shared object file

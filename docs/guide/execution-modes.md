@@ -208,9 +208,13 @@ Then it picks an exec strategy based on what the binary needs:
    bundled interpreter's path relative to the binary's own location,
    and jumps into it. `/proc/self/exe` points at the real binary,
    which is what Python, Electron, and Qt read to find their bundled
-   resources. When the host's glibc is newer than the bundled one, the
-   runtime sets `ONELF_INTERP` to the host loader and the bootstrap
-   jumps into that instead, for this process and every one it execs.
+   resources. The binary's `$ORIGIN` run path finds the bundled
+   libraries, and the host and set libraries linked beside them (see
+   [Environment](./environment#library-paths)), so no
+   `LD_LIBRARY_PATH` is set. When the host's glibc is newer than the
+   bundled one, the runtime sets `ONELF_INTERP` to the host loader and
+   the bootstrap jumps into that instead, for this process and every
+   one it execs.
 
 2. **Userland-execve.** For binaries without bootstrap injection that
    are PIE (`ET_DYN`), when the package records its bundled loader in

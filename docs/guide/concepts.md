@@ -80,7 +80,10 @@ whole process runs under the host loader. The chosen host libraries are
 placed over their bundled counterparts, by a bind mount inside a private
 mount namespace or by a symlink in a tree that belongs to this launch
 alone, so every process the app starts sees the same choice. A launch
-that can do neither never takes the host's glibc.
+that can do neither never takes the host's glibc. A chosen library the
+bundle does not carry, the driver itself for one, is shown as a symlink
+in the bundle's library directory, so nothing goes on `LD_LIBRARY_PATH`
+for the programs the app runs to inherit.
 
 What the resolver may touch is bounded by the package's **host-libs
 policy**: `never` takes nothing, `auto` considers the driver stack and
@@ -173,5 +176,5 @@ Detail: [Execution Modes](./execution-modes).
 | GL build | A package of Mesa and its drivers a sysroot names for hosts that have none, pinned by hash |
 | platform store | Where fetched GL builds live under the cache root, one directory per sysroot label |
 | resolver | The launch-time step that chooses each library from the bundle or the host |
-| link farm | The directory of chosen host libraries the resolver puts on the search path |
+| link farm | The directory of chosen host libraries the resolver makes; each one the bundle lacks is shown in the bundle's library directory |
 | rung, mode | One way of exposing the bundle to the kernel; the ladder tries them in order |

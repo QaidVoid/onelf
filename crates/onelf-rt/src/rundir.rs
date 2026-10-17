@@ -99,6 +99,7 @@ pub fn execute_rundir(
                 env_data,
                 private_ns: false,
                 tree_writable: true,
+                links: crate::launch::Links::Tree,
             })
         }
         Ok(Fork::ParentOf(child)) => {

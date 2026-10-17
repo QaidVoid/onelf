@@ -57,9 +57,10 @@ Its sandbox is as tight as the permissions an app asks for, and browsers
 and anything that works on the whole filesystem tend to open it wide.
 Flatpak's real strength is the store and its update model. onelf's
 difference is in two places. It never puts a host directory on the
-library path, choosing each host library on its merits instead, and it
-can take a bundle's contents from a package database rather than a scan
-of the packer's machine.
+library path, nor sets one the app's children would inherit, choosing
+each host library on its merits and showing it beside the bundled ones
+instead, and it can take a bundle's contents from a package database
+rather than a scan of the packer's machine.
 
 ## What a packed binary looks like
 

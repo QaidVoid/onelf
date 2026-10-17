@@ -162,51 +162,20 @@ fn find_bundled_interp(interp: &str, pkg_root: &Path, lib_dirs: &[&str]) -> Opti
 
 /// Build a `Command` for executing the target binary.
 ///
-/// With the AT_EXECFN bootstrap, bundled ELFs resolve their own
-/// interpreter relative to the binary's location. No CWD control needed.
-///
-/// Whether `target` names `$ORIGIN` in a `DT_RPATH` or `DT_RUNPATH`, which
-/// is how a bundled executable reaches the bundle's libraries on its own.
-pub(crate) fn has_origin_runpath(target: &Path) -> bool {
-    let Ok(data) = std::fs::read(target) else {
-        return false;
-    };
-    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
-        return false;
-    };
-    elf.rpaths
-        .iter()
-        .chain(elf.runpaths.iter())
-        .any(|p| p.contains("$ORIGIN") || p.contains("${ORIGIN}"))
-}
-
-/// The `LD_LIBRARY_PATH` for a binary handed to the kernel with no linker
-/// invocation of ours to carry `--library-path`.
-///
-/// Normally only the host-side directories: the bundled ones are reached
-/// through the `$ORIGIN` RPATH the packer wrote, and naming them here
-/// would leak them to every process the app spawns. A binary the packer
-/// could not give an RPATH (no slot and no patchelf at bundle time) has
-/// no other way to its own libc, so for it the whole path goes in; a leak
-/// beats a bundle that cannot start.
-pub(crate) fn kernel_exec_library_path(target: &Path, pkg_root: &Path, lib_path: &str) -> String {
-    if !has_origin_runpath(target) {
-        return lib_path.to_string();
-    }
-    lib_path
-        .split(':')
-        .filter(|dir| !dir.is_empty() && !Path::new(dir).starts_with(pkg_root))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-/// Fallback: if PT_INTERP is absolute and unpatched (packed without
-/// bundling), invoke the bundled loader explicitly with `--argv0`.
+/// If PT_INTERP is absolute and unpatched (packed without bundling), the
+/// bundled loader is invoked explicitly with `--argv0` and `lib_path` as
+/// its `--library-path`. A binary the kernel starts instead gets
+/// `kernel_lib_path` as `LD_LIBRARY_PATH`, which the caller gives only to
+/// a binary that has no `$ORIGIN` run path to find its libraries by.
+// Describes a single exec; every argument is distinct and a parameter
+// object would be built at each call site and read once.
+#[allow(clippy::too_many_arguments)]
 pub fn build_exec_command(
     target: &Path,
     pkg_root: &Path,
     lib_dirs: &[&str],
     lib_path: &str,
+    kernel_lib_path: Option<&str>,
     private_ns: bool,
     argv0: &str,
     args: &[OsString],
@@ -239,8 +208,8 @@ pub fn build_exec_command(
                     Ok(()) => {
                         let mut cmd = Command::new(target);
                         cmd.arg0(argv0).args(args);
-                        if !lib_path.is_empty() {
-                            cmd.env("LD_LIBRARY_PATH", lib_path);
+                        if let Some(path) = kernel_lib_path {
+                            cmd.env("LD_LIBRARY_PATH", path);
                         }
                         return cmd;
                     }
@@ -280,18 +249,13 @@ pub fn build_exec_command(
 
     // Nothing above claimed this binary, so no linker invocation of ours
     // carries --library-path for it. A bootstrap-injected binary reaches the
-    // bundled libraries through the RPATH the packer wrote, so only the host
-    // paths are named here: those are what the bundled linker cannot find on
-    // its own, and unlike our own libc they do no harm to anything the app
-    // goes on to run.
+    // bundled libraries, and the links to the host's and the sets', through
+    // the RPATH the packer wrote.
     let mut cmd = Command::new(target);
     cmd.arg0(argv0).args(args);
-
-    let path = kernel_exec_library_path(target, pkg_root, lib_path);
-    if !path.is_empty() {
+    if let Some(path) = kernel_lib_path {
         cmd.env("LD_LIBRARY_PATH", path);
     }
-
     cmd
 }
 

@@ -6,6 +6,7 @@ mod hostpaths;
 mod integrate;
 mod interp;
 mod launch;
+mod links;
 mod loader;
 mod memfd;
 mod metadata;
@@ -361,6 +362,7 @@ fn main() {
         env_data: env_data.as_deref(),
         private_ns: false,
         tree_writable: false,
+        links: launch::Links::Tree,
     })
 }
 

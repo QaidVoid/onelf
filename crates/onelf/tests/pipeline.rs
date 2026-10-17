@@ -6443,7 +6443,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(
         &src.join("app.c"),
-        "#include <stdio.h>\n#include <stdlib.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}return 0;}\n",
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}if (getenv(\"SHOW_LP\")) {const char *l = getenv(\"LD_LIBRARY_PATH\");printf(\"app_lp=%s\\n\", l ? l : \"(unset)\");}if (getenv(\"SHOW_CHILD\")) {fflush(stdout);if (system(\"echo \\\"child_lp=${LD_LIBRARY_PATH-(unset)}\\\"\") != 0) return 1;}if (getenv(\"AGAIN\")) printf(\"again\\n\");if (getenv(\"REEXEC\")) {char *argv[] = {\"app\", 0};char *envp[] = {\"AGAIN=1\", 0};fflush(stdout);execve(\"/proc/self/exe\", argv, envp);return 1;}if (getenv(\"HOLD\")) sleep(atoi(getenv(\"HOLD\")));return 0;}\n",
     );
     assert!(cc_with(
         &[
@@ -7926,6 +7926,9 @@ fn a_shared_set_is_served_from_its_build_rather_than_copied() {
         jwalk::WalkDir::new(td.join("xdg-cache"))
             .into_iter()
             .flatten()
+            // The cache tree links the set's libraries into its own
+            // library directory; a link is not a copy.
+            .filter(|e| !e.file_type().is_symlink())
             .filter(|e| e.file_name().to_string_lossy().starts_with("libfixture.so"))
             .count()
     };
@@ -7952,6 +7955,200 @@ fn a_shared_set_is_served_from_its_build_rather_than_copied() {
     );
     assert!(copies_of_the_set() > 0, "extract mode copied nothing");
 
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package on the fixture sysroot that leaves `libfixture` to a shared
+/// set and takes `libGL.so.1` from the fixture's host through the
+/// resolver. Launches fetch the set from `<td>/store`.
+fn build_set_app(td: &Path, fixture: &SysrootFixture) -> PathBuf {
+    let set_tree = td.join("set-tree");
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+            "--sysroot",
+            fixture.rootfs.to_str().unwrap(),
+            "--package",
+            "libfixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(
+        &dir,
+        fixture,
+        &format!(
+            "\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir.join("app.onelf")
+}
+
+/// A launch of [`build_set_app`]'s package against the fixture's host.
+fn set_app_launch(pkg: &Path, td: &Path, fixture: &SysrootFixture) -> Command {
+    let mut cmd = Command::new(pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", &fixture.ld_cache)
+        .env("ONELF_PLATFORM_STORE", td.join("store"));
+    isolate(&mut cmd, td);
+    cmd
+}
+
+/// The host library the resolver chose and the set's library are found
+/// through the bundle's own run path, so no library path is exported:
+/// the app sees the caller's `LD_LIBRARY_PATH` as it was, a host shell it
+/// runs sees the same, and a re-exec with an empty environment still
+/// loads both.
+#[test]
+fn host_and_set_libraries_load_without_a_library_path() {
+    let td = workdir("liblinks");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let pkg = build_set_app(&td, &fixture);
+    let caller = td.join("caller-lib").to_string_lossy().into_owned();
+
+    let mut modes = vec!["rundir"];
+    if fuse_available() {
+        modes.push("fuse");
+    }
+    for mode in modes {
+        let mut cmd = set_app_launch(&pkg, &td, &fixture);
+        cmd.env("ONELF_MODE", mode)
+            .env("LD_LIBRARY_PATH", &caller)
+            .env("SHOW_LP", "1")
+            .env("SHOW_CHILD", "1")
+            .env("REEXEC", "1");
+        let out = run_package(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{mode}:\n{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{report}");
+        // 41 from the set's library and its backend, 1 from the host's
+        // GL probe, before and after the re-exec.
+        assert_eq!(stdout.matches("value=42").count(), 2, "{report}");
+        assert!(stdout.contains("again"), "{report}");
+        let line = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {report}"))
+                .to_string()
+        };
+        assert_eq!(line("app_lp="), caller, "the app's path: {report}");
+        assert_eq!(line("child_lp="), caller, "a host shell's path: {report}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A launch that finds another instance's helper mount reuses it only when
+/// the mount shows the library links this launch resolved. One that
+/// resolved differently takes another mode rather than load what the
+/// first launch chose.
+#[test]
+fn a_mount_showing_other_library_links_is_not_reused() {
+    use std::os::unix::process::CommandExt;
+
+    if !fuse_available() || !have("fusermount3") {
+        return; // documented soft-skip
+    }
+    let td = workdir("linkreuse");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let pkg = build_set_app(&td, &fixture);
+
+    let mut holder = set_app_launch(&pkg, &td, &fixture);
+    holder
+        .env("ONELF_MODE", "fuse")
+        .env("ONELF_FUSE_NO_NAMESPACE", "1")
+        .env("HOLD", "30")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    let mut child = spawn_package(&mut holder);
+    // The package's own mount, not the set's, once it shows the links.
+    let prefix = format!("{}/onelf-", td.join("xdg-run").display());
+    let package_mount = || {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        info.lines()
+            .filter_map(|line| line.split(' ').nth(4))
+            .map(|mp| PathBuf::from(mp.replace("\\040", " ")))
+            .find(|mp| {
+                let mp = mp.to_string_lossy();
+                mp.starts_with(&prefix) && !mp.contains("onelf-set-")
+            })
+            .filter(|mp| mp.join("lib/libGL.so.1").exists())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mount = loop {
+        let mount = package_mount();
+        if mount.is_some() || std::time::Instant::now() > deadline {
+            break mount;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let Some(mount) = mount else {
+        kill_group(&child);
+        let _ = child.wait();
+        skip("the FUSE helper mount did not appear");
+        return;
+    };
+
+    // Resolved the same way: the mount is reused, forced FUSE and all.
+    let mut same = set_app_launch(&pkg, &td, &fixture);
+    same.env("ONELF_MODE", "fuse");
+    let out = run_package(&mut same);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("another mode"), "{stderr}");
+
+    // Without the resolver nothing supplies libGL.so.1. The mount still
+    // links it, so reusing the mount would hide that.
+    let mut other = set_app_launch(&pkg, &td, &fixture);
+    other.env("ONELF_NO_RESOLVER", "1");
+    let out = run_package(&mut other);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("another mode"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("value="),
+        "the first launch's links reached a launch that resolved none: {stderr}"
+    );
+    assert!(entrypoint_ran(&stderr), "{stderr}");
+    assert!(
+        mount.join("lib/libGL.so.1").exists(),
+        "the mount is unchanged"
+    );
+
+    kill_group(&child);
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&td);
 }
 

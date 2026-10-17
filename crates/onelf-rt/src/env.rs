@@ -4,12 +4,12 @@
 //! dynamic linker's `--library-path` flag. Also auto-detects and configures
 //! paths for graphics drivers (OpenGL/EGL/Vulkan/VA-API).
 //!
-//! `LD_LIBRARY_PATH` is intentionally NOT set for ELF entrypoints. It
-//! would be inherited by every child process the packed app spawns,
-//! including host binaries (`/bin/sh`, `ssh`, etc.), which corrupts them
-//! by mixing the bundled libc/libcrypto with the host loader. Instead,
-//! the lib path is passed via `--library-path` on a single linker
-//! invocation.
+//! `LD_LIBRARY_PATH` is intentionally NOT set. It would be inherited by
+//! every child process the packed app spawns, including host binaries
+//! (`/bin/sh`, `ssh`, etc.), which corrupts them by mixing the bundled
+//! libc/libcrypto with the host loader. Bundled binaries find their
+//! libraries through their `$ORIGIN` run path, and the lib path is
+//! passed via `--library-path` on a single linker invocation.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -31,8 +31,8 @@ pub(crate) fn set_var_checked(key: &str, value: &str) {
 /// For shebang scripts (non-ELF target), returns an empty string: the
 /// kernel hands off to a host interpreter linked against the host glibc,
 /// and pointing it at our bundled libs would mix two glibcs in one
-/// process. Scripts that need bundled libs export `LD_LIBRARY_PATH`
-/// from `ONELF_LIB_PATH` themselves before execing bundled binaries.
+/// process. The bundled binaries a script runs find their libraries
+/// through their own run path.
 // Describes a single exec; every argument is distinct and a parameter
 // object would be built at each call site and read once.
 #[allow(clippy::too_many_arguments)]
@@ -99,7 +99,7 @@ pub fn setup_env(
             if let Some(farm) = farm {
                 parts.push(farm.to_string_lossy().into_owned());
             }
-            parts.push(lib_str);
+            parts.push(lib_str.clone());
             // After the bundle's own directories: a set supplies what the
             // bundle left out, and a name the bundle kept stays its own.
             parts.extend(
@@ -122,14 +122,15 @@ pub fn setup_env(
 
             // LD_LIBRARY_PATH is deliberately not set here. The paths go to
             // the linker as --library-path, on the one invocation that needs
-            // them, so nothing the app spawns inherits them. Only the
-            // bootstrap path, which drives no linker invocation of its own,
-            // still sets the variable, and it does so on that command alone
-            // (see interp::build_exec_command).
+            // them, so nothing the app spawns inherits them. The farm's and
+            // the sets' libraries also show in the bundle's own library
+            // directory (see crate::links), where the run path finds them.
 
-            // For a script entrypoint to export as LD_LIBRARY_PATH.
+            // Kept for scripts written when they had to export it as
+            // LD_LIBRARY_PATH. The bundle's own directories hold everything
+            // now, so the farm and the sets are not named.
             unsafe {
-                env::set_var("ONELF_LIB_PATH", &lib_path);
+                env::set_var("ONELF_LIB_PATH", &lib_str);
             }
 
             // Auto-set LIBGL_DRIVERS_PATH and LIBVA_DRIVERS_PATH if any lib dir

@@ -83,6 +83,9 @@ Same as a real packed run, minus the mount:
   difference: the AppDir is your own tree and there is no mount
   namespace, so a newer host copy of a library you also bundle cannot be
   placed over the bundled one. It is reported, and a packed run does it.
+  A packed run sets no `LD_LIBRARY_PATH` at all (see
+  [Environment](./environment#library-paths)); `onelf run` does because
+  it does not write into your AppDir.
 - `XDG_DATA_DIRS` prepended with `share/`
 - `LIBGL_DRIVERS_PATH`, `LIBVA_DRIVERS_PATH`, `GBM_BACKENDS_PATH`
   if the corresponding subdirs exist

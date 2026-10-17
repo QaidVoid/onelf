@@ -268,6 +268,78 @@ fn appdir_to_sysroot(path: &str) -> Option<String> {
     }
 }
 
+/// Symlinks served beside the package's own entries: the libraries the
+/// launch takes from the host and from dependency sets, shown in the
+/// package's library directory (see `crate::links`). Their inodes follow
+/// the manifest's, in the order they were added.
+#[derive(Default)]
+struct Synthetic {
+    /// Inode of the first link.
+    first: u64,
+    links: Vec<SyntheticLink>,
+    by_name: HashMap<(u64, String), u64>,
+}
+
+struct SyntheticLink {
+    parent: u64,
+    name: String,
+    target: Vec<u8>,
+}
+
+impl Synthetic {
+    fn new(manifest: &Manifest) -> Self {
+        Self {
+            first: manifest.entries.len() as u64 + 1,
+            ..Self::default()
+        }
+    }
+
+    fn add(&mut self, parent: u64, name: String, target: Vec<u8>) {
+        let key = (parent, name);
+        if self.by_name.contains_key(&key) {
+            return;
+        }
+        let inode = self.first + self.links.len() as u64;
+        self.by_name.insert(key.clone(), inode);
+        self.links.push(SyntheticLink {
+            parent,
+            name: key.1,
+            target,
+        });
+    }
+
+    fn get(&self, inode: u64) -> Option<&SyntheticLink> {
+        let at = inode.checked_sub(self.first)?;
+        self.links.get(usize::try_from(at).ok()?)
+    }
+
+    fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
+        self.by_name.get(&(parent, name.to_string())).copied()
+    }
+
+    /// The links in directory `parent`, with their inodes.
+    fn children(&self, parent: u64) -> Vec<(u64, &SyntheticLink)> {
+        self.links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.parent == parent)
+            .map(|(i, l)| (self.first + i as u64, l))
+            .collect()
+    }
+
+    /// Attributes of the link at `inode`, timestamped like its directory.
+    fn attr(&self, inode: u64, link: &SyntheticLink, manifest: &Manifest) -> FuseAttr {
+        let dir = &manifest.entries[inode_to_entry(link.parent)];
+        let mut attr = make_attr(link.parent, dir, manifest);
+        attr.ino = inode;
+        attr.mode = 0o120000 | 0o777;
+        attr.nlink = 1;
+        attr.size = link.target.len() as u64;
+        attr.blocks = attr.size.div_ceil(512);
+        attr
+    }
+}
+
 pub struct FuseState<'a> {
     manifest: &'a Manifest,
     file: &'a mut File,
@@ -280,6 +352,9 @@ pub struct FuseState<'a> {
     verified: HashMap<u64, bool>,
     /// Present when `ONELF_TRACE` asked for a trace of this run.
     recorder: Option<TraceRecorder>,
+    synthetic: Synthetic,
+    /// Where the launching child sends the links it resolved, until it has.
+    inbox: Option<crate::links::Receiver>,
 }
 
 impl<'a> FuseState<'a> {
@@ -299,7 +374,33 @@ impl<'a> FuseState<'a> {
             cache: BlockCache::new(cache_budget()),
             verified: HashMap::new(),
             recorder: TraceRecorder::from_env(),
+            synthetic: Synthetic::new(manifest),
+            inbox: None,
         }
+    }
+
+    /// Serve the links the launching child sends through `inbox`, once it
+    /// has, and tell it so. Read while [`FuseState::run_loop`] serves.
+    pub fn expect_links(&mut self, inbox: crate::links::Receiver) {
+        self.inbox = Some(inbox);
+    }
+
+    fn take_links(&mut self) {
+        let Some(inbox) = self.inbox.as_mut() else {
+            return;
+        };
+        let crate::links::Received::Done(message) = inbox.read() else {
+            return;
+        };
+        if let Some(message) = message
+            && let Some(idx) = crate::links::dir_index(self.manifest, &message.dir)
+        {
+            for (name, target) in message.links {
+                self.synthetic.add(entry_to_inode(idx), name, target);
+            }
+            inbox.ack();
+        }
+        self.inbox = None;
     }
 
     /// Confirm the entry may be served, for manifests that predate
@@ -362,7 +463,7 @@ impl<'a> FuseState<'a> {
                 None
             };
 
-            let mut poll_fds = Vec::with_capacity(3);
+            let mut poll_fds = Vec::with_capacity(4);
             poll_fds.push(PollFd::new(fuse_fd, PollFlags::IN));
             if let Some(fd) = death_pipe {
                 poll_fds.push(PollFd::new(fd, PollFlags::IN));
@@ -370,31 +471,42 @@ impl<'a> FuseState<'a> {
             if let Some(fd) = child_exit {
                 poll_fds.push(PollFd::new(fd, PollFlags::IN));
             }
+            // Last, so the exit signals above stay at their indices.
+            if let Some(inbox) = &self.inbox {
+                poll_fds.push(PollFd::new(inbox.fd(), PollFlags::IN));
+            }
             match poll(&mut poll_fds, timeout) {
                 Ok(0) => continue,
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => return,
             }
+            let revents: Vec<PollFlags> = poll_fds.iter().map(|p| p.revents()).collect();
+            drop(poll_fds);
+            let signals = 1 + usize::from(death_pipe.is_some()) + usize::from(child_exit.is_some());
 
-            if poll_fds[1..]
+            if revents[1..signals]
                 .iter()
-                .any(|p| p.revents().intersects(PollFlags::HUP | PollFlags::IN))
+                .any(|r| r.intersects(PollFlags::HUP | PollFlags::IN))
             {
                 return;
+            }
+
+            if revents
+                .get(signals)
+                .is_some_and(|r| r.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
+            {
+                self.take_links();
             }
 
             // An external unmount (`fusermount3 -u -z`) signals ERR/HUP on
             // the FUSE fd, never IN. The connection is gone; polling on is
             // a 100%-core spin, since ERR is always ready.
-            if poll_fds[0]
-                .revents()
-                .intersects(PollFlags::ERR | PollFlags::HUP)
-            {
+            if revents[0].intersects(PollFlags::ERR | PollFlags::HUP) {
                 return;
             }
 
-            if !poll_fds[0].revents().intersects(PollFlags::IN) {
+            if !revents[0].intersects(PollFlags::IN) {
                 continue;
             }
 
@@ -500,16 +612,12 @@ impl<'a> FuseState<'a> {
             return Continue(());
         }
 
-        let manifest = self.manifest;
-        let children = &self.children;
-        let recorder = &mut self.recorder;
-        let response = dispatch(
-            &header,
-            &buf[IN_HEADER_SIZE..n],
-            manifest,
-            children,
-            recorder,
-        );
+        let tree = Tree {
+            manifest: self.manifest,
+            children: &self.children,
+            synthetic: &self.synthetic,
+        };
+        let response = dispatch(&header, &buf[IN_HEADER_SIZE..n], &tree, &mut self.recorder);
         if !response.is_empty() {
             let _ = rustix::io::write(fuse_fd, &response);
         }
@@ -722,25 +830,33 @@ impl<'a> FuseState<'a> {
     }
 }
 
+/// What requests are answered from: the package's entries and the links
+/// served beside them.
+struct Tree<'t> {
+    manifest: &'t Manifest,
+    children: &'t [Vec<u64>],
+    synthetic: &'t Synthetic,
+}
+
 fn dispatch(
     header: &FuseInHeader,
     body: &[u8],
-    manifest: &Manifest,
-    children: &[Vec<u64>],
+    tree: &Tree,
     recorder: &mut Option<TraceRecorder>,
 ) -> Vec<u8> {
+    let manifest = tree.manifest;
     match header.opcode {
         FUSE_INIT => handle_init(header, body),
-        FUSE_LOOKUP => handle_lookup(header, body, manifest, children, recorder),
-        FUSE_GETATTR => handle_getattr(header, manifest),
+        FUSE_LOOKUP => handle_lookup(header, body, tree, recorder),
+        FUSE_GETATTR => handle_getattr(header, tree),
         FUSE_OPEN => handle_open(header, manifest, recorder),
         FUSE_RELEASE | FUSE_RELEASEDIR => reply_ok(header, &[]),
         FUSE_OPENDIR => handle_opendir(header, manifest),
-        FUSE_READDIR => handle_readdir(header, body, manifest, children),
-        FUSE_READDIRPLUS => handle_readdirplus(header, body, manifest, children),
-        FUSE_READLINK => handle_readlink(header, manifest),
+        FUSE_READDIR => handle_readdir(header, body, tree, false),
+        FUSE_READDIRPLUS => handle_readdir(header, body, tree, true),
+        FUSE_READLINK => handle_readlink(header, tree),
         FUSE_STATFS => handle_statfs(header, manifest),
-        FUSE_ACCESS => handle_access(header, body, manifest),
+        FUSE_ACCESS => handle_access(header, body, tree),
         _ => reply_err(header, -libc_enosys()),
     }
 }
@@ -785,10 +901,10 @@ fn handle_init(header: &FuseInHeader, body: &[u8]) -> Vec<u8> {
 fn handle_lookup(
     header: &FuseInHeader,
     body: &[u8],
-    manifest: &Manifest,
-    children: &[Vec<u64>],
+    tree: &Tree,
     recorder: &mut Option<TraceRecorder>,
 ) -> Vec<u8> {
+    let manifest = tree.manifest;
     let parent_inode = header.nodeid;
     if parent_inode == 0 || inode_to_entry(parent_inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
@@ -810,32 +926,40 @@ fn handle_lookup(
         return reply_err(header, -libc_enoent());
     }
 
-    let ch = &children[parent_inode as usize];
-    for &child_inode in ch {
-        let entry_idx = inode_to_entry(child_inode);
-        let entry = &manifest.entries[entry_idx];
-        let entry_name = manifest.get_string(entry.name);
-        if entry_name == name_str {
+    let found = tree.children[parent_inode as usize]
+        .iter()
+        .find(|&&child| {
+            manifest.get_string(manifest.entries[inode_to_entry(child)].name) == name_str
+        })
+        .copied();
+    let attr = match found {
+        Some(child_inode) => {
+            let entry_idx = inode_to_entry(child_inode);
             if let Some(rec) = recorder {
                 rec.record(entry_idx, manifest);
             }
-            let attr = make_attr(child_inode, entry, manifest);
-            let entry_out = FuseEntryOut {
-                nodeid: child_inode,
-                generation: 0,
-                entry_valid: ENTRY_TIMEOUT,
-                attr_valid: ATTR_TIMEOUT,
-                entry_valid_nsec: 0,
-                attr_valid_nsec: 0,
-                attr,
-            };
-            let mut payload = Vec::new();
-            unsafe { write_struct(&mut payload, &entry_out) };
-            return reply_ok(header, &payload);
+            make_attr(child_inode, &manifest.entries[entry_idx], manifest)
         }
-    }
-
-    reply_err(header, -libc_enoent())
+        None => match tree.synthetic.lookup(parent_inode, name_str) {
+            Some(inode) => match tree.synthetic.get(inode) {
+                Some(link) => tree.synthetic.attr(inode, link, manifest),
+                None => return reply_err(header, -libc_enoent()),
+            },
+            None => return reply_err(header, -libc_enoent()),
+        },
+    };
+    let entry_out = FuseEntryOut {
+        nodeid: attr.ino,
+        generation: 0,
+        entry_valid: ENTRY_TIMEOUT,
+        attr_valid: ATTR_TIMEOUT,
+        entry_valid_nsec: 0,
+        attr_valid_nsec: 0,
+        attr,
+    };
+    let mut payload = Vec::new();
+    unsafe { write_struct(&mut payload, &entry_out) };
+    reply_ok(header, &payload)
 }
 
 /// ACCESS answered honestly instead of with a blanket yes.
@@ -848,18 +972,22 @@ fn handle_lookup(
 /// by the launching user — with one deliberate strictness: the mount is
 /// read-only, so a write-access question is denied even when the mode
 /// bits would allow it, matching the EROFS an actual open would get.
-fn handle_access(header: &FuseInHeader, body: &[u8], manifest: &Manifest) -> Vec<u8> {
+fn handle_access(header: &FuseInHeader, body: &[u8], tree: &Tree) -> Vec<u8> {
+    let manifest = tree.manifest;
     // FUSE_ACCESS_IN carries the mask as one little-endian u32.
     if body.len() < 4 {
         return reply_err(header, -libc_eio());
     }
     let mask = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     let inode = header.nodeid;
-    if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
+    let mode = if tree.synthetic.get(inode).is_some() {
+        0o777
+    } else if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
-    }
-    let entry = &manifest.entries[inode_to_entry(inode)];
-    if access_allowed(entry.mode, mask) {
+    } else {
+        manifest.entries[inode_to_entry(inode)].mode
+    };
+    if access_allowed(mode, mask) {
         reply_ok(header, &[])
     } else {
         reply_err(header, -libc_eacces())
@@ -881,14 +1009,16 @@ fn access_allowed(entry_mode: u32, mask: u32) -> bool {
     owner & mask == mask
 }
 
-fn handle_getattr(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
+fn handle_getattr(header: &FuseInHeader, tree: &Tree) -> Vec<u8> {
+    let manifest = tree.manifest;
     let inode = header.nodeid;
-    if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
+    let attr = if let Some(link) = tree.synthetic.get(inode) {
+        tree.synthetic.attr(inode, link, manifest)
+    } else if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
-    }
-
-    let entry = &manifest.entries[inode_to_entry(inode)];
-    let attr = make_attr(inode, entry, manifest);
+    } else {
+        make_attr(inode, &manifest.entries[inode_to_entry(inode)], manifest)
+    };
 
     let attr_out = FuseAttrOut {
         attr_valid: ATTR_TIMEOUT,
@@ -950,12 +1080,10 @@ fn handle_opendir(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
     reply_ok(header, &payload)
 }
 
-fn handle_readdir(
-    header: &FuseInHeader,
-    body: &[u8],
-    manifest: &Manifest,
-    children: &[Vec<u64>],
-) -> Vec<u8> {
+/// READDIR, or READDIRPLUS when `plus`: the directory's own entries, then
+/// the links served in it.
+fn handle_readdir(header: &FuseInHeader, body: &[u8], tree: &Tree, plus: bool) -> Vec<u8> {
+    let manifest = tree.manifest;
     let read_in: FuseReadIn = match unsafe { read_struct(body, 0) } {
         Some(v) => v,
         None => return reply_err(header, -libc_einval()),
@@ -981,23 +1109,58 @@ fn handle_readdir(
     let start_offset = read_in.offset as usize;
     let mut payload = Vec::with_capacity(max_size.min(4096));
 
-    let ch = &children[inode as usize];
-    let total_entries = 2 + ch.len();
+    let ch = &tree.children[inode as usize];
+    let links = tree.synthetic.children(inode);
+    let total_entries = 2 + ch.len() + links.len();
 
     for i in start_offset..total_entries {
-        let (ino, typ, name): (u64, u32, &[u8]) = match i {
-            0 => (inode, dir_type(EntryKind::Dir), b"."),
-            1 => (parent_inode, dir_type(EntryKind::Dir), b".."),
-            _ => {
+        // `attr` is None for . and .., which READDIRPLUS reports with a
+        // zero nodeid so the kernel does not cache them.
+        let (ino, typ, name, attr): (u64, u32, &[u8], Option<FuseAttr>) = match i {
+            0 => (inode, dir_type(EntryKind::Dir), b".", None),
+            1 => (parent_inode, dir_type(EntryKind::Dir), b"..", None),
+            _ if i - 2 < ch.len() => {
                 let child_inode = ch[i - 2];
                 let child_entry = &manifest.entries[inode_to_entry(child_inode)];
-                let name = manifest.get_string(child_entry.name).as_bytes();
-                (child_inode, dir_type(child_entry.kind), name)
+                (
+                    child_inode,
+                    dir_type(child_entry.kind),
+                    manifest.get_string(child_entry.name).as_bytes(),
+                    plus.then(|| make_attr(child_inode, child_entry, manifest)),
+                )
+            }
+            _ => {
+                let (link_inode, link) = links[i - 2 - ch.len()];
+                (
+                    link_inode,
+                    dir_type(EntryKind::Symlink),
+                    link.name.as_bytes(),
+                    plus.then(|| tree.synthetic.attr(link_inode, link, manifest)),
+                )
             }
         };
-        let dent_size = dirent_size(name.len());
+        let dent_size = if plus {
+            direntplus_size(name.len())
+        } else {
+            dirent_size(name.len())
+        };
         if payload.len() + dent_size > max_size {
             break;
+        }
+        if plus {
+            let entry_out = match attr {
+                Some(attr) => FuseEntryOut {
+                    nodeid: ino,
+                    generation: 0,
+                    entry_valid: ENTRY_TIMEOUT,
+                    attr_valid: ATTR_TIMEOUT,
+                    entry_valid_nsec: 0,
+                    attr_valid_nsec: 0,
+                    attr,
+                },
+                None => unsafe { core::mem::zeroed() },
+            };
+            unsafe { write_struct(&mut payload, &entry_out) };
         }
         let dirent = FuseDirent {
             ino,
@@ -1007,7 +1170,8 @@ fn handle_readdir(
         };
         unsafe { write_struct(&mut payload, &dirent) };
         payload.extend_from_slice(name);
-        let padding = dent_size - DIRENT_BASE_SIZE - name.len();
+        let used = if plus { ENTRY_OUT_SIZE } else { 0 } + DIRENT_BASE_SIZE + name.len();
+        let padding = dent_size - used;
         if padding > 0 {
             payload.extend_from_slice(&[0u8; 8][..padding]);
         }
@@ -1016,97 +1180,12 @@ fn handle_readdir(
     reply_ok(header, &payload)
 }
 
-fn handle_readdirplus(
-    header: &FuseInHeader,
-    body: &[u8],
-    manifest: &Manifest,
-    children: &[Vec<u64>],
-) -> Vec<u8> {
-    let read_in: FuseReadIn = match unsafe { read_struct(body, 0) } {
-        Some(v) => v,
-        None => return reply_err(header, -libc_einval()),
-    };
-
+fn handle_readlink(header: &FuseInHeader, tree: &Tree) -> Vec<u8> {
+    let manifest = tree.manifest;
     let inode = header.nodeid;
-    if inode == 0 {
-        return reply_err(header, -libc_enoent());
+    if let Some(link) = tree.synthetic.get(inode) {
+        return reply_ok(header, &link.target);
     }
-    let entry_idx = inode_to_entry(inode);
-    if entry_idx >= manifest.entries.len() {
-        return reply_err(header, -libc_enoent());
-    }
-
-    let entry = &manifest.entries[entry_idx];
-    let parent_inode = if entry.parent == u32::MAX {
-        1u64
-    } else {
-        entry_to_inode(entry.parent as usize)
-    };
-
-    let max_size = read_in.size as usize;
-    let start_offset = read_in.offset as usize;
-    let mut payload = Vec::with_capacity(max_size.min(4096));
-
-    let ch = &children[inode as usize];
-    let total_entries = 2 + ch.len();
-
-    for i in start_offset..total_entries {
-        let (child_inode, typ, name): (u64, u32, &[u8]) = match i {
-            0 => (inode, dir_type(EntryKind::Dir), b"."),
-            1 => (parent_inode, dir_type(EntryKind::Dir), b".."),
-            _ => {
-                let ci = ch[i - 2];
-                let ce = &manifest.entries[inode_to_entry(ci)];
-                (
-                    ci,
-                    dir_type(ce.kind),
-                    manifest.get_string(ce.name).as_bytes(),
-                )
-            }
-        };
-
-        let dent_size = direntplus_size(name.len());
-        if payload.len() + dent_size > max_size {
-            break;
-        }
-
-        // For real entries: full entry_out so kernel populates dcache + icache
-        // For . and ..: nodeid=0 tells kernel to skip cache population
-        let entry_out = if i >= 2 {
-            let ce = &manifest.entries[inode_to_entry(child_inode)];
-            FuseEntryOut {
-                nodeid: child_inode,
-                generation: 0,
-                entry_valid: ENTRY_TIMEOUT,
-                attr_valid: ATTR_TIMEOUT,
-                entry_valid_nsec: 0,
-                attr_valid_nsec: 0,
-                attr: make_attr(child_inode, ce, manifest),
-            }
-        } else {
-            unsafe { core::mem::zeroed() }
-        };
-        unsafe { write_struct(&mut payload, &entry_out) };
-
-        let dirent = FuseDirent {
-            ino: child_inode,
-            off: (i + 1) as u64,
-            namelen: name.len() as u32,
-            typ,
-        };
-        unsafe { write_struct(&mut payload, &dirent) };
-        payload.extend_from_slice(name);
-        let padding = dent_size - ENTRY_OUT_SIZE - DIRENT_BASE_SIZE - name.len();
-        if padding > 0 {
-            payload.extend_from_slice(&[0u8; 8][..padding]);
-        }
-    }
-
-    reply_ok(header, &payload)
-}
-
-fn handle_readlink(header: &FuseInHeader, manifest: &Manifest) -> Vec<u8> {
-    let inode = header.nodeid;
     if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
     }

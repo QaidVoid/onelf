@@ -183,7 +183,7 @@ pub struct Manifest {
     pub entrypoints: Vec<EntryPoint>,
     /// All filesystem entries (files, directories, symlinks) in the package.
     pub entries: Vec<Entry>,
-    /// Library directory string table offsets for `LD_LIBRARY_PATH` injection.
+    /// Library directory string table offsets: the bundle's library directories.
     pub lib_dir_offsets: Vec<u32>,
     /// Null-terminated string pool referenced by offset from entries and entrypoints.
     pub string_table: Vec<u8>,

@@ -130,6 +130,8 @@ pub(crate) fn install_signal_handlers() {
 
 /// Execute directly from an existing FUSE mount (another instance is serving).
 /// This process becomes the child, so no fork or FUSE loop is needed.
+/// Returns `false` when that mount cannot serve this launch, so the caller
+/// falls back to another mode.
 // Threads the launch context straight to the exec call; grouping it
 // would add a type used at one call site.
 #[allow(clippy::too_many_arguments)]
@@ -151,7 +153,7 @@ fn exec_from_mount(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
-    crate::launch::exec(&crate::launch::Launch {
+    crate::launch::exec_served(&crate::launch::Launch {
         pkg,
         pkg_root: mountpoint,
         mode: "fuse",
@@ -165,7 +167,15 @@ fn exec_from_mount(
         // instance mounted it through fusermount3, in the host namespace.
         private_ns: false,
         tree_writable: false,
-    })
+        links: crate::launch::Links::Served,
+    });
+    // The links that mount serves were placed for a launch that resolved
+    // the host differently, and only its own server could change them.
+    eprintln!(
+        "onelf-rt: fuse: the running instance's mount serves other host \
+         libraries than this launch needs; using another mode"
+    );
+    false
 }
 
 /// Whether any process other than this one is still running out of `mountpoint`.
@@ -380,10 +390,21 @@ pub fn execute_fuse(
     // Remove CLOEXEC from write end so the exec'd child inherits it.
     let _ = rustix::io::fcntl_setfd(&pipe_write, FdFlags::empty());
 
+    // The child resolves which libraries the mount shows from outside the
+    // package, since only it reads the mount, and the parent serves them.
+    let (links_tx, links_rx) = match crate::links::channel() {
+        Ok(c) => c,
+        Err(_) => {
+            cleanup_mountpoint(claim, used_namespace);
+            return false;
+        }
+    };
+
     use rustix::runtime::{Fork, kernel_fork};
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
+            drop(links_rx);
             // Everything that reads the mount has to happen in the child,
             // after the fork: the parent's FUSE event loop is what serves
             // it, and that loop is only now starting.
@@ -399,11 +420,13 @@ pub fn execute_fuse(
                 env_data,
                 private_ns: used_namespace,
                 tree_writable: false,
+                links: crate::launch::Links::Server(&links_tx),
             })
         }
         Ok(Fork::ParentOf(child_pid)) => {
             // Close write end in parent -- only child holds it now
             drop(pipe_write);
+            drop(links_tx);
 
             CHILD_PID.store(child_pid.as_raw_nonzero().get(), Ordering::Relaxed);
 
@@ -425,6 +448,7 @@ pub fn execute_fuse(
                 &pkg.footer,
                 pkg.dict.as_deref(),
             );
+            state.expect_links(links_rx);
 
             let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];
             state.run_loop(

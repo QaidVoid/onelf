@@ -38,10 +38,38 @@ pub struct Launch<'a> {
     /// edited in place, the other way a host library can shadow a bundled
     /// copy when there is no namespace to mount in.
     pub tree_writable: bool,
+    /// How the libraries the launch takes from outside the package come to
+    /// show in its library directory.
+    pub links: Links<'a>,
+}
+
+/// Where a launch's library links (see [`crate::links`]) are put.
+pub enum Links<'a> {
+    /// The tree is on disk and writable: the links are symlinks in it.
+    Tree,
+    /// The FUSE server this launch started is told, and serves them.
+    Server(&'a crate::links::Sender),
+    /// The mount is another launch's, which must serve these links already.
+    Served,
 }
 
 /// Replace this process with the entrypoint. Only returns by exiting.
 pub fn exec(launch: &Launch) -> ! {
+    run(launch);
+    eprintln!("onelf-rt: the library links of this launch could not be placed");
+    std::process::exit(1);
+}
+
+/// [`exec`] on a mount another launch serves. Returns, before anything of
+/// the environment is set up, when that mount serves other library links
+/// than this launch needs, so the caller can choose another mode.
+pub fn exec_served(launch: &Launch) {
+    run(launch);
+}
+
+/// Replace this process with the entrypoint, unless its library links
+/// cannot be placed, which only a mount served by another launch refuses.
+fn run(launch: &Launch) {
     let manifest = &launch.pkg.manifest;
     let ep = &manifest.entrypoints[launch.ep_idx];
     let ep_name = manifest.get_string(ep.name).to_string();
@@ -74,6 +102,18 @@ pub fn exec(launch: &Launch) -> ! {
     }
     if let Some(farm) = &resolution.farm {
         shadow_bundled_copies(farm, launch, &lib_dirs);
+    }
+    let runpath = crate::links::origin_runpath(&target_path);
+    if !lib_dirs.is_empty()
+        && !place_links(
+            launch,
+            &lib_dirs,
+            &runpath,
+            resolution.farm.as_deref(),
+            &set_roots,
+        )
+    {
+        return;
     }
 
     let lib_path = crate::env::setup_env(
@@ -119,8 +159,20 @@ pub fn exec(launch: &Launch) -> ! {
         .interp_data
         .and_then(crate::interp::parse_bundled_interp_rel);
 
+    // The only environment a launch ever adds to the library search, and
+    // only for an ELF that has no `$ORIGIN` run path and that the kernel
+    // has to start: nothing else would lead it to its own libraries.
+    let kernel_lib_path = (!lib_path.is_empty() && runpath.is_empty())
+        .then(|| fallback_library_path(launch.pkg_root, &lib_dirs));
+
     if let Some(host_interp) = &resolution.host_interp {
-        exec_under_host_loader(&target_path, host_interp, &lib_path, launch);
+        exec_under_host_loader(
+            &target_path,
+            host_interp,
+            &lib_path,
+            kernel_lib_path.as_deref(),
+            launch,
+        );
     }
 
     if let Some(interp) =
@@ -134,6 +186,7 @@ pub fn exec(launch: &Launch) -> ! {
         launch.pkg_root,
         &lib_dirs,
         &lib_path,
+        kernel_lib_path.as_deref(),
         launch.private_ns,
         launch.argv0,
         launch.args,
@@ -143,17 +196,70 @@ pub fn exec(launch: &Launch) -> ! {
     std::process::exit(1);
 }
 
+/// Show the libraries this launch takes from the farm and the sets in the
+/// package's library directory. False when the mount another launch
+/// serves shows a different set, which this launch cannot change.
+fn place_links(
+    launch: &Launch,
+    lib_dirs: &[&str],
+    runpath: &[std::path::PathBuf],
+    farm: Option<&Path>,
+    set_roots: &[std::path::PathBuf],
+) -> bool {
+    let manifest = &launch.pkg.manifest;
+    let Some(dir) = crate::links::dir(manifest, launch.pkg_root, runpath, lib_dirs) else {
+        return true;
+    };
+    let links = crate::links::wanted(manifest, &dir, farm, set_roots);
+    match launch.links {
+        Links::Tree => {
+            crate::links::place(manifest, launch.pkg_root, &dir, &links);
+            true
+        }
+        Links::Server(sender) => {
+            if !links.is_empty() {
+                sender.send(&dir, &links);
+            }
+            true
+        }
+        Links::Served => crate::links::served(manifest, launch.pkg_root, &dir, &links, lib_dirs),
+    }
+}
+
+/// `LD_LIBRARY_PATH` for an ELF without a `$ORIGIN` run path that the
+/// kernel starts: the package's library directories, which hold the
+/// library links as well, ahead of the caller's own path.
+///
+/// Such a binary is one the packer gave no run path: a self-extracting
+/// one, which needs the kernel to make `/proc/self/exe` itself, one
+/// bundled where neither a slot nor patchelf was there to write one, or
+/// one packed without `bundle-libs` that runs under the host's loader. A
+/// bootstrapped binary maps its loader itself, so no loader of ours could
+/// be handed `--library-path` for it, and a host loader may predate the
+/// `--argv0` the command line would need. This is the one place the
+/// variable is still set, and what the app spawns inherits it.
+fn fallback_library_path(pkg_root: &Path, lib_dirs: &[&str]) -> String {
+    let mut parts: Vec<String> = lib_dirs
+        .iter()
+        .map(|d| pkg_root.join(d).to_string_lossy().into_owned())
+        .collect();
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH").filter(|v| !v.is_empty()) {
+        parts.push(existing.to_string_lossy().into_owned());
+    }
+    parts.join(":")
+}
+
 /// Put each host winner in place of the bundled copy it beat.
 ///
-/// The farm on the library path is not enough for that: `bundle-libs`
-/// gives every executable a `DT_RPATH`, and the loader searches that
-/// before any library path, so a bundled copy would always be found
-/// first. Inside a private mount namespace the host file is bind-mounted
-/// over the bundled path, which every process in the tree then sees,
-/// including one that clears its environment and re-execs. A tree that is
-/// this launch's own gets a symlink instead. With neither, the farm is
-/// all there is, and only libraries the bundle does not carry can come
-/// from the host.
+/// A link beside the bundled copy is not enough for that, and neither is
+/// a library path: `bundle-libs` gives every executable a `DT_RPATH`, and
+/// the loader searches that before any library path, so a bundled copy
+/// would always be found first. Inside a private mount namespace the host
+/// file is bind-mounted over the bundled path, which every process in the
+/// tree then sees, including one that clears its environment and
+/// re-execs. A tree that is this launch's own gets a symlink instead.
+/// With neither, only libraries the bundle does not carry can come from
+/// the host.
 fn shadow_bundled_copies(farm: &Path, launch: &Launch, lib_dirs: &[&str]) {
     if !launch.private_ns && !launch.tree_writable {
         return;
@@ -201,7 +307,13 @@ fn shadow_bundled_copies(farm: &Path, launch: &Launch, lib_dirs: &[&str]) {
 /// binaries do not mind, and a non-PIE binary, or one that carries a
 /// trailer the loader path cannot preserve, is handed to the loader on its
 /// command line instead.
-fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, launch: &Launch) {
+fn exec_under_host_loader(
+    target: &Path,
+    host_interp: &Path,
+    lib_path: &str,
+    kernel_lib_path: Option<&str>,
+    launch: &Launch,
+) {
     let interp = crate::interp::read_elf_interp(target);
     // A self-extracting binary needs `/proc/self/exe` to be itself, which
     // only a kernel exec gives it. Its `PT_INTERP` names the host loader,
@@ -217,8 +329,7 @@ fn exec_under_host_loader(target: &Path, host_interp: &Path, lib_path: &str, lau
         cmd.arg0(launch.argv0)
             .args(launch.args)
             .env("ONELF_INTERP", host_interp);
-        let path = crate::interp::kernel_exec_library_path(target, launch.pkg_root, lib_path);
-        if !path.is_empty() {
+        if let Some(path) = kernel_lib_path {
             cmd.env("LD_LIBRARY_PATH", path);
         }
         let err = cmd.exec();

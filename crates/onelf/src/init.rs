@@ -64,7 +64,7 @@ dict = false
 # url = "https://example.com/{name}.onelf.zsync"
 
 [bundle]
-# Pass ["auto"] to detect, or list directories to add to LD_LIBRARY_PATH.
+# Pass ["auto"] to detect, or list the bundle's library directories.
 # lib-dirs = ["auto"]
 
 # Extra directories searched for shared libraries (highest priority).

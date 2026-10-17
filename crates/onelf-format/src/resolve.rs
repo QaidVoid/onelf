@@ -12,10 +12,11 @@
 //! the whole glibc family comes from the host so nothing bundled is loaded
 //! beside a foreign loader.
 //!
-//! Winners from the host are materialized as symlinks in a link farm that
-//! goes first on the library path. No host directory is ever on the path,
-//! so a soname the bundle lacks and the resolver did not choose fails by
-//! name instead of being satisfied by whatever the host has.
+//! Winners from the host are materialized as symlinks in a link farm, and
+//! the runtime shows each one the bundle lacks in the bundle's library
+//! directory. No host directory is ever searched, so a soname the bundle
+//! lacks and the resolver did not choose fails by name instead of being
+//! satisfied by whatever the host has.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
@@ -30,7 +31,7 @@ use crate::verdef::{self, Choice, VersionSet};
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Resolution {
     /// Directory of symlinks to the chosen host libraries, when any were
-    /// chosen. Goes first on the library path.
+    /// chosen.
     pub farm: Option<PathBuf>,
     /// The host loader to run the entrypoint under, when the host's libc
     /// won. The bundled loader is used otherwise.
@@ -492,6 +493,11 @@ fn bundled_libs(pkg_root: &Path, lib_dirs: &[&str]) -> BTreeMap<String, PathBuf>
 }
 
 /// Every shared object directly in `dir`, by file name.
+///
+/// A symlink to an absolute path is not one of them. A package's own links
+/// stay inside it, and an absolute one is a link the runtime made to a host
+/// or set library, which a mount or a cache tree still shows when a later
+/// launch looks.
 fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -501,7 +507,8 @@ fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(|entry| {
             let name = entry.file_name().to_str().map(String::from)?;
             let path = entry.path();
-            (name.contains(".so") && path.is_file()).then_some((name, path))
+            let placed = fs::read_link(&path).is_ok_and(|t| t.is_absolute());
+            (name.contains(".so") && !placed && path.is_file()).then_some((name, path))
         })
         .collect()
 }

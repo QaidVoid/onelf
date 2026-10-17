@@ -25,8 +25,8 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 
 | Variable | Set when | Points to |
 |----------|----------|-----------|
-| `LD_LIBRARY_PATH` | `lib/` contains `.so` files | the resolver's link farm of chosen host libraries, then `<pkg>/lib` on explicit linker invocations |
-| `ONELF_LIB_PATH` | `lib/` contains `.so` files | the link farm, then the bundled lib dirs, for a script entrypoint to export as `LD_LIBRARY_PATH` |
+| `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs, then the previous value |
+| `ONELF_LIB_PATH` | `lib/` contains `.so` files | the bundled lib dirs, kept for scripts that export it as `LD_LIBRARY_PATH` |
 | `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
 | `LIBVA_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
@@ -44,18 +44,26 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `GDK_PIXBUF_MODULE_FILE` | `lib/gdk-pixbuf-2.0/<version>/loaders.cache` exists | that cache, rewritten to absolute module paths (GTK resolves relative cache paths against the cwd). Only set when the caller has not set it. |
 | `GTK_IM_MODULE_FILE` | `lib/gtk-3.0/immodules.cache` exists | that cache, absolutised the same way, so the bundle's input-method modules are used. Only set when the caller has not set it. |
 
-`LD_LIBRARY_PATH` is set as a fallback for AT_EXECFN-bootstrapped
-binaries that do not drive an explicit linker invocation. The runtime
-also passes `--library-path` to the bundled linker on direct
-invocations. Both mechanisms cover the bundled lib search; the env
-var gets inherited by child processes the app spawns. No host directory
-appears in either: what the host supplies is chosen per library by the
-resolver and reached through its link farm.
+The runtime leaves `LD_LIBRARY_PATH` as the caller set it. Bundled
+binaries find their libraries through their `$ORIGIN` run path, and the
+host libraries the resolver chose and the libraries of the package's
+shared sets are shown as symlinks in the bundle's library directory,
+where that run path finds them. On an explicit linker invocation the
+runtime also passes `--library-path`, which no child process inherits.
+No host directory is ever searched: what the host supplies is chosen
+per library by the resolver. See
+[Environment](../guide/environment#library-paths).
+
+The one exception is an ELF entrypoint without an `$ORIGIN` run path
+that the kernel has to start, such as a self-extracting binary or an
+executable `bundle-libs` could give no run path. It gets the bundled
+lib dirs in `LD_LIBRARY_PATH`, since nothing else leads it to its
+libraries, and the programs it runs inherit them.
 
 A script entrypoint (shebang target) runs under a host interpreter that
-must not see the bundled libraries, so it gets neither mechanism: the
-path is published as `ONELF_LIB_PATH` instead, and the script exports it
-as `LD_LIBRARY_PATH` itself before execing bundled binaries.
+must not see the bundled libraries, so it gets none of this. The
+bundled binaries it runs find their libraries on their own.
+`ONELF_LIB_PATH` is still published for scripts written to export it.
 
 `VK_ADD_DRIVER_FILES` is never set by the runtime, but it is honored as
 a guard: if the app or the user sets it, the runtime stays out of

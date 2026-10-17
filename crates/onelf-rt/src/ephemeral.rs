@@ -125,5 +125,6 @@ pub fn execute_tmpfs(
         env_data,
         private_ns: true,
         tree_writable: false,
+        links: crate::launch::Links::Tree,
     })
 }

@@ -306,9 +306,15 @@ that cannot mount falls back to that on its own.
   distrobox host ask the runtime not to do. Where the helper is missing
   the set is copied out instead, which costs disk but behaves the same.
 
-Every directory of a set that holds a shared object goes on the launch's
-library path after the bundle's own, so a name the bundle kept stays the
-bundle's and the set supplies the rest. Its `share/` joins
+Every shared object the set holds, in `lib/` and in any directory below
+it, is shown in the bundle's library directory as a symlink, where the
+bundled executables' run path finds it. A name the bundle kept stays the
+bundle's, and the set supplies the rest. A set library that needs
+another finds it the same way, through the executable's run path, which
+the loader also searches for every library below it. Nothing goes on
+`LD_LIBRARY_PATH`, so the programs the application runs never load the
+set's libraries (see
+[Environment](./environment#library-paths)). Its `share/` joins
 `XDG_DATA_DIRS`, any Qt plugin directory it carries joins
 `QT_PLUGIN_PATH`, and its libraries are compared against the host
 exactly as bundled copies are.
@@ -408,10 +414,10 @@ indexed ahead of the host's, so two packages pinning the same build
 share one download and one extraction. The name is the build's own hash,
 so a label whose pin later moves to a new build keeps both rather than
 overwriting the old one and forcing a refetch. The build's
-directories are never put on the search path, where every process the
-application spawns would inherit them. Its libraries reach the
+directories are never searched as a whole. Its libraries reach the
 application through the link farm by name, the ones the drivers open
-by name (glvnd vendors, gallium, ICDs) included. `onelf cache list` shows the
+by name (glvnd vendors, gallium, ICDs) included, and are shown in the
+bundle's library directory as the host's are. `onelf cache list` shows the
 store and `onelf cache gc` collects a build no package has used past
 the age threshold.
 

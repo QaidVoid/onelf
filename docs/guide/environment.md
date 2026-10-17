@@ -30,33 +30,71 @@ The rules this page encodes:
 | `ONELF_ENTRYPOINT` | Active entrypoint name | `myapp-daemon` |
 | `ONELF_ENTRYPOINT_EXPORTED` | The same name, so a launched package ignores it | `myapp-daemon` |
 | `ONELF_LAUNCH_DIR` | Caller's original cwd | `/home/alice/project` |
-| `ONELF_LIB_PATH` | The library search path below, for script entrypoints | `/run/user/1000/onelf-myapp-ab12cd34/lib` |
+| `ONELF_LIB_PATH` | The bundle's library directories, kept for older scripts (see below) | `/run/user/1000/onelf-myapp-ab12cd34/lib` |
 
 ## Library paths
 
-The runtime takes the library directories recorded at pack time
-(`--lib-dir`, by default every directory that holds a `.so`) and builds
-a search-path string of the form:
+The runtime does not set `LD_LIBRARY_PATH` for the app. A value the
+caller set reaches the app unchanged, and so does its absence, and a
+host program the app runs (a shell, `git`, `xdg-open`) sees the same
+thing. The variable would otherwise carry the bundle's libraries into
+every one of those programs.
+
+Bundled binaries find their libraries through the `$ORIGIN` run path
+`bundle-libs` wrote into them, which names the bundle's library
+directory, `lib/` by default. Libraries from outside the bundle are
+shown in that same directory as symlinks, so the run path finds them
+too:
+
+- the host libraries the resolver chose for this launch, and those a
+  fetched [GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one)
+  supplies;
+- the libraries of the package's
+  [shared sets](./sysroot#sharing-a-dependency-set),
+  including those in subdirectories of a set's `lib/`.
+
+Only names the bundle does not carry are added. How the links come to
+exist depends on the [mode](./execution-modes):
+
+| Mode | The links are |
+|------|---------------|
+| `fuse` | entries the mount serves, decided by the launch before the app starts |
+| `tmpfs`, `rundir` | symlinks in the launch's own tree |
+| `cache` | symlinks in the shared cache tree, made to match what each launch resolved |
+
+A FUSE mount another instance is serving, which only the `fusermount3`
+path allows, is reused only when it shows the links this launch
+resolved. A launch that resolved differently, because the host changed
+or `ONELF_NO_RESOLVER` was set, says so and takes the next mode. In the
+cache mode a launch under a different host state rewrites the links,
+and an instance still running from that tree loads the new targets for
+anything it opens afterwards.
+
+The library directories recorded at pack time (`--lib-dir`, by default
+every directory that holds a `.so`) still form a search path, used
+only when the runtime invokes the dynamic linker itself:
 
 ```
 <resolver link farm>:<bundle lib dirs>:<shared set lib dirs>:<previous LD_LIBRARY_PATH>
 ```
 
-That string is used three ways:
+It is passed as `--library-path` on that one command line, so nothing
+the app spawns sees it.
 
-1. Passed to the bundled dynamic linker via `--library-path` when the
-   runtime invokes it explicitly.
-2. Set as `LD_LIBRARY_PATH` for AT_EXECFN-bootstrapped binaries, which
-   reach the bundled libraries through their own run path and only get
-   the entries outside the package (the farm, set directories and the
-   previous value), so that nested execs the app does still resolve
-   correctly. A binary that got no `$ORIGIN` run path at
-   bundle time (no slot and no `patchelf`) has no other way to the
-   bundled libraries, so it receives the whole string instead.
-3. Published as `ONELF_LIB_PATH` for a script entrypoint, which drives
-   no linker invocation of ours and runs under the host interpreter. The
-   script exports it as `LD_LIBRARY_PATH` itself before execing bundled
-   binaries.
+⚠️ One kind of binary still gets `LD_LIBRARY_PATH`: an ELF entrypoint
+without an `$ORIGIN` run path that the kernel has to start. That is a
+self-extracting binary, an executable `bundle-libs` could not give a
+run path (no slot and no `patchelf`), or a binary packed without
+`bundle-libs` that runs under the host's loader. Nothing else leads it
+to its libraries, so it gets the bundle's library directories ahead of
+the previous value, and the programs it runs inherit them.
+`bundle-libs` reports such executables at pack time.
+
+`ONELF_LIB_PATH` names the bundle's library directories. Scripts used
+to export it as `LD_LIBRARY_PATH` before running bundled binaries; that
+is no longer needed, since those binaries find every library through
+their own run path, and the variable is kept so such scripts go on
+working.
 
 The link farm holds the host libraries the runtime's resolver chose for
 this launch: the driver stack the bundle does not carry, and any library
@@ -64,11 +102,11 @@ whose host copy is newer than the bundled one. See
 [Bundling](./bundling#libraries-that-come-from-the-host) for how the
 choice is made.
 
-❌ Do not count on a host library directory appearing on the path. No
-host directory ever goes on the search path: what the host supplies is
-chosen per library by the resolver and reached through its link farm,
-and a library the bundle lacks and the resolver did not choose fails by
-name instead of being satisfied from the host.
+❌ Do not count on a host library directory being searched. No host
+directory ever is: what the host supplies is chosen per library by the
+resolver and linked by name, and a library the bundle lacks and the
+resolver did not choose fails by name instead of being satisfied from
+the host.
 
 Each variable below is set only when the caller has not set it and
 the directory it names exists. "A lib dir" means one of the bundle's
@@ -207,7 +245,7 @@ See [Recipe File](./recipe#env) for details.
 
 The problem: some apps re-exec themselves with a wiped environment
 (Chromium and Electron zygotes, Steam, `bwrap`-based sandboxes). Anything
-the runtime exported via `LD_LIBRARY_PATH` or `[env]` is lost across that
+the runtime exported, `[env]` included, is lost across that
 `clearenv()` + `execve()`, because the runtime is no longer in the loop
 on the re-exec.
 
@@ -216,7 +254,8 @@ into the ELF itself:
 
 - **Libraries**: `bundle-libs` bakes an `$ORIGIN` `DT_RPATH` into every
   binary, the one entry that reaches `lib/` from the binary's own depth,
-  so bundled libs resolve relative to its location on every exec.
+  so bundled libs resolve relative to its location on every exec. The
+  links to host and set libraries live in that directory too.
   ⚠️ Executables that could not get one (no in-place slot and no
   `patchelf`, or self-extract binaries) are reported at pack time. They
   fall back to `LD_LIBRARY_PATH` and are not re-exec-safe.
