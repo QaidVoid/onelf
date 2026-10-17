@@ -3126,7 +3126,7 @@ int main(void) {
         .expect("spawn onelf pack");
     assert!(o.status.success());
 
-    let launch = |no_resolver: bool| {
+    let launch_in = |no_resolver: bool, mode: Option<&str>| {
         let mut run = Command::new(&pkg);
         run.env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -3135,9 +3135,13 @@ int main(void) {
         if no_resolver {
             run.env("ONELF_NO_RESOLVER", "1");
         }
+        if let Some(mode) = mode {
+            run.env("ONELF_MODE", mode);
+        }
         isolate(&mut run, &td);
         run_package(&mut run)
     };
+    let launch = |no_resolver: bool| launch_in(no_resolver, None);
 
     // A host file shadowing a bundled one keeps the bundled path, so the
     // mapping is identified by inode rather than by name.
@@ -3191,6 +3195,27 @@ int main(void) {
     assert!(
         maps.contains("libfixture.so.1"),
         "the bundle's own library still loads:\n{maps}"
+    );
+
+    // The cache tree is shared and stays as extracted, so no host file can
+    // take a bundled one's place. Under the host loader the executable's
+    // run path would still find the bundled libc, so the pair stays. The
+    // fixture's two libcs come from one build and would even run together,
+    // so the loader is what tells the cases apart.
+    let cached = launch_in(false, Some("cache"));
+    let maps = maps_of(&cached);
+    assert!(
+        cached.status.success() && maps.contains("value=42"),
+        "the cache mode runs on the bundled pair:\n{maps}{}",
+        String::from_utf8_lossy(&cached.stderr)
+    );
+    assert!(
+        !mapped_inodes(&maps, "ld-linux-x86-64.so.2").contains(&host_ld_ino),
+        "a mode that cannot shadow keeps the bundled loader:\n{maps}"
+    );
+    assert!(
+        !mapped_inodes(&maps, "libc.so.6").contains(&host_libc_ino),
+        "and the bundled libc:\n{maps}"
     );
 
     let _ = std::fs::remove_dir_all(&td);
@@ -4481,6 +4506,13 @@ int main(void) {{
     assert!(
         path_line.contains("/bin:/sentinel/dir"),
         "expected bin/ prepended to inherited PATH, got: {path_line}"
+    );
+    // The runtime applies the default and the onelf-env constructor
+    // applies it again in the entrypoint: the prefix still appears once.
+    assert_eq!(
+        path_line.matches("/bin:").count(),
+        1,
+        "bin/ prepended more than once: {path_line}"
     );
     // $$ deferred to runtime: HOME must be the *runtime* value, not the
     // packer's HOME at build time.
@@ -7555,7 +7587,12 @@ fn a_path_the_application_was_built_with_reads_the_bundle() {
     sysroot_recipe(&dir, &fixture, "");
     let recipe = dir.join("onelf.toml");
     let mut text = std::fs::read_to_string(&recipe).unwrap();
-    text.push_str("\n[paths]\n\"/usr/share/fixture\" = \"share/fixture\"\n");
+    // A second name in the same parent, which used to stack a second
+    // overlay on the first.
+    text.push_str(
+        "\n[paths]\n\"/usr/share/fixture\" = \"share/fixture\"\n\
+         \"/usr/share/fixture-again\" = \"share/fixture\"\n",
+    );
     write(&recipe, &text);
 
     let out = onelf_build(&dir);
@@ -7576,11 +7613,22 @@ fn a_path_the_application_was_built_with_reads_the_bundle() {
     isolate(&mut cmd, &td);
     let out = run_package(&mut cmd);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stdout.contains("data=data"),
-        "the bundle's copy answered for the path:\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "the bundle's copy answered for the path:\n{stdout}\n{stderr}"
     );
+    assert!(
+        !stderr.contains("/usr/share"),
+        "every name was placed:\n{stderr}"
+    );
+    let staging: Vec<_> = std::fs::read_dir(td.join("xdg-run"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().starts_with("paths-"))
+        .collect();
+    assert!(staging.is_empty(), "staging left behind: {staging:?}");
     let _ = std::fs::remove_dir_all(&td);
 }
 

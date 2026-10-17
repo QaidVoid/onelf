@@ -64,6 +64,11 @@ pub struct Request<'a> {
     /// libraries are the ones the bundle left out, so they are compared
     /// against the host exactly as a bundled copy would be.
     pub set_roots: &'a [PathBuf],
+    /// Whether the launch can place host files over their bundled copies.
+    /// Without that the host's glibc is never chosen: the bundled
+    /// executables' run path would still find the bundled libc, and it
+    /// cannot run under the host loader.
+    pub host_libc: bool,
 }
 
 /// Library directories of a GL build, relative to its root.
@@ -216,7 +221,13 @@ pub fn resolve(req: &Request) -> Resolution {
     if host.libs.is_empty() {
         return Resolution::default();
     }
-    let fingerprint = fingerprint(req.ld_cache, req.icd_dirs, req.policy, req.extra_root);
+    let fingerprint = fingerprint(
+        req.ld_cache,
+        req.icd_dirs,
+        req.policy,
+        req.extra_root,
+        req.host_libc,
+    );
     if let Some(recorded) = load_recorded(req.store, &fingerprint) {
         return recorded;
     }
@@ -233,7 +244,9 @@ pub fn resolve(req: &Request) -> Resolution {
     let mut incomparable = Vec::new();
     let mut host_interp = None;
 
-    if let (Some(bundled_libc), Some(host_libc)) = (bundled.get(LIBC), host.libs.get(LIBC)) {
+    if let (true, Some(bundled_libc), Some(host_libc)) =
+        (req.host_libc, bundled.get(LIBC), host.libs.get(LIBC))
+    {
         match verdef::compare(&versions(bundled_libc), &versions(host_libc)) {
             Choice::Host => {
                 if let Some(interp) = host.loader_for(host_libc) {
@@ -503,8 +516,12 @@ fn fingerprint(
     icd_dirs: &[&str],
     policy: HostLibsPolicy,
     extra_root: Option<&Path>,
+    host_libc: bool,
 ) -> String {
     let mut out = format!("onelf-resolve-1 {}", policy.as_str());
+    if !host_libc {
+        out.push_str(" bundled-libc");
+    }
     let mut stamp = |path: &Path| {
         out.push('\x1f');
         out.push_str(&path.to_string_lossy());
@@ -783,6 +800,15 @@ mod tests {
         }
 
         fn resolve_with(&self, policy: HostLibsPolicy, extra_root: Option<&Path>) -> Resolution {
+            self.resolve_full(policy, extra_root, true)
+        }
+
+        fn resolve_full(
+            &self,
+            policy: HostLibsPolicy,
+            extra_root: Option<&Path>,
+            host_libc: bool,
+        ) -> Resolution {
             let icd_dir = self.icd_dir.to_string_lossy().into_owned();
             let set_roots = self.set_roots();
             let r = resolve(&Request {
@@ -794,6 +820,7 @@ mod tests {
                 icd_dirs: &[icd_dir.as_str()],
                 extra_root,
                 set_roots: &set_roots,
+                host_libc,
             });
             *self.last_farm.borrow_mut() = r.farm.clone();
             r
@@ -983,6 +1010,34 @@ mod tests {
         assert_eq!(w.farm_link("libm.so.6"), Some(host_libm));
         assert_eq!(w.farm_link("ld-linux-x86-64.so.2"), Some(host_ld));
         assert!(w.farm_link("libother.so.1").is_none());
+    }
+
+    /// Under the host loader the bundled executables' run path still finds
+    /// the bundled libc, so a launch that cannot put the host's copy in its
+    /// place must keep the bundled pair rather than crash at start.
+    #[test]
+    fn a_launch_that_cannot_shadow_keeps_the_bundled_glibc() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        w.host(
+            "libc.so.6",
+            &shared_object_with_interp(
+                &[(0, "GLIBC_2.2.5"), (0, "GLIBC_2.34")],
+                &[],
+                Some(host_ld.to_str().unwrap()),
+            ),
+        );
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.bundle("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+
+        let r = w.resolve_full(HostLibsPolicy::Auto, None, false);
+        assert!(r.host_interp.is_none());
+        assert!(w.farm_link("libc.so.6").is_none());
+
+        // The decision recorded for it is not the one a launch that can
+        // shadow gets.
+        let r = w.resolve_full(HostLibsPolicy::Auto, None, true);
+        assert_eq!(r.host_interp, Some(host_ld));
     }
 
     #[test]

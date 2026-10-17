@@ -103,7 +103,9 @@ pub fn run(
     // chosen per library, and no host directory goes on the search path.
     // The AppDir is the developer's own tree and there is no namespace to
     // mount in, so a host copy cannot be placed over a bundled one here;
-    // the farm still reaches everything the bundle does not carry.
+    // the farm still reaches everything the bundle does not carry. That
+    // rules out the host's glibc, which only runs once its copy replaces
+    // the bundled one.
     let policy = match recipe.as_ref().and_then(|r| r.package.host_libs) {
         Some(spec) => match HostLibs::from(spec) {
             HostLibs::Always => HostLibsPolicy::Always,
@@ -125,6 +127,7 @@ pub fn run(
                 icd_dirs: resolve::ICD_DIRS,
                 extra_root: None,
                 set_roots: &[],
+                host_libc: false,
             })
         }
         _ => Resolution::default(),

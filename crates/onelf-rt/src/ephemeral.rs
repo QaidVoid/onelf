@@ -77,7 +77,7 @@ pub fn execute_tmpfs(
 
     let size = tmpfs_size_for(pkg);
     if !fits_in_memory(size) {
-        let _ = std::fs::remove_dir(&mountpoint);
+        claim.release();
         return false;
     }
 
@@ -88,13 +88,13 @@ pub fn execute_tmpfs(
     // a failure is terminal.
     if let Err(e) = mount::enter_namespace() {
         eprintln!("onelf-rt: tmpfs: enter_namespace failed: {e}");
-        let _ = std::fs::remove_dir(&mountpoint);
+        claim.release();
         return false;
     }
 
     if let Err(e) = mount::mount_tmpfs(&mountpoint, size) {
         eprintln!("onelf-rt: tmpfs: mount failed: {e}");
-        let _ = std::fs::remove_dir(&mountpoint);
+        claim.release();
         std::process::exit(1);
     }
 

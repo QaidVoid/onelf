@@ -66,7 +66,7 @@ pub fn exec(launch: &Launch) -> ! {
     let resolved = if lib_dirs.is_empty() {
         Resolved::default()
     } else {
-        resolve_for(launch.pkg, launch.pkg_root, &lib_dirs, &set_roots)
+        resolve_for(launch, &lib_dirs, &set_roots)
     };
     let resolution = &resolved.resolution;
     for name in &resolution.incomparable {
@@ -264,16 +264,16 @@ struct Resolved {
 /// turns it off for one launch, which is the way to tell whether a
 /// failure is the resolver's doing.
 ///
+/// A launch that can put no host file in place of a bundled one, neither
+/// by mount nor by editing its tree, never takes the host's glibc: the
+/// bundled executables would load their own libc under the host loader.
+///
 /// A host with no GL stack gets the build the package pins, if it pins
 /// one and the build can be had; the resolver then indexes that build
 /// ahead of the host. Anything that stops that is a warning, and the
 /// launch goes on without a GL stack.
-fn resolve_for(
-    pkg: &PackageData,
-    pkg_root: &Path,
-    lib_dirs: &[&str],
-    set_roots: &[std::path::PathBuf],
-) -> Resolved {
+fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathBuf]) -> Resolved {
+    let (pkg, pkg_root) = (launch.pkg, launch.pkg_root);
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
     let policy = if disabled {
         HostLibsPolicy::Never
@@ -324,6 +324,7 @@ fn resolve_for(
         icd_dirs: resolve::ICD_DIRS,
         extra_root: platform_root.as_deref(),
         set_roots,
+        host_libc: launch.private_ns || launch.tree_writable,
     });
     Resolved {
         resolution,

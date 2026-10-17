@@ -366,3 +366,24 @@ pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Op
     )
     .ok()
 }
+
+/// Keeps the tests that start a process apart from the tests that expect
+/// a file lock of theirs to be released. A child inherits every descriptor
+/// open when it is forked, a lock that survives an exec among them, and a
+/// lock test running beside it then finds its lock still taken.
+#[cfg(test)]
+pub(crate) mod test_locks {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static FORKS: RwLock<()> = RwLock::new(());
+
+    /// Held by a lock test for its whole run.
+    pub(crate) fn locking() -> RwLockReadGuard<'static, ()> {
+        FORKS.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Held by a test for as long as a child it started lives.
+    pub(crate) fn forking() -> RwLockWriteGuard<'static, ()> {
+        FORKS.write().unwrap_or_else(|e| e.into_inner())
+    }
+}

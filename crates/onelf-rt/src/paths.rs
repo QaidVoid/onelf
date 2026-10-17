@@ -81,6 +81,31 @@ impl Mountpoint {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Let go of the claim and remove the directory, unless another
+    /// instance still claims it.
+    ///
+    /// The directory is shared by every launch of the package, and in
+    /// another instance's mount namespace it may be that instance's
+    /// mountpoint: removing it from here detaches that mount there too.
+    /// Only the exclusive lock the sweep also takes proves nobody else is
+    /// using it. A launch that still holds this claim through an inherited
+    /// descriptor keeps the directory as well, and the sweep removes it
+    /// once that launch is gone.
+    pub fn release(self) {
+        let Mountpoint { path, _lock } = self;
+        drop(_lock);
+        let (Some(base), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+        let Ok(lock) = std::fs::File::open(mountpoint_lock_path(base, name)) else {
+            return;
+        };
+        if rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            let _ = std::fs::remove_dir(&path);
+        }
+    }
 }
 
 /// Create a per-package mountpoint / extraction directory under the private
@@ -92,10 +117,33 @@ impl Mountpoint {
 /// the window where a freshly created but not yet mounted directory looks
 /// exactly like an abandoned one to a concurrent sweep.
 pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
-    let hash_suffix = crate::cache::hex(&package_id[0..4]);
-    let dir_name = format!("onelf-{}-{hash_suffix}", name_stem(package_name));
+    let (path, lock) = claim_mountpoint(&package_dir_name(package_name, package_id))?;
+    Some(Mountpoint { path, _lock: lock })
+}
+
+/// Create a directory for this launch alone, claimed the way
+/// [`create_mountpoint`] claims a shared one and named like it with the
+/// process id added.
+///
+/// A tree that is edited in place cannot be shared. Two launches of one
+/// package would extract over each other's files, and one would write
+/// through the symlink the other put over a bundled library, into the
+/// host file it names.
+pub fn create_launch_dir(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
+    let dir_name = launch_dir_name(package_name, package_id, std::process::id());
     let (path, lock) = claim_mountpoint(&dir_name)?;
     Some(Mountpoint { path, _lock: lock })
+}
+
+/// `onelf-<name prefix>-<id prefix>`, shared by every launch of a package.
+fn package_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
+    let hash_suffix = crate::cache::hex(&package_id[0..4]);
+    format!("onelf-{}-{hash_suffix}", name_stem(package_name))
+}
+
+/// The package's directory name with `pid` added, for one launch alone.
+fn launch_dir_name(package_name: &str, package_id: &[u8; 32], pid: u32) -> String {
+    format!("{}-{pid}", package_dir_name(package_name, package_id))
 }
 
 /// The mountpoint a dependency set's build is served at, named by the
@@ -129,9 +177,14 @@ pub fn lock_set_creation(dir_name: &str) -> Option<std::fs::File> {
 /// shared lock is taken first, so a concurrent sweep cannot mistake a
 /// directory that exists but is not yet mounted for an abandoned one.
 fn claim_mountpoint(dir_name: &str) -> Option<(PathBuf, std::fs::File)> {
+    claim_in(&private_dir()?, dir_name)
+}
+
+/// [`claim_mountpoint`] under an explicit base.
+fn claim_in(base: &Path, dir_name: &str) -> Option<(PathBuf, std::fs::File)> {
     use rustix::fs::FlockOperation;
 
-    let base = private_dir()?;
+    let base = base.to_path_buf();
     let lock_path = mountpoint_lock_path(&base, dir_name);
     let lock = match open_lock_inheritable(&lock_path) {
         Ok(f) => f,
@@ -495,6 +548,43 @@ mod tests {
         assert!(staging.is_dir());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every instance of a package claims the same directory, and in
+    /// another instance's namespace it is that instance's mountpoint. The
+    /// first to exit removed it regardless, which detached the mount the
+    /// other was still running from.
+    #[test]
+    fn a_released_mountpoint_stays_while_another_instance_claims_it() {
+        let _locking = crate::test_locks::locking();
+        let base = std::env::temp_dir().join(format!("onelf-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let claim = |name: &str| {
+            let (path, lock) = claim_in(&base, name).unwrap();
+            Mountpoint { path, _lock: lock }
+        };
+        let first = claim("onelf-pkg-aaaa");
+        let second = claim("onelf-pkg-aaaa");
+        let dir = first.path().to_path_buf();
+
+        second.release();
+        assert!(dir.is_dir(), "the first instance still claims it");
+        first.release();
+        assert!(!dir.exists(), "the last claim removes it");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn concurrent_launches_get_trees_of_their_own() {
+        let id = [7u8; 32];
+        assert_ne!(
+            launch_dir_name("app", &id, 100),
+            launch_dir_name("app", &id, 101)
+        );
+        assert!(launch_dir_name("app", &id, 100).starts_with(&package_dir_name("app", &id)));
     }
 
     #[test]

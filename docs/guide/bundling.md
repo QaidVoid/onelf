@@ -121,7 +121,10 @@ from the bundle, since a newer libc satisfies whatever the older one did.
 Host winners are placed over their bundled copies with a bind mount
 inside the private mount namespace, or a symlink in a tree that belongs
 to this launch alone, so every process the app starts sees the same
-choice, including one that clears its environment and re-execs. Host
+choice, including one that clears its environment and re-execs. A mode
+that has neither, the cache and a `fusermount3` mount, keeps the bundled
+glibc, since the bundled executables would still find their own libc
+under the host loader. Host
 libraries the bundle does not carry at all, the driver itself for one,
 are reached through a link farm the runtime puts first on the library
 path. A soname that is neither bundled nor chosen fails by name:

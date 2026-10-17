@@ -537,12 +537,93 @@ unsafe fn apply_env() {
         if scopy(key.as_mut_ptr(), key.len(), buf.add(ks), ke - ks) < 0 {
             continue;
         }
+        if already_applied(key.as_ptr(), buf.add(vs), ve - vs, root) {
+            continue;
+        }
         let mut val = [0u8; 8192];
         if !expand(val.as_mut_ptr(), val.len(), buf.add(vs), ve - vs, root) {
             continue;
         }
         setenv(key.as_ptr(), val.as_ptr(), 1);
     }
+}
+
+/// `n` bytes at `a` equal those at `b`.
+unsafe fn bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
+    let mut i = 0;
+    while i < n {
+        if *a.add(i) != *b.add(i) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether `key` already holds what the value `src[..n]` wraps around its
+/// own `${key}` or `${key:-word}`.
+///
+/// The default `${ONELF_DIR}/bin:${PATH}` refers to the variable it sets.
+/// The runtime applies it before this constructor runs, and every exec of
+/// the entrypoint runs the constructor again, so without this each one
+/// would add the prefix once more. A live value that already starts and
+/// ends with what surrounds the reference has had it applied.
+unsafe fn already_applied(key: *const u8, src: *const u8, n: usize, root: *const u8) -> bool {
+    let key_len = slen(key);
+    let mut i = 0usize;
+    while i + 1 < n {
+        if *src.add(i) != b'$' || *src.add(i + 1) != b'{' {
+            i += 1;
+            continue;
+        }
+        let mut close = i + 2;
+        while close < n && *src.add(close) != b'}' {
+            close += 1;
+        }
+        if close >= n {
+            return false;
+        }
+        let mut name_end = i + 2;
+        while name_end + 1 < close && !(*src.add(name_end) == b':' && *src.add(name_end + 1) == b'-')
+        {
+            name_end += 1;
+        }
+        if name_end + 1 >= close {
+            name_end = close;
+        }
+        if name_end - (i + 2) == key_len && bytes_eq(src.add(i + 2), key, key_len) {
+            return wraps_current(key, src, i, src.add(close + 1), n - close - 1, root);
+        }
+        i = close + 1;
+    }
+    false
+}
+
+/// Whether the live value of `key` starts with the expansion of
+/// `before[..before_n]` and ends with that of `after[..after_n]`.
+unsafe fn wraps_current(
+    key: *const u8,
+    before: *const u8,
+    before_n: usize,
+    after: *const u8,
+    after_n: usize,
+    root: *const u8,
+) -> bool {
+    let current = getenv(key);
+    if current.is_null() || *current == 0 {
+        return false;
+    }
+    let mut prefix = [0u8; 4096];
+    let mut suffix = [0u8; 4096];
+    if !expand(prefix.as_mut_ptr(), prefix.len(), before, before_n, root)
+        || !expand(suffix.as_mut_ptr(), suffix.len(), after, after_n, root)
+    {
+        return false;
+    }
+    let (cl, pl, sl) = (slen(current), slen(prefix.as_ptr()), slen(suffix.as_ptr()));
+    cl >= pl + sl
+        && bytes_eq(current, prefix.as_ptr(), pl)
+        && bytes_eq(current.add(cl - sl), suffix.as_ptr(), sl)
 }
 
 unsafe fn apply_preload() {

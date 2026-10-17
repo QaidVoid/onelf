@@ -14,10 +14,13 @@
 //! then behaves as it did before, which is to say it may fail, and the
 //! reason is on the terminal.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rustix::mount::{MountFlags, MountPropagationFlags, mount, mount_bind, mount_change};
+use rustix::mount::{
+    MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind, mount_change, unmount,
+};
 
 /// Where the packer records the pairs, one `ABSOLUTE<tab>RELATIVE` per line.
 pub const PATHS_FILE: &str = ".onelf/paths";
@@ -70,14 +73,48 @@ pub fn apply(pkg_root: &Path) -> bool {
         return false;
     }
     let mut mounted = 0;
+    // Targets that do not exist, by the directory they are to appear in.
+    let mut absent: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
     for (target, rel) in &wanted {
         let source = pkg_root.join(rel);
         if !source.is_dir() {
             continue;
         }
-        match place(&source, target) {
-            Ok(()) => mounted += 1,
-            Err(e) => eprintln!("onelf-rt: {}: {e}", target.display()),
+        if target.is_dir() {
+            match mount_bind(&source, target) {
+                Ok(()) => mounted += 1,
+                Err(e) => eprintln!(
+                    "onelf-rt: {}: binding {}: {e}",
+                    target.display(),
+                    source.display()
+                ),
+            }
+            continue;
+        }
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+            eprintln!(
+                "onelf-rt: {}: no parent to place it under",
+                target.display()
+            );
+            continue;
+        };
+        if !parent.is_dir() {
+            eprintln!(
+                "onelf-rt: {}: {} does not exist either",
+                target.display(),
+                parent.display()
+            );
+            continue;
+        }
+        absent
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push((PathBuf::from(name), source));
+    }
+    if !absent.is_empty() {
+        match add_names(&absent) {
+            Ok(added) => mounted += added,
+            Err(e) => eprintln!("onelf-rt: {e}"),
         }
     }
     mounted > 0
@@ -97,70 +134,78 @@ fn enter() -> io::Result<()> {
     Ok(())
 }
 
-/// Bind `source` over `target`, or, where the target does not exist,
-/// lay the bundle's directory over the target's parent so the name
-/// appears there.
-fn place(source: &Path, target: &Path) -> io::Result<()> {
-    if target.is_dir() {
-        return mount_bind(source, target)
-            .map_err(|e| io::Error::other(format!("binding {}: {e}", source.display())));
-    }
-    let Some(parent) = target.parent() else {
-        return Err(io::Error::other("no parent to place it under"));
-    };
-    if !parent.is_dir() {
-        return Err(io::Error::other(format!(
-            "{} does not exist either",
-            parent.display()
-        )));
-    }
-    // The target is absent, so there is nothing to bind onto. An overlay
-    // of the bundle's directory over the parent adds the name without
-    // hiding what the parent already holds.
-    let Some(name) = target.file_name() else {
-        return Err(io::Error::other("no name to add"));
-    };
-    let staging = staging_dir(name, source)?;
-    let options = format!("lowerdir={}:{}", staging.display(), parent.display());
-    let options = std::ffi::CString::new(options)
-        .map_err(|_| io::Error::other("a path with a nul byte in it"))?;
-    mount(
-        "overlay",
-        parent,
-        "overlay",
-        MountFlags::RDONLY,
-        Some(options.as_c_str()),
-    )
-    .map_err(|e| {
-        io::Error::other(format!(
-            "laying {} over {}: {e}",
-            source.display(),
-            parent.display()
-        ))
-    })
-}
-
-/// A directory holding one symlink, named as the target is, pointing at
-/// the bundle's copy. Used as the upper layer of the overlay, so only
-/// that one name is added to the parent.
-fn staging_dir(name: &std::ffi::OsStr, source: &Path) -> io::Result<PathBuf> {
+/// Make each name appear in its parent directory, pointing at the
+/// bundle's directory, and return how many did.
+///
+/// There is nothing to bind onto, so each parent gets one overlay: a
+/// staging directory holding a symlink per name, laid over the parent so
+/// the names are added without hiding what the parent already holds.
+/// One overlay per parent rather than per name, since the kernel refuses
+/// to stack overlays deeper than two, and the root of a container often
+/// is one already.
+///
+/// The staging lives on a tmpfs mounted for the purpose. An overlay keeps
+/// its own reference to every layer, so once the overlays are in place
+/// the tmpfs is detached and its mountpoint removed: nothing is left on
+/// disk, and it goes away with the namespace.
+fn add_names(absent: &BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>>) -> io::Result<usize> {
     // Under the 0700 per-uid base: a shared /tmp name keyed only on the
-    // pid is predictable across users, and the symlink becomes an overlay
+    // pid is predictable across users, and the symlinks become an overlay
     // lowerdir the kernel resolves at mount time. No `onelf-` prefix, so
     // the mountpoint sweep leaves it alone.
     let base = crate::paths::private_dir()
         .ok_or_else(|| io::Error::other("no private runtime directory for overlay staging"))?;
-    let dir = base
-        .join(format!(
-            "paths-{}",
-            rustix::process::getpid().as_raw_nonzero()
-        ))
-        .join(name);
-    std::fs::create_dir_all(&dir)?;
-    let link = dir.join(name);
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(source, &link)?;
-    Ok(dir)
+    let staging = base.join(format!(
+        "paths-{}",
+        rustix::process::getpid().as_raw_nonzero()
+    ));
+    std::fs::create_dir_all(&staging)?;
+    let added = mount(
+        "tmpfs",
+        &staging,
+        "tmpfs",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        Some(c"size=1m,mode=0700"),
+    )
+    .map_err(|e| io::Error::other(format!("staging tmpfs: {e}")))
+    .map(|()| lay_overlays(&staging, absent));
+    let _ = unmount(&staging, UnmountFlags::DETACH);
+    let _ = std::fs::remove_dir(&staging);
+    added
+}
+
+/// The overlays of [`add_names`], staged under `staging`.
+fn lay_overlays(staging: &Path, absent: &BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>>) -> usize {
+    let mut added = 0;
+    for (i, (parent, names)) in absent.iter().enumerate() {
+        let layer = staging.join(i.to_string());
+        let staged = std::fs::create_dir(&layer).and_then(|()| {
+            names
+                .iter()
+                .try_for_each(|(name, source)| std::os::unix::fs::symlink(source, layer.join(name)))
+        });
+        let laid = staged.map_err(|e| e.to_string()).and_then(|()| {
+            let options = format!("lowerdir={}:{}", layer.display(), parent.display());
+            let options = std::ffi::CString::new(options)
+                .map_err(|_| "a path with a nul byte in it".to_string())?;
+            mount(
+                "overlay",
+                parent,
+                "overlay",
+                MountFlags::RDONLY,
+                Some(options.as_c_str()),
+            )
+            .map_err(|e| e.to_string())
+        });
+        match laid {
+            Ok(()) => added += names.len(),
+            Err(e) => eprintln!(
+                "onelf-rt: laying the bundle's directories over {}: {e}",
+                parent.display()
+            ),
+        }
+    }
+    added
 }
 
 #[cfg(test)]

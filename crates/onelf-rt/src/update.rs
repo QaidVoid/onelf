@@ -229,6 +229,29 @@ fn sibling_path(self_path: &Path, suffix: &str) -> PathBuf {
     self_path.with_file_name(name)
 }
 
+/// Copy `self_path` to `prev_path` as the rollback point.
+///
+/// The name is predictable, so in a directory other users can write
+/// something may already sit there, a symlink to a file of ours among
+/// them. The copy is made in a staging file claimed the way an update's
+/// is and renamed over the name, which replaces whatever was there
+/// rather than writing through it.
+fn save_rollback(self_path: &Path, prev_path: &Path) -> io::Result<()> {
+    let tmp = staged_path(self_path)?;
+    let copied = (|| {
+        let mut out = claim_staging(&tmp)?;
+        io::copy(&mut std::fs::File::open(self_path)?, &mut out)?;
+        let mode = std::fs::metadata(self_path)?.permissions().mode();
+        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        out.sync_all()?;
+        std::fs::rename(&tmp, prev_path)
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    copied
+}
+
 /// The `.onelf/update-revision` entry of a packaged binary, if any.
 fn staged_revision(path: &Path) -> Option<u64> {
     let mut pkg = crate::loader::load_from(path).ok()?;
@@ -239,12 +262,20 @@ fn staged_revision(path: &Path) -> Option<u64> {
 }
 
 /// Pure freshness decision: a signed package may only replace a running
-/// binary of strictly lower revision. When either side carries no
-/// revision, fall back to the SHA1 freshness check done by the caller.
+/// binary of strictly lower revision. A running binary without a revision
+/// falls back to the SHA1 freshness check done by the caller. One that
+/// carries a revision refuses a package without one, since every release
+/// signed before revisions existed would otherwise roll it back.
 fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(), String> {
     let (current, downloaded) = match (current, downloaded) {
         (Some(c), Some(d)) => (c, d),
-        _ => return Ok(()),
+        (Some(c), None) => {
+            return Err(format!(
+                "the downloaded package carries no revision and the running one is at \
+                 revision {c}; refusing what may be an older release"
+            ));
+        }
+        (None, _) => return Ok(()),
     };
     if downloaded <= current {
         Err(format!(
@@ -331,10 +362,12 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
         return 2;
     }
 
-    // The revision, when both packages carry one, is the freshness gate:
-    // it lives inside the package, so the signature just checked covers
-    // it, and a rolled-back build cannot talk a client into installing
-    // itself again. Packages without one keep the SHA1 freshness check.
+    // The revision is the freshness gate once the running package carries
+    // one: it lives inside the package, so the signature just checked
+    // covers it, and a rolled-back build cannot talk a client into
+    // installing itself again. A package with no revision, or one that
+    // cannot be read, counts as revisionless and is refused. A running
+    // package without one keeps the SHA1 freshness check.
     let downloaded_revision = staged_revision(&tmp_path);
     if let Err(why) = revision_permits(current_revision, downloaded_revision) {
         eprintln!("onelf-rt: refusing update: {why}");
@@ -354,7 +387,7 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
     // install and forced to the disk. A failed install leaves it in
     // place for recovery.
     let prev_path = sibling_path(self_path, ".onelf-prev");
-    if let Err(e) = std::fs::copy(self_path, &prev_path).and_then(|_| fsync_path(&prev_path)) {
+    if let Err(e) = save_rollback(self_path, &prev_path) {
         eprintln!(
             "onelf-rt: warning: cannot save rollback copy {}: {e}",
             prev_path.display()
@@ -462,7 +495,7 @@ pub fn self_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod staging_tests {
-    use super::{claim_staging, fsync_path, staged_path};
+    use super::{claim_staging, fsync_path, save_rollback, staged_path};
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -511,6 +544,25 @@ mod staging_tests {
         // file there, an existing path is never written through.
         assert!(claim_staging(&link).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_planted_symlink_at_the_rollback_name_is_replaced_not_followed() {
+        let dir = scratch("rollback");
+        let self_path = dir.join("app");
+        std::fs::write(&self_path, b"the running binary").unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let prev = dir.join("app.onelf-prev");
+        std::os::unix::fs::symlink(&victim, &prev).unwrap();
+
+        save_rollback(&self_path, &prev).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert!(!prev.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&prev).unwrap(), b"the running binary");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -607,11 +659,13 @@ mod tests {
         assert!(revision_permits(Some(7), Some(6)).is_err());
         // Strictly newer is allowed.
         assert!(revision_permits(Some(7), Some(8)).is_ok());
-        // A revision on either side missing falls back to the SHA1
+        // A running package without a revision falls back to the SHA1
         // freshness check, i.e. no extra veto here.
         assert!(revision_permits(None, Some(3)).is_ok());
-        assert!(revision_permits(Some(3), None).is_ok());
         assert!(revision_permits(None, None).is_ok());
+        // Once the running package carries one, a package without one is
+        // refused: it may be any release signed before revisions existed.
+        assert!(revision_permits(Some(3), None).is_err());
     }
 
     #[test]

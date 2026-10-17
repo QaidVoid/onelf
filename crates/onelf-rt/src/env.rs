@@ -62,6 +62,12 @@ pub fn setup_env(
         env::set_var("ONELF_ENTRYPOINT", entrypoint_name);
         env::set_var("ONELF_LAUNCH_DIR", &launch_dir);
         env::set_var("ONELF_ACTIVE_MODE", mode);
+        // Inherited from a packed app that runs under the host loader and
+        // launched this one. Its loader is the answer to that package's
+        // resolver, not this one's, and a bootstrapped binary of this
+        // package would follow it. The host loader path sets it again on
+        // the one command that needs it.
+        env::remove_var("ONELF_INTERP");
     }
 
     if onelf_dir.is_empty() {
@@ -608,8 +614,10 @@ fn expand_env_value(val: &str, onelf_dir: &str) -> String {
 /// DT_NEEDED of the entrypoint), which re-applies the same `.onelf/env`
 /// on every exec including after a sandboxed `clearenv()`. The two are
 /// intentionally redundant: when the constructor is present they set
-/// identical `KEY=VALUE` pairs (order-independent, last-writer-wins), so
-/// double application is a no-op. This runtime pass is still required
+/// identical `KEY=VALUE` pairs (order-independent, last-writer-wins), and
+/// a value that refers to its own variable is left alone once applied
+/// (see [`already_applied`]), so double application is a no-op. This
+/// runtime pass is still required
 /// for packages where the constructor could not be wired (patchelf
 /// unavailable at pack time, no onelf-env blob for the target arch, or
 /// self-extract binaries that can't take a DT_NEEDED).
@@ -623,10 +631,52 @@ pub fn apply_custom_env(env_data: &[u8], onelf_dir: &str) {
             continue;
         }
         if let Some((key, val)) = line.split_once('=') {
-            let expanded = expand_env_value(val.trim(), onelf_dir);
-            set_var_checked(key.trim(), &expanded);
+            let (key, val) = (key.trim(), val.trim());
+            if already_applied(key, val, onelf_dir) {
+                continue;
+            }
+            set_var_checked(key, &expand_env_value(val, onelf_dir));
         }
     }
+}
+
+/// Whether `key` already holds what `val` wraps around its own `${key}`.
+///
+/// A value such as the default `${ONELF_DIR}/bin:${PATH}` refers to the
+/// variable it sets. Applied again, by the `onelf-env` constructor after
+/// this pass or by a nested launch of the package, it would add its
+/// prefix once more each time. A live value that already starts and ends
+/// with what surrounds the reference has had it applied.
+fn already_applied(key: &str, val: &str, onelf_dir: &str) -> bool {
+    let Some((before, after)) = split_at_self_reference(key, val) else {
+        return false;
+    };
+    let current = env::var(key).unwrap_or_default();
+    if current.is_empty() {
+        return false;
+    }
+    let (prefix, suffix) = (
+        expand_env_value(before, onelf_dir),
+        expand_env_value(after, onelf_dir),
+    );
+    current.len() >= prefix.len() + suffix.len()
+        && current.starts_with(&prefix)
+        && current.ends_with(&suffix)
+}
+
+/// `val` split around its first `${key}` or `${key:-word}`.
+fn split_at_self_reference<'a>(key: &str, val: &'a str) -> Option<(&'a str, &'a str)> {
+    let mut from = 0;
+    while let Some(at) = val[from..].find("${").map(|i| from + i) {
+        let end = at + 2 + val[at + 2..].find('}')?;
+        let token = &val[at + 2..end];
+        let name = token.split_once(":-").map_or(token, |(name, _)| name);
+        if name == key {
+            return Some((&val[..at], &val[end + 1..]));
+        }
+        from = end + 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -681,6 +731,35 @@ mod expand_value_tests {
 }
 
 #[cfg(test)]
+mod apply_custom_env_tests {
+    use super::apply_custom_env;
+
+    /// The runtime applies `.onelf/env` and the constructor applies it
+    /// again in the entrypoint, so a value naming its own variable has to
+    /// come out the same however many times it is applied.
+    #[test]
+    fn a_self_referential_value_is_applied_once() {
+        unsafe { std::env::set_var("ONELF_T_SELF_a1", "/usr/bin") };
+        let data = b"ONELF_T_SELF_a1=${ONELF_DIR}/bin:${ONELF_T_SELF_a1:-/bin}\n";
+        apply_custom_env(data, "/R");
+        apply_custom_env(data, "/R");
+        assert_eq!(
+            std::env::var("ONELF_T_SELF_a1").as_deref(),
+            Ok("/R/bin:/usr/bin")
+        );
+
+        unsafe { std::env::remove_var("ONELF_T_SELF_b2") };
+        let data = b"ONELF_T_SELF_b2=${ONELF_T_SELF_b2:-/bin}:/R/extra\n";
+        apply_custom_env(data, "/R");
+        apply_custom_env(data, "/R");
+        assert_eq!(
+            std::env::var("ONELF_T_SELF_b2").as_deref(),
+            Ok("/bin:/R/extra")
+        );
+    }
+}
+
+#[cfg(test)]
 mod set_var_tests {
     use super::*;
 
@@ -712,6 +791,16 @@ mod setup_env_tests {
             &[],
             &[],
         )
+    }
+
+    /// A packed app launched from one that runs under the host loader
+    /// inherits that loader's `ONELF_INTERP`, which its own bootstrapped
+    /// binaries would otherwise follow whatever its own resolver decided.
+    #[test]
+    fn an_inherited_interp_override_is_dropped() {
+        unsafe { env::set_var("ONELF_INTERP", "/other/package/ld-linux-x86-64.so.2") };
+        call("/nonexistent/target");
+        assert!(env::var_os("ONELF_INTERP").is_none());
     }
 
     #[test]

@@ -161,7 +161,9 @@ fn exec_from_mount(
         args,
         interp_data,
         env_data,
-        private_ns: true,
+        // Another instance's mount is only reachable from here when that
+        // instance mounted it through fusermount3, in the host namespace.
+        private_ns: false,
         tree_writable: false,
     })
 }
@@ -171,45 +173,58 @@ fn exec_from_mount(
 /// The death pipe cannot answer this. A process that daemonizes closes every
 /// descriptor it inherited, so the pipe hangs up while the process is very
 /// much alive and still reading from the mount. `/proc` is the only remaining
-/// witness: a process launched from the package has its executable, and often
-/// its working directory, inside the mount.
-///
-/// Only processes in this PID namespace are visible, which is exactly the set
-/// that could be using a mount private to it. A `/proc` that cannot be read
-/// reports "not in use", leaving the previous teardown behaviour in place
-/// rather than holding a mount forever on a guess.
+/// witness, read by [`tree_in_use`].
 pub(crate) fn mount_in_use(mountpoint: &Path) -> bool {
     // A forced unmount (`fusermount3 -u -z`) leaves the directory, and any
     // process still sitting in it, in place: the path prefix matches even
     // though nothing is mounted there any more, and this scan would then
     // hold the dead mount open forever. Only a live mount has users.
-    if !is_live_mount(mountpoint) {
-        return false;
-    }
+    is_live_mount(mountpoint) && tree_in_use(mountpoint)
+}
+
+/// Whether any process other than this one runs out of the directory `dir`,
+/// whether or not anything is mounted there.
+///
+/// A process launched from the package has its executable, and often its
+/// working directory, inside it. One started by userland exec or under a
+/// loader has neither: its executable is the packed file or the loader.
+/// The files it has mapped from `dir` still give it away, so the maps are
+/// read once the cheaper links have found nobody.
+///
+/// Only processes in this PID namespace are visible, which is exactly the set
+/// that could be using a mount private to it. A `/proc` that cannot be read
+/// reports "not in use", leaving the previous teardown behaviour in place
+/// rather than holding a mount forever on a guess.
+pub(crate) fn tree_in_use(dir: &Path) -> bool {
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
     };
-    for entry in entries.filter_map(Result::ok) {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let proc_dir = entry.path();
-        // Unreadable links belong to other users' processes, which cannot be
-        // running out of a mount private to this namespace.
-        for link in ["exe", "cwd", "root"] {
-            if let Ok(target) = std::fs::read_link(proc_dir.join(link))
-                && target.starts_with(mountpoint)
-            {
-                return true;
-            }
-        }
-    }
-    false
+    let others: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some_and(|pid| pid != me)
+        })
+        .map(|e| e.path())
+        .collect();
+    // Unreadable links and maps belong to other users' processes, which
+    // cannot be running out of a directory private to this one.
+    let linked = |proc_dir: &std::path::PathBuf| {
+        ["exe", "cwd", "root"].iter().any(|link| {
+            std::fs::read_link(proc_dir.join(link)).is_ok_and(|target| target.starts_with(dir))
+        })
+    };
+    let mapped = |proc_dir: &std::path::PathBuf| {
+        std::fs::read_to_string(proc_dir.join("maps")).is_ok_and(|maps| {
+            maps.lines()
+                .filter_map(|line| line.find('/').map(|at| &line[at..]))
+                .any(|path| Path::new(path).starts_with(dir))
+        })
+    };
+    others.iter().any(linked) || others.iter().any(mapped)
 }
 
 /// Whether `mountpoint` is still an actual mount.
@@ -229,13 +244,13 @@ fn is_live_mount(mountpoint: &Path) -> bool {
         .any(|l| l.split_whitespace().nth(1) == Some(mp.as_ref()))
 }
 
-fn cleanup_mountpoint(mountpoint: &Path, used_namespace: bool) {
+fn cleanup_mountpoint(claim: crate::paths::Mountpoint, used_namespace: bool) {
     if used_namespace {
-        mount::fuse_unmount_direct(mountpoint);
+        mount::fuse_unmount_direct(claim.path());
     } else {
-        mount::fuse_unmount(mountpoint);
+        mount::fuse_unmount(claim.path());
     }
-    let _ = std::fs::remove_dir(mountpoint);
+    claim.release();
 }
 
 /// Execute the package via FUSE mount.
@@ -328,14 +343,14 @@ pub fn execute_fuse(
                     eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
                     eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
                 }
-                let _ = std::fs::remove_dir(&mountpoint);
+                claim.release();
                 return false;
             }
             match mount::fuse_mount(&mountpoint) {
                 Ok(fd) => (fd, false),
                 Err(e) => {
                     eprintln!("onelf-rt: fuse: mount failed: {e}");
-                    let _ = std::fs::remove_dir(&mountpoint);
+                    claim.release();
                     return false;
                 }
             }
@@ -358,7 +373,7 @@ pub fn execute_fuse(
     let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
         Ok(p) => p,
         Err(_) => {
-            cleanup_mountpoint(&mountpoint, used_namespace);
+            cleanup_mountpoint(claim, used_namespace);
             return false;
         }
     };
@@ -382,7 +397,7 @@ pub fn execute_fuse(
                 args,
                 interp_data,
                 env_data,
-                private_ns: true,
+                private_ns: used_namespace,
                 tree_writable: false,
             })
         }
@@ -448,14 +463,14 @@ pub fn execute_fuse(
                             Ok(None) => continue,
                             Err(rustix::io::Errno::INTR) => continue,
                             Err(_) => {
-                                cleanup_mountpoint(&mountpoint, used_namespace);
+                                cleanup_mountpoint(claim, used_namespace);
                                 std::process::exit(1);
                             }
                         },
                     },
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(_) => {
-                        cleanup_mountpoint(&mountpoint, used_namespace);
+                        cleanup_mountpoint(claim, used_namespace);
                         std::process::exit(1);
                     }
                 }
@@ -508,7 +523,7 @@ pub fn execute_fuse(
                     }
                     state.serve_detached(&fuse_fd, &mut fuse_buf, || !mount_in_use(&mountpoint));
                     drop(fuse_fd);
-                    cleanup_mountpoint(&mountpoint, used_namespace);
+                    cleanup_mountpoint(claim, used_namespace);
                     std::process::exit(0);
                 }
                 Ok(Fork::ParentOf(_)) => true,
@@ -518,7 +533,7 @@ pub fn execute_fuse(
             };
             if !handed_off {
                 drop(fuse_fd);
-                cleanup_mountpoint(&mountpoint, used_namespace);
+                cleanup_mountpoint(claim, used_namespace);
             }
 
             if let Some(code) = exit_status.exit_status() {
@@ -542,7 +557,7 @@ pub fn execute_fuse(
             }
         }
         Err(e) => {
-            cleanup_mountpoint(&mountpoint, used_namespace);
+            cleanup_mountpoint(claim, used_namespace);
             eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);
         }
@@ -564,6 +579,7 @@ mod mount_in_use_tests {
         let inside = dir.join("bin");
         std::fs::create_dir_all(&inside).unwrap();
 
+        let _forking = crate::test_locks::forking();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .current_dir(&inside)
@@ -571,9 +587,48 @@ mod mount_in_use_tests {
             .expect("spawn holder");
 
         assert!(!mount_in_use(&dir), "a non-mount directory has no users");
+        assert!(
+            super::tree_in_use(&dir),
+            "the directory itself still has a user"
+        );
 
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process run under a loader names the loader as its executable
+    /// and may sit anywhere, so only its maps show it running from the
+    /// tree. A daemon started that way lost its mount a second after the
+    /// foreground exited.
+    #[test]
+    fn a_process_mapping_a_file_from_the_tree_is_a_user() {
+        let program = std::path::Path::new("/bin/sleep");
+        let Some(loader) = crate::interp::read_elf_interp(program) else {
+            return; // a static sleep has no loader to be run under
+        };
+        let dir = std::env::temp_dir().join(format!("onelf-maps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("sleep");
+        std::fs::copy(program, &copy).unwrap();
+
+        let _forking = crate::test_locks::forking();
+        let mut child = std::process::Command::new(&loader)
+            .arg(&copy)
+            .arg("30")
+            .spawn()
+            .expect("spawn under the loader");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = false;
+        while !seen && std::time::Instant::now() < deadline {
+            seen = super::tree_in_use(&dir);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen, "{loader} running {} uses the tree", copy.display());
     }
 }

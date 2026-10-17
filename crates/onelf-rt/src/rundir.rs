@@ -38,7 +38,7 @@ pub fn execute_rundir(
     // everything it forks, so a concurrent launch never sweeps a tree in
     // use. Once every holder is gone the sweep removes what is left.
     let claim =
-        match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
+        match crate::paths::create_launch_dir(pkg.manifest.name(), &pkg.manifest.header.package_id)
         {
             Some(m) => m,
             None => return false,
@@ -129,7 +129,11 @@ pub fn execute_rundir(
                     Ok(Fork::Child(_)) => {
                         let _ = rustix::process::setsid();
                         detach_stdio();
-                        while !tree_quiet(&pipe_read, &tree, 500) {}
+                        while !tree_quiet(&pipe_read, &tree, 500) {
+                            // A pipe that has hung up no longer makes the
+                            // poll wait, so the pause has to come from here.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
                         remove_tree(&tree);
                         std::process::exit(0);
                     }
@@ -157,6 +161,10 @@ pub fn execute_rundir(
 /// Whether nothing is using the tree any more: every holder of the death
 /// pipe's write end has gone, and no process in this namespace runs out
 /// of it. Waits up to `timeout_ms` for the pipe.
+///
+/// The tree is a plain directory, so the scan is the one for any
+/// directory and not the one for a mount, which finds no users at all
+/// where nothing is mounted.
 fn tree_quiet(pipe_read: &rustix::fd::OwnedFd, tree: &Path, timeout_ms: u32) -> bool {
     let mut fds = [PollFd::new(pipe_read, PollFlags::IN)];
     let timeout = rustix::event::Timespec {
@@ -167,7 +175,7 @@ fn tree_quiet(pipe_read: &rustix::fd::OwnedFd, tree: &Path, timeout_ms: u32) -> 
         Ok(_) => fds[0].revents().contains(PollFlags::HUP),
         Err(_) => false,
     };
-    hung_up && !crate::fuse::mount_in_use(tree)
+    hung_up && !crate::fuse::tree_in_use(tree)
 }
 
 /// Bytes available to this user on the filesystem holding `path`.
@@ -196,5 +204,40 @@ fn detach_stdio() {
         let mut slot =
             std::mem::ManuallyDrop::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(target) });
         let _ = rustix::io::dup2(&null, &mut slot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_quiet;
+
+    /// An app that daemonizes closes the death pipe and keeps running from
+    /// the tree. The tree is no mount, so asking whether a mount is in use
+    /// found nobody, and the foreground's exit removed the files under the
+    /// survivor.
+    #[test]
+    fn a_process_still_in_the_tree_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("onelf-rundir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pipe_read, pipe_write) = rustix::pipe::pipe().unwrap();
+        drop(pipe_write);
+
+        let _forking = crate::test_locks::forking();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn holder");
+        let quiet = tree_quiet(&pipe_read, &dir, 0);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!quiet, "a process runs from the tree");
+        assert!(
+            tree_quiet(&pipe_read, &dir, 0),
+            "and once it is gone, nothing does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

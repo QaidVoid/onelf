@@ -96,7 +96,7 @@ pub fn init(record: Option<&[u8]>) {
     };
     let mut out = Vec::new();
     for pin in parse(&text) {
-        match obtain(&pin) {
+        match obtain(&pin, &out) {
             Ok(o) => out.push(o),
             Err(why) => {
                 eprintln!("onelf-rt: dependency set {}: {why}", pin.label);
@@ -122,10 +122,11 @@ fn mount_wanted() -> bool {
     !matches!(std::env::var("ONELF_SET_MODE").as_deref(), Ok("extract"))
 }
 
-fn obtain(pin: &Pin) -> Result<Obtained, String> {
+/// Obtain one set. `earlier` are the sets this launch already holds.
+fn obtain(pin: &Pin, earlier: &[Obtained]) -> Result<Obtained, String> {
     let file = crate::platform::store_build(pin)?;
     if mount_wanted() {
-        match mount(&file, &pin.blake3) {
+        match mount(&file, &pin.blake3, earlier) {
             Ok(obtained) => return Ok(obtained),
             Err(why) => eprintln!(
                 "onelf-rt: dependency set {}: cannot mount ({why}); extracting instead",
@@ -138,8 +139,9 @@ fn obtain(pin: &Pin) -> Result<Obtained, String> {
 }
 
 /// Serve the build at `file` from a mountpoint named after `hash`, or
-/// join the mount another instance already serves there.
-fn mount(file: &Path, hash: &str) -> Result<Obtained, String> {
+/// join the mount another instance already serves there. `earlier` are
+/// the sets this launch already holds.
+fn mount(file: &Path, hash: &str, earlier: &[Obtained]) -> Result<Obtained, String> {
     use rustix::runtime::{Fork, kernel_fork};
 
     let (mountpoint, lock) =
@@ -191,6 +193,13 @@ fn mount(file: &Path, hash: &str) -> Result<Obtained, String> {
             // would hold it for as long as it serves.
             drop(lock);
             drop(_creating);
+            // The claims on sets obtained before this one are the
+            // launch's as well. Held here, they would keep those sets'
+            // servers up for as long as this one serves. The server never
+            // returns, so nothing closes these descriptors a second time.
+            for set in earlier {
+                unsafe { rustix::io::close(std::os::fd::AsRawFd::as_raw_fd(&set._lock)) };
+            }
             serve(file, &mountpoint);
         }
         Ok(Fork::ParentOf(child)) => {
@@ -336,6 +345,7 @@ mod tests {
 
     #[test]
     fn a_lock_file_cleaned_away_is_asked_through_the_original() {
+        let _locking = crate::test_locks::locking();
         let dir = std::env::temp_dir().join(format!("onelf-unclaimed-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

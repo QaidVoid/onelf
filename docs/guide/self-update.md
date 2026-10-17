@@ -75,7 +75,10 @@ On the CLI that is `--update-url` plus `--update-key`.
   revision out of the downloaded package and refuses to install one that
   is not strictly newer than the revision of the running binary: a
   compromised server can then offer only packages you signed, and a
-  signed-but-old package cannot roll a client back.
+  signed-but-old package cannot roll a client back. Once a release
+  carries a revision, every later one must carry one too: a client with
+  a revision refuses a package without one, since that is what every
+  release signed before revisions existed looks like.
 - ☑️ Omit the revision if the older freshness rule is what you want:
   packages without a revision install whenever the SHA1 differs, so the
   flag is optional.

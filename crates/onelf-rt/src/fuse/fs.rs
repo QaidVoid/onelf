@@ -246,18 +246,25 @@ impl TraceRecorder {
 }
 
 /// Map an AppDir-relative path back to the sysroot path the trace tier
-/// matches against: the flattened `bin/`, `lib/`, `share/` and friends
-/// regain their `usr/` prefix, everything else is already in sysroot
-/// space, and the runtime's own `.onelf/` bookkeeping is dropped.
+/// matches against, and drop the runtime's own `.onelf/` bookkeeping.
+///
+/// The sysroot copier strips `usr/` from every path under it, so any
+/// top-level directory may have come from there: `lib32/` and `libexec/`
+/// as much as `bin/` and `share/`. Only the directories a root
+/// filesystem keeps beside `usr/`, never inside it, were copied as they
+/// were and are already in sysroot space.
 fn appdir_to_sysroot(path: &str) -> Option<String> {
     if path.starts_with(".onelf") {
         return None;
     }
-    const FLATTENED: &[&str] = &["bin/", "sbin/", "lib/", "lib64/", "share/", "include/"];
-    if FLATTENED.iter().any(|p| path.starts_with(p)) {
-        Some(format!("usr/{path}"))
-    } else {
+    const BESIDE_USR: &[&str] = &[
+        "etc", "opt", "var", "srv", "boot", "home", "media", "mnt", "root", "run", "tmp",
+    ];
+    let top = path.split('/').next().unwrap_or(path);
+    if BESIDE_USR.contains(&top) {
         Some(path.to_string())
+    } else {
+        Some(format!("usr/{path}"))
     }
 }
 
@@ -1201,6 +1208,30 @@ mod tests {
 
     fn block(n: usize) -> Vec<u8> {
         vec![0u8; n]
+    }
+
+    /// The copier flattens every `usr/X/`, so every such directory has to
+    /// regain the prefix, or the trace names paths no database lists and
+    /// the trace tier prunes what the run used.
+    #[test]
+    fn a_trace_restores_usr_for_every_flattened_directory() {
+        for (appdir, sysroot) in [
+            ("bin/app", "usr/bin/app"),
+            ("lib/libfoo.so.1", "usr/lib/libfoo.so.1"),
+            ("lib32/libfoo.so.1", "usr/lib32/libfoo.so.1"),
+            ("libexec/app/helper", "usr/libexec/app/helper"),
+            ("share/app/data", "usr/share/app/data"),
+            ("etc/app.conf", "etc/app.conf"),
+            ("opt/vendor/run", "opt/vendor/run"),
+            ("var/lib/app/state", "var/lib/app/state"),
+        ] {
+            assert_eq!(
+                appdir_to_sysroot(appdir).as_deref(),
+                Some(sysroot),
+                "{appdir}"
+            );
+        }
+        assert_eq!(appdir_to_sysroot(".onelf/env"), None);
     }
 
     #[test]

@@ -91,7 +91,16 @@ pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()
             loader::read_verified_entry(&mut pkg.file, &pkg.footer, entry, pkg.dict.as_deref())
                 .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", rel.display())))?;
 
-        let mut f = fs::File::create(&out_path)?;
+        // Never through whatever already sits there: a symlink a launch
+        // put over a bundled library would carry the write to the host
+        // file it names.
+        if out_path.symlink_metadata().is_ok() {
+            fs::remove_file(&out_path)?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out_path)?;
         f.write_all(&data)?;
         f.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
     }
@@ -502,6 +511,7 @@ mod tests {
     #[test]
     fn collect_cas_respects_links_and_the_store_lock() {
         use rustix::fs::FlockOperation;
+        let _locking = crate::test_locks::locking();
 
         let base = std::env::temp_dir().join(format!("onelf-cas-gc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);

@@ -646,11 +646,14 @@ pub(crate) fn audit_unbundled_needs(
 ) -> Vec<(PathBuf, Vec<String>)> {
     use std::collections::{HashMap, HashSet};
 
+    // A name counts only when it resolves: a soname link whose target was
+    // pruned satisfies nothing the loader asks for.
     let names_in = |dir: &Path| -> HashSet<String> {
         fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| e.path().exists())
             .filter_map(|e| e.file_name().to_str().map(String::from))
             .collect()
     };
@@ -1928,6 +1931,31 @@ mod scrub_tests {
         assert_eq!(
             out,
             b"\0/XXX/ld.so.cache\0/XXX/ld.so.preload\0/XXX/XXX///\0/XXX///\0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn a_dangling_soname_link_satisfies_no_need() {
+        let tree = std::env::temp_dir().join(format!("onelf-audit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tree);
+        fs::create_dir_all(tree.join("bin")).unwrap();
+        fs::create_dir_all(tree.join("lib")).unwrap();
+        // The test binary needs libc.so.6, which is all this needs.
+        fs::copy(std::env::current_exe().unwrap(), tree.join("bin/app")).unwrap();
+        std::os::unix::fs::symlink("libc.so.6.pruned", tree.join("lib/libc.so.6")).unwrap();
+
+        let findings = audit_unbundled_needs(&tree, Path::new("lib"));
+        let _ = fs::remove_dir_all(&tree);
+        assert!(
+            findings
+                .iter()
+                .any(|(_, libs)| libs.iter().any(|l| l == "libc.so.6")),
+            "a link to nothing is reported missing: {findings:?}"
         );
     }
 }
