@@ -4948,6 +4948,27 @@ fn a_recipe_block_size_out_of_range_is_refused() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A recipe named by a bare file name builds from the current directory.
+#[test]
+fn a_recipe_named_by_a_bare_file_name_builds() {
+    let td = workdir("recipe-bare");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run.sh\"\n\n[bundle]\nskip = true\n",
+    );
+    let out = td.join("out.onelf");
+    let o = Command::new(onelf())
+        .current_dir(&app)
+        .args(["build", "onelf.toml", "-o", out.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf build");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.exists());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Recipe `${VAR}` expansion runs after the TOML is parsed, so an env value
 /// containing a quote and newline cannot inject a new recipe key. The
 /// variable is set on the child process only, never on this test process.

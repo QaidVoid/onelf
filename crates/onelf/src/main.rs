@@ -1105,6 +1105,7 @@ fn run_build(
     let recipe = recipe::load(&recipe_path)?;
     let dir = recipe_path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
