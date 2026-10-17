@@ -52,7 +52,8 @@ Entrypoints:
 
 The runtime picks the entrypoint in this order:
 
-1. `ONELF_ENTRYPOINT`, when it names an entrypoint of this package.
+1. `ONELF_ENTRYPOINT`, when it names an entrypoint of this package and
+   was not inherited from a runtime (see below).
 2. The file name of `argv[0]`, when it names an entrypoint.
 3. The default entrypoint.
 
@@ -71,9 +72,11 @@ toolkits ship many tools in one binary.
 ONELF_ENTRYPOINT=myapp-cli ./myapp.onelf   # select without a symlink
 ```
 
-⚠️ The runtime sets `ONELF_ENTRYPOINT` for the app it starts. A packed
-app that launches another package hands that name on, and it wins over
-`argv[0]` when the other package has an entrypoint of the same name.
+☑️ The runtime sets `ONELF_ENTRYPOINT` for the app it starts and records
+the same name in `ONELF_ENTRYPOINT_EXPORTED`. A package the app launches,
+or the app re-running itself through another symlink, ignores an
+`ONELF_ENTRYPOINT` equal to that record, so an inherited name never
+overrides `argv[0]`. Setting it to anything else still selects.
 
 ## Memfd eligibility per entrypoint
 

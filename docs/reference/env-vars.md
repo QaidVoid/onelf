@@ -11,11 +11,13 @@ Reference for all environment variables onelf reads or sets.
 | `ONELF_INTERP` | Set only when the host's glibc is newer than the bundled one: the host loader every bootstrapped binary in the process tree runs under. Another packed app launched from that tree drops the inherited value and decides for itself. Ignored by a set-uid, set-gid, or capability-raised executable, as glibc ignores `LD_PRELOAD` there |
 | `ONELF_ARGV0` | Original `argv[0]` before multicall resolution |
 | `ONELF_EXEC` | Absolute path to the packed binary |
-| `ONELF_ENTRYPOINT` | Resolved entrypoint name. The runtime also reads it to select an entrypoint, so it reaches another package the app launches |
+| `ONELF_ENTRYPOINT` | Resolved entrypoint name |
+| `ONELF_ENTRYPOINT_EXPORTED` | The same name, so a package the app launches ignores an inherited `ONELF_ENTRYPOINT` when it selects its own entrypoint |
 | `ONELF_LAUNCH_DIR` | Original cwd at launch time |
 
 `onelf run` sets `ONELF_DIR` (the AppDir), `ONELF_ACTIVE_MODE=dev`,
-`ONELF_ARGV0`, `ONELF_EXEC` and `ONELF_ENTRYPOINT`, but not
+`ONELF_ARGV0`, `ONELF_EXEC`, `ONELF_ENTRYPOINT` and
+`ONELF_ENTRYPOINT_EXPORTED`, but not
 `ONELF_LAUNCH_DIR`. When the recipe's `working-dir` moves the app to
 another directory, it passes the original one as `ONELF_USER_CWD`.
 
@@ -66,7 +68,7 @@ Vulkan loader's append semantics and the host's GPU drivers reachable.
 |----------|--------|
 | `ONELF_MODE` | Force a specific execution mode: `memfd`, `fuse`, `tmpfs`, `rundir` or `cache`. On failure the runtime errors instead of falling back. Read only; the mode chosen is reported as `ONELF_ACTIVE_MODE`, so a packed app that launches another does not force a mode on it. |
 | `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30; `0` disables auto-GC) |
-| `ONELF_ENTRYPOINT` | Select the entrypoint by name, ahead of `argv[0]` and the default. See [Entrypoints](../guide/entrypoints). |
+| `ONELF_ENTRYPOINT` | Select the entrypoint by name, ahead of `argv[0]` and the default, unless it equals the inherited `ONELF_ENTRYPOINT_EXPORTED`. See [Entrypoints](../guide/entrypoints). |
 | `ONELF_FUSE_NO_NAMESPACE` | Any value other than empty or `0` forces the `fusermount3` fallback path even when user namespaces are available, and keeps `[paths]` from being mounted. Useful for debugging mount visibility. |
 | `ONELF_FUSE_CACHE_BYTES` | Byte ceiling for the FUSE server's cache of decompressed blocks. Default 32 MiB; a value that does not parse or is zero keeps the default. |
 | `ONELF_CACHE` | `1` (any value other than empty or `0`) allows the persistent cache as the last execution mode for this launch. Without it, or `[package] cache = true` at pack time, the runtime stops at the runtime directory and reports failure rather than leaving an extraction on disk. |

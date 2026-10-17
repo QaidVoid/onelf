@@ -112,15 +112,22 @@ default installs `onelf-myapp-myapp-daemon.desktop` and its icon beside
 the default's files rather than over them, and `onelf unintegrate
 ./myapp-daemon` removes only those.
 
-⚠️ `--entrypoint` picks which entrypoint's files resolve, but `Exec=`
-still names the path you pass. `onelf integrate ./myapp.onelf
---entrypoint myapp-daemon` warns that `myapp.onelf` launches another
-entrypoint, and the menu entry would start that one.
+✅ Without a symlink, name the entrypoint:
 
-⚠️ `./myapp-daemon --onelf-integrate` also selects the entrypoint by
-name, but writes the resolved path of `myapp.onelf` into `Exec=`, so
-the menu entry starts the default entrypoint. Use `onelf integrate`
-through the symlink for a second entrypoint.
+```bash
+onelf integrate ./myapp.onelf --entrypoint myapp-daemon
+```
+
+`myapp.onelf` on its own starts the default entrypoint, so `Exec=`
+names the one you chose in the launch:
+
+```
+Exec=env ONELF_ENTRYPOINT=myapp-daemon /path/to/myapp.onelf %U
+```
+
+`TryExec=` stays the package path. `./myapp-daemon --onelf-integrate`
+writes the same line, since the runtime integrates from the package
+file it resolved the symlink to.
 
 ## Extract without installing
 

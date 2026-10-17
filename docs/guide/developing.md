@@ -71,8 +71,9 @@ onelf run --entrypoint myapp-daemon -- --port 8080
 
 Same as a real packed run, minus the mount:
 
-- `ONELF_DIR`, `ONELF_ACTIVE_MODE=dev`, `ONELF_ARGV0`, `ONELF_EXEC` and
-  `ONELF_ENTRYPOINT`. `ONELF_LAUNCH_DIR` is not set. When the recipe's
+- `ONELF_DIR`, `ONELF_ACTIVE_MODE=dev`, `ONELF_ARGV0`, `ONELF_EXEC`,
+  `ONELF_ENTRYPOINT` and `ONELF_ENTRYPOINT_EXPORTED`. `ONELF_LAUNCH_DIR`
+  is not set. When the recipe's
   `working-dir` moves the app away from your shell's directory, that
   directory is passed as `ONELF_USER_CWD` instead.
 - `LD_LIBRARY_PATH` prepended with the resolver's link farm and the

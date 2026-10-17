@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::desktop::{exec_arg, patch_desktop_file, string_value};
+use onelf_format::desktop::{exec_command, patch_desktop_file, string_value};
 use onelf_format::{Footer, Manifest};
 
 use crate::extract::decompress_verified;
@@ -24,6 +24,9 @@ struct IntegrationContext {
     /// The entrypoint is not the package's default, so its files are
     /// named after it as well and do not replace the default's.
     secondary: bool,
+    /// The entrypoint `Exec=` names, when the binary path alone would
+    /// start a different one.
+    exec_entrypoint: Option<String>,
 }
 
 impl IntegrationContext {
@@ -84,18 +87,9 @@ impl IntegrationContext {
             .entrypoints
             .iter()
             .position(|ep| manifest.get_string(ep.name) == ep_name);
-        if ep_index != Some(launched) {
-            eprintln!(
-                "warning: {} launches entrypoint '{}', not '{ep_name}'; integrate \
-                 through a symlink named '{ep_name}' to it instead",
-                binary.display(),
-                manifest
-                    .entrypoints
-                    .get(launched)
-                    .map(|ep| manifest.get_string(ep.name))
-                    .unwrap_or_default(),
-            );
-        }
+        // A path that would start another entrypoint names this one in
+        // the launch instead.
+        let exec_entrypoint = (ep_index != Some(launched)).then(|| ep_name.clone());
         let secondary = ep_index != Some(manifest.header.default_entrypoint as usize);
 
         let name = manifest.name();
@@ -112,6 +106,7 @@ impl IntegrationContext {
             pkg_name,
             ep_name,
             secondary,
+            exec_entrypoint,
         })
     }
 
@@ -245,9 +240,14 @@ fn install_desktop(
                     "desktop file is not valid UTF-8",
                 )
             })?;
-            patch_desktop_file(&text, exec_path, icon_name)
+            patch_desktop_file(&text, exec_path, ctx.exec_entrypoint.as_deref(), icon_name)
         }
-        None => generate_desktop_file(&ctx.pkg_name, exec_path, icon_name),
+        None => generate_desktop_file(
+            &ctx.pkg_name,
+            exec_path,
+            ctx.exec_entrypoint.as_deref(),
+            icon_name,
+        ),
     };
 
     fs::write(&dest, content.as_bytes())?;
@@ -256,8 +256,13 @@ fn install_desktop(
 }
 
 /// Generate a minimal `.desktop` file.
-fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    let quoted = exec_arg(exec_path);
+fn generate_desktop_file(
+    name: &str,
+    exec_path: &str,
+    entrypoint: Option<&str>,
+    icon_name: Option<&str>,
+) -> String {
+    let quoted = exec_command(exec_path, entrypoint);
     let mut lines = vec![
         "[Desktop Entry]".to_string(),
         "Type=Application".to_string(),
@@ -381,7 +386,7 @@ mod tests {
     #[test]
     fn patch_replaces_quoted_exec_without_fragments() {
         let desktop = "[Desktop Entry]\nType=Application\nExec=\"/opt/my app/bin\" %F\nIcon=old\n";
-        let out = patch_desktop_file(desktop, "/new/path/app", Some("newicon"));
+        let out = patch_desktop_file(desktop, "/new/path/app", None, Some("newicon"));
         // The old quoted path is gone (no leftover `app/bin"` fragment) and
         // the field code is preserved.
         assert!(out.contains("Exec=/new/path/app %F"), "got:\n{out}");
@@ -391,7 +396,7 @@ mod tests {
 
     #[test]
     fn generated_file_quotes_exec_path_with_spaces() {
-        let out = generate_desktop_file("App", "/opt/has space/app", None);
+        let out = generate_desktop_file("App", "/opt/has space/app", None, None);
         assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
         assert!(
             out.contains("TryExec=/opt/has space/app\n"),
@@ -402,7 +407,7 @@ mod tests {
     #[test]
     fn patch_quotes_exec_path_with_spaces() {
         let desktop = "[Desktop Entry]\nExec=/usr/bin/old %U\n";
-        let out = patch_desktop_file(desktop, "/opt/has space/app", None);
+        let out = patch_desktop_file(desktop, "/opt/has space/app", None, None);
         assert!(
             out.contains("Exec=\"/opt/has space/app\" %U"),
             "got:\n{out}"

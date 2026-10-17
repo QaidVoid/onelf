@@ -60,6 +60,7 @@ pub fn setup_env(
         env::set_var("ONELF_ARGV0", argv0);
         env::set_var("ONELF_EXEC", exec_path);
         env::set_var("ONELF_ENTRYPOINT", entrypoint_name);
+        env::set_var(crate::multicall::EXPORTED_VAR, entrypoint_name);
         env::set_var("ONELF_LAUNCH_DIR", &launch_dir);
         env::set_var("ONELF_ACTIVE_MODE", mode);
         // Inherited from a packed app that runs under the host loader and

@@ -27,6 +27,22 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 /// After this returns, the process has CAP_SYS_ADMIN inside the namespace
 /// and subsequent mounts are invisible to the host.
 pub fn enter_namespace() -> io::Result<()> {
+    // Entering is one-way: a launcher that unshares and then finds it may
+    // not map its ids or mount anything is stuck in a namespace where
+    // fusermount3's setuid bit means nothing and every fallback runs as
+    // the overflow uid. A child tries it first, so the launcher only
+    // commits when the whole sequence works. Ubuntu's AppArmor policy is
+    // the common case: it allows the unshare and denies what follows.
+    if !namespace_usable() {
+        return Err(io::Error::other(
+            "user namespaces are restricted on this host",
+        ));
+    }
+    unshare_and_map()
+}
+
+/// Unshare a user and mount namespace and map our ids 1:1 into it.
+fn unshare_and_map() -> io::Result<()> {
     // SAFETY: single-threaded runtime; unshare only affects this thread.
     let real_uid = rustix::process::getuid().as_raw();
     let real_gid = rustix::process::getgid().as_raw();
@@ -43,6 +59,37 @@ pub fn enter_namespace() -> io::Result<()> {
     File::create("/proc/self/gid_map")?.write_all(format!("{real_gid} {real_gid} 1").as_bytes())?;
 
     Ok(())
+}
+
+/// Whether a forked child can unshare, map its ids and mount a tmpfs.
+/// The mount lands in the child's own namespace and goes with it.
+fn namespace_usable() -> bool {
+    use rustix::runtime::{Fork, kernel_fork};
+
+    match unsafe { kernel_fork() } {
+        Ok(Fork::Child(_)) => {
+            let target = std::env::temp_dir();
+            let target = if target.is_dir() { target } else { "/".into() };
+            let ok = unshare_and_map().is_ok()
+                && mount(
+                    "tmpfs",
+                    &target,
+                    "tmpfs",
+                    MountFlags::NOSUID | MountFlags::NODEV,
+                    None,
+                )
+                .is_ok();
+            std::process::exit(if ok { 0 } else { 1 })
+        }
+        Ok(Fork::ParentOf(child)) => loop {
+            match rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty()) {
+                Ok(Some((_, status))) => return status.exit_status() == Some(0),
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => return false,
+            }
+        },
+        Err(_) => false,
+    }
 }
 
 /// Mount options for the namespace mount: `fd` plus the root dir and

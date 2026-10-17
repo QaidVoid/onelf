@@ -96,6 +96,38 @@ pub fn exec_arg_tail(value: &str) -> &str {
     &value[i..]
 }
 
+/// The `Exec=` command that launches `path`, through `entrypoint` when
+/// given. A package picks its entrypoint by the name it is run as, so an
+/// entrypoint the path would not reach is named in `ONELF_ENTRYPOINT`.
+pub fn exec_command(path: &str, entrypoint: Option<&str>) -> String {
+    match entrypoint {
+        Some(name) => format!(
+            "env {} {}",
+            exec_arg(&format!("{ENTRYPOINT_VAR}={name}")),
+            exec_arg(path)
+        ),
+        None => exec_arg(path),
+    }
+}
+
+/// The variable a desktop entry sets to launch a chosen entrypoint.
+const ENTRYPOINT_VAR: &str = "ONELF_ENTRYPOINT";
+
+/// `value` without the `env ONELF_ENTRYPOINT=...` an earlier patch wrote
+/// ahead of the binary, so re-patching replaces the binary and not `env`.
+fn without_entrypoint_prefix(value: &str) -> &str {
+    let Some(rest) = value.strip_prefix("env ") else {
+        return value;
+    };
+    let rest = rest.trim_start();
+    let token = rest.split_whitespace().next().unwrap_or_default();
+    if token.trim_start_matches('"').starts_with(ENTRYPOINT_VAR) {
+        rest[token.len()..].trim_start()
+    } else {
+        value
+    }
+}
+
 /// Patch an existing desktop file for this package's launch.
 ///
 /// `Exec=` is rewritten to launch the package binary (quoting it as the
@@ -103,7 +135,8 @@ pub fn exec_arg_tail(value: &str) -> &str {
 /// `TryExec=` gets the path with only string escaping: the spec defines
 /// it as a literal path, not an Exec field, so field-code quoting does
 /// not apply.
-/// `Icon=` becomes `icon_name` when given.
+/// `Icon=` becomes `icon_name` when given. `entrypoint` is passed to
+/// [`exec_command`].
 ///
 /// Only `[Desktop Entry]` is touched. A desktop file may carry further
 /// groups (`[Desktop Action ...]`) with `Exec=` lines of their own, and
@@ -111,8 +144,13 @@ pub fn exec_arg_tail(value: &str) -> &str {
 /// group gets. Missing keys are inserted right after the
 /// `[Desktop Entry]` header, so they land in that group even when it is
 /// not the last one.
-pub fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    let quoted = exec_arg(exec_path);
+pub fn patch_desktop_file(
+    content: &str,
+    exec_path: &str,
+    entrypoint: Option<&str>,
+    icon_name: Option<&str>,
+) -> String {
+    let quoted = exec_command(exec_path, entrypoint);
     let try_exec = string_value(exec_path);
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let mut has_exec = false;
@@ -131,7 +169,7 @@ pub fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str
         if line.starts_with("Exec=") {
             // Replace the executable (the first argument), keeping the
             // rest of the command line verbatim.
-            let tail = exec_arg_tail(&line[5..]);
+            let tail = exec_arg_tail(without_entrypoint_prefix(&line[5..]));
             if tail.is_empty() {
                 *line = format!("Exec={quoted}");
             } else {
@@ -213,7 +251,7 @@ mod tests {
 
     #[test]
     fn tryexec_is_string_escaped() {
-        let out = patch_desktop_file("[Desktop Entry]\n", r"/opt/a\b/app", None);
+        let out = patch_desktop_file("[Desktop Entry]\n", r"/opt/a\b/app", None, None);
         assert!(out.contains(r"TryExec=/opt/a\\b/app"), "{out}");
         assert!(out.contains(r#"Exec="/opt/a\\\\b/app""#), "{out}");
     }
@@ -221,7 +259,7 @@ mod tests {
     #[test]
     fn patch_replaces_exec_keeps_tail_and_icon() {
         let desktop = "[Desktop Entry]\nType=Application\nExec=\"/opt/my app/bin\" %F\nIcon=old\n";
-        let out = patch_desktop_file(desktop, "/new/path/app", Some("newicon"));
+        let out = patch_desktop_file(desktop, "/new/path/app", None, Some("newicon"));
         assert!(out.contains("Exec=/new/path/app %F"), "got:\n{out}");
         assert!(!out.contains("app/bin"), "stale path fragment left:\n{out}");
         assert!(out.contains("Icon=newicon"));
@@ -230,7 +268,7 @@ mod tests {
     #[test]
     fn a_spaced_path_is_quoted_in_exec_and_literal_in_tryexec() {
         let desktop = "[Desktop Entry]\nExec=/usr/bin/old\nTryExec=/usr/bin/old\n";
-        let out = patch_desktop_file(desktop, "/opt/has space/app", None);
+        let out = patch_desktop_file(desktop, "/opt/has space/app", None, None);
         assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
         assert!(
             out.contains("TryExec=/opt/has space/app\n"),
@@ -245,7 +283,7 @@ mod tests {
         // entry group, not at EOF inside the action.
         let desktop = "[Desktop Entry]\nType=Application\nName=App\n\
                       [Desktop Action new-window]\nExec=/opt/old/app --new\n";
-        let out = patch_desktop_file(desktop, "/opt/new/app", None);
+        let out = patch_desktop_file(desktop, "/opt/new/app", None, None);
         let entry_end = out.find("[Desktop Action").unwrap();
         let entry = &out[..entry_end];
         let action = &out[entry_end..];
@@ -261,5 +299,26 @@ mod tests {
             action.contains("Exec=/opt/old/app --new"),
             "the action's own Exec survives: {out}"
         );
+    }
+
+    #[test]
+    fn a_chosen_entrypoint_is_named_in_the_launch() {
+        let desktop = "[Desktop Entry]\nName=App\nExec=old %U\n";
+        let out = patch_desktop_file(desktop, "/opt/app.onelf", Some("daemon"), None);
+        assert!(
+            out.contains("Exec=env ONELF_ENTRYPOINT=daemon /opt/app.onelf %U"),
+            "{out}"
+        );
+        assert!(out.contains("TryExec=/opt/app.onelf"), "{out}");
+
+        // Patching again, as a moved package does, replaces the binary
+        // after the prefix and keeps the field codes.
+        let again = patch_desktop_file(&out, "/new/app.onelf", Some("daemon"), None);
+        assert!(
+            again.contains("Exec=env ONELF_ENTRYPOINT=daemon /new/app.onelf %U"),
+            "{again}"
+        );
+        let plain = patch_desktop_file(&out, "/new/app.onelf", None, None);
+        assert!(plain.contains("Exec=/new/app.onelf %U"), "{plain}");
     }
 }

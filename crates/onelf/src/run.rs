@@ -173,6 +173,7 @@ pub fn run(
     cmd.env("ONELF_ARGV0", &ep_name);
     cmd.env("ONELF_EXEC", &target);
     cmd.env("ONELF_ENTRYPOINT", &ep_name);
+    cmd.env("ONELF_ENTRYPOINT_EXPORTED", &ep_name);
 
     if !lib_paths_str.is_empty() {
         // Only set LD_LIBRARY_PATH for ELF targets. When the entrypoint

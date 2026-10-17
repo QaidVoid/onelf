@@ -230,9 +230,9 @@ the package has no bundled desktop file, a minimal one is generated.
 |------|-------------|
 | `--entrypoint` | Entrypoint whose icon and desktop file to install (default: the one `BINARY` launches) |
 
-`Exec=` names `BINARY` itself, so to integrate a second entrypoint pass
-its symlink as `BINARY` rather than `--entrypoint`. Naming an entrypoint
-that `BINARY` does not launch only warns. See
+`Exec=` names `BINARY`. When `--entrypoint` names one that `BINARY` would
+not start on its own, `Exec=` runs it as
+`env ONELF_ENTRYPOINT=<name> BINARY`. See
 [Desktop Integration](../guide/desktop#selecting-an-entrypoint).
 
 ## `onelf unintegrate`

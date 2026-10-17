@@ -28,6 +28,7 @@ The rules this page encodes:
 | `ONELF_ARGV0` | Original argv[0] | `myapp` |
 | `ONELF_EXEC` | Path to the packed binary | `/home/alice/bin/myapp.onelf` |
 | `ONELF_ENTRYPOINT` | Active entrypoint name | `myapp-daemon` |
+| `ONELF_ENTRYPOINT_EXPORTED` | The same name, so a launched package ignores it | `myapp-daemon` |
 | `ONELF_LAUNCH_DIR` | Caller's original cwd | `/home/alice/project` |
 | `ONELF_LIB_PATH` | The library search path below, for script entrypoints | `/run/user/1000/onelf-myapp-ab12cd34/lib` |
 

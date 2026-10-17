@@ -95,8 +95,13 @@ fn remove_icons(hicolor: &Path, int_name: &str) {
     }
 }
 
-fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -> String {
-    let quoted = onelf_format::desktop::exec_arg(exec_path);
+fn generate_desktop_file(
+    name: &str,
+    exec_path: &str,
+    entrypoint: Option<&str>,
+    icon_name: Option<&str>,
+) -> String {
+    let quoted = onelf_format::desktop::exec_command(exec_path, entrypoint);
     let mut lines = vec![
         "[Desktop Entry]".to_string(),
         "Type=Application".to_string(),
@@ -122,6 +127,26 @@ fn update_desktop_database(data_home: &Path) {
 }
 
 fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
+    // The runtime is integrated from the resolved package file, whose name
+    // starts the default entrypoint or the one it is named after. Any
+    // other entrypoint is named in the launch.
+    let launched = Path::new(exec_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| {
+            pkg.manifest
+                .entrypoints
+                .iter()
+                .any(|ep| pkg.manifest.get_string(ep.name) == *n)
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            pkg.manifest
+                .entrypoints
+                .get(pkg.manifest.header.default_entrypoint as usize)
+                .map(|ep| pkg.manifest.get_string(ep.name).to_string())
+        });
+    let exec_entrypoint = (launched.as_deref() != Some(ep_name)).then_some(ep_name);
     let Some(data_home) = xdg_data_home() else {
         eprintln!("onelf-rt: cannot determine XDG_DATA_HOME or HOME");
         std::process::exit(1);
@@ -199,12 +224,14 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
         match read_entry(pkg, desktop_idx) {
             Ok(raw) => {
                 let text = String::from_utf8(raw).unwrap_or_default();
-                patch_desktop_file(&text, exec_path, icon_name.as_deref())
+                patch_desktop_file(&text, exec_path, exec_entrypoint, icon_name.as_deref())
             }
-            Err(_) => generate_desktop_file(&pkg_name, exec_path, icon_name.as_deref()),
+            Err(_) => {
+                generate_desktop_file(&pkg_name, exec_path, exec_entrypoint, icon_name.as_deref())
+            }
         }
     } else {
-        generate_desktop_file(&pkg_name, exec_path, icon_name.as_deref())
+        generate_desktop_file(&pkg_name, exec_path, exec_entrypoint, icon_name.as_deref())
     };
 
     if let Err(e) = fs::write(&dest, content.as_bytes()) {
@@ -290,7 +317,7 @@ mod tests {
 
     #[test]
     fn generated_file_quotes_exec_and_keeps_tryexec_literal() {
-        let out = generate_desktop_file("App", "/opt/has space/app", Some("icon"));
+        let out = generate_desktop_file("App", "/opt/has space/app", None, Some("icon"));
         assert!(out.contains("Exec=\"/opt/has space/app\"\n"), "got:\n{out}");
         assert!(
             out.contains("TryExec=/opt/has space/app\n"),
