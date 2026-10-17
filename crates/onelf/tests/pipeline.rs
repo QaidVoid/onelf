@@ -1116,6 +1116,38 @@ fn cache_clear_spares_a_running_package() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// An interrupted extraction leaves `pkg/.<id>.tmp` and no last-used
+/// record. `cache clear` found packages only through those records, so
+/// the scratch and the blobs it hardlinks survived "Cache cleared.".
+#[test]
+fn cache_clear_removes_an_interrupted_extraction() {
+    let td = workdir("cleartmp");
+    let xdg = td.join("xdg-cache");
+    let root = xdg.join("onelf");
+    let id = "ab".repeat(32);
+    let scratch = root.join("pkg").join(format!(".{id}.tmp"));
+    let blob = root.join("cas/ab").join("ab".repeat(32));
+    write(&blob, "content");
+    std::fs::create_dir_all(scratch.join("bin")).unwrap();
+    std::fs::hard_link(&blob, scratch.join("bin/run")).unwrap();
+    write(&root.join("lock").join(&id), "");
+
+    let o = Command::new(onelf())
+        .args(["cache", "clear"])
+        .env("XDG_CACHE_HOME", &xdg)
+        .env("HOME", &td)
+        .output()
+        .expect("spawn onelf cache clear");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        o.status.success() && stdout.contains("Cache cleared"),
+        "{stdout}"
+    );
+    assert!(!scratch.exists(), "the extraction scratch survived");
+    assert!(!blob.exists(), "the blob the scratch hardlinked survived");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Every bundled object must end up with a search path the loader will
 /// actually inherit, whatever depth the executable sits at.
 ///
@@ -1503,10 +1535,22 @@ fn a_keyring_accepts_a_signature_from_any_embedded_key() {
     );
 
     // And the produced signature verifies explicitly against the key
-    // that made it. `verify --key` checks one given key, not the
-    // package's ring; the ring is what the embedded runtime applies.
+    // that made it. `verify --key` checks the given keys, not the
+    // package's embedded ring.
     let sig = td.join("ring.onelf.zsync.sig");
     assert!(sig.exists(), "signature not written next to the package");
+    let o = Command::new(onelf())
+        .arg("verify")
+        .arg(&pkg)
+        .args(["--key", ring_path.to_str().unwrap(), "--sig"])
+        .arg(&sig)
+        .output()
+        .expect("spawn onelf verify");
+    assert!(
+        o.status.success(),
+        "verify against the keyring failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let o = Command::new(onelf())
         .arg("verify")
         .arg(&pkg)
@@ -2064,6 +2108,58 @@ fn contradictory_pack_flags_are_refused() {
             o.status.code(),
             Some(2),
             "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Flags that only mean something with `--sysroot` were accepted and
+/// ignored without it, and the framework bundlers were ignored with it.
+#[test]
+fn sysroot_flag_combinations_that_do_nothing_are_refused() {
+    let td = workdir("sysroot-flags");
+    let dir = td.join("app");
+    let dir = dir.to_str().unwrap();
+    let sysroot = td.join("sysroot");
+    let sysroot = sysroot.to_str().unwrap();
+    let out = td.join("out.onelf");
+    let out = out.to_str().unwrap();
+    let mut cases: Vec<Vec<&str>> = [
+        "--sysroot-optional",
+        "--platform-line",
+        "--policy",
+        "--trace",
+        "--keep",
+    ]
+    .into_iter()
+    .map(|flag| vec!["bundle-libs", dir, flag, "/dev/null"])
+    .collect();
+    for flag in ["--gl", "--dri", "--vulkan", "--wayland", "--gtk"] {
+        cases.push(vec![
+            "bundle-libs",
+            dir,
+            "--target",
+            "bin/app",
+            "--sysroot",
+            sysroot,
+            flag,
+        ]);
+    }
+    for (flag, value) in [("--package", "mesa"), ("--platform-line", "/dev/null")] {
+        cases.push(vec![
+            "sysroot", "pack-set", dir, "-o", out, "--name", "set", flag, value,
+        ]);
+    }
+    for args in cases {
+        let o = Command::new(onelf())
+            .args(&args)
+            .output()
+            .expect("spawn onelf");
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{args:?}: {}",
             String::from_utf8_lossy(&o.stderr)
         );
     }
@@ -3859,7 +3955,7 @@ fn with_manifest(
     // before that field's final value exists, exactly as the packer does.
     m.header.footer_hash = [0; 32];
     let manifest = m.serialize().unwrap();
-    let checksum = onelf_format::manifest::manifest_checksum(&manifest);
+    let checksum = onelf_format::manifest::manifest_checksum(&manifest).unwrap();
 
     // Recompute the footer hash over the footer this rewrite produces,
     // with the layout fields (unknown until the manifest is compressed)
@@ -3998,7 +4094,7 @@ fn verify_rejects_a_replaced_runtime_prefix_and_a_rewritten_footer() {
 /// A format 1 package carries no structure hashes, so there is nothing
 /// `verify` could check; it must say that plainly instead of printing OK.
 #[test]
-fn verify_reports_why_it_cannot_authenticate_a_format_one_package() {
+fn verify_reports_why_it_cannot_check_a_format_one_package() {
     let td = workdir("oldfmt");
     let pkg = pack_script(&td, "old", "#!/bin/sh\necho RAN\n");
     let mut bytes = std::fs::read(&pkg).unwrap();
@@ -4013,9 +4109,12 @@ fn verify_reports_why_it_cannot_authenticate_a_format_one_package() {
     .unwrap();
 
     let o = run_onelf(&["verify", old.to_str().unwrap()], None);
-    assert!(!o.status.success(), "verify OK'd an unauthenticated format");
+    assert!(
+        !o.status.success(),
+        "verify OK'd a format without structure hashes"
+    );
     let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("predates structural authentication"), "{err}");
+    assert!(err.contains("predates structure hashes"), "{err}");
 
     // The package itself still runs: reading it was never the problem.
     let mut run = Command::new(&old);

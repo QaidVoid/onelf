@@ -72,7 +72,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--needs-setuid` | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
 | `--mtime SECS` | | Pin every entry's mtime to a Unix timestamp for reproducible output |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
-| `--update-url URL` | | zsync URL; enables update runtime |
+| `--update-url URL` | | `https://` zsync URL; enables update runtime |
 | `--update-key PATH` | | File with one or more 32-byte Ed25519 public keys concatenated; a multi-key file is a keyring and any of its keys can sign updates. Required for self-update |
 | `--update-revision N` | | Stamp release number N into the package; the runtime refuses downloads that are not strictly newer. Requires `--update-url` |
 | `--no-embed-updater` | `false` | Record the update URL without embedding the updater (keeps the slim runtime; see the self-update guide's size table) |
@@ -97,7 +97,8 @@ onelf bundle-libs DIRECTORY [options]
 | `--search-path DIR` | | Extra lib search dir (highest priority) |
 | `--dry-run` | `false` | Report without copying |
 | `--no-recursive` | `false` | Don't resolve transitive deps |
-| `--gl`, `--dri`, `--vulkan`, `--wayland`, `--gtk` | auto | Framework bundlers. Auto-detect inspects both `DT_NEEDED` and versioned soname strings in the binary, so dlopen'd frameworks are picked up too |
+| `--gl`, `--dri`, `--vulkan` | `false` | Bundle the GPU stack. It is never bundled on detection alone, because the host's driver is the one that works |
+| `--wayland`, `--gtk` | auto | Framework bundlers. Auto-detect inspects both `DT_NEEDED` and versioned soname strings in the binary, so dlopen'd frameworks are picked up too |
 | `--no-gl`, `--no-dri`, `--no-vulkan`, `--no-wayland`, `--no-gtk` | `false` | Force-off a framework, overriding auto-detection and the matching `--*` flag |
 | `--strip` | `false` | Run `strip --strip-unneeded` |
 | `--strict-libc` | `false` | Skip wrong-family libc libs |
@@ -106,12 +107,12 @@ onelf bundle-libs DIRECTORY [options]
 | `--trace-run` | `false` | Run the `--target` for a few seconds and bundle every library it loaded at runtime, from the glibc loader's own report (a musl target needs `strace`) |
 | `--trace-seconds N` | `5` | How long the traced run may go before it is stopped |
 | `--trace-arg ARG` | | Argument for the traced run (repeatable) |
-| `--sysroot DIR` | | Take the bundle's contents from this sysroot's package database; needs `--target` |
-| `--sysroot-optional PKG` | | Optional dependency to include from the sysroot (repeatable) |
-| `--platform-line FILE` | | Soname prefixes the host provides, one per line |
-| `--policy FILE` | | Glob patterns that never ship, one per line |
-| `--trace FILE` | | Paths a test run opened, one per line |
-| `--keep FILE` | | Glob patterns the trace may not prune, one per line |
+| `--sysroot DIR` | | Take the bundle's contents from this sysroot's package database; needs `--target`. Excludes the framework bundlers `--gl`, `--dri`, `--vulkan`, `--wayland` and `--gtk` |
+| `--sysroot-optional PKG` | | Optional dependency to include from the sysroot (repeatable); requires `--sysroot` |
+| `--platform-line FILE` | | Soname prefixes the host provides, one per line; requires `--sysroot` |
+| `--policy FILE` | | Glob patterns that never ship, one per line; requires `--sysroot` |
+| `--trace FILE` | | Paths a test run opened, one per line; requires `--sysroot` |
+| `--keep FILE` | | Glob patterns the trace may not prune, one per line; requires `--sysroot` |
 
 ## `onelf sysroot`
 
@@ -169,19 +170,21 @@ onelf verify BINARY [--key KEYFILE --sig SIGFILE]
 
 For format 2 packages the structure check covers the runtime ELF prefix
 and the footer, both hashed into the manifest. Format 1 packages carry
-no such hashes and are refused with a clear message; they cannot be
-authenticated at all.
+no such hashes and are refused with a clear message, since their
+structure cannot be checked at all. These hashes detect corruption and
+inconsistent edits, but anyone who rewrites a file can recompute them,
+so a passing check does not say who produced the file.
 
 The entry sweep recomputes a BLAKE3 for each file and compares it
 against the manifest.
 
 With `--key` and `--sig` (always together), also check a detached
-Ed25519 signature over the whole file — the same check the runtime's
-self-update applies before installing. `KEYFILE` is the raw 32-byte
-public key `onelf key new` writes; `SIGFILE` is the raw 64-byte
+Ed25519 signature over the whole file. This is the same check the
+runtime's self-update applies before installing. `KEYFILE` is the raw
+32-byte public key `onelf key new` writes, or a keyring of several
+concatenated keys, any of which may have signed; `SIGFILE` is the raw 64-byte
 signature `onelf sign` writes. A signature over a modified file fails,
-and re-signing a modified file does not help, because the per-entry
-hashes still fail; only a fresh pack and a fresh signature do.
+and only the holder of the secret key can make a new one.
 
 Exit `0` on match, `1` on mismatch.
 

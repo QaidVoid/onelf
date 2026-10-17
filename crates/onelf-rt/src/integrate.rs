@@ -91,7 +91,7 @@ fn generate_desktop_file(name: &str, exec_path: &str, icon_name: Option<&str>) -
         format!("Name={name}"),
         format!("Exec={quoted}"),
         // A literal path per the spec, not a quoted Exec field.
-        format!("TryExec={exec_path}"),
+        format!("TryExec={}", onelf_format::desktop::string_value(exec_path)),
     ];
     if let Some(icon) = icon_name {
         lines.push(format!("Icon={icon}"));

@@ -536,6 +536,17 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             ),
         ));
     }
+    if let Some(ref url) = opts.update_url
+        && !url.starts_with("https://")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("update URL must use https://, got {url}"),
+        ));
+    }
+    if let Some(ref key) = opts.update_key {
+        check_update_key(key)?;
+    }
     let dir = opts.directory.canonicalize()?;
 
     // Resolve lib dirs: handle "auto" detection and conflict checking
@@ -770,16 +781,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // One key is the common case; a concatenation of N keys is a keyring
     // and the runtime accepts a signature from any of them.
     if let Some(ref key) = opts.update_key {
-        if key.is_empty() || key.len() % 32 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "update key must be one or more 32-byte Ed25519 public keys \
-                     (a multiple of 32 bytes), got {} bytes",
-                    key.len()
-                ),
-            ));
-        }
         inject_onelf_file(
             &mut dirs,
             &mut files,
@@ -1349,7 +1350,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             lib_dir_count: lib_dir_offsets.len() as u16,
             name_offset,
             package_id: [0; 32], // placeholder, computed below
-            // Authenticated container structure, format version 2: the
+            // Container structure hashes, format version 2: the
             // manifest pins the runtime prefix and (once its bytes exist)
             // the footer, so `verify` can check both.
             prefix_hash: blake3::hash(&runtime_patched).into(),
@@ -1371,7 +1372,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Compute manifest checksum (xxhash32 of uncompressed manifest, with
     // the footer_hash field excluded; it is pinned by the footer hash
     // instead, see Footer::structure_hash).
-    let manifest_checksum = onelf_format::manifest::manifest_checksum(&manifest_bytes);
+    let manifest_checksum = onelf_format::manifest::manifest_checksum(&manifest_bytes)?;
 
     // Compute total payload size
     // What was actually written, which after dedup is less than the sum of
@@ -1529,6 +1530,41 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         }
     );
 
+    Ok(())
+}
+
+/// Refuses an update key file that is not a ring of distinct 32-byte
+/// public keys. A 64-byte Ed25519 secret key is a seed followed by its
+/// public key, so it has a valid ring length and would otherwise ship
+/// the private seed inside every package.
+fn check_update_key(key: &[u8]) -> io::Result<()> {
+    use ed25519_compact::{KeyPair, Seed};
+
+    let invalid = |msg: String| Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+    if key.is_empty() || !key.len().is_multiple_of(32) {
+        return invalid(format!(
+            "update key must be one or more 32-byte Ed25519 public keys \
+             (a multiple of 32 bytes), got {} bytes",
+            key.len()
+        ));
+    }
+    let (chunks, _) = key.as_chunks::<32>();
+    for (i, pair) in chunks.windows(2).enumerate() {
+        if *KeyPair::from_seed(Seed::new(pair[0])).pk == pair[1] {
+            return invalid(format!(
+                "update key bytes {}..{} look like an Ed25519 secret key, which \
+                 must never ship in a package; pass the public key from \
+                 `onelf key new` instead",
+                i * 32,
+                i * 32 + 64
+            ));
+        }
+    }
+    for (i, chunk) in chunks.iter().enumerate() {
+        if chunks[..i].contains(chunk) {
+            return invalid(format!("update key {} repeats an earlier key", i + 1));
+        }
+    }
     Ok(())
 }
 
@@ -1983,6 +2019,51 @@ mod tests {
 
         compile_gsettings_schemas(&dirs, &mut files, &dir, 0);
         assert!(files.len() == 1, "nothing injected without schema XML");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A 64-byte Ed25519 secret key is a seed followed by its public key,
+    /// which has a valid ring length. It must be refused so the seed never
+    /// ships in a package.
+    #[test]
+    fn update_key_refuses_a_secret_key_and_repeats() {
+        use ed25519_compact::{KeyPair, Seed};
+        let a = KeyPair::from_seed(Seed::new([7u8; 32]));
+        let b = KeyPair::from_seed(Seed::new([9u8; 32]));
+
+        let err = check_update_key(&a.sk[..]).unwrap_err().to_string();
+        assert!(err.contains("secret key"), "{err}");
+        let ring_with_secret = [&b.pk[..], &a.sk[..]].concat();
+        assert!(check_update_key(&ring_with_secret).is_err());
+        let repeated = [&a.pk[..], &b.pk[..], &a.pk[..]].concat();
+        let err = check_update_key(&repeated).unwrap_err().to_string();
+        assert!(err.contains("repeats"), "{err}");
+
+        check_update_key(&a.pk[..]).unwrap();
+        check_update_key(&[&a.pk[..], &b.pk[..]].concat()).unwrap();
+        assert!(check_update_key(&[]).is_err());
+        assert!(check_update_key(&[0u8; 33]).is_err());
+    }
+
+    /// Every client refuses a non-HTTPS update URL, so packing one would
+    /// ship a package that can never update.
+    #[test]
+    fn plain_http_update_url_is_refused() {
+        let dir = tmpdir("http-url");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+
+        opts.update_url = Some("http://example.com/app.onelf.zsync".to_string());
+        let err = pack(&opts, b"stub-runtime").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!out.exists());
+
+        opts.update_url = Some("https://example.com/app.onelf.zsync".to_string());
+        pack(&opts, b"stub-runtime").unwrap();
 
         let _ = fs::remove_dir_all(&dir);
     }

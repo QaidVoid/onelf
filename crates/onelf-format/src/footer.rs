@@ -35,7 +35,7 @@
 //! Version 2 means the manifest (version 3) carries `prefix_hash` and
 //! `footer_hash`, so the runtime prefix and this footer are covered by a
 //! hash chain rooted in the manifest; see [`crate::manifest`]. Version 1
-//! files carry no such fields and cannot be structurally authenticated.
+//! files carry no such fields, so their structure cannot be checked.
 //!
 //! # Example
 //!
@@ -152,7 +152,7 @@ impl HostLibsPolicy {
 
 #[derive(Debug, Clone)]
 pub struct Footer {
-    /// Format version: 1 (legacy, unauthenticated structure) or 2.
+    /// Format version: 1 (legacy, no structure hashes) or 2.
     pub format_version: u16,
     /// Feature flags describing optional sections and capabilities.
     pub flags: Flags,
@@ -191,11 +191,11 @@ impl Footer {
     /// know them before compressing the manifest, and the manifest cannot
     /// be compressed before this hash exists: their values are pinned
     /// indirectly instead, by the bounds checks and the entry hashes the
-    /// manifest carries. The `manifest_checksum` field is included, which
-    /// closes the loop: rewriting the manifest changes the checksum the
-    /// footer must carry, which changes this hash, which is pinned inside
-    /// the manifest itself. A consistent rewrite requires inverting
-    /// BLAKE3, not just recomputing hashes.
+    /// manifest carries. The `manifest_checksum` field is included, so
+    /// rewriting the manifest also changes this hash. The chain is an
+    /// integrity check, not authentication: whoever rewrites a file can
+    /// recompute every hash in it. Only a detached signature proves who
+    /// produced a package.
     pub fn structure_hash(&self) -> [u8; 32] {
         let mut buf = [0u8; FOOTER_SIZE];
         let mut sink: &mut [u8] = &mut buf;

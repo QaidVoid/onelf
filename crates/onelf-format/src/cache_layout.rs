@@ -97,6 +97,12 @@ pub fn ready_marker(root: &Path, package_id: &str) -> PathBuf {
     root.join("pkg").join(format!(".{package_id}.ready"))
 }
 
+/// Extraction scratch for `package_id`, renamed to [`pkg_dir`] once the
+/// tree is complete. An interrupted extraction leaves it behind.
+pub fn extract_tmp_dir(root: &Path, package_id: &str) -> PathBuf {
+    root.join("pkg").join(format!(".{package_id}.tmp"))
+}
+
 /// In-use lock for `package_id`, held shared for an instance's lifetime.
 pub fn lock_path(root: &Path, package_id: &str) -> PathBuf {
     root.join("lock").join(package_id)

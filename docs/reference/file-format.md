@@ -75,7 +75,7 @@ Compressed with zstd. After decompression:
 | 12 | 2 | default_entrypoint (index into entrypoints) |
 | 14 | 2 | lib_dir_count |
 | 16 | 2 | name_offset (into string_table) |
-| 18 | 32 | package_id (BLAKE3 of the serialized manifest bytes minus this field) |
+| 18 | 32 | package_id (BLAKE3 of the serialized manifest with this field and footer_hash zeroed) |
 | 50 | 32 | prefix_hash (BLAKE3 over file bytes `[0, manifest_offset)`; zeros in version 1/2) |
 | 82 | 32 | footer_hash (BLAKE3 over the footer, see below; zeros in version 1/2) |
 
@@ -198,16 +198,16 @@ Then the manifest tells you how to read entrypoints, files, etc.
 The three hashes chain: the manifest checksum covers the manifest, and
 the manifest carries both `prefix_hash` and `footer_hash`, so replacing
 the executable body or rewriting the footer shows up in `onelf verify`.
-Because `manifest_checksum` is part of the hashed footer bytes, a
-consistent rewrite of the whole file requires inverting BLAKE3, not just
-recomputing checksums. An external detached signature over the file
-remains the stronger guarantee.
+This is an integrity check, not authentication. No hash in the chain is
+keyed, so anyone who rewrites the file can recompute all of them and
+produce a consistent package. Only a detached signature over the file
+shows who produced it.
 
 ## Format compatibility
 
 The footer's `format_version` accepts `1` and `2`; writers emit `2`.
 Format 1 means manifest version 1 or 2: no `prefix_hash`, no
-`footer_hash`, and nothing authenticates the container structure.
+`footer_hash`, and no hash covers the container structure.
 `onelf verify` refuses such a file with a clear message instead of
 printing OK, but it still runs, as it always did.
 

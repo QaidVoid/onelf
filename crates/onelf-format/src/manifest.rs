@@ -152,14 +152,27 @@ impl ManifestHeader {
 /// is pinned by [`crate::footer::Footer::structure_hash`] instead. The
 /// packer, the runtime loader and `verify` must all agree on this, so it
 /// lives here rather than at each call site.
-pub fn manifest_checksum(manifest: &[u8]) -> [u8; 4] {
-    let version = u16::from_le_bytes(manifest[..2].try_into().expect("u16 version"));
+///
+/// Fails when `manifest` is too short to hold the header fields the
+/// checksum depends on, which only a corrupt or crafted footer produces.
+pub fn manifest_checksum(manifest: &[u8]) -> io::Result<[u8; 4]> {
+    let truncated = || io::Error::new(io::ErrorKind::InvalidData, "manifest header truncated");
+    let version = u16::from_le_bytes(
+        manifest
+            .get(..2)
+            .ok_or_else(truncated)?
+            .try_into()
+            .expect("u16 version"),
+    );
     if version < 3 {
-        return xxhash_rust::xxh32::xxh32(manifest, 0).to_le_bytes();
+        return Ok(xxhash_rust::xxh32::xxh32(manifest, 0).to_le_bytes());
+    }
+    if manifest.len() < MANIFEST_HEADER_SIZE {
+        return Err(truncated());
     }
     let mut zeroed = manifest.to_vec();
     zeroed[FOOTER_HASH_RANGE].fill(0);
-    xxhash_rust::xxh32::xxh32(&zeroed, 0).to_le_bytes()
+    Ok(xxhash_rust::xxh32::xxh32(&zeroed, 0).to_le_bytes())
 }
 
 #[derive(Debug, Clone)]
@@ -609,22 +622,35 @@ mod tests {
         let mut zeroed = bytes.clone();
         zeroed[FOOTER_HASH_RANGE].fill(0);
         assert_eq!(
-            manifest_checksum(&bytes),
+            manifest_checksum(&bytes).unwrap(),
             xxhash_rust::xxh32::xxh32(&zeroed, 0).to_le_bytes()
         );
         // The prefix hash is covered by the checksum, only footer_hash is
         // excluded.
         assert_ne!(
-            manifest_checksum(&bytes),
+            manifest_checksum(&bytes).unwrap(),
             xxhash_rust::xxh32::xxh32(&bytes, 0).to_le_bytes()
         );
 
         // Version 1 bytes checksum plainly: the field does not exist there.
         let v1 = [0u8, 0, 1, 2, 3];
         assert_eq!(
-            manifest_checksum(&v1),
+            manifest_checksum(&v1).unwrap(),
             xxhash_rust::xxh32::xxh32(&v1, 0).to_le_bytes()
         );
+    }
+
+    /// A crafted footer can make the manifest decompress to anything, and
+    /// the checksum runs before `deserialize` checks the length.
+    #[test]
+    fn manifest_checksum_refuses_truncated_headers() {
+        assert!(manifest_checksum(&[]).is_err());
+        assert!(manifest_checksum(&[3]).is_err());
+        let mut short_v3 = vec![0u8; MANIFEST_HEADER_SIZE - 1];
+        short_v3[0] = 3;
+        assert!(manifest_checksum(&short_v3).is_err());
+        short_v3.push(0);
+        assert!(manifest_checksum(&short_v3).is_ok());
     }
 
     #[test]

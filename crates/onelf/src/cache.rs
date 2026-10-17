@@ -58,8 +58,32 @@ fn remove_package(root: &Path, package_id: &str) {
     // Marker first: a concurrent reader must never see it without its tree.
     let _ = fs::remove_file(layout::ready_marker(root, package_id));
     let _ = fs::remove_dir_all(layout::pkg_dir(root, package_id));
+    let _ = fs::remove_dir_all(layout::extract_tmp_dir(root, package_id));
     let _ = fs::remove_file(layout::meta_path(root, package_id));
     let _ = fs::remove_file(layout::extract_lock_path(root, package_id));
+}
+
+/// Package IDs the cache holds anything for: those with a last-used record,
+/// and those with a tree, marker or extraction scratch in `pkg/`, since an
+/// interrupted extraction leaves its scratch behind without a record.
+fn cached_ids(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for dir in ["meta", "pkg"] {
+        let Ok(entries) = fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_prefix('.')
+                .and_then(|n| n.strip_suffix(".tmp").or_else(|| n.strip_suffix(".ready")))
+                .unwrap_or(&name);
+            if !id.is_empty() && !id.starts_with('.') {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// Remove content blobs no package directory hardlinks any more, returning
@@ -245,14 +269,11 @@ pub fn cache_clear() -> io::Result<()> {
 
     let mut removed = 0u64;
     let mut skipped = 0u64;
-    if let Ok(entries) = fs::read_dir(root.join("meta")) {
-        for entry in entries.flatten() {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if try_remove_locked(&root, &id) {
-                removed += 1;
-            } else {
-                skipped += 1;
-            }
+    for id in cached_ids(&root) {
+        if try_remove_locked(&root, &id) {
+            removed += 1;
+        } else {
+            skipped += 1;
         }
     }
     let mut builds = 0u64;

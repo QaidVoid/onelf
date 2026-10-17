@@ -2,8 +2,8 @@
 //!
 //! First the container structure: for format version 2 files, a BLAKE3
 //! over the runtime ELF prefix and over the footer, both rooted in the
-//! manifest. Format version 1 files carry no such hashes, so they cannot
-//! be authenticated and are refused. Then a BLAKE3 of every file entry's
+//! manifest. Format version 1 files carry no such hashes, so their
+//! structure cannot be checked and they are refused. Then a BLAKE3 of every file entry's
 //! content against the hash baked into the manifest, plus the manifest
 //! XXH32 checksum (already verified by the manifest reader). Returns
 //! non-zero exit code when anything fails.
@@ -39,7 +39,7 @@ pub fn verify(binary: &Path, key: Option<&Path>, sig: Option<&Path>) -> io::Resu
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "format version {} predates structural authentication: the runtime \
+                "format version {} predates structure hashes: the runtime \
                  prefix and footer are covered by no hash, so this package cannot \
                  be verified; repack it with a current onelf",
                 footer.format_version
@@ -77,7 +77,7 @@ pub fn verify(binary: &Path, key: Option<&Path>, sig: Option<&Path>) -> io::Resu
         )));
     }
     println!(
-        "Structure: OK (format {}, prefix and footer authenticated)",
+        "Structure: OK (format {}, prefix and footer intact)",
         footer.format_version
     );
 
@@ -138,23 +138,30 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 /// Check a detached Ed25519 signature over the whole binary, mirroring
 /// what the runtime's self-update does before installing. Both inputs
-/// are the raw fixed-width encodings `key new` and `sign` produce: a
-/// 32-byte public key, a 64-byte signature.
+/// are raw encodings: the key file holds one or more concatenated 32-byte
+/// public keys, as `key new` writes them or as `pack --update-key` takes
+/// a keyring, and the signature is the 64 bytes `sign` writes. A signature
+/// made with any key in the file passes.
 fn verify_detached_over(binary: &Path, key: &Path, sig: &Path) -> io::Result<()> {
     use ed25519_compact::{PublicKey, Signature};
 
     let key_bytes = std::fs::read(key)?;
-    let pk = PublicKey::from_slice(&key_bytes).map_err(|_| {
+    let not_a_key = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} is not a public key: expected {} raw bytes, found {}",
+                "{} is not a public key: expected one or more {}-byte raw keys, found {} bytes",
                 key.display(),
                 PublicKey::BYTES,
                 key_bytes.len()
             ),
         )
-    })?;
+    };
+    let (keys, rest) = key_bytes.as_chunks::<{ PublicKey::BYTES }>();
+    if keys.is_empty() || !rest.is_empty() {
+        return Err(not_a_key());
+    }
+    let ring: Vec<PublicKey> = keys.iter().map(|k| PublicKey::new(*k)).collect();
     let sig_bytes = std::fs::read(sig)?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|_| {
         io::Error::new(
@@ -168,7 +175,10 @@ fn verify_detached_over(binary: &Path, key: &Path, sig: &Path) -> io::Result<()>
         )
     })?;
     let message = std::fs::read(binary)?;
-    if pk.verify(&message, &signature).is_err() {
+    if !ring
+        .iter()
+        .any(|pk| pk.verify(&message, &signature).is_ok())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

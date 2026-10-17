@@ -2,23 +2,51 @@
 //! integrators so a binary under a path with a space gets one menu entry
 //! that launches, from either side.
 
-/// Quote one `Exec=` field argument per the Desktop Entry spec: a value
-/// containing whitespace or a reserved character is double-quoted, with
-/// `"`, `` ` ``, `$`, and `\` backslash-escaped inside the quotes.
+/// Quote one `Exec=` field argument per the Desktop Entry spec, ready to
+/// write into the file: a value containing whitespace or a reserved
+/// character is double-quoted, with `"`, `` ` ``, `$`, and `\`
+/// backslash-escaped inside the quotes, and `%` becomes `%%` so it is not
+/// read as a field code. The result then goes through [`string_value`],
+/// because `Exec` is a string key whose escapes are undone before the
+/// quoting is: a literal backslash in a quoted argument takes four.
 pub fn exec_arg(s: &str) -> String {
     let reserved = |c: char| c.is_whitespace() || "\"'\\<>~|&;$*?#()`".contains(c);
-    if !s.is_empty() && !s.chars().any(reserved) {
-        return s.to_string();
-    }
+    let quote = s.is_empty() || s.chars().any(reserved);
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    if quote {
+        out.push('"');
+    }
     for c in s.chars() {
-        if matches!(c, '"' | '`' | '$' | '\\') {
+        if quote && matches!(c, '"' | '`' | '$' | '\\') {
             out.push('\\');
+        }
+        if c == '%' {
+            out.push('%');
         }
         out.push(c);
     }
-    out.push('"');
+    if quote {
+        out.push('"');
+    }
+    string_value(&out)
+}
+
+/// Escape `s` as a Desktop Entry string value: a backslash, newline, tab
+/// or carriage return becomes its backslash escape, and a leading space
+/// becomes `\s` so it is not trimmed. This is the whole encoding for a
+/// plain string key such as `TryExec`.
+pub fn string_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            ' ' if i == 0 => out.push_str("\\s"),
+            c => out.push(c),
+        }
+    }
     out
 }
 
@@ -34,10 +62,22 @@ pub fn exec_arg_tail(value: &str) -> &str {
     }
     if i < bytes.len() && bytes[i] == b'"' {
         // Quoted argument: skip to the matching unescaped closing quote.
+        // The value is still string-escaped, so `\\` is one backslash,
+        // which in turn escapes whatever follows it.
         i += 1;
         while i < bytes.len() {
             match bytes[i] {
-                b'\\' if i + 1 < bytes.len() => i += 2,
+                b'\\' if i + 1 < bytes.len() => {
+                    let backslash = bytes[i + 1] == b'\\';
+                    i += 2;
+                    if backslash && i < bytes.len() {
+                        i += if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                }
                 b'"' => {
                     i += 1;
                     break;
@@ -60,8 +100,9 @@ pub fn exec_arg_tail(value: &str) -> &str {
 ///
 /// `Exec=` is rewritten to launch the package binary (quoting it as the
 /// spec requires), keeping any field codes or arguments that followed.
-/// `TryExec=` gets the plain path: the spec defines it as a literal
-/// path, not an Exec field, so field-code quoting does not apply.
+/// `TryExec=` gets the path with only string escaping: the spec defines
+/// it as a literal path, not an Exec field, so field-code quoting does
+/// not apply.
 /// `Icon=` becomes `icon_name` when given.
 ///
 /// Only `[Desktop Entry]` is touched. A desktop file may carry further
@@ -72,6 +113,7 @@ pub fn exec_arg_tail(value: &str) -> &str {
 /// not the last one.
 pub fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str>) -> String {
     let quoted = exec_arg(exec_path);
+    let try_exec = string_value(exec_path);
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let mut has_exec = false;
     let mut has_tryexec = false;
@@ -97,7 +139,7 @@ pub fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str
             }
             has_exec = true;
         } else if line.starts_with("TryExec=") {
-            *line = format!("TryExec={exec_path}");
+            *line = format!("TryExec={try_exec}");
             has_tryexec = true;
         } else if line.starts_with("Icon=")
             && let Some(name) = icon_name
@@ -116,7 +158,7 @@ pub fn patch_desktop_file(content: &str, exec_path: &str, icon_name: Option<&str
         insert_at += 1;
     }
     if !has_tryexec {
-        lines.insert(insert_at, format!("TryExec={exec_path}"));
+        lines.insert(insert_at, format!("TryExec={try_exec}"));
     }
 
     let mut result = lines.join("\n");
@@ -143,8 +185,37 @@ mod tests {
     fn exec_arg_quotes_only_what_needs_it() {
         assert_eq!(exec_arg("/opt/app/bin"), "/opt/app/bin");
         assert_eq!(exec_arg("/opt/my app/bin"), "\"/opt/my app/bin\"");
-        assert_eq!(exec_arg("/a\"b$c"), "\"/a\\\"b\\$c\"");
         assert_eq!(exec_arg(""), "\"\"");
+    }
+
+    /// The exec escapes sit inside a string value, so each of their
+    /// backslashes is doubled, and `%` is doubled so it is not a field code.
+    #[test]
+    fn exec_arg_escapes_for_both_levels_and_field_codes() {
+        assert_eq!(exec_arg(r#"/a"b$c"#), r#""/a\\"b\\$c""#);
+        assert_eq!(exec_arg(r"/a\b"), r#""/a\\\\b""#);
+        assert_eq!(exec_arg("/opt/100%/app"), "/opt/100%%/app");
+        assert_eq!(exec_arg("/opt/50% off/app"), r#""/opt/50%% off/app""#);
+        assert_eq!(exec_arg("/a\nb"), r#""/a\nb""#);
+        assert_eq!(string_value(r"/a\b"), r"/a\\b");
+        assert_eq!(string_value(" a"), r"\sa");
+    }
+
+    /// What `exec_arg` writes, `exec_arg_tail` must read back as one
+    /// argument, or patching an already patched file splits it.
+    #[test]
+    fn exec_arg_tail_skips_what_exec_arg_writes() {
+        for path in [r#"/a"b c"#, r"/a\ b", r"/a b\", r#"/x y\"z"#] {
+            let line = format!("{} %U", exec_arg(path));
+            assert_eq!(exec_arg_tail(&line), "%U", "{line}");
+        }
+    }
+
+    #[test]
+    fn tryexec_is_string_escaped() {
+        let out = patch_desktop_file("[Desktop Entry]\n", r"/opt/a\b/app", None);
+        assert!(out.contains(r"TryExec=/opt/a\\b/app"), "{out}");
+        assert!(out.contains(r#"Exec="/opt/a\\\\b/app""#), "{out}");
     }
 
     #[test]

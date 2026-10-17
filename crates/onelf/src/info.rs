@@ -226,7 +226,7 @@ fn read_manifest<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<
             )
         })?;
 
-    if onelf_format::manifest::manifest_checksum(&bytes) != footer.manifest_checksum {
+    if onelf_format::manifest::manifest_checksum(&bytes)? != footer.manifest_checksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "manifest checksum mismatch",

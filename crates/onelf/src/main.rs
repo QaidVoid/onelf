@@ -92,7 +92,7 @@ enum Commands {
         #[arg(long, default_value = "inherit")]
         working_dir: WorkingDirArg,
 
-        /// Base URL for delta updates (stored in .onelf/update-url)
+        /// HTTPS URL for delta updates (stored in .onelf/update-url)
         #[arg(long)]
         update_url: Option<String>,
 
@@ -203,8 +203,9 @@ enum Commands {
     Verify {
         /// Path to the onelf binary
         binary: PathBuf,
-        /// Ed25519 public key, raw 32 bytes as `key new` writes it; with
-        /// --sig, also check a detached signature over the whole file
+        /// Ed25519 public key, raw 32 bytes as `key new` writes it, or a
+        /// keyring of several concatenated keys; with --sig, also check a
+        /// detached signature over the whole file against any of them
         #[arg(long)]
         key: Option<PathBuf>,
         /// Detached signature over the whole binary, raw 64 bytes as
@@ -317,7 +318,9 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         key: PathBuf,
 
-        /// Where to write the signature (default: <BINARY>.sig)
+        /// Where to write the signature (default: the update URL's file
+        /// name with `.sig` appended, next to BINARY, or <BINARY>.sig when
+        /// the package has no update URL)
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
@@ -368,34 +371,34 @@ enum Commands {
         no_recursive: bool,
 
         /// Bundle Mesa GL/EGL/GBM libraries
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sysroot")]
         gl: bool,
 
         /// Bundle DRI drivers (architecture-filtered)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sysroot")]
         dri: bool,
 
         /// Bundle Vulkan ICD drivers (architecture-filtered)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sysroot")]
         vulkan: bool,
 
         /// Bundle Wayland client libraries (libwayland, libdecor, libxkbcommon)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sysroot")]
         wayland: bool,
 
         /// Bundle GSettings schemas for GTK apps
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sysroot")]
         gtk: bool,
 
-        /// Do not bundle Mesa GL/EGL/GBM libraries even if auto-detected
+        /// Do not bundle Mesa GL/EGL/GBM libraries (overrides --gl)
         #[arg(long)]
         no_gl: bool,
 
-        /// Do not bundle DRI drivers even if auto-detected
+        /// Do not bundle DRI drivers (overrides --dri)
         #[arg(long)]
         no_dri: bool,
 
-        /// Do not bundle Vulkan ICD drivers even if auto-detected
+        /// Do not bundle Vulkan ICD drivers (overrides --vulkan)
         #[arg(long)]
         no_vulkan: bool,
 
@@ -452,23 +455,23 @@ enum Commands {
         sysroot: Option<PathBuf>,
 
         /// Optional dependency to include from the sysroot (repeatable)
-        #[arg(long, value_name = "PACKAGE")]
+        #[arg(long, value_name = "PACKAGE", requires = "sysroot")]
         sysroot_optional: Vec<String>,
 
         /// File of soname prefixes the host provides, one per line
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", requires = "sysroot")]
         platform_line: Option<PathBuf>,
 
         /// File of glob patterns that never ship, one per line
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", requires = "sysroot")]
         policy: Option<PathBuf>,
 
         /// File of paths a test run opened, one per line
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", requires = "sysroot")]
         trace: Option<PathBuf>,
 
         /// File of glob patterns the trace may not prune
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", requires = "sysroot")]
         keep: Option<PathBuf>,
     },
 }
@@ -563,12 +566,12 @@ enum SysrootAction {
         #[arg(long)]
         sysroot: Option<PathBuf>,
         /// Packages whose closure the set holds (qt6-base, gtk4, ...)
-        #[arg(long)]
+        #[arg(long, requires = "sysroot")]
         package: Vec<String>,
         /// File of soname prefixes the host provides, one per line.
         /// Without one the GPU driver families are the line, so the
         /// stack behind them stays with the host.
-        #[arg(long)]
+        #[arg(long, requires = "sysroot")]
         platform_line: Option<PathBuf>,
     },
 }

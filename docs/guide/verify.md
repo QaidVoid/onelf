@@ -7,7 +7,8 @@ The rules this page encodes:
 
 - ✅ Verify every artifact in CI before it ships. Exit code `0` means
   every file entry matched; `1` means at least one did not.
-- ⚠️ It catches tampering and bit-rot, but it is not a signature; see the
+- ⚠️ It catches bit-rot and inconsistent edits, but it is not a signature.
+  Anyone who rewrites a package can recompute its hashes; see the
   [self-update](./self-update) caveat. For bit-rot and accidental edits
   to the covered files it is exactly what you want.
 - ❌ Do not expect directories and symlinks to be covered. They have no

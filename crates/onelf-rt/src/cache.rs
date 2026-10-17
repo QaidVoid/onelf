@@ -194,7 +194,7 @@ pub fn ensure_extracted(pkg: &mut PackageData) -> io::Result<(PathBuf, fs::File)
         // pkg_dir. A stale temp from a crashed extraction is removed first,
         // and any failure removes the temp so the next run re-extracts
         // rather than reusing a partial tree.
-        let tmp_dir = pkg_parent.join(format!(".{package_id}.tmp"));
+        let tmp_dir = layout::extract_tmp_dir(&base, &package_id);
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
 

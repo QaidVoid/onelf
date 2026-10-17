@@ -155,22 +155,43 @@ fn for_this_abi(flags: u32) -> bool {
 }
 
 /// The paths a cache image lists for this runtime's ABI, in cache order.
+///
+/// `ldconfig` sorts a library's hwcaps copies (such as
+/// `glibc-hwcaps/x86-64-v3/libzstd.so.1`) ahead of its base copy, and the
+/// loader takes one only after checking that the CPU supports it. A reader
+/// that keeps the first path would hand an older CPU code it cannot run,
+/// so a hwcaps copy is dropped whenever the cache also lists a base copy.
 fn cache_paths(data: &[u8]) -> Vec<&str> {
-    cache_entries(data)
+    fn file_name(path: &str) -> &str {
+        path.rsplit_once('/').map_or(path, |(_, name)| name)
+    }
+    let entries: Vec<(u64, &str)> = cache_entries(data)
         .into_iter()
-        .filter_map(|(flags, path)| for_this_abi(flags).then_some(path))
+        .filter_map(|(flags, hwcap, path)| for_this_abi(flags).then_some((hwcap, path)))
+        .collect();
+    let is_hwcaps = |hwcap: u64, path: &str| hwcap != 0 || path.contains("/glibc-hwcaps/");
+    let base: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|(hwcap, path)| !is_hwcaps(*hwcap, path))
+        .map(|(_, path)| file_name(path))
+        .collect();
+    entries
+        .into_iter()
+        .filter(|(hwcap, path)| !is_hwcaps(*hwcap, path) || !base.contains(file_name(path)))
+        .map(|(_, path)| path)
         .collect()
 }
 
 /// Library paths recorded in a glibc loader cache image, each with the
-/// entry's flags word.
+/// entry's flags and hwcap words. An old-format entry has no hwcap word
+/// and reads as zero.
 ///
 /// Two layouts exist. `ldconfig` in its compatibility mode writes the old
 /// header, its entries, and then a complete new-format cache after them;
 /// otherwise it writes the new format alone, which is what current
 /// distributions ship. The new format is preferred wherever it appears, since
 /// the old one cannot express hwcap and is only kept for compatibility.
-fn cache_entries(data: &[u8]) -> Vec<(u32, &str)> {
+fn cache_entries(data: &[u8]) -> Vec<(u32, u64, &str)> {
     if data.starts_with(CACHE_MAGIC_NEW) {
         return new_entries(data, 0);
     }
@@ -197,11 +218,11 @@ fn cache_entries(data: &[u8]) -> Vec<(u32, &str)> {
 }
 
 /// Entries of a new-format cache whose header starts at `base`.
-fn new_entries(data: &[u8], base: usize) -> Vec<(u32, &str)> {
+fn new_entries(data: &[u8], base: usize) -> Vec<(u32, u64, &str)> {
     // Header: magic+version (20), nlibs (4), len_strings (4), flags (1),
     // padding (3), extension_offset (4), unused (12). Entries follow at 48
-    // and are 24 bytes each, flags first; string offsets are relative to
-    // `base`.
+    // and are 24 bytes each: flags, key, value, osversion, then a 64-bit
+    // hwcap. String offsets are relative to `base`.
     let Some(nlibs) = read_u32(data, base + 20) else {
         return Vec::new();
     };
@@ -210,11 +231,17 @@ fn new_entries(data: &[u8], base: usize) -> Vec<(u32, &str)> {
         let Some(entry) = base.checked_add(48).and_then(|s| s.checked_add(i * 24)) else {
             break;
         };
-        let (Some(flags), Some(value)) = (read_u32(data, entry), read_u32(data, entry + 8)) else {
+        let (Some(flags), Some(value), Some(hwcap_lo), Some(hwcap_hi)) = (
+            read_u32(data, entry),
+            read_u32(data, entry + 8),
+            read_u32(data, entry + 16),
+            read_u32(data, entry + 20),
+        ) else {
             break;
         };
+        let hwcap = u64::from(hwcap_hi) << 32 | u64::from(hwcap_lo);
         if let Some(s) = read_str(data, base + value as usize) {
-            out.push((flags, s));
+            out.push((flags, hwcap, s));
         }
     }
     out
@@ -222,7 +249,7 @@ fn new_entries(data: &[u8], base: usize) -> Vec<(u32, &str)> {
 
 /// Entries of an old-format cache with `nlibs` entries and a string table
 /// beginning at `strings`.
-fn old_entries(data: &[u8], nlibs: usize, strings: usize) -> Vec<(u32, &str)> {
+fn old_entries(data: &[u8], nlibs: usize, strings: usize) -> Vec<(u32, u64, &str)> {
     let mut out = Vec::new();
     for i in 0..nlibs {
         let entry = 16 + i * 12;
@@ -230,7 +257,7 @@ fn old_entries(data: &[u8], nlibs: usize, strings: usize) -> Vec<(u32, &str)> {
             break;
         };
         if let Some(s) = read_str(data, strings + value as usize) {
-            out.push((flags, s));
+            out.push((flags, 0, s));
         }
     }
     out
@@ -256,7 +283,7 @@ mod tests {
     use super::*;
 
     fn paths(img: &[u8]) -> Vec<&str> {
-        cache_entries(img).into_iter().map(|(_, p)| p).collect()
+        cache_entries(img).into_iter().map(|(_, _, p)| p).collect()
     }
 
     /// A new-format cache image naming `paths`.
@@ -267,7 +294,13 @@ mod tests {
 
     /// A new-format cache image naming `entries` as `(flags, path)`.
     fn new_cache_flagged(entries: &[(u32, &str)]) -> Vec<u8> {
-        let paths: Vec<&str> = entries.iter().map(|(_, p)| *p).collect();
+        let full: Vec<(u32, u64, &str)> = entries.iter().map(|(f, p)| (*f, 0, *p)).collect();
+        new_cache_hwcap(&full)
+    }
+
+    /// A new-format cache image naming `entries` as `(flags, hwcap, path)`.
+    fn new_cache_hwcap(entries: &[(u32, u64, &str)]) -> Vec<u8> {
+        let paths: Vec<&str> = entries.iter().map(|(_, _, p)| *p).collect();
         let mut out = Vec::from(CACHE_MAGIC_NEW);
         out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // len_strings
@@ -280,12 +313,12 @@ mod tests {
         let base = out.len();
         let strings_at = base + paths.len() * 24;
         let (offsets, strings) = string_table(&paths, strings_at);
-        for (off, (flags, _)) in offsets.into_iter().zip(entries) {
+        for (off, (flags, hwcap, _)) in offsets.into_iter().zip(entries) {
             out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes()); // key
             out.extend_from_slice(&(off as u32).to_le_bytes()); // value
             out.extend_from_slice(&0u32.to_le_bytes()); // osversion
-            out.extend_from_slice(&0u64.to_le_bytes()); // hwcap
+            out.extend_from_slice(&hwcap.to_le_bytes());
         }
         out.extend_from_slice(&strings);
         out
@@ -433,6 +466,31 @@ mod tests {
         assert_eq!(
             cache_paths(&img),
             ["/usr/lib64/libGL.so.1", "/usr/lib64/libc.so.6"]
+        );
+    }
+
+    /// ldconfig lists hwcaps copies before the base copy. Keeping the first
+    /// path per soname would give a CPU without AVX2 the x86-64-v3 build.
+    #[test]
+    fn hwcaps_copies_yield_to_a_base_copy() {
+        let flags = native_entry_flags();
+        // glibc 2.33+ marks glibc-hwcaps entries with bit 62 and an index.
+        let ext = 1u64 << 62;
+        let img = new_cache_hwcap(&[
+            (flags, ext, "/usr/lib64/glibc-hwcaps/x86-64-v3/libzstd.so.1"),
+            (flags, 0, "/usr/lib64/glibc-hwcaps/x86-64-v2/libzstd.so.1"),
+            (flags, 0, "/usr/lib64/libzstd.so.1"),
+            (flags, 1 << 3, "/usr/lib64/haswell/libfoo.so.1"),
+            (flags, 0, "/usr/lib64/libfoo.so.1"),
+            (flags, ext, "/usr/lib64/glibc-hwcaps/x86-64-v3/libonly.so.1"),
+        ]);
+        assert_eq!(
+            cache_paths(&img),
+            [
+                "/usr/lib64/libzstd.so.1",
+                "/usr/lib64/libfoo.so.1",
+                "/usr/lib64/glibc-hwcaps/x86-64-v3/libonly.so.1",
+            ]
         );
     }
 }
