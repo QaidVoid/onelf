@@ -146,6 +146,11 @@ enum Commands {
         /// reproducible output, independent of filesystem timestamps.
         #[arg(long)]
         mtime: Option<u64>,
+
+        /// Startup profile recorded with ONELF_PROFILE: the runtime
+        /// decompresses the blocks it lists ahead of the app
+        #[arg(long, value_name = "FILE")]
+        prefetch: Option<PathBuf>,
     },
 
     /// Scaffold a starter onelf.toml
@@ -666,6 +671,7 @@ fn main() {
             preload,
             needs_setuid,
             mtime,
+            prefetch,
         } => {
             let memfd_opt = if no_memfd {
                 Some(false)
@@ -693,9 +699,10 @@ fn main() {
                 );
             }
             let update_key = update_key.as_deref().map(std::fs::read).transpose();
-            match update_key {
+            let profile = prefetch.as_deref().map(pack::read_profile).transpose();
+            match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),
-                Ok(update_key) => pack::pack(
+                Ok((update_key, profile)) => pack::pack(
                     &pack::PackOptions {
                         directory,
                         output,
@@ -723,6 +730,7 @@ fn main() {
                         paths: Vec::new(),
                         preload,
                         needs_setuid,
+                        profile,
                     },
                     // Pick the runtime: slim (~700KB) by default; the
                     // update-capable runtime (~2MB) when the user configures
@@ -1236,6 +1244,10 @@ fn run_build(
     };
 
     let package_info = build_package_info(&recipe.package);
+    let profile = match &recipe.compression.prefetch {
+        Some(path) => pack::read_profile(&dir.join(path))?,
+        None => Vec::new(),
+    };
 
     pack::pack(
         &pack::PackOptions {
@@ -1269,6 +1281,7 @@ fn run_build(
             paths: recipe.paths.into_iter().collect(),
             preload: recipe.preload,
             needs_setuid: recipe.package.needs_setuid,
+            profile,
         },
         runtime,
     )

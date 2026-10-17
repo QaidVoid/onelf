@@ -149,6 +149,9 @@ pub struct Compression {
     /// `level`. Larger file, zero decompression at runtime.
     #[serde(default)]
     pub store: bool,
+    /// Startup profile recorded with `ONELF_PROFILE`, relative to the
+    /// recipe. See [`crate::pack::read_profile`].
+    pub prefetch: Option<PathBuf>,
 }
 
 impl Default for Compression {
@@ -158,6 +161,7 @@ impl Default for Compression {
             block_size: default_block_size(),
             dict: false,
             store: false,
+            prefetch: None,
         }
     }
 }

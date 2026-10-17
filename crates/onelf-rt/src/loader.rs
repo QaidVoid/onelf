@@ -92,17 +92,18 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
 /// reassembling all of it: the check is per block, so memory stays
 /// proportional to the read rather than to the entry. Blocks from a
 /// version-1 manifest carry no hash, and the caller falls back to the
-/// whole-entry check for those.
+/// whole-entry check for those. The read leaves the file position alone, so
+/// the FUSE server's prefetch workers can share the file.
 pub fn read_payload_entry(
-    file: &mut File,
+    file: &File,
     footer: &Footer,
     block: &onelf_format::Block,
     dict: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
     let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
-    file.seek(SeekFrom::Start(abs))?;
     let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf)?;
+    file.read_exact_at(&mut buf, abs)?;
 
     // Store mode: bytes are the file content verbatim, no zstd. The hash
     // check still applies: a corrupt or tampered stored block must fail

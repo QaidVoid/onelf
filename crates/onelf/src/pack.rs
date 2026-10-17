@@ -110,6 +110,76 @@ pub struct PackOptions {
     /// and read by the runtime before it picks how to unpack itself. Keeps the
     /// app out of a user namespace, where a setuid bit does nothing.
     pub needs_setuid: bool,
+    /// Blocks a startup reads, as `(path, offset)` in the order it first
+    /// read them, from [`read_profile`]. Packed as `.onelf/prefetch` for the
+    /// runtime to decompress ahead of the app.
+    pub profile: Vec<(String, u64)>,
+}
+
+/// Where the runtime looks for the blocks to prefetch.
+const PREFETCH_FILE: &str = ".onelf/prefetch";
+
+/// Read a profile recorded with `ONELF_PROFILE`: one `path<TAB>offset` line
+/// per block, in the order the run first read them. Blank lines and `#`
+/// comments are skipped.
+pub fn read_profile(path: &Path) -> io::Result<Vec<(String, u64)>> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    parse_profile(&text).map_err(|(line, what)| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}:{line}: {what}", path.display()),
+        )
+    })
+}
+
+fn parse_profile(text: &str) -> Result<Vec<(String, u64)>, (usize, &'static str)> {
+    let mut blocks = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (path, offset) = line
+            .split_once('\t')
+            .ok_or((n + 1, "expected a path and an offset separated by a tab"))?;
+        let offset = offset
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| (n + 1, "the offset is not a number"))?;
+        blocks.push((path.to_string(), offset));
+    }
+    Ok(blocks)
+}
+
+/// The `.onelf/prefetch` lines for `profile`: `path<TAB>block` for each
+/// block of `files` it names, in its order, each block once. A profile
+/// taken with another block size still lands on the block holding each
+/// offset, and a path this tree does not have is left out.
+fn prefetch_lines(
+    files: &[CollectedFile],
+    profile: &[(String, u64)],
+    block_size: u64,
+) -> Vec<String> {
+    let sizes: HashMap<&Path, u64> = files
+        .iter()
+        .map(|f| (f.rel_path.as_path(), f.size))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for (path, offset) in profile {
+        let rel = package_relative(path);
+        if !sizes.get(rel.as_path()).is_some_and(|&size| *offset < size) {
+            continue;
+        }
+        let Some(rel) = rel.to_str() else {
+            continue;
+        };
+        let block = offset / block_size;
+        if seen.insert((rel.to_string(), block)) {
+            lines.push(format!("{rel}\t{block}"));
+        }
+    }
+    lines
 }
 
 /// Where a file's bytes come from when they are finally needed.
@@ -976,6 +1046,23 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             Vec::new(),
             inject_mtime,
         );
+    }
+
+    // Last, so every file the profile may name has been collected.
+    if !opts.profile.is_empty() {
+        let lines = prefetch_lines(&files, &opts.profile, opts.block_size);
+        if lines.is_empty() {
+            eprintln!("warning: the profile names no block of this tree; nothing to prefetch");
+        } else {
+            eprintln!("  Prefetch: {} blocks from the profile", lines.len());
+            inject_onelf_file(
+                &mut dirs,
+                &mut files,
+                PREFETCH_FILE,
+                lines.join("\n").into_bytes(),
+                inject_mtime,
+            );
+        }
     }
 
     pb.finish_with_message(format!(
@@ -1906,6 +1993,7 @@ mod tests {
             env: Vec::new(),
             preload: Vec::new(),
             needs_setuid: false,
+            profile: Vec::new(),
         }
     }
 
@@ -2150,5 +2238,64 @@ mod tests {
         pack(&opts, b"stub-runtime").unwrap();
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sized(path: &str, size: u64) -> CollectedFile {
+        CollectedFile {
+            rel_path: PathBuf::from(path),
+            source: FileSource::Memory(Vec::new()),
+            size,
+            mode: 0o644,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+        }
+    }
+
+    #[test]
+    fn a_profile_reads_as_paths_and_offsets() {
+        let text = "# a comment\nlib/libfoo.so\t0\n\nlib/libfoo.so\t65536\nbin/app\t4096\n";
+        assert_eq!(
+            parse_profile(text).unwrap(),
+            vec![
+                ("lib/libfoo.so".to_string(), 0),
+                ("lib/libfoo.so".to_string(), 65536),
+                ("bin/app".to_string(), 4096),
+            ]
+        );
+        assert_eq!(parse_profile("lib/libfoo.so\n").unwrap_err().0, 1);
+        assert_eq!(parse_profile("bin/app\t0\nlib/x\tten\n").unwrap_err().0, 2);
+    }
+
+    /// The prefetch list keeps the profile's order, lands each offset on
+    /// the block holding it at this block size, names each block once, and
+    /// leaves out what this tree does not have.
+    #[test]
+    fn the_prefetch_list_follows_the_profile_through_this_tree() {
+        let files = vec![sized("bin/app", 100_000), sized("lib/libfoo.so", 300_000)];
+        let profile: Vec<(String, u64)> = [
+            ("lib/libfoo.so", 200_000),
+            ("bin/app", 0),
+            ("./lib/libfoo.so", 0),
+            ("lib/libfoo.so", 70_000),
+            ("lib/libgone.so", 0),
+            ("bin/app", 100_000),
+            ("lib/libfoo.so", 1),
+        ]
+        .iter()
+        .map(|(p, o)| (p.to_string(), *o))
+        .collect();
+        assert_eq!(
+            prefetch_lines(&files, &profile, 64 * 1024),
+            [
+                "lib/libfoo.so\t3",
+                "bin/app\t0",
+                "lib/libfoo.so\t0",
+                "lib/libfoo.so\t1"
+            ]
+        );
+        assert_eq!(
+            prefetch_lines(&files, &profile, 256 * 1024),
+            ["lib/libfoo.so\t0", "bin/app\t0"]
+        );
     }
 }

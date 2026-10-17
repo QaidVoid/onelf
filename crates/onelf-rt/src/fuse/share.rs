@@ -55,11 +55,13 @@ pub(crate) enum Declined {
 }
 
 /// Whether this launch may share a mount. `ONELF_FUSE_NO_SHARE` turns it
-/// off. A traced launch never shares: the trace is recorded by the server,
-/// which would record what every instance reads.
+/// off. A traced or profiled launch never shares: the server records, so
+/// joining one would record nothing and serving others would record what
+/// every instance reads.
 pub(crate) fn wanted() -> bool {
-    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0");
-    !set("ONELF_FUSE_NO_SHARE") && std::env::var_os("ONELF_TRACE").is_none_or(|v| v.is_empty())
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    let on = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0");
+    !on("ONELF_FUSE_NO_SHARE") && !set("ONELF_TRACE") && !set("ONELF_PROFILE")
 }
 
 /// What the record says about the server.

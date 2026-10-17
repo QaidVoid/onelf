@@ -242,6 +242,39 @@ for it:
 Otherwise a host where every earlier rung fails gets an error saying
 so, with `ONELF_CACHE=1` named as the way to allow the extraction.
 
+## Prefetching a startup
+
+The FUSE modes decompress a block when the app first reads it, one
+request at a time. A large app reads thousands of blocks before it is
+ready, mostly scattered pieces of its libraries, and waits on each. A
+profile records which blocks a startup reads. A package built with it
+decompresses those blocks on spare cores ahead of the app, so the reads
+find them ready:
+
+```bash
+ONELF_MODE=fuse ONELF_PROFILE=profile.txt ./myapp.onelf --some-startup
+onelf pack ./myapp -o myapp.onelf --command bin/myapp --prefetch profile.txt
+```
+
+In a recipe, set `prefetch = "profile.txt"` under `[compression]`.
+
+- ✅ Record the startup your users wait on. On Blender 5.2 a profiled
+  package started headless in 1.1 s instead of 2.4 s with a cold page
+  cache, and printed `--version` in 0.7 s instead of 1.9 s.
+- ✅ Record again when the app changes. A profile names files and byte
+  offsets, so it survives a new block size, and the packer skips what
+  the tree no longer has.
+- ☑️ A stale profile costs memory and CPU, never correctness. The
+  workers hold at most 32 MiB nobody has read yet, a read never waits
+  for them, and what a read gets is the same either way. Everything
+  left is dropped once the app has stopped reading for a few seconds.
+- ⚠️ The prefetch runs on up to four threads and always leaves one core
+  free, so on a single-core host it does nothing.
+- ❌ Using a [trace](./sysroot#the-three-tiers) as a profile. A trace
+  lists files for pruning a sysroot build and starts when the app is
+  launched. A profile lists blocks and starts with the mount, because
+  what the runtime reads before the launch is part of every startup.
+
 ## Comparison
 
 | Mode | First run | Next run | Visible | Persistent | Deps |

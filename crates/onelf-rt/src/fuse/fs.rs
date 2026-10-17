@@ -2,13 +2,15 @@
 //!
 //! Implements the low-level FUSE ops (lookup, getattr, readdir, read, etc.)
 //! against the in-memory manifest. File reads decompress payload blocks on
-//! demand with a per-inode block cache and sequential prefetch.
+//! demand with a per-inode block cache.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use onelf_format::Manifest;
@@ -91,8 +93,8 @@ const DETACHED_PROBE_SECS: u64 = 5;
 /// Default ceiling on decompressed blocks held in memory.
 ///
 /// At the packer's default 256 KiB block size this is 128 blocks, far more
-/// than the one-block-ahead prefetch needs, while keeping the server itself
-/// from becoming the memory problem it exists to avoid. The packer caps
+/// than the reads in flight need, while keeping the server itself from
+/// becoming the memory problem it exists to avoid. The packer caps
 /// `--block-size` at this budget so a single block always fits.
 const DEFAULT_CACHE_BUDGET: usize = 32 * 1024 * 1024;
 
@@ -142,9 +144,9 @@ impl BlockCache {
     ///
     /// `pinned` names blocks of `inode` that the read in progress will read
     /// back, and which therefore must survive regardless of the budget.
-    /// Without that, a read spanning more blocks than the budget holds, or a
-    /// prefetch landing on a full cache, evicts a block that is about to be
-    /// borrowed.
+    /// Without that, a read spanning more blocks than the budget holds, or
+    /// another block landing on a full cache, evicts a block that is about to
+    /// be borrowed.
     fn insert_block(&mut self, inode: u64, block_index: usize, content: Vec<u8>, pinned: &[usize]) {
         self.last_access = Some(Instant::now());
         let key = (inode, block_index);
@@ -178,7 +180,9 @@ impl BlockCache {
         self.data.insert(key, content);
     }
 
-    fn maybe_clear(&mut self) {
+    /// Clear everything once nothing was inserted for [`CACHE_IDLE_SECS`],
+    /// and say whether it did.
+    fn maybe_clear(&mut self) -> bool {
         if let Some(last) = self.last_access
             && last.elapsed().as_secs() >= CACHE_IDLE_SECS
         {
@@ -187,7 +191,9 @@ impl BlockCache {
             self.order.clear();
             self.bytes = 0;
             self.last_access = None;
+            return true;
         }
+        false
     }
 
     fn is_active(&self) -> bool {
@@ -265,6 +271,290 @@ fn appdir_to_sysroot(path: &str) -> Option<String> {
         Some(path.to_string())
     } else {
         Some(format!("usr/{path}"))
+    }
+}
+
+/// Records each block a read touches for the first time into the file
+/// named by `ONELF_PROFILE`, as `path<TAB>offset` in the order the reads
+/// came. Unlike a trace it starts with the mount, since what the runtime
+/// reads before the app starts is part of every launch too. The packer
+/// turns such a profile into [`PREFETCH_FILE`] for [`Prefetch`].
+struct ProfileRecorder {
+    file: File,
+    seen: HashSet<BlockKey>,
+}
+
+impl ProfileRecorder {
+    /// A recorder when `ONELF_PROFILE` names a writable file, else none.
+    /// The file is appended, so several runs accumulate into one profile.
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("ONELF_PROFILE").filter(|v| !v.is_empty())?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file,
+            seen: HashSet::new(),
+        })
+    }
+
+    fn record(&mut self, manifest: &Manifest, entry_idx: usize, block: usize, offset: usize) {
+        if self.seen.insert((entry_to_inode(entry_idx), block)) {
+            let _ = writeln!(self.file, "{}\t{offset}", manifest.entry_path(entry_idx));
+        }
+    }
+}
+
+/// The blocks a startup reads, as the packer recorded them from a profile:
+/// one `path<TAB>block` line each, in the order they were first read.
+pub(crate) const PREFETCH_FILE: &str = ".onelf/prefetch";
+
+/// Decompressed bytes the prefetch may hold that no read has taken yet.
+///
+/// This bounds how far it runs ahead of the app, and so what it costs in
+/// memory when the profile no longer matches what the app does. On a
+/// Blender startup this much hid nearly all of the decompression, and
+/// twice as much gained a few percent at most.
+const PREFETCH_WINDOW: usize = 32 * 1024 * 1024;
+
+/// Most worker threads the prefetch runs. Each decompresses one block at a
+/// time, so this is how many cores it takes from the app at most. One core
+/// is always left for the app and this server.
+const PREFETCH_THREADS: usize = 4;
+
+/// Package-relative paths resolved against the tree one component at a
+/// time. A directory's names are indexed the first time a path passes
+/// through it, since a profile names hundreds of files in the same few
+/// directories.
+struct PathIndex<'m> {
+    manifest: &'m Manifest,
+    children: &'m [Vec<u64>],
+    dirs: HashMap<u64, HashMap<&'m str, u64>>,
+}
+
+impl<'m> PathIndex<'m> {
+    fn new(manifest: &'m Manifest, children: &'m [Vec<u64>]) -> Self {
+        Self {
+            manifest,
+            children,
+            dirs: HashMap::new(),
+        }
+    }
+
+    fn entry(&mut self, path: &str) -> Option<usize> {
+        let (manifest, children) = (self.manifest, self.children);
+        let mut inode = entry_to_inode(0);
+        for name in path.split('/') {
+            let names = self.dirs.entry(inode).or_insert_with(|| {
+                children[inode as usize]
+                    .iter()
+                    .map(|&c| {
+                        (
+                            manifest.get_string(manifest.entries[inode_to_entry(c)].name),
+                            c,
+                        )
+                    })
+                    .collect()
+            });
+            inode = *names.get(name)?;
+        }
+        Some(inode_to_entry(inode))
+    }
+}
+
+/// The blocks [`PREFETCH_FILE`] lists, in its order. Lines naming nothing
+/// in this package are skipped: the profile is a hint, never a reason to
+/// refuse a launch.
+fn profiled_blocks(
+    manifest: &Manifest,
+    children: &[Vec<u64>],
+    file: &mut File,
+    footer: &onelf_format::Footer,
+    dict: Option<&[u8]>,
+) -> Vec<(BlockKey, onelf_format::Block)> {
+    let mut index = PathIndex::new(manifest, children);
+    let Some(idx) = index.entry(PREFETCH_FILE) else {
+        return Vec::new();
+    };
+    let Ok(data) = loader::read_verified_entry(file, footer, &manifest.entries[idx], dict) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&data);
+    let mut seen = HashSet::new();
+    let mut blocks = Vec::new();
+    for line in text.lines() {
+        let Some((path, block)) = line.split_once('\t') else {
+            continue;
+        };
+        let (Some(idx), Ok(block)) = (index.entry(path), block.parse::<usize>()) else {
+            continue;
+        };
+        let Some(b) = manifest.entries[idx].blocks.get(block) else {
+            continue;
+        };
+        let key = (entry_to_inode(idx), block);
+        if seen.insert(key) {
+            blocks.push((key, b.clone()));
+        }
+    }
+    blocks
+}
+
+/// Decompresses the blocks a startup profile lists, in its order, on
+/// worker threads, so the app's reads find them ready instead of waiting
+/// on zstd one request at a time.
+///
+/// Reads never wait on it. A block a read needs before a worker has it is
+/// decompressed by the read as always, and the worker's copy is dropped.
+/// The workers stop when this is dropped, which has to happen before the
+/// process forks: a fork copies only the calling thread, and a lock a
+/// worker held would stay held in the copy.
+struct Prefetch {
+    shared: Arc<Prefetched>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct Prefetched {
+    blocks: Vec<(BlockKey, onelf_format::Block)>,
+    wanted: HashSet<BlockKey>,
+    /// Index into `blocks` of the next one a worker takes.
+    next: AtomicUsize,
+    store: Mutex<Store>,
+    /// Signalled when a read takes a block, which makes room in the window.
+    room: Condvar,
+    window: usize,
+}
+
+#[derive(Default)]
+struct Store {
+    ready: HashMap<BlockKey, Vec<u8>>,
+    bytes: usize,
+    /// Blocks a read decompressed itself, which a worker must not add.
+    taken: HashSet<BlockKey>,
+    stop: bool,
+}
+
+impl Prefetched {
+    fn new(blocks: Vec<(BlockKey, onelf_format::Block)>, window: usize) -> Self {
+        Self {
+            wanted: blocks.iter().map(|(key, _)| *key).collect(),
+            blocks,
+            next: AtomicUsize::new(0),
+            store: Mutex::new(Store::default()),
+            room: Condvar::new(),
+            window,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn work(&self, file: &File, footer: &onelf_format::Footer, dict: Option<&[u8]>) {
+        loop {
+            let Some((key, block)) = self.blocks.get(self.next.fetch_add(1, Ordering::Relaxed))
+            else {
+                return;
+            };
+            {
+                let mut store = self.lock();
+                while !store.stop && store.bytes >= self.window {
+                    store = self.room.wait(store).unwrap_or_else(|e| e.into_inner());
+                }
+                if store.stop {
+                    return;
+                }
+                if store.taken.contains(key) {
+                    continue;
+                }
+            }
+            let Ok(data) = loader::read_payload_entry(file, footer, block, dict) else {
+                continue;
+            };
+            let mut store = self.lock();
+            if store.stop {
+                return;
+            }
+            if !store.taken.contains(key) && !store.ready.contains_key(key) {
+                store.bytes += data.len();
+                store.ready.insert(*key, data);
+            }
+        }
+    }
+}
+
+impl Prefetch {
+    /// Start prefetching `blocks`, unless there are none or no core to
+    /// spare for it.
+    fn start(
+        blocks: Vec<(BlockKey, onelf_format::Block)>,
+        file: &File,
+        footer: &onelf_format::Footer,
+        dict: Option<&[u8]>,
+    ) -> Option<Self> {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = PREFETCH_THREADS.min(cores.saturating_sub(1));
+        if threads == 0 || blocks.is_empty() {
+            return None;
+        }
+        let shared = Arc::new(Prefetched::new(blocks, PREFETCH_WINDOW));
+        let dict: Option<Arc<[u8]>> = dict.map(Arc::from);
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let Ok(file) = file.try_clone() else {
+                break;
+            };
+            let shared = Arc::clone(&shared);
+            let footer = footer.clone();
+            let dict = dict.clone();
+            let spawned = std::thread::Builder::new()
+                .name("onelf-prefetch".into())
+                .spawn(move || shared.work(&file, &footer, dict.as_deref()));
+            match spawned {
+                Ok(worker) => workers.push(worker),
+                Err(_) => break,
+            }
+        }
+        if workers.is_empty() {
+            return None;
+        }
+        Some(Self { shared, workers })
+    }
+
+    /// The block, when a worker has it ready. Otherwise the caller
+    /// decompresses it, and no worker adds it afterwards.
+    fn take(&self, key: BlockKey) -> Option<Vec<u8>> {
+        if !self.shared.wanted.contains(&key) {
+            return None;
+        }
+        let mut store = self.shared.lock();
+        match store.ready.remove(&key) {
+            Some(data) => {
+                store.bytes -= data.len();
+                self.shared.room.notify_one();
+                Some(data)
+            }
+            None => {
+                store.taken.insert(key);
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        {
+            let mut store = self.shared.lock();
+            store.stop = true;
+            store.ready.clear();
+        }
+        self.shared.room.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -352,6 +642,10 @@ pub struct FuseState<'a> {
     verified: HashMap<u64, bool>,
     /// Present when `ONELF_TRACE` asked for a trace of this run.
     recorder: Option<TraceRecorder>,
+    /// Present when `ONELF_PROFILE` asked for a profile of this run.
+    profile: Option<ProfileRecorder>,
+    /// Present while the package's startup profile is being prefetched.
+    prefetch: Option<Prefetch>,
     synthetic: Synthetic,
     /// Where the launching child sends the links it resolved, until it has.
     inbox: Option<crate::links::Receiver>,
@@ -365,6 +659,8 @@ impl<'a> FuseState<'a> {
         dict: Option<&'a [u8]>,
     ) -> Self {
         let children = build_children(manifest);
+        let profiled = profiled_blocks(manifest, &children, file, footer, dict);
+        let prefetch = Prefetch::start(profiled, file, footer, dict);
         Self {
             manifest,
             file,
@@ -374,6 +670,8 @@ impl<'a> FuseState<'a> {
             cache: BlockCache::new(cache_budget()),
             verified: HashMap::new(),
             recorder: TraceRecorder::from_env(),
+            profile: ProfileRecorder::from_env(),
+            prefetch,
             synthetic: Synthetic::new(manifest),
             inbox: None,
         }
@@ -455,7 +753,7 @@ impl<'a> FuseState<'a> {
         };
 
         loop {
-            self.cache.maybe_clear();
+            self.clear_if_idle();
 
             let timeout = if self.cache.is_active() {
                 Some(&cache_timeout)
@@ -516,6 +814,21 @@ impl<'a> FuseState<'a> {
         }
     }
 
+    /// End the prefetch. Its workers do not survive a fork, so a caller
+    /// that forks to keep serving calls this first.
+    pub fn stop_prefetch(&mut self) {
+        self.prefetch = None;
+    }
+
+    /// Drop the cached blocks once reads have stopped for a while, and with
+    /// them whatever the prefetch still holds: by then the startup it was
+    /// for is over.
+    fn clear_if_idle(&mut self) {
+        if self.cache.maybe_clear() {
+            self.prefetch = None;
+        }
+    }
+
     /// Serve the mount until `is_idle` says nothing is using it any more.
     ///
     /// Runs after the death pipe has already hung up. That is not proof the
@@ -544,7 +857,7 @@ impl<'a> FuseState<'a> {
         };
 
         loop {
-            self.cache.maybe_clear();
+            self.clear_if_idle();
 
             let mut poll_fds = [PollFd::new(fuse_fd, PollFlags::IN)];
             let timed_out = match poll(&mut poll_fds, Some(&wait)) {
@@ -731,13 +1044,32 @@ impl<'a> FuseState<'a> {
             &needed_heap
         };
 
-        // Decompress missing blocks
+        // Only the blocks this read covers. The kernel already reads ahead
+        // for a sequential reader, and decompressing the next block too,
+        // before replying, made every scattered read wait for a block it did
+        // not ask for. Loading libraries is almost nothing but such reads.
         for &block_idx in needed_blocks {
+            if let Some(profile) = self.profile.as_mut() {
+                profile.record(
+                    self.manifest,
+                    entry_idx,
+                    block_idx,
+                    block_offsets[block_idx],
+                );
+            }
             if self.cache.get_block(inode, block_idx).is_some() {
                 continue;
             }
             let block = &entry.blocks[block_idx];
-            match loader::read_payload_entry(self.file, self.footer, block, self.dict) {
+            let prefetched = self
+                .prefetch
+                .as_ref()
+                .and_then(|p| p.take((inode, block_idx)));
+            let data = match prefetched {
+                Some(data) => Ok(data),
+                None => loader::read_payload_entry(self.file, self.footer, block, self.dict),
+            };
+            match data {
                 Ok(data) => {
                     self.cache
                         .insert_block(inode, block_idx, data, needed_blocks);
@@ -747,16 +1079,6 @@ impl<'a> FuseState<'a> {
                     let _ = rustix::io::write(fuse_fd, &r);
                     return;
                 }
-            }
-        }
-
-        // Prefetch next sequential block
-        if let Some(&last_needed) = needed_blocks.last() {
-            let next = last_needed + 1;
-            if next < num_blocks && self.cache.get_block(inode, next).is_none() {
-                let block = &entry.blocks[next];
-                let _ = loader::read_payload_entry(self.file, self.footer, block, self.dict)
-                    .map(|data| self.cache.insert_block(inode, next, data, needed_blocks));
             }
         }
 
@@ -1380,15 +1702,138 @@ mod tests {
             );
         }
 
-        // A prefetch on a full cache must not take one either.
+        // Another block landing on a full cache must not take one either.
         c.insert_block(1, 5, block(100), &needed);
         for i in needed {
-            assert!(c.get_block(1, i).is_some(), "prefetch evicted block {i}");
+            assert!(c.get_block(1, i).is_some(), "an insert evicted block {i}");
         }
 
         // Once nothing is pinned, the budget is enforced again.
         c.insert_block(2, 0, block(100), &[]);
         assert!(c.bytes <= 600, "unpinned inserts must still evict");
+    }
+
+    /// A stored (uncompressed) payload of `contents`, one block each, in a
+    /// file of its own, with the footer and blocks a read needs.
+    fn stored_payload(
+        tag: &str,
+        contents: &[&[u8]],
+    ) -> (File, onelf_format::Footer, Vec<onelf_format::Block>) {
+        let path =
+            std::env::temp_dir().join(format!("onelf-prefetch-{tag}-{}", std::process::id()));
+        std::fs::write(&path, contents.concat()).unwrap();
+        let file = File::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut offset = 0;
+        let blocks = contents
+            .iter()
+            .map(|c| {
+                let b = onelf_format::Block {
+                    payload_offset: offset,
+                    compressed_size: c.len() as u64,
+                    original_size: c.len() as u64,
+                    content_hash: *blake3::hash(c).as_bytes(),
+                };
+                offset += c.len() as u64;
+                b
+            })
+            .collect();
+        let footer = onelf_format::Footer {
+            format_version: 2,
+            flags: onelf_format::Flags::STORED,
+            manifest_offset: 0,
+            manifest_compressed: 0,
+            manifest_original: 0,
+            payload_offset: 0,
+            payload_size: offset,
+            dict_offset: 0,
+            dict_size: 0,
+            manifest_checksum: [0; 4],
+        };
+        (file, footer, blocks)
+    }
+
+    fn prefetch_of(blocks: &[onelf_format::Block], window: usize) -> Prefetch {
+        let jobs = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| ((1, i), b.clone()))
+            .collect();
+        Prefetch {
+            shared: Arc::new(Prefetched::new(jobs, window)),
+            workers: Vec::new(),
+        }
+    }
+
+    /// What a read takes from the prefetch is byte for byte what it would
+    /// have decompressed itself.
+    #[test]
+    fn a_prefetched_block_is_what_the_read_would_have_read() {
+        let contents: [&[u8]; 3] = [b"first block", b"second block", b"third"];
+        let (file, footer, blocks) = stored_payload("same", &contents);
+        let prefetch = prefetch_of(&blocks, usize::MAX);
+        prefetch.shared.work(&file, &footer, None);
+        for (i, b) in blocks.iter().enumerate() {
+            let direct = loader::read_payload_entry(&file, &footer, b, None).unwrap();
+            assert_eq!(prefetch.take((1, i)).as_deref(), Some(contents[i]));
+            assert_eq!(direct, contents[i]);
+        }
+        assert_eq!(
+            prefetch.shared.lock().bytes,
+            0,
+            "taking a block frees its room"
+        );
+    }
+
+    /// A read that got there first decompressed the block itself, so a
+    /// worker finishing it later must not keep a copy nobody will take.
+    #[test]
+    fn a_block_a_read_took_is_not_kept_afterwards() {
+        let (file, footer, blocks) = stored_payload("taken", &[b"aaaa", b"bbbb"]);
+        let prefetch = prefetch_of(&blocks, usize::MAX);
+        assert!(prefetch.take((1, 0)).is_none());
+        prefetch.shared.work(&file, &footer, None);
+        assert!(prefetch.take((1, 0)).is_none());
+        assert_eq!(prefetch.take((1, 1)).as_deref(), Some(&b"bbbb"[..]));
+    }
+
+    /// Blocks the profile does not list are the read's alone and leave no
+    /// trace in the prefetch.
+    #[test]
+    fn a_block_outside_the_profile_is_left_to_the_read() {
+        let (_file, _footer, blocks) = stored_payload("outside", &[b"aaaa"]);
+        let prefetch = prefetch_of(&blocks, usize::MAX);
+        assert!(prefetch.take((2, 0)).is_none());
+        assert!(prefetch.take((1, 7)).is_none());
+        assert!(prefetch.shared.lock().taken.is_empty());
+    }
+
+    /// The window holds the workers back until reads take what they made,
+    /// and dropping the prefetch stops a worker that is waiting for room.
+    #[test]
+    fn the_window_bounds_what_waits_unread() {
+        let contents: [&[u8]; 3] = [b"0123", b"4567", b"89ab"];
+        let (file, footer, blocks) = stored_payload("window", &contents);
+        let mut prefetch = prefetch_of(&blocks, 4);
+        let shared = Arc::clone(&prefetch.shared);
+        prefetch.workers.push(std::thread::spawn(move || {
+            shared.work(&file, &footer, None)
+        }));
+
+        let ready = |p: &Prefetch, key: BlockKey| {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !p.shared.lock().ready.contains_key(&key) {
+                assert!(Instant::now() < deadline, "block {key:?} never arrived");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        ready(&prefetch, (1, 0));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(prefetch.shared.lock().ready.len(), 1, "the window is full");
+
+        assert_eq!(prefetch.take((1, 0)).as_deref(), Some(contents[0]));
+        ready(&prefetch, (1, 1));
+        drop(prefetch);
     }
 
     #[test]

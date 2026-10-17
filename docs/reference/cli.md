@@ -69,6 +69,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--block-size SIZE` | `256K` | Bytes per payload block, `K`/`M` suffix allowed (4K to 32M) |
 | `--dict` | `false` | Train shared zstd dictionary |
 | `--no-compress` | `false` | Store payload raw, no zstd (overrides `--dict`) |
+| `--prefetch FILE` | | Startup profile recorded with `ONELF_PROFILE`. The runtime decompresses the blocks it lists ahead of the app. See [Prefetching a startup](../guide/execution-modes#prefetching-a-startup) |
 | `--preload PATH` | | Library dlopen'd on every exec via onelf-env (repeatable, re-exec-safe) |
 | `--memfd` | `false` | Mark the default entrypoint memfd-eligible (conflicts with `--no-memfd`) |
 | `--no-memfd` | `false` | Force memfd eligibility off |

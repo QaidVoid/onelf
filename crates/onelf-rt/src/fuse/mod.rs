@@ -553,6 +553,7 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
             // losing it tears the filesystem down under the process that was
             // about to appear. Hand off unconditionally and let the background
             // server ask once things have settled.
+            state.stop_prefetch();
             let handed_off = match unsafe { kernel_fork() } {
                 Ok(Fork::Child(_)) => {
                     detach_from_caller();

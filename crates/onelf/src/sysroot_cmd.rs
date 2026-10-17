@@ -325,6 +325,7 @@ fn pack_tree(
             paths: Vec::new(),
             preload: Vec::new(),
             needs_setuid: false,
+            profile: Vec::new(),
         },
         runtime,
     )?;

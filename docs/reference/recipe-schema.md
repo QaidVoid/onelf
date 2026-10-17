@@ -88,6 +88,7 @@ level = 19            # i32, 0..=22, default 19
 block-size = 262144   # u64 bytes, 4 KiB..=32 MiB, default 256 KiB
 dict = false          # bool, default false
 store = false         # bool, default false
+prefetch = "profile.txt"   # path, relative to the recipe, optional
 ```
 
 Higher levels pack tighter but are slower. `dict = true` trains a shared
@@ -107,6 +108,11 @@ package size for zero decompression at runtime. It overrides `dict` and
 `level`. Useful when the payload is dominated by already-compressed or
 incompressible assets. The manifest stays compressed regardless (it is
 small and separate from the payload).
+
+`prefetch` names a profile of the blocks a startup reads, recorded with
+`ONELF_PROFILE`. The packer writes the blocks it names to
+`.onelf/prefetch`, and the runtime decompresses them ahead of the app. See
+[Prefetching a startup](../guide/execution-modes#prefetching-a-startup).
 
 ## `[update]`
 

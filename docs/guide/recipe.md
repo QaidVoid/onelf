@@ -114,6 +114,7 @@ entrypoint automatically.
 | `block-size` | int | `262144` | Bytes per payload block, 4 KiB to 32 MiB |
 | `dict` | bool | `false` | Train a shared dictionary for better ratio |
 | `store` | bool | `false` | Store payload raw, no zstd (overrides `dict`/`level`) |
+| `prefetch` | path | none | Startup profile recorded with `ONELF_PROFILE`, relative to the recipe. See [Prefetching a startup](./execution-modes#prefetching-a-startup) |
 
 ### `[update]`
 

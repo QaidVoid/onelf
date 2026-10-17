@@ -42,6 +42,7 @@ myapp/
     ├── paths                    # [paths] pairs
     ├── preload                  # libraries the onelf-env constructor dlopens
     ├── needs-setuid             # present when the app runs setuid binaries
+    ├── prefetch                 # blocks a startup reads, from a profile
     ├── update-url               # self-update zsync URL
     ├── update-key               # public keys that may sign updates
     ├── update-revision          # release number for rollback protection
@@ -63,8 +64,8 @@ myapp/
 - **`share/`** is prepended to `XDG_DATA_DIRS` so GLib/GTK discover bundled
   schemas, icons, and mime types.
 - **`.onelf/`** is the onelf namespace. `onelf pack` writes `interp`,
-  `env`, `paths`, `preload`, `needs-setuid`, the `update-*` files and
-  `package-info.toml` from its options and the recipe. A
+  `env`, `paths`, `preload`, `needs-setuid`, `prefetch`, the `update-*`
+  files and `package-info.toml` from its options and the recipe. A
   [sysroot build](./sysroot) writes `provenance.toml`, which only
   `onelf info` reads, and `platform` and `sets` when it pins a GL build
   or relies on shared sets. `icons/` and `desktop/` are user-provided

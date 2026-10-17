@@ -6404,6 +6404,188 @@ fn onelf_trace_leaves_out_what_the_runtime_read() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A tree with a script that checksums a data file several blocks long,
+/// and that file's checksum as the host computes it.
+fn checksum_app(app: &Path) -> String {
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("share")).unwrap();
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(app.join("share/data.bin"), &data).unwrap();
+    write(&app.join("share/unused.bin"), "never read\n");
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncksum < \"$ONELF_DIR/share/data.bin\"\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let out = Command::new("cksum")
+        .stdin(std::fs::File::open(app.join("share/data.bin")).unwrap())
+        .output()
+        .expect("spawn cksum");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `ONELF_PROFILE` records the blocks a run read, and a package built with
+/// that profile prefetches them. Prefetching only moves decompression
+/// earlier: the run reads the same bytes either way.
+#[test]
+fn onelf_profile_records_blocks_and_prefetching_them_reads_the_same_bytes() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("profile");
+    let app = td.join("app");
+    let expected = checksum_app(&app);
+
+    let pack = |out: &Path, extra: &[&str]| {
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args([
+                "--command",
+                "bin/run",
+                "--mtime",
+                "0",
+                "--block-size",
+                "64K",
+            ])
+            .args(extra)
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    };
+    let run = |pkg: &Path, profile: Option<&Path>| {
+        let mut run = Command::new(pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "fuse");
+        if let Some(p) = profile {
+            run.env("ONELF_PROFILE", p);
+        }
+        isolate(&mut run, &td);
+        run_package(&mut run)
+    };
+
+    let plain = td.join("plain.onelf");
+    pack(&plain, &[]);
+    let profile = td.join("profile.txt");
+    let out = run(&plain, Some(&profile));
+    if !out.status.success() {
+        skip("FUSE cannot mount here");
+        return;
+    }
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+
+    let recorded = std::fs::read_to_string(&profile).unwrap_or_default();
+    let lines: Vec<&str> = recorded.lines().collect();
+    for want in ["bin/run\t0", "share/data.bin\t0", "share/data.bin\t262144"] {
+        assert!(lines.contains(&want), "{want:?} is recorded:\n{recorded}");
+    }
+    assert!(
+        !recorded.contains("unused.bin"),
+        "a file the run never read is not recorded:\n{recorded}"
+    );
+    let unique: std::collections::HashSet<&str> = lines.iter().copied().collect();
+    assert_eq!(unique.len(), lines.len(), "each block once:\n{recorded}");
+
+    // A profile from another build of the tree may name what this one
+    // lacks. The packer leaves that out rather than failing.
+    let mut stale = recorded.clone();
+    stale.push_str("share/gone.bin\t0\nshare/data.bin\t999999999\n");
+    std::fs::write(&profile, stale).unwrap();
+
+    let prefetched = td.join("prefetched.onelf");
+    let log = pack(&prefetched, &["--prefetch", profile.to_str().unwrap()]);
+    assert!(
+        log.contains(&format!("Prefetch: {} blocks", lines.len())),
+        "every recorded block and nothing else is prefetched:\n{log}"
+    );
+    let out = run(&prefetched, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "a prefetched run reads the same bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The profile is part of the package's bytes, so the same tree and the
+/// same profile pack to the same package, and leaving the profile out packs
+/// what packed before. A recipe names it relative to itself.
+#[test]
+fn packing_with_a_profile_is_deterministic() {
+    let td = workdir("profile-repro");
+    let app = td.join("app");
+    checksum_app(&app);
+    let profile = td.join("profile.txt");
+    write(
+        &profile,
+        "share/data.bin\t65536\nbin/run\t0\nshare/data.bin\t0\n",
+    );
+
+    let pack = |name: &str, extra: &[&str]| {
+        let out = td.join(name);
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .args([
+                "--command",
+                "bin/run",
+                "--mtime",
+                "0",
+                "--block-size",
+                "64K",
+            ])
+            .args(extra)
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        std::fs::read(out).unwrap()
+    };
+    let with = ["--prefetch", profile.to_str().unwrap()];
+    let plain = pack("a.onelf", &[]);
+    assert_eq!(plain, pack("b.onelf", &[]), "no profile: reproducible");
+    let profiled = pack("c.onelf", &with);
+    assert_eq!(profiled, pack("d.onelf", &with), "a profile: reproducible");
+    assert_ne!(plain, profiled, "the profile is packed");
+
+    let listed = Command::new(onelf())
+        .args(["list", td.join("c.onelf").to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains(".onelf/prefetch"), "{listed}");
+
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run\"\n\n\
+         [compression]\nblock-size = 65536\nprefetch = \"../profile.txt\"\n",
+    );
+    let o = Command::new(onelf())
+        .arg("build")
+        .arg(&app)
+        .arg("-o")
+        .arg(td.join("recipe.onelf"))
+        .output()
+        .expect("spawn onelf build");
+    let log = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{log}");
+    assert!(log.contains("Prefetch: 3 blocks"), "{log}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The runtime directory mode runs the package from the private per-user/// The runtime directory mode runs the package from the private per-user
 /// directory and leaves nothing behind when it exits.
 #[test]
