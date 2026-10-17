@@ -22,13 +22,16 @@ separately:
 - **AnyLinux AppImages** are AppImages built with pkgforge's tooling:
   `sharun` to bundle the libraries, `uruntime` as the runtime, and their
   own Rust `appimagetool`, which defaults to DwarFS. They work on musl
-  hosts, need no helper installed, and fall back to namespaces or
-  extraction on their own.
+  hosts and need no helper installed. The runtime uses the host's setuid
+  `fusermount` when there is one, falls back to a user namespace, and
+  extracts to `/tmp` as a last resort, removing the copy on exit.
 
 onelf needs no helper either. It mounts inside a private user namespace,
 uses `fusermount3` only on hosts that deny user namespaces, and extracts
 into the per-user runtime directory when neither works. Its persistent
-cache is opt-in. For GPU drivers, AnyLinux AppImages bundle Mesa and take
+cache is opt-in. Inside a user namespace, setuid helpers such as `sudo`
+or `pkexec` do not work, so a package that runs them sets
+`needs-setuid` and mounts through `fusermount3` instead. For GPU drivers, AnyLinux AppImages bundle Mesa and take
 the NVIDIA blob from the host. onelf takes the whole stack from the host
 by default. At every launch it decides, for each library the driver
 needs that the bundle also carries, whether the host's copy or the
@@ -42,11 +45,12 @@ page explains why.
 | Bundles libraries | yes | yes | yes | shared runtime | no |
 | musl hosts | yes | yes | no | no | yes |
 | No helper needed | yes | yes | `fusermount` | `bwrap` | yes |
-| Invisible mount | yes, with user namespaces | no, reused | no | n/a | n/a |
-| Nothing on disk | no copy left, cache opt-in | `/tmp` fallback | mount dir on crash | installs | yes |
-| GPU drivers | host, per library; bundling opt-in | bundles Mesa | host dirs on path | runtime extension | n/a |
-| Bundle source | scan or package DB | `lib4bin`, `strace` | `linuxdeploy` | build in SDK | compiler |
-| Delta updates | built in, signed | zsync hook | external tool | OSTree | no |
+| Invisible mount | yes, with user namespaces | no, `/tmp/.mount_*` | no | n/a | n/a |
+| Instances share a mount | no, one each | yes | no | n/a | n/a |
+| Nothing on disk | no copy left, cache opt-in | extraction removed on exit | mount dir on crash | installs | yes |
+| GPU drivers | host, per library; bundling opt-in | bundled Mesa, NVIDIA from the host | host dirs on path | runtime extension | n/a |
+| Bundle source | scan or package DB | `lib4bin` and `strace`, or debloated Arch packages | `linuxdeploy` | build in SDK | compiler |
+| Delta updates | built in, signed | embedded zsync info, unsigned | external tool | OSTree | no |
 | Sandbox | no | no | no | `bwrap`, as permitted | no |
 | Host programs the app starts | get the caller's environment back | bundle paths unset, home restored | inherit the bundle's | run in the sandbox | n/a |
 
