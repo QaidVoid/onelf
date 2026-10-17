@@ -2887,7 +2887,10 @@ fn cc_with(args: &[&str], out: &Path) -> bool {
         skip("no C compiler available");
         return false;
     };
+    // Fixtures link libraries they never call into, to describe a host.
+    // Ubuntu's gcc defaults to `--as-needed`, which would drop them.
     let st = Command::new(compiler)
+        .arg("-Wl,--no-as-needed")
         .arg("-o")
         .arg(out)
         .args(args)
