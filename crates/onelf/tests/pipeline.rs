@@ -6277,18 +6277,24 @@ fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", td.to_str().unwrap());
         isolate(&mut run, &td);
-        assert!(
-            reclaimed_by(&mut run, &td),
-            "helper={helper}: the mount stays"
-        );
-        // The reclaiming launch shares a mount of its own, gone once its
-        // server has noticed nothing uses it.
-        assert!(servers_gone(&other), "helper={helper}");
-        assert_eq!(
-            mount_leftovers(&td),
-            Vec::<String>::new(),
-            "helper={helper}"
-        );
+        // The killed app's last `sleep` outlives it for a moment and holds
+        // the mount, so a launch that arrives first rightly leaves it to a
+        // later one.
+        let mut left = Vec::new();
+        for _ in 0..20 {
+            assert!(
+                reclaimed_by(&mut run, &td),
+                "helper={helper}: the mount stays"
+            );
+            // The reclaiming launch shares a mount of its own, gone once its
+            // server has noticed nothing uses it.
+            assert!(servers_gone(&other), "helper={helper}");
+            left = mount_leftovers(&td);
+            if left.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(left, Vec::<String>::new(), "helper={helper}");
     }
     let _ = std::fs::remove_dir_all(&td);
 }
