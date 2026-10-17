@@ -80,9 +80,11 @@ fn keyring(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 fn verify_update_signature(path: &Path, url: &str, keyring_bytes: &[u8]) -> Result<(), String> {
     let sig_url = onelf_format::update::detached_sig_url(url);
-    // No redirects for the signature: a 3xx here is a hard error rather
-    // than a silently substituted body.
-    let agent = hardened_agent(0);
+    // Redirects are followed as for the package itself, over HTTPS only:
+    // release hosts such as GitHub answer every asset with a redirect to
+    // their CDN. A substituted body cannot pass the Ed25519 check below,
+    // which is what guards the update.
+    let agent = hardened_agent(10);
     let sig = agent
         .get(&sig_url)
         .call()

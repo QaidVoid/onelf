@@ -125,12 +125,14 @@ pub fn apply(pkg_root: &Path) -> bool {
 fn enter() -> io::Result<()> {
     crate::fuse::mount::enter_namespace()?;
     // Without this the bind below travels back up to whatever the host
-    // shares, which is the opposite of the intent.
+    // shares, which is the opposite of the intent. A downstream mount
+    // still hears from the host, so a disk mounted after launch reaches
+    // the app.
     mount_change(
         "/",
-        MountPropagationFlags::REC | MountPropagationFlags::PRIVATE,
+        MountPropagationFlags::REC | MountPropagationFlags::DOWNSTREAM,
     )
-    .map_err(|e| io::Error::other(format!("making mounts private: {e}")))?;
+    .map_err(|e| io::Error::other(format!("making mounts one-way: {e}")))?;
     Ok(())
 }
 

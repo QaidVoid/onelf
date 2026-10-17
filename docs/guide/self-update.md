@@ -338,9 +338,10 @@ it. See [Pinning a GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one)
   install it stop trusting the leaked key.
 - ✅ Serve everything over HTTPS. The runtime enforces this for every
   request the update makes, so no redirect can downgrade the transfer to
-  cleartext. The signature fetch follows no redirects at all; the
-  download follows them, since publishing behind a redirecting CDN is
-  ordinary and HTTPS plus the signature check keeps it safe.
+  cleartext. The signature fetch and the download both follow
+  redirects, since release hosts such as GitHub answer every asset with
+  a redirect to their CDN, and HTTPS plus the signature check keeps it
+  safe.
 - ⚠️ Certificates are checked against the machine's own trust store
   rather than a set of roots compiled into the binary. A host that
   terminates TLS at a corporate proxy can update, provided that proxy's
