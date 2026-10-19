@@ -150,11 +150,18 @@ pub fn run(
         WorkingDir::Inherit => None,
     };
 
+    // As the packed runtime does: the target's own path, unless the
+    // entrypoint is named apart from it and a multicall binary needs
+    // the name.
+    let argv0 = match target.to_str() {
+        Some(path) if target.file_name() == Some(ep_name.as_ref()) => path,
+        _ => ep_name.as_str(),
+    };
     let mut cmd = build_exec_command(
         &target,
         &dir,
         &search_str,
-        &ep_name,
+        argv0,
         resolution.host_interp.as_deref(),
     )?;
     cmd.args(&ep_args);

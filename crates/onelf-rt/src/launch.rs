@@ -156,6 +156,18 @@ fn run(launch: &Launch) {
         let _ = std::fs::symlink_metadata(launch.pkg_root.join(crate::fuse::TRACE_ARM));
     }
 
+    // The app's argv[0] is the file that actually executes, not the pack
+    // that carries it. A binary that locates its data files by resolving
+    // argv[0] would otherwise look beside the pack, where nothing of the
+    // app lives. ONELF_ARGV0 keeps the name the user launched. An
+    // entrypoint named apart from its target keeps the launched name,
+    // since a multicall binary dispatches on it.
+    let app_argv0: &str = if target_path.file_name() == Some(ep_name.as_ref()) {
+        target_path_s
+    } else {
+        launch.argv0
+    };
+
     let bundled_interp_rel = launch
         .interp_data
         .and_then(crate::interp::parse_bundled_interp_rel);
@@ -172,6 +184,7 @@ fn run(launch: &Launch) {
             host_interp,
             &lib_path,
             kernel_lib_path.as_deref(),
+            app_argv0,
             launch,
         );
     }
@@ -179,7 +192,7 @@ fn run(launch: &Launch) {
     if let Some(interp) =
         crate::interp::should_use_userland_exec(&target_path, launch.pkg_root, bundled_interp_rel)
     {
-        crate::interp::exec_userland(&target_path, &interp, &lib_path, launch.argv0, launch.args);
+        crate::interp::exec_userland(&target_path, &interp, &lib_path, app_argv0, launch.args);
     }
 
     let mut cmd = crate::interp::build_exec_command(
@@ -189,7 +202,7 @@ fn run(launch: &Launch) {
         &lib_path,
         kernel_lib_path.as_deref(),
         launch.private_ns,
-        launch.argv0,
+        app_argv0,
         launch.args,
     );
     let err = cmd.exec();
@@ -313,6 +326,7 @@ fn exec_under_host_loader(
     host_interp: &Path,
     lib_path: &str,
     kernel_lib_path: Option<&str>,
+    argv0: &str,
     launch: &Launch,
 ) {
     let interp = crate::interp::read_elf_interp(target);
@@ -327,7 +341,7 @@ fn exec_under_host_loader(
     };
     if kernel_exec {
         let mut cmd = Command::new(target);
-        cmd.arg0(launch.argv0)
+        cmd.arg0(argv0)
             .args(launch.args)
             .env("ONELF_INTERP", host_interp);
         if let Some(path) = kernel_lib_path {
@@ -342,17 +356,14 @@ fn exec_under_host_loader(
         && crate::interp::is_pie(target)
         && !crate::selfextract::has_self_extract_trailer(target);
     if direct {
-        crate::interp::exec_userland(target, host_interp, lib_path, launch.argv0, launch.args);
+        crate::interp::exec_userland(target, host_interp, lib_path, argv0, launch.args);
     }
     let mut cmd = Command::new(host_interp);
     cmd.arg("--inhibit-cache");
     if !lib_path.is_empty() {
         cmd.arg("--library-path").arg(lib_path);
     }
-    cmd.arg("--argv0")
-        .arg(launch.argv0)
-        .arg(target)
-        .args(launch.args);
+    cmd.arg("--argv0").arg(argv0).arg(target).args(launch.args);
     let err = cmd.exec();
     eprintln!(
         "onelf-rt: exec under {} failed: {err}",
