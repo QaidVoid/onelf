@@ -74,6 +74,7 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--memfd` | `false` | Mark the default entrypoint memfd-eligible (conflicts with `--no-memfd`) |
 | `--no-memfd` | `false` | Force memfd eligibility off |
 | `--cache` | `false` | Let the runtime fall back to the persistent cache when no other execution mode works |
+| `--prefer-cache` | `false` | Run from the persistent cache before any other execution mode, for an app that records its own path in files that outlive it. Implies `--cache` |
 | `--needs-setuid` | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
 | `--mtime SECS` | | Pin every entry's mtime to a Unix timestamp for reproducible output. Overrides `SOURCE_DATE_EPOCH` |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |

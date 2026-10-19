@@ -242,6 +242,24 @@ for it:
 Otherwise a host where every earlier rung fails gets an error saying
 so, with `ONELF_CACHE=1` named as the way to allow the extraction.
 
+### An app that records its own path
+
+Every other mode runs the app from a directory that is gone once it
+exits. An app that writes its own path into files that outlive it
+leaves those files pointing at nothing. A build system that writes
+its own path into the build files it generates is the usual case: the
+next build calls a path that no longer exists.
+
+- ✅ Pack such an app with `--prefer-cache`, or `[package] prefer-cache
+  = true`. The runtime then runs it from the cache before trying any
+  other mode, and the recorded path stays valid between runs.
+- ☑️ The other modes still run when the extraction fails, so a host
+  without a writable cache directory loses only the stable path.
+- ⚠️ A recorded path is only as durable as the cache entry. Auto-GC
+  removes a package nobody launched for 30 days, and a new version of
+  the package extracts under a new id. A build tree configured against
+  the old one has to be configured again.
+
 ## Prefetching a startup
 
 The FUSE modes decompress a block when the app first reads it, one

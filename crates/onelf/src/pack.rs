@@ -75,6 +75,9 @@ pub struct PackOptions {
     /// other execution mode works. Without it the runtime stops at the
     /// runtime directory and reports failure, leaving nothing on disk.
     pub cache: bool,
+    /// Ask the runtime to run from the persistent cache before trying any
+    /// other execution mode. Implies [`PackOptions::cache`].
+    pub prefer_cache: bool,
     pub update_url: Option<String>,
     /// Embed the update-capable runtime when `update_url` is set. False
     /// records the update metadata but links the slim runtime, for
@@ -1561,8 +1564,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         HostLibs::Auto => HostLibsPolicy::Never,
     };
     flags |= policy.to_flags();
-    if opts.cache {
+    if opts.cache || opts.prefer_cache {
         flags |= Flags::CACHE_REQUESTED;
+    }
+    if opts.prefer_cache {
+        flags |= Flags::CACHE_PREFERRED;
     }
 
     // Write the output file
@@ -1983,6 +1989,7 @@ mod tests {
             working_dir: WorkingDir::Inherit,
             host_libs: HostLibs::default(),
             cache: false,
+            prefer_cache: false,
             update_url: None,
             embed_updater: true,
             update_key: None,

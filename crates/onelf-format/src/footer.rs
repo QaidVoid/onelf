@@ -99,6 +99,11 @@ bitflags! {
         /// directory and reports failure rather than leaving an
         /// extraction on disk.
         const CACHE_REQUESTED = 1 << 7;
+        /// The publisher asked for the persistent cache before every
+        /// other execution mode, for an app that records its own path in
+        /// files that outlive it. Set together with [`Flags::CACHE_REQUESTED`],
+        /// so a runtime that predates this bit still falls back to the cache.
+        const CACHE_PREFERRED = 1 << 8;
     }
 }
 

@@ -22,7 +22,9 @@ pub fn info(path: &Path) -> io::Result<()> {
     );
     println!(
         "Cache:          {}",
-        if footer.flags.contains(Flags::CACHE_REQUESTED) {
+        if footer.flags.contains(Flags::CACHE_PREFERRED) {
+            "preferred over every other mode"
+        } else if footer.flags.contains(Flags::CACHE_REQUESTED) {
             "requested as last resort"
         } else {
             "only on request"

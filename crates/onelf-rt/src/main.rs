@@ -25,6 +25,7 @@ mod ulexec;
 mod update;
 
 use std::ffi::OsString;
+use std::path::Path;
 
 fn main() {
     hostenv::capture_starting_env();
@@ -39,8 +40,8 @@ fn main() {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
 
-    let exe_path = std::path::Path::new(&exec_path);
-    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+    let exe_path = Path::new(&exec_path);
+    let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
     let exe_name = exe_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -161,9 +162,13 @@ fn main() {
     // memfd (if eligible) -> fuse -> tmpfs -> rundir -> cache.
     let forced_mode = std::env::var("ONELF_MODE").ok();
     let force = forced_mode.as_deref();
+    let cache_preferred = pkg
+        .footer
+        .flags
+        .contains(onelf_format::Flags::CACHE_PREFERRED);
 
     // Memfd mode: single static binary, no libs needed
-    if force == Some("memfd") || (force.is_none() && ep_memfd) {
+    if force == Some("memfd") || (force.is_none() && ep_memfd && !cache_preferred) {
         // Forcing the mode cannot make a linked entrypoint work here. Its
         // libraries live inside the package and a memfd exec never puts them
         // on disk, so the loader fails on the first one it cannot find. This
@@ -242,6 +247,24 @@ fn main() {
     // own, leaving fusermount3 and, failing that, extraction. The file's
     // presence is the whole message; it holds nothing.
     let needs_setuid = read_package_file(&mut pkg, ".onelf/needs-setuid").is_some();
+
+    // The publisher put the cache first: the app records its own path in
+    // files that outlive it, so that path has to stay on disk. The other
+    // modes still run when the extraction fails.
+    if force.is_none() && cache_preferred {
+        let err = exec_cache(
+            &mut pkg,
+            ep_idx,
+            argv0,
+            &exec_path,
+            &final_args,
+            interp_data.as_deref(),
+            env_data.as_deref(),
+            exe_dir,
+            exe_name,
+        );
+        eprintln!("onelf-rt: {err}; trying the other execution modes");
+    }
 
     // FUSE mode: mount package as filesystem (default for non-memfd)
     if matches!(force, None | Some("fuse")) {
@@ -325,16 +348,43 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Persistent cache extraction mode. The lock guard is held (through
-    // exec, its fd is left inheritable) for the lifetime of this instance
-    // so a concurrent process's GC cannot delete the package while it is
-    // still in use.
-    let (pkg_dir, _lock_guard) = match cache::ensure_extracted(&mut pkg) {
+    let err = exec_cache(
+        &mut pkg,
+        ep_idx,
+        argv0,
+        &exec_path,
+        &final_args,
+        interp_data.as_deref(),
+        env_data.as_deref(),
+        exe_dir,
+        exe_name,
+    );
+    eprintln!("onelf-rt: {err}");
+    std::process::exit(1);
+}
+
+/// Run the entrypoint from the persistent cache. Returns only when the
+/// package cannot be run from there.
+// Describes a single exec; every argument is distinct and a parameter
+// object would be built at each call site and read once.
+#[allow(clippy::too_many_arguments)]
+fn exec_cache(
+    pkg: &mut loader::PackageData,
+    ep_idx: usize,
+    argv0: &str,
+    exec_path: &str,
+    args: &[OsString],
+    interp_data: Option<&[u8]>,
+    env_data: Option<&[u8]>,
+    exe_dir: &Path,
+    exe_name: &str,
+) -> std::io::Error {
+    // The lock guard is held (through exec, its fd is left inheritable)
+    // for the lifetime of this instance so a concurrent process's GC
+    // cannot delete the package while it is still in use.
+    let (pkg_dir, _lock_guard) = match cache::ensure_extracted(pkg) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("onelf-rt: extraction failed: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return std::io::Error::new(e.kind(), format!("extraction failed: {e}")),
     };
 
     let package_id = cache::hex(&pkg.manifest.header.package_id);
@@ -350,29 +400,27 @@ fn main() {
         cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
     }
 
-    let target_path_str = pkg.manifest.entry_path(ep_target_entry);
-    let target_path = pkg_dir.join(&target_path_str);
-
+    let target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
+    let target_path = pkg_dir.join(pkg.manifest.entry_path(target_entry));
     if !target_path.exists() {
-        eprintln!(
-            "onelf-rt: entrypoint target does not exist: {}",
-            target_path.display()
+        return std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("entrypoint target does not exist: {}", target_path.display()),
         );
-        std::process::exit(1);
     }
 
     portable::setup_portable(exe_dir, exe_name);
 
     launch::exec(&launch::Launch {
-        pkg: &pkg,
+        pkg,
         pkg_root: &pkg_dir,
         mode: "cache",
         ep_idx,
         argv0,
-        exec_path: &exec_path,
-        args: &final_args,
-        interp_data: interp_data.as_deref(),
-        env_data: env_data.as_deref(),
+        exec_path,
+        args,
+        interp_data,
+        env_data,
         private_ns: false,
         tree_writable: false,
         links: launch::Links::Tree,

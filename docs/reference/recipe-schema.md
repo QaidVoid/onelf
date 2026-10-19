@@ -46,6 +46,7 @@ working-dir = "inherit"           # "inherit" | "package" | "command"
 memfd = true                      # Option<bool>, overrides auto-detect
 host-libs = "auto"                # "auto" | "always" | "never": what the resolver may take from the host
 cache = false                     # bool, allow the persistent cache as the last execution mode
+prefer-cache = false              # bool, run from the persistent cache before any other mode; implies cache
 needs-setuid = false              # bool, the app runs setuid binaries (sudo, pkexec); keeps it out of user namespaces
 mtime = 1735689600                # Option<u64>, pin every entry's mtime to this Unix timestamp (overrides SOURCE_DATE_EPOCH)
 exclude = ["*.a", "__pycache__"]  # Vec<String>, path globs

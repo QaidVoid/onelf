@@ -121,6 +121,13 @@ enum Commands {
         #[arg(long)]
         cache: bool,
 
+        /// Run from the persistent cache before trying any other execution
+        /// mode, falling back to them when it cannot be extracted. For an
+        /// app that records its own path in files that outlive it.
+        /// Implies --cache.
+        #[arg(long)]
+        prefer_cache: bool,
+
         /// Record the update URL but do not embed the updater, linking the
         /// slim runtime instead. Saves about 1.4 MB per package. For
         /// packages updated by a package manager or deployment system,
@@ -667,6 +674,7 @@ fn main() {
             no_embed_updater,
             host_libs,
             cache,
+            prefer_cache,
             exclude,
             preload,
             needs_setuid,
@@ -719,6 +727,7 @@ fn main() {
                         working_dir: wd,
                         host_libs: host_libs.into(),
                         cache,
+                        prefer_cache,
                         update_url: update_url.clone(),
                         embed_updater: !no_embed_updater,
                         update_key,
@@ -1271,6 +1280,7 @@ fn run_build(
                 .map(Into::into)
                 .unwrap_or(pack::HostLibs::Auto),
             cache: recipe.package.cache,
+            prefer_cache: recipe.package.prefer_cache,
             update_url,
             embed_updater,
             update_key,

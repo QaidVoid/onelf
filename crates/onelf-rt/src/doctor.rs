@@ -32,6 +32,11 @@ fn modes(
     ns: bool,
 ) -> Vec<(&'static str, Verdict)> {
     let forced = std::env::var("ONELF_MODE").ok();
+    let cache_preferred = forced.is_none()
+        && pkg
+            .footer
+            .flags
+            .contains(onelf_format::Flags::CACHE_PREFERRED);
     let dev_fuse = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -103,20 +108,25 @@ fn modes(
         }
     };
     let memfd = || {
-        if pkg.manifest.entrypoints[ep_idx].is_memfd_eligible() {
+        if cache_preferred {
+            Err("the package prefers the persistent cache".to_string())
+        } else if pkg.manifest.entrypoints[ep_idx].is_memfd_eligible() {
             Ok(("the static entrypoint runs from memory".to_string(), false))
         } else {
             Err("the entrypoint needs shared libraries".to_string())
         }
     };
 
-    let tries: [(&'static str, &dyn Fn() -> Verdict); 5] = [
+    let mut tries: [(&'static str, &dyn Fn() -> Verdict); 5] = [
         ("memfd", &memfd),
         ("fuse", &fuse),
         ("tmpfs", &tmpfs),
         ("rundir", &rundir),
         ("cache", &cache),
     ];
+    if cache_preferred {
+        tries.rotate_right(1);
+    }
     let mut out = Vec::new();
     for (name, try_mode) in tries {
         let verdict = match forced.as_deref() {

@@ -84,6 +84,7 @@ runtime behavior, and metadata.
 | `working-dir` | enum | `inherit` | `inherit`, `package`, or `command` |
 | `host-libs` | string | `auto` | `auto`, `always`, `never`: what the launch resolver may take from the host. See [Bundling](./bundling#libraries-that-come-from-the-host) |
 | `cache` | bool | `false` | Allow the persistent cache as the last execution mode. See [Execution Modes](./execution-modes#mode-6-persistent-cache-only-on-request) |
+| `prefer-cache` | bool | `false` | Run from the persistent cache before any other execution mode. Implies `cache`. See [Execution Modes](./execution-modes#an-app-that-records-its-own-path) |
 | `memfd` | bool | auto | Force memfd-eligible (auto-detected otherwise) |
 | `needs-setuid` | bool | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
 | `mtime` | int | none | Pin every entry's mtime to this Unix timestamp. See [Reproducible Builds](./reproducible) |

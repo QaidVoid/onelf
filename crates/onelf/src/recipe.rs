@@ -83,6 +83,11 @@ pub struct Package {
     /// on disk unless the publisher or the user asks for it.
     #[serde(default)]
     pub cache: bool,
+    /// Run from the persistent cache before any other execution mode, for
+    /// an app that records its own path in files that outlive it.
+    /// Implies `cache`.
+    #[serde(default)]
+    pub prefer_cache: bool,
     /// Mark the default entrypoint memfd-eligible (overrides auto-detect).
     pub memfd: Option<bool>,
     #[serde(default)]
@@ -504,6 +509,10 @@ mod package_tests {
 
         let recipe = load_str("[package]\ncommand = \"bin/app\"\ncache = true\n");
         assert!(recipe.package.cache);
+        assert!(!recipe.package.prefer_cache);
+
+        let recipe = load_str("[package]\ncommand = \"bin/app\"\nprefer-cache = true\n");
+        assert!(recipe.package.prefer_cache);
     }
 }
 

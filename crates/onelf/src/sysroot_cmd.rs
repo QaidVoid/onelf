@@ -314,6 +314,7 @@ fn pack_tree(
             working_dir: onelf_format::WorkingDir::Inherit,
             host_libs: HostLibs::Never,
             cache: false,
+            prefer_cache: false,
             update_url: None,
             embed_updater: false,
             update_key: None,
