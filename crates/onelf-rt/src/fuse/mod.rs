@@ -635,20 +635,23 @@ mod mount_in_use_tests {
     /// foreground exited.
     #[test]
     fn a_process_mapping_a_file_from_the_tree_is_a_user() {
-        let program = std::path::Path::new("/bin/sleep");
+        // A shell rather than sleep: uutils coreutils refuses to run when
+        // its executable is the loader rather than itself.
+        let program = std::path::Path::new("/bin/sh");
         let Some(loader) = crate::interp::read_elf_interp(program) else {
-            return; // a static sleep has no loader to be run under
+            return; // a static shell has no loader to be run under
         };
         let dir = std::env::temp_dir().join(format!("onelf-maps-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let copy = dir.join("sleep");
+        let copy = dir.join("sh");
         std::fs::copy(program, &copy).unwrap();
 
         let _forking = crate::test_locks::forking();
         let mut child = std::process::Command::new(&loader)
             .arg(&copy)
-            .arg("30")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("spawn under the loader");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
