@@ -11393,3 +11393,225 @@ fn memfd_mode_applies_the_recipe_env_it_can() {
     assert!(stdout.contains("path=/usr/bin:/bin\n"), "{stdout}");
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A file spanning several verification slices, a copy of it the image
+/// stores once, an empty file and a symlink.
+fn stipple_app(app: &Path) -> Vec<u8> {
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::create_dir_all(app.join("share")).unwrap();
+    std::fs::write(app.join("share/data.bin"), &data).unwrap();
+    std::fs::write(app.join("share/copy.bin"), &data).unwrap();
+    std::fs::write(app.join("share/empty"), b"").unwrap();
+    std::os::unix::fs::symlink("data.bin", app.join("share/link.bin")).unwrap();
+    write(
+        &app.join("bin/run"),
+        "#!/bin/sh\ncd \"$ONELF_DIR/share\" && cksum data.bin copy.bin link.bin empty\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    data
+}
+
+#[test]
+fn a_stipple_payload_runs_in_every_mode_and_extracts() {
+    let td = workdir("stipple");
+    let app = td.join("app");
+    let data = stipple_app(&app);
+    let pkg = td.join("s.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/run",
+            "--payload",
+            "stipple",
+            "--block-size",
+            "128K",
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        has_footer_flag(&pkg, 1 << 9),
+        "the footer must mark the payload"
+    );
+
+    let expected = Command::new("sh")
+        .arg("-c")
+        .arg("cksum data.bin copy.bin link.bin empty")
+        .current_dir(app.join("share"))
+        .output()
+        .unwrap()
+        .stdout;
+    let mut modes = vec!["rundir", "cache"];
+    if fuse_available() {
+        modes.push("fuse");
+    }
+    for mode in modes {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", mode);
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&expected),
+            "{mode} served different bytes"
+        );
+    }
+
+    let outdir = td.join("out");
+    let o = run_onelf(
+        &[
+            "extract",
+            pkg.to_str().unwrap(),
+            "-o",
+            outdir.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "extract: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(std::fs::read(outdir.join("share/copy.bin")).unwrap(), data);
+    assert_eq!(
+        std::fs::read_link(outdir.join("share/link.bin")).unwrap(),
+        Path::new("data.bin")
+    );
+
+    let o = run_onelf(&["verify", pkg.to_str().unwrap()], None);
+    assert!(
+        o.status.success(),
+        "verify: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+#[test]
+fn a_tampered_stipple_image_fails_the_fuse_read() {
+    if !fuse_available() {
+        return;
+    }
+    let td = workdir("stippletamper");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\ncat \"$ONELF_DIR/data\"\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let data: Vec<u8> = (0..200_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(app.join("data"), &data).unwrap();
+
+    let pkg = td.join("pkg.onelf");
+    let o = run_onelf(
+        &[
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/run",
+            "--payload",
+            "stipple",
+            "--no-compress",
+        ],
+        None,
+    );
+    assert!(
+        o.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Stored, so the file's bytes sit in the image verbatim. The image's
+    // block checksum or the manifest's slice hash catches the change;
+    // neither may let the bytes through.
+    let mut bytes = std::fs::read(&pkg).unwrap();
+    let needle = &data[100_000..100_064];
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("stored content must be present verbatim");
+    bytes[at] ^= 0xff;
+    let tampered = td.join("tampered.onelf");
+    std::fs::write(&tampered, &bytes).unwrap();
+    std::fs::set_permissions(
+        &tampered,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut run = Command::new(&tampered);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "fuse");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    assert!(out.stdout != data, "FUSE must not serve the tampered bytes");
+    assert!(
+        !out.status.success(),
+        "a read that lost bytes must fail the app"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+#[test]
+fn a_stipple_payload_refuses_what_it_cannot_honour() {
+    let td = workdir("stipplerefuse");
+    let app = td.join("app");
+    stipple_app(&app);
+    let pkg = td.join("s.onelf");
+    for (extra, why) in [
+        (&["--dict"][..], "a stipplefs payload trains its own"),
+        (&["--block-size", "96K"][..], "power-of-two block size"),
+    ] {
+        let mut args = vec![
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/run",
+            "--payload",
+            "stipple",
+        ];
+        args.extend_from_slice(extra);
+        let o = run_onelf(&args, None);
+        assert!(!o.status.success(), "{extra:?} must be refused");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains(why),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}

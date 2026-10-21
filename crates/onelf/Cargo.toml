@@ -23,6 +23,7 @@ jwalk = { workspace = true }
 rayon = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
+stipplefs = { workspace = true, features = ["write", "read", "fs", "dict"] }
 toml = { workspace = true }
 # `onelf sysroot fetch`: the same client the runtime's updater uses, so
 # both trust the platform's certificate store.

@@ -478,12 +478,8 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
 
             install_signal_handlers();
 
-            let mut state = fs::FuseState::new(
-                &pkg.manifest,
-                &mut pkg.file,
-                &pkg.footer,
-                pkg.dict.as_deref(),
-            );
+            let mut state =
+                fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
             state.expect_links(links_rx);
 
             let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];

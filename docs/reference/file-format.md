@@ -35,7 +35,7 @@ manifest, payload, and dictionary begin.
 |--------|------|-------|-------------|
 | 0 | 8 | magic | `"ONELF\0\x01\x00"` |
 | 8 | 2 | format_version | `2` (format 1 files have `1`) |
-| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 reserved (never set), bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`; other bits reserved |
+| 10 | 2 | flags | bit 0 `HAS_DICT`, bit 1 `MEMFD_HINT`, bit 2 reserved (never set), bit 3 `STORED`, bit 4 `EXTERNAL_UPDATER`, bit 5 `NO_HOST_LIB_DIRS`, bit 6 `HOST_LIBS_ALWAYS`, bit 7 `CACHE_REQUESTED`, bit 8 `CACHE_PREFERRED`, bit 9 `STIPPLE_PAYLOAD`; other bits reserved |
 | 12 | 8 | manifest_offset | Absolute file offset of the compressed manifest |
 | 20 | 8 | manifest_compressed | Compressed manifest size in bytes |
 | 28 | 8 | manifest_original | Uncompressed manifest size |
@@ -150,6 +150,36 @@ When the `STORED` footer flag is set (`onelf pack --no-compress` or
 reads the bytes verbatim with zero decompression. `STORED` and
 `HAS_DICT` are mutually exclusive. The manifest stays zstd-compressed
 either way.
+
+### stipplefs payload
+
+When the `STIPPLE_PAYLOAD` footer flag is set (`onelf pack --payload
+stipple` or `[compression] payload = "stipple"`), the payload region is a
+[stipplefs](https://github.com/QaidVoid/stipplefs) image instead of
+separately compressed blocks. The image deduplicates content-defined chunks across
+files, compresses many files per block, and runs an x86 branch filter
+over executable code, so it comes out smaller than independently
+compressed blocks.
+
+The manifest is unchanged in every other respect: every file is listed
+with its blocks and hashes. A block then describes a slice of its file
+rather than a region of the payload:
+
+```
+payload_offset:  u64        (where the slice starts within the file)
+compressed_size: u64        (the file's inode in the stipplefs image)
+original_size:   u64        (the slice's length, 64 KiB except the last)
+content_hash:    [u8; 32]   (BLAKE3 of the slice)
+```
+
+A reader opens the image at `payload_offset` for `payload_size` bytes and
+reads each slice through it. The slice's BLAKE3 is checked exactly as a
+decompressed block's is, so the manifest remains what a package's
+integrity rests on, and the image's own XXH3 checksums are a second line.
+`--block-size` sets the image's block size, a power of two up to 64 MiB
+and 32 MiB unless chosen, while slices stay 64 KiB. `HAS_DICT` is never set: the image trains its
+own dictionary for blocks up to 1 MiB. A reader that predates the flag
+fails every hash check rather than serving wrong bytes.
 
 ## Reading a packed file
 

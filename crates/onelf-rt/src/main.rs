@@ -187,14 +187,10 @@ fn main() {
 
         // Verify the memfd payload against the entrypoint's content hash
         // so an in-memory exec never runs unverified bytes.
-        let verified = loader::read_payload_blocks(
-            &mut pkg.file,
-            &pkg.footer,
-            &target_blocks,
-            pkg.dict.as_deref(),
-        )
-        .ok()
-        .filter(|d| blake3::hash(d).as_bytes() == &target_hash);
+        let verified =
+            loader::read_payload_blocks(&pkg.file, &pkg.footer, &target_blocks, &pkg.codec)
+                .ok()
+                .filter(|d| blake3::hash(d).as_bytes() == &target_hash);
         if let Some(data) = verified {
             let lib_paths_str = pkg.manifest.lib_dirs().join(":");
             // memfd mode: target is the memfd data itself (an ELF we
@@ -405,7 +401,10 @@ fn exec_cache(
     if !target_path.exists() {
         return std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("entrypoint target does not exist: {}", target_path.display()),
+            format!(
+                "entrypoint target does not exist: {}",
+                target_path.display()
+            ),
         );
     }
 
@@ -433,10 +432,10 @@ pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Op
             && pkg.manifest.entry_path(i) == path
     })?;
     loader::read_payload_blocks(
-        &mut pkg.file,
+        &pkg.file,
         &pkg.footer,
         &pkg.manifest.entries[idx].blocks,
-        pkg.dict.as_deref(),
+        &pkg.codec,
     )
     .ok()
 }

@@ -114,9 +114,9 @@ impl IntegrationContext {
         let entry = &self.manifest.entries[entry_idx];
         let mut file = fs::File::open(&self.binary)?;
 
-        let dict = crate::info::read_dict(&mut file, &self.footer)?;
+        let codec = onelf_format::payload::Codec::open(&file, &self.footer)?;
 
-        decompress_verified(&mut file, &self.footer, entry, dict.as_deref())
+        decompress_verified(&mut file, &self.footer, entry, &codec)
     }
 }
 

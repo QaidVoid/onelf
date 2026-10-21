@@ -248,12 +248,8 @@ fn mount(pkg: &mut PackageData) -> i32 {
     println!("{}", shown.display());
     eprintln!("onelf-rt: serving the package there; interrupt to unmount");
 
-    let mut state = crate::fuse::fs::FuseState::new(
-        &pkg.manifest,
-        &mut pkg.file,
-        &pkg.footer,
-        pkg.dict.as_deref(),
-    );
+    let mut state =
+        crate::fuse::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
     let mut buf = vec![0u8; 1024 * 1024 + 4096];
     state.run_loop(&fuse_fd, Some(&stop_read), None::<&OwnedFd>, &mut buf);
     drop(fuse_fd);

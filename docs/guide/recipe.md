@@ -112,7 +112,8 @@ entrypoint automatically.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `level` | int | `19` | Zstd level, 0 to 22 |
-| `block-size` | int | `65536` | Bytes per payload block, 4 KiB to 32 MiB |
+| `block-size` | int | `65536` | Bytes per payload block, 4 KiB to 32 MiB. A stipplefs payload takes a power of two up to 64 MiB and defaults to 32 MiB |
+| `payload` | string | `blocks` | `blocks` or `stipple`. See [the file format](../reference/file-format#stipplefs-payload) |
 | `dict` | bool | `false` | Train a shared dictionary for better ratio |
 | `store` | bool | `false` | Store payload raw, no zstd (overrides `dict`/`level`) |
 | `prefetch` | path | none | Startup profile recorded with `ONELF_PROFILE`, relative to the recipe. See [Prefetching a startup](./execution-modes#prefetching-a-startup) |

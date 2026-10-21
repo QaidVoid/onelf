@@ -67,9 +67,16 @@ enum Commands {
         #[arg(long, default_value = "19")]
         level: i32,
 
-        /// Bytes per payload block, with an optional K/M suffix (4K to 32M)
-        #[arg(long, value_parser = parse_block_size, default_value = "64K")]
-        block_size: u64,
+        /// Bytes per payload block, with an optional K/M suffix: 4K to 32M,
+        /// 64K by default. A stipplefs payload takes a power of two up to
+        /// 64M, 32M by default.
+        #[arg(long, value_parser = parse_block_size)]
+        block_size: Option<u64>,
+
+        /// What the payload is made of: blocks compressed one by one, or a stipplefs
+        /// image, which deduplicates and compresses across files
+        #[arg(long, value_name = "FORMAT", default_value = "blocks")]
+        payload: PayloadArg,
 
         /// Build a shared zstd dictionary
         #[arg(long)]
@@ -611,6 +618,23 @@ impl From<HostLibsArg> for pack::HostLibs {
 }
 
 #[derive(Clone, ValueEnum)]
+enum PayloadArg {
+    /// Each file cut into blocks that are compressed one by one
+    Blocks,
+    /// A stipplefs image
+    Stipple,
+}
+
+impl From<PayloadArg> for pack::Payload {
+    fn from(v: PayloadArg) -> Self {
+        match v {
+            PayloadArg::Blocks => pack::Payload::Blocks,
+            PayloadArg::Stipple => pack::Payload::Stipple,
+        }
+    }
+}
+
+#[derive(Clone, ValueEnum)]
 enum WorkingDirArg {
     Inherit,
     Package,
@@ -638,7 +662,7 @@ fn parse_block_size(s: &str) -> Result<u64, String> {
         .checked_mul(scale)
         .ok_or_else(|| format!("block size '{s}' overflows"))?;
 
-    let (min, max) = (compress::MIN_BLOCK_SIZE, compress::MAX_BLOCK_SIZE);
+    let (min, max) = (compress::MIN_BLOCK_SIZE, compress::MAX_STIPPLE_BLOCK_SIZE);
     if !(min..=max).contains(&bytes) {
         return Err(format!(
             "block size {bytes} out of range: expected {}K to {}M",
@@ -663,6 +687,7 @@ fn main() {
             lib_dir,
             level,
             block_size,
+            payload,
             dict,
             no_compress,
             memfd,
@@ -681,6 +706,7 @@ fn main() {
             mtime,
             prefetch,
         } => {
+            let payload: pack::Payload = payload.into();
             let memfd_opt = if no_memfd {
                 Some(false)
             } else if memfd {
@@ -720,7 +746,8 @@ fn main() {
                         default_entrypoint,
                         lib_dirs: lib_dir,
                         level,
-                        block_size,
+                        block_size: block_size.unwrap_or(payload.default_block_size()),
+                        payload,
                         use_dict: dict,
                         no_compress,
                         memfd: memfd_opt,
@@ -1259,6 +1286,7 @@ fn run_build(
         None => Vec::new(),
     };
 
+    let payload: pack::Payload = recipe.compression.payload.into();
     pack::pack(
         &pack::PackOptions {
             directory: dir,
@@ -1269,7 +1297,11 @@ fn run_build(
             default_entrypoint,
             lib_dirs,
             level: recipe.compression.level,
-            block_size: recipe.compression.block_size,
+            block_size: recipe
+                .compression
+                .block_size
+                .unwrap_or(payload.default_block_size()),
+            payload,
             use_dict: recipe.compression.dict,
             no_compress: recipe.compression.store,
             memfd: recipe.package.memfd,
@@ -1380,7 +1412,7 @@ fn scaffold_from_binary(
 #[cfg(test)]
 mod block_size_tests {
     use super::parse_block_size;
-    use crate::compress::{MAX_BLOCK_SIZE, MIN_BLOCK_SIZE};
+    use crate::compress::{MAX_STIPPLE_BLOCK_SIZE, MIN_BLOCK_SIZE};
 
     #[test]
     fn accepts_plain_bytes_and_k_m_suffixes() {
@@ -1394,7 +1426,7 @@ mod block_size_tests {
     #[test]
     fn rejects_sizes_outside_the_supported_range() {
         assert!(parse_block_size(&(MIN_BLOCK_SIZE - 1).to_string()).is_err());
-        assert!(parse_block_size(&(MAX_BLOCK_SIZE + 1).to_string()).is_err());
+        assert!(parse_block_size(&(MAX_STIPPLE_BLOCK_SIZE + 1).to_string()).is_err());
         assert!(parse_block_size("0").is_err());
     }
 

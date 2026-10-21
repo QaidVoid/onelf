@@ -308,6 +308,7 @@ fn pack_tree(
             lib_dirs: vec!["auto".to_string()],
             level: 19,
             block_size: crate::compress::DEFAULT_BLOCK_SIZE,
+            payload: crate::pack::Payload::Blocks,
             use_dict: false,
             no_compress: false,
             memfd: Some(false),

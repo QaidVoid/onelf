@@ -51,6 +51,34 @@ pub enum HostLibs {
     Never,
 }
 
+/// What a package's payload is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Payload {
+    /// Each file cut into blocks that are compressed one by one.
+    #[default]
+    Blocks,
+    /// A stipplefs image, deduplicated and compressed across files.
+    Stipple,
+}
+
+impl Payload {
+    /// The block size a package of this payload gets unless it chooses.
+    pub fn default_block_size(self) -> u64 {
+        match self {
+            Payload::Blocks => compress::DEFAULT_BLOCK_SIZE,
+            Payload::Stipple => compress::DEFAULT_STIPPLE_BLOCK_SIZE,
+        }
+    }
+
+    /// The largest block size a package of this payload may choose.
+    fn max_block_size(self) -> u64 {
+        match self {
+            Payload::Blocks => compress::MAX_BLOCK_SIZE,
+            Payload::Stipple => compress::MAX_STIPPLE_BLOCK_SIZE,
+        }
+    }
+}
+
 pub struct PackOptions {
     pub directory: PathBuf,
     pub output: PathBuf,
@@ -63,6 +91,8 @@ pub struct PackOptions {
     pub level: i32,
     /// Bytes per payload block. See [`compress::DEFAULT_BLOCK_SIZE`].
     pub block_size: u64,
+    /// What the payload is made of. See [`Payload`].
+    pub payload: Payload,
     pub use_dict: bool,
     /// Store the payload raw (no zstd). Mutually exclusive with a
     /// dictionary; trades file size for zero decompression at runtime.
@@ -635,16 +665,34 @@ fn is_scratch_name(name: &str) -> bool {
 pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // The CLI parser enforces this range; a recipe does not, and a block
     // size of zero never advances the chunker.
-    if !(compress::MIN_BLOCK_SIZE..=compress::MAX_BLOCK_SIZE).contains(&opts.block_size) {
+    let max_block_size = opts.payload.max_block_size();
+    if !(compress::MIN_BLOCK_SIZE..=max_block_size).contains(&opts.block_size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "block size {} is outside {}..={} bytes",
                 opts.block_size,
                 compress::MIN_BLOCK_SIZE,
-                compress::MAX_BLOCK_SIZE
+                max_block_size
             ),
         ));
+    }
+    if opts.payload == Payload::Stipple {
+        if !opts.block_size.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a stipplefs payload needs a power-of-two block size, got {}",
+                    opts.block_size
+                ),
+            ));
+        }
+        if opts.use_dict {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--dict trains a dictionary for a blocks payload; a stipplefs payload trains its own",
+            ));
+        }
     }
     if let Some(ref url) = opts.update_url
         && !url.starts_with("https://")
@@ -1053,7 +1101,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // Last, so every file the profile may name has been collected.
     if !opts.profile.is_empty() {
-        let lines = prefetch_lines(&files, &opts.profile, opts.block_size);
+        let unit = match opts.payload {
+            Payload::Blocks => opts.block_size,
+            Payload::Stipple => onelf_format::payload::SLICE_SIZE,
+        };
+        let lines = prefetch_lines(&files, &opts.profile, unit);
         if lines.is_empty() {
             eprintln!("warning: the profile names no block of this tree; nothing to prefetch");
         } else {
@@ -1188,7 +1240,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let mut seen: HashMap<[u8; 32], Vec<onelf_format::Block>> = HashMap::new();
     let mut deduped_bytes: u64 = 0;
 
-    let result = (|| -> io::Result<()> {
+    let mut blocks_payload = || -> io::Result<()> {
         for (from, to) in size_bounded_chunks(&files, compression_budget()) {
             let chunk = &files[from..to];
             let done: Vec<(usize, [u8; 32], Vec<compress::CompressedBlock>)> = chunk
@@ -1253,7 +1305,15 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             }
         }
         payload_tmp.flush()
-    })();
+    };
+    let result = match opts.payload {
+        Payload::Blocks => blocks_payload(),
+        Payload::Stipple => stipple_payload(&files, opts, &mut payload_tmp, &payload_tmp_path, &pb)
+            .map(|(built, size)| {
+                compressed_files = built;
+                payload_offset = size;
+            }),
+    };
     drop(payload_tmp);
     result?;
 
@@ -1551,8 +1611,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.memfd == Some(true) {
         flags |= Flags::MEMFD_HINT;
     }
-    if opts.no_compress {
-        flags |= Flags::STORED;
+    match opts.payload {
+        Payload::Blocks if opts.no_compress => flags |= Flags::STORED,
+        Payload::Blocks => {}
+        Payload::Stipple => flags |= Flags::STIPPLE_PAYLOAD,
     }
     if opts.update_url.is_some() && !opts.embed_updater {
         flags |= Flags::EXTERNAL_UPDATER;
@@ -1664,7 +1726,19 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             format_size(deduped_bytes)
         );
     }
-    if opts.no_compress {
+    if opts.payload == Payload::Stipple {
+        eprintln!(
+            "  {} {} (stipplefs image, {} blocks, {})",
+            bold("Payload:"),
+            format_size(total_payload),
+            format_size(opts.block_size),
+            if opts.no_compress {
+                "stored".to_string()
+            } else {
+                format!("zstd level {}", opts.level)
+            }
+        );
+    } else if opts.no_compress {
         eprintln!(
             "  {} {} (stored, uncompressed)",
             bold("Payload:"),
@@ -1694,6 +1768,141 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     );
 
     Ok(())
+}
+
+/// Build the payload as a stipplefs image, written through `out` to
+/// `out_path`, then read every file back out of it to record its slices.
+///
+/// The slices are taken from the image rather than from the source, so the
+/// manifest describes exactly what the image holds even if a file changed
+/// after the walk. They are read in the image's own order, which decodes
+/// each of its blocks once.
+fn stipple_payload(
+    files: &[CollectedFile],
+    opts: &PackOptions,
+    out: &mut BufWriter<File>,
+    out_path: &Path,
+    pb: &ProgressBar,
+) -> io::Result<(Vec<CompressedFile>, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    use stipplefs::format::Codec;
+    use stipplefs::write::{Builder, FileOrder, Node, Options, Timestamps};
+
+    let stipple_error = |e: stipplefs::error::Error| io::Error::other(format!("stipplefs: {e}"));
+    let codecs = if opts.no_compress {
+        Codec::Stored.bit()
+    } else {
+        Codec::Stored.bit()
+            | Codec::Zstd.bit()
+            | Codec::ZstdDict.bit()
+            | Codec::ZstdBcj.bit()
+            | Codec::ZstdDictBcj.bit()
+    };
+    // What mkstipple chooses, apart from the times: the manifest records
+    // every entry's, so the image's are never read.
+    let mut builder = Builder::new(Options {
+        block_size: opts.block_size as u32,
+        chunk_average: 4096,
+        codecs,
+        level: opts.level,
+        dictionary_size: if opts.no_compress || opts.block_size > 1 << 20 {
+            0
+        } else {
+            112 * 1024
+        },
+        threads: rayon::current_num_threads(),
+        memory_limit: None,
+        timestamps: Timestamps::Clamp,
+        compress_metadata: !opts.no_compress,
+    })
+    .map_err(stipple_error)?;
+    builder.set_order(FileOrder::Extension);
+    builder.set_hot_list(
+        opts.profile
+            .iter()
+            .map(|(path, _)| package_relative(path).into_os_string().into_encoded_bytes()),
+    );
+    for f in files {
+        let path = f.rel_path.as_os_str().as_bytes();
+        let mode = f.mode & 0o7777;
+        match &f.source {
+            FileSource::Disk(source) => builder.insert_file_at(path, source, mode, 0, 0),
+            FileSource::Memory(content) => builder.insert(
+                path,
+                Node::File {
+                    content: content.clone(),
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    link_group: None,
+                },
+            ),
+        }
+        .map_err(stipple_error)?;
+    }
+    pb.set_message("Building the stipplefs image...");
+    builder.build_into(out).map_err(stipple_error)?;
+    out.flush()?;
+
+    pb.set_message("Hashing files...");
+    let image = stipplefs::read::Image::open(out_path).map_err(stipple_error)?;
+    let reader = image.reader().map_err(stipple_error)?;
+    let inodes = files
+        .iter()
+        .map(|f| {
+            reader
+                .resolve(f.rel_path.as_os_str().as_bytes())
+                .ok_or_else(|| {
+                    io::Error::other(format!("{}: not in the image", f.rel_path.display()))
+                })
+        })
+        .collect::<io::Result<Vec<u32>>>()?;
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_cached_key(|&i| {
+        reader
+            .file_extents(inodes[i])
+            .first()
+            .map_or(u64::MAX, |e| e.0)
+    });
+
+    let mut built: Vec<Option<CompressedFile>> = files.iter().map(|_| None).collect();
+    let mut buf = vec![0u8; onelf_format::payload::SLICE_SIZE as usize];
+    for i in order {
+        let (f, ino) = (&files[i], inodes[i]);
+        let size = reader.inode(ino).map_or(0, |n| n.size);
+        let mut whole = blake3::Hasher::new();
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        while offset < size {
+            let n = reader.read(ino, offset, &mut buf).map_err(stipple_error)?;
+            if n == 0 {
+                return Err(io::Error::other(format!(
+                    "{}: the image ends the file early",
+                    f.rel_path.display()
+                )));
+            }
+            let slice = &buf[..n];
+            whole.update(slice);
+            blocks.push(onelf_format::Block {
+                payload_offset: offset,
+                compressed_size: ino as u64,
+                original_size: n as u64,
+                content_hash: *blake3::hash(slice).as_bytes(),
+            });
+            offset += n as u64;
+        }
+        built[i] = Some(CompressedFile {
+            rel_path: f.rel_path.clone(),
+            blocks,
+            content_hash: *whole.finalize().as_bytes(),
+            mode: f.mode,
+            mtime_secs: f.mtime_secs,
+            mtime_nsec: f.mtime_nsec,
+        });
+        pb.inc(1);
+    }
+    let size = fs::metadata(out_path)?.len();
+    Ok((built.into_iter().flatten().collect(), size))
 }
 
 /// Refuses an update key file that is not a ring of distinct 32-byte
@@ -1983,6 +2192,7 @@ mod tests {
             lib_dirs: Vec::new(),
             level: 3,
             block_size: compress::DEFAULT_BLOCK_SIZE,
+            payload: Payload::Blocks,
             use_dict: false,
             no_compress: false,
             memfd: Some(false),

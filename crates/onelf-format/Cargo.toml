@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
+stipplefs = { workspace = true, features = ["read", "zstd"] }

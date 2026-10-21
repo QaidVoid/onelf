@@ -24,13 +24,8 @@ pub(crate) fn read_packed_file(binary: &Path, path: &str) -> io::Result<Option<V
         return Ok(None);
     };
     let mut file = File::open(binary)?;
-    let dict = crate::info::read_dict(&mut file, &footer)?;
-    let data = decompress_verified(
-        &mut file,
-        &footer,
-        &manifest.entries[index],
-        dict.as_deref(),
-    )?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)?;
+    let data = decompress_verified(&mut file, &footer, &manifest.entries[index], &codec)?;
     Ok(Some(data))
 }
 
@@ -99,9 +94,9 @@ fn extract_metadata(
     let entry = &manifest.entries[entry_idx];
     let mut file = File::open(binary)?;
 
-    let dict = crate::info::read_dict(&mut file, &footer)?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)?;
 
-    let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
+    let data = decompress_verified(&mut file, &footer, entry, &codec)?;
 
     match output {
         Some(path) if path.as_os_str() == "-" => {

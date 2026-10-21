@@ -145,9 +145,12 @@ pub struct Entrypoint {
 pub struct Compression {
     #[serde(default = "default_level")]
     pub level: i32,
-    /// Bytes per payload block. See [`crate::compress::DEFAULT_BLOCK_SIZE`].
-    #[serde(default = "default_block_size")]
-    pub block_size: u64,
+    /// Bytes per payload block, or the payload's default. See
+    /// [`crate::pack::Payload::default_block_size`].
+    pub block_size: Option<u64>,
+    /// What the payload is made of. See [`crate::pack::Payload`].
+    #[serde(default)]
+    pub payload: PayloadSpec,
     #[serde(default)]
     pub dict: bool,
     /// Store the payload uncompressed (no zstd). Overrides `dict` and
@@ -163,7 +166,8 @@ impl Default for Compression {
     fn default() -> Self {
         Self {
             level: default_level(),
-            block_size: default_block_size(),
+            block_size: None,
+            payload: PayloadSpec::default(),
             dict: false,
             store: false,
             prefetch: None,
@@ -177,8 +181,22 @@ fn default_level() -> i32 {
     19
 }
 
-fn default_block_size() -> u64 {
-    crate::compress::DEFAULT_BLOCK_SIZE
+/// Recipe spelling of the payload format.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadSpec {
+    #[default]
+    Blocks,
+    Stipple,
+}
+
+impl From<PayloadSpec> for crate::pack::Payload {
+    fn from(v: PayloadSpec) -> Self {
+        match v {
+            PayloadSpec::Blocks => crate::pack::Payload::Blocks,
+            PayloadSpec::Stipple => crate::pack::Payload::Stipple,
+        }
+    }
 }
 
 /// Recipe spelling of the host library policy.

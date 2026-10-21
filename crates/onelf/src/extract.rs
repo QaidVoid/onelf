@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use onelf_format::payload::Codec;
 use onelf_format::{EntryKind, symlink_target_within_root};
 
 use crate::info::read_footer_and_manifest;
@@ -45,11 +46,17 @@ pub(crate) fn decompress_entry(
     file: &mut File,
     footer: &onelf_format::Footer,
     entry: &onelf_format::Entry,
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();
 
     for block in &entry.blocks {
+        if let Codec::Stipple(reader) = codec {
+            let slice = onelf_format::payload::read_slice(reader, block)?;
+            check_block_hash(block, &slice)?;
+            result.extend_from_slice(&slice);
+            continue;
+        }
         let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
         file.seek(SeekFrom::Start(abs))?;
         let mut compressed = vec![0u8; len];
@@ -66,7 +73,7 @@ pub(crate) fn decompress_entry(
         // exact-length check below rejects any block that does not
         // reproduce its recorded size.
         let cap = onelf_format::reader::block_original_size(block)?;
-        let decompressed = if let Some(d) = dict {
+        let decompressed = if let Some(d) = codec.dict() {
             let mut dec = zstd::bulk::Decompressor::with_dictionary(d)?;
             dec.decompress(&compressed, cap).map_err(|e| {
                 io::Error::new(
@@ -91,20 +98,23 @@ pub(crate) fn decompress_entry(
                 ),
             ));
         }
-        // What the FUSE server checks on every read. A block that fails
-        // here fails at launch, so it has to fail here too.
-        if block.has_content_hash() && blake3::hash(&decompressed).as_bytes() != &block.content_hash
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "block hash mismatch (tampered or corrupt package)",
-            ));
-        }
-
+        check_block_hash(block, &decompressed)?;
         result.extend_from_slice(&decompressed);
     }
 
     Ok(result)
+}
+
+/// What the FUSE server checks on every read. A block that fails here
+/// fails at launch, so it has to fail here too.
+fn check_block_hash(block: &onelf_format::Block, data: &[u8]) -> io::Result<()> {
+    if block.has_content_hash() && blake3::hash(data).as_bytes() != &block.content_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "block hash mismatch (tampered or corrupt package)",
+        ));
+    }
+    Ok(())
 }
 
 /// Decompress an entry and verify its bytes against the recorded BLAKE3
@@ -116,9 +126,9 @@ pub(crate) fn decompress_verified(
     file: &mut File,
     footer: &onelf_format::Footer,
     entry: &onelf_format::Entry,
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> io::Result<Vec<u8>> {
-    let data = decompress_entry(file, footer, entry, dict)?;
+    let data = decompress_entry(file, footer, entry, codec)?;
     if blake3::hash(&data).as_bytes() != &entry.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -137,7 +147,7 @@ fn extract_selective(
     let (footer, manifest) = read_footer_and_manifest(binary)?;
     let mut file = File::open(binary)?;
 
-    let dict = crate::info::read_dict(&mut file, &footer)?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)?;
 
     // Find matching entries
     let matched: Vec<(usize, String)> = manifest
@@ -179,7 +189,7 @@ fn extract_selective(
         }
         let (idx, _) = &matched[0];
         let entry = &manifest.entries[*idx];
-        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
+        let data = decompress_verified(&mut file, &footer, entry, &codec)?;
         io::stdout().write_all(&data)?;
         return Ok(());
     }
@@ -188,7 +198,7 @@ fn extract_selective(
     if matched.len() == 1 && files.len() == 1 {
         let (idx, _) = &matched[0];
         let entry = &manifest.entries[*idx];
-        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
+        let data = decompress_verified(&mut file, &footer, entry, &codec)?;
 
         if let Some(out) = output {
             if out.is_dir() {
@@ -235,7 +245,7 @@ fn extract_selective(
 
     for (idx, _) in &matched {
         let entry = &manifest.entries[*idx];
-        let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
+        let data = decompress_verified(&mut file, &footer, entry, &codec)?;
         let rel_path = manifest.validated_entry_path(*idx)?;
         let target = output_dir.join(&rel_path);
         if let Some(parent) = target.parent() {
@@ -255,16 +265,10 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
     let (footer, manifest) = read_footer_and_manifest(binary)?;
 
     let mut file = File::open(binary)?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)?;
+    let files = onelf_format::payload::file_order(&manifest, &codec);
 
-    // Read dictionary if present
-    let dict = crate::info::read_dict(&mut file, &footer)?;
-
-    let file_count = manifest
-        .entries
-        .iter()
-        .filter(|e| e.kind == EntryKind::File)
-        .count();
-    let pb = ProgressBar::new(file_count as u64);
+    let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -280,47 +284,47 @@ fn extract_all(binary: &Path, output_dir: &Path, preserve_mode: bool) -> io::Res
     // reject writes of its own children.
     let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
 
-    // First pass: dirs and files (before symlinks, so no file is ever
-    // written through a symlink pointing outside the tree).
+    // Dirs, then files, then symlinks, so no file is ever written through
+    // a symlink pointing outside the tree.
     for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != EntryKind::Dir {
+            continue;
+        }
         let rel_path = manifest.validated_entry_path(i)?;
         if rel_path.as_os_str().is_empty() {
             continue;
         }
         let target = output_dir.join(&rel_path);
-
-        match entry.kind {
-            EntryKind::Dir => {
-                fs::create_dir_all(&target)?;
-                // The directory may already exist with a restrictive mode
-                // (e.g. a prior extraction left it 0555). Ensure it is
-                // owner-writable and traversable now so its children can be
-                // written; the recorded mode is applied in the final pass.
-                let mode = fs::metadata(&target)?.permissions().mode();
-                if mode & 0o700 != 0o700 {
-                    fs::set_permissions(&target, fs::Permissions::from_mode(mode | 0o700))?;
-                }
-                dir_modes.push((target, mode_bits(entry.mode, preserve_mode)));
-            }
-            EntryKind::File => {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                let data = decompress_verified(&mut file, &footer, entry, dict.as_deref())?;
-
-                fs::write(&target, &data)?;
-                fs::set_permissions(
-                    &target,
-                    fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
-                )?;
-                pb.inc(1);
-            }
-            EntryKind::Symlink => {}
+        fs::create_dir_all(&target)?;
+        // The directory may already exist with a restrictive mode
+        // (e.g. a prior extraction left it 0555). Ensure it is
+        // owner-writable and traversable now so its children can be
+        // written; the recorded mode is applied in the final pass.
+        let mode = fs::metadata(&target)?.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode | 0o700))?;
         }
+        dir_modes.push((target, mode_bits(entry.mode, preserve_mode)));
     }
 
-    // Second pass: symlinks last; refuse any target that escapes the tree.
+    for i in files {
+        let entry = &manifest.entries[i];
+        let target = output_dir.join(manifest.validated_entry_path(i)?);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let data = decompress_verified(&mut file, &footer, entry, &codec)?;
+
+        fs::write(&target, &data)?;
+        fs::set_permissions(
+            &target,
+            fs::Permissions::from_mode(mode_bits(entry.mode, preserve_mode)),
+        )?;
+        pb.inc(1);
+    }
+
+    // Symlinks last; refuse any target that escapes the tree.
     for (i, entry) in manifest.entries.iter().enumerate() {
         if entry.kind != EntryKind::Symlink {
             continue;

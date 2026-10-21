@@ -501,12 +501,8 @@ fn serve(pkg: &mut PackageData, share: &Share, server: Server) -> ! {
     drop(record_lock);
     drop(lease);
 
-    let mut state = super::fs::FuseState::new(
-        &pkg.manifest,
-        &mut pkg.file,
-        &pkg.footer,
-        pkg.dict.as_deref(),
-    );
+    let mut state =
+        super::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
     state.expect_links(links);
     let mut buf = vec![0u8; 1024 * 1024 + 4096];
     state.run_loop(&fuse_fd, Some(&launched), None::<&OwnedFd>, &mut buf);

@@ -55,6 +55,12 @@ bitflags! {
     }
 }
 
+/// One block of a file's content.
+///
+/// In a stipplefs payload ([`crate::Flags::STIPPLE_PAYLOAD`]) a block is a
+/// slice of the file rather than a region of the payload: `payload_offset`
+/// is where the slice starts within the file and `compressed_size` holds
+/// the file's stipplefs inode. See [`crate::payload`].
 #[derive(Debug, Clone)]
 pub struct Block {
     /// Byte offset into the payload section where this block's data begins.

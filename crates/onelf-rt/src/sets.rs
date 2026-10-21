@@ -257,12 +257,8 @@ fn serve(file: &Path, mountpoint: &Path) -> ! {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default(),
         );
-        let mut state = crate::fuse::fs::FuseState::new(
-            &pkg.manifest,
-            &mut pkg.file,
-            &pkg.footer,
-            pkg.dict.as_deref(),
-        );
+        let mut state =
+            crate::fuse::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
         // Opened now, while the file is certain to exist: if the runtime
         // directory is cleaned out from under the server, this is what
         // still says whether a launch holds the claim.

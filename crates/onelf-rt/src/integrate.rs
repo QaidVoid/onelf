@@ -14,7 +14,7 @@ use onelf_format::desktop::{entry_icon, icon_set, patch_desktop_file};
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
-    crate::loader::read_payload_blocks(&mut pkg.file, &pkg.footer, &blocks, pkg.dict.as_deref())
+    crate::loader::read_payload_blocks(&pkg.file, &pkg.footer, &blocks, &pkg.codec)
 }
 
 fn xdg_data_home_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
@@ -170,10 +170,10 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
     let bundled = resolve_icon(&pkg.manifest, ep_name);
     let read = |i: usize| {
         crate::loader::read_verified_entry(
-            &mut pkg.file,
+            &pkg.file,
             &pkg.footer,
             &pkg.manifest.entries[i],
-            pkg.dict.as_deref(),
+            &pkg.codec,
         )
     };
     let icons = icon_set(&pkg.manifest, &names, bundled, read).unwrap_or_else(|e| {

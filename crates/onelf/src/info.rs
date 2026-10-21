@@ -44,6 +44,14 @@ pub fn info(path: &Path) -> io::Result<()> {
     );
     println!();
     println!("Payload:");
+    println!(
+        "  Format:       {}",
+        if footer.is_stipple() {
+            "stipplefs image"
+        } else {
+            "blocks"
+        }
+    );
     println!("  Offset:       {}", footer.payload_offset);
     println!("  Size:         {} bytes", footer.payload_size);
     println!();
@@ -200,19 +208,6 @@ pub fn info(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Read the optional zstd dictionary described by `footer` from `reader`,
-/// or `None` when the package carries no dictionary. Shared by every command
-/// that decompresses payload entries.
-pub fn read_dict<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<Option<Vec<u8>>> {
-    if footer.dict_size == 0 {
-        return Ok(None);
-    }
-    reader.seek(SeekFrom::Start(footer.dict_offset))?;
-    let mut buf = vec![0u8; footer.dict_size as usize];
-    reader.read_exact(&mut buf)?;
-    Ok(Some(buf))
-}
-
 /// Read and verify the manifest `footer` describes, from an already
 /// bounds-checked file.
 fn read_manifest<R: Read + Seek>(reader: &mut R, footer: &Footer) -> io::Result<Manifest> {
@@ -320,12 +315,12 @@ fn read_metadata_bytes(
     let Some(idx) = idx else { return Ok(None) };
 
     let mut file = File::open(path)?;
-    let dict = read_dict(&mut file, footer)?;
+    let codec = onelf_format::payload::Codec::open(&file, footer)?;
     Ok(Some(decompress_verified(
         &mut file,
         footer,
         &manifest.entries[idx],
-        dict.as_deref(),
+        &codec,
     )?))
 }
 
@@ -344,9 +339,9 @@ fn read_package_info(
 
     // The footer is already parsed by the caller; just reopen for the payload.
     let mut file = File::open(path)?;
-    let dict = read_dict(&mut file, footer)?;
+    let codec = onelf_format::payload::Codec::open(&file, footer)?;
 
-    let data = decompress_verified(&mut file, footer, &manifest.entries[idx], dict.as_deref())?;
+    let data = decompress_verified(&mut file, footer, &manifest.entries[idx], &codec)?;
     let text = String::from_utf8(data).unwrap_or_default();
     Ok(Some(text))
 }

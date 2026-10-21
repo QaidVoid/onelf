@@ -87,10 +87,8 @@ pub fn extract_matching(
     }
 
     // Files (before symlinks, so no file is written through a symlink).
-    for (i, entry) in manifest.entries.iter().enumerate() {
-        if entry.kind != EntryKind::File {
-            continue;
-        }
+    for i in onelf_format::payload::file_order(manifest, &pkg.codec) {
+        let entry = &manifest.entries[i];
         let rel = manifest.validated_entry_path(i)?;
         if !keep(&rel) {
             continue;
@@ -100,9 +98,8 @@ pub fn extract_matching(
             fs::create_dir_all(parent)?;
         }
 
-        let data =
-            loader::read_verified_entry(&mut pkg.file, &pkg.footer, entry, pkg.dict.as_deref())
-                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", rel.display())))?;
+        let data = loader::read_verified_entry(&pkg.file, &pkg.footer, entry, &pkg.codec)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", rel.display())))?;
 
         // Never through whatever already sits there: a symlink a launch
         // put over a bundled library would carry the write to the host
@@ -269,10 +266,8 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
     }
 
     // Second pass: extract files to CAS and create hardlinks
-    for (i, entry) in manifest.entries.iter().enumerate() {
-        if entry.kind != EntryKind::File {
-            continue;
-        }
+    for i in onelf_format::payload::file_order(manifest, &pkg.codec) {
+        let entry = &manifest.entries[i];
 
         // Validate the link path before any I/O so a hostile name is
         // rejected before it can create directories.
@@ -298,12 +293,7 @@ fn extract_to_cas(pkg: &mut PackageData, cas_dir: &Path, pkg_dir: &Path) -> io::
             // read_verified_entry hashes the decompressed bytes against
             // entry.content_hash, so the CAS filename (derived from that
             // hash) is only ever populated with verified content.
-            let data = loader::read_verified_entry(
-                &mut pkg.file,
-                &pkg.footer,
-                entry,
-                pkg.dict.as_deref(),
-            )?;
+            let data = loader::read_verified_entry(&pkg.file, &pkg.footer, entry, &pkg.codec)?;
 
             // Atomic write: unique temp file then rename. A per-process
             // pid+sequence name avoids two concurrent extractions of the

@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use onelf_format::Manifest;
 use onelf_format::entry::EntryKind;
+use onelf_format::payload::Codec;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use crate::loader;
@@ -370,15 +371,15 @@ impl<'m> PathIndex<'m> {
 fn profiled_blocks(
     manifest: &Manifest,
     children: &[Vec<u64>],
-    file: &mut File,
+    file: &File,
     footer: &onelf_format::Footer,
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> Vec<(BlockKey, onelf_format::Block)> {
     let mut index = PathIndex::new(manifest, children);
     let Some(idx) = index.entry(PREFETCH_FILE) else {
         return Vec::new();
     };
-    let Ok(data) = loader::read_verified_entry(file, footer, &manifest.entries[idx], dict) else {
+    let Ok(data) = loader::read_verified_entry(file, footer, &manifest.entries[idx], codec) else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&data);
@@ -452,7 +453,7 @@ impl Prefetched {
         self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn work(&self, file: &File, footer: &onelf_format::Footer, dict: Option<&[u8]>) {
+    fn work(&self, file: &File, footer: &onelf_format::Footer, codec: &Codec) {
         loop {
             let Some((key, block)) = self.blocks.get(self.next.fetch_add(1, Ordering::Relaxed))
             else {
@@ -470,7 +471,7 @@ impl Prefetched {
                     continue;
                 }
             }
-            let Ok(data) = loader::read_payload_entry(file, footer, block, dict) else {
+            let Ok(data) = loader::read_payload_entry(file, footer, block, codec) else {
                 continue;
             };
             let mut store = self.lock();
@@ -492,7 +493,7 @@ impl Prefetch {
         blocks: Vec<(BlockKey, onelf_format::Block)>,
         file: &File,
         footer: &onelf_format::Footer,
-        dict: Option<&[u8]>,
+        codec: &Codec,
     ) -> Option<Self> {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let threads = PREFETCH_THREADS.min(cores.saturating_sub(1));
@@ -500,7 +501,6 @@ impl Prefetch {
             return None;
         }
         let shared = Arc::new(Prefetched::new(blocks, PREFETCH_WINDOW));
-        let dict: Option<Arc<[u8]>> = dict.map(Arc::from);
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
             let Ok(file) = file.try_clone() else {
@@ -508,10 +508,10 @@ impl Prefetch {
             };
             let shared = Arc::clone(&shared);
             let footer = footer.clone();
-            let dict = dict.clone();
+            let codec = codec.clone();
             let spawned = std::thread::Builder::new()
                 .name("onelf-prefetch".into())
-                .spawn(move || shared.work(&file, &footer, dict.as_deref()));
+                .spawn(move || shared.work(&file, &footer, &codec));
             match spawned {
                 Ok(worker) => workers.push(worker),
                 Err(_) => break,
@@ -634,7 +634,7 @@ pub struct FuseState<'a> {
     manifest: &'a Manifest,
     file: &'a mut File,
     footer: &'a onelf_format::Footer,
-    dict: Option<&'a [u8]>,
+    codec: &'a Codec,
     children: Vec<Vec<u64>>,
     cache: BlockCache,
     /// Per-inode verdict of whole-entry verification, used only for
@@ -656,16 +656,16 @@ impl<'a> FuseState<'a> {
         manifest: &'a Manifest,
         file: &'a mut File,
         footer: &'a onelf_format::Footer,
-        dict: Option<&'a [u8]>,
+        codec: &'a Codec,
     ) -> Self {
         let children = build_children(manifest);
-        let profiled = profiled_blocks(manifest, &children, file, footer, dict);
-        let prefetch = Prefetch::start(profiled, file, footer, dict);
+        let profiled = profiled_blocks(manifest, &children, file, footer, codec);
+        let prefetch = Prefetch::start(profiled, file, footer, codec);
         Self {
             manifest,
             file,
             footer,
-            dict,
+            codec,
             children,
             cache: BlockCache::new(cache_budget()),
             verified: HashMap::new(),
@@ -717,11 +717,11 @@ impl<'a> FuseState<'a> {
         if let Some(&ok) = self.verified.get(&inode) {
             return ok;
         }
-        let ok = match loader::read_payload_blocks(self.file, self.footer, &entry.blocks, self.dict)
-        {
-            Ok(data) => blake3::hash(&data).as_bytes() == &entry.content_hash,
-            Err(_) => false,
-        };
+        let ok =
+            match loader::read_payload_blocks(self.file, self.footer, &entry.blocks, self.codec) {
+                Ok(data) => blake3::hash(&data).as_bytes() == &entry.content_hash,
+                Err(_) => false,
+            };
         self.verified.insert(inode, ok);
         ok
     }
@@ -1067,7 +1067,7 @@ impl<'a> FuseState<'a> {
                 .and_then(|p| p.take((inode, block_idx)));
             let data = match prefetched {
                 Some(data) => Ok(data),
-                None => loader::read_payload_entry(self.file, self.footer, block, self.dict),
+                None => loader::read_payload_entry(self.file, self.footer, block, self.codec),
             };
             match data {
                 Ok(data) => {
@@ -1772,9 +1772,9 @@ mod tests {
         let contents: [&[u8]; 3] = [b"first block", b"second block", b"third"];
         let (file, footer, blocks) = stored_payload("same", &contents);
         let prefetch = prefetch_of(&blocks, usize::MAX);
-        prefetch.shared.work(&file, &footer, None);
+        prefetch.shared.work(&file, &footer, &Codec::Zstd(None));
         for (i, b) in blocks.iter().enumerate() {
-            let direct = loader::read_payload_entry(&file, &footer, b, None).unwrap();
+            let direct = loader::read_payload_entry(&file, &footer, b, &Codec::Zstd(None)).unwrap();
             assert_eq!(prefetch.take((1, i)).as_deref(), Some(contents[i]));
             assert_eq!(direct, contents[i]);
         }
@@ -1792,7 +1792,7 @@ mod tests {
         let (file, footer, blocks) = stored_payload("taken", &[b"aaaa", b"bbbb"]);
         let prefetch = prefetch_of(&blocks, usize::MAX);
         assert!(prefetch.take((1, 0)).is_none());
-        prefetch.shared.work(&file, &footer, None);
+        prefetch.shared.work(&file, &footer, &Codec::Zstd(None));
         assert!(prefetch.take((1, 0)).is_none());
         assert_eq!(prefetch.take((1, 1)).as_deref(), Some(&b"bbbb"[..]));
     }
@@ -1817,7 +1817,7 @@ mod tests {
         let mut prefetch = prefetch_of(&blocks, 4);
         let shared = Arc::clone(&prefetch.shared);
         prefetch.workers.push(std::thread::spawn(move || {
-            shared.work(&file, &footer, None)
+            shared.work(&file, &footer, &Codec::Zstd(None))
         }));
 
         let ready = |p: &Prefetch, key: BlockKey| {

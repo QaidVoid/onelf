@@ -22,6 +22,15 @@ pub const MIN_BLOCK_SIZE: u64 = 4 * 1024;
 /// cache budget so a single block can always be held.
 pub const MAX_BLOCK_SIZE: u64 = 32 * 1024 * 1024;
 
+/// Block size of a stipplefs payload unless one is chosen. Its blocks
+/// hold many files each, and the image is within a percent of its
+/// smallest here at half the decode time of 64 MiB.
+pub const DEFAULT_STIPPLE_BLOCK_SIZE: u64 = 32 * 1024 * 1024;
+
+/// Largest block a stipplefs payload may choose. The runtime serves it in
+/// 64 KiB slices, so its FUSE cache never has to hold one whole.
+pub const MAX_STIPPLE_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+
 pub struct CompressedBlock {
     pub data: Vec<u8>,
     pub original_size: u64,

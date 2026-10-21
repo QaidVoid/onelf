@@ -81,7 +81,7 @@ pub fn verify(binary: &Path, key: Option<&Path>, sig: Option<&Path>) -> io::Resu
         footer.format_version
     );
 
-    let dict = crate::info::read_dict(&mut file, &footer)?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)?;
 
     let file_entries: Vec<(usize, String)> = manifest
         .entries
@@ -96,7 +96,7 @@ pub fn verify(binary: &Path, key: Option<&Path>, sig: Option<&Path>) -> io::Resu
 
     for (idx, rel_path) in &file_entries {
         let entry = &manifest.entries[*idx];
-        let data = match decompress_entry(&mut file, &footer, entry, dict.as_deref()) {
+        let data = match decompress_entry(&mut file, &footer, entry, &codec) {
             Ok(data) => data,
             // A block that does not decode or does not hash is this file's
             // failure, reported with the rest rather than ending the run.

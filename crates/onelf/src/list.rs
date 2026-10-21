@@ -11,7 +11,7 @@ use onelf_format::EntryKind;
 use crate::info::read_footer_and_manifest;
 
 pub fn list(path: &Path) -> io::Result<()> {
-    let (_footer, manifest) = read_footer_and_manifest(path)?;
+    let (footer, manifest) = read_footer_and_manifest(path)?;
 
     println!(
         "{:<10} {:<7} {:<12} {:<12} {:<66} PATH",
@@ -36,7 +36,18 @@ pub fn list(path: &Path) -> io::Result<()> {
         match entry.kind {
             EntryKind::File => {
                 let total_original: u64 = entry.blocks.iter().map(|b| b.original_size).sum();
-                let total_compressed: u64 = entry.blocks.iter().map(|b| b.compressed_size).sum();
+                // A stipplefs image deduplicates and compresses across
+                // files, so no file has a compressed size of its own.
+                let total_compressed = if footer.is_stipple() {
+                    "-".to_string()
+                } else {
+                    entry
+                        .blocks
+                        .iter()
+                        .map(|b| b.compressed_size)
+                        .sum::<u64>()
+                        .to_string()
+                };
                 let hash: String = entry
                     .content_hash
                     .iter()

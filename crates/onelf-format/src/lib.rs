@@ -10,6 +10,7 @@ pub mod elf;
 pub mod entry;
 pub mod footer;
 pub mod manifest;
+pub mod payload;
 pub mod reader;
 pub mod resolve;
 pub mod update;

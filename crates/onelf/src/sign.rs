@@ -150,8 +150,8 @@ fn embedded_file(file: &Path, path: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut f = File::open(file).ok()?;
-    let dict = crate::info::read_dict(&mut f, &footer).ok()?;
-    crate::extract::decompress_verified(&mut f, &footer, entry, dict.as_deref()).ok()
+    let codec = onelf_format::payload::Codec::open(&f, &footer).ok()?;
+    crate::extract::decompress_verified(&mut f, &footer, entry, &codec).ok()
 }
 
 /// Compare the package's embedded update keys against the signing key.

@@ -104,6 +104,9 @@ bitflags! {
         /// files that outlive it. Set together with [`Flags::CACHE_REQUESTED`],
         /// so a runtime that predates this bit still falls back to the cache.
         const CACHE_PREFERRED = 1 << 8;
+        /// The payload is a stipplefs image rather than separately compressed blocks.
+        /// See [`crate::payload`] for what a block then describes.
+        const STIPPLE_PAYLOAD = 1 << 9;
     }
 }
 
@@ -185,6 +188,11 @@ impl Footer {
     /// must skip decompression and use payload bytes directly.
     pub fn is_stored(&self) -> bool {
         self.flags.contains(Flags::STORED)
+    }
+
+    /// Whether the payload is a stipplefs image. See [`crate::payload`].
+    pub fn is_stipple(&self) -> bool {
+        self.flags.contains(Flags::STIPPLE_PAYLOAD)
     }
 
     /// BLAKE3 over this footer's exact 76 bytes, with the four

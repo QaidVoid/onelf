@@ -1,19 +1,21 @@
 //! Package loading from the current binary, or from any package file.
 //!
 //! Reads the ONELF footer from the end of the file, decompresses the
-//! manifest, and optionally loads the zstd dictionary.
+//! manifest, and opens the payload's codec.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use onelf_format::payload::Codec;
 use onelf_format::{Entry, FOOTER_SIZE, Footer, Manifest};
 
 pub struct PackageData {
     pub footer: Footer,
     pub manifest: Manifest,
     pub file: File,
-    pub dict: Option<Vec<u8>>,
+    pub codec: Codec,
 }
 
 /// The package this process is running from.
@@ -66,22 +68,13 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
     }
 
     let manifest = Manifest::deserialize(&manifest_bytes)?;
-
-    // Read dictionary if present
-    let dict = if footer.flags.contains(onelf_format::Flags::HAS_DICT) && footer.dict_size > 0 {
-        file.seek(SeekFrom::Start(footer.dict_offset))?;
-        let mut dict_buf = vec![0u8; footer.dict_size as usize];
-        file.read_exact(&mut dict_buf)?;
-        Some(dict_buf)
-    } else {
-        None
-    };
+    let codec = Codec::open(&file, &footer)?;
 
     Ok(PackageData {
         footer,
         manifest,
         file,
-        dict,
+        codec,
     })
 }
 
@@ -98,36 +91,15 @@ pub fn read_payload_entry(
     file: &File,
     footer: &Footer,
     block: &onelf_format::Block,
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
-    let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
-    let mut buf = vec![0u8; len];
-    file.read_exact_at(&mut buf, abs)?;
-
-    // Store mode: bytes are the file content verbatim, no zstd. The hash
-    // check still applies: a corrupt or tampered stored block must fail
-    // the read rather than serve garbage. The FUSE block cache makes
-    // this once per block, so read latency keeps its disk-bound shape.
-    if footer.is_stored() {
-        if block.has_content_hash() && blake3::hash(&buf).as_bytes() != &block.content_hash {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "onelf: block hash mismatch (tampered or corrupt package)",
-            ));
-        }
-        return Ok(buf);
-    }
-    let original = onelf_format::reader::block_original_size(block)?;
-    let data = decode_block(&buf, original, dict)?;
-
+    let data = read_block(file, footer, block, codec)?;
     if block.has_content_hash() && blake3::hash(&data).as_bytes() != &block.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "onelf: block hash mismatch (tampered or corrupt package)",
         ));
     }
-
     Ok(data)
 }
 
@@ -137,12 +109,12 @@ pub fn read_payload_entry(
 /// slot) is a hard error, so unverified bytes never reach execution,
 /// hardlinking, memfd loading, or FUSE.
 pub fn read_verified_entry(
-    file: &mut File,
+    file: &File,
     footer: &Footer,
     entry: &Entry,
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> io::Result<Vec<u8>> {
-    let data = read_payload_blocks(file, footer, &entry.blocks, dict)?;
+    let data = read_payload_blocks(file, footer, &entry.blocks, codec)?;
     if blake3::hash(&data).as_bytes() != &entry.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -154,29 +126,38 @@ pub fn read_verified_entry(
 
 /// Read and concatenate every block of an entry.
 pub fn read_payload_blocks(
-    file: &mut File,
+    file: &File,
     footer: &Footer,
     blocks: &[onelf_format::Block],
-    dict: Option<&[u8]>,
+    codec: &Codec,
 ) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();
-
     for block in blocks {
-        let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
-        file.seek(SeekFrom::Start(abs))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)?;
-
-        // Store mode: bytes are the file content verbatim, no zstd.
-        if footer.is_stored() {
-            result.extend_from_slice(&buf);
-            continue;
-        }
-        let original = onelf_format::reader::block_original_size(block)?;
-        result.extend_from_slice(&decode_block(&buf, original, dict)?);
+        result.extend_from_slice(&read_block(file, footer, block, codec)?);
     }
-
     Ok(result)
+}
+
+/// One block's content, unverified. The read leaves the file position
+/// alone, so the FUSE server's prefetch workers can share the file.
+fn read_block(
+    file: &File,
+    footer: &Footer,
+    block: &onelf_format::Block,
+    codec: &Codec,
+) -> io::Result<Vec<u8>> {
+    if let Codec::Stipple(reader) = codec {
+        return onelf_format::payload::read_slice(reader, block);
+    }
+    let (abs, len) = onelf_format::reader::block_extent(footer, block)?;
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, abs)?;
+    // Store mode: bytes are the file content verbatim, no zstd.
+    if footer.is_stored() {
+        return Ok(buf);
+    }
+    let original = onelf_format::reader::block_original_size(block)?;
+    decode_block(&buf, original, codec.dict())
 }
 
 /// Decompress one block that the manifest says is `original` bytes long.
