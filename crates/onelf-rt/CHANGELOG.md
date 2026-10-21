@@ -1,4 +1,19 @@
 
+## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.1...onelf-rt-v0.4.2) - 2026-10-21
+
+### ⛰️  Features
+
+- Add a stipplefs payload with --payload stipple - ([1512eca](https://github.com/QaidVoid/onelf/commit/1512eca9d7ee6c3558b7476ab81e0b37a7ad6333))
+- Add --prefer-cache to run from the persistent cache first - ([20f0e6c](https://github.com/QaidVoid/onelf/commit/20f0e6caad37ca33dcc86d37c9b5f4fa5c69fa86))
+
+### 🐛 Bug Fixes
+
+- *(rt)* Pass the entrypoint's tree path as argv[0] - ([be446cc](https://github.com/QaidVoid/onelf/commit/be446cc7ac2abd1d29112edf9177c4183314fa9a))
+
+### 🧪 Testing
+
+- *(rt)* Use a shell, not sleep, in the mapped-tree test - ([2f40f80](https://github.com/QaidVoid/onelf/commit/2f40f808c92ad34084be2a304810f598107b7ebe))
+
 
 ## [0.4.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.3.3...onelf-rt-v0.4.0) - 2026-10-17
 

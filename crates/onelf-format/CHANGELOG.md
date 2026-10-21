@@ -1,4 +1,11 @@
 
+## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.4.1...onelf-format-v0.4.2) - 2026-10-21
+
+### ⛰️  Features
+
+- Add a stipplefs payload with --payload stipple - ([1512eca](https://github.com/QaidVoid/onelf/commit/1512eca9d7ee6c3558b7476ab81e0b37a7ad6333))
+- Add --prefer-cache to run from the persistent cache first - ([20f0e6c](https://github.com/QaidVoid/onelf/commit/20f0e6caad37ca33dcc86d37c9b5f4fa5c69fa86))
+
 
 ## [0.4.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.3.3...onelf-format-v0.4.0) - 2026-10-17
 
