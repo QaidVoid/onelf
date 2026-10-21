@@ -1,4 +1,10 @@
 
+## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-sysroot-v0.4.1...onelf-sysroot-v0.4.2) - 2026-10-21
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml dependencies - ([0000000](https://github.com/QaidVoid/onelf/commit/0000000))
+
 
 ## [0.4.0](https://github.com/QaidVoid/onelf/compare/onelf-sysroot-v0.3.3...onelf-sysroot-v0.4.0) - 2026-10-17
 
