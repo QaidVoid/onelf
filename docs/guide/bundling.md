@@ -156,7 +156,7 @@ quickest way to tell whether a failure is the resolver's doing.
 
 | Verdict | Mode | Meaning |
 |---------|------|---------|
-| default when the bundle references a driver stack | `auto` | The driver stack's host closure: the driver families, what the host's Vulkan and EGL vendor files name, the host's GLX vendor libraries, and everything they need |
+| default when the bundle references a driver stack | `auto` | The driver stack's host closure: the driver families, what the host's Vulkan and EGL vendor files name, the host's GLX vendor libraries, what the DRI and VA-API drivers in its `dri` directories need, and everything they need |
 | default otherwise | `never` | Nothing from the host |
 | ✅ for apps that load a host library under a name they never mention | `always` | Every bundled soname is compared as well |
 

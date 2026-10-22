@@ -389,6 +389,10 @@ struct HostIndex {
     /// build's dlopen-only libraries. They seed the closure walk alongside
     /// the driver families.
     icd_libs: Vec<PathBuf>,
+    /// What the host's driver modules need. Mesa and libva open those
+    /// modules by absolute path, so the modules load without the farm but
+    /// their dependencies are looked up by soname and must be in it.
+    module_needs: BTreeSet<String>,
 }
 
 impl HostIndex {
@@ -426,7 +430,23 @@ impl HostIndex {
                 libs.entry(name.to_string()).or_insert_with(|| path.clone());
             }
         }
-        HostIndex { libs, icd_libs }
+        let mut module_needs = BTreeSet::new();
+        for dir in module_dirs(ld_cache) {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "so") {
+                    module_needs.extend(verdef::read_needed(&path).unwrap_or_default());
+                }
+            }
+        }
+        HostIndex {
+            libs,
+            icd_libs,
+            module_needs,
+        }
     }
 
     /// The loader the host's libc was built with: its own `PT_INTERP`,
@@ -444,8 +464,9 @@ impl HostIndex {
             .map(|(_, path)| path.clone())
     }
 
-    /// Every soname reachable from the driver families, the host's
-    /// dlopen-only seeds, and the ICD-named drivers through `DT_NEEDED`.
+    /// Every soname reachable through `DT_NEEDED` from the driver
+    /// families, the host's dlopen-only seeds, the ICD-named drivers and
+    /// what the host's driver modules need.
     fn driver_closure(&self) -> HashSet<String> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = self
@@ -459,6 +480,7 @@ impl HostIndex {
                 queue.push_back(name.to_string());
             }
         }
+        queue.extend(self.module_needs.iter().cloned());
         while let Some(name) = queue.pop_front() {
             if !seen.insert(name.clone()) {
                 continue;
@@ -474,6 +496,18 @@ impl HostIndex {
         }
         seen
     }
+}
+
+/// The `dri` directories beside the host's library directories, where
+/// Mesa keeps its DRI drivers and libva its VA-API drivers. Each sits next
+/// to the library directory Mesa was installed into, so the loader cache
+/// finds them on any distribution layout.
+fn module_dirs(ld_cache: &Path) -> Vec<PathBuf> {
+    drivers::cache_dirs_in(ld_cache)
+        .into_iter()
+        .map(|dir| Path::new(&dir).join("dri"))
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 /// `library_path` values from Vulkan ICD and EGL vendor files under
@@ -599,6 +633,9 @@ fn fingerprint(
     stamp(ld_cache);
     for dir in drivers::cache_dirs_in(ld_cache) {
         stamp(Path::new(&dir));
+    }
+    for dir in module_dirs(ld_cache) {
+        stamp(&dir);
     }
     for dir in icd_dirs {
         stamp(Path::new(dir));
@@ -831,6 +868,16 @@ mod tests {
             path
         }
 
+        /// Put a driver module in the `dri` directory beside the host's
+        /// libraries, where Mesa opens it by path.
+        fn host_module(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let dir = self.host_lib.join("dri");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        }
+
         fn bundle(&self, name: &str, bytes: &[u8]) -> PathBuf {
             let path = self.pkg.join("lib").join(name);
             fs::write(&path, bytes).unwrap();
@@ -842,6 +889,7 @@ mod tests {
             let mut names: Vec<String> = fs::read_dir(&self.host_lib)
                 .unwrap()
                 .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect();
             names.sort();
@@ -1466,5 +1514,50 @@ mod tests {
         w.resolve(HostLibsPolicy::Auto);
         assert_eq!(w.farm_link("libGL.so.1"), Some(host_gl));
         assert!(w.farm_link("libfoo.so.1").is_some());
+    }
+
+    #[test]
+    fn a_dri_module_brings_what_it_needs() {
+        let w = World::new();
+        let host_llvm = w.host("libLLVM-15.so.1", &versioned(&[]));
+        w.host_module("swrast_dri.so", &driver_needing(&["libLLVM-15.so.1"]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libLLVM-15.so.1"), Some(host_llvm));
+        assert!(w.farm_link("swrast_dri.so").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_module_is_ignored() {
+        let w = World::new();
+        let host_llvm = w.host("libLLVM-15.so.1", &versioned(&[]));
+        w.host_module("broken_dri.so", b"not an ELF object");
+        w.host_module("swrast_dri.so", &driver_needing(&["libLLVM-15.so.1"]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libLLVM-15.so.1"), Some(host_llvm));
+    }
+
+    #[test]
+    fn a_new_module_resolves_afresh() {
+        let w = World::new();
+        w.host("libLLVM-15.so.1", &versioned(&[]));
+        let host_sensors = w.host("libsensors.so.5", &versioned(&[]));
+        w.host_module("swrast_dri.so", &driver_needing(&["libLLVM-15.so.1"]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(w.farm_link("libsensors.so.5").is_none());
+
+        w.host_module("radeonsi_dri.so", &driver_needing(&["libsensors.so.5"]));
+        // Set explicitly: a directory's mtime can be coarser than the
+        // time between the two writes.
+        fs::File::open(w.host_lib.join("dri"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libsensors.so.5"), Some(host_sensors));
     }
 }
