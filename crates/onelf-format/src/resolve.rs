@@ -92,6 +92,13 @@ const GL_BUILD_SEEDS: &[&str] = &[
     "libVkLayer_",
 ];
 
+/// Host libraries that glvnd opens by a name built from the X server's
+/// vendor string, so neither `DT_NEEDED` nor any driver description file
+/// names them. They seed the host's closure walk like the driver
+/// families, or a package reaching GL through GLX cannot load the
+/// vendor the host's display names.
+const HOST_SEEDS: &[&str] = &["libGLX_"];
+
 /// Where a launch gets its GL stack from, if anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gl {
@@ -437,14 +444,14 @@ impl HostIndex {
             .map(|(_, path)| path.clone())
     }
 
-    /// Every soname reachable from the driver families through
-    /// `DT_NEEDED`, seeds included.
+    /// Every soname reachable from the driver families, the host's
+    /// dlopen-only seeds, and the ICD-named drivers through `DT_NEEDED`.
     fn driver_closure(&self) -> HashSet<String> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = self
             .libs
             .keys()
-            .filter(|name| is_driver_family(name))
+            .filter(|name| is_driver_family(name) || HOST_SEEDS.iter().any(|p| name.starts_with(p)))
             .cloned()
             .collect();
         for path in &self.icd_libs {
@@ -1388,5 +1395,76 @@ mod tests {
         w.resolve(HostLibsPolicy::Auto);
         assert!(w.farm_link("libGLX_nvidia.so.0").is_some());
         assert_eq!(w.farm_link("libnvidia-glcore.so.1"), Some(host_glcore));
+    }
+
+    #[test]
+    fn a_glx_vendor_library_nothing_names_is_farmed_with_its_needs() {
+        let w = World::new();
+        // glvnd builds the vendor's soname from the X server's vendor
+        // string, so no ICD or EGL vendor file names Mesa's copy and no
+        // driver family prefix matches it.
+        let host_mesa = w.host("libGLX_mesa.so.0", &driver_needing(&["libxcb-glx.so.0"]));
+        let host_xcb_glx = w.host("libxcb-glx.so.0", &versioned(&[]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libGLX_mesa.so.0"), Some(host_mesa));
+        assert_eq!(w.farm_link("libxcb-glx.so.0"), Some(host_xcb_glx));
+    }
+
+    #[test]
+    fn the_glx_indirect_fallback_is_farmed() {
+        let w = World::new();
+        let host_indirect = w.host("libGLX_indirect.so.0", &versioned(&[]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libGLX_indirect.so.0"), Some(host_indirect));
+    }
+
+    #[test]
+    fn a_bundled_glx_vendor_stays_bundled() {
+        let w = World::new();
+        // Neither copy defines symbol versions, so the sets are equal and
+        // the package ships its own driver choice.
+        w.host("libGLX_mesa.so.0", &versioned(&[]));
+        w.bundle("libGLX_mesa.so.0", &versioned(&[]));
+
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let req = Request {
+            pkg_root: &w.pkg,
+            lib_dirs: &["lib"],
+            policy: HostLibsPolicy::Auto,
+            store: &w.store,
+            ld_cache: &w.cache,
+            icd_dirs: &[icd_dir.as_str()],
+            extra_root: None,
+            set_roots: &[],
+            host_libc: true,
+        };
+        let d = decide(&req);
+        assert_eq!(
+            d.compared,
+            vec![("libGLX_mesa.so.0".to_string(), Some(Choice::Bundle))]
+        );
+        assert!(d.winners.is_empty());
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(w.farm_link("libGLX_mesa.so.0").is_none());
+    }
+
+    #[test]
+    fn a_host_without_glx_vendors_is_unaffected() {
+        let w = World::new();
+        let host_gl = w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+
+        let closure = HostIndex::load(&w.cache, &[], None).driver_closure();
+        assert!(!closure.iter().any(|n| n.starts_with("libGLX_")));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libGL.so.1"), Some(host_gl));
+        assert!(w.farm_link("libfoo.so.1").is_some());
     }
 }
