@@ -238,6 +238,32 @@ pub struct ThemeIcon {
     pub data: Vec<u8>,
 }
 
+/// The entrypoints other than the default that carry a desktop file of
+/// their own, `.onelf/desktop/<name>.desktop`, in manifest order.
+/// Integrating a package installs these beside the default's entry. One
+/// served only by the `default.desktop` fallback is left out, so a
+/// command line entrypoint does not become a second copy of the app's
+/// menu entry.
+pub fn menu_entrypoints(manifest: &Manifest) -> Vec<&str> {
+    let desktops: Vec<String> = (0..manifest.entries.len())
+        .filter(|&i| manifest.entries[i].kind == EntryKind::File)
+        .map(|i| manifest.entry_path(i))
+        .filter(|path| path.starts_with(".onelf/desktop/"))
+        .collect();
+    let default = manifest.header.default_entrypoint as usize;
+    manifest
+        .entrypoints
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != default)
+        .map(|(_, ep)| manifest.get_string(ep.name))
+        .filter(|name| {
+            let own = format!(".onelf/desktop/{name}.desktop");
+            desktops.contains(&own)
+        })
+        .collect()
+}
+
 /// Every icon a package carries for one desktop entry.
 ///
 /// That is each `icons/hicolor/<size>/apps/<name>.png` or `.svg` the
@@ -327,6 +353,85 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Entry, EntryPoint, EntryPointFlags, ManifestHeader, StringTableBuilder, WorkingDir,
+    };
+
+    /// A manifest with entrypoints `eps` (the first the default) and the
+    /// files `desktops` under `.onelf/desktop/`.
+    fn with_desktops(eps: &[&str], desktops: &[&str]) -> Manifest {
+        let mut strings = StringTableBuilder::new();
+        let dir = |name: u32, parent: u32| Entry {
+            kind: EntryKind::Dir,
+            parent,
+            name,
+            mode: 0o755,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+            content_hash: [0; 32],
+            blocks: Vec::new(),
+            symlink_target: 0,
+        };
+        let mut entries = vec![dir(strings.add(".onelf"), u32::MAX)];
+        entries.push(dir(strings.add("desktop"), 0));
+        for file in desktops {
+            entries.push(Entry {
+                kind: EntryKind::File,
+                mode: 0o644,
+                ..dir(strings.add(file), 1)
+            });
+        }
+        let entrypoints = eps
+            .iter()
+            .map(|name| EntryPoint {
+                name: strings.add(name),
+                target_entry: 0,
+                args: 0,
+                working_dir: WorkingDir::Inherit,
+                flags: EntryPointFlags::empty(),
+            })
+            .collect::<Vec<_>>();
+        let string_table = strings.finish();
+        Manifest {
+            header: ManifestHeader {
+                version: crate::manifest::MANIFEST_VERSION,
+                entry_count: entries.len() as u32,
+                string_table_size: string_table.len() as u32,
+                entrypoint_count: entrypoints.len() as u16,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [0; 32],
+                prefix_hash: [0; 32],
+                footer_hash: [0; 32],
+            },
+            entrypoints,
+            entries,
+            lib_dir_offsets: Vec::new(),
+            string_table,
+        }
+    }
+
+    #[test]
+    fn an_entrypoint_with_its_own_desktop_file_has_a_menu_entry() {
+        let m = with_desktops(
+            &["app", "settings", "cli"],
+            &["app.desktop", "settings.desktop"],
+        );
+        assert_eq!(menu_entrypoints(&m), vec!["settings"]);
+    }
+
+    #[test]
+    fn the_default_desktop_file_gives_no_extra_menu_entry() {
+        let m = with_desktops(&["app", "cli"], &["default.desktop"]);
+        assert!(menu_entrypoints(&m).is_empty());
+    }
+
+    #[test]
+    fn a_package_without_desktop_files_has_no_extra_menu_entry() {
+        let m = with_desktops(&["app", "cli"], &[]);
+        assert!(menu_entrypoints(&m).is_empty());
+    }
 
     #[test]
     fn exec_arg_tail_handles_quoting() {

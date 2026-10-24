@@ -235,9 +235,14 @@ so integrating a second entrypoint does not replace the first. The
 so is the `Exec=` of every desktop action. If the package has no bundled
 desktop file, a minimal one is generated.
 
+Integrating the default entrypoint integrates the package: the default
+and every other entrypoint that carries a desktop file of its own,
+`.onelf/desktop/<entrypoint>.desktop`, each with its own files. An
+entrypoint served only by `default.desktop` gets no menu entry.
+
 | Flag | Description |
 |------|-------------|
-| `--entrypoint` | Entrypoint whose icon and desktop file to install (default: the one `BINARY` launches) |
+| `--entrypoint` | Entrypoint to integrate alone (default: the one `BINARY` launches; the default entrypoint integrates the package) |
 
 `Exec=` names `BINARY`. When `--entrypoint` names one that `BINARY` would
 not start on its own, `Exec=` runs it as
@@ -246,8 +251,9 @@ not start on its own, `Exec=` runs it as
 
 ## `onelf unintegrate`
 
-Remove desktop shortcut and icons installed by `integrate`. Pass the same
-`--entrypoint` that was integrated.
+Remove desktop shortcut and icons installed by `integrate`. Through the
+default entrypoint it removes every entrypoint's files; `--entrypoint`
+naming another removes only that one's.
 
 ```
 onelf unintegrate BINARY [--entrypoint NAME]

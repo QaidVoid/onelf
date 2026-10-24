@@ -8,7 +8,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::desktop::{entry_icon, exec_command, icon_set, patch_desktop_file, string_value};
+use onelf_format::desktop::{
+    entry_icon, exec_command, icon_set, menu_entrypoints, patch_desktop_file, string_value,
+};
 use onelf_format::{Footer, Manifest};
 
 use crate::extract::decompress_verified;
@@ -308,9 +310,28 @@ fn update_desktop_database(data_home: &Path) {
         .status();
 }
 
-pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
+/// The entrypoints an integration through `binary` covers. One selected
+/// other than the default is handled alone. The default stands for the
+/// whole package, so it comes with the entrypoints `others` names from
+/// the manifest.
+fn targets(
+    binary: &Path,
+    entrypoint: Option<&str>,
+    others: impl Fn(&Manifest) -> Vec<String>,
+) -> io::Result<Vec<IntegrationContext>> {
     let ctx = IntegrationContext::load(binary, entrypoint)?;
-    let data_home = xdg_data_home()?;
+    if ctx.secondary {
+        return Ok(vec![ctx]);
+    }
+    let names = others(&ctx.manifest);
+    let mut all = vec![ctx];
+    for name in names {
+        all.push(IntegrationContext::load(binary, Some(&name))?);
+    }
+    Ok(all)
+}
+
+fn integrate_one(ctx: &IntegrationContext, data_home: &Path) -> io::Result<()> {
     let int_name = ctx.integration_name();
 
     // Remove any stale icons first (handles format changes on re-integrate)
@@ -319,26 +340,39 @@ pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
         let _ = remove_icons(&hicolor, &int_name);
     }
 
-    let desktop = bundled_desktop(&ctx)?;
-    let icon_name = install_icons(&ctx, desktop.as_deref(), &data_home, &int_name)?;
+    let desktop = bundled_desktop(ctx)?;
+    let icon_name = install_icons(ctx, desktop.as_deref(), data_home, &int_name)?;
     install_desktop(
-        &ctx,
+        ctx,
         desktop.as_deref(),
-        &data_home,
+        data_home,
         &int_name,
         icon_name.as_deref(),
-    )?;
+    )
+}
+
+/// Install the menu entry of the selected entrypoint. Through the default
+/// entrypoint that is the whole package: the default and every entrypoint
+/// with a desktop file of its own.
+pub fn integrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
+    let targets = targets(binary, entrypoint, |m| {
+        menu_entrypoints(m)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    })?;
+    let data_home = xdg_data_home()?;
+    for ctx in &targets {
+        integrate_one(ctx, &data_home)?;
+    }
     update_desktop_database(&data_home);
 
-    eprintln!("Integrated '{}'", ctx.pkg_name);
+    eprintln!("Integrated '{}'", targets[0].pkg_name);
     Ok(())
 }
 
-pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
-    let ctx = IntegrationContext::load(binary, entrypoint)?;
-    let data_home = xdg_data_home()?;
+fn unintegrate_one(ctx: &IntegrationContext, data_home: &Path) -> io::Result<bool> {
     let int_name = ctx.integration_name();
-
     let mut removed = false;
 
     let desktop_path = data_home
@@ -354,13 +388,35 @@ pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
     if hicolor.exists() {
         removed |= remove_icons(&hicolor, &int_name)?;
     }
+    Ok(removed)
+}
+
+/// Remove what integrating the selected entrypoint installed. Through the
+/// default entrypoint that is every entrypoint's files, whether or not it
+/// carries a desktop file now, so an older integration is cleaned too.
+pub fn unintegrate(binary: &Path, entrypoint: Option<&str>) -> io::Result<()> {
+    let targets = targets(binary, entrypoint, |m| {
+        let default = m.header.default_entrypoint as usize;
+        m.entrypoints
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != default)
+            .map(|(_, ep)| m.get_string(ep.name).to_string())
+            .collect()
+    })?;
+    let data_home = xdg_data_home()?;
+    let mut removed = false;
+    for ctx in &targets {
+        removed |= unintegrate_one(ctx, &data_home)?;
+    }
 
     update_desktop_database(&data_home);
 
+    let pkg_name = &targets[0].pkg_name;
     if removed {
-        eprintln!("Unintegrated '{}'", ctx.pkg_name);
+        eprintln!("Unintegrated '{pkg_name}'");
     } else {
-        eprintln!("Nothing was installed for '{}'", ctx.pkg_name);
+        eprintln!("Nothing was installed for '{pkg_name}'");
     }
 
     Ok(())

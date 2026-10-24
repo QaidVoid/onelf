@@ -10893,6 +10893,121 @@ fn a_second_entrypoint_integrates_beside_the_first() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A package with a menu entry per entrypoint: `myapp` (the default) and
+/// `myapp-settings` carry desktop files, `myapp-cli` only has the
+/// `default.desktop` fallback. Returns the package and a scratch home.
+fn menu_entry_package(tag: &str) -> (PathBuf, PathBuf) {
+    let td = workdir(tag);
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &app.join(".onelf/desktop/default.desktop"),
+        "[Desktop Entry]\nType=Application\nName=My App\nExec=myapp\n",
+    );
+    write(
+        &app.join(".onelf/desktop/myapp-settings.desktop"),
+        "[Desktop Entry]\nType=Application\nName=My App Settings\nExec=myapp-settings\n",
+    );
+    let pkg = td.join("myapp.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--name", "myapp"])
+        .args(["--entrypoint", "myapp-settings=bin/run"])
+        .args(["--entrypoint", "myapp-cli=bin/run"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    (td, pkg)
+}
+
+/// `flag` (`integrate` or `unintegrate`) through `binary`, by the packer's
+/// CLI or by the runtime itself.
+fn integration(binary: &Path, flag: &str, runtime: bool, td: &Path) {
+    let mut cmd = if runtime {
+        let mut cmd = Command::new(binary);
+        cmd.arg(format!("--onelf-{flag}"));
+        isolate(&mut cmd, td);
+        cmd
+    } else {
+        let mut cmd = Command::new(onelf());
+        cmd.args([flag, binary.to_str().unwrap()]);
+        cmd
+    };
+    cmd.env("XDG_DATA_HOME", td.join("share")).env("HOME", td);
+    let out = run_package(&mut cmd);
+    assert!(
+        out.status.success(),
+        "{flag} (runtime: {runtime}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Integrating the package installs a menu entry for every entrypoint that
+/// carries a desktop file of its own, in one step, and unintegrating it
+/// removes them all. Only the default's entry used to be installed.
+#[test]
+fn integrating_the_package_integrates_every_menu_entrypoint() {
+    let (td, pkg) = menu_entry_package("integrateall");
+    let apps = td.join("share/applications");
+    for runtime in [false, true] {
+        integration(&pkg, "integrate", runtime, &td);
+        let main = std::fs::read_to_string(apps.join("onelf-myapp.desktop")).unwrap();
+        assert!(!main.contains("ONELF_ENTRYPOINT"), "{main}");
+        let settings =
+            std::fs::read_to_string(apps.join("onelf-myapp-myapp-settings.desktop")).unwrap();
+        assert!(
+            settings.contains("ONELF_ENTRYPOINT=myapp-settings"),
+            "the settings entry does not start its entrypoint (runtime: {runtime}):\n{settings}"
+        );
+        assert!(
+            !apps.join("onelf-myapp-myapp-cli.desktop").exists(),
+            "an entrypoint without a desktop file of its own got a menu entry"
+        );
+
+        integration(&pkg, "unintegrate", runtime, &td);
+        for name in ["onelf-myapp.desktop", "onelf-myapp-myapp-settings.desktop"] {
+            assert!(
+                !apps.join(name).exists(),
+                "{name} left behind (runtime: {runtime})"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Integrating one entrypoint through its symlink installs that entrypoint
+/// alone, and unintegrating it leaves the others' entries in place.
+#[test]
+fn integrating_one_entrypoint_leaves_the_others_alone() {
+    let (td, pkg) = menu_entry_package("integrateone");
+    let link = td.join("myapp-settings");
+    std::os::unix::fs::symlink("myapp.onelf", &link).unwrap();
+    let apps = td.join("share/applications");
+    for runtime in [false, true] {
+        integration(&link, "integrate", runtime, &td);
+        assert!(apps.join("onelf-myapp-myapp-settings.desktop").is_file());
+        assert!(
+            !apps.join("onelf-myapp.desktop").exists(),
+            "integrating one entrypoint installed the default's entry (runtime: {runtime})"
+        );
+
+        integration(&pkg, "integrate", runtime, &td);
+        integration(&link, "unintegrate", runtime, &td);
+        assert!(!apps.join("onelf-myapp-myapp-settings.desktop").exists());
+        assert!(
+            apps.join("onelf-myapp.desktop").is_file(),
+            "unintegrating one entrypoint removed the default's entry (runtime: {runtime})"
+        );
+        integration(&pkg, "unintegrate", runtime, &td);
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Integration installs every icon size the package carries, from the
 /// theme it ships and from `.onelf/icons`, and unintegration removes them
 /// all. Only the one `.onelf/icons` file used to be installed.

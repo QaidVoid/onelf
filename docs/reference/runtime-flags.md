@@ -75,8 +75,8 @@ removes the directory.
 
 | Flag | Action |
 |------|--------|
-| `--onelf-integrate` | Install every icon size and the `.desktop` file to XDG directories, then exit |
-| `--onelf-unintegrate` | Remove the icons and `.desktop` file installed by integrate, then exit |
+| `--onelf-integrate` | Install every icon size and the `.desktop` file to XDG directories, then exit. Through the default entrypoint this covers every entrypoint with a desktop file of its own |
+| `--onelf-unintegrate` | Remove the icons and `.desktop` file installed by integrate, then exit. Through the default entrypoint this removes every entrypoint's files |
 
 ## Self-update
 

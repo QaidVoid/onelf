@@ -13,7 +13,10 @@ The rules this page encodes:
   `Icon=myapp`). `onelf integrate` rewrites `Exec=` and `TryExec=` to
   the binary's absolute path and sets `Icon=` to the installed icon's
   theme name.
-- ✅ Integrate a second entrypoint through its symlink. Its
+- ✅ Give each entrypoint that belongs in the menu a desktop file of
+  its own, `.onelf/desktop/{entrypoint}.desktop`. Integrating the
+  package then installs all of them in one step.
+- ✅ Integrate a single entrypoint through its symlink. Its
   `{entrypoint}`-named files win over the `default.*` fallbacks.
 - ✅ Name a multi-entrypoint `Exec=` after the entrypoint's argv[0] and
   ship the matching symlink (`myapp-daemon -> myapp.onelf`).
@@ -104,9 +107,25 @@ onelf unintegrate ./myapp.onelf
 
 This removes the desktop file and the icon at every size.
 
+## Packages with several menu entries
+
+Integrating through the default entrypoint, by running the package
+itself or `onelf integrate` on it, integrates the whole package. That is
+the default entrypoint and every other entrypoint that carries a desktop
+file of its own, each installed as if integrated separately:
+
+```
+.onelf/desktop/myapp.desktop            ->  onelf-myapp.desktop
+.onelf/desktop/myapp-settings.desktop   ->  onelf-myapp-myapp-settings.desktop
+```
+
+An entrypoint served only by `default.desktop`, such as a command line
+tool, gets no menu entry. Unintegrating through the default entrypoint
+removes the files of every entrypoint.
+
 ## Selecting an entrypoint
 
-✅ For a package with multiple entrypoints, integrate through the
+✅ To integrate one entrypoint alone, integrate through the
 entrypoint's symlink:
 
 ```bash

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::loader::PackageData;
 use crate::metadata::{resolve_desktop, resolve_icon};
-use onelf_format::desktop::{entry_icon, icon_set, patch_desktop_file};
+use onelf_format::desktop::{entry_icon, icon_set, menu_entrypoints, patch_desktop_file};
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
@@ -119,7 +119,51 @@ fn update_desktop_database(data_home: &Path) {
         .status();
 }
 
+/// The package's name, or the entrypoint's when the package has none.
+fn package_name(pkg: &PackageData, ep_name: &str) -> String {
+    let name = pkg.manifest.name();
+    if name.is_empty() {
+        ep_name.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn is_default(pkg: &PackageData, ep_name: &str) -> bool {
+    pkg.manifest
+        .entrypoints
+        .get(pkg.manifest.header.default_entrypoint as usize)
+        .is_some_and(|ep| pkg.manifest.get_string(ep.name) == ep_name)
+}
+
+fn data_home_or_exit() -> PathBuf {
+    xdg_data_home().unwrap_or_else(|| {
+        eprintln!("onelf-rt: cannot determine XDG_DATA_HOME or HOME");
+        std::process::exit(1);
+    })
+}
+
+/// Install the menu entry of the selected entrypoint. Through the default
+/// entrypoint that is the whole package: the default and every entrypoint
+/// with a desktop file of its own.
 fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
+    let data_home = data_home_or_exit();
+    let mut names = vec![ep_name.to_string()];
+    if is_default(pkg, ep_name) {
+        names.extend(
+            menu_entrypoints(&pkg.manifest)
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    for name in &names {
+        integrate_one(pkg, name, exec_path, &data_home);
+    }
+    update_desktop_database(&data_home);
+    eprintln!("Integrated '{}'", package_name(pkg, ep_name));
+}
+
+fn integrate_one(pkg: &mut PackageData, ep_name: &str, exec_path: &str, data_home: &Path) {
     // The runtime is integrated from the resolved package file, whose name
     // starts the default entrypoint or the one it is named after. Any
     // other entrypoint is named in the launch.
@@ -140,17 +184,7 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
                 .map(|ep| pkg.manifest.get_string(ep.name).to_string())
         });
     let exec_entrypoint = (launched.as_deref() != Some(ep_name)).then_some(ep_name);
-    let Some(data_home) = xdg_data_home() else {
-        eprintln!("onelf-rt: cannot determine XDG_DATA_HOME or HOME");
-        std::process::exit(1);
-    };
-
-    let name = pkg.manifest.name();
-    let pkg_name = if name.is_empty() {
-        ep_name.to_string()
-    } else {
-        name.to_string()
-    };
+    let pkg_name = package_name(pkg, ep_name);
     let int_name = integration_name(pkg, &pkg_name, ep_name);
 
     // Clean stale icons first
@@ -211,23 +245,40 @@ fn do_integrate(pkg: &mut PackageData, ep_name: &str, exec_path: &str) {
         std::process::exit(1);
     }
     eprintln!("  Desktop: {}", dest.display());
-
-    update_desktop_database(&data_home);
-    eprintln!("Integrated '{pkg_name}'");
 }
 
+/// Remove what integrating the selected entrypoint installed. Through the
+/// default entrypoint that is every entrypoint's files, whether or not it
+/// carries a desktop file now, so an older integration is cleaned too.
 fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
-    let Some(data_home) = xdg_data_home() else {
-        eprintln!("onelf-rt: cannot determine XDG_DATA_HOME or HOME");
-        std::process::exit(1);
-    };
+    let data_home = data_home_or_exit();
+    let mut names = vec![ep_name.to_string()];
+    if is_default(pkg, ep_name) {
+        names.extend(
+            pkg.manifest
+                .entrypoints
+                .iter()
+                .map(|ep| pkg.manifest.get_string(ep.name).to_string())
+                .filter(|name| name != ep_name),
+        );
+    }
+    let mut removed = false;
+    for name in &names {
+        removed |= unintegrate_one(pkg, name, &data_home);
+    }
 
-    let name = pkg.manifest.name();
-    let pkg_name = if name.is_empty() {
-        ep_name.to_string()
+    update_desktop_database(&data_home);
+
+    let pkg_name = package_name(pkg, ep_name);
+    if removed {
+        eprintln!("Unintegrated '{pkg_name}'");
     } else {
-        name.to_string()
-    };
+        eprintln!("Nothing was installed for '{pkg_name}'");
+    }
+}
+
+fn unintegrate_one(pkg: &PackageData, ep_name: &str, data_home: &Path) -> bool {
+    let pkg_name = package_name(pkg, ep_name);
     let int_name = integration_name(pkg, &pkg_name, ep_name);
 
     let mut removed = false;
@@ -248,14 +299,7 @@ fn do_unintegrate(pkg: &PackageData, ep_name: &str) {
     if hicolor.exists() {
         removed |= remove_icons(&hicolor, &int_name);
     }
-
-    update_desktop_database(&data_home);
-
-    if removed {
-        eprintln!("Unintegrated '{pkg_name}'");
-    } else {
-        eprintln!("Nothing was installed for '{pkg_name}'");
-    }
+    removed
 }
 
 /// Check args for `--onelf-integrate` or `--onelf-unintegrate` and handle them.
