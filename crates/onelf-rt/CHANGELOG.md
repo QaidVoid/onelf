@@ -1,4 +1,10 @@
 
+## [0.4.3](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.2...onelf-rt-v0.4.3) - 2026-10-24
+
+### ⛰️  Features
+
+- Integrate every entrypoint that has a menu entry - ([08a39bd](https://github.com/QaidVoid/onelf/commit/08a39bded09cd39816368b40ec5070d1dcff8208))
+
 ## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.1...onelf-rt-v0.4.2) - 2026-10-21
 
 ### ⛰️  Features
