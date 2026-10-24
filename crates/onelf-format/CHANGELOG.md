@@ -1,4 +1,15 @@
 
+## [0.4.3](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.4.2...onelf-format-v0.4.3) - 2026-10-24
+
+### ⛰️  Features
+
+- Integrate every entrypoint that has a menu entry - ([08a39bd](https://github.com/QaidVoid/onelf/commit/08a39bded09cd39816368b40ec5070d1dcff8208))
+
+### 🐛 Bug Fixes
+
+- *(rt)* Farm what the host's DRI driver modules need - ([1f12826](https://github.com/QaidVoid/onelf/commit/1f12826072f5c6feef8a91f19454860aabaf1169))
+- *(rt)* Farm the host's GLX vendor libraries - ([1db8d66](https://github.com/QaidVoid/onelf/commit/1db8d663d5823db0a03bbf50ba94ae40f90717fc))
+
 ## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.4.1...onelf-format-v0.4.2) - 2026-10-21
 
 ### ⛰️  Features
