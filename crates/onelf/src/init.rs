@@ -62,6 +62,9 @@ dict = false
 # updates enabled use a larger runtime (about 1.3 MB more).
 # [update]
 # url = "https://example.com/{name}.onelf"
+# key = "myapp.pub"
+# revision = 1
+# unsigned = true  # updates with no signature check; conflicts with key
 
 [bundle]
 # Pass ["auto"] to detect, or list the bundle's library directories.

@@ -121,8 +121,9 @@ pub struct PackOptions {
     pub update_key: Option<Vec<u8>>,
     /// Monotonic revision embedded as `.onelf/update-revision`; the
     /// runtime refuses an update whose revision is not newer, so a
-    /// rolled-back build cannot be reinstalled. The detached signature
-    /// covers it.
+    /// rolled-back build cannot be reinstalled. Under the signed policy
+    /// the detached signature covers it; under the unsigned opt-in it
+    /// ships unauthenticated.
     pub update_revision: Option<u64>,
     /// Mark the package as accepting unsigned updates by embedding the
     /// `.onelf/update-unsigned` marker: no signing key is stored and the
@@ -713,16 +714,33 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     if opts.update_unsigned && opts.update_url.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--update-unsigned needs an update URL; unsigned updates would \
-             have nothing to fetch"
+            "an unsigned update policy needs an update URL; unsigned \
+             updates would have nothing to fetch"
                 .to_string(),
         ));
     }
     if opts.update_unsigned && opts.update_key.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--update-unsigned and --update-key contradict each other: a \
-             package either verifies its updates or accepts them unsigned"
+            "an unsigned update policy and an embedded signing key \
+             contradict each other: a package either verifies its updates \
+             or accepts them unsigned"
+                .to_string(),
+        ));
+    }
+    if opts.update_key.is_some() && opts.update_url.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an update key needs an update URL; a keyring without one is \
+             dead metadata"
+                .to_string(),
+        ));
+    }
+    if opts.update_revision.is_some() && opts.update_url.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an update revision needs an update URL; a stamped number \
+             without one is dead metadata"
                 .to_string(),
         ));
     }
@@ -954,9 +972,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         );
     }
 
-    // Inject .onelf/update-revision if requested. The detached signature
-    // covers the whole package, so this number is authenticated, and the
-    // runtime refuses an update that is not newer than what it runs.
+    // Inject .onelf/update-revision if requested. Under the signed policy
+    // the detached signature covers it, so the number is authenticated;
+    // under the unsigned opt-in it is not. The runtime refuses an update
+    // that is not newer than what it runs either way.
     if let Some(rev) = opts.update_revision {
         inject_onelf_file(
             &mut dirs,

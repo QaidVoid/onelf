@@ -24,6 +24,7 @@ use std::ffi::OsString;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -126,6 +127,10 @@ fn keyring(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.chunks(32).filter(|k| k.len() == 32)
 }
 
+/// A signature is 64 bytes; anything the server streams beyond this is
+/// not one, and must not be buffered.
+const SIG_MAX_BYTES: u64 = 64 * 1024;
+
 fn verify_update_signature(path: &Path, url: &str, keyring_bytes: &[u8]) -> Result<(), String> {
     let sig_url = onelf_format::update::detached_sig_url(url);
     // Redirects are followed as for the package itself, over HTTPS only:
@@ -133,12 +138,15 @@ fn verify_update_signature(path: &Path, url: &str, keyring_bytes: &[u8]) -> Resu
     // their CDN. A substituted body cannot pass the Ed25519 check below,
     // which is what guards the update.
     let agent = hardened_agent(10);
-    let sig = agent
+    let mut sig = Vec::new();
+    agent
         .get(&sig_url)
         .call()
         .map_err(|e| format!("fetch signature: {e}"))?
-        .body_mut()
-        .read_to_vec()
+        .into_body()
+        .into_reader()
+        .take(SIG_MAX_BYTES)
+        .read_to_end(&mut sig)
         .map_err(|e| format!("read signature: {e}"))?;
     // Map the assembled binary read-only instead of reading it onto the
     // heap: it can be hundreds of MB and the kernel already has the pages
@@ -209,6 +217,22 @@ impl Drop for Mmap {
                 let _ = rustix::mm::munmap(self.ptr, self.len);
             }
         }
+    }
+}
+
+/// An exclusive advisory lock on the binary being updated, held for the
+/// lifetime of the value. `flock(2)` sits on the inode, so it survives a
+/// concurrent process renaming over the name and disappears with this
+/// process.
+struct InstallLock {
+    _file: std::fs::File,
+}
+
+impl InstallLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(InstallLock { _file: file })
     }
 }
 
@@ -427,7 +451,8 @@ fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(),
 
 /// Download the update beside `self_path` and verify its signature,
 /// returning the staged file. `remote` is the probe result when the host
-/// honors range requests; without it the release downloads in full. On
+/// honors range requests; without it the release downloads in full. A
+/// `None` keyring (the unsigned opt-in) skips the signature step. On
 /// failure nothing is left behind, and the error is the exit code, already
 /// explained on stderr.
 fn fetch_verified(
@@ -511,6 +536,17 @@ fn fetch_verified(
 }
 
 fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: Option<u64>) -> i32 {
+    // One installer at a time: two concurrent applies would both pass the
+    // freshness gate and race their renames, and the older release could
+    // win. The lock sits on the running binary's inode and lives until
+    // this process exits; the binding is held to the end of the function.
+    let _install_lock = match InstallLock::acquire(self_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("onelf-rt: cannot lock {} for updating: {e}", self_path.display());
+            return 2;
+        }
+    };
     let local_id = local_package_id(self_path);
     let src = HttpsRangeSource::new(url.to_string());
     let remote = match range::probe(&src) {
@@ -539,36 +575,65 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         Err(code) => return code,
     };
 
+    // The signature verified the bytes under `tmp_path`, and the rename
+    // below installs whatever sits there when it runs. Pin the file's
+    // identity now, before the slower steps, and re-check it just before
+    // the rename: a local attacker with write access to this directory
+    // must not swap the verified file for their own while the rollback
+    // copy and the fsyncs run.
+    let verified_identity = match std::fs::metadata(&tmp_path) {
+        Ok(m) => (m.dev(), m.ino()),
+        Err(e) => {
+            eprintln!("onelf-rt: staged update disappeared: {e}");
+            let _ = std::fs::remove_file(&tmp_path);
+            return 2;
+        }
+    };
+
     // The revision is the freshness gate once the running package carries
     // one: it lives inside the package, so the signature just checked
-    // covers it, and a rolled-back build cannot talk a client into
-    // installing itself again. A package with no revision, or one that
-    // cannot be read, counts as revisionless and is refused. A running
-    // package without one keeps the package-id freshness check.
+    // covers it under the signed policy, and a rolled-back build cannot
+    // talk a client into installing itself again. The package-id
+    // freshness check stands in for a running package without one.
     let (downloaded_revision, downloaded_id) = staged_info(&tmp_path);
-    if let Err(why) = revision_permits(current_revision, downloaded_revision) {
-        eprintln!("onelf-rt: refusing update: {why}");
+    let Some(downloaded_id) = downloaded_id else {
+        eprintln!(
+            "onelf-rt: the downloaded update is not a readable onelf package; \
+             refusing to install it"
+        );
         let _ = std::fs::remove_file(&tmp_path);
         return 2;
+    };
+    if let Err(why) = revision_permits(current_revision, downloaded_revision) {
+        println!("no update offered: {why}");
+        let _ = std::fs::remove_file(&tmp_path);
+        return 0;
     }
 
-    // Preserve executable bit.
+    // Preserve executable bit. A failure here would install a binary the
+    // system cannot run, so it fails the update rather than the exec.
     let mode = std::fs::metadata(self_path)
         .map(|m| m.permissions().mode())
         .unwrap_or(0o755);
     if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode)) {
         eprintln!("onelf-rt: chmod failed: {e}");
+        let _ = std::fs::remove_file(&tmp_path);
+        return 2;
     }
 
     // A rollback point: the bytes this process was, kept beside the
     // install and forced to the disk. A failed install leaves it in
-    // place for recovery.
+    // place for recovery. Without it the update would destroy the only
+    // known-good bytes, so a failure fails the update; it can be
+    // retried.
     let prev_path = sibling_path(self_path, ".onelf-prev");
     if let Err(e) = save_rollback(self_path, &prev_path) {
         eprintln!(
-            "onelf-rt: warning: cannot save rollback copy {}: {e}",
+            "onelf-rt: cannot save rollback copy {}: {e}",
             prev_path.display()
         );
+        let _ = std::fs::remove_file(&tmp_path);
+        return 2;
     }
 
     // The staged bytes reach the disk before the rename puts them under
@@ -578,7 +643,19 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         eprintln!("onelf-rt: warning: fsync of staged update failed: {e}");
     }
 
-    // Atomic replace.
+    // Atomic replace. The identity re-check must be the last thing before
+    // the rename.
+    match std::fs::metadata(&tmp_path) {
+        Ok(m) if (m.dev(), m.ino()) == verified_identity => {}
+        _ => {
+            eprintln!(
+                "onelf-rt: the staged update changed after it was verified; \
+                 refusing to install it"
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            return 2;
+        }
+    }
     if let Err(e) = std::fs::rename(&tmp_path, self_path) {
         eprintln!("onelf-rt: rename failed: {e}");
         // The rename is atomic, so the old binary is normally intact;
@@ -601,35 +678,53 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     println!(
         "updated: {} -> {}",
         id_or_dash(local_id.as_ref()),
-        id_or_dash(downloaded_id.as_ref())
+        id_or_dash(Some(&downloaded_id))
     );
     0
 }
 
-/// The transport policy for every request the update makes.
+/// The transport policy shared by every request the update makes.
 ///
 /// HTTPS only, so no redirect can downgrade the transfer to cleartext, and
-/// a bounded timeout so a stalled server cannot hang the update. Trust
-/// comes from the platform's own store rather than a set of roots compiled
-/// into this binary, which is what lets a host that terminates TLS at a
+/// bounded redirects so a server cannot chain them forever. Trust comes
+/// from the platform's own store rather than a set of roots compiled into
+/// this binary, which is what lets a host that terminates TLS at a
 /// corporate proxy update at all, and what makes the update path testable
 /// against a locally issued certificate.
 ///
 /// `redirects` is the allowance for this request. The download follows
 /// them, since publishing behind a redirecting CDN is ordinary, and HTTPS
-/// only plus the signature check make that safe. Every fetch in this
-/// module shares the same allowance.
-fn hardened_agent(redirects: u32) -> ureq::Agent {
+/// only plus the signature check make that safe.
+fn transport(redirects: u32) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(redirects)
         .max_redirects_will_error(true)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
+}
+
+/// The client for control requests: the release probe and the signature
+/// fetch. Their bodies are bytes to kilobytes, so a single end-to-end
+/// budget keeps a stalled server from hanging the update.
+fn hardened_agent(redirects: u32) -> ureq::Agent {
+    transport(redirects)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .new_agent()
+}
+
+/// The client for requests that stream a body: whole-file downloads and
+/// ranged block fetches. The budget is per read rather than for the whole
+/// transfer, because a total would cut off a full download on a slow link,
+/// while a stalled connection still fails within 30 seconds of its last
+/// byte.
+fn streaming_agent(redirects: u32) -> ureq::Agent {
+    transport(redirects)
+        .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
         .build()
         .new_agent()
 }
@@ -643,7 +738,7 @@ pub fn download(url: &str, into: &Path) -> Result<(), String> {
 
 /// Stream `url` into an open file from its start.
 fn download_into(url: &str, file: &mut std::fs::File) -> Result<(), String> {
-    let response = hardened_agent(10)
+    let response = streaming_agent(10)
         .get(url)
         .call()
         .map_err(|e| format!("{url}: {e}"))?;

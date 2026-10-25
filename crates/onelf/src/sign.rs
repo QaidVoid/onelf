@@ -108,6 +108,9 @@ pub fn public_key_of(secret_path: &Path) -> io::Result<Vec<u8>> {
 /// Path inside a package holding the update URL.
 const EMBEDDED_URL_PATH: &str = ".onelf/update-url";
 
+/// Path inside a package holding the unsigned-update marker.
+const EMBEDDED_UNSIGNED_PATH: &str = ".onelf/update-unsigned";
+
 /// The default detached-signature path for `file`.
 ///
 /// The runtime asks for the update URL with `.sig` appended, so a binary
@@ -201,6 +204,20 @@ pub struct Signed {
 
 /// Sign `file`, writing the detached signature the runtime fetches.
 pub fn sign(file: &Path, secret_path: &Path, out: Option<&Path>) -> io::Result<Signed> {
+    // An unsigned package updates without ever fetching a signature, so
+    // one produced here would be dead weight at best; refuse instead of
+    // pointing the publisher at an upload nobody will request.
+    if embedded_file(file, EMBEDDED_UNSIGNED_PATH).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} accepts unsigned updates, so its runtime never fetches a \
+                 signature and there is nothing to sign; repack without the \
+                 unsigned policy to make signing useful",
+                file.display()
+            ),
+        ));
+    }
     let secret = read_secret(secret_path)?;
     let matched = check_key_against_package(file, &secret.public_key())?;
 

@@ -22,7 +22,10 @@ pub fn detached_sig_filename(url: &str) -> Option<String> {
     let sig_url = detached_sig_url(url);
     let path = sig_url.split(['?', '#']).next()?;
     let name = path.rsplit('/').next()?;
-    if name.is_empty() {
+    if name.is_empty() || name == ".sig" {
+        // A URL whose path ends in `/` derives the degenerate hidden name
+        // `.sig`; that names nothing a publisher can upload, so fall back
+        // to `<file>.sig` instead.
         return None;
     }
     Some(name.to_string())
@@ -61,6 +64,18 @@ mod tests {
         assert_eq!(
             detached_sig_filename("https://h/d/app.onelf?v=2").as_deref(),
             Some("app.onelf.sig")
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_url_falls_back_instead_of_a_hidden_dotfile() {
+        assert_eq!(detached_sig_filename("https://h/app.onelf/"), None);
+        assert_eq!(detached_sig_filename("https://h/"), None);
+        // The URL itself is still formed the same way; only the derived
+        // file name falls back.
+        assert_eq!(
+            detached_sig_url("https://h/app.onelf/"),
+            "https://h/app.onelf/.sig"
         );
     }
 }

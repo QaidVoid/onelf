@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use onelf_format::reader::validate_footer;
 use onelf_format::{Footer, Manifest, FOOTER_SIZE};
 
-use super::hardened_agent;
+use super::streaming_agent;
 
 /// Why a fetch failed, and whether the caller can still get the release.
 #[derive(Debug)]
@@ -62,7 +62,10 @@ impl HttpsRangeSource {
     pub(super) fn new(url: String) -> Self {
         HttpsRangeSource {
             url,
-            agent: hardened_agent(10),
+            // Ranged fetches stream bodies of every size from a few
+            // kilobytes to whole releases, so they want the per-read
+            // budget rather than a total for the transfer.
+            agent: streaming_agent(10),
             ranges: AtomicBool::new(true),
         }
     }
@@ -107,31 +110,73 @@ impl RangeSource for HttpsRangeSource {
                 "the release host does not honor range requests".into(),
             ));
         }
-        let end = start + len - 1;
+        let end = start.checked_add(len - 1).ok_or_else(|| {
+            FetchError::Other(format!("range {start}+{len} overflows the file size"))
+        })?;
         let response = self
             .agent
             .get(&self.url)
             .header("Range", format!("bytes={start}-{end}"))
             .call()
             .map_err(|e| FetchError::Other(format!("range {start}-{end}: {e}")))?;
-        match response.status().as_u16() {
-            // The body is capped at the requested length: a buggy server
-            // sending more must not shift anything downstream.
-            206 => Ok(Box::new(response.into_body().into_reader().take(len))),
-            // A 200 here is the whole file, not the range: byte positions
-            // would silently misalign, so range use stops entirely.
-            200 => {
+        let status = response.status().as_u16();
+        let content_range = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok());
+        // The verdict runs before any body byte is read: a 200 here must
+        // poison range use before the body can be misread, and a 206 that
+        // does not name exactly the requested span must never be trusted.
+        match range_verdict(status, content_range, start, end) {
+            Ok(true) => {
+                // The body is capped at the requested length: a buggy
+                // server sending more must not shift anything downstream.
+                Ok(Box::new(response.into_body().into_reader().take(len)))
+            }
+            Ok(false) => {
                 self.ranges.store(false, Ordering::Relaxed);
                 Err(FetchError::NoRanges(format!(
                     "{url} answered a range request with a full 200",
                     url = self.url
                 )))
             }
-            status => Err(FetchError::Other(format!(
-                "{}: HTTP {status} for bytes {start}-{end}",
-                self.url
-            ))),
+            Err(why) => Err(FetchError::Other(format!("{}: {why}", self.url))),
         }
+    }
+}
+
+/// What a response to a `bytes={start}-{end}` request means, from its
+/// status and Content-Range alone. `Ok(true)` is a scoped 206 whose body
+/// may be read, `Ok(false)` is a plain 200 meaning the host ignores
+/// Range, and an error refuses the response outright.
+///
+/// A 206 that does not name exactly the requested span is refused rather
+/// than trusted: its bytes would land at offsets they do not belong to,
+/// and only the manifest checksums or the signature would notice, never
+/// the unsigned policy.
+fn range_verdict(
+    status: u16,
+    content_range: Option<&str>,
+    start: u64,
+    end: u64,
+) -> Result<bool, String> {
+    match status {
+        206 => {
+            let Some(header) = content_range else {
+                return Err(format!(
+                    "a 206 for bytes {start}-{end} carries no Content-Range header"
+                ));
+            };
+            let header = header.trim();
+            if !header.starts_with(&format!("bytes {start}-{end}/")) {
+                return Err(format!(
+                    "a 206 for bytes {start}-{end} claims Content-Range {header:?}"
+                ));
+            }
+            Ok(true)
+        }
+        200 => Ok(false),
+        status => Err(format!("HTTP {status} for bytes {start}-{end}")),
     }
 }
 
@@ -155,6 +200,11 @@ fn content_range_total(headers: &ureq::http::HeaderMap) -> Option<u64> {
         total.parse().ok()
     }
 }
+
+/// Ceiling on any single range read the probe is willing to buffer. The
+/// server also bounds these through the footer it served, but a hostile
+/// host controls both sides of that check.
+const MAX_PROBE_READ: u64 = 256 << 20;
 
 /// The remote release, as far as two small range requests can see it.
 pub(super) struct RemotePackage {
@@ -203,6 +253,17 @@ pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> 
     validate_footer(&footer, size)
         .map_err(|e| FetchError::Other(format!("remote footer: {e}")))?;
 
+    // The manifest read is sized by the footer the server itself served,
+    // so a hostile host can name a huge region and make this process
+    // allocate for it. Real manifests are kilobytes to a few megabytes;
+    // anything past the loader's own manifest ceiling is a refusal, not
+    // an allocation.
+    if footer.manifest_compressed > MAX_PROBE_READ {
+        return Err(FetchError::Other(format!(
+            "the remote manifest claims {} compressed bytes",
+            footer.manifest_compressed
+        )));
+    }
     let manifest_bytes = read(footer.manifest_offset, footer.manifest_compressed)?;
     let manifest_raw = zstd::bulk::decompress(&manifest_bytes, footer.manifest_original as usize)
         .map_err(|e| FetchError::Other(format!("remote manifest decompression: {e}")))?;
@@ -261,6 +322,27 @@ mod tests {
 
         headers.insert("content-range", "nonsense".parse().unwrap());
         assert_eq!(content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn range_verdicts_accept_only_exactly_scoped_206s() {
+        use super::range_verdict;
+
+        // A 206 naming exactly the requested span is readable.
+        assert!(range_verdict(206, Some("bytes 100-199/12345"), 100, 199).unwrap());
+        assert!(range_verdict(206, Some("bytes 100-199/*"), 100, 199).unwrap());
+        // A different span, a missing header, or multipart nonsense is
+        // refused: its bytes would land at offsets they do not belong to.
+        assert!(range_verdict(206, Some("bytes 0-99/12345"), 100, 199).is_err());
+        assert!(range_verdict(206, Some("bytes 100-198/12345"), 100, 199).is_err());
+        assert!(range_verdict(206, None, 100, 199).is_err());
+        assert!(range_verdict(206, Some("bytes 100-199, 300-399/12345"), 100, 199).is_err());
+        // A plain 200 means no range support, whatever headers say.
+        assert!(!range_verdict(200, Some("bytes 100-199/12345"), 100, 199).unwrap());
+        assert!(!range_verdict(200, None, 100, 199).unwrap());
+        // Anything else is a transport failure.
+        assert!(range_verdict(404, None, 100, 199).is_err());
+        assert!(range_verdict(500, None, 100, 199).is_err());
     }
 
     #[test]

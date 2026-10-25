@@ -89,7 +89,9 @@ struct CopyGroup {
     /// Otherwise they are compressed and decoded with `original` and the
     /// dictionary first.
     raw: bool,
-    original: u64,
+    /// The block's decompressed size, already passed through the loader's
+    /// ceiling.
+    original: usize,
 }
 
 /// A contiguous remote span to download.
@@ -118,6 +120,16 @@ enum Prefix {
 fn fetch_dict(src: &dyn RangeSource, footer: &Footer) -> Result<Option<Vec<u8>>, String> {
     if !footer.flags.contains(Flags::HAS_DICT) || footer.dict_size == 0 {
         return Ok(None);
+    }
+    // A trained dictionary is kilobytes; a footer claiming more than this
+    // is hostile, and the allocation would happen before any content
+    // check could refuse it.
+    const DICT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+    if footer.dict_size as u64 > DICT_MAX_BYTES {
+        return Err(format!(
+            "the release claims a {}-byte dictionary",
+            footer.dict_size
+        ));
     }
     let mut dict = vec![0u8; footer.dict_size as usize];
     src.fetch_range(footer.dict_offset, footer.dict_size as u64)
@@ -243,7 +255,11 @@ fn plan_blocks(
                     ranges: vec![CopyRange { dst, src: *src, len }],
                     hash: block.content_hash,
                     raw: remote.footer.is_stored(),
-                    original: block.original_size,
+                    // The loader's own ceiling, not the manifest's raw
+                    // number: a crafted `original_size` must fail the plan
+                    // cleanly instead of reaching the decoder's allocator.
+                    original: onelf_format::reader::block_original_size(block)
+                        .map_err(|e| format!("plan the delta: {e}"))?,
                 });
             } else {
                 extend_fetch(&mut fetch, dst, len);
@@ -477,8 +493,10 @@ fn plan_stipple(
             copies.push(CopyGroup {
                 ranges,
                 hash: block.content_hash,
+                // Raw groups hash the copied bytes directly, so the
+                // decoded size is never consulted.
                 raw: true,
-                original: len,
+                original: len as usize,
             });
         }
     }
@@ -574,7 +592,7 @@ fn write_group(
     let ok = if group.raw {
         blake3::hash(&bytes).as_bytes() == &group.hash
     } else {
-        match crate::loader::decode_block(&bytes, group.original as usize, dict) {
+        match crate::loader::decode_block(&bytes, group.original, dict) {
             Ok(decoded) => blake3::hash(&decoded).as_bytes() == &group.hash,
             Err(_) => false,
         }
@@ -1063,6 +1081,46 @@ mod tests {
             stats.fetched
         );
         assert!(stats.fetched < remote_pkg.footer.payload_size);
+    }
+
+    /// The running binary's own manifest can lie about its bytes: bit
+    /// rot, an ancient truncated write, tampering. The planner trusts the
+    /// manifest when it picks a copy source, so the writer's per-group
+    /// re-hash is what catches the divergence and fetches the true bytes
+    /// instead.
+    #[test]
+    fn a_local_byte_that_disagrees_with_its_manifest_is_refetched() {
+        let stage = Stage::new("degrade");
+        let prefix = fake_prefix(3);
+        let app = vec![b'a'; 200_000];
+        // Incompressible content, so the last block's compressed bytes are
+        // far longer than the corrupted span below.
+        let libs: Vec<u8> = (0..100_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let package = build_blocks_package(&prefix, &[("bin/app", app), ("lib/x.so", libs)], None);
+
+        // Flip one byte near the end of the payload: inside the last
+        // block's compressed bytes, under a manifest that still claims
+        // the original hash for it.
+        let mut local = package.clone();
+        let payload_end = local.len() - FOOTER_SIZE;
+        local[payload_end - 500] ^= 0xff;
+
+        let (out, stats, _) = stage.run(&local, &package).expect("assemble");
+        assert_eq!(
+            out, package,
+            "the degraded fetch must still assemble the release"
+        );
+        assert_eq!(
+            stats.reused, 5,
+            "five groups verify, the corrupted one degrades to a fetch"
+        );
+        assert!(
+            stats.fetched > 0 && stats.fetched < 100_000,
+            "only the corrupted block is re-fetched, got {} bytes",
+            stats.fetched
+        );
     }
 
     #[test]

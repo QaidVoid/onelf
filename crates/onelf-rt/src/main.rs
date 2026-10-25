@@ -107,13 +107,18 @@ fn main() {
         };
         // The package's own metadata picks the policy: a signing keyring
         // verifies every update, the unsigned opt-in skips verification
-        // loudly, and a URL with neither leaves self-update disabled.
+        // loudly, and a URL with neither leaves self-update disabled. A
+        // package carrying both the key and the marker is not merely
+        // unconfigured but contradictory, so it exits 2 rather than the
+        // benign disabled 1.
         let unsigned = read_package_file(&mut pkg, ".onelf/update-unsigned").is_some();
-        let key = match update::policy(read_package_file(&mut pkg, ".onelf/update-key"), unsigned) {
+        let key_bytes = read_package_file(&mut pkg, ".onelf/update-key");
+        let tampered = unsigned && key_bytes.is_some();
+        let key = match update::policy(key_bytes, unsigned) {
             Ok(key) => key,
             Err(why) => {
                 eprintln!("onelf-rt: {why}");
-                std::process::exit(1);
+                std::process::exit(if tampered { 2 } else { 1 });
             }
         };
         let Some(self_path) = update::self_path() else {
@@ -121,11 +126,24 @@ fn main() {
             std::process::exit(1);
         };
         let current_revision =
-            read_package_file(&mut pkg, ".onelf/update-revision").and_then(|b| {
-                std::str::from_utf8(&b)
+            match read_package_file(&mut pkg, ".onelf/update-revision") {
+                Some(bytes) => match std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
-            });
+                {
+                    Some(rev) => Some(rev),
+                    None => {
+                        // Fail open only with a name: the gate silently
+                        // disabling is otherwise invisible.
+                        eprintln!(
+                            "onelf-rt: warning: .onelf/update-revision does not \
+                             parse; treating this install as revisionless"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
         std::process::exit(update::run(
             flag,
             &self_path,

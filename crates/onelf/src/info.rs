@@ -150,16 +150,20 @@ pub fn info(path: &Path) -> io::Result<()> {
             println!("  Revision:     {}", rev.trim());
         }
         println!("  Signing key:  {key_desc}");
-        println!(
-            "  Updater:      {}",
-            if footer.flags.contains(Flags::EXTERNAL_UPDATER) {
-                "external (this package does not update itself)"
-            } else if embedded_key.is_some() {
-                "embedded"
-            } else {
-                "embedded, but disabled without a signing key"
-            }
-        );
+        let updater = if footer.flags.contains(Flags::EXTERNAL_UPDATER) {
+            "external (this package does not update itself)".to_string()
+        } else if unsigned && embedded_key.is_some() {
+            "embedded, but refuses to update: a signing key and the \
+             unsigned marker contradict each other"
+                .to_string()
+        } else if unsigned {
+            "embedded (installs updates without signature verification)".to_string()
+        } else if embedded_key.is_some() {
+            "embedded".to_string()
+        } else {
+            "embedded, but disabled without a signing key".to_string()
+        };
+        println!("  Updater:      {updater}");
         println!();
     }
 
