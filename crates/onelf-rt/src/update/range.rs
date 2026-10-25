@@ -73,10 +73,14 @@ impl HttpsRangeSource {
 
 impl RangeSource for HttpsRangeSource {
     fn size(&self) -> Result<u64, FetchError> {
-        // HEAD first. Hosts that refuse it usually still answer a one-byte
-        // range, whose Content-Range carries the total; a plain 200 there
-        // still yields Content-Length, only without range support.
+        // HEAD first, and only a success response's Content-Length is
+        // the release size: ureq hands back error responses as `Ok`, and
+        // a 404 page's length would poison every later offset. Hosts
+        // that refuse HEAD usually still answer a one-byte range, whose
+        // Content-Range carries the total; a plain 200 there still
+        // yields Content-Length, only without range support.
         if let Ok(response) = self.agent.head(&self.url).call()
+            && response.status().is_success()
             && let Some(len) = content_length(response.headers())
         {
             return Ok(len);
@@ -88,9 +92,28 @@ impl RangeSource for HttpsRangeSource {
             .call()
             .map_err(|e| FetchError::Other(format!("probe {}: {e}", self.url)))?;
         match response.status().as_u16() {
-            206 => content_range_total(response.headers()).ok_or_else(|| {
-                FetchError::Other(format!("{}: 206 without Content-Range", self.url))
-            }),
+            // The one-byte probe's 206 is held to the same exactness as
+            // every ranged fetch: only a header naming `bytes 0-0` may
+            // have its total read.
+            206 => {
+                let scoped = response
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("bytes 0-0/"));
+                if !scoped {
+                    return Err(FetchError::Other(format!(
+                        "{}: 206 without a `bytes 0-0/` Content-Range",
+                        self.url
+                    )));
+                }
+                content_range_total(response.headers()).ok_or_else(|| {
+                    FetchError::Other(format!(
+                        "{}: 206 without a parseable Content-Range total",
+                        self.url
+                    ))
+                })
+            }
             200 => content_length(response.headers()).ok_or_else(|| {
                 FetchError::Other(format!("{}: no Content-Length", self.url))
             }),
@@ -311,6 +334,29 @@ mod tests {
         }
     }
 
+    /// A release that claims a size its bytes cannot back: the footer is
+    /// real, everything else is refused, so the probe's ceiling must fire
+    /// before the manifest read rather than after a failed fetch.
+    struct PhantomRelease {
+        claimed_size: u64,
+        footer: [u8; FOOTER_SIZE],
+    }
+
+    impl RangeSource for PhantomRelease {
+        fn size(&self) -> Result<u64, FetchError> {
+            Ok(self.claimed_size)
+        }
+
+        fn fetch_range(&self, start: u64, len: u64) -> Result<Box<dyn Read + '_>, FetchError> {
+            if start == self.claimed_size - FOOTER_SIZE as u64 && len == FOOTER_SIZE as u64 {
+                return Ok(Box::new(io::Cursor::new(self.footer.to_vec())));
+            }
+            Err(FetchError::Other(
+                "the phantom release serves only its footer".into(),
+            ))
+        }
+    }
+
     #[test]
     fn content_range_totals_parse_and_reject_unknown_lengths() {
         let mut headers = ureq::http::HeaderMap::new();
@@ -374,6 +420,40 @@ mod tests {
         assert!(matches!(
             probe(&src),
             Err(FetchError::Other(m)) if m.contains("footer") || m.contains("manifest")
+        ));
+    }
+
+    #[test]
+    fn probe_refuses_a_manifest_read_past_its_ceiling_before_allocating() {
+        use onelf_format::footer::{Flags, FORMAT_VERSION};
+
+        // A release whose size and footer agree on a manifest far past
+        // the probe's read ceiling. The source serves only the footer;
+        // any other read is refused, so a cap applied too late would
+        // surface as the wrong message and fail the assertion.
+        let footer = Footer {
+            format_version: FORMAT_VERSION,
+            flags: Flags::empty(),
+            manifest_offset: 1024,
+            manifest_compressed: MAX_PROBE_READ + 1,
+            manifest_original: 1024,
+            payload_offset: 0,
+            payload_size: 0,
+            dict_offset: 0,
+            dict_size: 0,
+            manifest_checksum: [1, 2, 3, 4],
+        };
+        let mut bytes = Vec::new();
+        footer.write_to(&mut bytes).unwrap();
+        let footer_bytes: [u8; FOOTER_SIZE] = bytes.try_into().unwrap();
+
+        let src = PhantomRelease {
+            claimed_size: footer.manifest_offset + footer.manifest_compressed + FOOTER_SIZE as u64,
+            footer: footer_bytes,
+        };
+        assert!(matches!(
+            probe(&src),
+            Err(FetchError::Other(m)) if m.contains("compressed bytes")
         ));
     }
 }

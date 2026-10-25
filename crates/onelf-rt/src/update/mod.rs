@@ -24,8 +24,7 @@ use std::ffi::OsString;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use range::{FetchError, HttpsRangeSource, RangeSource, RemotePackage};
@@ -113,10 +112,6 @@ fn verify_detached(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     pk.verify(message, &sig).is_ok()
 }
 
-/// Fetch the detached signature (`<url>.sig`) and verify it over the
-/// assembled binary at `path` against the embedded public key. Fails
-/// closed: any fetch/parse/verify problem is an error so the binary is
-/// never installed unverified.
 /// Keys a package trusts, from its embedded `.onelf/update-key` bytes: a
 /// concatenation of 32-byte Ed25519 public keys. One key is the classic
 /// encoding; several form a keyring, so a signature made with any key the
@@ -127,11 +122,23 @@ fn keyring(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.chunks(32).filter(|k| k.len() == 32)
 }
 
-/// A signature is 64 bytes; anything the server streams beyond this is
-/// not one, and must not be buffered.
+/// A detached signature is 64 bytes. The fetch is capped well above that
+/// so a server streaming something else is cut off before it can be
+/// buffered in full; `Signature::from_slice` then rejects every length
+/// but one.
 const SIG_MAX_BYTES: u64 = 64 * 1024;
 
-fn verify_update_signature(path: &Path, url: &str, keyring_bytes: &[u8]) -> Result<(), String> {
+/// Fetch the detached signature (`<url>.sig`) and verify it over the
+/// staged binary through the file handle the assembly wrote, against the
+/// embedded public keys. Reading the staged bytes through their handle,
+/// never by path, is what lets the caller pin this exact inode as the
+/// verified one. Fails closed: any fetch/parse/verify problem is an
+/// error so the binary is never installed unverified.
+fn verify_update_signature(
+    staged: &std::fs::File,
+    url: &str,
+    keyring_bytes: &[u8],
+) -> Result<(), String> {
     let sig_url = onelf_format::update::detached_sig_url(url);
     // Redirects are followed as for the package itself, over HTTPS only:
     // release hosts such as GitHub answer every asset with a redirect to
@@ -152,7 +159,7 @@ fn verify_update_signature(path: &Path, url: &str, keyring_bytes: &[u8]) -> Resu
     // heap: it can be hundreds of MB and the kernel already has the pages
     // cached from the assembly write. The mapping stays alive through the
     // verify call and is unmapped on drop.
-    let map = Mmap::open(path).map_err(|e| format!("map assembled binary: {e}"))?;
+    let map = Mmap::open(staged).map_err(|e| format!("map assembled binary: {e}"))?;
     let keys: Vec<&[u8]> = keyring(keyring_bytes).collect();
     if keys
         .iter()
@@ -177,9 +184,9 @@ struct Mmap {
 }
 
 impl Mmap {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
+    fn open(file: &std::fs::File) -> io::Result<Self> {
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "package too large to map"))?;
         if len == 0 {
             return Ok(Mmap {
                 ptr: core::ptr::null_mut(),
@@ -193,7 +200,7 @@ impl Mmap {
                 len,
                 rustix::mm::ProtFlags::READ,
                 rustix::mm::MapFlags::PRIVATE,
-                &file,
+                file,
                 0,
             )?
         };
@@ -247,15 +254,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
             eprintln!("onelf-rt: {why}; checking against a full download");
             return match fetch_verified(self_path, url, pubkey, None, &src) {
                 Err(code) => code,
-                Ok(staged) => {
-                    let (revision, id) = staged_info(&staged);
-                    let _ = std::fs::remove_file(&staged);
-                    if id.is_some() && id == local_id {
-                        println!("up to date");
-                        return 0;
-                    }
-                    report_available(local_id.as_ref(), id.as_ref(), current_revision, revision)
-                }
+                Ok((staged, _)) => check_verdict(local_id.as_ref(), current_revision, &staged),
             };
         }
         Err(FetchError::Other(e)) => {
@@ -284,12 +283,25 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // would, and an update the apply would refuse is not offered.
     match fetch_verified(self_path, url, pubkey, Some(remote), &src) {
         Err(code) => code,
-        Ok(staged) => {
-            let (revision, id) = staged_info(&staged);
-            let _ = std::fs::remove_file(&staged);
-            report_available(local_id.as_ref(), id.as_ref(), current_revision, revision)
-        }
+        Ok((staged, _)) => check_verdict(local_id.as_ref(), current_revision, &staged),
     }
+}
+
+/// The verdict `check` reports once the signed bytes settled freshness
+/// and revision. A staged file the loader cannot read is the same error
+/// `apply` refuses with, never an offered update.
+fn check_verdict(local_id: Option<&[u8; 32]>, current_revision: Option<u64>, staged: &Path) -> i32 {
+    let (revision, id) = staged_info(staged);
+    let _ = std::fs::remove_file(staged);
+    let Some(staged_id) = id else {
+        eprintln!("onelf-rt: the downloaded update is not a readable onelf package");
+        return 2;
+    };
+    if Some(staged_id) == local_id.copied() {
+        println!("up to date");
+        return 0;
+    }
+    report_available(local_id, Some(&staged_id), current_revision, revision)
 }
 
 /// The verdict after the signed bytes settled freshness and revision.
@@ -357,13 +369,17 @@ fn staged_path(self_path: &Path) -> io::Result<PathBuf> {
     Ok(self_path.with_file_name(name))
 }
 
-/// Claim the staging path: create the file exclusively, or fail. A path
-/// that already exists — a crashed run's leftover, or a planted
-/// symlink — is refused rather than written through.
+/// Claim the staging path: create the file exclusively, owner-readable
+/// and -writable only, whatever the umask allows. A path that already
+/// exists, a crashed run's leftover or a planted symlink, is refused
+/// rather than written through. The handle is opened read-write: the
+/// assembly writes through it, and the signature verification maps it.
 fn claim_staging(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
 }
 
@@ -450,7 +466,9 @@ fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(),
 }
 
 /// Download the update beside `self_path` and verify its signature,
-/// returning the staged file. `remote` is the probe result when the host
+/// returning the staged path and the (device, inode) identity of the
+/// verified bytes, taken from the file handle verification read.
+/// `remote` is the probe result when the host
 /// honors range requests; without it the release downloads in full. A
 /// `None` keyring (the unsigned opt-in) skips the signature step. On
 /// failure nothing is left behind, and the error is the exit code, already
@@ -461,7 +479,7 @@ fn fetch_verified(
     pubkey: Option<&[u8]>,
     remote: Option<RemotePackage>,
     src: &dyn RangeSource,
-) -> Result<PathBuf, i32> {
+) -> Result<(PathBuf, (u64, u64)), i32> {
     let tmp_path = match staged_path(self_path) {
         Ok(p) => p,
         Err(e) => {
@@ -494,8 +512,8 @@ fn fetch_verified(
                     // identical content encodes identically. When that
                     // assumption breaks the signature names it, and a full
                     // download replaces the guess with certainty.
-                    Some(keys) => match verify_update_signature(&tmp_path, url, keys) {
-                        Ok(()) => return Ok(tmp_path),
+                    Some(keys) => match verify_update_signature(&staged, url, keys) {
+                        Ok(()) => return pin_verified(&tmp_path, &staged),
                         Err(e) if stats.reused > 0 => {
                             eprintln!(
                                 "onelf-rt: assembled update failed its signature check ({e}); \
@@ -509,7 +527,7 @@ fn fetch_verified(
                         }
                     },
                     // Unsigned policy: the assembled bytes install as-is.
-                    None => return Ok(tmp_path),
+                    None => return pin_verified(&tmp_path, &staged),
                 }
             }
             Err(why) => {
@@ -526,13 +544,34 @@ fn fetch_verified(
         return Err(2);
     }
     if let Some(keys) = pubkey
-        && let Err(e) = verify_update_signature(&tmp_path, url, keys)
+        && let Err(e) = verify_update_signature(&staged, url, keys)
     {
         eprintln!("onelf-rt: update signature check failed: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
-    Ok(tmp_path)
+    pin_verified(&tmp_path, &staged)
+}
+
+/// Pin the verified bytes as a (device, inode) pair taken from the file
+/// handle verification read. The pin names an inode, never a path, so
+/// the caller's last check before the install rename compares it against
+/// the path and refuses a file swapped in after verification.
+fn pin_verified(path: &Path, file: &std::fs::File) -> Result<(PathBuf, (u64, u64)), i32> {
+    match file_identity(file) {
+        Ok(identity) => Ok((path.to_path_buf(), identity)),
+        Err(e) => {
+            eprintln!("onelf-rt: cannot pin the verified update: {e}");
+            Err(2)
+        }
+    }
+}
+
+/// A file's (device, inode) identity, from the descriptor rather than
+/// the path.
+fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    let m = file.metadata()?;
+    Ok((m.dev(), m.ino()))
 }
 
 fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: Option<u64>) -> i32 {
@@ -570,25 +609,19 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 0;
     }
 
-    let tmp_path = match fetch_verified(self_path, url, pubkey, remote, &src) {
+    let (tmp_path, verified_identity) = match fetch_verified(self_path, url, pubkey, remote, &src)
+    {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    // The signature verified the bytes under `tmp_path`, and the rename
-    // below installs whatever sits there when it runs. Pin the file's
-    // identity now, before the slower steps, and re-check it just before
-    // the rename: a local attacker with write access to this directory
-    // must not swap the verified file for their own while the rollback
-    // copy and the fsyncs run.
-    let verified_identity = match std::fs::metadata(&tmp_path) {
-        Ok(m) => (m.dev(), m.ino()),
-        Err(e) => {
-            eprintln!("onelf-rt: staged update disappeared: {e}");
-            let _ = std::fs::remove_file(&tmp_path);
-            return 2;
-        }
-    };
+    // The signature verified the bytes through the staged file's handle,
+    // and the pin names that handle's inode, not a path: whatever sits
+    // at `tmp_path` now is unproven. The rename below installs whatever
+    // sits there when it runs, so the identity is re-checked against the
+    // path immediately before it: a local attacker with write access to
+    // this directory who swaps the verified file for their own at any
+    // point in between is refused.
 
     // The revision is the freshness gate once the running package carries
     // one: it lives inside the package, so the signature just checked
@@ -700,6 +733,13 @@ fn transport(redirects: u32) -> ureq::config::ConfigBuilder<ureq::typestate::Age
         .https_only(true)
         .max_redirects(redirects)
         .max_redirects_will_error(true)
+        // Every phase of every request is bounded: connect and the
+        // response headers here, the body by whichever budget the caller
+        // layers on top. A server that accepts and then stalls before
+        // the first header byte must not hang an update that holds the
+        // install lock.
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -757,7 +797,7 @@ pub fn self_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod staging_tests {
-    use super::{claim_staging, fsync_path, save_rollback, staged_path};
+    use super::{claim_staging, fsync_path, save_rollback, staged_path, InstallLock};
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -790,6 +830,26 @@ mod staging_tests {
         std::fs::write(&a, b"update one").unwrap();
         std::fs::write(&b, b"update two").unwrap();
         assert_eq!(std::fs::read(&self_path).unwrap(), b"current");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_install_lock_excludes_a_second_holder_until_it_is_released() {
+        let dir = scratch("lock");
+        let self_path = dir.join("app");
+        std::fs::write(&self_path, b"current").unwrap();
+
+        let first = InstallLock::acquire(&self_path).unwrap();
+        assert!(
+            InstallLock::acquire(&self_path).is_err(),
+            "a second installer must be refused while the first holds the lock"
+        );
+        drop(first);
+        assert!(
+            InstallLock::acquire(&self_path).is_ok(),
+            "the lock must be free again once released"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -886,14 +946,15 @@ mod tests {
         let f = dir.join("blob");
         let bytes: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
         std::fs::write(&f, &bytes).unwrap();
-        let map = Mmap::open(&f).unwrap();
+        let map = Mmap::open(&std::fs::File::open(&f).unwrap()).unwrap();
         assert_eq!(map.as_slice(), &bytes[..]);
         drop(map);
 
         // Empty files map to an empty slice without touching mmap.
         let empty = dir.join("empty");
         std::fs::write(&empty, b"").unwrap();
-        assert!(Mmap::open(&empty).unwrap().as_slice().is_empty());
+        let empty_file = std::fs::File::open(&empty).unwrap();
+        assert!(Mmap::open(&empty_file).unwrap().as_slice().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -975,5 +1036,32 @@ mod tests {
         let mut partial = three.clone();
         partial.extend_from_slice(&[9u8; 8]);
         assert_eq!(keyring(&partial).count(), 3);
+    }
+
+    #[test]
+    fn a_refused_revision_is_reported_as_no_update_with_a_zero_exit() {
+        use super::report_available;
+        let running = [3u8; 32];
+        let release = [9u8; 32];
+
+        // Older, equal, or revision-less downloads are not offered, and
+        // none of them is an error: the client is as current as the
+        // release allows it to be.
+        assert_eq!(
+            report_available(Some(&running), Some(&release), Some(7), Some(6)),
+            0
+        );
+        assert_eq!(
+            report_available(Some(&running), Some(&release), Some(7), Some(7)),
+            0
+        );
+        assert_eq!(report_available(Some(&running), Some(&release), Some(7), None), 0);
+        // A genuinely newer release is offered with exit 1.
+        assert_eq!(
+            report_available(Some(&running), Some(&release), Some(7), Some(8)),
+            1
+        );
+        // Without a running revision the id comparison stands in.
+        assert_eq!(report_available(Some(&running), Some(&release), None, Some(8)), 1);
     }
 }

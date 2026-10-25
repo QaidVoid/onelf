@@ -342,11 +342,15 @@ fn slice_stored_ranges(
     if block_size == 0 {
         return Err(format!("{what}: the image declares no block size"));
     }
-    let end = file_off + len;
+    let end = file_off
+        .checked_add(len)
+        .ok_or_else(|| format!("{what}: the file range overflows the image"))?;
     let mut out = Vec::new();
     let mut covered = file_off;
     for (stream_off, ext_off, ext_len) in reader.file_extents(ino) {
-        let ext_end = ext_off + ext_len;
+        let ext_end = ext_off
+            .checked_add(ext_len)
+            .ok_or_else(|| format!("{what}: an extent overflows the image"))?;
         if ext_end <= covered {
             continue;
         }
@@ -354,8 +358,12 @@ fn slice_stored_ranges(
             return Err(format!("{what}: a hole sits before byte {covered}"));
         }
         let stop = end.min(ext_end);
-        let mut at = stream_off + (covered - ext_off);
-        let stream_end = stream_off + (stop - ext_off);
+        let mut at = stream_off
+            .checked_add(covered - ext_off)
+            .ok_or_else(|| format!("{what}: an extent overflows the image"))?;
+        let stream_end = stream_off
+            .checked_add(stop - ext_off)
+            .ok_or_else(|| format!("{what}: an extent overflows the image"))?;
         while at < stream_end {
             let within_block = at % block_size;
             let index = u32::try_from(at / block_size)
@@ -519,24 +527,29 @@ fn plan_stipple(
 // Writing
 // ---------------------------------------------------------------------------
 
+/// Copy one contiguous byte run, hashing the bytes en route. `dst` and
+/// `src` are absolute package-file offsets; the caller compares the hash
+/// against the manifest's claim before trusting what was copied.
 fn copy_run(
     from: &std::fs::File,
     to: &std::fs::File,
     src: u64,
     dst: u64,
     len: u64,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut done = 0;
     while done < len {
         let n = (len - done).min(buf.len() as u64) as usize;
         from.read_exact_at(&mut buf[..n], src + done)
             .map_err(|e| format!("read the running binary at {}: {e}", src + done))?;
+        hasher.update(&buf[..n]);
         to.write_all_at(&buf[..n], dst + done)
             .map_err(|e| format!("write the staged update at {}: {e}", dst + done))?;
         done += n as u64;
     }
-    Ok(())
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn fetch_span(
@@ -626,7 +639,22 @@ fn write_plan(
         .map_err(|e| format!("size the staged update: {e}"))?;
     let mut fetched = 0;
     match plan.prefix {
-        Prefix::Copy { len } => copy_run(local_file, staged, 0, 0, len)?,
+        Prefix::Copy { len } => {
+            // The planner picks a copy when both manifests pin the same
+            // prefix_hash, but the running binary's actual bytes can
+            // diverge from its own manifest through bit rot or an old
+            // truncated write. The hash is checked against the release's
+            // claim, and a mismatch fetches the prefix rather than
+            // copying rot into the staged update.
+            let hash = copy_run(local_file, staged, 0, 0, len)?;
+            if hash != remote.manifest.header.prefix_hash {
+                eprintln!(
+                    "onelf-rt: the running binary's prefix does not match its own manifest; \
+                     fetching the release prefix"
+                );
+                fetched += fetch_span(src, staged, 0, len)?;
+            }
+        }
         Prefix::Fetch { len } => fetched += fetch_span(src, staged, 0, len)?,
     }
     staged
@@ -1121,6 +1149,35 @@ mod tests {
             "only the corrupted block is re-fetched, got {} bytes",
             stats.fetched
         );
+    }
+
+    #[test]
+    fn a_dictionary_past_the_ceiling_is_refused_before_any_fetch() {
+        let src = FakeSource {
+            data: Arc::new(vec![0u8; 16]),
+        };
+        let footer = Footer {
+            format_version: FORMAT_VERSION,
+            flags: Flags::HAS_DICT,
+            manifest_offset: 0,
+            manifest_compressed: 0,
+            manifest_original: 0,
+            payload_offset: 0,
+            payload_size: 0,
+            dict_offset: 0,
+            dict_size: 64 * 1024 * 1024 + 1,
+            manifest_checksum: [0; 4],
+        };
+
+        // The cap fires from the footer alone: no fetch happens, so the
+        // 16-byte source, which cannot satisfy one, is never asked.
+        let err = fetch_dict(&src, &footer).unwrap_err();
+        assert!(err.contains("dictionary"), "{err}");
+
+        // A dictionary under the cap is fetched as usual.
+        let mut small = footer;
+        small.dict_size = 16;
+        assert_eq!(fetch_dict(&src, &small).unwrap(), Some(vec![0u8; 16]));
     }
 
     #[test]

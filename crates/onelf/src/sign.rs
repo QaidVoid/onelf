@@ -119,8 +119,8 @@ const EMBEDDED_UNSIGNED_PATH: &str = ".onelf/update-unsigned";
 /// the URL removes the guesswork, since a signature published under any
 /// other name is simply never fetched.
 ///
-/// Falls back to `<file>.sig` when the target carries no update URL to
-/// derive from.
+/// Falls back to `<file>.sig` when no name can be derived from the
+/// update URL (no URL, or one whose path yields no file name).
 fn default_sig_path(file: &Path, update_url: Option<&str>) -> PathBuf {
     if let Some(name) = update_url.and_then(onelf_format::update::detached_sig_filename) {
         let dir = file.parent().unwrap_or(Path::new("."));

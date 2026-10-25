@@ -102,7 +102,7 @@ fn main() {
             Ok(s) => s.trim().to_string(),
             Err(_) => {
                 eprintln!("onelf-rt: update URL is not valid UTF-8");
-                std::process::exit(1);
+                std::process::exit(2);
             }
         };
         // The package's own metadata picks the policy: a signing keyring
@@ -123,7 +123,7 @@ fn main() {
         };
         let Some(self_path) = update::self_path() else {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
-            std::process::exit(1);
+            std::process::exit(2);
         };
         let current_revision =
             match read_package_file(&mut pkg, ".onelf/update-revision") {

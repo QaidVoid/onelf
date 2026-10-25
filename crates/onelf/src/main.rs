@@ -348,7 +348,7 @@ enum Commands {
 
         /// Where to write the signature (default: the update URL's file
         /// name with `.sig` appended, next to BINARY, or <BINARY>.sig when
-        /// the package has no update URL)
+        /// no name can be derived from the update URL)
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
@@ -740,7 +740,20 @@ fn main() {
                      the slim runtime is already used when no update URL is set"
                 );
             }
-            let update_key = update_key.as_deref().map(std::fs::read).transpose();
+            if update_url.is_some() && update_key.is_none() && !update_unsigned {
+                eprintln!(
+                    "warning: --update-url without --update-key or --update-unsigned; \
+                     the package cannot self-update until it is repacked with one of them"
+                );
+            }
+            let update_key = update_key.as_deref().map(|path| {
+                std::fs::read(path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("--update-key {}: {e}", path.display()),
+                    )
+                })
+            }).transpose();
             let profile = prefetch.as_deref().map(pack::read_profile).transpose();
             match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),
@@ -777,8 +790,8 @@ fn main() {
                         needs_setuid,
                         profile,
                     },
-                    // Pick the runtime: slim (~700KB) by default; the
-                    // update-capable runtime (~2MB) when the user configures
+                    // Pick the runtime: the slim one by default, the
+                    // update-capable one when the user configures
                     // self-updates or the package pins a GL build over HTTPS.
                     if (update_url.is_some() && !no_embed_updater) || pins_https {
                         RUNTIME_BINARY_UPDATE
@@ -1279,7 +1292,14 @@ fn run_build(
         .as_ref()
         .and_then(|u| u.key.clone())
         .map(|k| if k.is_absolute() { k } else { dir.join(k) })
-        .map(std::fs::read)
+        .map(|path| {
+            std::fs::read(&path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("recipe [update] key {}: {e}", path.display()),
+                )
+            })
+        })
         .transpose()?;
     let update_revision = recipe.update.as_ref().and_then(|u| u.revision);
     let update_unsigned = recipe.update.as_ref().map(|u| u.unsigned).unwrap_or(false);
