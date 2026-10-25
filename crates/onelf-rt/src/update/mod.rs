@@ -1,17 +1,33 @@
-//! Self-update via zsync.
+//! Self-update from the release binary itself.
 //!
 //! Reads the update URL from `.onelf/update-url` metadata (written at pack
-//! time) and uses zsync-rs to perform a delta download seeded by the current
-//! executable. The new binary is written to a sibling temp file and moved
-//! atomically into place.
+//! time). The URL names the release binary: the runtime fetches its footer
+//! and block manifest with two small range requests, downloads only the
+//! content it does not already have, and copies the rest from the running
+//! executable. The new binary lands in a sibling temp file and is moved
+//! atomically into place after a detached Ed25519 signature over the
+//! assembled bytes verifies. No control file is published or fetched.
+//!
+//! A package packed with the unsigned opt-in (`.onelf/update-unsigned`,
+//! see [`policy`]) carries no signing key and verifies nothing: every
+//! update step announces on stderr that the release server is trusted in
+//! full. Signing stays the default and a keyed package never skips
+//! verification, whichever markers it carries.
+//!
+//! `range` carries the HTTPS transport and the remote probe; `delta`
+//! plans and writes the assembled file.
+
+mod delta;
+mod range;
 
 use std::ffi::OsString;
 use std::io;
 use std::io::Read;
+use std::io::Seek;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use zsync_rs::ZsyncAssembly;
+use range::{FetchError, HttpsRangeSource, RangeSource, RemotePackage};
 
 pub enum UpdateFlag {
     /// Just report whether an update is available.
@@ -31,13 +47,39 @@ pub fn parse_flag(args: &[OsString]) -> Option<UpdateFlag> {
     }
 }
 
+/// Resolve the update policy a package carries into the verification
+/// behavior: `Some(keys)` verifies signatures against that keyring,
+/// `None` updates without verification. A package with both a keyring
+/// and the unsigned marker is refused rather than guessed about: the
+/// packer never produces one, so it is hand-crafted or tampered with.
+/// A URL without either means self-update stays disabled, as before.
+pub fn policy(key: Option<Vec<u8>>, unsigned: bool) -> Result<Option<Vec<u8>>, String> {
+    match (key, unsigned) {
+        (Some(keys), false) => Ok(Some(keys)),
+        (Some(_), true) => Err(
+            "package has both a signing key and the unsigned marker; refusing to \
+             guess which policy it means"
+                .to_string(),
+        ),
+        (None, true) => Ok(None),
+        (None, false) => Err(
+            "self-update disabled: package has an update URL but no signing \
+             key (repack with --update-key, or --update-unsigned to accept \
+             unsigned updates)"
+                .to_string(),
+        ),
+    }
+}
+
 /// Run the chosen update action against `self_path`, using `update_url`
-/// from the package metadata. Returns a process exit code.
+/// from the package metadata. `pubkey` is the package's policy: `None`
+/// updates without signature verification, warning on stderr every time.
+/// Returns a process exit code.
 pub fn run(
     flag: UpdateFlag,
     self_path: &Path,
     update_url: &str,
-    pubkey: &[u8],
+    pubkey: Option<&[u8]>,
     current_revision: Option<u64>,
 ) -> i32 {
     // Refuse plaintext transports before any request is made: a MITM on
@@ -45,6 +87,12 @@ pub fn run(
     if !update_url.starts_with("https://") {
         eprintln!("onelf-rt: refusing non-HTTPS update URL");
         return 2;
+    }
+    if pubkey.is_none() {
+        eprintln!(
+            "onelf-rt: warning: this package verifies no update signatures; \
+             every update installs whatever the release server serves"
+        );
     }
     match flag {
         UpdateFlag::Check => check(self_path, update_url, pubkey, current_revision),
@@ -164,38 +212,104 @@ impl Drop for Mmap {
     }
 }
 
-fn check(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u64>) -> i32 {
-    let ctl = match fetch_control(url) {
-        Ok(c) => c,
-        Err(e) => {
+fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: Option<u64>) -> i32 {
+    let local_id = local_package_id(self_path);
+    let src = HttpsRangeSource::new(url.to_string());
+    let remote = match range::probe(&src) {
+        Ok(remote) => remote,
+        Err(FetchError::NoRanges(why)) => {
+            // The host ignores Range, so freshness needs the whole file.
+            // A rare case: ordinary static file servers answer ranges.
+            eprintln!("onelf-rt: {why}; checking against a full download");
+            return match fetch_verified(self_path, url, pubkey, None, &src) {
+                Err(code) => code,
+                Ok(staged) => {
+                    let (revision, id) = staged_info(&staged);
+                    let _ = std::fs::remove_file(&staged);
+                    if id.is_some() && id == local_id {
+                        println!("up to date");
+                        return 0;
+                    }
+                    report_available(local_id.as_ref(), id.as_ref(), current_revision, revision)
+                }
+            };
+        }
+        Err(FetchError::Other(e)) => {
             eprintln!("onelf-rt: check update: {e}");
             return 2;
         }
     };
-    let current_sha = sha1_file_hex(self_path).unwrap_or_default();
-    let remote_sha = ctl.sha1.clone().unwrap_or_default();
-    if !remote_sha.is_empty() && current_sha == remote_sha {
-        println!("up to date ({current_sha})");
+
+    // The package id covers every content hash and the runtime prefix, so
+    // equal ids mean equal packages: a two-request freshness check.
+    if Some(remote.package_id()) == local_id.as_ref() {
+        println!("up to date ({})", hex(remote.package_id()));
         return 0;
+    }
+    if current_revision.is_none() {
+        println!(
+            "update available: {} -> {}",
+            id_or_dash(local_id.as_ref()),
+            hex(remote.package_id())
+        );
+        return 1;
     }
 
     // Only the remote package's own bytes carry its revision, so a running
     // package with one has the update fetched and verified as an apply
     // would, and an update the apply would refuse is not offered.
-    if current_revision.is_some() {
-        let staged = match fetch_verified(self_path, url, pubkey) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
-        let permitted = revision_permits(current_revision, staged_revision(&staged));
-        let _ = std::fs::remove_file(&staged);
-        if let Err(why) = permitted {
-            println!("no update offered: {why}");
-            return 0;
+    match fetch_verified(self_path, url, pubkey, Some(remote), &src) {
+        Err(code) => code,
+        Ok(staged) => {
+            let (revision, id) = staged_info(&staged);
+            let _ = std::fs::remove_file(&staged);
+            report_available(local_id.as_ref(), id.as_ref(), current_revision, revision)
         }
     }
-    println!("update available: {current_sha} -> {remote_sha}");
-    1
+}
+
+/// The verdict after the signed bytes settled freshness and revision.
+fn report_available(
+    local_id: Option<&[u8; 32]>,
+    staged_id: Option<&[u8; 32]>,
+    current_revision: Option<u64>,
+    staged_revision: Option<u64>,
+) -> i32 {
+    match revision_permits(current_revision, staged_revision) {
+        Err(why) => {
+            println!("no update offered: {why}");
+            0
+        }
+        Ok(()) => {
+            println!(
+                "update available: {} -> {}",
+                id_or_dash(local_id),
+                id_or_dash(staged_id)
+            );
+            1
+        }
+    }
+}
+
+/// The running package's id, when this binary is a readable package.
+fn local_package_id(self_path: &Path) -> Option<[u8; 32]> {
+    crate::loader::load_from(self_path)
+        .ok()
+        .map(|p| p.manifest.header.package_id)
+}
+
+/// A package id as hex, or a dash when there is none to show.
+fn id_or_dash(id: Option<&[u8; 32]>) -> String {
+    id.map(|b| hex(b.as_slice())).unwrap_or_else(|| "-".into())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// An unpredictable staging path beside the binary being updated.
@@ -268,18 +382,26 @@ fn save_rollback(self_path: &Path, prev_path: &Path) -> io::Result<()> {
     copied
 }
 
-/// The `.onelf/update-revision` entry of a packaged binary, if any.
-fn staged_revision(path: &Path) -> Option<u64> {
-    let mut pkg = crate::loader::load_from(path).ok()?;
-    let bytes = crate::read_package_file(&mut pkg, ".onelf/update-revision")?;
-    std::str::from_utf8(&bytes)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+/// The `.onelf/update-revision` entry and package id of a packaged
+/// binary, read from its own bytes.
+fn staged_info(path: &Path) -> (Option<u64>, Option<[u8; 32]>) {
+    let mut pkg = match crate::loader::load_from(path) {
+        Ok(p) => p,
+        Err(_) => return (None, None),
+    };
+    let id = pkg.manifest.header.package_id;
+    let revision = crate::read_package_file(&mut pkg, ".onelf/update-revision")
+        .and_then(|bytes| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        });
+    (revision, Some(id))
 }
 
 /// Pure freshness decision: a signed package may only replace a running
 /// binary of strictly lower revision. A running binary without a revision
-/// falls back to the SHA1 freshness check done by the caller. One that
+/// falls back to the package-id comparison done by the caller. One that
 /// carries a revision refuses a package without one, since every release
 /// signed before revisions existed would otherwise roll it back.
 fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(), String> {
@@ -304,9 +426,17 @@ fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(),
 }
 
 /// Download the update beside `self_path` and verify its signature,
-/// returning the staged file. On failure nothing is left behind, and the
-/// error is the exit code, already explained on stderr.
-fn fetch_verified(self_path: &Path, url: &str, pubkey: &[u8]) -> Result<PathBuf, i32> {
+/// returning the staged file. `remote` is the probe result when the host
+/// honors range requests; without it the release downloads in full. On
+/// failure nothing is left behind, and the error is the exit code, already
+/// explained on stderr.
+fn fetch_verified(
+    self_path: &Path,
+    url: &str,
+    pubkey: Option<&[u8]>,
+    remote: Option<RemotePackage>,
+    src: &dyn RangeSource,
+) -> Result<PathBuf, i32> {
     let tmp_path = match staged_path(self_path) {
         Ok(p) => p,
         Err(e) => {
@@ -315,53 +445,64 @@ fn fetch_verified(self_path: &Path, url: &str, pubkey: &[u8]) -> Result<PathBuf,
         }
     };
     // Exclusive create: ours alone, whatever the directory holds.
-    if let Err(e) = claim_staging(&tmp_path) {
-        eprintln!(
-            "onelf-rt: cannot claim staging file {}: {e}",
-            tmp_path.display()
-        );
-        return Err(2);
-    }
+    let staged = match claim_staging(&tmp_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "onelf-rt: cannot claim staging file {}: {e}",
+                tmp_path.display()
+            );
+            return Err(2);
+        }
+    };
     eprintln!("onelf-rt: downloading update to {}", tmp_path.display());
 
-    let mut assembly =
-        match ZsyncAssembly::from_url_with_client(url, &tmp_path, update_http_client()) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("onelf-rt: init assembly: {e}");
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(2);
+    if let Some(remote) = &remote {
+        match delta::assemble(self_path, remote, &staged, src) {
+            Ok(stats) => {
+                eprintln!(
+                    "onelf-rt: reused {} blocks, fetching {} of {} bytes",
+                    stats.reused, stats.fetched, remote.size
+                );
+                match pubkey {
+                    // Copied bytes are only as good as the assumption that
+                    // identical content encodes identically. When that
+                    // assumption breaks the signature names it, and a full
+                    // download replaces the guess with certainty.
+                    Some(keys) => match verify_update_signature(&tmp_path, url, keys) {
+                        Ok(()) => return Ok(tmp_path),
+                        Err(e) if stats.reused > 0 => {
+                            eprintln!(
+                                "onelf-rt: assembled update failed its signature check ({e}); \
+                                 retrying with a full download"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("onelf-rt: update signature check failed: {e}");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(2);
+                        }
+                    },
+                    // Unsigned policy: the assembled bytes install as-is.
+                    None => return Ok(tmp_path),
+                }
             }
-        };
-
-    // Seed from our own file: most blocks usually match.
-    if let Err(e) = assembly.submit_source_file(self_path) {
-        eprintln!("onelf-rt: warning: seeding failed: {e}");
-    }
-
-    while !assembly.is_complete() {
-        match assembly.download_missing_blocks() {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("onelf-rt: download error: {e}");
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(2);
+            Err(why) => {
+                eprintln!("onelf-rt: delta update unavailable ({why}); downloading in full");
             }
         }
     }
 
-    if let Err(e) = assembly.complete() {
-        eprintln!("onelf-rt: verify failed: {e}");
+    // Full download into the staging file already claimed above.
+    let mut staged = staged;
+    if let Err(e) = download_into(url, &mut staged) {
+        eprintln!("onelf-rt: download update: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
-
-    // Verify a detached Ed25519 signature over the fully-assembled binary
-    // against the pack-time public key before it is ever installed. Fails
-    // closed: on any problem the temp file is removed and the running
-    // executable is left unchanged.
-    if let Err(e) = verify_update_signature(&tmp_path, url, pubkey) {
+    if let Some(keys) = pubkey
+        && let Err(e) = verify_update_signature(&tmp_path, url, keys)
+    {
         eprintln!("onelf-rt: update signature check failed: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
@@ -369,23 +510,31 @@ fn fetch_verified(self_path: &Path, url: &str, pubkey: &[u8]) -> Result<PathBuf,
     Ok(tmp_path)
 }
 
-fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u64>) -> i32 {
-    let ctl = match fetch_control(url) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("onelf-rt: fetch control: {e}");
+fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: Option<u64>) -> i32 {
+    let local_id = local_package_id(self_path);
+    let src = HttpsRangeSource::new(url.to_string());
+    let remote = match range::probe(&src) {
+        Ok(remote) => Some(remote),
+        Err(FetchError::NoRanges(why)) => {
+            eprintln!("onelf-rt: {why}; downloading in full");
+            None
+        }
+        Err(FetchError::Other(e)) => {
+            eprintln!("onelf-rt: fetch release: {e}");
             return 2;
         }
     };
 
-    let current_sha = sha1_file_hex(self_path).unwrap_or_default();
-    let remote_sha = ctl.sha1.clone().unwrap_or_default();
-    if !remote_sha.is_empty() && current_sha == remote_sha {
-        println!("already up to date ({current_sha})");
+    // The package id covers every content hash and the runtime prefix, so
+    // equal ids mean equal packages: nothing to install.
+    if let Some(remote) = &remote
+        && Some(remote.package_id()) == local_id.as_ref()
+    {
+        println!("already up to date ({})", hex(remote.package_id()));
         return 0;
     }
 
-    let tmp_path = match fetch_verified(self_path, url, pubkey) {
+    let tmp_path = match fetch_verified(self_path, url, pubkey, remote, &src) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -395,8 +544,8 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
     // covers it, and a rolled-back build cannot talk a client into
     // installing itself again. A package with no revision, or one that
     // cannot be read, counts as revisionless and is refused. A running
-    // package without one keeps the SHA1 freshness check.
-    let downloaded_revision = staged_revision(&tmp_path);
+    // package without one keeps the package-id freshness check.
+    let (downloaded_revision, downloaded_id) = staged_info(&tmp_path);
     if let Err(why) = revision_permits(current_revision, downloaded_revision) {
         eprintln!("onelf-rt: refusing update: {why}");
         let _ = std::fs::remove_file(&tmp_path);
@@ -449,7 +598,11 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
         eprintln!("onelf-rt: warning: fsync of install dir failed: {e}");
     }
 
-    println!("updated: {current_sha} -> {remote_sha}");
+    println!(
+        "updated: {} -> {}",
+        id_or_dash(local_id.as_ref()),
+        id_or_dash(downloaded_id.as_ref())
+    );
     0
 }
 
@@ -464,8 +617,8 @@ fn apply(self_path: &Path, url: &str, pubkey: &[u8], current_revision: Option<u6
 ///
 /// `redirects` is the allowance for this request. The download follows
 /// them, since publishing behind a redirecting CDN is ordinary, and HTTPS
-/// only plus the signature check make that safe. The signature fetch
-/// allows none.
+/// only plus the signature check make that safe. Every fetch in this
+/// module shares the same allowance.
 fn hardened_agent(redirects: u32) -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
@@ -481,39 +634,25 @@ fn hardened_agent(redirects: u32) -> ureq::Agent {
         .new_agent()
 }
 
-/// Download `url` to `into` through the hardened client. Used for a
-/// pinned GL build, which its hash verifies afterwards.
+/// Download `url` through the hardened client. Used for a pinned GL
+/// build, which its hash verifies afterwards.
 pub fn download(url: &str, into: &Path) -> Result<(), String> {
+    let mut file = std::fs::File::create(into).map_err(|e| format!("{}: {e}", into.display()))?;
+    download_into(url, &mut file)
+}
+
+/// Stream `url` into an open file from its start.
+fn download_into(url: &str, file: &mut std::fs::File) -> Result<(), String> {
     let response = hardened_agent(10)
         .get(url)
         .call()
         .map_err(|e| format!("{url}: {e}"))?;
     let mut reader = response.into_body().into_reader();
-    let mut file = std::fs::File::create(into).map_err(|e| format!("{}: {e}", into.display()))?;
-    io::copy(&mut reader, &mut file).map_err(|e| format!("{url}: {e}"))?;
+    file.set_len(0).map_err(|e| format!("{url}: {e}"))?;
+    file.seek(io::SeekFrom::Start(0))
+        .map_err(|e| format!("{url}: {e}"))?;
+    io::copy(&mut reader, file).map_err(|e| format!("{url}: {e}"))?;
     Ok(())
-}
-
-/// A zsync client carrying the same policy as the rest of the update.
-fn update_http_client() -> zsync_rs::HttpClient {
-    zsync_rs::HttpClient::with_agent(hardened_agent(10))
-}
-
-fn fetch_control(url: &str) -> Result<zsync_rs::ControlFile, String> {
-    update_http_client()
-        .fetch_control_file(url)
-        .map_err(|e| format!("{e}"))
-}
-
-fn sha1_file_hex(path: &Path) -> io::Result<String> {
-    let mut f = std::fs::File::open(path)?;
-    let digest = zsync_rs::checksum::calc_sha1_stream(&mut f)?;
-    let mut s = String::with_capacity(40);
-    for b in digest.iter() {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    Ok(s)
 }
 
 /// Resolve this binary's path on disk via `/proc/self/exe`.
@@ -666,16 +805,39 @@ mod tests {
 
     #[test]
     fn non_https_url_is_refused_before_any_request() {
-        // A plaintext URL is rejected up front (exit 2) with no network.
+        // A plaintext URL is rejected up front (exit 2) with no network,
+        // whichever policy the package carries.
         let path = std::path::Path::new("/proc/self/exe");
         assert_eq!(
-            super::run(super::UpdateFlag::Check, path, "http://x/app", &[], None),
+            super::run(
+                super::UpdateFlag::Check,
+                path,
+                "http://x/app",
+                Some(&[7u8; 32]),
+                None
+            ),
             2
         );
         assert_eq!(
-            super::run(super::UpdateFlag::Apply, path, "ftp://x/app", &[], None),
+            super::run(super::UpdateFlag::Apply, path, "ftp://x/app", None, None),
             2
         );
+    }
+
+    #[test]
+    fn policy_resolves_keys_markers_and_refusals() {
+        use super::policy;
+
+        let keys = vec![7u8; 32];
+
+        // A keyed package verifies; the plain keyless one stays disabled.
+        assert_eq!(policy(Some(keys.clone()), false), Ok(Some(keys.clone())));
+        assert!(policy(None, false).is_err());
+
+        // The unsigned opt-in is honored only without a key: a package
+        // carrying both is refused rather than guessed about.
+        assert_eq!(policy(None, true), Ok(None));
+        assert!(policy(Some(keys), true).is_err());
     }
 
     #[test]

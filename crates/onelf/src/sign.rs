@@ -110,13 +110,11 @@ const EMBEDDED_URL_PATH: &str = ".onelf/update-url";
 
 /// The default detached-signature path for `file`.
 ///
-/// The runtime asks for the update URL with `.sig` appended, and the
-/// update URL names the zsync control file rather than the binary. So a
-/// binary published as `app.onelf` with an update URL of
-/// `app.onelf.zsync` needs its signature uploaded as
-/// `app.onelf.zsync.sig`, even though the signed bytes are the binary's.
-/// Naming the local file after the URL removes the guesswork, since a
-/// signature published under any other name is simply never fetched.
+/// The runtime asks for the update URL with `.sig` appended, so a binary
+/// published as `app.onelf` with an update URL of `app.onelf` needs its
+/// signature uploaded as `app.onelf.sig`. Naming the local file after
+/// the URL removes the guesswork, since a signature published under any
+/// other name is simply never fetched.
 ///
 /// Falls back to `<file>.sig` when the target carries no update URL to
 /// derive from.

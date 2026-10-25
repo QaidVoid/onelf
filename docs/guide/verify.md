@@ -62,7 +62,7 @@ how these hashes chain.
 ## Checking a signature
 
 ```bash
-onelf verify myapp.onelf --key myapp.pub --sig myapp.onelf.zsync.sig
+onelf verify myapp.onelf --key myapp.pub --sig myapp.onelf.sig
 ```
 
 With `--key` and `--sig` (always together), `verify` first checks a

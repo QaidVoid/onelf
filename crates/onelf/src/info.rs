@@ -134,8 +134,11 @@ pub fn info(path: &Path) -> io::Result<()> {
     println!();
 
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {
+        let unsigned = read_metadata_bytes(path, &footer, &manifest, ".onelf/update-unsigned")?
+            .is_some();
         let embedded_key = read_metadata_bytes(path, &footer, &manifest, ".onelf/update-key")?;
         let key_desc = match embedded_key.as_deref().map(|b| b.len() / 32) {
+            None if unsigned => "none (updates are not signature-verified)".to_string(),
             None => "none".to_string(),
             Some(n) if n <= 1 => "embedded".to_string(),
             Some(n) => format!("keyring of {n} keys"),

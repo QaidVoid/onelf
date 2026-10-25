@@ -79,9 +79,10 @@ onelf pack DIRECTORY -o OUTPUT --command PATH [options]
 | `--needs-setuid` | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
 | `--mtime SECS` | | Pin every entry's mtime to a Unix timestamp for reproducible output. Overrides `SOURCE_DATE_EPOCH` |
 | `--working-dir MODE` | `inherit` | `inherit`, `package`, or `command` |
-| `--update-url URL` | | URL of the `.zsync` file for self-update. Must start with `https://`. Selects the update runtime unless `--no-embed-updater` is given |
+| `--update-url URL` | | URL of the release binary for self-update. Must start with `https://`. Selects the update runtime unless `--no-embed-updater` is given |
 | `--update-key PATH` | | File with one or more 32-byte Ed25519 public keys. Several concatenated keys form a keyring, and any of them can sign updates. A file that holds a secret key, is not a multiple of 32 bytes or repeats a key is refused. Requires `--update-url`, and self-update needs it |
 | `--update-revision N` | | Stamp release number N into the package; the runtime refuses downloads that are not strictly newer. Requires `--update-url` |
+| `--update-unsigned` | `false` | Accept unsigned updates: store no signing key and mark the package so its runtime installs whatever the update URL serves, warning on stderr. HTTPS is still required. Requires `--update-url`, conflicts with `--update-key` |
 | `--no-embed-updater` | `false` | Record the update URL without embedding the updater (keeps the slim runtime; see the self-update guide's size table) |
 | `--host-libs MODE` | `auto` | What the launch resolver may take from the host: `never` nothing, `auto` the GPU driver stack's closure, `always` any bundled soname the host has newer |
 | `--exclude GLOB` | | Exclude paths matching glob (repeatable) |
@@ -292,8 +293,8 @@ onelf sign BINARY --key PATH [-o PATH]
 
 The default output name comes from the update URL the package carries,
 because that is the only name the runtime requests: a package whose
-update URL is `app.onelf.zsync` needs its signature at
-`app.onelf.zsync.sig`. Signing refuses when the package embeds update
+update URL is `app.onelf` needs its signature at `app.onelf.sig`.
+Signing refuses when the package embeds update
 keys and the secret matches none of them. It warns, and still signs,
 when the package embeds no key. See
 [Self-Update](../guide/self-update) for the full publish flow.

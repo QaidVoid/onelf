@@ -355,8 +355,12 @@ fn update(pkg: &mut PackageData) {
         return;
     };
     println!("  url: {url}");
+    let unsigned = read_package_file(pkg, ".onelf/update-unsigned").is_some();
     match read_package_file(pkg, ".onelf/update-key") {
         Some(keys) => println!("  signing keys: {}", keys.len() / 32),
+        None if unsigned => {
+            println!("  signing keys: none (updates are not signature-verified)");
+        }
         None => println!("  signing keys: none, so --onelf-update refuses"),
     }
     if let Some(revision) = text(pkg, ".onelf/update-revision") {

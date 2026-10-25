@@ -320,6 +320,7 @@ fn pack_tree(
             embed_updater: false,
             update_key: None,
             update_revision: None,
+            update_unsigned: false,
             exclude: Vec::new(),
             package_info: None,
             mtime: Some(0),

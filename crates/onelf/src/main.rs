@@ -116,6 +116,13 @@ enum Commands {
         #[arg(long, requires = "update_url")]
         update_revision: Option<u64>,
 
+        /// Accept unsigned self-updates: store no signing key and mark
+        /// the package (.onelf/update-unsigned) so its runtime installs
+        /// whatever the update URL serves, warning on stderr. HTTPS is
+        /// still required.
+        #[arg(long, requires = "update_url", conflicts_with = "update_key")]
+        update_unsigned: bool,
+
         /// What the launch resolver may take from the host: `never`
         /// nothing, `auto` the driver stack's closure, `always` any
         /// bundled soname. `auto` decides from the bundle's contents.
@@ -696,6 +703,7 @@ fn main() {
             update_url,
             update_key,
             update_revision,
+            update_unsigned,
             no_embed_updater,
             host_libs,
             cache,
@@ -759,6 +767,7 @@ fn main() {
                         embed_updater: !no_embed_updater,
                         update_key,
                         update_revision,
+                        update_unsigned,
                         exclude,
                         package_info: None,
                         mtime,
@@ -1273,6 +1282,7 @@ fn run_build(
         .map(std::fs::read)
         .transpose()?;
     let update_revision = recipe.update.as_ref().and_then(|u| u.revision);
+    let update_unsigned = recipe.update.as_ref().map(|u| u.unsigned).unwrap_or(false);
     let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
     let runtime: &[u8] = if (update_url.is_some() && embed_updater) || pins_https_build(&dir) {
         RUNTIME_BINARY_UPDATE
@@ -1317,6 +1327,7 @@ fn run_build(
             embed_updater,
             update_key,
             update_revision,
+            update_unsigned,
             exclude: recipe.package.exclude,
             package_info,
             mtime,

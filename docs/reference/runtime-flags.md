@@ -87,7 +87,7 @@ The slim runtime does not know these flags and passes them to the app.
 | Flag | Action |
 |------|--------|
 | `--onelf-check-update` | Print status, exit 0 if up to date or if `--onelf-update` would refuse what the server has, 1 if an update is available, 2 on error |
-| `--onelf-update` | Delta-download, verify the signature, and atomically replace self. Refused when the package embeds no update key |
+| `--onelf-update` | Delta-download, verify the signature, and atomically replace self. A package packed with the unsigned opt-in installs without a signature check, warning on stderr. Otherwise refused when the package embeds no update key |
 
 ## Portable directory setup
 

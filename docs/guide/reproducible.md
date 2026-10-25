@@ -74,8 +74,11 @@ time the AppDir happened to be written never reaches the package.
 timestamp. onelf warns once about a `SOURCE_DATE_EPOCH` that is not a
 whole number of seconds and then treats it as unset.
 
-✅ Any CI that checks out the same commit produces byte-identical output,
-which in turn makes the zsync delta size predictable.
+✅ Any CI that checks out the same commit produces byte-identical output.
+That matters for updates: identical packages share a package id, so a
+client checking for updates gets "up to date" after two small range
+requests, and a new release deltas against the old one with every
+unchanged block copied from the installed binary.
 
 ## Verifying reproducibility
 

@@ -50,7 +50,7 @@ page explains why.
 | Nothing on disk | no copy left, cache opt-in | extraction removed on exit | mount dir on crash | installs | yes |
 | GPU drivers | host, per library; bundling opt-in | bundled Mesa, NVIDIA from the host | host dirs on path | runtime extension | n/a |
 | Bundle source | scan or package DB | `lib4bin` and `strace`, or debloated Arch packages | `linuxdeploy` | build in SDK | compiler |
-| Delta updates | built in, signed | embedded zsync info, unsigned | external tool | OSTree | no |
+| Delta updates | built in, signed | update server, unsigned | external tool | OSTree | no |
 | Sandbox | no | no | no | `bwrap`, as permitted | no |
 | Host programs the app starts | get the caller's environment back | bundle paths unset, home restored | inherit the bundle's | run in the sandbox | n/a |
 
@@ -71,7 +71,7 @@ rather than a scan of the packer's machine.
 
 ```
 +-------------------------------------+
-| onelf-rt (static musl runtime)      |  1.1 MB slim, 2.4 MB with the updater
+| onelf-rt (static musl runtime)      |  1.2 MB slim, 2.5 MB with the updater
 +-------------------------------------+
 | Manifest (zstd-compressed)          |  File tree, entrypoints, metadata
 +-------------------------------------+
@@ -98,10 +98,11 @@ When you execute the file:
 ## When to use onelf
 
 - You want to distribute a Linux app as one file without `.deb`/`.rpm`/flathub/etc.
-- You're okay with about 1.1 MB of runtime per package, or 2.4 MB with
+- You're okay with about 1.2 MB of runtime per package, or 2.5 MB with
   the self-updater.
 - You want the app to leave no trace when it exits.
-- You want delta self-updates without bundling `zsync`.
+- You want delta self-updates from the release binary itself, with no
+  extra files to publish.
 - You want cross-libc portability (ship a musl binary, run on glibc hosts).
 
 ## When not to use onelf

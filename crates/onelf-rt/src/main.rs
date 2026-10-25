@@ -105,15 +105,16 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        // Self-update requires an embedded signing public key. A package
-        // with a URL but no key is refused rather than installing bytes
-        // that cannot be verified.
-        let Some(key_bytes) = read_package_file(&mut pkg, ".onelf/update-key") else {
-            eprintln!(
-                "onelf-rt: self-update disabled: package has an update URL but no \
-                 signing key (repack with --update-key)"
-            );
-            std::process::exit(1);
+        // The package's own metadata picks the policy: a signing keyring
+        // verifies every update, the unsigned opt-in skips verification
+        // loudly, and a URL with neither leaves self-update disabled.
+        let unsigned = read_package_file(&mut pkg, ".onelf/update-unsigned").is_some();
+        let key = match update::policy(read_package_file(&mut pkg, ".onelf/update-key"), unsigned) {
+            Ok(key) => key,
+            Err(why) => {
+                eprintln!("onelf-rt: {why}");
+                std::process::exit(1);
+            }
         };
         let Some(self_path) = update::self_path() else {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
@@ -129,7 +130,7 @@ fn main() {
             flag,
             &self_path,
             &url,
-            &key_bytes,
+            key.as_deref(),
             current_revision,
         ));
     }

@@ -22,7 +22,8 @@ The full guide lives in [docs/](./docs).
   versions, never by directory order. Bundling Mesa is an explicit opt-in.
 - **Bundles from a sysroot.** `bundle-libs` can fill a bundle from a
   pinned sysroot's package database instead of scanning your machine.
-- **Signed delta updates.** zsync-based self-update, verified with an
+- **Signed delta updates.** Self-update straight from the release
+  binary, downloading only the changed content, verified with an
   Ed25519 signature before anything is replaced. Or leave the updater
   out and let a package manager do it.
 - **Recipes.** One `onelf.toml` captures the whole build, and the same

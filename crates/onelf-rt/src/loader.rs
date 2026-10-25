@@ -166,9 +166,10 @@ fn read_block(
 /// without a bound a few kilobytes of input could expand without limit
 /// before the hash check; and a block that comes up short is an error,
 /// since on a v1 manifest with no per-block hash it would be served with
-/// every later offset shifted.
-fn decode_block(buf: &[u8], original: usize, dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
-    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+/// every later offset shifted. Shared with the delta updater, which
+/// verifies a block it copied from the running binary by decoding it and
+/// hashing the content.
+pub(crate) fn decode_block(buf: &[u8], original: usize, dict: Option<&[u8]>) -> io::Result<Vec<u8>> {    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
     let data = match dict {
         Some(d) => {
             let decoder = zstd::Decoder::with_dictionary(Cursor::new(buf), d)?;

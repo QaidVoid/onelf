@@ -1,25 +1,47 @@
 # Self-Update
 
-onelf integrates [zsync](https://zsync.moria.org.uk/) for delta updates.
-After a user has your app, they can pull updates with one command and the
-runtime downloads only the differing blocks from your hosted binary.
+onelf packages update themselves straight from the release binary. There
+is no control file and no delta tool to run: the update URL names the
+binary you already publish, and the runtime downloads only the content
+it does not already have, copying the rest from the running executable.
+
+The trick is the package's own manifest. Every block of payload content
+carries a BLAKE3 hash, and the manifest is small enough to fetch in one
+range request. The runtime fetches a release's footer and manifest with
+two small HTTPS range requests, compares the hashes against the running
+package's manifest, and knows exactly which byte spans changed. Nothing
+about the release needs to be prepared beyond signing it.
 
 Updates are signed. The runtime verifies a detached Ed25519 signature
 over the fully assembled binary before it replaces anything, and refuses
 to update at all if the package carries no key. Publishing an update
 therefore takes a keypair, and the key has to be embedded when you pack.
+Signing is the default, not a hard requirement: a package packed with
+the unsigned opt-in carries no key and installs whatever its release
+server serves, saying so on stderr every time. See
+[Opting out of signatures](#opting-out-of-signatures).
 
 The rules this page encodes:
 
 - ✅ Set both the update URL and the public key at pack time. A package
-  with a URL but no key cannot self-update: the runtime reports that
-  self-update is disabled and does not contact the server.
+  with a URL but no key cannot self-update unless it was packed with the
+  unsigned opt-in: the runtime reports that self-update is disabled and
+  does not contact the server.
+- ☑️ Accept unsigned updates deliberately with the unsigned opt-in
+  (`unsigned = true`, or `--update-unsigned`). Such a package stores no
+  key and updates from its release server with no signature check: the
+  HTTPS connection is then the only protection, and the runtime says so
+  on stderr at every update.
 - ✅ Give each release `--update-revision N`. Without it, the older
   freshness rule applies and a signed-but-old package can roll a client
   back.
-- ✅ Sign after `zsyncmake` and publish the signature at the update URL
-  plus `.sig`. A signature published under any other name is never
+- ✅ Sign the finished binary and publish the signature at the update
+  URL plus `.sig`. A signature published under any other name is never
   requested, and the update fails closed.
+- ✅ Host the release on a server that honors range requests. Any
+  ordinary static file server does. One that answers a range request
+  with a full-body 200 still works: the runtime notices and falls back
+  to a whole-file download, which only costs bandwidth.
 - ❌ Never publish over plain HTTP. `onelf pack` refuses an update URL
   that is not `https://`, and the runtime refuses one before any request
   is made.
@@ -63,12 +85,12 @@ one that repeats a key.
 
 ## Opt in at pack time
 
-Set both the update URL and the public key. The URL should point at the
-`.zsync` control file you'll host alongside the binary.
+Set both the update URL and the public key. The URL points at the
+release binary itself, exactly where you will host it.
 
 ```toml
 [update]
-url = "https://releases.example.com/myapp.onelf.zsync"
+url = "https://releases.example.com/myapp.onelf"
 key = "myapp.pub"
 ```
 
@@ -76,7 +98,7 @@ On the CLI that is `--update-url` plus `--update-key`.
 
 - ❌ Build with a URL but no key. The package cannot self-update: the
   runtime reports that self-update is disabled and does not contact the
-  server.
+  server. The unsigned opt-in below is the one way to change that.
 - ✅ Give each release a number with `--update-revision N`. The number is
   embedded in the package as `.onelf/update-revision`, so the signature
   covers it like any other byte. At update time the runtime reads the
@@ -88,15 +110,46 @@ On the CLI that is `--update-url` plus `--update-key`.
   a revision refuses a package without one, since that is what every
   release signed before revisions existed looks like.
 - ☑️ Omit the revision if the older freshness rule is what you want:
-  packages without a revision install whenever the SHA1 differs, so the
-  flag is optional.
+  packages without a revision install whenever the package id differs,
+  so the flag is optional.
 - ☑️ `embed = false` when something else updates the package. When
   `[update]` is present, onelf links the larger update-capable runtime
-  (1.35 MB extra for the HTTPS, zsync and signature code); without it,
+  (1.3 MB extra for the HTTPS client and signature code); without it,
   the slim runtime is used and `--onelf-update` is unrecognized. See
   [Updating from outside the package](#updating-from-outside-the-package).
 - ❌ A plain-HTTP URL. The URL must be `https://`. `onelf pack` refuses
   anything else.
+
+## Opting out of signatures
+
+Not every release channel needs signatures: an internal tool whose
+release server is already trusted, a build exercised end to end in CI.
+The unsigned opt-in marks the package so its runtime updates without any
+signature check, and no key is embedded.
+
+```toml
+[update]
+url = "https://releases.example.com/myapp.onelf"
+unsigned = true
+```
+
+On the CLI that is `--update-url` plus `--update-unsigned`. The package
+carries a `.onelf/update-unsigned` marker, `onelf info` shows the
+policy, and `--update-unsigned` cannot be combined with `--update-key`.
+
+- ✅ Keep serving over HTTPS. Without a signature the transport is the
+  only thing standing between your users and whoever can answer at the
+  update URL.
+- ⚠️ Every update and every check prints a warning that the package
+  verifies no signatures. That is deliberate: the policy should be
+  visible to whoever runs the package.
+- ✅ Publishing is one file: the binary alone, since nothing fetches a
+  `.sig`. The revision gate, the rollback copy and the atomic install
+  all still apply.
+- ❌ Reaching for the opt-in because managing a key seems heavy for a
+  public release. A keypair is generated once, and the keyring makes
+  replacing it routine; an unsigned release server, once compromised,
+  pushes arbitrary code to every client.
 
 ## Publish
 
@@ -107,11 +160,7 @@ has to be produced after everything that changes them.
 # 1. Build the binary.
 onelf build
 
-# 2. Generate the zsync control file. It describes the binary but does
-#    not modify it.
-zsyncmake myapp.onelf -u https://releases.example.com/myapp.onelf
-
-# 3. Sign the finished binary.
+# 2. Sign the finished binary.
 onelf sign myapp.onelf --key myapp.key
 ```
 
@@ -119,19 +168,15 @@ onelf sign myapp.onelf --key myapp.key
 
 ```
 Signed with the key this package embeds.
-Signature: myapp.onelf.zsync.sig
-Publish it at: https://releases.example.com/myapp.onelf.zsync.sig
+Signature: myapp.onelf.sig
+Publish it at: https://releases.example.com/myapp.onelf.sig
 ```
 
-- ⚠️ Note the name. The runtime builds the signature URL by appending
-  `.sig` to the **update URL**, which names the zsync control file, so
-  the signature over `myapp.onelf` is published as
-  `myapp.onelf.zsync.sig`. `onelf sign` derives that name from the URL
-  inside the package so you do not have to work it out. ❌ A signature
+- ✅ Upload both files: `myapp.onelf` and `myapp.onelf.sig`. That is the
+  whole release. The runtime derives the signature URL by appending
+  `.sig` to the update URL inside the package, so ❌ a signature
   published under any other name is never requested, and the update
   fails closed.
-- ✅ Upload all three: `myapp.onelf`, `myapp.onelf.zsync`, and
-  `myapp.onelf.zsync.sig`.
 - ⚠️ `sign` refuses if the secret does not match the public key embedded
   in the package. The mismatch is otherwise invisible: such a package
   installs and runs normally, and only its update path is dead.
@@ -175,24 +220,18 @@ choose which secret signs a given release.
 
 ```
 Update:
-  URL:          https://releases.example.com/myapp.onelf.zsync
+  URL:          https://releases.example.com/myapp.onelf
   Revision:     12
   Signing key:  keyring of 2 keys
   Updater:      embedded
 ```
 
-:::info
-`zsyncmake` comes from the [zsync-rs](https://crates.io/crates/zsync-rs)
-crate. The C `zsyncmake` from most distros works too; they produce the
-same format.
-:::
-
 ## Updating from outside the package
 
 Recording where a package updates from and embedding an updater are two
 separate choices. By default an update URL brings the update-capable
-runtime with it, which costs 1.35 MB over the slim runtime, making the
-runtime 2.5 times larger.
+runtime with it, which costs 1.3 MB over the slim runtime, making the
+runtime more than twice as large.
 
 - ❌ Embedding the updater when something else does the updating. The
   code is dead weight, and worse than dead weight: a self-update
@@ -202,7 +241,7 @@ runtime 2.5 times larger.
 
 ```bash
 onelf pack app -o myapp.onelf --command bin/myapp \
-  --update-url https://releases.example.com/myapp.onelf.zsync \
+  --update-url https://releases.example.com/myapp.onelf \
   --no-embed-updater
 ```
 
@@ -210,7 +249,7 @@ or in a recipe:
 
 ```toml
 [update]
-url = "https://releases.example.com/myapp.onelf.zsync"
+url = "https://releases.example.com/myapp.onelf"
 embed = false
 ```
 
@@ -220,7 +259,7 @@ update flags do nothing. Read the metadata with `onelf info`:
 
 ```
 Update:
-  URL:          https://releases.example.com/myapp.onelf.zsync
+  URL:          https://releases.example.com/myapp.onelf
   Signing key:  embedded
   Updater:      external (this package does not update itself)
 ```
@@ -236,21 +275,35 @@ from the package and the `.sig` from the server.
 ./myapp.onelf --onelf-update         # download delta, atomically replace self
 ```
 
-The check compares the `.zsync` control file against the running binary.
-When the running binary carries a `.onelf/update-revision`, a difference
-is not enough, because only the new package's own bytes say its
-revision. The check then downloads and verifies the update the way the
-apply does (steps 3 to 5 below) and removes it again. An update the
-apply would refuse is reported as `no update offered`, with the reason.
+The check fetches the release's footer and manifest with two small range
+requests and compares the package id, which covers every content hash
+and the runtime prefix: equal ids mean equal packages, so an identical
+release costs a few kilobytes. When the running binary carries a
+`.onelf/update-revision`, a differing id is not enough, because only the
+new package's own bytes say its revision. The check then downloads and
+verifies the update the way the apply does (steps 3 to 5 below) and
+removes it again. An update the apply would refuse is reported as
+`no update offered`, with the reason.
 
 The update-apply flow:
 
-1. Fetch the `.zsync` control file over HTTPS.
-2. Compare it against the running binary.
-3. If different, delta-download the new binary, using the current one
-   as a seed (most blocks match, so typical downloads are tiny).
+1. Fetch the release's footer, then its manifest, with two small range
+   requests.
+2. Compare package ids. Equal means "already up to date" with no
+   download at all.
+3. Delta-assemble the new binary: every payload block whose hash the
+   running package also has is copied from the running binary, and only
+   the rest is fetched. Typical updates share most of their content, so
+   the download is a fraction of the release. Copied blocks are decoded
+   and re-hashed as they are written; a block that does not hash back is
+   fetched instead, so encoder drift can never corrupt an update.
 4. Fetch the detached signature and verify it over the assembled binary
-   against the key embedded at pack time.
+   against the keys embedded at pack time. If any bytes were copied and
+   the signature does not verify, the release is downloaded in full and
+   verified again: the signature stays the final word, and the copy
+   optimization never overrides it. A package packed with the unsigned
+   opt-in skips this step and installs the assembled binary, after the
+   warning on stderr.
 5. If the running binary carries a `.onelf/update-revision`, refuse
    unless the download carries one too and it is strictly newer. A
    running binary without a revision skips this step. This check sits
@@ -263,12 +316,22 @@ to a sibling `<name>.onelf-prev` and forced to the disk as a rollback
 point; on the rare failure of the rename itself, that copy is moved back
 into place.
 
+:::info
+Packages with a stipplefs payload (`--payload stipple`) delta-update
+only when the image is stored uncompressed (`--no-compress`). A
+compressed image re-encodes unchanged content against a dictionary
+retrained for every build, so its bytes are not stable across builds and
+nothing shorter than the whole payload can be reused; the updater says
+so on stderr and downloads in full. The default blocks payload always
+delta-updates.
+:::
+
 Exit codes:
 
 | Code | Meaning |
 |------|---------|
 | 0 | Up to date, update applied successfully, or (for `--onelf-check-update`) no update offered |
-| 1 | Update available (for `--onelf-check-update`), or the package has no update URL or no signing key |
+| 1 | Update available (for `--onelf-check-update`), or the package has no update URL, or it has neither a signing key nor the unsigned opt-in |
 | 2 | Error (network, parse, write, verify) |
 
 ## Example CI workflow
@@ -280,11 +343,6 @@ Exit codes:
 ```yaml
 - name: Build
   run: onelf build
-
-- name: Generate .zsync
-  run: |
-    cargo install zsync-rs
-    zsyncmake myapp.onelf -u https://releases.example.com/myapp.onelf
 
 - name: Sign
   env:
@@ -298,7 +356,7 @@ Exit codes:
   uses: svenstaro/upload-release-action@v2
   with:
     repo_token: ${{ secrets.GITHUB_TOKEN }}
-    file: "myapp.onelf{,.zsync,.zsync.sig}"
+    file: "myapp.onelf{,.sig}"
     file_glob: true
 ```
 
@@ -306,11 +364,11 @@ Exit codes:
 
 | Runtime | Size | Self-update | Records an update URL |
 |---------|------|-------------|----------------------|
-| slim | 1092 KB | no | no |
-| slim, `embed = false` | 1092 KB | no | yes |
-| update | 2.37 MB | yes | yes |
+| slim | 1156 KB | no | no |
+| slim, `embed = false` | 1156 KB | no | yes |
+| update | 2472 KB | yes | yes |
 
-Measured on rustc 1.99.1, x86_64 musl, release profile. This table is
+Measured on rustc 1.99.0, x86_64 musl, release profile. This table is
 the one source of these numbers; other pages link here rather than
 restating them.
 
@@ -328,14 +386,20 @@ it. See [Pinning a GL build](./sysroot#pinning-a-gl-build-for-hosts-without-one)
 - ✅ The signature is the security boundary. It is checked over the fully
   assembled binary, against a key baked into the package at pack time,
   before anything is installed.
-- ⚠️ zsync's own checksum catches corruption and accidental mismatches
-  during the transfer. It is not a signature and is not what makes the
-  update safe.
+- ⚠️ The per-block hashes make the delta copy safe to attempt, not safe
+  to trust. Every copied block is re-hashed as it is written, and a
+  mismatch downgrades that block to a download; the signature over the
+  assembled bytes is what makes the update safe.
 - ⚠️ Compromising your server is not enough to push a malicious update,
   since the attacker would also need a signing key. Compromising a
   signing key is enough, so treat it accordingly, and remove a
   compromised key from the keyring in your next release: clients that
   install it stop trusting the leaked key.
+- ⚠️ The unsigned opt-in removes that boundary on purpose: anyone who
+  can answer at the update URL pushes code to every client of the
+  package. It exists for channels where the server is already trusted
+  and the key ceremony buys nothing, not as a lighter default, and the
+  runtime announces it on stderr at every update.
 - ✅ Serve everything over HTTPS. The runtime enforces this for every
   request the update makes, so no redirect can downgrade the transfer to
   cleartext. The signature fetch and the download both follow

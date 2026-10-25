@@ -60,7 +60,7 @@ level = 19
 dict = false
 
 [update]
-url = "https://releases.example.com/amdgpu_top.onelf.zsync"
+url = "https://releases.example.com/amdgpu_top.onelf"
 
 [bundle]
 search-paths = ["${MUSL_LIBDRM}", "${MUSL_GCC}"]
@@ -122,7 +122,7 @@ entrypoint automatically.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | required | `https://` URL of the zsync control file |
+| `url` | string | required | `https://` URL of the release binary itself, where updates are fetched from |
 | `key` | path | none | 32-byte Ed25519 public key, or several concatenated as a keyring. Required for self-update. A secret key is refused |
 | `revision` | int | none | Release number. The runtime refuses an update that is not strictly newer |
 | `embed` | bool | `true` | Embed the updater. `false` records the URL for an external updater |
