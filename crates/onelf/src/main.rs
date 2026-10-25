@@ -740,12 +740,6 @@ fn main() {
                      the slim runtime is already used when no update URL is set"
                 );
             }
-            if update_url.is_some() && update_key.is_none() && !update_unsigned {
-                eprintln!(
-                    "warning: --update-url without --update-key or --update-unsigned; \
-                     the package cannot self-update until it is repacked with one of them"
-                );
-            }
             let update_key = update_key.as_deref().map(|path| {
                 std::fs::read(path).map_err(|e| {
                     std::io::Error::new(

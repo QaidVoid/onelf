@@ -93,14 +93,17 @@ impl RangeSource for HttpsRangeSource {
             .map_err(|e| FetchError::Other(format!("probe {}: {e}", self.url)))?;
         match response.status().as_u16() {
             // The one-byte probe's 206 is held to the same exactness as
-            // every ranged fetch: only a header naming `bytes 0-0` may
-            // have its total read.
+            // every ranged fetch: only a header naming `bytes 0-0` with
+            // a well-formed total may have that total read.
             206 => {
                 let scoped = response
                     .headers()
                     .get("content-range")
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.starts_with("bytes 0-0/"));
+                    .is_some_and(|v| {
+                        v.strip_prefix("bytes 0-0/")
+                            .is_some_and(|total| !total.is_empty() && !total.contains('/'))
+                    });
                 if !scoped {
                     return Err(FetchError::Other(format!(
                         "{}: 206 without a `bytes 0-0/` Content-Range",
@@ -279,8 +282,9 @@ pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> 
     // The manifest read is sized by the footer the server itself served,
     // so a hostile host can name a huge region and make this process
     // allocate for it. Real manifests are kilobytes to a few megabytes;
-    // anything past the loader's own manifest ceiling is a refusal, not
-    // an allocation.
+    // the loader bounds only the decompressed manifest, so the probe
+    // adds this compressed-side ceiling of its own: past it is a
+    // refusal, not an allocation.
     if footer.manifest_compressed > MAX_PROBE_READ {
         return Err(FetchError::Other(format!(
             "the remote manifest claims {} compressed bytes",
@@ -424,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_refuses_a_manifest_read_past_its_ceiling_before_allocating() {
+    fn probe_refuses_a_manifest_read_past_its_ceiling_before_any_read() {
         use onelf_format::footer::{Flags, FORMAT_VERSION};
 
         // A release whose size and footer agree on a manifest far past

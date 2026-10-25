@@ -744,6 +744,12 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 .to_string(),
         ));
     }
+    if opts.update_url.is_some() && opts.update_key.is_none() && !opts.update_unsigned {
+        eprintln!(
+            "warning: an update URL without a signing key or the unsigned \
+             opt-in leaves self-update disabled"
+        );
+    }
     let dir = opts.directory.canonicalize()?;
 
     // Resolve lib dirs: handle "auto" detection and conflict checking

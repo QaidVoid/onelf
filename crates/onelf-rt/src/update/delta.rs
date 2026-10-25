@@ -360,10 +360,10 @@ fn slice_stored_ranges(
         let stop = end.min(ext_end);
         let mut at = stream_off
             .checked_add(covered - ext_off)
-            .ok_or_else(|| format!("{what}: an extent overflows the image"))?;
+            .ok_or_else(|| format!("{what}: an extent position overflows the image"))?;
         let stream_end = stream_off
             .checked_add(stop - ext_off)
-            .ok_or_else(|| format!("{what}: an extent overflows the image"))?;
+            .ok_or_else(|| format!("{what}: an extent end overflows the image"))?;
         while at < stream_end {
             let within_block = at % block_size;
             let index = u32::try_from(at / block_size)
@@ -1152,6 +1152,30 @@ mod tests {
     }
 
     #[test]
+    fn a_local_prefix_byte_that_disagrees_with_its_manifest_is_refetched() {
+        let stage = Stage::new("prefix-rot");
+        let refs: Vec<(&str, Vec<u8>)> = vec![("bin/app", vec![b'a'; 200_000])];
+        let package = build_blocks_package(&fake_prefix(5), &refs, None);
+
+        // Flip one byte inside the runtime prefix, under a manifest that
+        // still claims the original prefix_hash. The writer must catch
+        // the divergence and fetch the release prefix instead of copying
+        // the rot into the staged update.
+        let mut local = package.clone();
+        local[100] ^= 0xff;
+
+        let (out, stats, remote_pkg) = stage.run(&local, &package).expect("assemble");
+        assert_eq!(
+            out, package,
+            "the degraded prefix fetch must still assemble the release"
+        );
+        assert_eq!(
+            stats.fetched, remote_pkg.footer.manifest_offset,
+            "exactly the runtime prefix is re-fetched"
+        );
+    }
+
+    #[test]
     fn a_dictionary_past_the_ceiling_is_refused_before_any_fetch() {
         let src = FakeSource {
             data: Arc::new(vec![0u8; 16]),
@@ -1172,7 +1196,10 @@ mod tests {
         // The cap fires from the footer alone: no fetch happens, so the
         // 16-byte source, which cannot satisfy one, is never asked.
         let err = fetch_dict(&src, &footer).unwrap_err();
-        assert!(err.contains("dictionary"), "{err}");
+        assert!(
+            err.contains("claims a 67108865-byte dictionary"),
+            "the ceiling must refuse before any fetch, got: {err}"
+        );
 
         // A dictionary under the cap is fetched as usual.
         let mut small = footer;

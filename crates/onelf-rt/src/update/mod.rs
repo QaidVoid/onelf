@@ -254,7 +254,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
             eprintln!("onelf-rt: {why}; checking against a full download");
             return match fetch_verified(self_path, url, pubkey, None, &src) {
                 Err(code) => code,
-                Ok((staged, _)) => check_verdict(local_id.as_ref(), current_revision, &staged),
+                Ok(staged) => check_verdict(local_id.as_ref(), current_revision, &staged.path),
             };
         }
         Err(FetchError::Other(e)) => {
@@ -283,7 +283,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // would, and an update the apply would refuse is not offered.
     match fetch_verified(self_path, url, pubkey, Some(remote), &src) {
         Err(code) => code,
-        Ok((staged, _)) => check_verdict(local_id.as_ref(), current_revision, &staged),
+        Ok(staged) => check_verdict(local_id.as_ref(), current_revision, &staged.path),
     }
 }
 
@@ -298,7 +298,7 @@ fn check_verdict(local_id: Option<&[u8; 32]>, current_revision: Option<u64>, sta
         return 2;
     };
     if Some(staged_id) == local_id.copied() {
-        println!("up to date");
+        println!("up to date ({})", hex(&staged_id));
         return 0;
     }
     report_available(local_id, Some(&staged_id), current_revision, revision)
@@ -465,9 +465,19 @@ fn revision_permits(current: Option<u64>, downloaded: Option<u64>) -> Result<(),
     }
 }
 
+/// The verified update, staged beside the binary: the name it will be
+/// renamed from, the handle its bytes were written and verified through,
+/// and the (device, inode) identity pinning those bytes against a swap.
+/// Every post-verification step rides the handle, so a swapped-in name
+/// is never chmod'ed, synced, or installed by mistake.
+struct StagedUpdate {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: (u64, u64),
+}
+
 /// Download the update beside `self_path` and verify its signature,
-/// returning the staged path and the (device, inode) identity of the
-/// verified bytes, taken from the file handle verification read.
+/// returning the [`StagedUpdate`].
 /// `remote` is the probe result when the host
 /// honors range requests; without it the release downloads in full. A
 /// `None` keyring (the unsigned opt-in) skips the signature step. On
@@ -479,7 +489,7 @@ fn fetch_verified(
     pubkey: Option<&[u8]>,
     remote: Option<RemotePackage>,
     src: &dyn RangeSource,
-) -> Result<(PathBuf, (u64, u64)), i32> {
+) -> Result<StagedUpdate, i32> {
     let tmp_path = match staged_path(self_path) {
         Ok(p) => p,
         Err(e) => {
@@ -513,7 +523,7 @@ fn fetch_verified(
                     // assumption breaks the signature names it, and a full
                     // download replaces the guess with certainty.
                     Some(keys) => match verify_update_signature(&staged, url, keys) {
-                        Ok(()) => return pin_verified(&tmp_path, &staged),
+                        Ok(()) => return pin_verified(tmp_path, staged),
                         Err(e) if stats.reused > 0 => {
                             eprintln!(
                                 "onelf-rt: assembled update failed its signature check ({e}); \
@@ -527,7 +537,7 @@ fn fetch_verified(
                         }
                     },
                     // Unsigned policy: the assembled bytes install as-is.
-                    None => return pin_verified(&tmp_path, &staged),
+                    None => return pin_verified(tmp_path, staged),
                 }
             }
             Err(why) => {
@@ -550,17 +560,23 @@ fn fetch_verified(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
-    pin_verified(&tmp_path, &staged)
+    pin_verified(tmp_path, staged)
 }
 
-/// Pin the verified bytes as a (device, inode) pair taken from the file
-/// handle verification read. The pin names an inode, never a path, so
-/// the caller's last check before the install rename compares it against
-/// the path and refuses a file swapped in after verification.
-fn pin_verified(path: &Path, file: &std::fs::File) -> Result<(PathBuf, (u64, u64)), i32> {
-    match file_identity(file) {
-        Ok(identity) => Ok((path.to_path_buf(), identity)),
+/// Pin the verified bytes: the (device, inode) of the handle
+/// verification read, so the caller's last check before the install
+/// rename compares it against the path and refuses a file swapped in
+/// after verification. On failure the staged file is removed like on
+/// every other failure.
+fn pin_verified(path: PathBuf, file: std::fs::File) -> Result<StagedUpdate, i32> {
+    match file_identity(&file) {
+        Ok(identity) => Ok(StagedUpdate {
+            path,
+            file,
+            identity,
+        }),
         Err(e) => {
+            let _ = std::fs::remove_file(&path);
             eprintln!("onelf-rt: cannot pin the verified update: {e}");
             Err(2)
         }
@@ -609,19 +625,23 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 0;
     }
 
-    let (tmp_path, verified_identity) = match fetch_verified(self_path, url, pubkey, remote, &src)
-    {
-        Ok(p) => p,
+    let StagedUpdate {
+        path: tmp_path,
+        file: staged_file,
+        identity: verified_identity,
+    } = match fetch_verified(self_path, url, pubkey, remote, &src) {
+        Ok(staged) => staged,
         Err(code) => return code,
     };
 
     // The signature verified the bytes through the staged file's handle,
     // and the pin names that handle's inode, not a path: whatever sits
-    // at `tmp_path` now is unproven. The rename below installs whatever
-    // sits there when it runs, so the identity is re-checked against the
-    // path immediately before it: a local attacker with write access to
-    // this directory who swaps the verified file for their own at any
-    // point in between is refused.
+    // at `tmp_path` now is unproven. The chmod and the fsync below run
+    // through the same handle for exactly that reason, and the rename
+    // is gated by an identity re-check of the path immediately before
+    // it: a local attacker with write access to this directory who
+    // swaps the verified file for their own at any point in between is
+    // refused.
 
     // The revision is the freshness gate once the running package carries
     // one: it lives inside the package, so the signature just checked
@@ -643,12 +663,14 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 0;
     }
 
-    // Preserve executable bit. A failure here would install a binary the
-    // system cannot run, so it fails the update rather than the exec.
+    // Preserve executable bit, through the pinned handle so a swapped-in
+    // name never receives the running binary's mode. A failure here would
+    // install a binary the system cannot run, so it fails the update
+    // rather than the exec.
     let mode = std::fs::metadata(self_path)
         .map(|m| m.permissions().mode())
         .unwrap_or(0o755);
-    if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode)) {
+    if let Err(e) = rustix::fs::fchmod(&staged_file, rustix::fs::Mode::from_bits_retain(mode)) {
         eprintln!("onelf-rt: chmod failed: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return 2;
@@ -669,10 +691,11 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 2;
     }
 
-    // The staged bytes reach the disk before the rename puts them under
-    // the final name, so a power cut cannot leave a truncated binary
-    // behind it; the rename itself is made durable right after.
-    if let Err(e) = fsync_path(&tmp_path) {
+    // The staged bytes reach the disk through the pinned handle before
+    // the rename puts them under the final name, so a power cut cannot
+    // leave a truncated binary behind it; the rename itself is made
+    // durable right after.
+    if let Err(e) = staged_file.sync_all() {
         eprintln!("onelf-rt: warning: fsync of staged update failed: {e}");
     }
 
