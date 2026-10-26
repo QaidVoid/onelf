@@ -740,14 +740,17 @@ fn main() {
                      the slim runtime is already used when no update URL is set"
                 );
             }
-            let update_key = update_key.as_deref().map(|path| {
-                std::fs::read(path).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("--update-key {}: {e}", path.display()),
-                    )
+            let update_key = update_key
+                .as_deref()
+                .map(|path| {
+                    std::fs::read(path).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("--update-key {}: {e}", path.display()),
+                        )
+                    })
                 })
-            }).transpose();
+                .transpose();
             let profile = prefetch.as_deref().map(pack::read_profile).transpose();
             match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),

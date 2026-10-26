@@ -146,6 +146,11 @@ policy, and `--update-unsigned` cannot be combined with `--update-key`.
 - ✅ Publishing is one file: the binary alone, since nothing fetches a
   `.sig`. The revision gate, the rollback copy and the atomic install
   all still apply.
+- ✅ Integrity checks still compare the runtime prefix and file content
+  with the downloaded manifest. Ranged requests retain the probed size
+  and use a strong ETag when the server supplies one. A mixed or corrupt
+  assembly is retried as a full download and checked again. These checks
+  detect corruption; they do not authenticate the release server.
 - ❌ Reaching for the opt-in because managing a key seems heavy for a
   public release. A keypair is generated once, and the keyring makes
   replacing it routine; an unsigned release server, once compromised,
@@ -302,8 +307,9 @@ The update-apply flow:
    the signature does not verify, the release is downloaded in full and
    verified again: the signature stays the final word, and the copy
    optimization never overrides it. A package packed with the unsigned
-   opt-in skips this step and installs the assembled binary, after the
-   warning on stderr.
+   opt-in checks the runtime prefix and every file's content against the
+   manifest instead, after the warning on stderr. An integrity failure
+   retries a full download, which must pass the same checks.
 5. If the running binary carries a `.onelf/update-revision`, refuse
    unless the download carries one too and it is strictly newer. A
    running binary without a revision skips this step. This check sits

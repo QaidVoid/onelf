@@ -125,25 +125,24 @@ fn main() {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
             std::process::exit(2);
         };
-        let current_revision =
-            match read_package_file(&mut pkg, ".onelf/update-revision") {
-                Some(bytes) => match std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                {
-                    Some(rev) => Some(rev),
-                    None => {
-                        // Fail open only with a name: the gate silently
-                        // disabling is otherwise invisible.
-                        eprintln!(
-                            "onelf-rt: warning: .onelf/update-revision does not \
+        let current_revision = match read_package_file(&mut pkg, ".onelf/update-revision") {
+            Some(bytes) => match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                Some(rev) => Some(rev),
+                None => {
+                    // Fail open only with a name: the gate silently
+                    // disabling is otherwise invisible.
+                    eprintln!(
+                        "onelf-rt: warning: .onelf/update-revision does not \
                              parse; treating this install as revisionless"
-                        );
-                        None
-                    }
-                },
-                None => None,
-            };
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         std::process::exit(update::run(
             flag,
             &self_path,

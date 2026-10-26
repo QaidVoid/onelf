@@ -30,7 +30,7 @@ use std::path::Path;
 
 use onelf_format::payload::Codec;
 use onelf_format::reader::{block_extent, block_original_size};
-use onelf_format::{EntryKind, Flags, Footer, Manifest, FOOTER_SIZE};
+use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, Manifest};
 use stipplefs::read::{Image, Reader};
 use stipplefs::source::ByteSource;
 
@@ -167,7 +167,10 @@ fn complement(start: u64, end: u64, mut taken: Vec<Range<u64>>) -> Vec<Span> {
         }
         let s = range.start.max(at);
         if s > at {
-            spans.push(Span { start: at, len: s - at });
+            spans.push(Span {
+                start: at,
+                len: s - at,
+            });
         }
         at = at.max(range.end);
     }
@@ -252,7 +255,11 @@ fn plan_blocks(
                 // lookup above found the block.
                 let (src, _) = local_index.get(&block.content_hash).unwrap();
                 copies.push(CopyGroup {
-                    ranges: vec![CopyRange { dst, src: *src, len }],
+                    ranges: vec![CopyRange {
+                        dst,
+                        src: *src,
+                        len,
+                    }],
                     hash: block.content_hash,
                     raw: remote.footer.is_stored(),
                     // The loader's own ceiling, not the manifest's raw
@@ -301,9 +308,7 @@ impl ByteSource for FetchingSource<'_> {
             .src
             .fetch_range(offset, len)
             .map_err(|e| stipplefs::error::Error::Io(std::io::Error::other(e.to_string())))?;
-        reader
-            .read_exact(buf)
-            .map_err(stipplefs::error::Error::Io)
+        reader.read_exact(buf).map_err(stipplefs::error::Error::Io)
     }
 }
 
@@ -441,8 +446,12 @@ fn plan_stipple(
         src,
         size: remote.size,
     };
-    let image = Image::new(source, remote.footer.payload_offset, remote.footer.payload_size)
-        .map_err(|e| format!("read the release image: {e}"))?;
+    let image = Image::new(
+        source,
+        remote.footer.payload_offset,
+        remote.footer.payload_size,
+    )
+    .map_err(|e| format!("read the release image: {e}"))?;
     let remote_reader = image
         .reader()
         .map_err(|e| format!("read the release image: {e}"))?;
@@ -457,9 +466,11 @@ fn plan_stipple(
         for block in &entry.blocks {
             let ino = u32::try_from(block.compressed_size)
                 .map_err(|_| "the running package names an inode outside the image")?;
-            local_slices
-                .entry(block.content_hash)
-                .or_insert((ino, block.payload_offset, block.original_size));
+            local_slices.entry(block.content_hash).or_insert((
+                ino,
+                block.payload_offset,
+                block.original_size,
+            ));
         }
     }
 
@@ -470,8 +481,7 @@ fn plan_stipple(
             continue;
         }
         for block in &entry.blocks {
-            let len = block_original_size(block)
-                .map_err(|e| format!("release: {e}"))? as u64;
+            let len = block_original_size(block).map_err(|e| format!("release: {e}"))? as u64;
             let Some(&(ino_l, off_l, len_l)) = local_slices.get(&block.content_hash) else {
                 continue;
             };
@@ -675,10 +685,7 @@ fn write_plan(
         fetched += fetch_span(src, staged, span.start, span.len)?;
     }
     staged
-        .write_all_at(
-            &remote.footer_bytes,
-            remote.size - FOOTER_SIZE as u64,
-        )
+        .write_all_at(&remote.footer_bytes, remote.size - FOOTER_SIZE as u64)
         .map_err(|e| format!("write the staged footer: {e}"))?;
     Ok(Stats { reused, fetched })
 }
@@ -728,10 +735,7 @@ mod tests {
     impl LocalFile {
         fn open(path: &std::path::Path) -> stipplefs::error::Result<Self> {
             let file = std::fs::File::open(path).map_err(stipplefs::error::Error::Io)?;
-            let size = file
-                .metadata()
-                .map_err(stipplefs::error::Error::Io)?
-                .len();
+            let size = file.metadata().map_err(stipplefs::error::Error::Io)?.len();
             Ok(LocalFile { file, size })
         }
     }
@@ -824,7 +828,11 @@ mod tests {
 
     /// Build a blocks-mode package in the real onelf layout:
     /// `[prefix][manifest][payload][dict][footer]`.
-    fn build_blocks_package(prefix: &[u8], files: &[(&str, Vec<u8>)], dict: Option<&[u8]>) -> Vec<u8> {
+    fn build_blocks_package(
+        prefix: &[u8],
+        files: &[(&str, Vec<u8>)],
+        dict: Option<&[u8]>,
+    ) -> Vec<u8> {
         let (string_table, name_offsets) = string_table_for(files);
         let mut payload = Vec::new();
         let mut entries = Vec::new();
@@ -887,7 +895,11 @@ mod tests {
     /// Build a `STIPPLE_PAYLOAD` package the way the packer does: write
     /// the stipplefs image, then describe it with one manifest slice per
     /// 64 KiB of every file.
-    fn build_stipple_package(prefix: &[u8], files: &[(&str, Vec<u8>)], stored_only: bool) -> Vec<u8> {
+    fn build_stipple_package(
+        prefix: &[u8],
+        files: &[(&str, Vec<u8>)],
+        stored_only: bool,
+    ) -> Vec<u8> {
         use stipplefs::format::Codec;
         use stipplefs::write::{Builder, FileOrder, Node, Options, Timestamps};
 
@@ -1072,6 +1084,173 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_integrity_checks_support_blocks_dictionaries_and_stipple() {
+        let stage = Stage::new("unsigned-codecs");
+        let prefix = fake_prefix(12);
+        let files = [("app", vec![b'x'; 150_000]), ("empty", Vec::new())];
+        for package in [
+            build_blocks_package(&prefix, &files, None),
+            build_blocks_package(&prefix, &files, Some(b"shared dictionary")),
+            build_stipple_package(&prefix, &files, true),
+            build_stipple_package(&prefix, &files, false),
+        ] {
+            let path = stage.dir.join("staged");
+            std::fs::write(&path, &package).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            super::super::verify_unsigned(&file).unwrap();
+
+            // Authentic payload blocks with a false whole-entry hash
+            // must still fail the entry-level check.
+            let mut remote = probe(&FakeSource {
+                data: Arc::new(package.clone()),
+            })
+            .unwrap();
+            remote.manifest.entries[0].content_hash[0] ^= 1;
+            let payload = &package[remote.footer.payload_offset as usize
+                ..(remote.footer.payload_offset + remote.footer.payload_size) as usize];
+            let dict = if remote.footer.dict_size > 0 {
+                Some(
+                    &package[remote.footer.dict_offset as usize
+                        ..remote.footer.dict_offset as usize + remote.footer.dict_size as usize],
+                )
+            } else {
+                None
+            };
+            let bad = finish_package(
+                &prefix,
+                &remote.manifest,
+                payload,
+                dict,
+                remote.footer.flags,
+            );
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                super::super::verify_unsigned(&file)
+                    .unwrap_err()
+                    .contains("entry content hash")
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_updates_refuse_payload_bytes_from_a_later_release() {
+        let stage = Stage::new("unsigned-mixed");
+        let prefix = fake_prefix(13);
+        let local_path = stage.dir.join("local");
+        let local = build_blocks_package(
+            &prefix,
+            &[("app", vec![b'a'; 32_000]), ("stable", vec![b's'; 32_000])],
+            None,
+        );
+        let release = build_blocks_package(
+            &prefix,
+            &[("app", vec![b'b'; 32_000]), ("stable", vec![b's'; 32_000])],
+            None,
+        );
+        let remote = probe(&FakeSource {
+            data: Arc::new(release.clone()),
+        })
+        .unwrap();
+        let mut changed = release;
+        let block = &remote.manifest.entries[0].blocks[0];
+        let (offset, len) = block_extent(&remote.footer, block).unwrap();
+        let replacement = zstd::bulk::compress(&vec![b'c'; 32_000], 3).unwrap();
+        assert_eq!(replacement.len(), len);
+        changed[offset as usize..offset as usize + len].copy_from_slice(&replacement);
+        std::fs::write(&local_path, local).unwrap();
+        let path = stage.dir.join("staged");
+        let file = super::super::claim_staging(&path).unwrap();
+        let stats = assemble(
+            &local_path,
+            &remote,
+            &file,
+            &FakeSource {
+                data: Arc::new(changed),
+            },
+        )
+        .unwrap();
+        assert!(stats.reused > 0);
+        assert!(super::super::verify_unsigned(&file).is_err());
+    }
+
+    #[test]
+    fn unsigned_updates_refuse_a_changed_runtime_prefix() {
+        let stage = Stage::new("unsigned-prefix");
+        let mut package =
+            build_blocks_package(&fake_prefix(14), &[("app", vec![b'a'; 1000])], None);
+        package[100] ^= 1;
+        let path = stage.dir.join("staged");
+        std::fs::write(&path, package).unwrap();
+        assert!(
+            super::super::verify_unsigned(&std::fs::File::open(path).unwrap())
+                .unwrap_err()
+                .contains("runtime prefix hash mismatch")
+        );
+    }
+
+    #[test]
+    fn identical_full_download_leaves_the_executable_and_rollback_untouched() {
+        let stage = Stage::new("identical-install");
+        let package = build_blocks_package(&fake_prefix(15), &[("app", vec![b'a'; 1000])], None);
+        let installed = stage.dir.join("app");
+        let prev = super::super::sibling_path(&installed, ".onelf-prev");
+        let tmp = stage.dir.join("download");
+        std::fs::write(&installed, &package).unwrap();
+        std::fs::write(&prev, b"previous release").unwrap();
+        std::fs::write(&tmp, &package).unwrap();
+        let identity =
+            super::super::file_identity(&std::fs::File::open(&installed).unwrap()).unwrap();
+        let file = std::fs::File::open(&tmp).unwrap();
+        let staged = super::super::pin_verified(tmp.clone(), file).unwrap();
+        let local_id = super::super::local_package_id(&installed).unwrap();
+        assert_eq!(
+            super::super::install_staged(&installed, Some(&local_id), None, staged),
+            0
+        );
+        assert_eq!(std::fs::read(&installed).unwrap(), package);
+        assert_eq!(std::fs::read(&prev).unwrap(), b"previous release");
+        assert_eq!(
+            super::super::file_identity(&std::fs::File::open(installed).unwrap()).unwrap(),
+            identity
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_symlink_to_the_verified_inode_is_not_installed() {
+        let stage = Stage::new("symlink-install");
+        let package = build_blocks_package(&fake_prefix(16), &[("app", vec![b'a'; 1000])], None);
+        let installed = stage.dir.join("app");
+        let tmp = stage.dir.join("download");
+        let moved = stage.dir.join("moved");
+        std::fs::write(&installed, b"running binary").unwrap();
+        std::fs::write(&tmp, package).unwrap();
+        let file = std::fs::File::open(&tmp).unwrap();
+        let staged = super::super::pin_verified(tmp.clone(), file).unwrap();
+        std::fs::rename(&tmp, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &tmp).unwrap();
+        assert_eq!(
+            super::super::install_staged(&installed, None, None, staged),
+            2
+        );
+        assert_eq!(std::fs::read(installed).unwrap(), b"running binary");
+    }
+
+    #[test]
+    fn staged_metadata_comes_from_the_verified_handle_after_a_path_swap() {
+        let stage = Stage::new("metadata-swap");
+        let package = build_blocks_package(&fake_prefix(17), &[("app", vec![b'a'; 1000])], None);
+        let tmp = stage.dir.join("download");
+        std::fs::write(&tmp, package).unwrap();
+        let file = std::fs::File::open(&tmp).unwrap();
+        let expected = super::super::staged_info(&file);
+        assert!(expected.1.is_some());
+        std::fs::remove_file(&tmp).unwrap();
+        std::fs::write(&tmp, b"unverified replacement").unwrap();
+        assert_eq!(super::super::staged_info(&file), expected);
+    }
+
+    #[test]
     fn identical_blocks_packages_fetch_nothing() {
         let stage = Stage::new("identical");
         let prefix = fake_prefix(1);
@@ -1095,7 +1274,11 @@ mod tests {
         let prefix = fake_prefix(2);
         let mut app = vec![b'a'; 200_000];
         let libs = (0..100_000u32).map(|i| i as u8).collect::<Vec<u8>>();
-        let local = build_blocks_package(&prefix, &[("bin/app", app.clone()), ("lib/x.so", libs.clone())], None);
+        let local = build_blocks_package(
+            &prefix,
+            &[("bin/app", app.clone()), ("lib/x.so", libs.clone())],
+            None,
+        );
 
         app[100_000] = b'z';
         let remote = build_blocks_package(&prefix, &[("bin/app", app), ("lib/x.so", libs)], None);
@@ -1244,7 +1427,10 @@ mod tests {
         let stable: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
         let local = build_stipple_package(
             &prefix,
-            &[("bin/app", stable.clone()), ("share/data", vec![1u8; 50_000])],
+            &[
+                ("bin/app", stable.clone()),
+                ("share/data", vec![1u8; 50_000]),
+            ],
             true,
         );
         let remote = build_stipple_package(
@@ -1270,12 +1456,18 @@ mod tests {
         let prefix = fake_prefix(7);
         let local = build_stipple_package(
             &prefix,
-            &[("bin/app", (0..300_000u32).map(|i| (i * 3 % 251) as u8).collect())],
+            &[(
+                "bin/app",
+                (0..300_000u32).map(|i| (i * 3 % 251) as u8).collect(),
+            )],
             false,
         );
         let remote = build_stipple_package(
             &prefix,
-            &[("bin/app", (0..300_000u32).map(|i| (i * 5 % 251) as u8).collect())],
+            &[(
+                "bin/app",
+                (0..300_000u32).map(|i| (i * 5 % 251) as u8).collect(),
+            )],
             false,
         );
 
@@ -1289,21 +1481,24 @@ mod tests {
     #[test]
     fn a_stipple_prefix_change_fetches_only_the_prefix() {
         let stage = Stage::new("stipple-prefix");
-        let refs: Vec<(&str, Vec<u8>)> =
-            vec![("bin/app", (0..100_000u32).map(|i| (i * 11 % 251) as u8).collect())];
+        let refs: Vec<(&str, Vec<u8>)> = vec![(
+            "bin/app",
+            (0..100_000u32).map(|i| (i * 11 % 251) as u8).collect(),
+        )];
         let local = build_stipple_package(&fake_prefix(8), &refs, true);
         let remote = build_stipple_package(&fake_prefix(9), &refs, true);
 
         let (out, stats, remote_pkg) = stage.run(&local, &remote).expect("assemble");
         assert_eq!(out, remote);
-        assert_eq!(
-            stats.reused, 2,
-            "both slices copy from the running binary"
-        );
+        assert_eq!(stats.reused, 2, "both slices copy from the running binary");
         // The prefix is fetched, and so is the image's own bookkeeping:
         // superblock and metadata sections sit outside the onelf manifest,
         // so no slice can describe them. They are small and fixed-size.
-        assert!(stats.fetched > 4096, "the prefix alone is {}", stats.fetched);
+        assert!(
+            stats.fetched > 4096,
+            "the prefix alone is {}",
+            stats.fetched
+        );
         assert!(
             stats.fetched < remote_pkg.footer.payload_size,
             "fetched {} of {} payload bytes: content is still copied",

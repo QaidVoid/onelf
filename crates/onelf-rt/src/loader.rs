@@ -25,7 +25,11 @@ pub fn load() -> io::Result<PackageData> {
 
 /// The package at `path`, which is how a pinned GL build is opened.
 pub fn load_from(path: &Path) -> io::Result<PackageData> {
-    let mut file = File::open(path)?;
+    load_file(File::open(path)?)
+}
+
+/// Load through an already opened handle, preserving the caller's inode pin.
+pub(crate) fn load_file(mut file: File) -> io::Result<PackageData> {
     let file_size = file.metadata()?.len();
 
     if file_size < FOOTER_SIZE as u64 {
@@ -169,7 +173,12 @@ fn read_block(
 /// every later offset shifted. Shared with the delta updater, which
 /// verifies a block it copied from the running binary by decoding it and
 /// hashing the content.
-pub(crate) fn decode_block(buf: &[u8], original: usize, dict: Option<&[u8]>) -> io::Result<Vec<u8>> {    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+pub(crate) fn decode_block(
+    buf: &[u8],
+    original: usize,
+    dict: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
     let data = match dict {
         Some(d) => {
             let decoder = zstd::Decoder::with_dictionary(Cursor::new(buf), d)?;

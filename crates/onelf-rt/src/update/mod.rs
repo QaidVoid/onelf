@@ -9,7 +9,8 @@
 //! assembled bytes verifies. No control file is published or fetched.
 //!
 //! A package packed with the unsigned opt-in (`.onelf/update-unsigned`,
-//! see [`policy`]) carries no signing key and verifies nothing: every
+//! see [`policy`]) carries no signing key and verifies content integrity
+//! against the downloaded manifest, but not its authenticity: every
 //! update step announces on stderr that the release server is trusted in
 //! full. Signing stays the default and a keyed package never skips
 //! verification, whichever markers it carries.
@@ -254,7 +255,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
             eprintln!("onelf-rt: {why}; checking against a full download");
             return match fetch_verified(self_path, url, pubkey, None, &src) {
                 Err(code) => code,
-                Ok(staged) => check_verdict(local_id.as_ref(), current_revision, &staged.path),
+                Ok(staged) => check_verdict(local_id.as_ref(), current_revision, staged),
             };
         }
         Err(FetchError::Other(e)) => {
@@ -283,16 +284,20 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // would, and an update the apply would refuse is not offered.
     match fetch_verified(self_path, url, pubkey, Some(remote), &src) {
         Err(code) => code,
-        Ok(staged) => check_verdict(local_id.as_ref(), current_revision, &staged.path),
+        Ok(staged) => check_verdict(local_id.as_ref(), current_revision, staged),
     }
 }
 
 /// The verdict `check` reports once the signed bytes settled freshness
 /// and revision. A staged file the loader cannot read is the same error
 /// `apply` refuses with, never an offered update.
-fn check_verdict(local_id: Option<&[u8; 32]>, current_revision: Option<u64>, staged: &Path) -> i32 {
-    let (revision, id) = staged_info(staged);
-    let _ = std::fs::remove_file(staged);
+fn check_verdict(
+    local_id: Option<&[u8; 32]>,
+    current_revision: Option<u64>,
+    staged: StagedUpdate,
+) -> i32 {
+    let (revision, id) = staged_info(&staged.file);
+    let _ = std::fs::remove_file(&staged.path);
     let Some(staged_id) = id else {
         eprintln!("onelf-rt: the downloaded update is not a readable onelf package");
         return 2;
@@ -424,19 +429,55 @@ fn save_rollback(self_path: &Path, prev_path: &Path) -> io::Result<()> {
 
 /// The `.onelf/update-revision` entry and package id of a packaged
 /// binary, read from its own bytes.
-fn staged_info(path: &Path) -> (Option<u64>, Option<[u8; 32]>) {
-    let mut pkg = match crate::loader::load_from(path) {
+fn staged_info(file: &std::fs::File) -> (Option<u64>, Option<[u8; 32]>) {
+    let mut pkg = match file.try_clone().and_then(crate::loader::load_file) {
         Ok(p) => p,
         Err(_) => return (None, None),
     };
     let id = pkg.manifest.header.package_id;
-    let revision = crate::read_package_file(&mut pkg, ".onelf/update-revision")
-        .and_then(|bytes| {
-            std::str::from_utf8(&bytes)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-        });
+    let revision = crate::read_package_file(&mut pkg, ".onelf/update-revision").and_then(|bytes| {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    });
     (revision, Some(id))
+}
+
+/// Check unsigned content against its own manifest through the staging
+/// handle. This detects mixed releases and transfer corruption, including
+/// the executable prefix; it does not authenticate the publisher. Hash
+/// entries block by block so verification never buffers an entire file.
+fn verify_unsigned(staged: &std::fs::File) -> Result<(), String> {
+    let pkg = staged
+        .try_clone()
+        .and_then(crate::loader::load_file)
+        .map_err(|e| format!("read unsigned package: {e}"))?;
+    if pkg.manifest.header.version >= 3 {
+        let mut prefix = staged.try_clone().map_err(|e| e.to_string())?;
+        prefix.rewind().map_err(|e| e.to_string())?;
+        let mut hasher = blake3::Hasher::new();
+        io::copy(&mut prefix.take(pkg.footer.manifest_offset), &mut hasher)
+            .map_err(|e| format!("hash runtime prefix: {e}"))?;
+        if hasher.finalize().as_bytes() != &pkg.manifest.header.prefix_hash {
+            return Err("unsigned runtime prefix hash mismatch".into());
+        }
+    }
+    for entry in &pkg.manifest.entries {
+        if entry.kind != onelf_format::EntryKind::File {
+            continue;
+        }
+        let mut hasher = blake3::Hasher::new();
+        for block in &entry.blocks {
+            let bytes =
+                crate::loader::read_payload_entry(&pkg.file, &pkg.footer, block, &pkg.codec)
+                    .map_err(|e| format!("read unsigned payload: {e}"))?;
+            hasher.update(&bytes);
+        }
+        if hasher.finalize().as_bytes() != &entry.content_hash {
+            return Err("unsigned entry content hash mismatch".into());
+        }
+    }
+    Ok(())
 }
 
 /// Pure freshness decision: a signed package may only replace a running
@@ -536,8 +577,13 @@ fn fetch_verified(
                             return Err(2);
                         }
                     },
-                    // Unsigned policy: the assembled bytes install as-is.
-                    None => return pin_verified(tmp_path, staged),
+                    None => match verify_unsigned(&staged) {
+                        Ok(()) => return pin_verified(tmp_path, staged),
+                        Err(e) => eprintln!(
+                            "onelf-rt: assembled update failed its integrity check ({e}); \
+                             retrying with a full download"
+                        ),
+                    },
                 }
             }
             Err(why) => {
@@ -553,10 +599,12 @@ fn fetch_verified(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
-    if let Some(keys) = pubkey
-        && let Err(e) = verify_update_signature(&staged, url, keys)
-    {
-        eprintln!("onelf-rt: update signature check failed: {e}");
+    let verified = match pubkey {
+        Some(keys) => verify_update_signature(&staged, url, keys),
+        None => verify_unsigned(&staged),
+    };
+    if let Err(e) = verified {
+        eprintln!("onelf-rt: update verification failed: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
@@ -598,7 +646,10 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     let _install_lock = match InstallLock::acquire(self_path) {
         Ok(lock) => lock,
         Err(e) => {
-            eprintln!("onelf-rt: cannot lock {} for updating: {e}", self_path.display());
+            eprintln!(
+                "onelf-rt: cannot lock {} for updating: {e}",
+                self_path.display()
+            );
             return 2;
         }
     };
@@ -625,14 +676,26 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 0;
     }
 
+    let staged = match fetch_verified(self_path, url, pubkey, remote, &src) {
+        Ok(staged) => staged,
+        Err(code) => return code,
+    };
+    install_staged(self_path, local_id.as_ref(), current_revision, staged)
+}
+
+/// Apply freshness and revision gates before creating a rollback copy or
+/// replacing the executable. The caller holds the install lock.
+fn install_staged(
+    self_path: &Path,
+    local_id: Option<&[u8; 32]>,
+    current_revision: Option<u64>,
+    staged: StagedUpdate,
+) -> i32 {
     let StagedUpdate {
         path: tmp_path,
         file: staged_file,
         identity: verified_identity,
-    } = match fetch_verified(self_path, url, pubkey, remote, &src) {
-        Ok(staged) => staged,
-        Err(code) => return code,
-    };
+    } = staged;
 
     // The signature verified the bytes through the staged file's handle,
     // and the pin names that handle's inode, not a path: whatever sits
@@ -648,7 +711,7 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // covers it under the signed policy, and a rolled-back build cannot
     // talk a client into installing itself again. The package-id
     // freshness check stands in for a running package without one.
-    let (downloaded_revision, downloaded_id) = staged_info(&tmp_path);
+    let (downloaded_revision, downloaded_id) = staged_info(&staged_file);
     let Some(downloaded_id) = downloaded_id else {
         eprintln!(
             "onelf-rt: the downloaded update is not a readable onelf package; \
@@ -657,6 +720,11 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         let _ = std::fs::remove_file(&tmp_path);
         return 2;
     };
+    if Some(&downloaded_id) == local_id {
+        println!("already up to date ({})", hex(&downloaded_id));
+        let _ = std::fs::remove_file(&tmp_path);
+        return 0;
+    }
     if let Err(why) = revision_permits(current_revision, downloaded_revision) {
         println!("no update offered: {why}");
         let _ = std::fs::remove_file(&tmp_path);
@@ -701,7 +769,7 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
 
     // Atomic replace. The identity re-check must be the last thing before
     // the rename.
-    match std::fs::metadata(&tmp_path) {
+    match std::fs::symlink_metadata(&tmp_path) {
         Ok(m) if (m.dev(), m.ino()) == verified_identity => {}
         _ => {
             eprintln!(
@@ -733,7 +801,7 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
 
     println!(
         "updated: {} -> {}",
-        id_or_dash(local_id.as_ref()),
+        id_or_dash(local_id),
         id_or_dash(Some(&downloaded_id))
     );
     0
@@ -820,7 +888,7 @@ pub fn self_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod staging_tests {
-    use super::{claim_staging, fsync_path, save_rollback, staged_path, InstallLock};
+    use super::{InstallLock, claim_staging, fsync_path, save_rollback, staged_path};
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1078,13 +1146,19 @@ mod tests {
             report_available(Some(&running), Some(&release), Some(7), Some(7)),
             0
         );
-        assert_eq!(report_available(Some(&running), Some(&release), Some(7), None), 0);
+        assert_eq!(
+            report_available(Some(&running), Some(&release), Some(7), None),
+            0
+        );
         // A genuinely newer release is offered with exit 1.
         assert_eq!(
             report_available(Some(&running), Some(&release), Some(7), Some(8)),
             1
         );
         // Without a running revision the id comparison stands in.
-        assert_eq!(report_available(Some(&running), Some(&release), None, Some(8)), 1);
+        assert_eq!(
+            report_available(Some(&running), Some(&release), None, Some(8)),
+            1
+        );
     }
 }

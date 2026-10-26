@@ -10,10 +10,11 @@
 
 use std::fmt;
 use std::io::{self, Read};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use onelf_format::reader::validate_footer;
-use onelf_format::{Footer, Manifest, FOOTER_SIZE};
+use onelf_format::{FOOTER_SIZE, Footer, Manifest};
 
 use super::streaming_agent;
 
@@ -56,6 +57,14 @@ pub(super) struct HttpsRangeSource {
     url: String,
     agent: ureq::Agent,
     ranges: AtomicBool,
+    release: OnceLock<ReleaseIdentity>,
+}
+
+/// The representation selected by the size probe. Weak ETags cannot be
+/// used with If-Range because they do not guarantee byte-for-byte equality.
+struct ReleaseIdentity {
+    size: u64,
+    etag: Option<String>,
 }
 
 impl HttpsRangeSource {
@@ -67,12 +76,28 @@ impl HttpsRangeSource {
             // budget rather than a total for the transfer.
             agent: streaming_agent(10),
             ranges: AtomicBool::new(true),
+            release: OnceLock::new(),
         }
+    }
+
+    fn remember(&self, size: u64, headers: &ureq::http::HeaderMap) -> u64 {
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| v.starts_with('"') && v.ends_with('"'))
+            .map(str::to_owned);
+        self.release
+            .get_or_init(|| ReleaseIdentity { size, etag })
+            .size
     }
 }
 
 impl RangeSource for HttpsRangeSource {
     fn size(&self) -> Result<u64, FetchError> {
+        if let Some(release) = self.release.get() {
+            return Ok(release.size);
+        }
         // HEAD first, and only a success response's Content-Length is
         // the release size: ureq hands back error responses as `Ok`, and
         // a 404 page's length would poison every later offset. Hosts
@@ -83,7 +108,7 @@ impl RangeSource for HttpsRangeSource {
             && response.status().is_success()
             && let Some(len) = content_length(response.headers())
         {
-            return Ok(len);
+            return Ok(self.remember(len, response.headers()));
         }
         let response = self
             .agent
@@ -110,16 +135,25 @@ impl RangeSource for HttpsRangeSource {
                         self.url
                     )));
                 }
-                content_range_total(response.headers()).ok_or_else(|| {
+                let size = content_range_total(response.headers()).ok_or_else(|| {
                     FetchError::Other(format!(
                         "{}: 206 without a parseable Content-Range total",
                         self.url
                     ))
-                })
+                })?;
+                if size == 0 {
+                    return Err(FetchError::Other(
+                        "empty release in a 206 size probe".into(),
+                    ));
+                }
+                Ok(self.remember(size, response.headers()))
             }
-            200 => content_length(response.headers()).ok_or_else(|| {
-                FetchError::Other(format!("{}: no Content-Length", self.url))
-            }),
+            200 => {
+                self.ranges.store(false, Ordering::Relaxed);
+                let size = content_length(response.headers())
+                    .ok_or_else(|| FetchError::Other(format!("{}: no Content-Length", self.url)))?;
+                Ok(self.remember(size, response.headers()))
+            }
             status => Err(FetchError::Other(format!(
                 "{}: HTTP {status} probing the release size",
                 self.url
@@ -139,10 +173,15 @@ impl RangeSource for HttpsRangeSource {
         let end = start.checked_add(len - 1).ok_or_else(|| {
             FetchError::Other(format!("range {start}+{len} overflows the file size"))
         })?;
-        let response = self
+        let size = self.size()?;
+        let mut request = self
             .agent
             .get(&self.url)
-            .header("Range", format!("bytes={start}-{end}"))
+            .header("Range", format!("bytes={start}-{end}"));
+        if let Some(etag) = self.release.get().and_then(|r| r.etag.as_deref()) {
+            request = request.header("If-Range", etag);
+        }
+        let response = request
             .call()
             .map_err(|e| FetchError::Other(format!("range {start}-{end}: {e}")))?;
         let status = response.status().as_u16();
@@ -153,7 +192,7 @@ impl RangeSource for HttpsRangeSource {
         // The verdict runs before any body byte is read: a 200 here must
         // poison range use before the body can be misread, and a 206 that
         // does not name exactly the requested span must never be trusted.
-        match range_verdict(status, content_range, start, end) {
+        match range_verdict(status, content_range, start, end, size) {
             Ok(true) => {
                 // The body is capped at the requested length: a buggy
                 // server sending more must not shift anything downstream.
@@ -178,13 +217,13 @@ impl RangeSource for HttpsRangeSource {
 ///
 /// A 206 that does not name exactly the requested span is refused rather
 /// than trusted: its bytes would land at offsets they do not belong to,
-/// and only the manifest checksums or the signature would notice, never
-/// the unsigned policy.
+/// and a changed total indicates the release changed after the probe.
 fn range_verdict(
     status: u16,
     content_range: Option<&str>,
     start: u64,
     end: u64,
+    expected_total: u64,
 ) -> Result<bool, String> {
     match status {
         206 => {
@@ -194,9 +233,17 @@ fn range_verdict(
                 ));
             };
             let header = header.trim();
-            if !header.starts_with(&format!("bytes {start}-{end}/")) {
+            let Some(total) = header.strip_prefix(&format!("bytes {start}-{end}/")) else {
                 return Err(format!(
                     "a 206 for bytes {start}-{end} claims Content-Range {header:?}"
+                ));
+            };
+            if end >= expected_total
+                || (total != "*" && total.parse::<u64>().ok() != Some(expected_total))
+            {
+                return Err(format!(
+                    "the release changed size or has an invalid Content-Range {header:?} \
+                     (expected {expected_total} bytes)"
                 ));
             }
             Ok(true)
@@ -262,9 +309,12 @@ pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> 
         )));
     }
     let read = |start: u64, len: u64| -> Result<Vec<u8>, FetchError> {
-        let mut buf = vec![0u8; usize::try_from(len).map_err(|_| {
-            FetchError::Other(format!("a {len}-byte range does not fit in memory"))
-        })?];
+        let mut buf = vec![
+            0u8;
+            usize::try_from(len).map_err(|_| {
+                FetchError::Other(format!("a {len}-byte range does not fit in memory"))
+            })?
+        ];
         src.fetch_range(start, len)?
             .read_exact(&mut buf)
             .map_err(|e| FetchError::Other(format!("read {len} bytes at {start}: {e}")))?;
@@ -276,8 +326,7 @@ pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> 
         .expect("the footer read is FOOTER_SIZE bytes");
     let footer = Footer::from_bytes(&footer_bytes)
         .map_err(|e| FetchError::Other(format!("remote footer: {e}")))?;
-    validate_footer(&footer, size)
-        .map_err(|e| FetchError::Other(format!("remote footer: {e}")))?;
+    validate_footer(&footer, size).map_err(|e| FetchError::Other(format!("remote footer: {e}")))?;
 
     // The manifest read is sized by the footer the server itself served,
     // so a hostile host can name a huge region and make this process
@@ -292,12 +341,15 @@ pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> 
         )));
     }
     let manifest_bytes = read(footer.manifest_offset, footer.manifest_compressed)?;
-    let manifest_raw = zstd::bulk::decompress(&manifest_bytes, footer.manifest_original as usize)
-        .map_err(|e| FetchError::Other(format!("remote manifest decompression: {e}")))?;
+    let manifest_raw =
+        zstd::bulk::decompress(&manifest_bytes, footer.manifest_original as usize)
+            .map_err(|e| FetchError::Other(format!("remote manifest decompression: {e}")))?;
     let checksum = onelf_format::manifest::manifest_checksum(&manifest_raw)
         .map_err(|e| FetchError::Other(format!("remote manifest: {e}")))?;
     if checksum != footer.manifest_checksum {
-        return Err(FetchError::Other("remote manifest checksum mismatch".into()));
+        return Err(FetchError::Other(
+            "remote manifest checksum mismatch".into(),
+        ));
     }
     let manifest = Manifest::deserialize(&manifest_raw)
         .map_err(|e| FetchError::Other(format!("remote manifest: {e}")))?;
@@ -379,20 +431,109 @@ mod tests {
         use super::range_verdict;
 
         // A 206 naming exactly the requested span is readable.
-        assert!(range_verdict(206, Some("bytes 100-199/12345"), 100, 199).unwrap());
-        assert!(range_verdict(206, Some("bytes 100-199/*"), 100, 199).unwrap());
+        assert!(range_verdict(206, Some("bytes 100-199/12345"), 100, 199, 12345).unwrap());
+        assert!(range_verdict(206, Some("bytes 100-199/*"), 100, 199, 12345).unwrap());
         // A different span, a missing header, or multipart nonsense is
         // refused: its bytes would land at offsets they do not belong to.
-        assert!(range_verdict(206, Some("bytes 0-99/12345"), 100, 199).is_err());
-        assert!(range_verdict(206, Some("bytes 100-198/12345"), 100, 199).is_err());
-        assert!(range_verdict(206, None, 100, 199).is_err());
-        assert!(range_verdict(206, Some("bytes 100-199, 300-399/12345"), 100, 199).is_err());
+        assert!(range_verdict(206, Some("bytes 0-99/12345"), 100, 199, 12345).is_err());
+        assert!(range_verdict(206, Some("bytes 100-198/12345"), 100, 199, 12345).is_err());
+        assert!(range_verdict(206, None, 100, 199, 12345).is_err());
+        assert!(range_verdict(206, Some("bytes 100-199, 300-399/12345"), 100, 199, 12345).is_err());
         // A plain 200 means no range support, whatever headers say.
-        assert!(!range_verdict(200, Some("bytes 100-199/12345"), 100, 199).unwrap());
-        assert!(!range_verdict(200, None, 100, 199).unwrap());
+        assert!(!range_verdict(200, Some("bytes 100-199/12345"), 100, 199, 12345).unwrap());
+        assert!(!range_verdict(200, None, 100, 199, 12345).unwrap());
         // Anything else is a transport failure.
-        assert!(range_verdict(404, None, 100, 199).is_err());
-        assert!(range_verdict(500, None, 100, 199).is_err());
+        assert!(range_verdict(404, None, 100, 199, 12345).is_err());
+        assert!(range_verdict(500, None, 100, 199, 12345).is_err());
+    }
+
+    #[test]
+    fn ranges_refuse_changed_or_malformed_totals() {
+        for header in [
+            "bytes 100-199/12346",
+            "bytes 100-199/",
+            "bytes 100-199/nonsense",
+            "bytes 100-199/12345/extra",
+        ] {
+            assert!(range_verdict(206, Some(header), 100, 199, 12345).is_err());
+        }
+        assert!(range_verdict(206, Some("bytes 100-199/*"), 100, 199, 150).is_err());
+    }
+
+    /// Exercise request headers and the 200 fallback over a loopback
+    /// server. Only this test's client permits HTTP; production remains
+    /// HTTPS-only with the same range handling.
+    #[test]
+    fn ranged_requests_use_the_probed_etag_and_fall_back_when_it_changes() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/release", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nETag: \"release-a\"\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/100\r\nConnection: close\r\n\r\nab",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap().to_ascii_lowercase());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        let src = HttpsRangeSource {
+            url,
+            agent: ureq::Agent::config_builder()
+                .proxy(None)
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .build()
+                .new_agent(),
+            ranges: AtomicBool::new(true),
+            release: OnceLock::new(),
+        };
+        assert_eq!(src.size().unwrap(), 100);
+        assert_eq!(src.size().unwrap(), 100, "the size probe must be cached");
+        let mut bytes = Vec::new();
+        src.fetch_range(1, 2)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"ab");
+        assert!(matches!(
+            src.fetch_range(3, 2),
+            Err(FetchError::NoRanges(_))
+        ));
+        assert!(matches!(
+            src.fetch_range(5, 2),
+            Err(FetchError::NoRanges(_))
+        ));
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("head "));
+        for request in &requests[1..] {
+            assert!(request.contains("if-range: \"release-a\"\r\n"));
+        }
+        assert!(requests[1].contains("range: bytes=1-2\r\n"));
+        assert!(requests[2].contains("range: bytes=3-4\r\n"));
+    }
+
+    #[test]
+    fn weak_etags_are_not_used_as_byte_identity() {
+        let src = HttpsRangeSource::new("https://example.com/release".into());
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.insert("etag", "W/\"release\"".parse().unwrap());
+        src.remember(100, &headers);
+        assert!(src.release.get().unwrap().etag.is_none());
     }
 
     #[test]
@@ -429,7 +570,7 @@ mod tests {
 
     #[test]
     fn probe_refuses_a_manifest_read_past_its_ceiling_before_any_read() {
-        use onelf_format::footer::{Flags, FORMAT_VERSION};
+        use onelf_format::footer::{FORMAT_VERSION, Flags};
 
         // A release whose size and footer agree on a manifest far past
         // the probe's read ceiling. The source serves only the footer;
