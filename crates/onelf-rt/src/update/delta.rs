@@ -40,8 +40,12 @@ use super::range::{RangeSource, RemotePackage};
 pub(super) struct Stats {
     /// Copy groups taken from the running binary.
     pub reused: usize,
-    /// Bytes fetched from the release. The manifest, dictionary and
-    /// footer are not counted: they are small and always fetched.
+    /// What a copy group is: a block, or a stipplefs slice.
+    pub unit: &'static str,
+    /// Bytes fetched while assembling: the prefix when it is not copied,
+    /// every changed span, and each copy that failed its hash and was
+    /// fetched instead. The footer, manifest, dictionary and stipplefs
+    /// metadata are fetched before assembly and not counted.
     pub fetched: u64,
 }
 
@@ -62,13 +66,23 @@ pub(super) fn assemble(
     if local.footer.is_stipple() != remote.footer.is_stipple() {
         return Err("the update changes the payload kind".into());
     }
-    let plan = if remote.footer.is_stipple() {
+    let mut plan = if remote.footer.is_stipple() {
         plan_stipple(&local, remote, src)?
     } else {
         plan_blocks(&local, remote, src)?
     };
+    coalesce(&mut plan);
     let dict = plan.dict.as_deref();
-    write_plan(staged, &local.file, remote, &plan, dict, src)
+    let (reused, fetched) = write_plan(staged, &local.file, remote, &plan, dict, src)?;
+    Ok(Stats {
+        reused,
+        unit: if remote.footer.is_stipple() {
+            "slices"
+        } else {
+            "blocks"
+        },
+        fetched,
+    })
 }
 
 /// One contiguous byte run copied from the running binary into the staged
@@ -109,6 +123,11 @@ struct Plan {
     dict: Option<Vec<u8>>,
     copies: Vec<CopyGroup>,
     fetch: Vec<Span>,
+    /// Stored stipplefs blocks, as absolute start and stored length. Each
+    /// is followed by an 8-byte digest of its bytes, computed from the
+    /// staged file once every byte is in place rather than fetched: a
+    /// request per block would cost more than all the content.
+    digests: Vec<(u64, u64)>,
 }
 
 enum Prefix {
@@ -195,6 +214,40 @@ fn extend_fetch(spans: &mut Vec<Span>, start: u64, len: u64) {
     spans.push(Span { start, len });
 }
 
+/// Largest run of reusable bytes worth downloading to save a request.
+/// Fetching 128 KiB costs less than a round trip on most links, and a
+/// redirecting host such as GitHub spends two round trips per request.
+const FETCH_GAP_MAX: u64 = 128 * 1024;
+
+/// Merge fetch spans separated by at most [`FETCH_GAP_MAX`] bytes, and
+/// drop the copy groups a merged span now downloads anyway.
+fn coalesce(plan: &mut Plan) {
+    plan.fetch.sort_by_key(|s| s.start);
+    let mut merged: Vec<Span> = Vec::with_capacity(plan.fetch.len());
+    for span in plan.fetch.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.start + last.len;
+            if span.start <= last_end.saturating_add(FETCH_GAP_MAX) {
+                last.len = last_end.max(span.start + span.len) - last.start;
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    plan.fetch = merged;
+
+    let fetch = &plan.fetch;
+    let fetched = |range: &CopyRange| {
+        let i = fetch.partition_point(|s| s.start <= range.dst);
+        i > 0 && {
+            let s = &fetch[i - 1];
+            range.dst + range.len <= s.start + s.len
+        }
+    };
+    plan.copies
+        .retain(|group| !group.ranges.iter().all(fetched));
+}
+
 // ---------------------------------------------------------------------------
 // Blocks payloads
 // ---------------------------------------------------------------------------
@@ -214,6 +267,12 @@ fn plan_blocks(
         (Some(a), Some(b)) => a == b.as_slice(),
         _ => false,
     };
+    if !dicts_equal {
+        eprintln!(
+            "onelf-rt: the release compresses against a different dictionary, so no \
+             block can be copied from the running binary; fetching every block"
+        );
+    }
     let stored_equal = local.footer.is_stored() == remote.footer.is_stored();
 
     // Local block index: content hash to the block's absolute range.
@@ -279,6 +338,7 @@ fn plan_blocks(
         dict: remote_dict,
         copies,
         fetch,
+        digests: Vec::new(),
     };
     Ok(plan)
 }
@@ -476,6 +536,10 @@ fn plan_stipple(
 
     let mut copies = Vec::new();
     let mut taken = Vec::new();
+    // A slice is planned once however often the manifest lists it, so a
+    // crafted manifest cannot multiply the copying and hashing done before
+    // verification.
+    let mut seen = HashSet::new();
     for entry in &remote.manifest.entries {
         if entry.kind != EntryKind::File {
             continue;
@@ -490,6 +554,9 @@ fn plan_stipple(
             }
             let ino_r = u32::try_from(block.compressed_size)
                 .map_err(|_| "the release names an inode outside the image")?;
+            if !seen.insert((ino_r, block.payload_offset)) {
+                continue;
+            }
             let dst = slice_stored_ranges(
                 &remote_reader,
                 remote.footer.payload_offset,
@@ -518,6 +585,26 @@ fn plan_stipple(
             });
         }
     }
+    let mut digests = Vec::new();
+    let block_size = u64::from(remote_reader.superblock().block_size);
+    let payload_end = remote.footer.payload_offset + remote.footer.payload_size;
+    let blocks = remote_reader.blocks();
+    for i in 0..blocks.count() {
+        let entry = blocks
+            .get(i)
+            .ok_or_else(|| format!("the release: block {i} is outside the block index"))?;
+        let len = u64::from(entry.stored_length);
+        let start = remote.footer.payload_offset.checked_add(entry.image_offset);
+        let end = start.and_then(|s| s.checked_add(len));
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(format!("the release: block {i} overflows its image"));
+        };
+        if len > block_size || end.saturating_add(8) > payload_end {
+            return Err(format!("the release: block {i} does not fit its image"));
+        }
+        taken.push(end..end + 8);
+        digests.push((start, len));
+    }
     let fetch = complement(
         remote.footer.payload_offset,
         remote.footer.payload_offset + remote.footer.payload_size,
@@ -529,6 +616,7 @@ fn plan_stipple(
         dict: None,
         copies,
         fetch,
+        digests,
     };
     Ok(plan)
 }
@@ -546,9 +634,10 @@ fn copy_run(
     src: u64,
     dst: u64,
     len: u64,
+    buf: &mut Vec<u8>,
 ) -> Result<[u8; 32], String> {
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1024 * 1024];
+    buf.resize(1024 * 1024, 0);
     let mut done = 0;
     while done < len {
         let n = (len - done).min(buf.len() as u64) as usize;
@@ -591,7 +680,8 @@ fn fetch_span(
 
 /// Copy one group, hashing what was copied. A hash mismatch degrades the
 /// group to fetches, so encoder drift never fails an update outright;
-/// the signature stays the final word on the assembled bytes.
+/// the signature stays the final word on the assembled bytes. `bytes` is
+/// scratch space reused across groups.
 fn write_group(
     staged: &std::fs::File,
     local_file: &std::fs::File,
@@ -599,12 +689,13 @@ fn write_group(
     dict: Option<&[u8]>,
     src: &dyn RangeSource,
     fetched: &mut u64,
+    bytes: &mut Vec<u8>,
 ) -> Result<bool, String> {
     let total: u64 = group.ranges.iter().map(|r| r.len).sum();
     if total == 0 {
         return Ok(true);
     }
-    let mut bytes = Vec::with_capacity(total as usize);
+    bytes.clear();
     for range in &group.ranges {
         let at = bytes.len();
         bytes.resize(at + range.len as usize, 0);
@@ -613,9 +704,9 @@ fn write_group(
             .map_err(|e| format!("read the running binary at {}: {e}", range.src))?;
     }
     let ok = if group.raw {
-        blake3::hash(&bytes).as_bytes() == &group.hash
+        blake3::hash(bytes).as_bytes() == &group.hash
     } else {
-        match crate::loader::decode_block(&bytes, group.original, dict) {
+        match crate::loader::decode_block(bytes, group.original, dict) {
             Ok(decoded) => blake3::hash(&decoded).as_bytes() == &group.hash,
             Err(_) => false,
         }
@@ -643,11 +734,12 @@ fn write_plan(
     plan: &Plan,
     dict: Option<&[u8]>,
     src: &dyn RangeSource,
-) -> Result<Stats, String> {
+) -> Result<(usize, u64), String> {
     staged
         .set_len(remote.size)
         .map_err(|e| format!("size the staged update: {e}"))?;
     let mut fetched = 0;
+    let mut scratch = Vec::new();
     match plan.prefix {
         Prefix::Copy { len } => {
             // The planner picks a copy when both manifests pin the same
@@ -656,7 +748,7 @@ fn write_plan(
             // truncated write. The hash is checked against the release's
             // claim, and a mismatch fetches the prefix rather than
             // copying rot into the staged update.
-            let hash = copy_run(local_file, staged, 0, 0, len)?;
+            let hash = copy_run(local_file, staged, 0, 0, len, &mut scratch)?;
             if hash != remote.manifest.header.prefix_hash {
                 eprintln!(
                     "onelf-rt: the running binary's prefix does not match its own manifest; \
@@ -677,17 +769,35 @@ fn write_plan(
     }
     let mut reused = 0;
     for group in &plan.copies {
-        if write_group(staged, local_file, group, dict, src, &mut fetched)? {
+        if write_group(
+            staged,
+            local_file,
+            group,
+            dict,
+            src,
+            &mut fetched,
+            &mut scratch,
+        )? {
             reused += 1;
         }
     }
     for span in &plan.fetch {
         fetched += fetch_span(src, staged, span.start, span.len)?;
     }
+    for &(start, len) in &plan.digests {
+        scratch.resize(len as usize, 0);
+        staged
+            .read_exact_at(&mut scratch, start)
+            .map_err(|e| format!("read the staged block at {start}: {e}"))?;
+        let digest = xxhash_rust::xxh3::xxh3_64(&scratch).to_le_bytes();
+        staged
+            .write_all_at(&digest, start + len)
+            .map_err(|e| format!("write the staged block digest at {}: {e}", start + len))?;
+    }
     staged
         .write_all_at(&remote.footer_bytes, remote.size - FOOTER_SIZE as u64)
         .map_err(|e| format!("write the staged footer: {e}"))?;
-    Ok(Stats { reused, fetched })
+    Ok((reused, fetched))
 }
 
 #[cfg(test)]
@@ -718,6 +828,67 @@ mod tests {
             Ok(Box::new(std::io::Cursor::new(
                 self.data[start as usize..end as usize].to_vec(),
             )))
+        }
+
+        fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+            Ok(Box::new(std::io::Cursor::new(self.data.to_vec())))
+        }
+
+        fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+            Err(FetchError::Other("the fake release is unsigned".into()))
+        }
+    }
+
+    /// A release whose range answers, whole-file body and signature can
+    /// disagree, the way a corrupted transfer or a release replaced
+    /// mid-update makes them disagree. Counts whole-file downloads.
+    struct FakeRelease {
+        ranged: Vec<u8>,
+        whole: Vec<u8>,
+        sig: Option<Vec<u8>>,
+        whole_fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRelease {
+        fn new(ranged: Vec<u8>, whole: Vec<u8>, sig: Option<Vec<u8>>) -> Self {
+            FakeRelease {
+                ranged,
+                whole,
+                sig,
+                whole_fetches: Default::default(),
+            }
+        }
+
+        fn whole_fetches(&self) -> usize {
+            self.whole_fetches
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl RangeSource for FakeRelease {
+        fn size(&self) -> Result<u64, FetchError> {
+            Ok(self.ranged.len() as u64)
+        }
+
+        fn fetch_range(&self, start: u64, len: u64) -> Result<Box<dyn Read + '_>, FetchError> {
+            let range = start as usize..(start + len) as usize;
+            let bytes = self
+                .ranged
+                .get(range)
+                .ok_or_else(|| FetchError::Other(format!("range {start}+{len} out of bounds")))?;
+            Ok(Box::new(bytes))
+        }
+
+        fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+            self.whole_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(self.whole.as_slice()))
+        }
+
+        fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+            self.sig
+                .clone()
+                .ok_or_else(|| FetchError::Other("fetch signature: HTTP 404".into()))
         }
     }
 
@@ -1203,8 +1374,9 @@ mod tests {
         let file = std::fs::File::open(&tmp).unwrap();
         let staged = super::super::pin_verified(tmp.clone(), file).unwrap();
         let local_id = super::super::local_package_id(&installed).unwrap();
+        let lock = super::super::InstallLock::acquire(&installed).unwrap();
         assert_eq!(
-            super::super::install_staged(&installed, Some(&local_id), None, staged),
+            super::super::install_staged(&installed, &lock, Some(&local_id), None, staged),
             0
         );
         assert_eq!(std::fs::read(&installed).unwrap(), package);
@@ -1229,11 +1401,78 @@ mod tests {
         let staged = super::super::pin_verified(tmp.clone(), file).unwrap();
         std::fs::rename(&tmp, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &tmp).unwrap();
+        let lock = super::super::InstallLock::acquire(&installed).unwrap();
         assert_eq!(
-            super::super::install_staged(&installed, None, None, staged),
+            super::super::install_staged(&installed, &lock, None, None, staged),
             2
         );
         assert_eq!(std::fs::read(installed).unwrap(), b"running binary");
+    }
+
+    #[test]
+    fn a_downloaded_revision_that_does_not_parse_is_refused() {
+        let stage = Stage::new("bad-revision");
+        let package = build_blocks_package(
+            &fake_prefix(18),
+            &[(".onelf/update-revision", b"not a number".to_vec())],
+            None,
+        );
+        let path = stage.dir.join("download");
+        std::fs::write(&path, package).unwrap();
+        let err = super::super::staged_info(&std::fs::File::open(&path).unwrap()).unwrap_err();
+        assert!(err.contains("does not hold a number"), "{err}");
+    }
+
+    #[test]
+    fn a_binary_replaced_after_the_lock_is_not_overwritten() {
+        let stage = Stage::new("replaced-install");
+        let package = build_blocks_package(&fake_prefix(19), &[("app", vec![b'a'; 1000])], None);
+        let installed = stage.dir.join("app");
+        let tmp = stage.dir.join("download");
+        std::fs::write(&installed, b"running binary").unwrap();
+        std::fs::write(&tmp, package).unwrap();
+        let lock = super::super::InstallLock::acquire(&installed).unwrap();
+        // Something else installs over the name while the update runs.
+        let other = stage.dir.join("other");
+        std::fs::write(&other, b"someone else's install").unwrap();
+        std::fs::rename(&other, &installed).unwrap();
+
+        let staged =
+            super::super::pin_verified(tmp.clone(), std::fs::File::open(&tmp).unwrap()).unwrap();
+        assert_eq!(
+            super::super::install_staged(&installed, &lock, None, None, staged),
+            2
+        );
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            b"someone else's install"
+        );
+        assert!(!super::super::sibling_path(&installed, ".onelf-prev").exists());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_revision_that_cannot_be_read_is_refused_not_skipped() {
+        let stage = Stage::new("unreadable-revision");
+        let package = build_blocks_package(
+            &fake_prefix(24),
+            &[(".onelf/update-revision", b"7".to_vec())],
+            None,
+        );
+        // Wreck the entry's compressed block so it no longer decodes.
+        let remote = probe(&FakeSource {
+            data: Arc::new(package.clone()),
+        })
+        .unwrap();
+        let (offset, len) =
+            block_extent(&remote.footer, &remote.manifest.entries[0].blocks[0]).unwrap();
+        let mut bad = package;
+        bad[offset as usize..offset as usize + len].fill(0xff);
+        let path = stage.dir.join("download");
+        std::fs::write(&path, bad).unwrap();
+
+        let err = super::super::staged_info(&std::fs::File::open(&path).unwrap()).unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
     }
 
     #[test]
@@ -1243,11 +1482,10 @@ mod tests {
         let tmp = stage.dir.join("download");
         std::fs::write(&tmp, package).unwrap();
         let file = std::fs::File::open(&tmp).unwrap();
-        let expected = super::super::staged_info(&file);
-        assert!(expected.1.is_some());
+        let expected = super::super::staged_info(&file).unwrap();
         std::fs::remove_file(&tmp).unwrap();
         std::fs::write(&tmp, b"unverified replacement").unwrap();
-        assert_eq!(super::super::staged_info(&file), expected);
+        assert_eq!(super::super::staged_info(&file).unwrap(), expected);
     }
 
     #[test]
@@ -1481,16 +1719,21 @@ mod tests {
     #[test]
     fn a_stipple_prefix_change_fetches_only_the_prefix() {
         let stage = Stage::new("stipple-prefix");
-        let refs: Vec<(&str, Vec<u8>)> = vec![(
-            "bin/app",
-            (0..100_000u32).map(|i| (i * 11 % 251) as u8).collect(),
-        )];
+        // Larger than the fetch gap ceiling, so its slices are not merged
+        // into the metadata fetches around them.
+        let len = 300_000u32;
+        let refs: Vec<(&str, Vec<u8>)> =
+            vec![("bin/app", (0..len).map(|i| (i * 11 % 251) as u8).collect())];
         let local = build_stipple_package(&fake_prefix(8), &refs, true);
         let remote = build_stipple_package(&fake_prefix(9), &refs, true);
 
         let (out, stats, remote_pkg) = stage.run(&local, &remote).expect("assemble");
         assert_eq!(out, remote);
-        assert_eq!(stats.reused, 2, "both slices copy from the running binary");
+        let slices = u64::from(len).div_ceil(onelf_format::payload::SLICE_SIZE) as usize;
+        assert_eq!(
+            stats.reused, slices,
+            "every slice copies from the running binary"
+        );
         // The prefix is fetched, and so is the image's own bookkeeping:
         // superblock and metadata sections sit outside the onelf manifest,
         // so no slice can describe them. They are small and fixed-size.
@@ -1507,6 +1750,177 @@ mod tests {
         );
     }
 
+    /// Counts the range requests a delta makes.
+    struct CountingSource {
+        inner: FakeSource,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RangeSource for CountingSource {
+        fn size(&self) -> Result<u64, FetchError> {
+            self.inner.size()
+        }
+
+        fn fetch_range(&self, start: u64, len: u64) -> Result<Box<dyn Read + '_>, FetchError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.fetch_range(start, len)
+        }
+
+        fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+            self.inner.fetch_whole()
+        }
+
+        fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+            self.inner.fetch_signature()
+        }
+    }
+
+    #[test]
+    fn stored_stipple_requests_do_not_grow_with_the_block_count() {
+        let requests = |stable_len: u32| {
+            let stage = Stage::new("stipple-requests");
+            let prefix = fake_prefix(10);
+            let stable: Vec<u8> = (0..stable_len).map(|i| (i * 7 % 251) as u8).collect();
+            let local = build_stipple_package(
+                &prefix,
+                &[
+                    ("bin/app", stable.clone()),
+                    ("share/data", vec![1u8; 50_000]),
+                ],
+                true,
+            );
+            let remote = build_stipple_package(
+                &prefix,
+                &[("bin/app", stable), ("share/data", vec![9u8; 50_000])],
+                true,
+            );
+            let local_path = stage.dir.join("local");
+            std::fs::write(&local_path, local).unwrap();
+            let src = CountingSource {
+                inner: FakeSource {
+                    data: Arc::new(remote.clone()),
+                },
+                requests: Default::default(),
+            };
+            let remote_pkg = probe(&src).unwrap();
+            let staged_path = stage.dir.join("staged");
+            let staged = std::fs::File::create_new(&staged_path).unwrap();
+            let stats = assemble(&local_path, &remote_pkg, &staged, &src).unwrap();
+            assert_eq!(std::fs::read(&staged_path).unwrap(), remote);
+            (
+                src.requests.load(std::sync::atomic::Ordering::Relaxed),
+                stats.reused,
+            )
+        };
+        // Sixteen times the data adds 240 blocks. Fetching their digests
+        // would cost a request each, or, merged into one span, would
+        // download every block they sit between. Only the larger metadata
+        // may cost a few more requests, and every unchanged slice copies.
+        let (small, _) = requests(1 << 20);
+        let (large, reused) = requests(16 << 20);
+        assert!(large < small + 8, "{small} requests grew to {large}");
+        assert!(reused >= 256, "only {reused} slices were copied");
+    }
+
+    /// Serve `data` over loopback HTTP for `connections` requests, each on
+    /// its own connection, honoring Range only when `ranges` is set.
+    /// Returns the URL and a handle yielding each request line.
+    fn loopback_release(
+        data: Vec<u8>,
+        ranges: bool,
+        connections: usize,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.onelf", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..connections {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let range = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("range: bytes=")
+                            .map(str::to_owned)
+                    })
+                    .filter(|_| ranges)
+                    .map(|r| {
+                        let (a, b) = r.split_once('-').unwrap();
+                        (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())
+                    });
+                let (status, body, extra) = match range {
+                    Some((a, b)) => (
+                        "206 Partial Content",
+                        &data[a..=b],
+                        format!("Content-Range: bytes {a}-{b}/{}\r\n", data.len()),
+                    ),
+                    None => ("200 OK", &data[..], String::new()),
+                };
+                let is_head = head.starts_with("HEAD ");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                if !is_head {
+                    // A client that saw what it needed may hang up early.
+                    let _ = stream.write_all(body);
+                }
+                requests.push(head.lines().next().unwrap().to_owned());
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn the_http_source_probes_a_real_release_in_three_requests() {
+        let release = build_blocks_package(&fake_prefix(22), &[("app", vec![b'p'; 100_000])], None);
+        let (url, server) = loopback_release(release.clone(), true, 3);
+        let src = crate::update::range::HttpsRangeSource::over_plain_http(url);
+
+        let remote = probe(&src).expect("probe over HTTP");
+        assert_eq!(remote.size, release.len() as u64);
+        let local = probe(&FakeSource {
+            data: Arc::new(release),
+        })
+        .unwrap();
+        assert_eq!(remote.package_id(), local.package_id());
+        assert_eq!(remote.manifest_bytes, local.manifest_bytes);
+
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("HEAD "), "{requests:?}");
+        assert!(
+            requests[1..].iter().all(|r| r.starts_with("GET ")),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn the_http_source_reports_a_host_that_ignores_ranges() {
+        let release = build_blocks_package(&fake_prefix(23), &[("app", vec![b'q'; 1000])], None);
+        // HEAD for the size, then the footer read answered in full.
+        let (url, server) = loopback_release(release, false, 2);
+        let src = crate::update::range::HttpsRangeSource::over_plain_http(url);
+
+        assert!(matches!(probe(&src), Err(FetchError::NoRanges(_))));
+        // Later reads fail the same way without another request.
+        assert!(matches!(
+            src.fetch_range(0, 1),
+            Err(FetchError::NoRanges(_))
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
     #[test]
     fn changing_the_payload_kind_is_refused() {
         let stage = Stage::new("kind");
@@ -1516,5 +1930,203 @@ mod tests {
 
         let err = stage.run_err(&local, &remote);
         assert!(err.contains("payload kind"), "got: {err}");
+    }
+
+    #[test]
+    fn nearby_fetches_merge_and_drop_the_copies_they_cover() {
+        let group = |dst: u64, len: u64| CopyGroup {
+            ranges: vec![CopyRange { dst, src: 0, len }],
+            hash: [0; 32],
+            raw: true,
+            original: len as usize,
+        };
+        let span = |start: u64, len: u64| Span { start, len };
+        let far = 10 * FETCH_GAP_MAX;
+        let mut plan = Plan {
+            prefix: Prefix::Fetch { len: 0 },
+            dict: None,
+            copies: vec![group(1000, 500), group(far - 100, 200), group(far * 3, 100)],
+            // Out of order, as a deduplicating packer can lay them out.
+            fetch: vec![span(far, 100), span(0, 1000), span(1500, 100)],
+            digests: Vec::new(),
+        };
+        coalesce(&mut plan);
+
+        let fetch: Vec<(u64, u64)> = plan.fetch.iter().map(|s| (s.start, s.len)).collect();
+        assert_eq!(fetch, vec![(0, 1600), (far, 100)]);
+        // The copy inside the merged span is downloaded with it; one that
+        // only straddles a span, and one far from any, still copy.
+        let copies: Vec<u64> = plan.copies.iter().map(|g| g.ranges[0].dst).collect();
+        assert_eq!(copies, vec![far - 100, far * 3]);
+    }
+
+    #[test]
+    fn spans_past_the_gap_ceiling_stay_separate() {
+        let mut plan = Plan {
+            prefix: Prefix::Fetch { len: 0 },
+            dict: None,
+            copies: Vec::new(),
+            fetch: vec![
+                Span { start: 0, len: 10 },
+                Span {
+                    start: 10 + FETCH_GAP_MAX + 1,
+                    len: 10,
+                },
+            ],
+            digests: Vec::new(),
+        };
+        coalesce(&mut plan);
+        assert_eq!(plan.fetch.len(), 2);
+    }
+
+    /// A running package and a release that changes one file and shares
+    /// another, so a delta reuses blocks.
+    fn running_and_release(stage: &Stage) -> (std::path::PathBuf, Vec<u8>) {
+        let prefix = fake_prefix(20);
+        let stable = (0..200_000u32)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        let local = build_blocks_package(
+            &prefix,
+            &[("app", vec![b'a'; 32_000]), ("stable", stable.clone())],
+            None,
+        );
+        let release = build_blocks_package(
+            &prefix,
+            &[("app", vec![b'b'; 32_000]), ("stable", stable)],
+            None,
+        );
+        let local_path = stage.dir.join("local");
+        std::fs::write(&local_path, local).unwrap();
+        (local_path, release)
+    }
+
+    /// `release` with one byte flipped inside the changed file's block,
+    /// which a delta fetches rather than copies.
+    fn corrupt_fetched_block(release: &[u8]) -> Vec<u8> {
+        let remote = probe(&FakeSource {
+            data: Arc::new(release.to_vec()),
+        })
+        .unwrap();
+        let (offset, len) =
+            block_extent(&remote.footer, &remote.manifest.entries[0].blocks[0]).unwrap();
+        let mut bad = release.to_vec();
+        bad[offset as usize + len / 2] ^= 0xff;
+        bad
+    }
+
+    fn signer() -> ed25519_compact::KeyPair {
+        ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([5u8; 32]))
+    }
+
+    /// Everything in the stage beside the running binary: a failed update
+    /// must leave nothing behind.
+    fn leftovers(stage: &Stage) -> Vec<String> {
+        std::fs::read_dir(&stage.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "local")
+            .collect()
+    }
+
+    #[test]
+    fn a_signed_delta_that_fails_its_signature_retries_in_full() {
+        let stage = Stage::new("signed-retry");
+        let (local_path, release) = running_and_release(&stage);
+        let kp = signer();
+        let sig = kp.sk.sign(&release, None).to_vec();
+        let src = FakeRelease::new(corrupt_fetched_block(&release), release.clone(), Some(sig));
+        let remote = probe(&src).unwrap();
+
+        let staged =
+            super::super::fetch_verified(&local_path, Some(kp.pk.as_ref()), Some(remote), &src)
+                .expect("the full download verifies");
+        assert_eq!(src.whole_fetches(), 1);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), release);
+    }
+
+    #[test]
+    fn a_signed_delta_without_reuse_is_refused_without_a_full_download() {
+        let stage = Stage::new("signed-no-reuse");
+        let (_, release) = running_and_release(&stage);
+        // A running package sharing nothing with the release.
+        let local_path = stage.dir.join("local");
+        std::fs::write(
+            &local_path,
+            build_blocks_package(&fake_prefix(21), &[("other", vec![b'z'; 1000])], None),
+        )
+        .unwrap();
+        let kp = signer();
+        let sig = kp.sk.sign(&release, None).to_vec();
+        let src = FakeRelease::new(corrupt_fetched_block(&release), release, Some(sig));
+        let remote = probe(&src).unwrap();
+
+        let result =
+            super::super::fetch_verified(&local_path, Some(kp.pk.as_ref()), Some(remote), &src);
+        assert_eq!(result.err(), Some(2));
+        assert_eq!(
+            src.whole_fetches(),
+            0,
+            "nothing was copied, so nothing to retry"
+        );
+        assert!(leftovers(&stage).is_empty(), "left {:?}", leftovers(&stage));
+    }
+
+    #[test]
+    fn a_missing_signature_fails_before_any_download() {
+        let stage = Stage::new("signed-missing");
+        let (local_path, release) = running_and_release(&stage);
+        let src = FakeRelease::new(release.clone(), release, None);
+        let remote = probe(&src).unwrap();
+
+        let result = super::super::fetch_verified(
+            &local_path,
+            Some(signer().pk.as_ref()),
+            Some(remote),
+            &src,
+        );
+        assert_eq!(result.err(), Some(2));
+        assert_eq!(src.whole_fetches(), 0);
+        assert!(leftovers(&stage).is_empty(), "left {:?}", leftovers(&stage));
+    }
+
+    #[test]
+    fn an_unsigned_delta_that_fails_integrity_retries_in_full() {
+        let stage = Stage::new("unsigned-retry");
+        let (local_path, release) = running_and_release(&stage);
+        let src = FakeRelease::new(corrupt_fetched_block(&release), release.clone(), None);
+        let remote = probe(&src).unwrap();
+
+        let staged = super::super::fetch_verified(&local_path, None, Some(remote), &src)
+            .expect("the full download passes the integrity check");
+        assert_eq!(src.whole_fetches(), 1);
+        assert_eq!(std::fs::read(&staged.path).unwrap(), release);
+    }
+
+    #[test]
+    fn an_unsigned_full_download_that_stays_corrupt_is_refused() {
+        let stage = Stage::new("unsigned-corrupt");
+        let (local_path, release) = running_and_release(&stage);
+        let bad = corrupt_fetched_block(&release);
+        let src = FakeRelease::new(bad.clone(), bad, None);
+        let remote = probe(&src).unwrap();
+
+        let result = super::super::fetch_verified(&local_path, None, Some(remote), &src);
+        assert_eq!(result.err(), Some(2));
+        assert_eq!(src.whole_fetches(), 1);
+        assert!(leftovers(&stage).is_empty(), "left {:?}", leftovers(&stage));
+    }
+
+    #[test]
+    fn a_full_download_longer_than_the_probed_size_is_refused() {
+        let stage = Stage::new("oversized");
+        let (local_path, release) = running_and_release(&stage);
+        let mut endless = release.clone();
+        endless.extend(std::iter::repeat_n(0u8, 1 << 20));
+        let src = FakeRelease::new(release, endless, None);
+
+        let result = super::super::fetch_verified(&local_path, None, None, &src);
+        assert_eq!(result.err(), Some(2));
+        assert!(leftovers(&stage).is_empty(), "left {:?}", leftovers(&stage));
     }
 }

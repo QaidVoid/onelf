@@ -3778,6 +3778,62 @@ fn self_update_refuses_without_a_signing_key() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A package packed with the unsigned opt-in passes the policy gate the
+/// keyless one stops at: both update commands warn that no signature is
+/// checked and go on to contact the release server, leaving the binary
+/// untouched when that fails.
+#[test]
+fn an_unsigned_package_warns_and_reaches_the_release_server() {
+    let td = workdir("unsigned-run");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho APP\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("unsigned.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        // A host that cannot resolve, so the request fails distinctly.
+        .args(["--update-url", "https://onelf.invalid/app.onelf"])
+        .arg("--update-unsigned")
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let before = std::fs::read(&pkg).unwrap();
+
+    for flag in ["--onelf-update", "--onelf-check-update"] {
+        let mut run = Command::new(&pkg);
+        run.arg(flag)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("verifies no update signatures"),
+            "{flag} must announce the unsigned policy, got: {err}"
+        );
+        assert!(
+            !err.contains("no signing key"),
+            "{flag} must not treat the opt-in as a missing key, got: {err}"
+        );
+        assert!(
+            err.contains("onelf.invalid"),
+            "{flag} must go on to contact the release server, got: {err}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{flag}: {err}");
+        assert_eq!(std::fs::read(&pkg).unwrap(), before);
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Several instances starting at once must each get a complete package.
 ///
 /// Extraction publishes through a rename and a completion marker, so a

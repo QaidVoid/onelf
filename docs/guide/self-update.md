@@ -145,7 +145,8 @@ policy, and `--update-unsigned` cannot be combined with `--update-key`.
   visible to whoever runs the package.
 - ✅ Publishing is one file: the binary alone, since nothing fetches a
   `.sig`. The revision gate, the rollback copy and the atomic install
-  all still apply.
+  all still apply. `onelf sign` refuses such a package, because no
+  signature it made would ever be requested.
 - ✅ Integrity checks still compare the runtime prefix and file content
   with the downloaded manifest. Ranged requests retain the probed size
   and use a strong ETag when the server supplies one. A mixed or corrupt
@@ -322,6 +323,10 @@ to a sibling `<name>.onelf-prev` and forced to the disk as a rollback
 point; on the rare failure of the rename itself, that copy is moved back
 into place.
 
+A release replaced on the server while an update runs fails that update
+with exit 2, since the bytes no longer belong to one release. Running
+the update again picks up the new release.
+
 :::info
 Packages with a stipplefs payload (`--payload stipple`) delta-update
 only when the image is stored uncompressed (`--no-compress`). A
@@ -329,7 +334,11 @@ compressed image re-encodes unchanged content against a dictionary
 retrained for every build, so its bytes are not stable across builds and
 nothing shorter than the whole payload can be reused; the updater says
 so on stderr and downloads in full. The default blocks payload always
-delta-updates.
+delta-updates, with one exception: `--dict` trains its dictionary from
+the package's own files, so a release that changes any sampled file
+ships a new dictionary and no compressed block can be copied. The
+updater says so on stderr and fetches every block. Leave `--dict` off
+for packages that self-update often.
 :::
 
 Exit codes:
@@ -370,9 +379,9 @@ Exit codes:
 
 | Runtime | Size | Self-update | Records an update URL |
 |---------|------|-------------|----------------------|
-| slim | 1156 KB | no | no |
-| slim, `embed = false` | 1156 KB | no | yes |
-| update | 2472 KB | yes | yes |
+| slim | 1152 KB | no | no |
+| slim, `embed = false` | 1152 KB | no | yes |
+| update | 2484 KB | yes | yes |
 
 Measured on rustc 1.99.0, x86_64 musl, release profile. This table is
 the one source of these numbers; other pages link here rather than

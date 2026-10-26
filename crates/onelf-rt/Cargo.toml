@@ -8,13 +8,13 @@ repository.workspace = true
 
 [features]
 default = []
-update = ["dep:ed25519-compact", "dep:ureq"]
+update = ["dep:ed25519-compact", "dep:ureq", "xxhash-rust/xxh3"]
 
 [dependencies]
 onelf-format = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["rand"] }
 goblin = { workspace = true }
 zstd = { workspace = true }
 # Already linked through onelf-format's payload codec; named directly so

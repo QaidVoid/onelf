@@ -123,49 +123,24 @@ fn keyring(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.chunks(32).filter(|k| k.len() == 32)
 }
 
-/// A detached signature is 64 bytes. The fetch is capped well above that
-/// so a server streaming something else is cut off before it can be
-/// buffered in full; `Signature::from_slice` then rejects every length
-/// but one.
-const SIG_MAX_BYTES: u64 = 64 * 1024;
-
-/// Fetch the detached signature (`<url>.sig`) and verify it over the
-/// staged binary through the file handle the assembly wrote, against the
-/// embedded public keys. Reading the staged bytes through their handle,
-/// never by path, is what lets the caller pin this exact inode as the
-/// verified one. Fails closed: any fetch/parse/verify problem is an
-/// error so the binary is never installed unverified.
+/// Verify the detached `sig` over the staged binary through the file
+/// handle the assembly wrote, against the embedded public keys. Reading
+/// the staged bytes through their handle, never by path, is what lets
+/// the caller pin this exact inode as the verified one. Fails closed:
+/// any parse or verify problem is an error so the binary is never
+/// installed unverified.
 fn verify_update_signature(
     staged: &std::fs::File,
-    url: &str,
+    sig: &[u8],
     keyring_bytes: &[u8],
 ) -> Result<(), String> {
-    let sig_url = onelf_format::update::detached_sig_url(url);
-    // Redirects are followed as for the package itself, over HTTPS only:
-    // release hosts such as GitHub answer every asset with a redirect to
-    // their CDN. A substituted body cannot pass the Ed25519 check below,
-    // which is what guards the update.
-    let agent = hardened_agent(10);
-    let mut sig = Vec::new();
-    agent
-        .get(&sig_url)
-        .call()
-        .map_err(|e| format!("fetch signature: {e}"))?
-        .into_body()
-        .into_reader()
-        .take(SIG_MAX_BYTES)
-        .read_to_end(&mut sig)
-        .map_err(|e| format!("read signature: {e}"))?;
     // Map the assembled binary read-only instead of reading it onto the
-    // heap: it can be hundreds of MB and the kernel already has the pages
-    // cached from the assembly write. The mapping stays alive through the
+    // heap: it can be hundreds of MB, and its pages are still cached from
+    // being written, whether by the assembly or by a full download. The mapping stays alive through the
     // verify call and is unmapped on drop.
     let map = Mmap::open(staged).map_err(|e| format!("map assembled binary: {e}"))?;
     let keys: Vec<&[u8]> = keyring(keyring_bytes).collect();
-    if keys
-        .iter()
-        .any(|k| verify_detached(k, map.as_slice(), &sig))
-    {
+    if keys.iter().any(|k| verify_detached(k, map.as_slice(), sig)) {
         Ok(())
     } else if keys.len() == 1 {
         Err("signature does not verify against the embedded key".to_string())
@@ -185,14 +160,16 @@ struct Mmap {
 }
 
 impl Mmap {
+    /// Map `file` whole. An empty file is refused: there is no update to
+    /// verify, and a zero-length mapping is not one mmap(2) can make.
     fn open(file: &std::fs::File) -> io::Result<Self> {
         let len = usize::try_from(file.metadata()?.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "package too large to map"))?;
         if len == 0 {
-            return Ok(Mmap {
-                ptr: core::ptr::null_mut(),
-                len: 0,
-            });
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the downloaded update is empty",
+            ));
         }
         // SAFETY: a fresh mapping of `len` bytes from a valid fd at offset 0.
         let ptr = unsafe {
@@ -209,9 +186,6 @@ impl Mmap {
     }
 
     fn as_slice(&self) -> &[u8] {
-        if self.len == 0 {
-            return &[];
-        }
         // SAFETY: `ptr`/`len` describe a live read-only mapping owned by self.
         unsafe { core::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
     }
@@ -219,11 +193,9 @@ impl Mmap {
 
 impl Drop for Mmap {
     fn drop(&mut self) {
-        if self.len != 0 {
-            // SAFETY: unmapping the region this Mmap created and still owns.
-            unsafe {
-                let _ = rustix::mm::munmap(self.ptr, self.len);
-            }
+        // SAFETY: unmapping the region this Mmap created and still owns.
+        unsafe {
+            let _ = rustix::mm::munmap(self.ptr, self.len);
         }
     }
 }
@@ -232,15 +204,18 @@ impl Drop for Mmap {
 /// lifetime of the value. `flock(2)` sits on the inode, so it survives a
 /// concurrent process renaming over the name and disappears with this
 /// process.
+///
+/// The handle doubles as the running binary for the install: the rollback
+/// copy and the preserved mode are read through it, never by name.
 struct InstallLock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 impl InstallLock {
     fn acquire(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-        Ok(InstallLock { _file: file })
+        Ok(InstallLock { file })
     }
 }
 
@@ -253,7 +228,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
             // The host ignores Range, so freshness needs the whole file.
             // A rare case: ordinary static file servers answer ranges.
             eprintln!("onelf-rt: {why}; checking against a full download");
-            return match fetch_verified(self_path, url, pubkey, None, &src) {
+            return match fetch_verified(self_path, pubkey, None, &src) {
                 Err(code) => code,
                 Ok(staged) => check_verdict(local_id.as_ref(), current_revision, staged),
             };
@@ -282,7 +257,7 @@ fn check(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // Only the remote package's own bytes carry its revision, so a running
     // package with one has the update fetched and verified as an apply
     // would, and an update the apply would refuse is not offered.
-    match fetch_verified(self_path, url, pubkey, Some(remote), &src) {
+    match fetch_verified(self_path, pubkey, Some(remote), &src) {
         Err(code) => code,
         Ok(staged) => check_verdict(local_id.as_ref(), current_revision, staged),
     }
@@ -296,17 +271,20 @@ fn check_verdict(
     current_revision: Option<u64>,
     staged: StagedUpdate,
 ) -> i32 {
-    let (revision, id) = staged_info(&staged.file);
+    let info = staged_info(&staged.file);
     let _ = std::fs::remove_file(&staged.path);
-    let Some(staged_id) = id else {
-        eprintln!("onelf-rt: the downloaded update is not a readable onelf package");
-        return 2;
+    let info = match info {
+        Ok(info) => info,
+        Err(why) => {
+            eprintln!("onelf-rt: {why}");
+            return 2;
+        }
     };
-    if Some(staged_id) == local_id.copied() {
-        println!("up to date ({})", hex(&staged_id));
+    if Some(&info.id) == local_id {
+        println!("up to date ({})", hex(&info.id));
         return 0;
     }
-    report_available(local_id, Some(&staged_id), current_revision, revision)
+    report_available(local_id, Some(&info.id), current_revision, info.revision)
 }
 
 /// The verdict after the signed bytes settled freshness and revision.
@@ -364,13 +342,19 @@ fn hex(bytes: &[u8]) -> String {
 /// destination, so the destination must be ours alone.
 fn staged_path(self_path: &Path) -> io::Result<PathBuf> {
     let mut random = [0u8; 8];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let mut hex = String::with_capacity(random.len() * 2);
-    for b in random {
-        hex.push_str(&format!("{b:02x}"));
+    // getrandom(2) rather than /dev/urandom: no path to resolve, and it
+    // works where /dev is not mounted. Eight bytes are always delivered
+    // whole once the pool is ready.
+    if rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty())? != random.len()
+    {
+        return Err(io::Error::other("getrandom returned too few bytes"));
     }
     let mut name = self_path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".onelf-update.{}.{}.tmp", std::process::id(), hex));
+    name.push(format!(
+        ".onelf-update.{}.{}.tmp",
+        std::process::id(),
+        hex(&random)
+    ));
     Ok(self_path.with_file_name(name))
 }
 
@@ -404,20 +388,22 @@ fn sibling_path(self_path: &Path, suffix: &str) -> PathBuf {
     self_path.with_file_name(name)
 }
 
-/// Copy `self_path` to `prev_path` as the rollback point.
+/// Copy `running`, the locked binary, to `prev_path` as the rollback
+/// point.
 ///
 /// The name is predictable, so in a directory other users can write
 /// something may already sit there, a symlink to a file of ours among
 /// them. The copy is made in a staging file claimed the way an update's
 /// is and renamed over the name, which replaces whatever was there
 /// rather than writing through it.
-fn save_rollback(self_path: &Path, prev_path: &Path) -> io::Result<()> {
+fn save_rollback(running: &std::fs::File, self_path: &Path, prev_path: &Path) -> io::Result<()> {
     let tmp = staged_path(self_path)?;
     let copied = (|| {
         let mut out = claim_staging(&tmp)?;
-        io::copy(&mut std::fs::File::open(self_path)?, &mut out)?;
-        let mode = std::fs::metadata(self_path)?.permissions().mode();
-        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        let mut src = running.try_clone()?;
+        src.rewind()?;
+        io::copy(&mut src, &mut out)?;
+        out.set_permissions(running.metadata()?.permissions())?;
         out.sync_all()?;
         std::fs::rename(&tmp, prev_path)
     })();
@@ -427,20 +413,51 @@ fn save_rollback(self_path: &Path, prev_path: &Path) -> io::Result<()> {
     copied
 }
 
-/// The `.onelf/update-revision` entry and package id of a packaged
-/// binary, read from its own bytes.
-fn staged_info(file: &std::fs::File) -> (Option<u64>, Option<[u8; 32]>) {
-    let mut pkg = match file.try_clone().and_then(crate::loader::load_file) {
-        Ok(p) => p,
-        Err(_) => return (None, None),
-    };
-    let id = pkg.manifest.header.package_id;
-    let revision = crate::read_package_file(&mut pkg, ".onelf/update-revision").and_then(|bytes| {
-        std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
+/// A package's `.onelf/update-revision` number, or `None` when it carries
+/// no such entry. An entry that cannot be read or holds no number is an
+/// error, never "no revision": the packer only writes numbers, and a
+/// missing revision is what lets an older release through the downgrade
+/// gate.
+pub fn package_revision(pkg: &mut crate::loader::PackageData) -> Result<Option<u64>, String> {
+    const PATH: &str = ".onelf/update-revision";
+    let present = (0..pkg.manifest.entries.len()).any(|i| {
+        pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
+            && pkg.manifest.entry_path(i) == PATH
     });
-    (revision, Some(id))
+    if !present {
+        return Ok(None);
+    }
+    let bytes = crate::read_package_file(pkg, PATH).ok_or(format!("{PATH} cannot be read"))?;
+    parse_revision(&bytes).map(Some)
+}
+
+fn parse_revision(bytes: &[u8]) -> Result<u64, String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| ".onelf/update-revision does not hold a number".to_string())
+}
+
+/// What the install gates read from a downloaded package.
+#[derive(Debug, PartialEq)]
+struct StagedInfo {
+    id: [u8; 32],
+    revision: Option<u64>,
+}
+
+/// The package id and revision of a downloaded package, read through
+/// its verified handle.
+fn staged_info(file: &std::fs::File) -> Result<StagedInfo, String> {
+    let mut pkg = file
+        .try_clone()
+        .and_then(crate::loader::load_file)
+        .map_err(|e| format!("the downloaded update is not a readable onelf package: {e}"))?;
+    let revision =
+        package_revision(&mut pkg).map_err(|why| format!("the downloaded update's {why}"))?;
+    Ok(StagedInfo {
+        id: pkg.manifest.header.package_id,
+        revision,
+    })
 }
 
 /// Check unsigned content against its own manifest through the staging
@@ -452,15 +469,22 @@ fn verify_unsigned(staged: &std::fs::File) -> Result<(), String> {
         .try_clone()
         .and_then(crate::loader::load_file)
         .map_err(|e| format!("read unsigned package: {e}"))?;
-    if pkg.manifest.header.version >= 3 {
-        let mut prefix = staged.try_clone().map_err(|e| e.to_string())?;
-        prefix.rewind().map_err(|e| e.to_string())?;
-        let mut hasher = blake3::Hasher::new();
-        io::copy(&mut prefix.take(pkg.footer.manifest_offset), &mut hasher)
-            .map_err(|e| format!("hash runtime prefix: {e}"))?;
-        if hasher.finalize().as_bytes() != &pkg.manifest.header.prefix_hash {
-            return Err("unsigned runtime prefix hash mismatch".into());
-        }
+    // Older manifests pin no prefix hash, so the executable part of such a
+    // package could not be checked at all.
+    if pkg.manifest.header.version < 3 {
+        return Err(format!(
+            "an unsigned update needs a version-3 manifest to check its runtime, \
+             and this one is version {}",
+            pkg.manifest.header.version
+        ));
+    }
+    let mut prefix = staged.try_clone().map_err(|e| e.to_string())?;
+    prefix.rewind().map_err(|e| e.to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    io::copy(&mut prefix.take(pkg.footer.manifest_offset), &mut hasher)
+        .map_err(|e| format!("hash runtime prefix: {e}"))?;
+    if hasher.finalize().as_bytes() != &pkg.manifest.header.prefix_hash {
+        return Err("unsigned runtime prefix hash mismatch".into());
     }
     for entry in &pkg.manifest.entries {
         if entry.kind != onelf_format::EntryKind::File {
@@ -517,20 +541,34 @@ struct StagedUpdate {
     identity: (u64, u64),
 }
 
-/// Download the update beside `self_path` and verify its signature,
-/// returning the [`StagedUpdate`].
-/// `remote` is the probe result when the host
-/// honors range requests; without it the release downloads in full. A
-/// `None` keyring (the unsigned opt-in) skips the signature step. On
-/// failure nothing is left behind, and the error is the exit code, already
-/// explained on stderr.
+/// Download the update beside `self_path` and verify it, returning the
+/// [`StagedUpdate`]. `remote` is the probe result when the host honors
+/// range requests; without it the release downloads in full. A `None`
+/// keyring (the unsigned opt-in) checks content integrity against the
+/// downloaded manifest instead of a signature. On failure nothing is
+/// left behind, and the error is the exit code, already explained on
+/// stderr.
 fn fetch_verified(
     self_path: &Path,
-    url: &str,
     pubkey: Option<&[u8]>,
     remote: Option<RemotePackage>,
     src: &dyn RangeSource,
 ) -> Result<StagedUpdate, i32> {
+    // The signature comes first: a release published without one fails
+    // before any of the package is downloaded.
+    let signed = match pubkey.map(|keys| src.fetch_signature().map(|sig| (keys, sig))) {
+        None => None,
+        Some(Ok(signed)) => Some(signed),
+        Some(Err(e)) => {
+            eprintln!("onelf-rt: {e}");
+            return Err(2);
+        }
+    };
+    let verify = |staged: &std::fs::File| match &signed {
+        Some((keys, sig)) => verify_update_signature(staged, sig, keys),
+        None => verify_unsigned(staged),
+    };
+
     let tmp_path = match staged_path(self_path) {
         Ok(p) => p,
         Err(e) => {
@@ -555,35 +593,30 @@ fn fetch_verified(
         match delta::assemble(self_path, remote, &staged, src) {
             Ok(stats) => {
                 eprintln!(
-                    "onelf-rt: reused {} blocks, fetching {} of {} bytes",
-                    stats.reused, stats.fetched, remote.size
+                    "onelf-rt: copied {} {} from the running binary, fetched {} bytes of the \
+                     {}-byte release",
+                    stats.reused, stats.unit, stats.fetched, remote.size
                 );
-                match pubkey {
+                match verify(&staged) {
+                    Ok(()) => return pin_verified(tmp_path, staged),
                     // Copied bytes are only as good as the assumption that
                     // identical content encodes identically. When that
                     // assumption breaks the signature names it, and a full
-                    // download replaces the guess with certainty.
-                    Some(keys) => match verify_update_signature(&staged, url, keys) {
-                        Ok(()) => return pin_verified(tmp_path, staged),
-                        Err(e) if stats.reused > 0 => {
-                            eprintln!(
-                                "onelf-rt: assembled update failed its signature check ({e}); \
-                                 retrying with a full download"
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("onelf-rt: update signature check failed: {e}");
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(2);
-                        }
-                    },
-                    None => match verify_unsigned(&staged) {
-                        Ok(()) => return pin_verified(tmp_path, staged),
-                        Err(e) => eprintln!(
-                            "onelf-rt: assembled update failed its integrity check ({e}); \
+                    // download replaces the guess with certainty. Under the
+                    // unsigned policy a failure can also mean the release
+                    // changed between requests, which a full download
+                    // settles the same way.
+                    Err(e) if stats.reused > 0 || pubkey.is_none() => {
+                        eprintln!(
+                            "onelf-rt: assembled update failed verification ({e}); \
                              retrying with a full download"
-                        ),
-                    },
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("onelf-rt: update signature check failed: {e}");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(2);
+                    }
                 }
             }
             Err(why) => {
@@ -592,18 +625,20 @@ fn fetch_verified(
         }
     }
 
-    // Full download into the staging file already claimed above.
+    // Full download into the staging file already claimed above, no
+    // longer than the size the probe saw: a server streaming without end
+    // must not fill the disk before verification can refuse it.
     let mut staged = staged;
-    if let Err(e) = download_into(url, &mut staged) {
+    let downloaded = src.size().map_err(|e| e.to_string()).and_then(|size| {
+        let reader = src.fetch_whole().map_err(|e| e.to_string())?;
+        copy_into(reader, &mut staged, Some(size))
+    });
+    if let Err(e) = downloaded {
         eprintln!("onelf-rt: download update: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
     }
-    let verified = match pubkey {
-        Some(keys) => verify_update_signature(&staged, url, keys),
-        None => verify_unsigned(&staged),
-    };
-    if let Err(e) = verified {
+    if let Err(e) = verify(&staged) {
         eprintln!("onelf-rt: update verification failed: {e}");
         let _ = std::fs::remove_file(&tmp_path);
         return Err(2);
@@ -643,7 +678,7 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
     // freshness gate and race their renames, and the older release could
     // win. The lock sits on the running binary's inode and lives until
     // this process exits; the binding is held to the end of the function.
-    let _install_lock = match InstallLock::acquire(self_path) {
+    let install_lock = match InstallLock::acquire(self_path) {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!(
@@ -676,17 +711,24 @@ fn apply(self_path: &Path, url: &str, pubkey: Option<&[u8]>, current_revision: O
         return 0;
     }
 
-    let staged = match fetch_verified(self_path, url, pubkey, remote, &src) {
+    let staged = match fetch_verified(self_path, pubkey, remote, &src) {
         Ok(staged) => staged,
         Err(code) => return code,
     };
-    install_staged(self_path, local_id.as_ref(), current_revision, staged)
+    install_staged(
+        self_path,
+        &install_lock,
+        local_id.as_ref(),
+        current_revision,
+        staged,
+    )
 }
 
 /// Apply freshness and revision gates before creating a rollback copy or
 /// replacing the executable. The caller holds the install lock.
 fn install_staged(
     self_path: &Path,
+    lock: &InstallLock,
     local_id: Option<&[u8; 32]>,
     current_revision: Option<u64>,
     staged: StagedUpdate,
@@ -711,14 +753,16 @@ fn install_staged(
     // covers it under the signed policy, and a rolled-back build cannot
     // talk a client into installing itself again. The package-id
     // freshness check stands in for a running package without one.
-    let (downloaded_revision, downloaded_id) = staged_info(&staged_file);
-    let Some(downloaded_id) = downloaded_id else {
-        eprintln!(
-            "onelf-rt: the downloaded update is not a readable onelf package; \
-             refusing to install it"
-        );
-        let _ = std::fs::remove_file(&tmp_path);
-        return 2;
+    let StagedInfo {
+        id: downloaded_id,
+        revision: downloaded_revision,
+    } = match staged_info(&staged_file) {
+        Ok(info) => info,
+        Err(why) => {
+            eprintln!("onelf-rt: {why}; refusing to install it");
+            let _ = std::fs::remove_file(&tmp_path);
+            return 2;
+        }
     };
     if Some(&downloaded_id) == local_id {
         println!("already up to date ({})", hex(&downloaded_id));
@@ -731,11 +775,29 @@ fn install_staged(
         return 0;
     }
 
+    // The rollback copy and the mode come from the locked handle, so the
+    // name must still lead to it: a binary replaced since the lock was
+    // taken is someone else's install, not this one's to overwrite.
+    let locked = file_identity(&lock.file);
+    match std::fs::symlink_metadata(self_path) {
+        Ok(m) if locked.as_ref().is_ok_and(|&id| id == (m.dev(), m.ino())) => {}
+        _ => {
+            eprintln!(
+                "onelf-rt: {} changed during the update; refusing to replace it",
+                self_path.display()
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            return 2;
+        }
+    }
+
     // Preserve executable bit, through the pinned handle so a swapped-in
     // name never receives the running binary's mode. A failure here would
     // install a binary the system cannot run, so it fails the update
     // rather than the exec.
-    let mode = std::fs::metadata(self_path)
+    let mode = lock
+        .file
+        .metadata()
         .map(|m| m.permissions().mode())
         .unwrap_or(0o755);
     if let Err(e) = rustix::fs::fchmod(&staged_file, rustix::fs::Mode::from_bits_retain(mode)) {
@@ -750,7 +812,7 @@ fn install_staged(
     // known-good bytes, so a failure fails the update; it can be
     // retried.
     let prev_path = sibling_path(self_path, ".onelf-prev");
-    if let Err(e) = save_rollback(self_path, &prev_path) {
+    if let Err(e) = save_rollback(&lock.file, self_path, &prev_path) {
         eprintln!(
             "onelf-rt: cannot save rollback copy {}: {e}",
             prev_path.display()
@@ -864,20 +926,33 @@ fn streaming_agent(redirects: u32) -> ureq::Agent {
 /// build, which its hash verifies afterwards.
 pub fn download(url: &str, into: &Path) -> Result<(), String> {
     let mut file = std::fs::File::create(into).map_err(|e| format!("{}: {e}", into.display()))?;
-    download_into(url, &mut file)
-}
-
-/// Stream `url` into an open file from its start.
-fn download_into(url: &str, file: &mut std::fs::File) -> Result<(), String> {
     let response = streaming_agent(10)
         .get(url)
         .call()
         .map_err(|e| format!("{url}: {e}"))?;
-    let mut reader = response.into_body().into_reader();
-    file.set_len(0).map_err(|e| format!("{url}: {e}"))?;
+    copy_into(response.into_body().into_reader(), &mut file, None)
+        .map_err(|e| format!("{url}: {e}"))
+}
+
+/// Stream `reader` into `file` from its start, refusing a body longer
+/// than `limit` bytes.
+fn copy_into(
+    reader: impl Read,
+    file: &mut std::fs::File,
+    limit: Option<u64>,
+) -> Result<(), String> {
+    file.set_len(0).map_err(|e| e.to_string())?;
     file.seek(io::SeekFrom::Start(0))
-        .map_err(|e| format!("{url}: {e}"))?;
-    io::copy(&mut reader, file).map_err(|e| format!("{url}: {e}"))?;
+        .map_err(|e| e.to_string())?;
+    let limit = limit.unwrap_or(u64::MAX);
+    let copied =
+        io::copy(&mut reader.take(limit.saturating_add(1)), file).map_err(|e| e.to_string())?;
+    if copied > limit {
+        return Err(format!(
+            "the release is larger than the {limit} bytes it was probed at; \
+             it may have changed during the update, so run it again"
+        ));
+    }
     Ok(())
 }
 
@@ -971,7 +1046,8 @@ mod staging_tests {
         let prev = dir.join("app.onelf-prev");
         std::os::unix::fs::symlink(&victim, &prev).unwrap();
 
-        save_rollback(&self_path, &prev).unwrap();
+        let running = std::fs::File::open(&self_path).unwrap();
+        save_rollback(&running, &self_path, &prev).unwrap();
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
         assert!(!prev.symlink_metadata().unwrap().file_type().is_symlink());
@@ -1029,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn mmap_maps_file_contents_and_handles_empty() {
+    fn mmap_maps_file_contents_and_refuses_empty() {
         use super::Mmap;
         let dir = std::env::temp_dir().join(format!("onelf-mmap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1041,11 +1117,12 @@ mod tests {
         assert_eq!(map.as_slice(), &bytes[..]);
         drop(map);
 
-        // Empty files map to an empty slice without touching mmap.
+        // An empty file is refused rather than verified as a zero-byte
+        // message.
         let empty = dir.join("empty");
         std::fs::write(&empty, b"").unwrap();
         let empty_file = std::fs::File::open(&empty).unwrap();
-        assert!(Mmap::open(&empty_file).unwrap().as_slice().is_empty());
+        assert!(Mmap::open(&empty_file).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1085,6 +1162,17 @@ mod tests {
         // carrying both is refused rather than guessed about.
         assert_eq!(policy(None, true), Ok(None));
         assert!(policy(Some(keys), true).is_err());
+    }
+
+    #[test]
+    fn a_revision_that_is_not_a_number_is_an_error_not_an_absence() {
+        use super::parse_revision;
+
+        assert_eq!(parse_revision(b"7"), Ok(7));
+        assert_eq!(parse_revision(b" 12\n"), Ok(12));
+        for bad in [&b""[..], b"seven", b"-1", b"1.5", b"\xff"] {
+            assert!(parse_revision(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

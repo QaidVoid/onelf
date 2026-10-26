@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use onelf_format::reader::validate_footer;
 use onelf_format::{FOOTER_SIZE, Footer, Manifest};
 
-use super::streaming_agent;
+use super::{hardened_agent, streaming_agent};
 
 /// Why a fetch failed, and whether the caller can still get the release.
 #[derive(Debug)]
@@ -36,17 +36,31 @@ impl fmt::Display for FetchError {
     }
 }
 
-/// The bytes the updater needs from a remote release: its size, and any
-/// byte range of it. Implementations must be usable from `&self` because
-/// the stipplefs [`stipplefs::source::ByteSource`] reads through a shared
-/// reference.
+/// The bytes the updater needs from a remote release: its size, any byte
+/// range of it, the whole file, and its detached signature.
+/// Implementations must be usable from `&self` because the stipplefs
+/// [`stipplefs::source::ByteSource`] reads through a shared reference.
 pub(super) trait RangeSource: Send + Sync {
     /// Total size of the remote file in bytes.
     fn size(&self) -> Result<u64, FetchError>;
 
     /// Exactly `len` bytes starting at `start`. Short reads are an error.
     fn fetch_range(&self, start: u64, len: u64) -> Result<Box<dyn Read + '_>, FetchError>;
+
+    /// The whole release, for hosts without range support and for the
+    /// retry after a delta fails verification.
+    fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError>;
+
+    /// The detached signature published at the update URL plus `.sig`,
+    /// capped at [`SIG_MAX_BYTES`].
+    fn fetch_signature(&self) -> Result<Vec<u8>, FetchError>;
 }
+
+/// A detached signature is 64 bytes. The fetch is capped well above that
+/// so a server streaming something else is cut off before it can be
+/// buffered in full; `Signature::from_slice` then rejects every length
+/// but one.
+pub(super) const SIG_MAX_BYTES: u64 = 64 * 1024;
 
 /// A remote release over the hardened HTTPS client.
 ///
@@ -75,6 +89,22 @@ impl HttpsRangeSource {
             // kilobytes to whole releases, so they want the per-read
             // budget rather than a total for the transfer.
             agent: streaming_agent(10),
+            ranges: AtomicBool::new(true),
+            release: OnceLock::new(),
+        }
+    }
+
+    /// A source over plain HTTP, for loopback servers in tests. Production
+    /// always goes through [`HttpsRangeSource::new`], which is HTTPS only.
+    #[cfg(test)]
+    pub(super) fn over_plain_http(url: String) -> Self {
+        HttpsRangeSource {
+            url,
+            agent: ureq::Agent::config_builder()
+                .proxy(None)
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .build()
+                .new_agent(),
             ranges: AtomicBool::new(true),
             release: OnceLock::new(),
         }
@@ -121,31 +151,31 @@ impl RangeSource for HttpsRangeSource {
             // every ranged fetch: only a header naming `bytes 0-0` with
             // a well-formed total may have that total read.
             206 => {
-                let scoped = response
+                let total = response
                     .headers()
                     .get("content-range")
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| {
-                        v.strip_prefix("bytes 0-0/")
-                            .is_some_and(|total| !total.is_empty() && !total.contains('/'))
-                    });
-                if !scoped {
-                    return Err(FetchError::Other(format!(
-                        "{}: 206 without a `bytes 0-0/` Content-Range",
-                        self.url
-                    )));
-                }
-                let size = content_range_total(response.headers()).ok_or_else(|| {
-                    FetchError::Other(format!(
-                        "{}: 206 without a parseable Content-Range total",
-                        self.url
-                    ))
-                })?;
-                if size == 0 {
-                    return Err(FetchError::Other(
-                        "empty release in a 206 size probe".into(),
-                    ));
-                }
+                    .map(|v| scoped_total(v, 0, 0));
+                let size = match total {
+                    Some(Ok(Some(size))) if size > 0 => size,
+                    Some(Ok(Some(_))) => {
+                        return Err(FetchError::Other(
+                            "empty release in a 206 size probe".into(),
+                        ));
+                    }
+                    Some(Ok(None)) => {
+                        return Err(FetchError::Other(format!(
+                            "{}: 206 without a known Content-Range total",
+                            self.url
+                        )));
+                    }
+                    _ => {
+                        return Err(FetchError::Other(format!(
+                            "{}: 206 without a `bytes 0-0/` Content-Range",
+                            self.url
+                        )));
+                    }
+                };
                 Ok(self.remember(size, response.headers()))
             }
             200 => {
@@ -178,6 +208,9 @@ impl RangeSource for HttpsRangeSource {
             .agent
             .get(&self.url)
             .header("Range", format!("bytes={start}-{end}"));
+        // ureq carries Range and If-Range across redirects, so on a
+        // redirecting host the validator reaches the CDN whose answer to
+        // the probe it came from.
         if let Some(etag) = self.release.get().and_then(|r| r.etag.as_deref()) {
             request = request.header("If-Range", etag);
         }
@@ -208,6 +241,34 @@ impl RangeSource for HttpsRangeSource {
             Err(why) => Err(FetchError::Other(format!("{}: {why}", self.url))),
         }
     }
+
+    fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+        let response = self
+            .agent
+            .get(&self.url)
+            .call()
+            .map_err(|e| FetchError::Other(format!("{}: {e}", self.url)))?;
+        Ok(Box::new(response.into_body().into_reader()))
+    }
+
+    fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+        let sig_url = onelf_format::update::detached_sig_url(&self.url);
+        // Redirects are followed as for the package itself, over HTTPS
+        // only: release hosts such as GitHub answer every asset with a
+        // redirect to their CDN. A substituted body cannot pass the
+        // Ed25519 check, which is what guards the update.
+        let mut sig = Vec::new();
+        hardened_agent(10)
+            .get(&sig_url)
+            .call()
+            .map_err(|e| FetchError::Other(format!("fetch signature: {e}")))?
+            .into_body()
+            .into_reader()
+            .take(SIG_MAX_BYTES)
+            .read_to_end(&mut sig)
+            .map_err(|e| FetchError::Other(format!("read signature: {e}")))?;
+        Ok(sig)
+    }
 }
 
 /// What a response to a `bytes={start}-{end}` request means, from its
@@ -232,15 +293,12 @@ fn range_verdict(
                     "a 206 for bytes {start}-{end} carries no Content-Range header"
                 ));
             };
-            let header = header.trim();
-            let Some(total) = header.strip_prefix(&format!("bytes {start}-{end}/")) else {
+            let Ok(total) = scoped_total(header, start, end) else {
                 return Err(format!(
                     "a 206 for bytes {start}-{end} claims Content-Range {header:?}"
                 ));
             };
-            if end >= expected_total
-                || (total != "*" && total.parse::<u64>().ok() != Some(expected_total))
-            {
+            if end >= expected_total || total.is_some_and(|t| t != expected_total) {
                 return Err(format!(
                     "the release changed size or has an invalid Content-Range {header:?} \
                      (expected {expected_total} bytes)"
@@ -263,15 +321,18 @@ fn content_length(headers: &ureq::http::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// The total from a `Content-Range: bytes 0-0/12345` header.
-fn content_range_total(headers: &ureq::http::HeaderMap) -> Option<u64> {
-    let value = headers.get("content-range")?.to_str().ok()?;
-    let total = value.rsplit('/').next()?.trim();
+/// The total a `Content-Range` value names for exactly `start-end`:
+/// `Ok(None)` for the unknown total `*`, and an error for any other
+/// span, a multi-range answer or a malformed total.
+fn scoped_total(header: &str, start: u64, end: u64) -> Result<Option<u64>, ()> {
+    let total = header
+        .trim()
+        .strip_prefix(&format!("bytes {start}-{end}/"))
+        .ok_or(())?;
     if total == "*" {
-        None
-    } else {
-        total.parse().ok()
+        return Ok(None);
     }
+    total.parse().map(Some).map_err(|_| ())
 }
 
 /// Ceiling on any single range read the probe is willing to buffer. The
@@ -301,6 +362,11 @@ impl RemotePackage {
 /// Every later decision the delta planner makes rests on these bytes, so
 /// both are checked the same way the runtime checks a local package: the
 /// footer against the file size, the manifest against its checksum.
+///
+/// Nothing here can pin the requests to one release on a host without a
+/// strong ETag. A release republished at the same size while an update
+/// runs mixes two releases; verification after assembly refuses the
+/// result, and the next run sees the new release whole.
 pub(super) fn probe(src: &dyn RangeSource) -> Result<RemotePackage, FetchError> {
     let size = src.size()?;
     if size < FOOTER_SIZE as u64 {
@@ -388,6 +454,14 @@ mod tests {
                 self.data[start as usize..end as usize].to_vec(),
             )))
         }
+
+        fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+            Ok(Box::new(io::Cursor::new(self.data.to_vec())))
+        }
+
+        fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+            Err(FetchError::Other("the fake release is unsigned".into()))
+        }
     }
 
     /// A release that claims a size its bytes cannot back: the footer is
@@ -411,19 +485,34 @@ mod tests {
                 "the phantom release serves only its footer".into(),
             ))
         }
+
+        fn fetch_whole(&self) -> Result<Box<dyn Read + '_>, FetchError> {
+            Err(FetchError::Other(
+                "the phantom release serves only its footer".into(),
+            ))
+        }
+
+        fn fetch_signature(&self) -> Result<Vec<u8>, FetchError> {
+            Err(FetchError::Other(
+                "the phantom release serves only its footer".into(),
+            ))
+        }
     }
 
     #[test]
-    fn content_range_totals_parse_and_reject_unknown_lengths() {
-        let mut headers = ureq::http::HeaderMap::new();
-        headers.insert("content-range", "bytes 0-0/12345".parse().unwrap());
-        assert_eq!(content_range_total(&headers), Some(12345));
-
-        headers.insert("content-range", "bytes 0-0/*".parse().unwrap());
-        assert_eq!(content_range_total(&headers), None);
-
-        headers.insert("content-range", "nonsense".parse().unwrap());
-        assert_eq!(content_range_total(&headers), None);
+    fn scoped_totals_parse_only_the_requested_span() {
+        assert_eq!(scoped_total("bytes 0-0/12345", 0, 0), Ok(Some(12345)));
+        assert_eq!(scoped_total(" bytes 0-0/12345 ", 0, 0), Ok(Some(12345)));
+        assert_eq!(scoped_total("bytes 0-0/*", 0, 0), Ok(None));
+        for bad in [
+            "nonsense",
+            "bytes 1-1/12345",
+            "bytes 0-0/",
+            "bytes 0-0/12/34",
+            "bytes 0-0, 5-9/12345",
+        ] {
+            assert_eq!(scoped_total(bad, 0, 0), Err(()), "{bad}");
+        }
     }
 
     #[test]
@@ -492,16 +581,7 @@ mod tests {
             }
             requests
         });
-        let src = HttpsRangeSource {
-            url,
-            agent: ureq::Agent::config_builder()
-                .proxy(None)
-                .timeout_global(Some(std::time::Duration::from_secs(5)))
-                .build()
-                .new_agent(),
-            ranges: AtomicBool::new(true),
-            release: OnceLock::new(),
-        };
+        let src = HttpsRangeSource::over_plain_http(url);
         assert_eq!(src.size().unwrap(), 100);
         assert_eq!(src.size().unwrap(), 100, "the size probe must be cached");
         let mut bytes = Vec::new();
