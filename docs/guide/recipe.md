@@ -60,7 +60,7 @@ level = 19
 dict = false
 
 [update]
-url = "https://releases.example.com/amdgpu_top.onelf.zsync"
+url = "https://releases.example.com/amdgpu_top.onelf"
 
 [bundle]
 search-paths = ["${MUSL_LIBDRM}", "${MUSL_GCC}"]
@@ -122,17 +122,18 @@ entrypoint automatically.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | required | `https://` URL of the zsync control file |
-| `key` | path | none | 32-byte Ed25519 public key, or several concatenated as a keyring. Required for self-update. A secret key is refused |
+| `url` | string | required | `https://` URL of the release binary itself, where updates are fetched from |
+| `key` | path | none | 32-byte Ed25519 public key, or several concatenated as a keyring. Required for signed self-update. A secret key is refused |
 | `revision` | int | none | Release number. The runtime refuses an update that is not strictly newer |
+| `unsigned` | bool | `false` | Accept updates without signature verification, warning on stderr. Trusts the release server and cannot be combined with `key` |
 | `embed` | bool | `true` | Embed the updater. `false` records the URL for an external updater |
 
 The problem: `[update]` selects the update-capable runtime, which is
 considerably larger than the slim runtime (exact sizes in the
 [Self-Update size table](./self-update#size-tradeoff)), and self-update
-also needs `key`.
+also needs `key` or an explicit `unsigned = true` opt-in.
 
-- ❌ Self-update without `key`. The runtime refuses to update.
+- ❌ Self-update without `key` or `unsigned = true`. The runtime refuses to update.
 - ✅ `embed = false` when a package manager updates the package: the
   URL is recorded for an external updater and the slim runtime is kept.
 - ✅ The default `embed = true` when the package updates itself.

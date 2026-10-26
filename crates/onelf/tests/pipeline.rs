@@ -1544,7 +1544,7 @@ fn a_signature_verifies_against_the_key_the_package_embeds() {
     let o = Command::new(onelf())
         .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
         .args(["--command", "bin/run", "--mtime", "0"])
-        .args(["--update-url", "https://onelf.invalid/signed.onelf.zsync"])
+        .args(["--update-url", "https://onelf.invalid/signed.onelf"])
         .arg("--update-key")
         .arg(&public)
         .output()
@@ -1586,9 +1586,9 @@ fn a_signature_verifies_against_the_key_the_package_embeds() {
     assert_eq!(embedded, std::fs::read(&public).unwrap());
 
     // Named for the update URL, not the binary: the runtime appends
-    // `.sig` to the zsync URL it was given, so that is the only name it
+    // `.sig` to the update URL it was given, so that is the only name it
     // ever requests.
-    let sig_bytes = std::fs::read(td.join("signed.onelf.zsync.sig")).expect("signature");
+    let sig_bytes = std::fs::read(td.join("signed.onelf.sig")).expect("signature");
     let pk = ed25519_compact::PublicKey::from_slice(&embedded).expect("32-byte public key");
     let sig = ed25519_compact::Signature::from_slice(&sig_bytes).expect("64-byte signature");
     assert!(
@@ -1639,7 +1639,7 @@ fn a_revision_requested_at_pack_time_is_embedded_and_signature_covered() {
     let o = Command::new(onelf())
         .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
         .args(["--command", "bin/run", "--mtime", "0"])
-        .args(["--update-url", "https://onelf.invalid/rev.onelf.zsync"])
+        .args(["--update-url", "https://onelf.invalid/rev.onelf"])
         .arg("--update-key")
         .arg(&public)
         .args(["--update-revision", "7"])
@@ -1691,7 +1691,7 @@ fn a_revision_requested_at_pack_time_is_embedded_and_signature_covered() {
     // Flip a byte in the entry payload region after the name.
     let payload = at + needle.len() + 16;
     tampered[payload] ^= 0xff;
-    let sig_bytes = std::fs::read(td.join("rev.onelf.zsync.sig")).expect("signature");
+    let sig_bytes = std::fs::read(td.join("rev.onelf.sig")).expect("signature");
     let pk = ed25519_compact::PublicKey::from_slice(&std::fs::read(&public).unwrap()).unwrap();
     let sig = ed25519_compact::Signature::from_slice(&sig_bytes).unwrap();
     assert!(
@@ -1740,7 +1740,7 @@ fn a_keyring_accepts_a_signature_from_any_embedded_key() {
     let o = Command::new(onelf())
         .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
         .args(["--command", "bin/run", "--mtime", "0"])
-        .args(["--update-url", "https://onelf.invalid/ring.onelf.zsync"])
+        .args(["--update-url", "https://onelf.invalid/ring.onelf"])
         .arg("--update-key")
         .arg(&ring_path)
         .output()
@@ -1777,7 +1777,7 @@ fn a_keyring_accepts_a_signature_from_any_embedded_key() {
     // And the produced signature verifies explicitly against the key
     // that made it. `verify --key` checks the given keys, not the
     // package's embedded ring.
-    let sig = td.join("ring.onelf.zsync.sig");
+    let sig = td.join("ring.onelf.sig");
     assert!(sig.exists(), "signature not written next to the package");
     let o = Command::new(onelf())
         .arg("verify")
@@ -1839,7 +1839,7 @@ fn a_keyring_accepts_a_signature_from_any_embedded_key() {
     let o = Command::new(onelf())
         .args(["pack", app.to_str().unwrap(), "-o", bad.to_str().unwrap()])
         .args(["--command", "bin/run", "--mtime", "0"])
-        .args(["--update-url", "https://onelf.invalid/bad.onelf.zsync"])
+        .args(["--update-url", "https://onelf.invalid/bad.onelf"])
         .arg("--update-key")
         .arg(&junk)
         .output()
@@ -1869,7 +1869,7 @@ fn an_update_url_can_be_recorded_without_embedding_an_updater() {
     )
     .unwrap();
 
-    const URL: &str = "https://onelf.invalid/app.onelf.zsync";
+    const URL: &str = "https://onelf.invalid/app.onelf";
     let pack_one = |out: &Path, external: bool| {
         let mut cmd = Command::new(onelf());
         cmd.args(["pack", app.to_str().unwrap(), "-o", out.to_str().unwrap()])
@@ -1953,6 +1953,103 @@ fn an_update_url_can_be_recorded_without_embedding_an_updater() {
         !combined.contains("download") && !combined.contains("update available"),
         "an externally-updated package must not try to update: {combined}"
     );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The unsigned opt-in is explicit: `--update-unsigned` stores no key
+/// and marks the package, so its runtime installs whatever the release
+/// server serves, announcing that on stderr. A key and the marker
+/// contradict each other at the CLI, and the packer refuses the same
+/// combination reached through a recipe.
+#[test]
+fn an_unsigned_update_opt_in_marks_the_package_without_a_key() {
+    let td = workdir("unsigned");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho USG\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("unsigned.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/unsigned.onelf"])
+        .arg("--update-unsigned")
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The marker rides in the package and a key does not: the runtime
+    // reads the whole policy from the package's own bytes.
+    let marker = td.join("marker");
+    let o = Command::new(onelf())
+        .arg("extract")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&marker)
+        .args(["--file", ".onelf/update-unsigned"])
+        .output()
+        .expect("spawn onelf extract");
+    assert!(
+        o.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"true");
+
+    let key_probe = td.join("no-key");
+    let o = Command::new(onelf())
+        .arg("extract")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&key_probe)
+        .args(["--file", ".onelf/update-key"])
+        .output()
+        .expect("spawn onelf extract");
+    assert!(
+        !o.status.success(),
+        "an unsigned package must not carry a signing key"
+    );
+
+    // `info` names the policy; that is the supported way to audit a
+    // release before publishing it.
+    let o = Command::new(onelf())
+        .arg("info")
+        .arg(&pkg)
+        .output()
+        .expect("spawn onelf info");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains("not signature-verified"),
+        "info must disclose the unsigned policy: {stdout}"
+    );
+
+    // Key and marker contradict each other before any bytes are written.
+    let both = td.join("both.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", both.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--update-url", "https://onelf.invalid/both.onelf"])
+        .args(["--update-key", "/dev/null"])
+        .arg("--update-unsigned")
+        .output()
+        .expect("spawn onelf pack");
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!both.exists());
 
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -2338,6 +2435,7 @@ fn contradictory_pack_flags_are_refused() {
         vec!["--memfd", "--no-memfd"],
         vec!["--update-key", "/dev/null"],
         vec!["--update-revision", "3"],
+        vec!["--update-unsigned"],
     ] {
         let o = Command::new(onelf())
             .args(base)
@@ -3653,7 +3751,7 @@ fn self_update_refuses_without_a_signing_key() {
         .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
         .args(["--command", "bin/run", "--mtime", "0"])
         // A host that cannot resolve, so a request would say so distinctly.
-        .args(["--update-url", "https://onelf.invalid/app.zsync"])
+        .args(["--update-url", "https://onelf.invalid/app.onelf"])
         .output()
         .expect("spawn onelf pack");
     assert!(o.status.success());
@@ -3675,6 +3773,62 @@ fn self_update_refuses_without_a_signing_key() {
             !err.contains("resolve") && !err.contains("dns") && !err.contains("connect"),
             "{flag} must refuse before reaching the network, got: {err}"
         );
+    }
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A package packed with the unsigned opt-in passes the policy gate the
+/// keyless one stops at: both update commands warn that no signature is
+/// checked and go on to contact the release server, leaving the binary
+/// untouched when that fails.
+#[test]
+fn an_unsigned_package_warns_and_reaches_the_release_server() {
+    let td = workdir("unsigned-run");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&app.join("bin/run"), "#!/bin/sh\necho APP\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("unsigned.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        // A host that cannot resolve, so the request fails distinctly.
+        .args(["--update-url", "https://onelf.invalid/app.onelf"])
+        .arg("--update-unsigned")
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let before = std::fs::read(&pkg).unwrap();
+
+    for flag in ["--onelf-update", "--onelf-check-update"] {
+        let mut run = Command::new(&pkg);
+        run.arg(flag)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("verifies no update signatures"),
+            "{flag} must announce the unsigned policy, got: {err}"
+        );
+        assert!(
+            !err.contains("no signing key"),
+            "{flag} must not treat the opt-in as a missing key, got: {err}"
+        );
+        assert!(
+            err.contains("onelf.invalid"),
+            "{flag} must go on to contact the release server, got: {err}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{flag}: {err}");
+        assert_eq!(std::fs::read(&pkg).unwrap(), before);
     }
 
     let _ = std::fs::remove_dir_all(&td);
@@ -11253,7 +11407,7 @@ fn the_doctor_reports_without_running_or_leaving_anything() {
         .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
         .args(["--command", "bin/hello", "--name", "hello"])
         .args(["--host-libs", "always"])
-        .args(["--update-url", "https://example.invalid/hello.zsync"])
+        .args(["--update-url", "https://example.invalid/hello.onelf"])
         .args(["--update-key", keys.to_str().unwrap()])
         .args(["--update-revision", "7"])
         .output()
@@ -11294,7 +11448,7 @@ fn the_doctor_reports_without_running_or_leaving_anything() {
         );
         assert!(stdout.contains("would run"), "{stdout}");
         assert!(
-            stdout.contains("url: https://example.invalid/hello.zsync")
+            stdout.contains("url: https://example.invalid/hello.onelf")
                 && stdout.contains("signing keys: 2")
                 && stdout.contains("revision: 7"),
             "{stdout}"

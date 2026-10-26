@@ -31,7 +31,7 @@ features:
     details: A bundle carries glibc and the loader, so it runs on musl hosts and on distributions older or newer than the one it was built on.
   - icon: update
     title: Delta updates, signed
-    details: zsync-based self-update with an Ed25519 signature checked before a single byte is replaced. Or leave the updater out and let a package manager do it.
+    details: Self-update straight from the release binary, downloading only changed content, with an Ed25519 signature checked before a single byte is replaced. Or leave the updater out and let a package manager do it.
   - icon: recipe
     title: A recipe, not a ritual
     details: One onelf.toml captures the whole build. Same input, same bytes, on any machine, with SOURCE_DATE_EPOCH doing the rest.

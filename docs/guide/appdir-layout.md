@@ -43,7 +43,7 @@ myapp/
     ├── preload                  # libraries the onelf-env constructor dlopens
     ├── needs-setuid             # present when the app runs setuid binaries
     ├── prefetch                 # blocks a startup reads, from a profile
-    ├── update-url               # self-update zsync URL
+    ├── update-url               # self-update URL (names the release binary)
     ├── update-key               # public keys that may sign updates
     ├── update-revision          # release number for rollback protection
     ├── package-info.toml        # version, description, license

@@ -102,34 +102,44 @@ fn main() {
             Ok(s) => s.trim().to_string(),
             Err(_) => {
                 eprintln!("onelf-rt: update URL is not valid UTF-8");
-                std::process::exit(1);
+                std::process::exit(2);
             }
         };
-        // Self-update requires an embedded signing public key. A package
-        // with a URL but no key is refused rather than installing bytes
-        // that cannot be verified.
-        let Some(key_bytes) = read_package_file(&mut pkg, ".onelf/update-key") else {
-            eprintln!(
-                "onelf-rt: self-update disabled: package has an update URL but no \
-                 signing key (repack with --update-key)"
-            );
-            std::process::exit(1);
+        // The package's own metadata picks the policy: a signing keyring
+        // verifies every update, the unsigned opt-in skips verification
+        // loudly, and a URL with neither leaves self-update disabled. A
+        // package carrying both the key and the marker is not merely
+        // unconfigured but contradictory, so it exits 2 rather than the
+        // benign disabled 1.
+        let unsigned = read_package_file(&mut pkg, ".onelf/update-unsigned").is_some();
+        let key_bytes = read_package_file(&mut pkg, ".onelf/update-key");
+        let tampered = unsigned && key_bytes.is_some();
+        let key = match update::policy(key_bytes, unsigned) {
+            Ok(key) => key,
+            Err(why) => {
+                eprintln!("onelf-rt: {why}");
+                std::process::exit(if tampered { 2 } else { 1 });
+            }
         };
         let Some(self_path) = update::self_path() else {
             eprintln!("onelf-rt: cannot resolve /proc/self/exe");
-            std::process::exit(1);
+            std::process::exit(2);
         };
-        let current_revision =
-            read_package_file(&mut pkg, ".onelf/update-revision").and_then(|b| {
-                std::str::from_utf8(&b)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-            });
+        // A revision entry that does not read back as a number marks a
+        // broken package. Treating it as revisionless would let any
+        // release through the downgrade gate.
+        let current_revision = match update::package_revision(&mut pkg) {
+            Ok(rev) => rev,
+            Err(why) => {
+                eprintln!("onelf-rt: this package's {why}; refusing to update");
+                std::process::exit(2);
+            }
+        };
         std::process::exit(update::run(
             flag,
             &self_path,
             &url,
-            &key_bytes,
+            key.as_deref(),
             current_revision,
         ));
     }

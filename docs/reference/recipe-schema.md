@@ -130,10 +130,11 @@ small and separate from the payload).
 
 ```toml
 [update]
-url = "https://releases.example.com/myapp.onelf.zsync"   # must be https://
+url = "https://releases.example.com/myapp.onelf"   # must be https://, names the release binary
 key = "myapp.pub"      # optional path, required for self-update
 revision = 7           # optional release number; the runtime refuses non-newer downloads
 embed = true           # optional, false for an external updater
+unsigned = false       # optional, true accepts updates with no signature check
 ```
 
 When present, onelf selects the update-capable runtime, much larger
@@ -148,6 +149,12 @@ runtime refuses a download whose revision is not strictly newer than the
 running one, and a running package that has a revision refuses a
 download without one. `embed = false` records the URL and key but links
 the slim runtime, for packages updated by a package manager.
+`unsigned = true` is the opt-out from all of that verification: the
+package stores no key and embeds a `.onelf/update-unsigned` marker, and
+its runtime installs whatever the update URL serves, warning on stderr
+every time. HTTPS is still required, and `unsigned` cannot be combined
+with `key`. See
+[Opting out of signatures](../guide/self-update.md#opting-out-of-signatures).
 
 ## `[bundle]`
 

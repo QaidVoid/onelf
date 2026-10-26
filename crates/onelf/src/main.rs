@@ -116,6 +116,13 @@ enum Commands {
         #[arg(long, requires = "update_url")]
         update_revision: Option<u64>,
 
+        /// Accept unsigned self-updates: store no signing key and mark
+        /// the package (.onelf/update-unsigned) so its runtime installs
+        /// whatever the update URL serves, warning on stderr. HTTPS is
+        /// still required.
+        #[arg(long, requires = "update_url", conflicts_with = "update_key")]
+        update_unsigned: bool,
+
         /// What the launch resolver may take from the host: `never`
         /// nothing, `auto` the driver stack's closure, `always` any
         /// bundled soname. `auto` decides from the bundle's contents.
@@ -136,7 +143,7 @@ enum Commands {
         prefer_cache: bool,
 
         /// Record the update URL but do not embed the updater, linking the
-        /// slim runtime instead. Saves about 1.4 MB per package. For
+        /// slim runtime instead. Saves about 1.3 MB per package. For
         /// packages updated by a package manager or deployment system,
         /// where the package must not replace itself.
         #[arg(long)]
@@ -341,7 +348,7 @@ enum Commands {
 
         /// Where to write the signature (default: the update URL's file
         /// name with `.sig` appended, next to BINARY, or <BINARY>.sig when
-        /// the package has no update URL)
+        /// no name can be derived from the update URL)
         #[arg(short, long, value_name = "PATH")]
         output: Option<PathBuf>,
     },
@@ -696,6 +703,7 @@ fn main() {
             update_url,
             update_key,
             update_revision,
+            update_unsigned,
             no_embed_updater,
             host_libs,
             cache,
@@ -732,7 +740,17 @@ fn main() {
                      the slim runtime is already used when no update URL is set"
                 );
             }
-            let update_key = update_key.as_deref().map(std::fs::read).transpose();
+            let update_key = update_key
+                .as_deref()
+                .map(|path| {
+                    std::fs::read(path).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("--update-key {}: {e}", path.display()),
+                        )
+                    })
+                })
+                .transpose();
             let profile = prefetch.as_deref().map(pack::read_profile).transpose();
             match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),
@@ -759,6 +777,7 @@ fn main() {
                         embed_updater: !no_embed_updater,
                         update_key,
                         update_revision,
+                        update_unsigned,
                         exclude,
                         package_info: None,
                         mtime,
@@ -768,8 +787,8 @@ fn main() {
                         needs_setuid,
                         profile,
                     },
-                    // Pick the runtime: slim (~700KB) by default; the
-                    // update-capable runtime (~2MB) when the user configures
+                    // Pick the runtime: the slim one by default, the
+                    // update-capable one when the user configures
                     // self-updates or the package pins a GL build over HTTPS.
                     if (update_url.is_some() && !no_embed_updater) || pins_https {
                         RUNTIME_BINARY_UPDATE
@@ -1270,9 +1289,17 @@ fn run_build(
         .as_ref()
         .and_then(|u| u.key.clone())
         .map(|k| if k.is_absolute() { k } else { dir.join(k) })
-        .map(std::fs::read)
+        .map(|path| {
+            std::fs::read(&path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("recipe [update] key {}: {e}", path.display()),
+                )
+            })
+        })
         .transpose()?;
     let update_revision = recipe.update.as_ref().and_then(|u| u.revision);
+    let update_unsigned = recipe.update.as_ref().map(|u| u.unsigned).unwrap_or(false);
     let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
     let runtime: &[u8] = if (update_url.is_some() && embed_updater) || pins_https_build(&dir) {
         RUNTIME_BINARY_UPDATE
@@ -1317,6 +1344,7 @@ fn run_build(
             embed_updater,
             update_key,
             update_revision,
+            update_unsigned,
             exclude: recipe.package.exclude,
             package_info,
             mtime,

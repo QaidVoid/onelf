@@ -57,11 +57,14 @@ level = 19
 # Train a shared dictionary across blocks for better ratios.
 dict = false
 
-# Uncomment to enable self-updates. Host the .zsync file (produced by
-# `zsyncmake`) at this URL. Packages with updates enabled use a larger
-# runtime (about 1.4 MB more).
+# Uncomment to enable self-updates. Host the release binary at this URL;
+# `onelf sign` names the signature to upload beside it. Packages with
+# updates enabled use a larger runtime (about 1.3 MB more).
 # [update]
-# url = "https://example.com/{name}.onelf.zsync"
+# url = "https://example.com/{name}.onelf"
+# key = "myapp.pub"
+# revision = 1
+# unsigned = true  # updates with no signature check; conflicts with key
 
 [bundle]
 # Pass ["auto"] to detect, or list the bundle's library directories.

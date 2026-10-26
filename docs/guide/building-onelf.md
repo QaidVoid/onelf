@@ -49,9 +49,8 @@ silently. Three capabilities gate skips:
   namespaces or a working `fusermount3` plus `/dev/fuse`. Three tests
   additionally require the `fusermount3` binary on `PATH`.
 
-Nothing else is required: the suite never invokes `zsyncmake`,
-`appstreamcli`, or `bash`, and plain `/bin/sh` scripts stand in for
-applications.
+Nothing else is required: the suite never invokes `appstreamcli` or
+`bash`, and plain `/bin/sh` scripts stand in for applications.
 
 ## `CI` makes skips failures
 

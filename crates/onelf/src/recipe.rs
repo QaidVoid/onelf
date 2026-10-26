@@ -18,7 +18,7 @@
 //! dict = true
 //!
 //! [update]
-//! url = "https://example.com/myapp.onelf.zsync"
+//! url = "https://example.com/myapp.onelf"
 //!
 //! [bundle]
 //! search-paths = ["${MUSL_LIBDRM}/lib"]
@@ -278,6 +278,11 @@ pub struct Update {
     /// `.onelf/update-revision`. The runtime refuses downloads that are
     /// not strictly newer than the running revision.
     pub revision: Option<u64>,
+    /// Accept unsigned self-updates: the package stores no signing key
+    /// and its runtime installs whatever the update URL serves,
+    /// warning on stderr every time. HTTPS is still required.
+    #[serde(default)]
+    pub unsigned: bool,
     /// Embed the update-capable runtime. Defaults to true. False records
     /// the URL and key but links the slim runtime, for packages updated
     /// by a package manager rather than by themselves.

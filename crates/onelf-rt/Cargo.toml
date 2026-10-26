@@ -8,17 +8,22 @@ repository.workspace = true
 
 [features]
 default = []
-update = ["dep:zsync-rs", "dep:ed25519-compact", "dep:ureq"]
+update = ["dep:ed25519-compact", "dep:ureq", "xxhash-rust/xxh3"]
 
 [dependencies]
 onelf-format = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["rand"] }
 goblin = { workspace = true }
 zstd = { workspace = true }
-zsync-rs = { version = "0.1.4", optional = true }
+# Already linked through onelf-format's payload codec; named directly so
+# the delta updater can open a stipplefs image over range fetches.
+stipplefs = { workspace = true, features = ["read", "zstd"] }
 # Update-only: verify-only Ed25519 for signed self-update, and ureq to
-# fetch the detached signature. Kept out of the slim runtime.
+# fetch the release over HTTPS. Kept out of the slim runtime.
 ed25519-compact = { version = "2", optional = true }
 ureq = { version = "3", optional = true, features = ["platform-verifier"] }
+
+[dev-dependencies]
+stipplefs = { workspace = true, features = ["read", "write", "zstd"] }
