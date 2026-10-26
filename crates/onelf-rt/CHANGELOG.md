@@ -1,4 +1,20 @@
 
+## [0.5.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.2...onelf-rt-v0.5.0) - 2026-10-29
+
+### ⛰️  Features
+
+- *(rt)* [**breaking**] Delta-update compressed stipple payloads - ([57df6b1](https://github.com/QaidVoid/onelf/commit/57df6b132f36be891a481c591bb0a52792db9269))
+- [**breaking**] Replace zsync with direct-release delta self-updates ([#41](https://github.com/QaidVoid/onelf/pull/41)) - ([cd99efb](https://github.com/QaidVoid/onelf/commit/cd99efbe9463d0d80b23937968177d0c980843e0))
+- Integrate every entrypoint that has a menu entry - ([08a39bd](https://github.com/QaidVoid/onelf/commit/08a39bded09cd39816368b40ec5070d1dcff8208))
+
+### ⚡ Performance
+
+- *(rt)* Fetch remote stipple metadata in one range - ([62a1664](https://github.com/QaidVoid/onelf/commit/62a1664489dcba16e64670a2aa9c1dfdd1ba113c))
+
+### 🧪 Testing
+
+- *(rt)* Seed the delta tests' noise distinctly - ([37430ae](https://github.com/QaidVoid/onelf/commit/37430ae21bf06deedb23afec8bf5ebc05e63e11f))
+
 ## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.1...onelf-rt-v0.4.2) - 2026-10-21
 
 ### ⛰️  Features

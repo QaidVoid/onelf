@@ -1,4 +1,21 @@
 
+## [0.5.0](https://github.com/QaidVoid/onelf/compare/0.4.2...0.5.0) - 2026-10-29
+
+### ⛰️  Features
+
+- *(rt)* [**breaking**] Delta-update compressed stipple payloads - ([57df6b1](https://github.com/QaidVoid/onelf/commit/57df6b132f36be891a481c591bb0a52792db9269))
+- [**breaking**] Replace zsync with direct-release delta self-updates ([#41](https://github.com/QaidVoid/onelf/pull/41)) - ([cd99efb](https://github.com/QaidVoid/onelf/commit/cd99efbe9463d0d80b23937968177d0c980843e0))
+- Integrate every entrypoint that has a menu entry - ([08a39bd](https://github.com/QaidVoid/onelf/commit/08a39bded09cd39816368b40ec5070d1dcff8208))
+
+### 🐛 Bug Fixes
+
+- *(rt)* Farm what the host's DRI driver modules need - ([1f12826](https://github.com/QaidVoid/onelf/commit/1f12826072f5c6feef8a91f19454860aabaf1169))
+- *(rt)* Farm the host's GLX vendor libraries - ([1db8d66](https://github.com/QaidVoid/onelf/commit/1db8d663d5823db0a03bbf50ba94ae40f90717fc))
+
+### ⚡ Performance
+
+- *(pack)* Stop training a stipple dictionary - ([9d94dc8](https://github.com/QaidVoid/onelf/commit/9d94dc8b2c395803ea80d079065f6abb8ebd37f5))
+
 ## [0.4.2](https://github.com/QaidVoid/onelf/compare/0.4.1...0.4.2) - 2026-10-21
 
 ### ⛰️  Features
