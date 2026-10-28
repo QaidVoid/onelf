@@ -177,9 +177,14 @@ reads each slice through it. The slice's BLAKE3 is checked exactly as a
 decompressed block's is, so the manifest remains what a package's
 integrity rests on, and the image's own XXH3 checksums are a second line.
 `--block-size` sets the image's block size, a power of two up to 64 MiB
-and 32 MiB unless chosen, while slices stay 64 KiB. `HAS_DICT` is never set: the image trains its
-own dictionary for blocks up to 1 MiB. A reader that predates the flag
-fails every hash check rather than serving wrong bytes.
+and 32 MiB unless chosen, while slices stay 64 KiB. A compressed image
+uses stipplefs variable blocks: each ends where the content says to and
+`--block-size` is the largest it may be, so unchanged content keeps its
+blocks across releases for [delta updates](../guide/self-update). `HAS_DICT` is never set: the image trains its
+own dictionary for blocks up to 1 MiB. A onelf reader that predates the
+`STIPPLE_PAYLOAD` flag fails every hash check rather than serving wrong
+bytes, and a stipplefs reader that predates variable blocks refuses the
+image when it opens it.
 
 ## Reading a packed file
 

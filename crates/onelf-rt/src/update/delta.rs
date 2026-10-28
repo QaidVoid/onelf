@@ -15,12 +15,15 @@
 //!   mismatch degrades that one block to a fetch.
 //! - **Stipplefs images**: the image is planned from its own metadata,
 //!   which is fetched from the release in a handful of small requests.
-//!   Only fully stored images (built with `--no-compress`) are eligible:
-//!   a compressed image re-encodes unchanged content against a dictionary
-//!   retrained for every build, so its stored bytes are not stable across
-//!   builds and nothing shorter than the whole payload can be reused.
-//!   Stored images copy at slice granularity through the extent table,
-//!   which follows the content wherever the image's layout put it.
+//!   Fully stored images (built with `--no-compress`) copy at slice
+//!   granularity through the extent table, which follows the content
+//!   wherever the image's layout put it. Compressed images copy whole
+//!   blocks, matched by the digests in the block index, and need
+//!   content-defined blocks on both sides: a block cut at a fixed stream
+//!   offset changes whenever anything before it grows or shrinks, so its
+//!   compressed bytes are not stable across builds. A block coded against
+//!   the image's dictionary, which is retrained for every build, never
+//!   matches either.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -76,11 +79,7 @@ pub(super) fn assemble(
     let (reused, fetched) = write_plan(staged, &local.file, remote, &plan, dict, src)?;
     Ok(Stats {
         reused,
-        unit: if remote.footer.is_stipple() {
-            "slices"
-        } else {
-            "blocks"
-        },
+        unit: plan.unit,
         fetched,
     })
 }
@@ -97,15 +96,20 @@ struct CopyRange {
 /// slice may straddle stored blocks and arrive as several.
 struct CopyGroup {
     ranges: Vec<CopyRange>,
-    /// BLAKE3 the copied bytes must hash to.
-    hash: [u8; 32],
-    /// The bytes are the content (stored payloads): hash them directly.
-    /// Otherwise they are compressed and decoded with `original` and the
-    /// dictionary first.
-    raw: bool,
-    /// The block's decompressed size, already passed through the loader's
-    /// ceiling.
-    original: usize,
+    check: Check,
+}
+
+/// What the copied bytes of a group must prove before they are written.
+enum Check {
+    /// The bytes are the content (stored payloads) and hash to this BLAKE3.
+    Raw([u8; 32]),
+    /// The bytes are a compressed block whose decoded content hashes to
+    /// `hash`. `original` is its decompressed size, already passed through
+    /// the loader's ceiling.
+    Decoded { hash: [u8; 32], original: usize },
+    /// The bytes are a stipplefs block's stored bytes and the digest that
+    /// follows them, and both match the release's block index.
+    Block(u64),
 }
 
 /// A contiguous remote span to download.
@@ -128,6 +132,8 @@ struct Plan {
     /// staged file once every byte is in place rather than fetched: a
     /// request per block would cost more than all the content.
     digests: Vec<(u64, u64)>,
+    /// What a copy group is, for the summary: a block or a slice.
+    unit: &'static str,
 }
 
 enum Prefix {
@@ -319,13 +325,19 @@ fn plan_blocks(
                         src: *src,
                         len,
                     }],
-                    hash: block.content_hash,
-                    raw: remote.footer.is_stored(),
-                    // The loader's own ceiling, not the manifest's raw
-                    // number: a crafted `original_size` must fail the plan
-                    // cleanly instead of reaching the decoder's allocator.
-                    original: onelf_format::reader::block_original_size(block)
-                        .map_err(|e| format!("plan the delta: {e}"))?,
+                    check: if remote.footer.is_stored() {
+                        Check::Raw(block.content_hash)
+                    } else {
+                        Check::Decoded {
+                            hash: block.content_hash,
+                            // The loader's own ceiling, not the manifest's
+                            // raw number: a crafted `original_size` must
+                            // fail the plan cleanly instead of reaching the
+                            // decoder's allocator.
+                            original: onelf_format::reader::block_original_size(block)
+                                .map_err(|e| format!("plan the delta: {e}"))?,
+                        }
+                    },
                 });
             } else {
                 extend_fetch(&mut fetch, dst, len);
@@ -339,6 +351,7 @@ fn plan_blocks(
         copies,
         fetch,
         digests: Vec::new(),
+        unit: "blocks",
     };
     Ok(plan)
 }
@@ -372,23 +385,21 @@ impl ByteSource for FetchingSource<'_> {
     }
 }
 
-/// Every block in the image is stored raw. Compressed blocks re-encode
-/// unchanged content against a dictionary retrained per build, so their
-/// stored bytes are useless for cross-build reuse.
-fn all_stored(reader: &Reader<'_>, what: &str) -> Result<(), String> {
+/// Every block in the image is stored raw, so content can be copied at
+/// any granularity.
+fn all_stored(reader: &Reader<'_>) -> bool {
     let blocks = reader.blocks();
-    for i in 0..blocks.count() {
-        let entry = blocks
+    (0..blocks.count()).all(|i| {
+        blocks
             .get(i)
-            .ok_or_else(|| format!("{what}: block {i} is outside the block index"))?;
-        if entry.codec != stipplefs::format::Codec::Stored {
-            return Err(format!(
-                "{what}: the stipplefs image compresses its blocks, so its bytes are \
-                 not stable across builds; only --no-compress images delta-update"
-            ));
-        }
-    }
-    Ok(())
+            .is_some_and(|e| e.codec == stipplefs::format::Codec::Stored)
+    })
+}
+
+/// The image ends its blocks where the content says to, so unchanged
+/// content sits in identical blocks across builds.
+fn variable_blocks(reader: &Reader<'_>) -> bool {
+    reader.superblock().flags & stipplefs::format::FLAG_VARIABLE_BLOCKS != 0
 }
 
 /// The absolute package-file ranges holding `len` bytes of a file's
@@ -403,10 +414,6 @@ fn slice_stored_ranges(
     len: u64,
     what: &str,
 ) -> Result<Vec<Range<u64>>, String> {
-    let block_size = reader.superblock().block_size as u64;
-    if block_size == 0 {
-        return Err(format!("{what}: the image declares no block size"));
-    }
     let end = file_off
         .checked_add(len)
         .ok_or_else(|| format!("{what}: the file range overflows the image"))?;
@@ -430,9 +437,10 @@ fn slice_stored_ranges(
             .checked_add(stop - ext_off)
             .ok_or_else(|| format!("{what}: an extent end overflows the image"))?;
         while at < stream_end {
-            let within_block = at % block_size;
-            let index = u32::try_from(at / block_size)
-                .map_err(|_| format!("{what}: the image holds too many blocks"))?;
+            let (index, within_block) = reader
+                .blocks()
+                .locate(at)
+                .ok_or_else(|| format!("{what}: stream byte {at} is outside every block"))?;
             let entry = reader
                 .blocks()
                 .get(index)
@@ -440,7 +448,7 @@ fn slice_stored_ranges(
             if entry.codec != stipplefs::format::Codec::Stored {
                 return Err(format!("{what}: a compressed block cannot be copied"));
             }
-            let count = (block_size - within_block).min(stream_end - at);
+            let count = (u64::from(entry.decoded_length) - within_block).min(stream_end - at);
             if u64::from(entry.stored_length) < within_block + count {
                 return Err(format!("{what}: block {index} is shorter than its content"));
             }
@@ -498,7 +506,6 @@ fn plan_stipple(
     let Codec::Stipple(local_reader) = &local.codec else {
         return Err("the running package is not a stipple payload".into());
     };
-    all_stored(local_reader, "the running package")?;
 
     // The remote image's metadata: a superblock and a handful of small
     // sections, each its own range request. No data block is read here.
@@ -515,8 +522,32 @@ fn plan_stipple(
     let remote_reader = image
         .reader()
         .map_err(|e| format!("read the release image: {e}"))?;
-    all_stored(&remote_reader, "the release")?;
 
+    match (all_stored(local_reader), all_stored(&remote_reader)) {
+        (true, true) => plan_stipple_slices(local, local_reader, remote, &remote_reader),
+        (false, false) if !variable_blocks(&remote_reader) => Err(
+            "the release compresses fixed-size stipplefs blocks, whose bytes shift \
+             between builds"
+                .into(),
+        ),
+        (false, false) if !variable_blocks(local_reader) => Err(
+            "the running package compresses fixed-size stipplefs blocks, which the \
+             release's content-defined blocks cannot match"
+                .into(),
+        ),
+        (false, false) => plan_stipple_blocks(local, local_reader, remote, &remote_reader),
+        _ => Err("the update changes whether the stipplefs payload is compressed".into()),
+    }
+}
+
+/// A fully stored image on both sides: copy content slice by slice through
+/// each image's extent table.
+fn plan_stipple_slices(
+    local: &crate::loader::PackageData,
+    local_reader: &Reader<'_>,
+    remote: &RemotePackage,
+    remote_reader: &Reader<'_>,
+) -> Result<Plan, String> {
     // Content hash to the local file's inode and file offset.
     let mut local_slices: HashMap<[u8; 32], (u32, u64, u64)> = HashMap::new();
     for entry in &local.manifest.entries {
@@ -558,7 +589,7 @@ fn plan_stipple(
                 continue;
             }
             let dst = slice_stored_ranges(
-                &remote_reader,
+                remote_reader,
                 remote.footer.payload_offset,
                 ino_r,
                 block.payload_offset,
@@ -577,11 +608,7 @@ fn plan_stipple(
             taken.extend(ranges.iter().map(|r| r.dst..r.dst + r.len));
             copies.push(CopyGroup {
                 ranges,
-                hash: block.content_hash,
-                // Raw groups hash the copied bytes directly, so the
-                // decoded size is never consulted.
-                raw: true,
-                original: len as usize,
+                check: Check::Raw(block.content_hash),
             });
         }
     }
@@ -617,8 +644,78 @@ fn plan_stipple(
         copies,
         fetch,
         digests,
+        unit: "slices",
     };
     Ok(plan)
+}
+
+/// Content-defined compressed blocks on both sides: copy every release
+/// block whose stored bytes the running package already holds, matched by
+/// the digest, lengths and codec its block index records.
+fn plan_stipple_blocks(
+    local: &crate::loader::PackageData,
+    local_reader: &Reader<'_>,
+    remote: &RemotePackage,
+    remote_reader: &Reader<'_>,
+) -> Result<Plan, String> {
+    type Key = (u64, u32, u32, u8);
+    let key = |e: &stipplefs::read::BlockEntry, what: &str| -> Result<Key, String> {
+        let digest = e
+            .digest
+            .ok_or_else(|| format!("{what}: a block index entry records no digest"))?;
+        Ok((digest, e.stored_length, e.decoded_length, e.codec.id()))
+    };
+
+    let mut local_blocks: HashMap<Key, u64> = HashMap::new();
+    let blocks = local_reader.blocks();
+    for i in 0..blocks.count() {
+        let entry = blocks
+            .get(i)
+            .ok_or_else(|| format!("the running package: block {i} is outside its index"))?;
+        local_blocks
+            .entry(key(&entry, "the running package")?)
+            .or_insert(local.footer.payload_offset + entry.image_offset);
+    }
+
+    let payload_start = remote.footer.payload_offset;
+    let payload_end = payload_start + remote.footer.payload_size;
+    let mut copies = Vec::new();
+    let mut taken = Vec::new();
+    // Release blocks must follow one another without overlapping, which
+    // also bounds the copying planned here by the size of the payload, so
+    // a crafted index cannot multiply it.
+    let mut after = payload_start;
+    let blocks = remote_reader.blocks();
+    for i in 0..blocks.count() {
+        let entry = blocks
+            .get(i)
+            .ok_or_else(|| format!("the release: block {i} is outside its index"))?;
+        let len = u64::from(entry.stored_length) + 8;
+        let dst = payload_start.checked_add(entry.image_offset);
+        let fits = |d: u64| d >= after && d.checked_add(len).is_some_and(|e| e <= payload_end);
+        let Some(dst) = dst.filter(|&d| fits(d)) else {
+            return Err(format!(
+                "the release: block {i} overlaps another or its image"
+            ));
+        };
+        after = dst + len;
+        if let Some(&src) = local_blocks.get(&key(&entry, "the release")?) {
+            taken.push(dst..dst + len);
+            copies.push(CopyGroup {
+                ranges: vec![CopyRange { dst, src, len }],
+                check: Check::Block(entry.digest.unwrap_or_default()),
+            });
+        }
+    }
+
+    Ok(Plan {
+        prefix: prefix_plan(&local.footer, &local.manifest, remote),
+        dict: None,
+        copies,
+        fetch: complement(payload_start, payload_end, taken),
+        digests: Vec::new(),
+        unit: "blocks",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -703,12 +800,19 @@ fn write_group(
             .read_exact_at(&mut bytes[at..], range.src)
             .map_err(|e| format!("read the running binary at {}: {e}", range.src))?;
     }
-    let ok = if group.raw {
-        blake3::hash(bytes).as_bytes() == &group.hash
-    } else {
-        match crate::loader::decode_block(bytes, group.original, dict) {
-            Ok(decoded) => blake3::hash(&decoded).as_bytes() == &group.hash,
-            Err(_) => false,
+    let ok = match group.check {
+        Check::Raw(hash) => blake3::hash(bytes).as_bytes() == &hash,
+        Check::Decoded { hash, original } => {
+            match crate::loader::decode_block(bytes, original, dict) {
+                Ok(decoded) => blake3::hash(&decoded).as_bytes() == &hash,
+                Err(_) => false,
+            }
+        }
+        Check::Block(digest) => {
+            bytes.len() >= 8 && {
+                let (stored, trailing) = bytes.split_at(bytes.len() - 8);
+                trailing == digest.to_le_bytes() && xxhash_rust::xxh3::xxh3_64(stored) == digest
+            }
         }
     };
     if !ok {
@@ -1063,17 +1167,26 @@ mod tests {
         finish_package(prefix, &manifest, &payload, dict, flags)
     }
 
+    /// How a test stipplefs image stores its blocks.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Layout {
+        /// Every block stored raw, as `--no-compress` packs.
+        Stored,
+        /// Compressed fixed-size blocks against a trained dictionary, as
+        /// packages built before content-defined blocks were.
+        Fixed,
+        /// Compressed content-defined blocks, as the packer now writes.
+        Variable,
+    }
+
     /// Build a `STIPPLE_PAYLOAD` package the way the packer does: write
     /// the stipplefs image, then describe it with one manifest slice per
     /// 64 KiB of every file.
-    fn build_stipple_package(
-        prefix: &[u8],
-        files: &[(&str, Vec<u8>)],
-        stored_only: bool,
-    ) -> Vec<u8> {
+    fn build_stipple_package(prefix: &[u8], files: &[(&str, Vec<u8>)], layout: Layout) -> Vec<u8> {
         use stipplefs::format::Codec;
         use stipplefs::write::{Builder, FileOrder, Node, Options, Timestamps};
 
+        let stored_only = layout == Layout::Stored;
         let codecs = if stored_only {
             Codec::Stored.bit()
         } else {
@@ -1088,11 +1201,16 @@ mod tests {
             chunk_average: 4096,
             codecs,
             level: 3,
-            dictionary_size: if stored_only { 0 } else { 112 * 1024 },
+            dictionary_size: if layout == Layout::Fixed {
+                112 * 1024
+            } else {
+                0
+            },
             threads: 1,
             memory_limit: None,
             timestamps: Timestamps::Clamp,
             compress_metadata: !stored_only,
+            variable_blocks: layout == Layout::Variable,
         })
         .expect("stipple builder");
         builder.set_order(FileOrder::Extension);
@@ -1262,8 +1380,9 @@ mod tests {
         for package in [
             build_blocks_package(&prefix, &files, None),
             build_blocks_package(&prefix, &files, Some(b"shared dictionary")),
-            build_stipple_package(&prefix, &files, true),
-            build_stipple_package(&prefix, &files, false),
+            build_stipple_package(&prefix, &files, Layout::Stored),
+            build_stipple_package(&prefix, &files, Layout::Fixed),
+            build_stipple_package(&prefix, &files, Layout::Variable),
         ] {
             let path = stage.dir.join("staged");
             std::fs::write(&path, &package).unwrap();
@@ -1669,12 +1788,12 @@ mod tests {
                 ("bin/app", stable.clone()),
                 ("share/data", vec![1u8; 50_000]),
             ],
-            true,
+            Layout::Stored,
         );
         let remote = build_stipple_package(
             &prefix,
             &[("bin/app", stable), ("share/data", vec![9u8; 50_000])],
-            true,
+            Layout::Stored,
         );
 
         let (out, stats, remote_pkg) = stage.run(&local, &remote).expect("assemble");
@@ -1689,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn compressed_stipple_images_are_refused() {
+    fn fixed_block_compressed_stipple_images_are_refused() {
         let stage = Stage::new("stipple-zstd");
         let prefix = fake_prefix(7);
         let local = build_stipple_package(
@@ -1698,7 +1817,7 @@ mod tests {
                 "bin/app",
                 (0..300_000u32).map(|i| (i * 3 % 251) as u8).collect(),
             )],
-            false,
+            Layout::Fixed,
         );
         let remote = build_stipple_package(
             &prefix,
@@ -1706,7 +1825,7 @@ mod tests {
                 "bin/app",
                 (0..300_000u32).map(|i| (i * 5 % 251) as u8).collect(),
             )],
-            false,
+            Layout::Fixed,
         );
 
         let err = stage.run_err(&local, &remote);
@@ -1724,8 +1843,8 @@ mod tests {
         let len = 300_000u32;
         let refs: Vec<(&str, Vec<u8>)> =
             vec![("bin/app", (0..len).map(|i| (i * 11 % 251) as u8).collect())];
-        let local = build_stipple_package(&fake_prefix(8), &refs, true);
-        let remote = build_stipple_package(&fake_prefix(9), &refs, true);
+        let local = build_stipple_package(&fake_prefix(8), &refs, Layout::Stored);
+        let remote = build_stipple_package(&fake_prefix(9), &refs, Layout::Stored);
 
         let (out, stats, remote_pkg) = stage.run(&local, &remote).expect("assemble");
         assert_eq!(out, remote);
@@ -1788,12 +1907,12 @@ mod tests {
                     ("bin/app", stable.clone()),
                     ("share/data", vec![1u8; 50_000]),
                 ],
-                true,
+                Layout::Stored,
             );
             let remote = build_stipple_package(
                 &prefix,
                 &[("bin/app", stable), ("share/data", vec![9u8; 50_000])],
-                true,
+                Layout::Stored,
             );
             let local_path = stage.dir.join("local");
             std::fs::write(&local_path, local).unwrap();
@@ -1821,6 +1940,136 @@ mod tests {
         let (large, reused) = requests(16 << 20);
         assert!(large < small + 8, "{small} requests grew to {large}");
         assert!(reused >= 256, "only {reused} slices were copied");
+    }
+
+    /// Bytes from a sixteen-letter alphabet: they compress, so the image
+    /// keeps compressed blocks, but never repeat, so every chunk is its own.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"etaoinshrdlucmfw"[(x >> 24) as usize & 15]
+            })
+            .collect()
+    }
+
+    type Tree = Vec<(&'static str, Vec<u8>)>;
+
+    /// A tree whose first file in the image grows in the release, shifting
+    /// everything placed after it.
+    fn shifted_trees(stable_len: usize) -> (Tree, Tree) {
+        let first = noise(1, 200_000);
+        let mut grown = first.clone();
+        grown.splice(100_000..100_000, noise(2, 5_000));
+        let rest = [
+            ("lib/b.bin", noise(3, stable_len)),
+            ("lib/c.bin", noise(4, 300_000)),
+        ];
+        let mut local = vec![("lib/a.bin", first)];
+        local.extend(rest.iter().cloned());
+        let mut remote = vec![("lib/a.bin", grown)];
+        remote.extend(rest);
+        (local, remote)
+    }
+
+    #[test]
+    fn compressed_stipple_images_delta_across_builds() {
+        let stage = Stage::new("stipple-variable");
+        let prefix = fake_prefix(13);
+        let (local, remote) = shifted_trees(1_000_000);
+        let local = build_stipple_package(&prefix, &local, Layout::Variable);
+        let remote = build_stipple_package(&prefix, &remote, Layout::Variable);
+
+        let (out, stats, remote_pkg) = stage.run(&local, &remote).expect("assemble");
+        assert_eq!(out, remote);
+        assert_eq!(stats.unit, "blocks");
+        assert!(stats.reused > 0, "no block was copied");
+        assert!(
+            stats.fetched < remote_pkg.footer.payload_size / 4,
+            "fetched {} of {} payload bytes after a 5 KB insertion",
+            stats.fetched,
+            remote_pkg.footer.payload_size
+        );
+    }
+
+    #[test]
+    fn a_fixed_running_package_cannot_seed_a_variable_release() {
+        let stage = Stage::new("stipple-fixed-to-variable");
+        let prefix = fake_prefix(14);
+        let (local, remote) = shifted_trees(100_000);
+        let local = build_stipple_package(&prefix, &local, Layout::Fixed);
+        let remote = build_stipple_package(&prefix, &remote, Layout::Variable);
+        let err = stage.run_err(&local, &remote);
+        assert!(err.contains("fixed-size"), "{err}");
+    }
+
+    #[test]
+    fn a_corrupt_copied_stipple_block_is_fetched_instead() {
+        let stage = Stage::new("stipple-corrupt");
+        let prefix = fake_prefix(15);
+        let (local, remote) = shifted_trees(1_000_000);
+        let mut local = build_stipple_package(&prefix, &local, Layout::Variable);
+        let remote = build_stipple_package(&prefix, &remote, Layout::Variable);
+        let (_, clean, _) = stage.run(&local, &remote).expect("assemble");
+        assert_eq!(clean.unit, "blocks");
+
+        // Flip a byte in the running package's last block, which the
+        // release shares: the copy must fail its digest and be fetched.
+        let footer = probe(&FakeSource {
+            data: Arc::new(local.clone()),
+        })
+        .unwrap()
+        .footer;
+        let payload =
+            footer.payload_offset as usize..(footer.payload_offset + footer.payload_size) as usize;
+        let image = Image::new(local[payload].to_vec(), 0, footer.payload_size).unwrap();
+        let index = image.block_index().unwrap();
+        let last = index.get(index.count() - 1).unwrap();
+        local[(footer.payload_offset + last.image_offset) as usize] ^= 0xff;
+
+        let stage = Stage::new("stipple-corrupt-2");
+        let (out, corrupt, _) = stage.run(&local, &remote).expect("assemble");
+        assert_eq!(out, remote);
+        assert_eq!(corrupt.reused, clean.reused - 1);
+        assert!(corrupt.fetched > clean.fetched);
+    }
+
+    #[test]
+    fn compressed_stipple_requests_do_not_grow_with_the_block_count() {
+        let requests = |stable_len: usize| {
+            let stage = Stage::new("stipple-variable-requests");
+            let prefix = fake_prefix(16);
+            let (local, remote) = shifted_trees(stable_len);
+            let local = build_stipple_package(&prefix, &local, Layout::Variable);
+            let remote = build_stipple_package(&prefix, &remote, Layout::Variable);
+            let local_path = stage.dir.join("local");
+            std::fs::write(&local_path, local).unwrap();
+            let src = CountingSource {
+                inner: FakeSource {
+                    data: Arc::new(remote.clone()),
+                },
+                requests: Default::default(),
+            };
+            let remote_pkg = probe(&src).unwrap();
+            let staged_path = stage.dir.join("staged");
+            let staged = std::fs::File::create_new(&staged_path).unwrap();
+            let stats = assemble(&local_path, &remote_pkg, &staged, &src).unwrap();
+            assert_eq!(stats.unit, "blocks");
+            assert_eq!(std::fs::read(&staged_path).unwrap(), remote);
+            (
+                src.requests.load(std::sync::atomic::Ordering::Relaxed),
+                stats.reused,
+            )
+        };
+        // Sixteen times the stable data adds hundreds of blocks, all
+        // matched from the block index the metadata already fetched.
+        let (small, _) = requests(1 << 20);
+        let (large, reused) = requests(16 << 20);
+        assert!(large < small + 8, "{small} requests grew to {large}");
+        assert!(reused >= 256, "only {reused} blocks were copied");
     }
 
     /// Serve `data` over loopback HTTP for `connections` requests, each on
@@ -1926,7 +2175,8 @@ mod tests {
         let stage = Stage::new("kind");
         let prefix = fake_prefix(10);
         let local = build_blocks_package(&prefix, &[("bin/app", vec![b'x'; 4096])], None);
-        let remote = build_stipple_package(&prefix, &[("bin/app", vec![b'y'; 4096])], true);
+        let remote =
+            build_stipple_package(&prefix, &[("bin/app", vec![b'y'; 4096])], Layout::Stored);
 
         let err = stage.run_err(&local, &remote);
         assert!(err.contains("payload kind"), "got: {err}");
@@ -1936,9 +2186,7 @@ mod tests {
     fn nearby_fetches_merge_and_drop_the_copies_they_cover() {
         let group = |dst: u64, len: u64| CopyGroup {
             ranges: vec![CopyRange { dst, src: 0, len }],
-            hash: [0; 32],
-            raw: true,
-            original: len as usize,
+            check: Check::Raw([0; 32]),
         };
         let span = |start: u64, len: u64| Span { start, len };
         let far = 10 * FETCH_GAP_MAX;
@@ -1949,6 +2197,7 @@ mod tests {
             // Out of order, as a deduplicating packer can lay them out.
             fetch: vec![span(far, 100), span(0, 1000), span(1500, 100)],
             digests: Vec::new(),
+            unit: "blocks",
         };
         coalesce(&mut plan);
 
@@ -1974,6 +2223,7 @@ mod tests {
                 },
             ],
             digests: Vec::new(),
+            unit: "blocks",
         };
         coalesce(&mut plan);
         assert_eq!(plan.fetch.len(), 2);

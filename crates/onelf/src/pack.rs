@@ -1872,6 +1872,10 @@ fn stipple_payload(
         memory_limit: None,
         timestamps: Timestamps::Clamp,
         compress_metadata: !opts.no_compress,
+        // Content-defined block ends keep unchanged content in identical
+        // compressed blocks across releases, so a delta update can copy
+        // them. A stored image already reuses content slice by slice.
+        variable_blocks: !opts.no_compress,
     })
     .map_err(stipple_error)?;
     builder.set_order(FileOrder::Extension);

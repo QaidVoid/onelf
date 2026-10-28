@@ -329,16 +329,27 @@ the update again picks up the new release.
 
 :::info
 Packages with a stipplefs payload (`--payload stipple`) delta-update
-only when the image is stored uncompressed (`--no-compress`). A
-compressed image re-encodes unchanged content against a dictionary
-retrained for every build, so its bytes are not stable across builds and
-nothing shorter than the whole payload can be reused; the updater says
-so on stderr and downloads in full. The default blocks payload always
-delta-updates, with one exception: `--dict` trains its dictionary from
-the package's own files, so a release that changes any sampled file
-ships a new dictionary and no compressed block can be copied. The
-updater says so on stderr and fetches every block. Leave `--dict` off
-for packages that self-update often.
+too. A compressed image ends its blocks where the content says to, so
+content that did not change lands in the same blocks in both releases
+and those blocks are copied whole. A change costs the blocks that hold
+it, so a smaller `--block-size` downloads less per change and compresses
+a little worse. At 1 MiB and below the packer also trains a dictionary,
+which differs between builds, so blocks coded against it are fetched.
+An image stored uncompressed (`--no-compress`) is copied slice by slice
+instead.
+
+Stipple packages built by onelf 0.4.2 cut compressed blocks at fixed
+offsets, so the updater downloads their next release in full and says
+so on stderr. Their runtime also cannot open the image format the
+current packer writes, so that one update fails after the download and
+must be installed by hand. Updates after it delta-update as above.
+
+The default blocks payload always delta-updates, with one exception:
+`--dict` trains its dictionary from the package's own files, so a
+release that changes any sampled file ships a new dictionary and no
+compressed block can be copied. The updater says so on stderr and
+fetches every block. Leave `--dict` off for packages that self-update
+often.
 :::
 
 Exit codes:
