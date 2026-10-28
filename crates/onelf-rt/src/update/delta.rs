@@ -30,10 +30,12 @@ use std::io::Read;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use onelf_format::payload::Codec;
 use onelf_format::reader::{block_extent, block_original_size};
 use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, Manifest};
+use stipplefs::format::Section;
 use stipplefs::read::{Image, Reader};
 use stipplefs::source::ByteSource;
 
@@ -134,6 +136,9 @@ struct Plan {
     digests: Vec<(u64, u64)>,
     /// What a copy group is, for the summary: a block or a slice.
     unit: &'static str,
+    /// Bytes the planner already fetched, written as they are: a stipplefs
+    /// release image's superblock and metadata, at their absolute offset.
+    known: Option<(u64, Vec<u8>)>,
 }
 
 enum Prefix {
@@ -352,6 +357,7 @@ fn plan_blocks(
         fetch,
         digests: Vec::new(),
         unit: "blocks",
+        known: None,
     };
     Ok(plan)
 }
@@ -360,11 +366,20 @@ fn plan_blocks(
 // Stipplefs payloads
 // ---------------------------------------------------------------------------
 
+/// Most metadata a release image may make the planner fetch and hold. The
+/// largest tree measured carries about 100 KB of it; this leaves room for
+/// millions of files while keeping a hostile image from exhausting memory
+/// before its signature is checked.
+const METADATA_MAX: u64 = 64 * 1024 * 1024;
+
 /// A byte source served by range fetches, so the remote image's own
 /// metadata parser can run against the release without downloading it.
 struct FetchingSource<'a> {
     src: &'a dyn RangeSource,
     size: u64,
+    /// The image's metadata sections, fetched in one request once the
+    /// superblock names where they lie: an absolute start and its bytes.
+    prefetched: &'a OnceLock<(u64, Vec<u8>)>,
 }
 
 impl ByteSource for FetchingSource<'_> {
@@ -377,12 +392,42 @@ impl ByteSource for FetchingSource<'_> {
             return Ok(());
         }
         let len = buf.len() as u64;
+        if let Some((start, bytes)) = self.prefetched.get()
+            && let Some(at) = offset.checked_sub(*start)
+            && let Some(cached) = bytes.get(at as usize..(at + len) as usize)
+        {
+            buf.copy_from_slice(cached);
+            return Ok(());
+        }
         let mut reader = self
             .src
             .fetch_range(offset, len)
             .map_err(|e| stipplefs::error::Error::Io(std::io::Error::other(e.to_string())))?;
         reader.read_exact(buf).map_err(stipplefs::error::Error::Io)
     }
+}
+
+/// The image-relative bytes from the image's start through every present
+/// metadata section, up to the 4096-byte boundary the first data block
+/// starts on, refused when they span more than [`METADATA_MAX`]. The
+/// superblock has already checked that each section lies inside the image.
+fn metadata_range(sections: &[Section], image_size: u64) -> Result<Option<Range<u64>>, String> {
+    let Some(end) = sections
+        .iter()
+        .filter(|s| !s.is_absent())
+        .map(|s| s.offset + s.size)
+        .max()
+    else {
+        return Ok(None);
+    };
+    let end = end.div_ceil(4096).saturating_mul(4096).min(image_size);
+    if end > METADATA_MAX {
+        return Err(format!(
+            "the release image's metadata spans {end} bytes, more than the {METADATA_MAX} \
+             the updater fetches"
+        ));
+    }
+    Ok(Some(0..end))
 }
 
 /// Every block in the image is stored raw, so content can be copied at
@@ -507,24 +552,42 @@ fn plan_stipple(
         return Err("the running package is not a stipple payload".into());
     };
 
-    // The remote image's metadata: a superblock and a handful of small
-    // sections, each its own range request. No data block is read here.
+    // The remote image's metadata: the superblock in one request, then
+    // every section it names in a second. No data block is read here.
+    let prefetched = OnceLock::new();
     let source = FetchingSource {
         src,
         size: remote.size,
+        prefetched: &prefetched,
     };
-    let image = Image::new(
+    let mut image = Image::new(
         source,
         remote.footer.payload_offset,
         remote.footer.payload_size,
     )
     .map_err(|e| format!("read the release image: {e}"))?;
+    image.set_metadata_limit(METADATA_MAX);
+    // The superblock is fetched a second time with the sections: four more
+    // kilobytes, so the whole range is written from memory below.
+    let metadata = metadata_range(&image.superblock().sections, remote.footer.payload_size)?;
+    if let Some(range) = &metadata {
+        let start = remote.footer.payload_offset + range.start;
+        let len = range.end - range.start;
+        let mut bytes = vec![0u8; len as usize];
+        src.fetch_range(start, len)
+            .map_err(|e| format!("fetch the release image's metadata: {e}"))?
+            .read_exact(&mut bytes)
+            .map_err(|e| format!("read the release image's metadata: {e}"))?;
+        let _ = prefetched.set((start, bytes));
+    }
     let remote_reader = image
         .reader()
         .map_err(|e| format!("read the release image: {e}"))?;
 
-    match (all_stored(local_reader), all_stored(&remote_reader)) {
-        (true, true) => plan_stipple_slices(local, local_reader, remote, &remote_reader),
+    let known = metadata
+        .map(|r| remote.footer.payload_offset + r.start..remote.footer.payload_offset + r.end);
+    let mut plan = match (all_stored(local_reader), all_stored(&remote_reader)) {
+        (true, true) => plan_stipple_slices(local, local_reader, remote, &remote_reader, known),
         (false, false) if !variable_blocks(&remote_reader) => Err(
             "the release compresses fixed-size stipplefs blocks, whose bytes shift \
              between builds"
@@ -535,9 +598,13 @@ fn plan_stipple(
              release's content-defined blocks cannot match"
                 .into(),
         ),
-        (false, false) => plan_stipple_blocks(local, local_reader, remote, &remote_reader),
+        (false, false) => plan_stipple_blocks(local, local_reader, remote, &remote_reader, known),
         _ => Err("the update changes whether the stipplefs payload is compressed".into()),
-    }
+    }?;
+    drop(remote_reader);
+    drop(image);
+    plan.known = prefetched.into_inner();
+    Ok(plan)
 }
 
 /// A fully stored image on both sides: copy content slice by slice through
@@ -547,6 +614,7 @@ fn plan_stipple_slices(
     local_reader: &Reader<'_>,
     remote: &RemotePackage,
     remote_reader: &Reader<'_>,
+    known: Option<Range<u64>>,
 ) -> Result<Plan, String> {
     // Content hash to the local file's inode and file offset.
     let mut local_slices: HashMap<[u8; 32], (u32, u64, u64)> = HashMap::new();
@@ -632,6 +700,7 @@ fn plan_stipple_slices(
         taken.push(end..end + 8);
         digests.push((start, len));
     }
+    taken.extend(known);
     let fetch = complement(
         remote.footer.payload_offset,
         remote.footer.payload_offset + remote.footer.payload_size,
@@ -645,6 +714,7 @@ fn plan_stipple_slices(
         fetch,
         digests,
         unit: "slices",
+        known: None,
     };
     Ok(plan)
 }
@@ -657,6 +727,7 @@ fn plan_stipple_blocks(
     local_reader: &Reader<'_>,
     remote: &RemotePackage,
     remote_reader: &Reader<'_>,
+    known: Option<Range<u64>>,
 ) -> Result<Plan, String> {
     type Key = (u64, u32, u32, u8);
     let key = |e: &stipplefs::read::BlockEntry, what: &str| -> Result<Key, String> {
@@ -708,6 +779,7 @@ fn plan_stipple_blocks(
         }
     }
 
+    taken.extend(known);
     Ok(Plan {
         prefix: prefix_plan(&local.footer, &local.manifest, remote),
         dict: None,
@@ -715,6 +787,7 @@ fn plan_stipple_blocks(
         fetch: complement(payload_start, payload_end, taken),
         digests: Vec::new(),
         unit: "blocks",
+        known: None,
     })
 }
 
@@ -870,6 +943,11 @@ fn write_plan(
         staged
             .write_all_at(dict, remote.footer.dict_offset)
             .map_err(|e| format!("write the staged dictionary: {e}"))?;
+    }
+    if let Some((at, bytes)) = &plan.known {
+        staged
+            .write_all_at(bytes, *at)
+            .map_err(|e| format!("write the staged image metadata: {e}"))?;
     }
     let mut reused = 0;
     for group in &plan.copies {
@@ -2072,6 +2150,49 @@ mod tests {
         assert!(reused >= 256, "only {reused} blocks were copied");
     }
 
+    #[test]
+    fn an_identical_stipple_release_plans_in_three_requests() {
+        for layout in [Layout::Stored, Layout::Variable] {
+            let stage = Stage::new("stipple-metadata-requests");
+            let (tree, _) = shifted_trees(300_000);
+            let package = build_stipple_package(&fake_prefix(17), &tree, layout);
+            let local_path = stage.dir.join("local");
+            std::fs::write(&local_path, &package).unwrap();
+            let src = CountingSource {
+                inner: FakeSource {
+                    data: Arc::new(package.clone()),
+                },
+                requests: Default::default(),
+            };
+            let remote_pkg = probe(&src).unwrap();
+            let after_probe = src.requests.load(std::sync::atomic::Ordering::Relaxed);
+            let staged_path = stage.dir.join("staged");
+            let staged = std::fs::File::create_new(&staged_path).unwrap();
+            assemble(&local_path, &remote_pkg, &staged, &src).unwrap();
+            assert_eq!(std::fs::read(&staged_path).unwrap(), package);
+            // Every block and slice of an identical release copies. What
+            // is left is the superblock, every metadata section in one
+            // range that is then written without a refetch, and the padding
+            // that ends the image.
+            let planned = src.requests.load(std::sync::atomic::Ordering::Relaxed) - after_probe;
+            assert_eq!(planned, 3);
+        }
+    }
+
+    #[test]
+    fn metadata_beyond_the_ceiling_is_refused() {
+        let section = |offset, size| Section { offset, size };
+        let sections = [section(4096, 4096), section(8192, 100), Section::default()];
+        assert_eq!(metadata_range(&sections, 1 << 20).unwrap(), Some(0..12288));
+        assert_eq!(
+            metadata_range(&[Section::default()], 1 << 20).unwrap(),
+            None
+        );
+        let far = [section(4096, 4096), section(METADATA_MAX, 8)];
+        let err = metadata_range(&far, METADATA_MAX * 2).unwrap_err();
+        assert!(err.contains("more than"), "{err}");
+    }
+
     /// Serve `data` over loopback HTTP for `connections` requests, each on
     /// its own connection, honoring Range only when `ranges` is set.
     /// Returns the URL and a handle yielding each request line.
@@ -2198,6 +2319,7 @@ mod tests {
             fetch: vec![span(far, 100), span(0, 1000), span(1500, 100)],
             digests: Vec::new(),
             unit: "blocks",
+            known: None,
         };
         coalesce(&mut plan);
 
@@ -2224,6 +2346,7 @@ mod tests {
             ],
             digests: Vec::new(),
             unit: "blocks",
+            known: None,
         };
         coalesce(&mut plan);
         assert_eq!(plan.fetch.len(), 2);
