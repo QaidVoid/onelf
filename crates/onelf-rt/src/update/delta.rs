@@ -2023,7 +2023,7 @@ mod tests {
     /// Bytes from a sixteen-letter alphabet: they compress, so the image
     /// keeps compressed blocks, but never repeat, so every chunk is its own.
     fn noise(seed: u64, len: usize) -> Vec<u8> {
-        let mut x = seed | 1;
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         (0..len)
             .map(|_| {
                 x ^= x << 13;
