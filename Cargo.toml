@@ -40,3 +40,7 @@ stipplefs = { version = "0.1.0", default-features = false }
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = { version = "0.14", default-features = false }
+
+# Until stipplefs 0.2.0 is published with variable blocks.
+[patch.crates-io]
+stipplefs = { path = "../stipplefs" }
