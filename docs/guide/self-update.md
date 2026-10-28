@@ -333,9 +333,8 @@ too. A compressed image ends its blocks where the content says to, so
 content that did not change lands in the same blocks in both releases
 and those blocks are copied whole. A change costs the blocks that hold
 it, so a smaller `--block-size` downloads less per change and compresses
-a little worse. At 1 MiB and below the packer also trains a dictionary,
-which differs between builds, so blocks coded against it are fetched.
-An image stored uncompressed (`--no-compress`) is copied slice by slice
+a little worse. A file of a block or more gets blocks of its own, so a
+change to it does not drag its neighbours into the update. An image stored uncompressed (`--no-compress`) is copied slice by slice
 instead.
 
 Stipple packages built by onelf 0.4.2 cut compressed blocks at fixed

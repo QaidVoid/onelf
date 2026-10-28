@@ -11860,7 +11860,7 @@ fn a_stipple_payload_refuses_what_it_cannot_honour() {
     stipple_app(&app);
     let pkg = td.join("s.onelf");
     for (extra, why) in [
-        (&["--dict"][..], "a stipplefs payload trains its own"),
+        (&["--dict"][..], "a stipplefs payload uses none"),
         (&["--block-size", "96K"][..], "power-of-two block size"),
     ] {
         let mut args = vec![

@@ -180,8 +180,8 @@ integrity rests on, and the image's own XXH3 checksums are a second line.
 and 32 MiB unless chosen, while slices stay 64 KiB. A compressed image
 uses stipplefs variable blocks: each ends where the content says to and
 `--block-size` is the largest it may be, so unchanged content keeps its
-blocks across releases for [delta updates](../guide/self-update). `HAS_DICT` is never set: the image trains its
-own dictionary for blocks up to 1 MiB. A onelf reader that predates the
+blocks across releases for [delta updates](../guide/self-update). `HAS_DICT` is never set, and the image
+carries no dictionary of its own either. A onelf reader that predates the
 `STIPPLE_PAYLOAD` flag fails every hash check rather than serving wrong
 bytes, and a stipplefs reader that predates variable blocks refuses the
 image when it opens it.

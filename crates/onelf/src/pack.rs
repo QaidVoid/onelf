@@ -696,7 +696,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         if opts.use_dict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--dict trains a dictionary for a blocks payload; a stipplefs payload trains its own",
+                "--dict trains a dictionary for a blocks payload; a stipplefs payload uses none, \
+                 so its blocks match across releases",
             ));
         }
     }
@@ -1863,11 +1864,11 @@ fn stipple_payload(
         chunk_average: 4096,
         codecs,
         level: opts.level,
-        dictionary_size: if opts.no_compress || opts.block_size > 1 << 20 {
-            0
-        } else {
-            112 * 1024
-        },
+        // No dictionary: one is retrained every build, so blocks coded
+        // against it never match across releases. Measured on VS Code at
+        // 1 MiB blocks, it saved 0.05% of the image and cost 6% more update
+        // download and 70% more packing time.
+        dictionary_size: 0,
         threads: rayon::current_num_threads(),
         memory_limit: None,
         timestamps: Timestamps::Clamp,
