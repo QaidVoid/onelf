@@ -36,11 +36,8 @@ onelf-sysroot = { version = "0.4.2", path = "crates/onelf-sysroot" }
 rayon = "1.11"
 rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
-stipplefs = { version = "0.1.0", default-features = false }
+stipplefs = { version = "0.2.0", default-features = false }
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = { version = "0.14", default-features = false }
 
-# Until stipplefs 0.2.0 is published with variable blocks.
-[patch.crates-io]
-stipplefs = { path = "../stipplefs" }
