@@ -57,6 +57,8 @@ fn bundle_from_recipe(dir: &Path, r: &recipe::Recipe) -> io::Result<()> {
         trace_seconds: r.bundle.trace_seconds.unwrap_or(5),
         trace_args: r.bundle.trace_args.clone(),
         sysroot: None,
+        sets: Vec::new(),
+        platform_pin: None,
     })
 }
 

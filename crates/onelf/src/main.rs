@@ -980,6 +980,8 @@ fn main() {
                 trace_seconds,
                 trace_args: trace_arg,
                 sysroot,
+                sets: Vec::new(),
+                platform_pin: None,
             })
         }),
         Commands::Sysroot { action } => match action {
@@ -1075,14 +1077,48 @@ fn main() {
     }
 }
 
+/// What a recipe's `[sysroot]` section resolves to for a build.
+struct ResolvedSysroot {
+    /// The package database the bundle's contents are taken from. `None`
+    /// when the recipe names no `path`: the AppDir then stands as the
+    /// author assembled it.
+    root: Option<bundle::SysrootOptions>,
+    /// The sets recorded for the runtime to fetch at launch.
+    sets: Vec<bundle::sysroot::SharedSet>,
+    /// A GL build pin, when the recipe names one whole.
+    pin: Option<onelf_sysroot::platform::Pin>,
+}
+
 /// The sysroot a recipe names, materialized from its archive when the
 /// directory does not exist yet. Paths resolve against the recipe's
-/// directory.
+/// directory. Without a `path` there is no database to consult: only the
+/// sets and the pin are carried, and `validate` has refused everything
+/// else.
 fn sysroot_from_recipe(
     dir: &std::path::Path,
     command: &str,
     sr: &recipe::Sysroot,
-) -> std::io::Result<bundle::SysrootOptions> {
+) -> std::io::Result<ResolvedSysroot> {
+    let sets = sr
+        .sets
+        .iter()
+        .map(|(name, set)| bundle::sysroot::SharedSet {
+            name: name.clone(),
+            packages: set.packages.clone(),
+            url: set.url.clone(),
+            blake3: set.blake3.clone(),
+        })
+        .collect();
+    let Some(path) = &sr.path else {
+        return Ok(ResolvedSysroot {
+            root: None,
+            sets,
+            pin: bundle::sysroot::pin_without_root(
+                sr.platform_url.as_ref(),
+                sr.platform_hash.as_ref(),
+            )?,
+        });
+    };
     let resolve = |p: &std::path::Path| {
         if p.is_absolute() {
             p.to_path_buf()
@@ -1090,7 +1126,7 @@ fn sysroot_from_recipe(
             dir.join(p)
         }
     };
-    let root = resolve(&sr.path);
+    let root = resolve(path);
     bundle::sysroot::refuse_inside(&root, dir)?;
     if !root.is_dir() {
         let Some(archive) = &sr.archive else {
@@ -1116,27 +1152,22 @@ fn sysroot_from_recipe(
         .platform
         .clone()
         .unwrap_or_else(|| bundle::sysroot::default_label(&root, sr.archive.as_deref()));
-    Ok(bundle::SysrootOptions {
-        root,
-        command: command.to_string(),
-        platform,
-        optional: sr.optional.clone(),
-        platform_line: sr.platform_line.as_deref().map(resolve),
-        policy: sr.policy.as_deref().map(resolve),
-        trace: sr.trace.as_deref().map(resolve),
-        keep: sr.keep.as_deref().map(resolve),
-        platform_url: sr.platform_url.clone(),
-        platform_hash: sr.platform_hash.clone(),
-        sets: sr
-            .sets
-            .iter()
-            .map(|(name, set)| bundle::sysroot::SharedSet {
-                name: name.clone(),
-                packages: set.packages.clone(),
-                url: set.url.clone(),
-                blake3: set.blake3.clone(),
-            })
-            .collect(),
+    Ok(ResolvedSysroot {
+        root: Some(bundle::SysrootOptions {
+            root,
+            command: command.to_string(),
+            platform,
+            optional: sr.optional.clone(),
+            platform_line: sr.platform_line.as_deref().map(resolve),
+            policy: sr.policy.as_deref().map(resolve),
+            trace: sr.trace.as_deref().map(resolve),
+            keep: sr.keep.as_deref().map(resolve),
+            platform_url: sr.platform_url.clone(),
+            platform_hash: sr.platform_hash.clone(),
+            sets,
+        }),
+        sets: Vec::new(),
+        pin: None,
     })
 }
 
@@ -1164,8 +1195,10 @@ fn run_build(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // A sysroot build does not use the framework bundlers, so their flags
-    // would do nothing. `--sysroot` refuses them, and so does a recipe.
+    // A build from a sysroot's package database does not use the
+    // framework bundlers, so their flags would do nothing. `--sysroot`
+    // refuses them, and so does a recipe. A `[sysroot]` without `path`
+    // leaves the AppDir to the host scan, where the flags keep working.
     let b = &recipe.bundle;
     let frameworks: Vec<&str> = [
         ("gl", b.gl),
@@ -1177,7 +1210,8 @@ fn run_build(
     .into_iter()
     .filter_map(|(name, on)| on.then_some(name))
     .collect();
-    if recipe.sysroot.is_some() && !frameworks.is_empty() {
+    let sysroot_db = recipe.sysroot.as_ref().is_some_and(|sr| sr.path.is_some());
+    if sysroot_db && !frameworks.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -1190,9 +1224,12 @@ fn run_build(
         ));
     }
 
-    let sysroot = match &recipe.sysroot {
-        Some(sr) => Some(sysroot_from_recipe(&dir, &recipe.package.command, sr)?),
-        None => None,
+    let (sysroot, recipe_sets, platform_pin) = match &recipe.sysroot {
+        Some(sr) => {
+            let resolved = sysroot_from_recipe(&dir, &recipe.package.command, sr)?;
+            (resolved.root, resolved.sets, resolved.pin)
+        }
+        None => (None, Vec::new(), None),
     };
 
     // A sysroot build is reproducible from its archive and recipe alone,
@@ -1204,8 +1241,15 @@ fn run_build(
         .or((recipe.sysroot.is_some() && pack::source_date_epoch().is_none()).then_some(0));
 
     // Stage 1: bundle-libs. A sysroot is applied by bundle-libs, so it
-    // runs even when the recipe would otherwise skip bundling.
-    if sysroot.is_some() || !recipe.bundle.skip {
+    // runs even when the recipe would otherwise skip bundling. A recipe
+    // that skips bundling and pins sets without a sysroot keeps its AppDir
+    // exactly as it stands: only the records the runtime fetches by are
+    // written, with no scan and no verification.
+    if recipe.bundle.skip && sysroot.is_none() {
+        if !recipe_sets.is_empty() || platform_pin.is_some() {
+            bundle::sysroot::record_sets(&dir, &recipe_sets, platform_pin.as_ref())?;
+        }
+    } else {
         let search_path: Vec<PathBuf> = recipe
             .bundle
             .search_paths
@@ -1241,6 +1285,8 @@ fn run_build(
             trace_seconds: recipe.bundle.trace_seconds.unwrap_or(5),
             trace_args: recipe.bundle.trace_args.clone(),
             sysroot,
+            sets: recipe_sets,
+            platform_pin,
         })?;
     }
 

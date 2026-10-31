@@ -437,6 +437,13 @@ pub struct BundleOptions {
     /// framework bundlers stay off since the closure already holds what
     /// the packages declare, and an unresolved soname is an error.
     pub sysroot: Option<SysrootOptions>,
+    /// Sets pinned without a sysroot package database: the AppDir is the
+    /// author's own tree, taken as it stands, and the sets are recorded
+    /// for the runtime to fetch at launch. Host-scan rules apply, and the
+    /// verifier reports what the sets supply instead of warning about it.
+    pub sets: Vec<sysroot::SharedSet>,
+    /// A GL build pinned without a sysroot, named whole by the recipe.
+    pub platform_pin: Option<onelf_sysroot::platform::Pin>,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -496,11 +503,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         None => {
             // A record from an earlier sysroot build would describe a
             // bundle this run is about to change. A dry run changes
-            // nothing, so the record still holds.
+            // nothing, so the record still holds. The records a
+            // sysroot-less recipe pins are (re)written here.
             if !opts.dry_run {
                 let _ = fs::remove_file(opts.directory.join(sysroot::PROVENANCE_FILE));
-                let _ = fs::remove_file(opts.directory.join(sysroot::PLATFORM_FILE));
-                let _ = fs::remove_file(opts.directory.join(sysroot::SETS_FILE));
+                sysroot::record_sets(&opts.directory, &opts.sets, opts.platform_pin.as_ref())?;
             }
             None
         }
@@ -1622,7 +1629,9 @@ pub(crate) fn remove_dangling_links_beside(object: &Path) {
 /// From a sysroot the universe was complete, so an omission is a policy
 /// or platform-line mistake the publisher can fix, and the bundle fails.
 /// From a host scan the universe was a guess, and the finding stays a
-/// warning.
+/// warning. What a set-only build's pinned sets ship, read from their
+/// builds, is neither: it is reported as theirs, since the launch fetches
+/// it.
 fn verify_needs(
     opts: &BundleOptions,
     platform: Option<&PlatformLine>,
@@ -1655,6 +1664,10 @@ fn verify_needs(
                 );
             }
         }
+    }
+    if opts.sysroot.is_none() && !opts.sets.is_empty() {
+        let (provides, unchecked) = sysroot::take_set_provides(&opts.sets, &mut findings);
+        sysroot::report_set_provides(&provides, &unchecked);
     }
     report_unbundled_needs(&findings);
     if opts.sysroot.is_some()

@@ -190,15 +190,17 @@ skip = false                     # don't run bundle-libs at all (pre-bundled App
 The GPU stack (`gl`, `dri`, `vulkan`) is bundled only when asked for,
 because the host's driver is the one that works. Wayland and GTK data
 are bundled when the binary needs them, and `no-*` turns either off.
-With a `[sysroot]` the framework bundlers are not used at all, so
-setting `gl`, `dri`, `vulkan`, `wayland` or `gtk` is an error, and
-`skip` is ignored because the sysroot is applied by `bundle-libs`.
+With a `[sysroot]` that names a `path`, the framework bundlers are not
+used at all, so setting `gl`, `dri`, `vulkan`, `wayland` or `gtk` is an
+error, and `skip` is ignored because the sysroot is applied by
+`bundle-libs`. A `[sysroot]` without `path` keeps the host scan, flags
+included.
 
 ## `[sysroot]`
 
 ```toml
 [sysroot]
-path = "../sysroot"                   # PathBuf, required; must be outside the AppDir
+path = "../sysroot"                   # PathBuf, optional; must be outside the AppDir
 archive = "../platform-1.tar.zst"     # Option<PathBuf>, materialized into path when absent; a path or an https:// URL
 hash = "3f2a..."                       # Option<String>, BLAKE3 of the archive; a mismatch is not unpacked
 platform = "platform-1"               # Option<String>, provenance label; defaults to the archive or directory name
@@ -211,9 +213,24 @@ platform-url = "https://..."          # Option<String>, GL build for hosts witho
 platform-hash = "3f1c...a9e2"         # Option<String>, its BLAKE3 hash; overrides the sysroot's
 ```
 
+With `path`, the bundle is the closure of the entrypoint's package in
+that rootfs' package database. Without `path` there is no database: the
+AppDir is the one the author assembled (an upstream release unpacked
+into place, say), bundling runs its ordinary host scan unless `[bundle]
+skip` is set, and the section only records the sets and an explicit GL
+build pin for the runtime to fetch at launch. The verifier reads each
+set's pinned build, fetching an `https://` one into the platform store
+when it is not there, to attribute what it ships. That mode accepts nothing else:
+`archive`, `hash`, `platform`, `optional`, `platform-line`, `policy`,
+`trace` and `keep` are database concepts, and naming one without `path`
+is a recipe error, as is a `[sysroot]` with neither `path` nor sets nor
+a GL build pin. See
+[Sets without a sysroot](../guide/sysroot#sets-without-a-sysroot).
+
 `platform-url` and `platform-hash` override what the sysroot's
-`etc/onelf/platform.toml` names, field by field. A URL is `https://` or
-`file://`. An `archive` URL must be `https://`.
+`etc/onelf/platform.toml` names, field by field; both are required
+together, with or without `path`. A URL is `https://` or `file://`. An
+`archive` URL must be `https://`.
 
 A build with `[sysroot]` pins every entry's mtime to 0 unless
 `[package].mtime` or `SOURCE_DATE_EPOCH` is set, so the package depends
@@ -230,7 +247,11 @@ blake3 = "3f1c...a9e2"                       # String, the set's BLAKE3
 
 A dependency set shared between packages. The closure of `packages` is
 left out of the bundle and expected from the build at `url`, made with
-`onelf sysroot pack-set`. `<name>` is letters, digits, `-` and `_` only. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set).
+`onelf sysroot pack-set`. `<name>` is letters, digits, `-` and `_` only. See [Sharing a dependency set](../guide/sysroot#sharing-a-dependency-set)
+and [Sets without a sysroot](../guide/sysroot#sets-without-a-sysroot),
+which pins a set with no `path` at all. `packages` is required either
+way; without a sysroot it is a note on what the set was made from, since
+no database is consulted.
 
 ## `[paths]`
 

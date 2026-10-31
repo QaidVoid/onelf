@@ -17,6 +17,10 @@ The rules this page encodes:
 - ✅ Pin a sysroot when the bundle must not depend on your machine. The
   bundle is the closure of your application's package, and two builds
   from the same archive and recipe produce the same bytes.
+- ✅ Pin a set without a sysroot when the AppDir is already assembled (an
+  upstream release unpacked): the tree stands, and only the sets are
+  recorded for the runtime to fetch. See
+  [Sets without a sysroot](#sets-without-a-sysroot).
 - ✅ Prune that closure with the three tiers: platform line for what the
   host supplies, policy for what never ships, trace and keep file for
   what only a run proves.
@@ -331,6 +335,64 @@ it, so a set that cannot be obtained ends the launch naming the set and
 the reason, rather than failing later at the first missing symbol.
 `ONELF_NO_PLATFORM_FETCH` and `ONELF_PLATFORM_STORE` apply to sets as
 they do to the GL build.
+
+## Sets without a sysroot
+
+A set can be pinned with no `path` in `[sysroot]` at all. That is the
+shape for an AppDir you assembled yourself, an upstream release tarball
+unpacked into place: there is no package database to take a closure
+from, so the section takes nothing from one, and only records the sets
+for the runtime to fetch at launch.
+
+```toml
+[package]
+command = "bin/myapp"
+
+[sysroot.sets.gtk]
+packages = ["gtk3"]
+url = "https://mirror.example.org/gtk-3.24.onelf"
+blake3 = "3f1c...a9e2"
+```
+
+- ✅ Use it when the application's tree holds what it ships and only
+  the shared toolkit is to come from a set. Bundling is otherwise
+  unchanged: `bundle-libs` runs its ordinary host scan and copies in
+  what the tree needs from the packer's machine, and the build writes
+  the set records under `.onelf/`.
+- ✅ Add `[bundle] skip = true` to pack the tree exactly as it stands:
+  nothing is scanned, added or verified, and the set records are the
+  only files the build writes.
+- ❌ Expecting `archive`, `optional`, `platform-line`, `policy`,
+  `trace`, `keep`, `platform` or `hash` to work here. Each decides what
+  a package database's closure holds, and there is none; naming one
+  without `path` stops the recipe from loading. A `[sysroot]` with
+  neither `path` nor at least one set (nor a GL build pin) is refused
+  too, since it has nothing to do.
+- ✅ `platform-url` and `platform-hash` keep working without `path`:
+  they name a GL build whole, which needs no database.
+
+The verifier still audits the tree, and reads each set's pinned build
+to see what it ships. A build is taken from its `file://` URL, or from
+the platform store the runtime fetches into (`ONELF_PLATFORM_STORE`,
+otherwise `platform/` under the cache root); an `https://` build not
+there yet is fetched into that store first, and kept only when its
+BLAKE3 is the pinned one, so a wrong pin fails here rather than at a
+user's launch. A soname a set's build ships is reported as that set's:
+
+```
+  Provided by set gtk: libgtk-3.so.0, libgdk-3.so.0
+```
+
+- ✅ Everything no set ships stays a plain warning, so a library the
+  tree truly lacks is not hidden behind a set that does not carry it.
+- ⚠️ A set whose build cannot be had, offline or with a wrong pin, is
+  reported with the reason, and claims nothing: what it would have
+  supplied is listed with the missing libraries.
+
+The package records the sets in `.onelf/sets`, the same file a sysroot
+build writes, and `onelf info` prints them. A build made this way pins
+every entry's mtime to 0 unless `[package].mtime` or
+`SOURCE_DATE_EPOCH` names a time, as any `[sysroot]` build does.
 
 ## Pinning a GL build for hosts without one
 

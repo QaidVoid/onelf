@@ -64,7 +64,7 @@ fn check_archive_hash(archive: &Path, expected: Option<&str>) -> io::Result<()> 
     Ok(())
 }
 
-fn download(url: &str, into: &Path) -> io::Result<()> {
+pub(crate) fn download(url: &str, into: &Path) -> io::Result<()> {
     let response = ureq::get(url)
         .call()
         .map_err(|e| io::Error::other(format!("{url}: {e}")))?;

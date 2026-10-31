@@ -6,7 +6,7 @@
 //! line, the policy and an optional trace decide what stays out. Nothing
 //! from the packer's own machine is consulted.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -215,12 +215,10 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     let mut set_sonames: HashSet<String> = HashSet::new();
     for set in &opts.sets {
         match shipped_sonames(set) {
-            Some(shipped) => set_sonames.extend(shipped),
-            None => {
+            Ok(shipped) => set_sonames.extend(shipped),
+            Err(why) => {
                 eprintln!(
-                    "  {} set {}: its build is not at hand, so what it holds is \
-                     inferred from the sysroot; put the build at its file:// URL \
-                     or in ONELF_PLATFORM_STORE to read it instead",
+                    "  {} set {}: {why}, so what it holds is inferred from the sysroot",
                     color::bold("note:"),
                     set.name
                 );
@@ -380,6 +378,65 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         super::normalize_mtime(&sets_path);
     }
     Ok((report, platform))
+}
+
+/// Record what a `[sysroot]` without `path` pins, in an AppDir no
+/// package database populates: the shared sets, and a GL build pin when
+/// the recipe names one whole. The AppDir stays as the author assembled
+/// it; these records are the only trace of the section, and they are
+/// what the runtime fetches at launch. The files and their format are
+/// the ones a populated build writes, so the runtime cannot tell the
+/// two apart.
+pub fn record_sets(appdir: &Path, sets: &[SharedSet], pin: Option<&Pin>) -> io::Result<()> {
+    let records = [
+        (
+            SETS_FILE,
+            (!sets.is_empty()).then(|| render_sets(sets, &[])),
+        ),
+        (PLATFORM_FILE, pin.map(render_pin)),
+    ];
+    for (name, text) in records {
+        let path = appdir.join(name);
+        match text {
+            Some(text) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, text)?;
+                super::normalize_mtime(&path);
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The GL build pin a recipe names without a sysroot: both fields are
+/// the recipe's, and the label is the plain `sysroot` since no archive
+/// or directory names a platform. Packages naming the same build share
+/// one store directory under it.
+pub fn pin_without_root(url: Option<&String>, hash: Option<&String>) -> io::Result<Option<Pin>> {
+    let (Some(url), Some(hash)) = (url, hash) else {
+        if url.is_some() || hash.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a GL build pin needs both platform-url and platform-hash",
+            ));
+        }
+        return Ok(None);
+    };
+    let label = "sysroot".to_string();
+    platform::check_label(&label)
+        .and_then(|()| platform::check_url(url))
+        .and_then(|()| platform::check_hash(hash))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(Some(Pin {
+        label,
+        url: url.clone(),
+        blake3: hash.to_ascii_lowercase(),
+    }))
 }
 
 /// The sysroot path the link at `rel` points to, with the directories on
@@ -630,44 +687,167 @@ fn populate_closure(
     })
 }
 
-/// The sonames a set's build records, when the build can be found.
-///
-/// Looked for where a build plausibly sits without going to the network:
-/// a `file://` URL names one outright, and a store keyed by hash holds
-/// the ones already fetched. A file counts only when its hash is the
-/// pinned one, since that is the build the launch will use. Anything
-/// else leaves the caller to infer.
-fn shipped_sonames(set: &SharedSet) -> Option<Vec<String>> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = set.url.strip_prefix("file://") {
-        candidates.push(PathBuf::from(path));
+/// The store the runtime fetches set and GL builds into: the same root,
+/// so a build the packer fetched is already there for a launch on this
+/// machine.
+fn store_root() -> Option<PathBuf> {
+    match std::env::var_os("ONELF_PLATFORM_STORE").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => onelf_format::cache_layout::resolve_root(rustix::process::getuid().as_raw(), None)
+            .map(|root| onelf_format::cache_layout::platform_dir(&root)),
     }
-    if let Some(store) = std::env::var_os("ONELF_PLATFORM_STORE") {
-        candidates.push(
-            Path::new(&store)
-                .join(&set.name)
-                .join(format!("{}.onelf", set.blake3)),
+}
+
+/// A set's pinned build: where it already sits, or fetched over https
+/// into the store. A file counts only when its hash is the pinned one,
+/// since that is the build the launch will use; a fetch that does not
+/// match is discarded. The error says why no build could be had.
+fn set_build(set: &SharedSet) -> Result<PathBuf, String> {
+    let pinned = |p: &Path| {
+        p.is_file()
+            && crate::sysroot_cmd::hash_file(p).is_ok_and(|h| h.eq_ignore_ascii_case(&set.blake3))
+    };
+    if let Some(path) = set.url.strip_prefix("file://") {
+        let path = PathBuf::from(path);
+        return if pinned(&path) {
+            Ok(path)
+        } else {
+            Err(format!(
+                "{} is missing or not the pinned build",
+                path.display()
+            ))
+        };
+    }
+    if !set.url.starts_with("https://") {
+        return Err(format!("{} is neither https:// nor file://", set.url));
+    }
+    let store = store_root()
+        .ok_or("no store to fetch it into (set HOME, XDG_CACHE_HOME or ONELF_PLATFORM_STORE)")?;
+    let stored = store.join(&set.name).join(format!("{}.onelf", set.blake3));
+    if pinned(&stored) {
+        return Ok(stored);
+    }
+    eprintln!(
+        "  {} set {} from {}",
+        color::bold("Fetching"),
+        color::cyan(&set.name),
+        set.url
+    );
+    if let Some(parent) = stored.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let staged = stored.with_extension(format!("part-{}", std::process::id()));
+    let fetched = crate::sysroot_cmd::download(&set.url, &staged)
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            if pinned(&staged) {
+                fs::rename(&staged, &stored).map_err(|e| format!("{}: {e}", stored.display()))
+            } else {
+                Err(format!(
+                    "{} does not hash to the pinned {}",
+                    set.url, set.blake3
+                ))
+            }
+        });
+    if fetched.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    fetched.map(|()| stored)
+}
+
+/// The sonames a set's pinned build records, or why they cannot be read.
+fn shipped_sonames(set: &SharedSet) -> Result<Vec<String>, String> {
+    let build = set_build(set)?;
+    let bytes = crate::metadata::read_packed_file(&build, SHIPPED_FILE)
+        .map_err(|e| format!("{}: {e}", build.display()))?
+        .ok_or_else(|| format!("{} records no sonames", build.display()))?;
+    let text = String::from_utf8(bytes).map_err(|e| format!("{}: {e}", build.display()))?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// The sonames a set-only build's pinned sets supply, split out of the
+/// verifier's findings and reported as theirs.
+///
+/// Each set's pinned build is read for `.onelf/sonames`, fetched first
+/// when it is not at hand, so a name is attributed to a set only when
+/// that set's build ships it. A set whose build cannot be had is
+/// returned with the reason, and claims nothing: what it may supply
+/// stays among the findings rather than being taken on the recipe's
+/// word.
+pub(crate) fn take_set_provides(
+    sets: &[SharedSet],
+    findings: &mut Vec<(PathBuf, Vec<String>)>,
+) -> (Vec<SetProvides>, Vec<(String, String)>) {
+    let mut known: Vec<(String, HashSet<String>)> = Vec::new();
+    let mut unchecked: Vec<(String, String)> = Vec::new();
+    for set in sets {
+        match shipped_sonames(set) {
+            Ok(names) => known.push((set.name.clone(), names.into_iter().collect())),
+            Err(why) => unchecked.push((set.name.clone(), why)),
+        }
+    }
+    (partition_set_provides(&known, findings), unchecked)
+}
+
+/// What one set provides, for the report.
+#[derive(Debug)]
+pub(crate) struct SetProvides {
+    pub set: String,
+    pub sonames: BTreeSet<String>,
+}
+
+/// Remove from `findings` every soname a set's build ships, and return
+/// them per set, in declaration order.
+fn partition_set_provides(
+    known: &[(String, HashSet<String>)],
+    findings: &mut Vec<(PathBuf, Vec<String>)>,
+) -> Vec<SetProvides> {
+    let mut provides: Vec<SetProvides> = known
+        .iter()
+        .map(|(name, _)| SetProvides {
+            set: name.clone(),
+            sonames: BTreeSet::new(),
+        })
+        .collect();
+    for (_, libs) in findings.iter_mut() {
+        libs.retain(
+            |soname| match known.iter().position(|(_, names)| names.contains(soname)) {
+                Some(i) => {
+                    provides[i].sonames.insert(soname.clone());
+                    false
+                }
+                None => true,
+            },
         );
     }
-    let text = candidates
-        .iter()
-        .filter(|p| {
-            p.is_file()
-                && crate::sysroot_cmd::hash_file(p)
-                    .is_ok_and(|h| h.eq_ignore_ascii_case(&set.blake3))
-        })
-        .find_map(|path| {
-            crate::metadata::read_packed_file(path, SHIPPED_FILE)
-                .ok()
-                .flatten()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        })?;
-    Some(
-        text.lines()
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect(),
-    )
+    findings.retain(|(_, libs)| !libs.is_empty());
+    provides.retain(|p| !p.sonames.is_empty());
+    provides
+}
+
+/// Print what the pinned sets supply, and which could not be checked,
+/// ahead of the remaining findings.
+pub(crate) fn report_set_provides(provides: &[SetProvides], unchecked: &[(String, String)]) {
+    for p in provides {
+        eprintln!(
+            "  {} {}: {}",
+            color::bold("Provided by set"),
+            color::cyan(&p.set),
+            p.sonames.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    for (set, why) in unchecked {
+        eprintln!(
+            "  {} set {} could not be checked ({why}); what it supplies is \
+             listed below as missing",
+            color::bold("warning:"),
+            color::cyan(set)
+        );
+    }
 }
 
 /// Rewrite the absolute module paths in a copied cache to paths relative
@@ -1465,5 +1645,81 @@ mod tests {
         assert_eq!(appdir_path("usr/share/x"), "share/x");
         assert_eq!(appdir_path("etc/app.conf"), "etc/app.conf");
         assert_eq!(appdir_path("opt/app/run"), "opt/app/run");
+    }
+
+    /// A name goes to the set whose build ships it, and a name no build
+    /// ships stays a finding: nothing is attributed on a recipe's word.
+    #[test]
+    fn set_provides_are_taken_from_the_findings() {
+        let known = vec![
+            (
+                "qt".to_string(),
+                HashSet::from(["libQt6Core.so.6".to_string()]),
+            ),
+            (
+                "gtk".to_string(),
+                HashSet::from(["libgtk-3.so.0".to_string()]),
+            ),
+        ];
+        let mut findings = vec![
+            (
+                PathBuf::from("bin/app"),
+                vec![
+                    "libQt6Core.so.6".to_string(),
+                    "libgdk-3.so.0".to_string(),
+                    "libgtk-3.so.0".to_string(),
+                ],
+            ),
+            (
+                PathBuf::from("bin/helper"),
+                vec!["libtruly.so.1".to_string()],
+            ),
+        ];
+
+        let provides = partition_set_provides(&known, &mut findings);
+        assert_eq!(provides.len(), 2, "{provides:?}");
+        assert_eq!(provides[0].set, "qt");
+        assert_eq!(
+            provides[0].sonames.iter().cloned().collect::<Vec<_>>(),
+            ["libQt6Core.so.6"]
+        );
+        assert_eq!(provides[1].set, "gtk");
+        assert_eq!(
+            provides[1].sonames.iter().cloned().collect::<Vec<_>>(),
+            ["libgtk-3.so.0"]
+        );
+        assert_eq!(
+            findings,
+            vec![
+                (PathBuf::from("bin/app"), vec!["libgdk-3.so.0".to_string()]),
+                (
+                    PathBuf::from("bin/helper"),
+                    vec!["libtruly.so.1".to_string()]
+                ),
+            ],
+            "what no build ships stays a finding"
+        );
+    }
+
+    /// A build is checked against its pin before anything is read from
+    /// it, and a set with no build to be had says why.
+    #[test]
+    fn a_set_build_must_match_its_pin() {
+        let dir = std::env::temp_dir().join(format!("onelf-set-build-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("set.onelf");
+        fs::write(&file, b"not the pinned build").unwrap();
+        let set = |url: String| SharedSet {
+            name: "gtk".to_string(),
+            packages: vec!["gtk3".to_string()],
+            url,
+            blake3: "0".repeat(64),
+        };
+
+        let err = set_build(&set(format!("file://{}", file.display()))).unwrap_err();
+        assert!(err.contains("not the pinned build"), "{err}");
+        let err = set_build(&set("http://example.com/set.onelf".to_string())).unwrap_err();
+        assert!(err.contains("neither https:// nor file://"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

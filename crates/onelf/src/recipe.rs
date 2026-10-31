@@ -220,11 +220,18 @@ impl From<HostLibsSpec> for crate::pack::HostLibs {
 
 /// `[sysroot]`: a materialized rootfs whose package database decides the
 /// bundle's contents. Paths are relative to the recipe.
+///
+/// With `path` the bundle is the closure of the entrypoint's package.
+/// Without one there is no package database, so the AppDir stays exactly
+/// as the author assembled it and only the sets (and an explicit GL
+/// build pin) are recorded for the runtime to fetch at launch.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Sysroot {
-    /// The materialized rootfs.
-    pub path: PathBuf,
+    /// The materialized rootfs, when the bundle is taken from a package
+    /// database. Absent leaves the AppDir alone and records only the
+    /// sets.
+    pub path: Option<PathBuf>,
     /// An archive to materialize into `path` when it does not exist yet:
     /// a path relative to the recipe, or an `https://` URL.
     pub archive: Option<PathBuf>,
@@ -254,6 +261,49 @@ pub struct Sysroot {
     /// closure the bundle leaves out and a pinned build supplies.
     #[serde(default)]
     pub sets: BTreeMap<String, SharedSet>,
+}
+
+impl Sysroot {
+    /// Reject a `[sysroot]` that cannot do anything, and sysroot-database
+    /// keys used without the database they belong to.
+    ///
+    /// Without `path` there is no package database: no closure to take
+    /// the bundle from, no archive to materialize, no owner to look up.
+    /// The AppDir then stands as the author assembled it, and the only
+    /// things left to record are the sets and an explicit GL build pin.
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.path.is_some() {
+            return Ok(());
+        }
+        let database_keys: &[(&str, bool)] = &[
+            ("archive", self.archive.is_some()),
+            ("hash", self.hash.is_some()),
+            ("platform", self.platform.is_some()),
+            ("optional", !self.optional.is_empty()),
+            ("platform-line", self.platform_line.is_some()),
+            ("policy", self.policy.is_some()),
+            ("trace", self.trace.is_some()),
+            ("keep", self.keep.is_some()),
+        ];
+        for (name, present) in database_keys {
+            if *present {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "[sysroot] {name} is a sysroot-database concept and needs path: \
+                         without it there is no package database to apply it to"
+                    ),
+                ));
+            }
+        }
+        if self.sets.is_empty() && self.platform_url.is_none() && self.platform_hash.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[sysroot] names neither path nor sets: there is nothing to record",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One shared dependency set: the sysroot packages it holds, made into a
@@ -378,12 +428,21 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
         )
     })?;
     expand_value(&mut value);
-    value.try_into().map_err(|e| {
+    let recipe: Recipe = value.try_into().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("{}: {e}", path.display()),
         )
-    })
+    })?;
+    if let Some(sr) = &recipe.sysroot {
+        sr.validate().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+    }
+    Ok(recipe)
 }
 
 /// Recursively expand `${VAR}` references in every string value of a parsed
@@ -475,7 +534,7 @@ pub fn expand_env(s: &str) -> String {
 mod package_tests {
     use super::load;
 
-    fn load_str(body: &str) -> super::Recipe {
+    fn load_result(body: &str) -> std::io::Result<super::Recipe> {
         let dir = std::env::temp_dir().join(format!(
             "onelf-recipe-{}-{}",
             std::process::id(),
@@ -487,9 +546,13 @@ mod package_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("onelf.toml");
         std::fs::write(&path, body).unwrap();
-        let recipe = load(&path).unwrap();
+        let recipe = load(&path);
         std::fs::remove_dir_all(&dir).unwrap();
         recipe
+    }
+
+    fn load_str(body: &str) -> super::Recipe {
+        load_result(body).unwrap()
     }
 
     #[test]
@@ -498,7 +561,7 @@ mod package_tests {
             "[package]\ncommand = \"bin/app\"\n\n[sysroot]\npath = \"sysroot\"\narchive = \"root.tar.zst\"\noptional = [\"extra\"]\nplatform-line = \"platform.txt\"\npolicy = \"policy.txt\"\n",
         );
         let sr = recipe.sysroot.expect("section present");
-        assert_eq!(sr.path, std::path::PathBuf::from("sysroot"));
+        assert_eq!(sr.path, Some(std::path::PathBuf::from("sysroot")));
         assert_eq!(
             sr.archive.as_deref(),
             Some(std::path::Path::new("root.tar.zst"))
@@ -536,6 +599,58 @@ mod package_tests {
 
         let recipe = load_str("[package]\ncommand = \"bin/app\"\nprefer-cache = true\n");
         assert!(recipe.package.prefer_cache);
+    }
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A `[sysroot]` with only sets has no package database: the AppDir
+    /// is the author's own, and the sets are recorded for the runtime.
+    #[test]
+    fn a_sysroot_with_only_sets_parses() {
+        let recipe = load_str(&format!(
+            "[package]\ncommand = \"bin/app\"\n\n[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"{HASH}\"\n"
+        ));
+        let sr = recipe.sysroot.expect("section present");
+        assert!(sr.path.is_none());
+        assert_eq!(sr.sets["gtk"].packages, ["gtk3"]);
+        assert_eq!(sr.sets["gtk"].url, "https://e/gtk.onelf");
+        assert_eq!(sr.sets["gtk"].blake3, HASH);
+    }
+
+    #[test]
+    fn a_sysroot_with_neither_path_nor_sets_is_refused() {
+        let err = load_result("[package]\ncommand = \"bin/app\"\n\n[sysroot]\n").unwrap_err();
+        assert!(err.to_string().contains("neither path nor sets"), "{err}");
+    }
+
+    /// Every key that names a package-database concept is a typo waiting
+    /// to be ignored when there is no database to apply it to.
+    #[test]
+    fn sysroot_database_keys_are_refused_without_a_path() {
+        let hash = HASH;
+        let bodies = [
+            "[sysroot]\narchive = \"root.tar.zst\"\n",
+            "[sysroot]\nhash = \"abc\"\n",
+            "[sysroot]\nplatform = \"platform-1\"\n",
+            "[sysroot]\noptional = [\"mesa\"]\n",
+            "[sysroot]\nplatform-line = \"line.txt\"\n",
+            "[sysroot]\npolicy = \"policy.txt\"\n",
+            "[sysroot]\ntrace = \"trace.txt\"\n",
+            "[sysroot]\nkeep = \"keep.txt\"\n",
+        ];
+        for body in bodies {
+            let err =
+                load_result(&format!("[package]\ncommand = \"bin/app\"\n\n{body}")).unwrap_err();
+            assert!(err.to_string().contains("needs path"), "{body}: {err}");
+        }
+        // The GL build pin keeps its meaning without a database: both
+        // fields name a build to fetch, nothing more.
+        let recipe = load_str(&format!(
+            "[package]\ncommand = \"bin/app\"\n\n[sysroot]\nplatform-url = \"https://e/gl.onelf\"\nplatform-hash = \"{hash}\"\n"
+        ));
+        let sr = recipe.sysroot.unwrap();
+        assert!(sr.path.is_none());
+        assert_eq!(sr.platform_url.as_deref(), Some("https://e/gl.onelf"));
     }
 }
 

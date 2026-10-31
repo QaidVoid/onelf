@@ -8677,7 +8677,7 @@ fn a_package_believes_the_set_build_about_what_it_ships() {
     // The build dropped libchainlib, so the package cannot rely on it
     // being there and has to decide for itself.
     assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("is not at hand"),
+        !String::from_utf8_lossy(&out.stderr).contains("is inferred from the sysroot"),
         "the build was read, not inferred"
     );
 
@@ -8689,11 +8689,198 @@ fn a_package_believes_the_set_build_about_what_it_ships() {
     );
     sysroot_recipe(&dir, &fixture, &sets);
     let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is not at hand"),
-        "{}",
+        stderr.contains("not the pinned build") && stderr.contains("is inferred from the sysroot"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A `[sysroot]` with only sets: an AppDir assembled by hand (an
+/// upstream release unpacked, say) needs no package database to pin one.
+/// The tree stands as the author left it, the verifier reports the
+/// soname the set supplies instead of warning about it, the packed
+/// package records the set for the runtime, and a launch fetches it and
+/// runs.
+#[test]
+fn a_set_pins_without_a_sysroot() {
+    let td = workdir("setonly");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // The set's build, packed from a hand-made tree: no sysroot, no
+    // package database anywhere in this test.
+    let set_tree = td.join("set-tree");
+    std::fs::create_dir_all(set_tree.join("lib")).unwrap();
+    write(&src.join("fix.c"), "int fix_value(void){return 42;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            src.join("fix.c").to_str().unwrap(),
+        ],
+        &set_tree.join("lib/libfixture.so.1"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    let set_pkg = td.join("fixture-set.onelf");
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            set_tree.to_str().unwrap(),
+            "-o",
+            set_pkg.to_str().unwrap(),
+            "--name",
+            "fixture",
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+
+    // The AppDir: an application needing the set's library, which is
+    // nowhere in the tree.
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &src.join("app.c"),
+        "#include <stdio.h>\nint fix_value(void);\nint main(void){printf(\"value=%d\\n\", fix_value());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", set_tree.join("lib").display()),
+            "-l:libfixture.so.1",
+        ],
+        &dir.join("bin/app"),
+    ));
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Provided by set fixture: libfixture.so.1"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("librar(ies) are not in the bundle"),
+        "the set's soname is not a plain warning:\n{stderr}"
+    );
+    let sets = std::fs::read_to_string(dir.join(".onelf/sets")).unwrap();
+    assert!(sets.contains("[fixture]"), "{sets}");
+    assert!(
+        sets.contains(&format!("url = \"file://{}\"", set_pkg.display())),
+        "{sets}"
+    );
+    assert!(sets.contains(&hash), "{sets}");
+
+    // The packed package carries the record, and `onelf info` prints it.
+    let pkg = dir.join("app.onelf");
+    let info_out = run_onelf(&["info", pkg.to_str().unwrap()], None);
+    let info = String::from_utf8_lossy(&info_out.stdout);
+    assert!(
+        info.contains("Shared sets:") && info.contains("[fixture]"),
+        "{info}"
+    );
+    assert!(info.contains(&hash), "the pin is recorded:\n{info}");
+
+    let run = |fetch: bool| -> std::process::Output {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .env("ONELF_LD_CACHE", "/nonexistent");
+        if fetch {
+            cmd.env("ONELF_PLATFORM_STORE", td.join("store"));
+        } else {
+            cmd.env("ONELF_NO_PLATFORM_FETCH", "1");
+        }
+        isolate(&mut cmd, &td);
+        run_package(&mut cmd)
+    };
+
+    // Fetching disabled: the launch names the set it could not get.
+    let out = run(false);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "ran without its set:\n{err}");
+    assert!(err.contains("dependency set fixture"), "{err}");
+
+    // With the store reachable the set is fetched from its file:// URL
+    // and the application runs against it.
+    let out = run(true);
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("value=42"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        td.join("store")
+            .join("fixture")
+            .join(format!("{hash}.onelf"))
+            .is_file(),
+        "the set is stored by its hash"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `[bundle] skip` keeps its meaning with sets pinned and no sysroot: the
+/// AppDir is packed exactly as it stands, nothing is scanned or added,
+/// and only the set records the runtime fetches by are written.
+#[test]
+fn a_skipped_bundle_still_records_its_sets() {
+    let td = workdir("setskip");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&src.join("app.c"), "int main(void){return 0;}\n");
+    if !cc_with(&[src.join("app.c").to_str().unwrap()], &dir.join("bin/app")) {
+        return; // no compiler: documented soft-skip
+    }
+    let hash = "0".repeat(64);
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\nskip = true\n\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\nurl = \"https://example.invalid/fixture.onelf\"\nblake3 = \"{hash}\"\n"
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        !dir.join("lib").exists(),
+        "a skipped bundle gains no libraries"
+    );
+    assert!(
+        !stderr.contains("Fetching"),
+        "nothing is fetched without a scan to check:\n{stderr}"
+    );
+    let sets = std::fs::read_to_string(dir.join(".onelf/sets")).unwrap();
+    assert!(sets.contains("[fixture]") && sets.contains(&hash), "{sets}");
     let _ = std::fs::remove_dir_all(&td);
 }
 
