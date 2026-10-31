@@ -469,6 +469,12 @@ The runtime fetches only when all four hold: the host-library policy is
 and the package carries a pin. A package that bundles Mesa never
 fetches, and neither does one on a host with a working driver.
 
+☑️ Without a pin, the launch warns only when the bundle's libraries or
+the binary it runs link a GL entry point the host lacks, since that
+launch fails without one. A toolkit that opens GL by name, as GTK's
+libepoxy and SDL do, does so only when the application draws with GL,
+so a package that links none runs quietly on a host without a stack.
+
 The file lands in `<cache root>/platform/<label>/<hash>.onelf` once its
 hash matches. A mismatch or a broken download leaves nothing behind. It
 is then extracted through the package cache and its libraries are

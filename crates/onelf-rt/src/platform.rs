@@ -65,13 +65,13 @@ fn env_set(name: &str) -> bool {
 /// Make the build the package at `pkg_root` pins available: fetched if
 /// the store lacks it, verified, extracted. Returns the extracted root
 /// and the lock that keeps the extraction from being collected while
-/// this instance runs. The error names why no build could be used.
-pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
-    let text = fs::read_to_string(pkg_root.join(PIN_FILE)).ok();
-    let mut pin = text
-        .as_deref()
-        .and_then(parse_pin)
-        .ok_or("the package pins no GL build")?;
+/// this instance runs, or `None` when the package pins no build. The
+/// error names why the pinned build could not be used.
+pub fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
+    let text = fs::read_to_string(pkg_root.join(PIN_FILE)).ok()?;
+    let Some(mut pin) = parse_pin(&text) else {
+        return Some(Err(format!("{PIN_FILE} names no usable build")));
+    };
     if let Some(url) = std::env::var("ONELF_PLATFORM_URL")
         .ok()
         .filter(|u| !u.is_empty())
@@ -79,7 +79,7 @@ pub fn obtain(pkg_root: &Path) -> Result<(PathBuf, fs::File), String> {
         pin.url = url;
     }
 
-    obtain_build(&pin)
+    Some(obtain_build(&pin))
 }
 
 /// Make the build `pin` names available: fetched into the shared store if

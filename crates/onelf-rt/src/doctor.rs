@@ -191,13 +191,13 @@ pub fn run(pkg: &mut PackageData, ep_idx: usize) {
         && name != "memfd"
         && !lib_dirs.is_empty()
     {
-        libraries(pkg, &lib_dirs, places_host_files);
+        libraries(pkg, ep_idx, &lib_dirs, places_host_files);
     }
     sets(pkg);
     update(pkg);
 }
 
-fn libraries(pkg: &mut PackageData, lib_dirs: &[String], places_host_files: bool) {
+fn libraries(pkg: &mut PackageData, ep_idx: usize, lib_dirs: &[String], places_host_files: bool) {
     println!("\nLibraries");
     let disabled = env_set("ONELF_NO_RESOLVER");
     let policy = if disabled {
@@ -217,14 +217,25 @@ fn libraries(pkg: &mut PackageData, lib_dirs: &[String], places_host_files: bool
         println!("  no private runtime directory to read the libraries in");
         return;
     };
-    let in_lib_dir = |rel: &Path| {
-        rel.parent()
-            .is_some_and(|p| lib_dirs.iter().any(|d| p == Path::new(d)))
+    let ep = &pkg.manifest.entrypoints[ep_idx];
+    let executable = std::path::PathBuf::from(pkg.manifest.entry_path(ep.target_entry as usize));
+    let wanted = |rel: &Path| {
+        rel == executable
+            || rel
+                .parent()
+                .is_some_and(|p| lib_dirs.iter().any(|d| p == Path::new(d)))
     };
     let extracted = std::fs::create_dir(&scratch)
-        .and_then(|()| crate::cache::extract_matching(pkg, &scratch, in_lib_dir));
+        .and_then(|()| crate::cache::extract_matching(pkg, &scratch, wanted));
     match extracted {
-        Ok(()) => verdicts(pkg, &scratch, lib_dirs, policy, places_host_files),
+        Ok(()) => verdicts(
+            pkg,
+            &scratch,
+            &scratch.join(&executable),
+            lib_dirs,
+            policy,
+            places_host_files,
+        ),
         Err(e) => println!("  cannot read the bundled libraries: {e}"),
     }
     let _ = std::fs::remove_dir_all(&scratch);
@@ -233,23 +244,32 @@ fn libraries(pkg: &mut PackageData, lib_dirs: &[String], places_host_files: bool
 fn verdicts(
     pkg: &mut PackageData,
     root: &Path,
+    executable: &Path,
     lib_dirs: &[String],
     policy: HostLibsPolicy,
     places_host_files: bool,
 ) {
     let lib_dirs: Vec<&str> = lib_dirs.iter().map(String::as_str).collect();
     let ld_cache = drivers::cache_file();
-    let gl = resolve::gl_situation(root, &lib_dirs, &[], &ld_cache, resolve::ICD_DIRS);
+    let gl = resolve::gl_situation(
+        root,
+        &lib_dirs,
+        &[],
+        Some(executable),
+        &ld_cache,
+        resolve::ICD_DIRS,
+    );
     let gl_text = match gl {
         Gl::Bundled => "bundled",
         Gl::Host => "from the host",
-        Gl::Absent => "none on the host or in the bundle",
+        Gl::Missing => "none on the host, which the bundle links",
+        Gl::Absent => "none on the host or in the bundle; nothing links one",
     };
     println!("  GL stack: {gl_text}");
     let pin = read_package_file(pkg, crate::platform::PIN_FILE)
         .and_then(|b| crate::platform::parse_pin(&String::from_utf8_lossy(&b)));
     if let Some(pin) = &pin {
-        let wanted = if gl == Gl::Absent {
+        let wanted = if gl.lacking() {
             "the launch uses it"
         } else {
             "not needed here"
@@ -271,7 +291,7 @@ fn verdicts(
     if !places_host_files {
         println!("  this mode cannot put a host file over a bundled one, so glibc stays bundled");
     }
-    if gl == Gl::Absent && pin.is_some() {
+    if gl.lacking() && pin.is_some() {
         println!("  the pinned build's libraries are not weighed below");
     }
     if read_package_file(pkg, crate::sets::SETS_FILE).is_some() {

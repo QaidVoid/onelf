@@ -418,19 +418,31 @@ fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathB
         .iter()
         .flat_map(|root| crate::sets::lib_dirs(root))
         .collect();
-    if resolve::gl_situation(
+    let ep = &pkg.manifest.entrypoints[launch.ep_idx];
+    let executable = pkg_root.join(pkg.manifest.entry_path(ep.target_entry as usize));
+    let gl = resolve::gl_situation(
         pkg_root,
         lib_dirs,
         &set_lib_dirs,
+        Some(&executable),
         &ld_cache,
         resolve::ICD_DIRS,
-    ) == Gl::Absent
-    {
+    );
+    if gl.lacking() {
+        // Without a pin, a package that links no GL entry point has
+        // nothing to warn about: it only ever opens one by name, when
+        // the application draws with GL.
         match crate::platform::obtain(pkg_root) {
-            Ok(fetched) => platform = Some(fetched),
-            Err(why) => {
-                eprintln!("onelf-rt: this host has no GL stack and {why}; continuing without one")
-            }
+            Some(Ok(fetched)) => platform = Some(fetched),
+            Some(Err(why)) => eprintln!(
+                "onelf-rt: this host has no GL stack and the pinned build cannot be used \
+                 ({why}); continuing without one"
+            ),
+            None if gl == Gl::Missing => eprintln!(
+                "onelf-rt: this host has no GL stack, which the package links, and the \
+                 package pins no GL build; continuing without one"
+            ),
+            None => {}
         }
     }
     let (platform_root, lock) = match platform {

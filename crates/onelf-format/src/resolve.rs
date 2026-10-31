@@ -104,7 +104,21 @@ const HOST_SEEDS: &[&str] = &["libGLX_"];
 pub enum Gl {
     Bundled,
     Host,
+    /// The host lacks an entry point the bundle links, so the bundle
+    /// fails without one.
+    Missing,
+    /// Nothing links an entry point and the host has none. A library may
+    /// still open one by name, as libepoxy and SDL do, but only when the
+    /// application draws with GL.
     Absent,
+}
+
+impl Gl {
+    /// Whether neither the bundle nor the host has a GL stack, so a
+    /// pinned build is worth fetching.
+    pub fn lacking(self) -> bool {
+        matches!(self, Gl::Missing | Gl::Absent)
+    }
 }
 
 /// The entry points of a GL or Vulkan stack. One of them present, on
@@ -116,12 +130,15 @@ fn has_gl_entry(libs: &BTreeMap<String, PathBuf>) -> bool {
         .any(|name| GL_ENTRY.iter().any(|p| name.starts_with(p)))
 }
 
-/// The GL entry points `carried` objects name and `carried` does not
-/// itself hold. This is what the launch will ask the host, or a pinned
-/// build, to supply.
-fn gl_entries_wanted(carried: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
+/// The GL entry points `carried` objects and `executable` name and
+/// `carried` does not itself hold. This is what the launch will ask the
+/// host, or a pinned build, to supply.
+fn gl_entries_wanted(
+    carried: &BTreeMap<String, PathBuf>,
+    executable: Option<&Path>,
+) -> BTreeSet<String> {
     let mut wanted = BTreeSet::new();
-    for path in carried.values() {
+    for path in carried.values().map(PathBuf::as_path).chain(executable) {
         for needed in verdef::read_needed(path).unwrap_or_default() {
             if GL_ENTRY.iter().any(|p| needed.starts_with(p)) && !carried.contains_key(&needed) {
                 wanted.insert(needed);
@@ -136,7 +153,8 @@ fn gl_entries_wanted(carried: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
 ///
 /// `extra_dirs` are library directories beside the package, which is
 /// where a shared dependency set puts a toolkit, and a toolkit is
-/// usually what names a GL entry point.
+/// usually what names a GL entry point. `executable` is the binary the
+/// launch runs, which links GL itself as often as its libraries do.
 ///
 /// A host counts only when it has every entry point the package asks
 /// for. Some hosts have part of a stack and not the rest: an image with
@@ -147,6 +165,7 @@ pub fn gl_situation(
     pkg_root: &Path,
     lib_dirs: &[&str],
     extra_dirs: &[PathBuf],
+    executable: Option<&Path>,
     ld_cache: &Path,
     icd_dirs: &[&str],
 ) -> Gl {
@@ -160,7 +179,7 @@ pub fn gl_situation(
         return Gl::Bundled;
     }
     let host = HostIndex::load(ld_cache, icd_dirs, None).libs;
-    let wanted = gl_entries_wanted(&carried);
+    let wanted = gl_entries_wanted(&carried, executable);
     // Nothing names one outright, so a plugin may still ask for one by
     // dlopen and any entry point is worth having.
     if wanted.is_empty() {
@@ -173,7 +192,7 @@ pub fn gl_situation(
     if wanted.iter().all(|name| host.contains_key(name)) {
         Gl::Host
     } else {
-        Gl::Absent
+        Gl::Missing
     }
 }
 
@@ -937,7 +956,7 @@ mod tests {
         }
 
         fn gl(&self) -> Gl {
-            gl_situation(&self.pkg, &["lib"], &[], &self.cache, &[])
+            gl_situation(&self.pkg, &["lib"], &[], None, &self.cache, &[])
         }
 
         fn farm_link(&self, name: &str) -> Option<PathBuf> {
@@ -1329,7 +1348,7 @@ mod tests {
         );
         assert_eq!(
             w.gl(),
-            Gl::Absent,
+            Gl::Missing,
             "the host has no libEGL, which the bundle asks for"
         );
         w.host("libEGL.so.1", &shared_object(&[(1, "EGL_1")], &[]));
@@ -1337,14 +1356,47 @@ mod tests {
     }
 
     #[test]
-    fn the_gl_situation_is_bundled_host_or_absent() {
+    fn the_gl_situation_is_bundled_host_missing_or_absent() {
         let w = World::new();
         w.host("libz.so.1", &shared_object(&[(1, "Z_1")], &[]));
         assert_eq!(w.gl(), Gl::Absent, "no GL entry point anywhere");
+        w.bundle(
+            "libgtk-3.so.0",
+            &shared_object(&[(1, "Gtk_3")], &["libepoxy.so.0"]),
+        );
+        assert_eq!(
+            w.gl(),
+            Gl::Absent,
+            "a toolkit that opens GL by name links none"
+        );
+        w.bundle(
+            "libQtGui.so.6",
+            &shared_object(&[(1, "Qt_6")], &["libEGL.so.1"]),
+        );
+        assert_eq!(w.gl(), Gl::Missing, "the bundle links libEGL");
         w.host("libEGL.so.1", &shared_object(&[(1, "EGL_1")], &[]));
         assert_eq!(w.gl(), Gl::Host);
         w.bundle("libGL.so.1", &shared_object(&[(1, "GL_1")], &[]));
         assert_eq!(w.gl(), Gl::Bundled, "the bundle's own stack comes first");
+    }
+
+    #[test]
+    fn the_launched_binary_names_gl_like_a_library() {
+        let w = World::new();
+        w.host("libz.so.1", &shared_object(&[(1, "Z_1")], &[]));
+        let app = w.pkg.join("bin/app");
+        fs::create_dir_all(app.parent().unwrap()).unwrap();
+        fs::write(&app, shared_object(&[(1, "App_1")], &["libGL.so.1"])).unwrap();
+        assert_eq!(
+            gl_situation(&w.pkg, &["lib"], &[], None, &w.cache, &[]),
+            Gl::Absent,
+            "a binary the launch does not run asks for nothing"
+        );
+        assert_eq!(
+            gl_situation(&w.pkg, &["lib"], &[], Some(&app), &w.cache, &[]),
+            Gl::Missing,
+            "the launched binary links libGL"
+        );
     }
 
     #[test]
