@@ -123,7 +123,7 @@ fn spawn_package(cmd: &mut Command) -> std::process::Child {
     panic!("package remained busy after repeated attempts")
 }
 
-fn workdir(tag: &str) -> PathBuf {
+fn workdir(tag: &str) -> Workdir {
     let d = std::env::temp_dir().join(format!(
         "onelf-it-{tag}-{}-{}",
         std::process::id(),
@@ -133,7 +133,61 @@ fn workdir(tag: &str) -> PathBuf {
             .as_nanos()
     ));
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Workdir(d)
+}
+
+/// A test's scratch directory, removed when the test ends however it
+/// ends: a failed assertion or an early soft-skip return leaves nothing
+/// behind in a `/tmp` that is often RAM.
+struct Workdir(PathBuf);
+
+impl std::ops::Deref for Workdir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Workdir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Workdir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for Workdir {
+    /// A package a test launched can still have a read-only FUSE mount in
+    /// the scratch runtime dir when the test ends, which no removal can
+    /// descend into, so those are lazily unmounted first, deepest first.
+    fn drop(&mut self) {
+        let prefix = format!("{}/", self.0.display());
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mut mounts: Vec<&str> = mountinfo
+            .lines()
+            .filter_map(|l| l.split(' ').nth(4))
+            .filter(|m| m.starts_with(&prefix))
+            .collect();
+        mounts.sort_by_key(|m| std::cmp::Reverse(m.len()));
+        for mount in mounts {
+            for helper in ["fusermount3", "fusermount"] {
+                if Command::new(helper)
+                    .args(["-u", "-z", mount])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+                {
+                    break;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Point a packed binary at per-test scratch for its private runtime state
@@ -11237,7 +11291,7 @@ fn a_second_entrypoint_integrates_beside_the_first() {
 /// A package with a menu entry per entrypoint: `myapp` (the default) and
 /// `myapp-settings` carry desktop files, `myapp-cli` only has the
 /// `default.desktop` fallback. Returns the package and a scratch home.
-fn menu_entry_package(tag: &str) -> (PathBuf, PathBuf) {
+fn menu_entry_package(tag: &str) -> (Workdir, PathBuf) {
     let td = workdir(tag);
     let app = td.join("app");
     write(&app.join("bin/run"), "#!/bin/sh\necho RAN\n");
