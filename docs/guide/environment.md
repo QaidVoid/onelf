@@ -174,8 +174,10 @@ a multiarch `lib/x86_64-linux-gnu/` count:
 Data a library reads from a fixed path is looked for in the package's
 root, then in the sets':
 
-- `ALSA_CONFIG_DIR` for `share/alsa/` and `ALSA_CONFIG_PATH` for
-  `share/alsa/alsa.conf`
+- `ALSA_CONFIG_DIR` for `share/alsa/`, and `ALSA_CONFIG_PATH` naming
+  `share/alsa/alsa.conf` followed by every file in `share/alsa/alsa.conf.d/`,
+  so the carried defaults load after the top config and win over whatever
+  the host's own ALSA setup defines
 - `XLOCALEDIR` for `share/X11/locale/`, the X11 compose and locale
   tables
 - `MAGIC` for `share/file/misc/magic.mgc` or `share/misc/magic.mgc`,

@@ -36,7 +36,24 @@ With no flags, this:
    `C.UTF-8` locale comes too, into `lib/locale/`, when the source
    system has it. It is not built into glibc, and a bundled glibc reads
    the host's locale archive, which a musl host or a minimal container
-   does not have.
+   does not have. A library resolved from a plugin directory of its own
+   kind keeps that directory: the ALSA plugins a recipe force-includes
+   land in `lib/alsa-lib/`, GStreamer's in `lib/gstreamer-1.0/`,
+   PipeWire's in `lib/pipewire-0.3/` and `lib/spa-0.2/`, GIO's in
+   `lib/gio/modules/`, and libheif's, babl's and GEGL's likewise. That
+   is where their loaders look for them; a copy written flat would be
+   dead weight, since nothing loads it from there. With the library
+   comes the data it reads from a path compiled into it: libasound
+   brings `share/alsa`, libxkbcommon `share/X11/xkb`, libX11
+   `share/X11/locale`, and libmagic its magic files, each copied from
+   beside the resolved library. On a host without the owning package,
+   ALSA without `share/alsa` has no `alsa.conf` and cannot open any
+   device at all, bundled plugins included. The carried `alsa.conf`
+   also gets a hook entry inserted, loading the carried
+   `alsa.conf.d/` right after the host's own snippet directories:
+   the host's distro snippets then cannot steal the default output
+   from the pulse default the package carries, while a deliberate
+   `/etc/asound.conf` or `~/.asoundrc` still wins.
 4. Rewrites `RPATH`/`RUNPATH` on every bundled ELF to the one `$ORIGIN`
    entry that reaches `lib/` from where the file sits: `$ORIGIN/../lib`
    for `bin/app`, `$ORIGIN/../../../lib` for `opt/tool/bin/app`. No entry
@@ -211,11 +228,19 @@ for:
 ```
 warning: 2 compiled-in plugin or data path(s) have no copy in the bundle:
   - lib/libasound.so.2 reads /usr/lib/alsa-lib (carry alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR)
-  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR)
+  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR and ALSA_CONFIG_PATH)
 ```
 
 - ✅ Copy the directory into the bundle where the line says, and the
   warning goes away.
+- ✅ Or force-include the plugins by soname
+  (`include = ["libasound_module_pcm_pulse.so"]`): a resolved plugin
+  keeps the directory it was found in (`lib/alsa-lib/`), which is the
+  copy the line asks for, and the warning clears on the next run.
+- ✅ For the data directories (`share/alsa` and the rest), nothing to
+  do: a bundled library brings its own data from beside it, and the
+  warning clears without a hand-placed copy. It stays when the build
+  host has none to bring.
 - ☑️ Leave it when the app never uses that part of the library, such as
   an app that links libasound but plays no sound.
 - ⚠️ Only paths stored whole in a library are found. GLib, GTK,

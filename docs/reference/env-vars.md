@@ -53,7 +53,7 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `LIBHEIF_PLUGIN_PATH` | a library directory has `libheif/` | colon-joined list of their `plugins/` subdirs, or of the dirs themselves where they have none. Replaces a value the caller set. |
 | `BABL_PATH`, `GEGL_PATH` | a library directory has `babl-0.1/` or `gegl-0.4/` | colon-joined list of those dirs. Replaces a value the caller set. |
 | `TCL_LIBRARY`, `TK_LIBRARY` | a library directory or `share/tcltk/` has `tcl<version>/init.tcl` or `tk<version>/tk.tcl` | that dir. Replaces a value the caller set. |
-| `ALSA_CONFIG_DIR`, `ALSA_CONFIG_PATH` | the package or a set has `share/alsa/` with `alsa.conf` | that dir and that file |
+| `ALSA_CONFIG_DIR`, `ALSA_CONFIG_PATH` | the package or a set has `share/alsa/` with `alsa.conf` | that dir, and a list of `alsa.conf` followed by each file in its `alsa.conf.d/` |
 | `XLOCALEDIR` | `share/X11/locale/` exists | that dir |
 | `MAGIC` | `share/file/misc/magic.mgc` or `share/misc/magic.mgc` exists | that file |
 | `TEXTDOMAINDIR` | `share/locale/` exists | that dir |
