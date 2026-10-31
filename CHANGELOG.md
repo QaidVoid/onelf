@@ -1,4 +1,14 @@
 
+## [0.5.1](https://github.com/QaidVoid/onelf/compare/0.5.0...0.5.1) - 2026-10-31
+
+### ⛰️  Features
+
+- *(recipe)* Pin dependency sets without a sysroot - ([1a2c8ad](https://github.com/QaidVoid/onelf/commit/1a2c8ad50561a64f17217ef2f13e1bac29f9dede))
+
+### 🧪 Testing
+
+- Remove each test's scratch dir however it ends - ([6eef501](https://github.com/QaidVoid/onelf/commit/6eef5010d5753f4bb43730a3f881cc884ceec302))
+
 ## [0.5.0](https://github.com/QaidVoid/onelf/compare/0.4.2...0.5.0) - 2026-10-29
 
 ### ⛰️  Features
