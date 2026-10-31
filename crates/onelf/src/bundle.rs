@@ -391,6 +391,270 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 
 pub(crate) use onelf_sysroot::LIB_PATHS as STANDARD_LIB_PATHS;
 
+/// Library-directory subdirectories whose contents are plugins a library
+/// dlopens by soname, matched against the tail of the directory a resolved
+/// library was found in. A resolved plugin keeps its subdirectory in the
+/// bundle (`lib/alsa-lib/libasound_module_pcm_pulse.so`), which is the one
+/// place its loader looks for it: alsa-lib falls back to `alsa-lib/` beside
+/// the loaded libasound when `ALSA_PLUGIN_DIR` is unset, and the runtime
+/// points the others' variables at the directory below a library directory
+/// (the runtime's `setup_plugin_dirs`, the `datadirs` lint). Written flat,
+/// the copy is dead weight: nothing ever looks for it there.
+const PLUGIN_LIB_SUBDIRS: &[&str] = &[
+    // Longest first: Debian keeps libheif's plugins one level deeper.
+    "libheif/plugins",
+    "alsa-lib",
+    "babl-0.1",
+    "gegl-0.4",
+    "gio/modules",
+    "gstreamer-1.0",
+    "libheif",
+    "pipewire-0.3",
+    "spa-0.2",
+];
+
+/// The plugin subdirectory a resolved library belongs in, read from the
+/// tail of the directory it was found in: `/usr/lib/alsa-lib/x.so`
+/// belongs in `alsa-lib/`. `None` leaves the soname flat.
+fn plugin_subdir(resolved: &Path) -> Option<&'static str> {
+    let dir: Vec<&std::ffi::OsStr> = resolved
+        .parent()?
+        .components()
+        .map(|c| c.as_os_str())
+        .collect();
+    PLUGIN_LIB_SUBDIRS.iter().copied().find(|rel| {
+        let parts: Vec<&str> = rel.split('/').collect();
+        dir.len() >= parts.len()
+            && dir[dir.len() - parts.len()..]
+                .iter()
+                .zip(parts)
+                .all(|(c, part)| c.to_str() == Some(part))
+    })
+}
+
+/// Where a resolved soname is written inside the library directory: the
+/// subdirectory its kind of plugin lives in when it came from one,
+/// otherwise flat.
+fn dest_rel(soname: &str, resolved: &Path) -> PathBuf {
+    match plugin_subdir(resolved) {
+        Some(dir) => Path::new(dir).join(soname),
+        None => PathBuf::from(soname),
+    }
+}
+
+/// A symlink target reaching `to` (relative to the library directory)
+/// from inside `from_dir` (also relative to it), where the link itself
+/// sits: the bare name when both are in the same directory, `../` climbs
+/// otherwise.
+fn link_target(from_dir: &Path, to: &Path) -> String {
+    if to.parent().is_some_and(|p| p == from_dir) {
+        return to
+            .file_name()
+            .unwrap_or(to.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+    }
+    let mut target = String::new();
+    for _ in 0..from_dir.components().count() {
+        target.push_str("../");
+    }
+    target.push_str(&to.to_string_lossy());
+    target
+}
+
+/// The data directories a bundled library reads from a path compiled into
+/// it, by soname prefix, matched against what the walk resolves. The
+/// runtime points each variable at the copy below the tree root (the
+/// runtime's `DATA_PATHS` and `XKB_CONFIG_ROOT` setup), and the
+/// `datadirs` lint names the same directories. Without the copy the
+/// library reads the host's data or, on a host without the owning
+/// package, none at all: an alsa-less host leaves a bundled libasound
+/// without `alsa.conf`, and it cannot open any device, plugins included.
+const LIB_DATA_DIRS: &[(&str, &[&str])] = &[
+    // alsa.conf and the PCM definitions that say what `default` is.
+    ("libasound.so", &["share/alsa"]),
+    // Keymaps libxkbcommon compiles keycodes from.
+    ("libxkbcommon.so", &["share/X11/xkb"]),
+    // Locale and compose data of the Xlib encodings.
+    ("libX11.so", &["share/X11/locale"]),
+    ("libmagic.so", &["share/file/misc/magic", "share/misc/magic"]),
+];
+
+/// The data directory a resolved library was found beside: `share/alsa`
+/// of the tree the library's own directory belongs to. One and two
+/// directory climbs cover the flat `/usr/lib` and the Debian multiarch
+/// layouts, and a Nix store path carries its `share` beside `lib`.
+fn data_dir_beside(resolved: &Path, rel: &str) -> Option<PathBuf> {
+    let dir = resolved.parent()?;
+    ["..", "../.."]
+        .iter()
+        .map(|up| dir.join(up).join(rel))
+        .find(|p| p.is_dir())
+        .and_then(|p| fs::canonicalize(p).ok())
+}
+
+/// Copy a data directory into the tree, pinning each file's mtime like
+/// every other copy. Regular files and relative symlinks go; anything
+/// else stays. Returns the bytes copied.
+fn copy_data_dir(src: &Path, dst: &Path) -> io::Result<u64> {
+    let mut total = 0u64;
+    fs::create_dir_all(dst)?;
+    let mut entries: Vec<std::fs::DirEntry> =
+        fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            total += copy_data_dir(&entry.path(), &dst.join(entry.file_name()))?;
+        } else if kind.is_file() {
+            let to = dst.join(entry.file_name());
+            ensure_writable(&to);
+            fs::copy(entry.path(), &to)?;
+            normalize_mtime(&to);
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        } else if kind.is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            if target.is_relative() {
+                let to = dst.join(entry.file_name());
+                if to.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(&to);
+                }
+                std::os::unix::fs::symlink(target, &to)?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// A carried `share/alsa` must not let the host's distro snippets name
+/// the output. `alsa.conf`'s top-level `@hooks` load the host's
+/// `/etc/alsa/conf.d` by absolute path after everything the carried
+/// config named, so a host that ships a pipewire default wins over the
+/// pulse default the package carried, and the plugin it names usually
+/// cannot load. The carried snippet directory is inserted into the hook
+/// list right after the host's, so the carried defaults load last among
+/// them. `/etc/asound.conf` and `~/.asoundrc` keep their places after
+/// that: an explicit user configuration still wins. Returns whether the
+/// file was rewritten.
+fn patch_alsa_conf_hooks(conf: &Path) -> io::Result<bool> {
+    const CARRIED: &str = "{ @func datadir } \"/alsa.conf.d\"";
+    let text = fs::read_to_string(conf)?;
+    if text.contains(CARRIED) {
+        return Ok(false);
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let Some((start, end)) = hooks_block(&lines) else {
+        return Ok(false);
+    };
+    let mut insert_at = None;
+    for at in start..end {
+        let line = lines[at].trim();
+        if line.contains("conf.d") && !line.contains("@func") {
+            insert_at = Some(at + 1);
+        }
+    }
+    let Some(insert_at) = insert_at else {
+        return Ok(false);
+    };
+    let mut out = String::with_capacity(text.len() + CARRIED.len() + 64);
+    for (at, line) in lines.iter().enumerate() {
+        if at == insert_at {
+            out.push_str("\t\t\t{ @func concat strings [ ");
+            out.push_str(CARRIED);
+            out.push_str(" ] }\n");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    ensure_writable(conf);
+    fs::write(conf, out)?;
+    normalize_mtime(conf);
+    Ok(true)
+}
+
+/// The half-open line range of the top-level `@hooks` block, `[` on the
+/// first line through the line closing it. `cards.@hooks` and deeper
+/// blocks do not match: the leading name must be exactly the hook.
+fn hooks_block(lines: &[&str]) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (at, line) in lines.iter().enumerate() {
+        if depth == 0 {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("@hooks") && trimmed.contains('[')) {
+                continue;
+            }
+            start = Some(at);
+            depth = line
+                .matches('[')
+                .count()
+                .saturating_sub(line.matches(']').count());
+        } else {
+            depth += line.matches('[').count();
+            depth = depth.saturating_sub(line.matches(']').count());
+        }
+        if start.is_some() && depth == 0 {
+            return Some((start?, at + 1));
+        }
+    }
+    None
+}
+
+/// Carry the data directories of a resolved library into the tree, once
+/// per directory: a re-run and a tree that already carries it are left
+/// alone. What the host has not, nothing is carried, and the lint keeps
+/// saying so.
+fn carry_lib_data(
+    directory: &Path,
+    soname: &str,
+    resolved: &Path,
+    dry_run: bool,
+    carried: &mut HashSet<String>,
+) -> io::Result<()> {
+    for (prefix, rels) in LIB_DATA_DIRS {
+        if !soname.starts_with(prefix) {
+            continue;
+        }
+        for rel in *rels {
+            if carried.contains(*rel) || directory.join(rel).exists() {
+                carried.insert((*rel).to_string());
+                continue;
+            }
+            let Some(src) = data_dir_beside(resolved, rel) else {
+                continue;
+            };
+            carried.insert((*rel).to_string());
+            if dry_run {
+                eprintln!(
+                    "  {} {} (data of {})",
+                    color::bold("Would copy"),
+                    rel,
+                    color::cyan(soname)
+                );
+                continue;
+            }
+            let bytes = copy_data_dir(&src, &directory.join(rel))?;
+            if *rel == "share/alsa"
+                && patch_alsa_conf_hooks(&directory.join("share/alsa/alsa.conf"))?
+            {
+                eprintln!(
+                    "  {} share/alsa/alsa.conf hooks (carried snippets load after the host's)",
+                    color::bold_green("Patched")
+                );
+            }
+            eprintln!(
+                "  {} {} <- {} (data of {}, {})",
+                color::bold_green("Copied"),
+                rel,
+                src.display(),
+                color::cyan(soname),
+                color::dim(&format_size(bytes))
+            );
+        }
+    }
+    Ok(())
+}
+
 pub struct BundleOptions {
     pub directory: PathBuf,
     /// Restricts *which* binaries are scanned for dependencies.
@@ -1041,8 +1305,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut left_with_host: Vec<(String, String)> = Vec::new();
     let mut already_processed: HashSet<String> = HashSet::new();
     let mut expanded_nix: HashSet<PathBuf> = HashSet::new();
-    // BLAKE3(content) -> soname, so aliases with identical bytes symlink instead of copy.
-    let mut bundled_by_hash: HashMap<[u8; 32], String> = HashMap::new();
+    // BLAKE3(content) -> the destination the file was written to,
+    // relative to the library directory, so aliases with identical bytes
+    // symlink instead of copy.
+    let mut bundled_by_hash: HashMap<[u8; 32], PathBuf> = HashMap::new();
+    // The data directories the walk already carried or found in the tree.
+    let mut carried_data: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = needed_by.keys().cloned().collect();
     queue.sort();
     // Name service modules glibc loads by dlopen, let through the excluded
@@ -1122,7 +1390,24 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
             Some((_, resolved)) => {
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-                let dest = lib_dest.join(&soname);
+                let rel = dest_rel(&soname, &resolved);
+                let dest = lib_dest.join(&rel);
+                // The data the library reads from a compiled-in path goes
+                // with it, before any skip: a tree bundled before the data
+                // was carried has the library but not the data.
+                carry_lib_data(
+                    &opts.directory,
+                    &soname,
+                    &resolved,
+                    opts.dry_run,
+                    &mut carried_data,
+                )?;
+                // A plugin keeping its subdirectory is already bundled on
+                // a re-run, or the candidate is the tree's own file, found
+                // through a search dir inside the tree.
+                if dest.exists() || is_same_file(&resolved, &dest) {
+                    continue;
+                }
 
                 // Check libc family of this candidate before copying: if it
                 // mismatches the target and --strict-libc is set, skip.
@@ -1185,28 +1470,30 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     }
                 }
                 if let Some(hash) = content_hash
-                    && let Some(existing_name) = bundled_by_hash.get(&hash).cloned()
+                    && let Some(existing) = bundled_by_hash.get(&hash).cloned()
                 {
                     eprintln!(
                         "  {} {} -> {} (alias for {}, {})",
                         color::bold_green("Linked"),
                         soname,
-                        existing_name,
+                        existing.display(),
                         color::cyan(&requirer),
                         color::dim(&format_size(size))
                     );
                     if !opts.dry_run {
-                        fs::create_dir_all(&lib_dest)?;
-                        let dest = lib_dest.join(&soname);
+                        if let Some(dir) = dest.parent() {
+                            fs::create_dir_all(dir)?;
+                        }
                         if dest.exists() || dest.is_symlink() {
                             let _ = fs::remove_file(&dest);
                         }
-                        if let Err(e) = std::os::unix::fs::symlink(&existing_name, &dest) {
+                        let target = link_target(rel.parent().unwrap_or(Path::new("")), &existing);
+                        if let Err(e) = std::os::unix::fs::symlink(&target, &dest) {
                             eprintln!(
                                 "  {} failed to symlink {} -> {}: {e}",
                                 color::bold_red("warning:"),
                                 soname,
-                                existing_name
+                                target
                             );
                         }
                     }
@@ -1215,13 +1502,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
                 eprintln!(
                     "  {} <- {} (needed by {}, {})",
-                    color::bold_green(&soname),
+                    color::bold_green(&rel.to_string_lossy()),
                     resolved.display(),
                     color::cyan(&requirer),
                     color::dim(&format_size(size))
                 );
                 if !opts.dry_run {
-                    fs::create_dir_all(&lib_dest)?;
+                    if let Some(dir) = dest.parent() {
+                        fs::create_dir_all(dir)?;
+                    }
                     // Copying onto an existing alias symlink corrupts the
                     // alias target; drop the symlink first.
                     if dest.is_symlink() {
@@ -1262,9 +1551,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 }
 
                 if let Some(hash) = content_hash {
-                    bundled_by_hash.insert(hash, soname.clone());
+                    bundled_by_hash.insert(hash, rel.clone());
                 }
-                copied.push((soname.clone(), resolved.clone(), size, requirer));
+                copied.push((soname.clone(), rel, size, requirer));
                 if soname == "libc.so.6" && !opts.dry_run {
                     match bundle_gconv(&resolved, &lib_dest, opts.strip) {
                         Ok(files) if !files.is_empty() => {
@@ -1358,7 +1647,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if opts.sysroot.is_some() && !opts.dry_run {
         let generated = copied
             .iter()
-            .map(|(soname, _, _, _)| opts.lib_dir.join(soname).to_string_lossy().into_owned())
+            .map(|(_, rel, _, _)| opts.lib_dir.join(rel).to_string_lossy().into_owned())
             .chain(
                 libc_data_files
                     .iter()
@@ -2204,6 +2493,250 @@ fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod plugin_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_plugin_from_a_named_dir_keeps_the_dir() {
+        assert_eq!(
+            dest_rel(
+                "libasound_module_pcm_pulse.so",
+                Path::new("/usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so")
+            ),
+            PathBuf::from("alsa-lib/libasound_module_pcm_pulse.so")
+        );
+        assert_eq!(
+            dest_rel("libgstx.so", Path::new("/usr/lib/gstreamer-1.0/libgstx.so")),
+            PathBuf::from("gstreamer-1.0/libgstx.so")
+        );
+    }
+
+    #[test]
+    fn a_flat_library_stays_flat() {
+        assert_eq!(
+            dest_rel("libasound.so.2", Path::new("/usr/lib/libasound.so.2")),
+            PathBuf::from("libasound.so.2")
+        );
+        assert_eq!(
+            dest_rel(
+                "libpulse.so.0",
+                Path::new("/usr/lib/x86_64-linux-gnu/libpulse.so.0")
+            ),
+            PathBuf::from("libpulse.so.0")
+        );
+    }
+
+    #[test]
+    fn the_longest_tail_wins() {
+        // Debian keeps libheif's plugins one level below the directory.
+        assert_eq!(
+            dest_rel(
+                "libheif-x.so",
+                Path::new("/usr/lib/x86_64-linux-gnu/libheif/plugins/libheif-x.so")
+            ),
+            PathBuf::from("libheif/plugins/libheif-x.so")
+        );
+        // Arch keeps them directly in it.
+        assert_eq!(
+            dest_rel("libheif-x.so", Path::new("/usr/lib/libheif/libheif-x.so")),
+            PathBuf::from("libheif/libheif-x.so")
+        );
+    }
+
+    #[test]
+    fn a_sysroot_path_matches_the_same_way() {
+        assert_eq!(
+            dest_rel(
+                "libpipewire-module-x.so",
+                Path::new("/tmp/sysroot/usr/lib/pipewire-0.3/libpipewire-module-x.so")
+            ),
+            PathBuf::from("pipewire-0.3/libpipewire-module-x.so")
+        );
+    }
+
+    #[test]
+    fn link_targets_stay_inside_the_library_directory() {
+        // Beside each other: the bare name.
+        assert_eq!(
+            link_target(Path::new("alsa-lib"), Path::new("alsa-lib/b.so")),
+            "b.so"
+        );
+        // Flat link into a subdirectory.
+        assert_eq!(
+            link_target(Path::new(""), Path::new("alsa-lib/b.so")),
+            "alsa-lib/b.so"
+        );
+        // A subdirectory link to a flat library climbs out.
+        assert_eq!(link_target(Path::new("alsa-lib"), Path::new("b.so")), "../b.so");
+        // Flat to flat, the shape every alias had before.
+        assert_eq!(link_target(Path::new(""), Path::new("b.so")), "b.so");
+    }
+
+    /// A temp tree shaped like a distribution: `usr/lib` flat, data under
+    /// `usr/share`.
+    fn dist_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("onelf-libdata-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(root.join("usr/share/alsa/cards")).unwrap();
+        fs::write(root.join("usr/share/alsa/alsa.conf"), b"conf").unwrap();
+        fs::write(root.join("usr/share/alsa/cards/aliases.conf"), b"cards").unwrap();
+        (root.clone(), root.join("usr/lib/libasound.so.2"))
+    }
+
+    #[test]
+    fn a_carried_library_brings_its_data() {
+        let (root, lib) = dist_tree("carry");
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("lib")).unwrap();
+
+        let mut carried = HashSet::new();
+        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap(),
+            "conf"
+        );
+        assert!(tree.join("share/alsa/cards/aliases.conf").is_file());
+        assert_eq!(carried, HashSet::from(["share/alsa".to_string()]));
+
+        // A second run is a no-op, not a second copy.
+        let before = fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap();
+        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The carried snippet directory loads after the host's distro
+    /// snippets but before the user's own config files, so a pipewire
+    /// host cannot steal the output while a deliberate `asound.conf`
+    /// still can.
+    #[test]
+    fn a_carried_alsa_conf_loads_its_snippets_between_host_and_user() {
+        let work = std::env::temp_dir().join(format!("onelf-alsa-hooks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        let conf = work.join("alsa.conf");
+        fs::write(
+            &conf,
+            r##"@hooks [
+	{
+		func load
+		files [
+			"/var/lib/alsa/conf.d"
+			"/usr/etc/alsa/conf.d"
+			"/etc/alsa/conf.d"
+			"/etc/asound.conf|||/usr/etc/asound.conf"
+			"~/.asoundrc"
+		]
+		errors false
+	}
+]
+
+cards.@hooks [
+	{
+		func load
+		files [
+			"/etc/alsa/conf.d"
+		]
+	}
+]
+
+pcm.default cards.pcm.default
+"##,
+        )
+        .unwrap();
+
+        assert!(patch_alsa_conf_hooks(&conf).unwrap());
+
+        let out = fs::read_to_string(&conf).unwrap();
+        let host = out.find("\"/etc/alsa/conf.d\"").unwrap();
+        let carried = out
+            .find("{ @func datadir } \"/alsa.conf.d\"")
+            .expect("carried entry injected");
+        let user = out.find("\"/etc/asound.conf").unwrap();
+        assert!(host < carried && carried < user);
+        assert!(out.contains("cards.@hooks"));
+        assert_eq!(out.matches("\"/etc/alsa/conf.d\"").count(), 2);
+
+        // A second run is a no-op.
+        assert!(!patch_alsa_conf_hooks(&conf).unwrap());
+        assert_eq!(fs::read_to_string(&conf).unwrap(), out);
+
+        // A config without a hook block is left alone.
+        let plain = work.join("plain.conf");
+        fs::write(&plain, "pcm.default cards.pcm.default\n").unwrap();
+        assert!(!patch_alsa_conf_hooks(&plain).unwrap());
+
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn multiarch_and_store_layouts_are_both_found() {
+        // Debian: the library two levels below the one share serves.
+        let root =
+            std::env::temp_dir().join(format!("onelf-libdata-arch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let multiarch = root.join("usr/lib/x86_64-linux-gnu");
+        fs::create_dir_all(&multiarch).unwrap();
+        let alsa = root.join("usr/share/alsa");
+        fs::create_dir_all(&alsa).unwrap();
+        fs::write(alsa.join("alsa.conf"), b"conf").unwrap();
+        assert_eq!(
+            data_dir_beside(&multiarch.join("libasound.so.2"), "share/alsa"),
+            Some(alsa)
+        );
+
+        // Nix: the store path carries its own share beside lib.
+        let store = root.join("nix/store/x-alsa-lib");
+        fs::create_dir_all(store.join("lib")).unwrap();
+        fs::create_dir_all(store.join("share/X11/xkb/symbols")).unwrap();
+        assert_eq!(
+            data_dir_beside(&store.join("lib/libxkbcommon.so.0"), "share/X11/xkb"),
+            Some(store.join("share/X11/xkb"))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_data_is_skipped_and_the_lint_still_answers_for_it() {
+        let (root, lib) = dist_tree("missing");
+        // No share/X11/locale on this host.
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        let mut carried = HashSet::new();
+        carry_lib_data(&tree, "libX11.so.6", &lib, false, &mut carried).unwrap();
+
+        assert!(!tree.join("share").exists());
+        assert!(carried.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_the_owning_library_triggers_the_carry() {
+        let (root, lib) = dist_tree("owner");
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        let mut carried = HashSet::new();
+        // The x11 variant links libxkbcommon but owns no data; the soname
+        // prefix must not match it.
+        carry_lib_data(&tree, "libxkbcommon-x11.so.0", &lib, false, &mut carried).unwrap();
+        assert!(carried.is_empty());
+        assert!(!tree.join("share/X11").exists());
+
+        // An unrelated library carries nothing either.
+        carry_lib_data(&tree, "libpulse.so.0", &lib, false, &mut carried).unwrap();
+        assert!(!tree.join("share/alsa").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
