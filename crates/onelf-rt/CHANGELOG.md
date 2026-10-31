@@ -1,4 +1,10 @@
 
+## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.5.1...onelf-rt-v0.6.0) - 2026-10-31
+
+### 🐛 Bug Fixes
+
+- *(runtime)* Warn about missing GL only when the package links it - ([2f9904c](https://github.com/QaidVoid/onelf/commit/2f9904c9a97e6042619aa8ce2623d23f8963beca))
+
 
 ## [0.5.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.2...onelf-rt-v0.5.0) - 2026-10-29
 
