@@ -570,7 +570,6 @@ const DATA_PATHS: &[(&str, &[&str])] = &[
     ("TEXTDOMAINDIR", &["share/locale"]),
     ("XLOCALEDIR", &["share/X11/locale"]),
     ("ALSA_CONFIG_DIR", &["share/alsa"]),
-    ("ALSA_CONFIG_PATH", &["share/alsa/alsa.conf"]),
     (
         "MAGIC",
         &["share/file/misc/magic.mgc", "share/misc/magic.mgc"],
@@ -650,6 +649,44 @@ fn setup_plugin_dirs(pkg: &Path, lib_dirs: &[PathBuf], set_roots: &[PathBuf]) {
         if let Some(path) = found {
             set_path(var, path.as_os_str());
         }
+    }
+    set_alsa_config_path(&roots);
+}
+
+/// ALSA reads its top-level config from `ALSA_CONFIG_PATH` when set, and
+/// `alsa.conf`'s own `@hooks` then load the host's `/etc/asound.conf` and
+/// `/etc/alsa/conf.d` over it by absolute path. Nothing loads the carried
+/// `share/alsa/alsa.conf.d`: distros wire those files up as `/etc/alsa/conf.d`
+/// symlinks, which only exist on the host, and there is no hook for the
+/// data directory. A host whose conf.d names pipewire thus opens pipewire
+/// even though the package carried a pulse default, and the plugin it
+/// names usually cannot load. Listing `alsa.conf` followed by every
+/// carried `alsa.conf.d` file reads them last, so the carried default
+/// overrides whatever the host hooks set.
+fn set_alsa_config_path(roots: &[&Path]) {
+    if env::var_os("ALSA_CONFIG_PATH").is_some() {
+        return;
+    }
+    for root in roots {
+        let alsa = root.join("share/alsa");
+        let conf = alsa.join("alsa.conf");
+        if !conf.is_file() {
+            continue;
+        }
+        let mut list = vec![conf];
+        if let Ok(entries) = std::fs::read_dir(alsa.join("alsa.conf.d")) {
+            let mut confs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file())
+                .collect();
+            confs.sort();
+            list.extend(confs);
+        }
+        if let Ok(joined) = env::join_paths(list.iter().map(|path| path.as_os_str())) {
+            set_path("ALSA_CONFIG_PATH", &joined);
+        }
+        return;
     }
 }
 
@@ -1433,6 +1470,60 @@ mod plugin_dir_tests {
             var("XLOCALEDIR"),
             pkg.join("share/X11/locale").to_string_lossy()
         );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// `alsa.conf` first, then the carried `alsa.conf.d` files in name
+    /// order: the hooks inside `alsa.conf` load the host's `/etc` configs
+    /// over the top-level file, so the carried defaults must be read last
+    /// to win.
+    #[test]
+    fn alsa_config_path_appends_the_carried_conf_d() {
+        let work = tree("alsaconf");
+        let pkg = work.join("pkg");
+        let alsa = pkg.join("share/alsa");
+        touch(&alsa.join("alsa.conf"));
+        touch(&alsa.join("alsa.conf.d/99-pulseaudio-default.conf"));
+        touch(&alsa.join("alsa.conf.d/50-pulseaudio.conf"));
+        std::fs::create_dir_all(alsa.join("alsa.conf.d/10-not-a-file")).unwrap();
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        set_alsa_config_path(&[pkg.as_path()]);
+
+        let paths: Vec<String> = env::split_paths(&env::var_os("ALSA_CONFIG_PATH").unwrap())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                alsa.join("alsa.conf").to_string_lossy().into_owned(),
+                alsa
+                    .join("alsa.conf.d/50-pulseaudio.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+                alsa
+                    .join("alsa.conf.d/99-pulseaudio-default.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Without a carried `alsa.conf` the variable is left unset so ALSA
+    /// falls back to its compiled-in data directory.
+    #[test]
+    fn alsa_config_path_needs_a_carried_alsa_conf() {
+        let work = tree("alsaconf-missing");
+        let pkg = work.join("pkg");
+        std::fs::create_dir_all(pkg.join("share/alsa")).unwrap();
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        set_alsa_config_path(&[pkg.as_path()]);
+
+        assert!(env::var_os("ALSA_CONFIG_PATH").is_none());
 
         let _ = std::fs::remove_dir_all(&work);
     }
