@@ -45,8 +45,14 @@ With no flags, this:
    dead weight, since nothing loads it from there. With the library
    comes the data it reads from a path compiled into it: libasound
    brings `share/alsa`, libxkbcommon `share/X11/xkb`, libX11
-   `share/X11/locale`, and libmagic its magic files, each copied from
-   beside the resolved library. On a host without the owning package,
+   `share/X11/locale`, and libmagic its compiled database
+   `magic.mgc`, each copied from beside the resolved library. The
+   carry is automatic and adds bulk on every matching bundle: a
+   GUI toolkit's libxkbcommon brings roughly 3 MB of keymap data,
+   libasound about 150 KB. A tree bundled by an older onelf is
+   repaired on the next run: the missing data is carried then, and a
+   plugin left flat in `lib/` moves into its subdirectory. On a host
+   without the owning package,
    ALSA without `share/alsa` has no `alsa.conf` and cannot open any
    device at all, bundled plugins included. The carried `alsa.conf`
    also gets a hook entry inserted, loading the carried
@@ -228,7 +234,7 @@ for:
 ```
 warning: 2 compiled-in plugin or data path(s) have no copy in the bundle:
   - lib/libasound.so.2 reads /usr/lib/alsa-lib (carry alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR)
-  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR and ALSA_CONFIG_PATH)
+  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR)
 ```
 
 - ✅ Copy the directory into the bundle where the line says, and the
@@ -236,7 +242,10 @@ warning: 2 compiled-in plugin or data path(s) have no copy in the bundle:
 - ✅ Or force-include the plugins by soname
   (`include = ["libasound_module_pcm_pulse.so"]`): a resolved plugin
   keeps the directory it was found in (`lib/alsa-lib/`), which is the
-  copy the line asks for, and the warning clears on the next run.
+  copy the line asks for, and the warning clears on the next run. The
+  soname alone is not enough to find the file: give the walk a
+  `search-paths` entry pointing at the host's plugin directory, such as
+  `/usr/lib/alsa-lib`.
 - ✅ For the data directories (`share/alsa` and the rest), nothing to
   do: a bundled library brings its own data from beside it, and the
   warning clears without a hand-placed copy. It stays when the build
