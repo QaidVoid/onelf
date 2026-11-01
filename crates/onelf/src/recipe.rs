@@ -8,6 +8,9 @@
 //! command = "bin/myapp"
 //! working-dir = "package"
 //!
+//! [input]
+//! binary = "../upstream/myapp"
+//!
 //! [[entrypoint]]
 //! name = "myapp-cli"
 //! path = "bin/myapp"
@@ -36,6 +39,10 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Recipe {
     pub package: Package,
+    /// Files the build imports into the AppDir before assembly, from the
+    /// `[input]` TOML table.
+    #[serde(default)]
+    pub input: Option<Input>,
     #[serde(default)]
     pub entrypoint: Vec<Entrypoint>,
     #[serde(default)]
@@ -65,6 +72,55 @@ pub struct Recipe {
     /// that should answer for it.
     #[serde(default)]
     pub paths: BTreeMap<String, String>,
+}
+
+/// The longest path an `[input]` names, in bytes.
+const MAX_INPUT_PATH: usize = 4096;
+
+/// `[input]`: files the build imports into the AppDir before assembly.
+///
+/// An imported binary is tracked by content hash like the rest of the
+/// generated AppDir: a rebuild refreshes it from its source, and a
+/// staged copy someone edited stops the build instead of being
+/// silently overwritten.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Input {
+    /// A bare executable the build copies to the package command's
+    /// path before assembly, named relative to the recipe's directory.
+    pub binary: Option<PathBuf>,
+}
+
+impl Input {
+    /// Reject an `[input]` that cannot do anything, and path spellings
+    /// the recipe-relative resolution rules refuse.
+    pub fn validate(&self) -> std::io::Result<()> {
+        let Some(binary) = &self.binary else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[input] names no binary: there is nothing to import",
+            ));
+        };
+        if binary.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[input] binary is empty",
+            ));
+        }
+        if std::os::unix::ffi::OsStrExt::as_bytes(binary.as_os_str()).len() > MAX_INPUT_PATH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("[input] binary is longer than the {MAX_INPUT_PATH} byte path limit"),
+            ));
+        }
+        if binary.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[input] binary must be relative to the recipe's directory",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -442,6 +498,14 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
             )
         })?;
     }
+    if let Some(input) = &recipe.input {
+        input.validate().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+    }
     Ok(recipe)
 }
 
@@ -651,6 +715,75 @@ mod package_tests {
         let sr = recipe.sysroot.unwrap();
         assert!(sr.path.is_none());
         assert_eq!(sr.platform_url.as_deref(), Some("https://e/gl.onelf"));
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::load;
+
+    fn load_result(body: &str) -> std::io::Result<super::Recipe> {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-recipe-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("onelf.toml");
+        std::fs::write(&path, body).unwrap();
+        let recipe = load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        recipe
+    }
+
+    #[test]
+    fn an_input_section_parses_a_recipe_relative_binary() {
+        let recipe = load_result(
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"../upstream/app\"\n",
+        )
+        .unwrap();
+        let input = recipe.input.expect("section present");
+        assert_eq!(
+            input.binary,
+            Some(std::path::PathBuf::from("../upstream/app"))
+        );
+        let bare = load_result("[package]\ncommand = \"bin/app\"\n").unwrap();
+        assert!(bare.input.is_none());
+    }
+
+    #[test]
+    fn an_unknown_input_field_is_refused() {
+        let err = load_result("[package]\ncommand = \"bin/app\"\n\n[input]\nbinaryy = \"app\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn an_input_that_names_nothing_is_refused() {
+        let err = load_result("[package]\ncommand = \"bin/app\"\n\n[input]\n").unwrap_err();
+        assert!(err.to_string().contains("names no binary"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_or_empty_binary_is_refused() {
+        let err =
+            load_result("[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"/bin/app\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("must be relative"), "{err}");
+        let err = load_result("[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
+    }
+
+    #[test]
+    fn an_over_long_binary_path_is_refused() {
+        let long = "a".repeat(super::MAX_INPUT_PATH + 1);
+        let body = format!("[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"{long}\"\n");
+        let err = load_result(&body).unwrap_err();
+        assert!(err.to_string().contains("path limit"), "{err}");
     }
 }
 

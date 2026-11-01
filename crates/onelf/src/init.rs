@@ -1,11 +1,13 @@
 //! Scaffold a starter `onelf.toml` recipe.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Write a default onelf.toml at `output`. If `binary` is provided, its
-/// basename is used for the package name and it becomes `bin/<name>`.
-/// Refuses to overwrite an existing file unless `force` is set.
+/// basename is used for the package name and it becomes `bin/<name>`,
+/// with an `[input]` section naming the binary relative to the recipe,
+/// so the scaffolded recipe actually builds. Refuses to overwrite an
+/// existing file unless `force` is set.
 pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()> {
     if output.exists() && !force {
         return Err(io::Error::new(
@@ -23,6 +25,14 @@ pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()>
         }
         None => ("myapp".to_string(), "bin/myapp".to_string()),
     };
+    let input = match binary {
+        Some(b) => format!(
+            "\n[input]\n# The bare binary imported to `command` before assembly. A path\n\
+             # relative to this file.\nbinary = \"{}\"\n",
+            toml_escape(&recipe_relative(output, b).to_string_lossy())
+        ),
+        None => String::new(),
+    };
 
     let body = format!(
         r##"# onelf recipe. Edit to taste, then run `onelf build` to produce the binary.
@@ -30,7 +40,7 @@ pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()>
 [package]
 name = "{name}"
 command = "{command}"
-
+{input}
 # Optional metadata. Displayed by `onelf info`, stored as .onelf/package-info.toml.
 # version = "0.1.0"
 # description = "Short summary of what this package does"
@@ -114,8 +124,95 @@ dict = false
     Ok(())
 }
 
+/// `binary` as a path relative to the recipe `output`'s directory,
+/// computed lexically so it holds before either path exists. An
+/// absolute `--binary` still lands in the recipe, spelled so the
+/// recipe-relative resolution the build applies finds it.
+fn recipe_relative(output: &Path, binary: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = lexical_absolute(&cwd, output.parent().unwrap_or(Path::new("")));
+    let target = lexical_absolute(&cwd, binary);
+    relative_to(&base, &target)
+}
+
+/// `path` made absolute against `base` and stripped of `.` and `..`
+/// components, without touching the filesystem.
+fn lexical_absolute(base: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            component => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `path` spelled relative to `base`, both absolute.
+fn relative_to(base: &Path, path: &Path) -> PathBuf {
+    let base: Vec<_> = base.components().collect();
+    let path: Vec<_> = path.components().collect();
+    let shared = base
+        .iter()
+        .zip(path.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in shared..base.len() {
+        out.push("..");
+    }
+    for component in &path[shared..] {
+        out.push(component.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Escape `s` for a TOML basic string: a file name holding a quote or a
+/// backslash must not break the recipe.
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{init, recipe_relative};
+    use crate::assembly::AssemblyRequest;
+    use crate::recipe;
+
+    /// A temp directory unique per test and per call, so parallel tests
+    /// never share state.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-init-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// The template writes `level` out, so it has to be the level a recipe
     /// without one gets.
     #[test]
@@ -129,5 +226,59 @@ mod tests {
         let bare = crate::recipe::load(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(written.compression.level, bare.compression.level);
+    }
+
+    /// A seed without `--binary` gains no `[input]`: existing behavior
+    /// stays as it was.
+    #[test]
+    fn a_plain_seed_writes_no_input_section() {
+        let dir = temp_dir("plain");
+        let path = dir.join("onelf.toml");
+        init(&path, None, false).unwrap();
+        let recipe = recipe::load(&path).unwrap();
+        assert!(recipe.input.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `init --binary` writes a recipe that builds: the input resolves,
+    /// and planning yields the seeded binary as the import source.
+    #[test]
+    fn a_binary_seed_writes_a_buildable_import_recipe() {
+        let dir = temp_dir("seed");
+        let binary = dir.join("upstream/app");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+        let recipe_path = dir.join("pkg/onelf.toml");
+        std::fs::create_dir_all(recipe_path.parent().unwrap()).unwrap();
+        init(&recipe_path, Some(&binary), false).unwrap();
+        let recipe = recipe::load(&recipe_path).unwrap();
+        let input = recipe.input.as_ref().expect("[input] seeded");
+        assert_eq!(
+            input.binary,
+            Some(std::path::PathBuf::from("../upstream/app"))
+        );
+        assert_eq!(recipe.package.command, "bin/app");
+        let request = AssemblyRequest::plan(&recipe_path, recipe, None).unwrap();
+        // The planned source is spelled relative to the recipe's own
+        // directory, so compare it by what it reaches.
+        assert_eq!(
+            std::fs::canonicalize(request.input.expect("planned import").source).unwrap(),
+            std::fs::canonicalize(&binary).unwrap()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A binary inside the recipe's directory stays a plain relative
+    /// path, and a name with TOML-hostile characters survives.
+    #[test]
+    fn seeds_spell_the_input_path_for_the_recipe() {
+        let dir = temp_dir("spell");
+        std::fs::write(dir.join("app"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            recipe_relative(&dir.join("onelf.toml"), &dir.join("app")),
+            std::path::PathBuf::from("app")
+        );
+        assert_eq!(super::toml_escape("we\"ird\\name"), "we\\\"ird\\\\name");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

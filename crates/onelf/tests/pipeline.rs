@@ -12164,3 +12164,394 @@ fn a_stipple_payload_refuses_what_it_cannot_honour() {
     }
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A bare executable for `[input] binary` to import, plus the recipe
+/// directory beside it. The recipe imports `../upstream/app` to
+/// `bin/app`, the path the design example spells.
+fn import_fixture(td: &Path, tag: &str) -> (PathBuf, PathBuf) {
+    let upstream = td.join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    let source = upstream.join("app");
+    write(&source, "#!/bin/sh\necho IMPORT_OK\n");
+    std::fs::set_permissions(
+        &source,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let pkg = td.join(tag);
+    std::fs::create_dir_all(&pkg).unwrap();
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+         [input]\nbinary = \"../upstream/app\"\n",
+    );
+    (pkg, source)
+}
+
+/// A minimal dynamically linked ELF for the end-to-end import build.
+fn elf_source(td: &Path, marker: &str) -> PathBuf {
+    let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
+    write(
+        &td.join("app.c"),
+        &format!("#include <stdio.h>\nint main(){{printf(\"{escaped}\\n\");return 0;}}\n"),
+    );
+    td.join("app.c")
+}
+
+/// Run the package a test built, isolated to the test's scratch.
+fn run_import_package(pkg: &Path, td: &Path) -> std::process::Output {
+    let mut c = Command::new(pkg);
+    c.env_clear().env("PATH", "/usr/bin:/bin").env("HOME", td);
+    isolate(&mut c, td);
+    run_package(&mut c)
+}
+
+/// A recipe that imports a bare binary builds the binary into an
+/// executable without a pre-existing AppDir. The upstream file itself
+/// is never modified, the package carries the command, and a rebuild
+/// after the bundler's own ELF rewriting still refreshes instead of
+/// reporting a conflict.
+#[test]
+fn a_bare_binary_import_builds_and_runs() {
+    let td = workdir("import-e2e");
+    let src = elf_source(&td, "ELF_IMPORT_OK");
+    let upstream = td.join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    let source = upstream.join("app");
+    if !cc(&src, &source) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    let before = std::fs::read(&source).unwrap();
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+         [input]\nbinary = \"../upstream/app\"\n",
+    );
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "bare-binary build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        before,
+        "the import must not modify the upstream file"
+    );
+    assert!(pkg.join("bin/app").is_file());
+    assert!(pkg.join(".onelf/generated").is_file());
+
+    let run = run_import_package(&pkg.join("imported.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_OK"), "{stdout}");
+
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "a rebuild after bundling rewrote the import must refresh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = run_import_package(&pkg.join("imported.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A rebuild refreshes the staged copy: a vanished one is restored, and
+/// an untouched one is rewritten in place from the same source.
+#[test]
+fn an_import_refreshes_its_staged_copy() {
+    let td = workdir("import-refresh");
+    let (pkg, source) = import_fixture(&td, "pkg");
+    let staged = pkg.join("bin/app");
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(staged.is_file());
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "an unchanged rebuild must refresh, not conflict: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_file(&staged).unwrap();
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&staged).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A source that changed upstream refreshes a staged copy the record
+/// still attests, and the new bytes are what the next package carries.
+#[test]
+fn a_changed_source_refreshes_a_recorded_import() {
+    let td = workdir("import-changed");
+    let (pkg, source) = import_fixture(&td, "pkg");
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    write(&source, "#!/bin/sh\necho IMPORT_V2\n");
+    std::fs::set_permissions(
+        &source,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "a changed upstream must refresh the recorded copy: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(pkg.join("bin/app")).unwrap(),
+        "#!/bin/sh\necho IMPORT_V2\n"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Staged bytes nobody recorded are publisher content: the build keeps
+/// them and stops instead of packing an edit or overwriting it.
+#[test]
+fn an_edited_import_conflicts_instead_of_building() {
+    let td = workdir("import-edited");
+    let (pkg, _source) = import_fixture(&td, "pkg");
+    let staged = pkg.join("bin/app");
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    write(&staged, "#!/bin/sh\necho EDITED\n");
+    let out = onelf_build(&pkg);
+    assert!(
+        !out.status.success(),
+        "an edited import must stop the build"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("did not import"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&staged).unwrap(),
+        "#!/bin/sh\necho EDITED\n",
+        "the edit must survive the failed build"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An import reads through a source alias and a hardlink without
+/// changing either: the link keeps its target and the hardlink keeps
+/// its inode, so the source binary is never the build's to rewrite.
+#[test]
+fn an_import_follows_a_source_alias_or_hardlink() {
+    let td = workdir("import-alias");
+    let (pkg, source) = import_fixture(&td, "pkg");
+    let alias = td.join("upstream/link");
+    std::os::unix::fs::symlink("app", &alias).unwrap();
+    let hard = td.join("upstream/hard");
+    std::fs::hard_link(&source, &hard).unwrap();
+    let inode = |p: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let hard_before = inode(&hard);
+
+    for (name, rel) in [("alias", "../upstream/link"), ("hard", "../upstream/hard")] {
+        write(
+            &pkg.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+                 [input]\nbinary = \"{rel}\"\n"
+            ),
+        );
+        let out = onelf_build(&pkg);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read(pkg.join("bin/app")).unwrap(),
+            std::fs::read(&source).unwrap(),
+            "{name}: the staged copy holds the source bytes"
+        );
+        assert!(
+            std::fs::symlink_metadata(pkg.join("bin/app"))
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "{name}: the staged copy is its own file, not a link"
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(&alias).unwrap().as_os_str(),
+        "app",
+        "the alias must keep pointing at the source"
+    );
+    assert_eq!(inode(&hard), hard_before, "the hardlink keeps its inode");
+    assert_eq!(
+        std::fs::read(&hard).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A symlink sitting on the import's destination path stops the build
+/// before anything is written, and the link's target is untouched.
+#[test]
+fn an_import_refuses_to_write_through_a_destination_symlink() {
+    let td = workdir("import-attack");
+    let (pkg, _source) = import_fixture(&td, "pkg");
+    let victim = td.join("victim");
+    write(&victim, "do not touch\n");
+    std::fs::create_dir_all(pkg.join("bin")).unwrap();
+    std::os::unix::fs::symlink(&victim, pkg.join("bin/app")).unwrap();
+    let out = onelf_build(&pkg);
+    assert!(
+        !out.status.success(),
+        "an import must not write through a destination symlink"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "do not touch\n",
+        "the linked file must be untouched"
+    );
+    assert!(
+        std::fs::symlink_metadata(pkg.join("bin/app"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two authoritative sources are refused, naming both fields, before
+/// either source is materialized.
+#[test]
+fn a_binary_input_conflicts_with_a_sysroot_database() {
+    let td = workdir("import-sysroot");
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"../upstream/app\"\n\n\
+         [sysroot]\npath = \"root\"\n",
+    );
+    let out = onelf_build(&pkg);
+    assert!(!out.status.success(), "the conflict must refuse the build");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[input] binary"), "{stderr}");
+    assert!(stderr.contains("[sysroot] path"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An import needs a tree to import into, so explicit skip is refused.
+#[test]
+fn a_binary_input_conflicts_with_bundle_skip() {
+    let td = workdir("import-skip");
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"../upstream/app\"\n\n\
+         [bundle]\nskip = true\n",
+    );
+    let out = onelf_build(&pkg);
+    assert!(!out.status.success(), "the conflict must refuse the build");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[input] binary"), "{stderr}");
+    assert!(stderr.contains("[bundle] skip"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A set-only sysroot records its sets for the runtime beside an
+/// imported binary: the one accepted combination of an import with a
+/// sysroot section.
+#[test]
+fn a_set_only_sysroot_works_with_a_binary_input() {
+    let td = workdir("import-setonly");
+    let (pkg, _source) = import_fixture(&td, "pkg");
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+         [input]\nbinary = \"../upstream/app\"\n\n[sysroot.sets.dev]\n\
+         packages = [\"gtk3\"]\nurl = \"https://example.com/dev.onelf\"\n\
+         blake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+    );
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(pkg.join(".onelf/sets").is_file());
+    let sets = std::fs::read_to_string(pkg.join(".onelf/sets")).unwrap();
+    assert!(sets.contains("dev"), "{sets}");
+    assert!(pkg.join("imported.onelf").is_file());
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `init --binary` writes the `[input]` reference beside the name and
+/// command, so init followed by build produces a working package.
+#[test]
+fn init_seeds_a_buildable_binary_input() {
+    let td = workdir("import-init");
+    let (_pkg, _source) = import_fixture(&td, "pkg");
+    std::fs::remove_file(td.join("pkg/onelf.toml")).unwrap();
+    let out = run_onelf(
+        &["init", "--binary", "../upstream/app"],
+        Some(&td.join("pkg")),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recipe = std::fs::read_to_string(td.join("pkg/onelf.toml")).unwrap();
+    assert!(recipe.contains("[input]"), "{recipe}");
+    assert!(recipe.contains("binary = \"../upstream/app\""), "{recipe}");
+    let out = onelf_build(&td.join("pkg"));
+    assert!(
+        out.status.success(),
+        "the scaffolded recipe must build: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The scaffold derives the package name from the binary's basename.
+    let run = run_import_package(&td.join("pkg/app.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("IMPORT_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}

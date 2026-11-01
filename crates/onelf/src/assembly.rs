@@ -8,7 +8,8 @@
 //! request yields the low-level pack invocation.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 
 use onelf_format::WorkingDir;
 use onelf_format::elf;
@@ -125,6 +126,14 @@ impl UpdateRequest {
     }
 }
 
+/// The bare binary a recipe imports before assembly, resolved against
+/// the recipe's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryImport {
+    /// The file to import, as the build reads it.
+    pub source: PathBuf,
+}
+
 /// How the AppDir contents are produced, normalized from the recipe's
 /// `[bundle]` and `[sysroot]` sections.
 #[derive(Debug, Clone)]
@@ -235,6 +244,9 @@ pub struct AssemblyRequest {
     /// Libraries dlopen'd on every exec by the bundled environment
     /// constructor.
     pub preload: Vec<String>,
+    /// The bare binary imported to the package command's path before
+    /// the AppDir is assembled, when the recipe asks for one.
+    pub input: Option<BinaryImport>,
     /// How the AppDir contents are produced.
     pub bundle: BundleRequest,
 }
@@ -265,7 +277,70 @@ impl AssemblyRequest {
             env,
             paths,
             preload,
+            input,
         } = recipe;
+
+        // An imported binary is a second authoritative source of the
+        // AppDir's contents, so it is judged before anything is
+        // materialized or mutated: a conflict must fail naming both
+        // fields while neither source has been touched.
+        let import = match input
+            .as_ref()
+            .and_then(|i| i.binary.as_ref().map(|b| (i, b)))
+        {
+            None => None,
+            Some((declared, binary)) => {
+                declared.validate()?;
+                if sysroot.as_ref().is_some_and(|sr| sr.path.is_some()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: [input] binary and [sysroot] path conflict: a build \
+                             takes its contents from one authoritative source, so \
+                             name one of them",
+                            recipe_path.display()
+                        ),
+                    ));
+                }
+                if rb.skip {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: [input] binary conflicts with [bundle] skip: skip \
+                             expects an already prepared tree, so there is nothing \
+                             to import into",
+                            recipe_path.display()
+                        ),
+                    ));
+                }
+                import_destination(&package.command)?;
+                let source = dir.join(binary);
+                let why = "[input] binary names a bare executable file to import; \
+                           archives, package-manager identifiers and source trees \
+                           are not supported inputs";
+                let meta = std::fs::metadata(&source).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{}: [input] binary {}: {e}. {why}",
+                            recipe_path.display(),
+                            source.display()
+                        ),
+                    )
+                })?;
+                if !meta.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: [input] binary {}: not a file. {why}",
+                            recipe_path.display(),
+                            source.display()
+                        ),
+                    ));
+                }
+                Some(BinaryImport { source })
+            }
+        };
 
         // A build from a sysroot's package database does not use the
         // framework bundlers, so their flags would do nothing. A recipe
@@ -395,6 +470,7 @@ impl AssemblyRequest {
             env: env.into_iter().collect(),
             paths: paths.into_iter().collect(),
             preload,
+            input: import,
             bundle: BundleRequest {
                 skip: rb.skip && sysroot.is_none(),
                 gl: rb.gl,
@@ -427,12 +503,17 @@ impl AssemblyRequest {
     /// Populate the AppDir this request names and report what the
     /// assembly did.
     ///
-    /// A sysroot is applied by bundle-libs, so it runs even when the
-    /// recipe would otherwise skip bundling. A recipe that skips
-    /// bundling and pins sets without a sysroot keeps its AppDir exactly
-    /// as it stands: only the records the runtime fetches by are
-    /// written, with no scan and no verification.
+    /// A recipe that imports a bare binary has it copied to the
+    /// package command's path first, so a build can start from
+    /// nothing but the binary. A sysroot is applied by bundle-libs, so
+    /// it runs even when the recipe would otherwise skip bundling. A
+    /// recipe that skips bundling and pins sets without a sysroot
+    /// keeps its AppDir exactly as it stands: only the records the
+    /// runtime fetches by are written, with no scan and no verification.
     pub fn stage(&self) -> io::Result<AssemblyReport> {
+        if let Some(import) = &self.input {
+            import_binary(&self.directory, import, &self.package.command)?;
+        }
         let sets = set_names(&self.bundle.sets);
         if self.bundle.skip {
             if !self.bundle.sets.is_empty() || self.bundle.platform_pin.is_some() {
@@ -450,6 +531,13 @@ impl AssemblyRequest {
             });
         }
         bundle::bundle_libs(&self.bundle_options())?;
+        if self.input.is_some() {
+            // The bundler may rewrite the imported command (its ELF
+            // constructor injection among other things), so the import's
+            // recorded hash is attested only after that rewriting: what
+            // the record then hashes are the build's final bytes.
+            bundle::sysroot::attest_generated(&self.directory)?;
+        }
         Ok(AssemblyReport {
             source: if self.bundle.sysroot.is_some() {
                 Source::SysrootDatabase
@@ -553,6 +641,210 @@ impl AssemblyRequest {
             runtime_note,
         }
     }
+}
+
+/// The AppDir path an import writes to: the package command as a plain
+/// relative path. Traversal, an absolute prefix or anything else that
+/// could reach outside the AppDir is refused before anything is staged.
+fn import_destination(command: &str) -> io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in Path::new(command).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "command path '{command}' must be a plain relative path \
+                         inside the AppDir"
+                    ),
+                ));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("command path '{command}' names nothing inside the AppDir"),
+        ));
+    }
+    Ok(out)
+}
+
+/// Refuse to write `rel` under `appdir` when any existing component of
+/// it, including the last, is a symbolic link: a link could carry the
+/// write outside the AppDir or over a file the import does not own. A
+/// component that does not exist yet ends the walk; the import creates
+/// the missing directories itself.
+fn refuse_destination_links(appdir: &Path, rel: &Path) -> io::Result<()> {
+    let mut prefix = PathBuf::from(appdir);
+    for component in rel.components() {
+        prefix.push(component);
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{}: a symbolic link is in the way of the import; remove \
+                         it or point [package] command elsewhere",
+                        prefix.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", prefix.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The BLAKE3 of a regular file's bytes, tagged the way
+/// [`bundle::sysroot::hash_entry`] tags a file, so a staged copy, its
+/// recorded hash and its source all compare under one scheme.
+fn hash_file(path: &Path) -> io::Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"file ");
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize())
+}
+
+/// Whether an existing destination may be overwritten by this import.
+/// Bytes that already match the source are an idempotent re-import.
+/// Bytes the record still attests as the previous build's own output
+/// are a refresh, and so is a record whose hash predates the build's
+/// own ELF rewriting, since the rewriting may have changed the bytes
+/// through no publisher's hand. Anything else is publisher content,
+/// which stays and stops the build instead of being replaced or packed.
+fn judge_existing_import(
+    appdir: &Path,
+    dest_rel: &Path,
+    actual: blake3::Hash,
+    snapshot: blake3::Hash,
+) -> io::Result<()> {
+    if actual == snapshot {
+        return Ok(());
+    }
+    let dest_rel = dest_rel.to_string_lossy();
+    let recorded = bundle::sysroot::read_generated(appdir)?
+        .into_iter()
+        .find(|e| e.path == dest_rel);
+    match recorded {
+        Some(entry) if entry.pending => Ok(()),
+        Some(entry) if entry.hash == Some(actual) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{dest_rel}: holds bytes this recipe did not import: neither the \
+                 recorded import nor the source matches. Remove the file or move \
+                 it to a name [package] command does not use"
+            ),
+        )),
+    }
+}
+
+/// Copy `source` beside `dest` under an exclusively created unique name,
+/// for the caller to hash, make executable, and rename into place.
+fn staged_copy(source: &Path, dest: &Path) -> io::Result<PathBuf> {
+    let dir = dest.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}: no parent directory to stage the import in",
+                dest.display()
+            ),
+        )
+    })?;
+    let name = dest.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: no file name to stage the import under", dest.display()),
+        )
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staged = dir.join(format!(
+        ".{}.import-{}-{nanos}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::copy(source, &staged).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("[input] binary {}: {e}", source.display()),
+        )
+    })?;
+    Ok(staged)
+}
+
+/// Import a recipe's bare binary into the AppDir: copy the source to
+/// the package command's path through a uniquely named staged file
+/// renamed into place. The source is only ever read, so an alias or a
+/// hardlink to it never changes, and no destination a symlink names is
+/// ever written through.
+///
+/// The copy is recorded in the generated ledger with its content hash.
+/// The record starts pending: the build may still rewrite the command
+/// after the import, and only the bytes the build finishes with are
+/// attested. A staged copy the record still attests is refreshed from
+/// the source, including a source that changed upstream since the last
+/// build; a record whose hash predates the build's own rewriting is
+/// also refreshed; staged bytes that attest to nothing are publisher
+/// content and stop the build with a conflict before anything is packed.
+fn import_binary(appdir: &Path, import: &BinaryImport, command: &str) -> io::Result<()> {
+    let dest_rel = import_destination(command)?;
+    let dest = appdir.join(&dest_rel);
+    refuse_destination_links(appdir, &dest_rel)?;
+    let snapshot = hash_file(&import.source)?;
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{}: is a directory; [package] command must name a file the \
+                     import can write",
+                    dest.display()
+                ),
+            ));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: not a regular file; refusing to import over it",
+                    dest.display()
+                ),
+            ));
+        }
+        Ok(_) => judge_existing_import(appdir, &dest_rel, hash_file(&dest)?, snapshot)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", dest.display()))),
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staged = staged_copy(&import.source, &dest)?;
+    if hash_file(&staged)? != snapshot {
+        let _ = std::fs::remove_file(&staged);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: changed while the import copied it",
+                import.source.display()
+            ),
+        ));
+    }
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&staged, &dest)?;
+    bundle::sysroot::record_generated(appdir, vec![dest_rel.to_string_lossy().into_owned()])?;
+    Ok(())
 }
 
 /// The runtime selected for a build, with the capability note probed
@@ -1044,5 +1336,240 @@ mod tests {
         let request = plan_in(&dir, "[package]\ncommand = \"bin/app\"\n").unwrap();
         assert_eq!(embed_runtime(&request).unwrap().bytes, RUNTIME_BINARY_SLIM);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain executable file under `base`, relative path `rel`,
+    /// executable so a staged import of it is runnable.
+    fn seed_binary(base: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = base.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    const UPSTREAM: &[u8] = b"#!/bin/sh\necho IMPORT_OK\n";
+
+    #[test]
+    fn an_import_resolves_against_the_recipe_directory() {
+        let dir = temp_dir("import-resolve");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            request.input,
+            Some(BinaryImport {
+                source: dir.join("upstream/app"),
+            })
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_binary_import_and_a_sysroot_database_are_refused_together() {
+        let sysroot = temp_dir("import-sysroot");
+        let dir = temp_dir("import-conflict");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        std::fs::create_dir_all(&sysroot).unwrap();
+        let body = format!(
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n\n\
+             [sysroot]\npath = \"{}\"\n",
+            sysroot.display()
+        );
+        let err = plan_in(&dir, &body).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("[input] binary"), "{err}");
+        assert!(text.contains("[sysroot] path"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&sysroot).unwrap();
+    }
+
+    #[test]
+    fn a_binary_import_and_bundle_skip_are_refused_together() {
+        let dir = temp_dir("import-skip");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let err = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n\n\
+             [bundle]\nskip = true\n",
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("[input] binary"), "{err}");
+        assert!(text.contains("[bundle] skip"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_must_name_a_supported_file() {
+        let dir = temp_dir("import-missing");
+        let err = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"absent/app\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bare executable"), "{err}");
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        let err = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"tree\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bare executable"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_refuses_a_command_that_leaves_the_appdir() {
+        let dir = temp_dir("import-escape");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        for command in ["../app", "/bin/app", "."] {
+            let body = format!(
+                "[package]\ncommand = \"{command}\"\n\n[input]\nbinary = \"upstream/app\"\n"
+            );
+            let err = plan_in(&dir, &body).unwrap_err();
+            assert!(
+                err.to_string().contains("plain relative path"),
+                "{command}: {err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_stages_the_command_and_records_it() {
+        let dir = temp_dir("import-stage");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        let report = request.stage().unwrap();
+        assert_eq!(report.source, Source::HostScan);
+        let dest = dir.join("bin/app");
+        assert_eq!(std::fs::read(&dest).unwrap(), UPSTREAM);
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let entries = bundle::sysroot::read_generated(&dir).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.path == "bin/app")
+            .expect("recorded");
+        assert_eq!(entry.hash, Some(hash_file(&dest).unwrap()));
+        assert!(!entry.pending);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_refreshes_a_staged_copy_from_its_source() {
+        let dir = temp_dir("import-refresh");
+        let source = seed_binary(&dir, "upstream/app", UPSTREAM);
+        let body = "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n";
+        let request = plan_in(&dir, body).unwrap();
+        request.stage().unwrap();
+        // An idempotent rebuild, a vanished staged copy, and a source
+        // that changed upstream all refresh to the current source.
+        request.stage().unwrap();
+        std::fs::remove_file(dir.join("bin/app")).unwrap();
+        request.stage().unwrap();
+        std::fs::write(&source, b"#!/bin/sh\necho IMPORT_V2\n").unwrap();
+        request.stage().unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("bin/app")).unwrap(),
+            b"#!/bin/sh\necho IMPORT_V2\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_edited_staged_import_stops_the_build() {
+        let dir = temp_dir("import-edited");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        request.stage().unwrap();
+        std::fs::write(dir.join("bin/app"), b"#!/bin/sh\necho EDITED\n").unwrap();
+        let err = request.stage().unwrap_err();
+        assert!(err.to_string().contains("did not import"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("bin/app")).unwrap(),
+            b"#!/bin/sh\necho EDITED\n",
+            "the edit must be preserved, not overwritten"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_refuses_a_destination_symlink_and_leaves_it_alone() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("import-link");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do not touch\n").unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&victim, dir.join("bin/app")).unwrap();
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        let err = request.stage().unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch\n");
+        assert!(
+            std::fs::symlink_metadata(dir.join("bin/app"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_refuses_publisher_owned_content() {
+        let dir = temp_dir("import-publisher");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/app"), b"the publisher's own binary\n").unwrap();
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        let err = request.stage().unwrap_err();
+        assert!(err.to_string().contains("did not import"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("bin/app")).unwrap(),
+            b"the publisher's own binary\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_through_a_linked_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("import-linkdir");
+        seed_binary(&dir, "upstream/app", UPSTREAM);
+        let outside = dir.parent().unwrap().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, dir.join("bin")).unwrap();
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"upstream/app\"\n",
+        )
+        .unwrap();
+        let err = request.stage().unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!outside.join("app").exists(), "nothing may land outside");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 }
