@@ -35,11 +35,13 @@ mod datadirs;
 mod discover;
 pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
+mod plan;
 mod resolve;
 pub(crate) use resolve::*;
 pub(crate) mod elf;
 pub mod sysroot;
 pub(crate) use elf::*;
+use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
 
 /// Ensure a file is writable so it can be overwritten on re-runs.
@@ -634,21 +636,23 @@ fn hooks_block(lines: &[&str]) -> Option<(usize, usize)> {
     None
 }
 
-/// Carry the data directories and files of a resolved library into the
+/// Plan the data directories and files of a resolved library into the
 /// tree, once per path: a re-run and a tree that already carries a path
 /// are left alone, except that an existing `share/alsa` still has its
 /// `alsa.conf` anchored (a tree bundled before the patch existed carries
-/// the directory but not the entry that loads its snippets). What the
-/// host has not, nothing is carried, and the lint keeps saying so. A
-/// failure to carry one path is a warning, not a failed bundle: the walk
-/// carries the rest.
-fn carry_lib_data(
+/// the directory but not the entry that loads its snippets). An existing
+/// path is judged by content, so the tree cannot silently stand in for
+/// data it does not match, and the writes themselves are queued for the
+/// executor after the whole plan resolves. What the host has not,
+/// nothing is carried, and the lint keeps saying so.
+fn plan_carried_data(
     directory: &Path,
     soname: &str,
     resolved: &Path,
-    dry_run: bool,
     carried: &mut HashSet<String>,
-) {
+    plan: &mut DestinationPlan,
+    actions: &mut Vec<WalkAction>,
+) -> io::Result<()> {
     for (prefix, rels) in LIB_DATA_DIRS {
         if !soname.starts_with(prefix) {
             continue;
@@ -657,58 +661,298 @@ fn carry_lib_data(
             if carried.contains(*rel) {
                 continue;
             }
+            let alsa = *rel == "share/alsa";
             let dest = directory.join(rel);
+            let src = data_dir_beside(resolved, rel);
             if dest.exists() {
                 carried.insert((*rel).to_string());
-                if *rel == "share/alsa" {
-                    patch_carried_alsa_conf(directory, dry_run);
+                if alsa {
+                    actions.push(WalkAction::PatchCarriedAlsa);
+                }
+                let Some(src) = src else {
+                    continue;
+                };
+                // A carried directory the tree already holds is the
+                // tree's own: the build anchors its config in place, so
+                // presence satisfies the carry. A carried file is never
+                // rewritten by the build, so its content is judged.
+                if !src.is_dir() {
+                    plan.admit_carried(Path::new(*rel), &src, &format!("{soname} data carry"))?;
                 }
                 continue;
             }
-            let Some(src) = data_dir_beside(resolved, rel) else {
+            let Some(src) = src else {
                 continue;
             };
             carried.insert((*rel).to_string());
-            if dry_run {
-                eprintln!(
-                    "  {} {} (data of {})",
-                    color::bold("Would copy"),
+            if plan.admit_carried(Path::new(*rel), &src, &format!("{soname} data carry"))?
+                == Admission::Write
+            {
+                actions.push(WalkAction::CarryData {
+                    soname: soname.to_string(),
+                    src,
                     rel,
-                    color::cyan(soname)
-                );
-                continue;
-            }
-            match copy_data(&src, &dest) {
-                Ok(bytes) => {
-                    eprintln!(
-                        "  {} {} <- {} (data of {}, {})",
-                        color::bold_green("Copied"),
-                        rel,
-                        src.display(),
-                        color::cyan(soname),
-                        color::dim(&format_size(bytes))
-                    );
-                    if *rel == "share/alsa" {
-                        patch_carried_alsa_conf(directory, dry_run);
-                    }
-                }
-                Err(e) => {
-                    // A half-copied path reads as carried to the lint
-                    // while missing half its files; take it back.
-                    if dest.is_dir() {
-                        let _ = fs::remove_dir_all(&dest);
-                    } else {
-                        let _ = fs::remove_file(&dest);
-                    }
-                    eprintln!(
-                        "  {} could not carry {}: {e}",
-                        color::bold_red("warning:"),
-                        rel
-                    );
-                }
+                });
             }
         }
     }
+    Ok(())
+}
+
+/// One write the planned walk performs once the whole plan has resolved
+/// without findings. The executor replays these in planning order, so
+/// the output and the mutations match the single-pass walk this
+/// replaces.
+enum WalkAction {
+    /// Copy a resolved library or plugin into the library directory.
+    CopyLib {
+        soname: String,
+        resolved: PathBuf,
+        rel: PathBuf,
+        size: u64,
+        requirer: String,
+        stale_flat: bool,
+        libc_data: bool,
+    },
+    /// Link one soname's destination onto identical content already
+    /// bundled under another name.
+    LinkAlias {
+        soname: String,
+        resolved: PathBuf,
+        rel: PathBuf,
+        existing: PathBuf,
+        requirer: String,
+        size: u64,
+        stale_flat: bool,
+    },
+    /// Copy one carried data path beside the tree root.
+    CarryData {
+        soname: String,
+        src: PathBuf,
+        rel: &'static str,
+    },
+    /// Anchor the hooks of an existing carried `share/alsa/alsa.conf`.
+    PatchCarriedAlsa,
+    /// Retarget a plugin's alias links and drop the flat copy the
+    /// subdirectory copy replaces.
+    MigrateFlat { flat: PathBuf, new_rel: PathBuf },
+}
+
+/// What executing the planned actions produced, for the summary and
+/// the generated record.
+struct WalkOutcome {
+    copied: Vec<(String, PathBuf, u64, String)>,
+    libc_data_files: Vec<String>,
+}
+
+/// Execute the planned walk actions in planning order, each with its
+/// report line, failing the assembly the moment a source no longer
+/// matches what planning read from it. A dry run reports without
+/// writing, as before.
+fn execute_walk(
+    directory: &Path,
+    dry_run: bool,
+    strip: bool,
+    lib_dest: &Path,
+    actions: &[WalkAction],
+    plan: &DestinationPlan,
+) -> io::Result<WalkOutcome> {
+    let mut outcome = WalkOutcome {
+        copied: Vec::new(),
+        libc_data_files: Vec::new(),
+    };
+    for action in actions {
+        match action {
+            WalkAction::CopyLib {
+                soname,
+                resolved,
+                rel,
+                size,
+                requirer,
+                stale_flat,
+                libc_data,
+            } => {
+                plan.verify_source(resolved)?;
+                let dest = lib_dest.join(rel);
+                eprintln!(
+                    "  {} <- {} (needed by {}, {})",
+                    color::bold_green(&rel.to_string_lossy()),
+                    resolved.display(),
+                    color::cyan(requirer),
+                    color::dim(&format_size(*size))
+                );
+                if !dry_run {
+                    if let Some(dir) = dest.parent() {
+                        fs::create_dir_all(dir)?;
+                    }
+                    // Copying onto an existing alias symlink corrupts the
+                    // alias target; drop the symlink first.
+                    if dest.is_symlink() {
+                        let _ = fs::remove_file(&dest);
+                    }
+                    ensure_writable(&dest);
+                    fs::copy(resolved, &dest)?;
+                    let _ = fs::set_permissions(
+                        &dest,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                    );
+                    normalize_mtime(&dest);
+                    // The dynamic loader itself ships with baked-in absolute
+                    // paths (ld.so.cache location, preload hook, fallback
+                    // library dirs). On the packer's system those resolve to
+                    // real files (e.g. /nix/store/.../glibc/etc/ld.so.cache);
+                    // on someone else's system they're dead paths at best and
+                    // wrong-content paths at worst. Scrub before shipping.
+                    // musl's libc is its loader too, and whichever of its
+                    // names is copied first is the file the other links to.
+                    let is_loader = is_dynamic_loader(soname)
+                        || libc_family_of_soname(soname) == Some(LibcFamily::Musl);
+                    if is_loader
+                        && let Err(e) = scrub_loader_paths(
+                            &dest,
+                            libc_family_of_soname(soname).unwrap_or(LibcFamily::Glibc),
+                        )
+                    {
+                        eprintln!(
+                            "  {} failed to scrub loader paths in {}: {e}",
+                            color::bold_red("warning:"),
+                            soname
+                        );
+                    }
+                    if strip {
+                        strip_debug(&dest);
+                    }
+                }
+                if *stale_flat {
+                    migrate_flat_plugin(&lib_dest.join(soname), rel, lib_dest, dry_run);
+                }
+                outcome
+                    .copied
+                    .push((soname.clone(), rel.clone(), *size, requirer.clone()));
+                if *libc_data && !dry_run {
+                    match bundle_gconv(resolved, lib_dest, strip) {
+                        Ok(files) if !files.is_empty() => {
+                            eprintln!(
+                                "  {} {} gconv module(s) beside libc",
+                                color::bold_green("Copied"),
+                                files.len()
+                            );
+                            outcome.libc_data_files = files;
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "  {} could not copy gconv modules: {e}",
+                            color::bold_red("warning:")
+                        ),
+                    }
+                    match bundle_c_utf8(resolved, lib_dest) {
+                        Ok(files) if !files.is_empty() => {
+                            eprintln!("  {} the C.UTF-8 locale", color::bold_green("Copied"));
+                            outcome.libc_data_files.extend(files);
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "  {} could not copy the C.UTF-8 locale: {e}",
+                            color::bold_red("warning:")
+                        ),
+                    }
+                }
+            }
+            WalkAction::LinkAlias {
+                soname,
+                resolved,
+                rel,
+                existing,
+                requirer,
+                size,
+                stale_flat,
+            } => {
+                plan.verify_source(resolved)?;
+                eprintln!(
+                    "  {} {} -> {} (alias for {}, {})",
+                    color::bold_green("Linked"),
+                    soname,
+                    existing.display(),
+                    color::cyan(requirer),
+                    color::dim(&format_size(*size))
+                );
+                if !dry_run {
+                    let dest = lib_dest.join(rel);
+                    if let Some(dir) = dest.parent() {
+                        fs::create_dir_all(dir)?;
+                    }
+                    if dest.exists() || dest.is_symlink() {
+                        let _ = fs::remove_file(&dest);
+                    }
+                    let target = link_target(rel.parent().unwrap_or(Path::new("")), existing);
+                    if let Err(e) = std::os::unix::fs::symlink(&target, &dest) {
+                        eprintln!(
+                            "  {} failed to symlink {} -> {}: {e}",
+                            color::bold_red("warning:"),
+                            soname,
+                            target
+                        );
+                    }
+                }
+                if *stale_flat {
+                    migrate_flat_plugin(&lib_dest.join(soname), rel, lib_dest, dry_run);
+                }
+            }
+            WalkAction::CarryData { soname, src, rel } => {
+                if src.is_dir() {
+                    plan.verify_tree(src, Path::new(rel))?;
+                } else {
+                    plan.verify_source(src)?;
+                }
+                let dest = directory.join(rel);
+                if dry_run {
+                    eprintln!(
+                        "  {} {} (data of {})",
+                        color::bold("Would copy"),
+                        rel,
+                        color::cyan(soname)
+                    );
+                    continue;
+                }
+                match copy_data(src, &dest) {
+                    Ok(bytes) => {
+                        eprintln!(
+                            "  {} {} <- {} (data of {}, {})",
+                            color::bold_green("Copied"),
+                            rel,
+                            src.display(),
+                            color::cyan(soname),
+                            color::dim(&format_size(bytes))
+                        );
+                        if *rel == "share/alsa" {
+                            patch_carried_alsa_conf(directory, dry_run);
+                        }
+                    }
+                    Err(e) => {
+                        // A half-copied path reads as carried to the lint
+                        // while missing half its files; take it back.
+                        if dest.is_dir() {
+                            let _ = fs::remove_dir_all(&dest);
+                        } else {
+                            let _ = fs::remove_file(&dest);
+                        }
+                        eprintln!(
+                            "  {} could not carry {}: {e}",
+                            color::bold_red("warning:"),
+                            rel
+                        );
+                    }
+                }
+            }
+            WalkAction::PatchCarriedAlsa => {
+                patch_carried_alsa_conf(directory, dry_run);
+            }
+            WalkAction::MigrateFlat { flat, new_rel } => {
+                migrate_flat_plugin(flat, new_rel, lib_dest, dry_run);
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Anchor the carried snippet directory in a carried `share/alsa/alsa.conf`.
@@ -920,6 +1164,35 @@ fn strip_debug(path: &Path) {
     }
 }
 
+/// Attest the bytes the staging flow left at the paths the generated
+/// ledger records, once its own ELF rewriting (RUNPATH rewriting,
+/// loader scrubbing, bootstrap injection) has run over them, so every
+/// entry attests the final bytes and a later rebuild stops on a
+/// publisher's edit instead of excusing the rewriting as the build's
+/// own doing. Only a build tracking generated paths through a sysroot
+/// attests: a tree without a ledger gets none written.
+fn attest_staged_outputs(opts: &BundleOptions) -> io::Result<()> {
+    if opts.sysroot.is_some() && opts.directory.join(sysroot::GENERATED_FILE).is_file() {
+        sysroot::attest_generated(&opts.directory)?;
+    }
+    Ok(())
+}
+
+/// Bundle the shared libraries the tree's ELF files need into its
+/// library directory, rewrite the ELF files for the bundled layout,
+/// and record what the build generated.
+///
+/// Every destination the dependency walk intends to write is resolved
+/// into a plan first, so conflicting resources, overlapping file and
+/// directory destinations, destinations that would leave the tree, and
+/// destinations already holding different bytes than the resource
+/// requires all stop the build before anything is written. Sources are
+/// stamped at planning time and re-checked before each copy, so a
+/// source that changes while the bundle is written fails the assembly
+/// instead of mixing bytes. Bundling writes only into the AppDir it is
+/// given: the output package is written later, by packing, and only
+/// after assembly succeeds, so a failed build never replaces an
+/// existing output.
 pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if !opts.directory.is_dir() {
         return Err(io::Error::new(
@@ -1354,6 +1627,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     color::bold_red("warning:"),
                 ),
             }
+            attest_staged_outputs(opts)?;
             // After injection, so the audit sees the final DT_NEEDED set.
             verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
         }
@@ -1440,7 +1714,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     search_paths.extend(rpath_dirs);
     let lib_dest = opts.directory.join(&opts.lib_dir);
 
-    let mut copied: Vec<(String, PathBuf, u64, String)> = Vec::new();
     let mut not_found: Vec<(String, String)> = Vec::new();
     // In sysroot mode the policy holds for dependencies too: a library it
     // prunes is not brought back because something bundled needs it. The
@@ -1488,6 +1761,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut bundled_by_hash: HashMap<[u8; 32], PathBuf> = HashMap::new();
     // The data directories the walk already carried or found in the tree.
     let mut carried_data: HashSet<String> = HashSet::new();
+    // The destinations the walk intends to write, resolved against each
+    // other and against the tree before any of them is written, with the
+    // writes themselves queued for the executor.
+    let mut plan = DestinationPlan::load(&opts.directory)?;
+    let mut actions: Vec<WalkAction> = Vec::new();
     let mut queue: Vec<String> = needed_by.keys().cloned().collect();
     queue.sort();
     // Name service modules glibc loads by dlopen, let through the excluded
@@ -1496,7 +1774,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Without them every user, group, host and service lookup fails on a
     // host whose own glibc did not win.
     let mut nss_allow: HashSet<String> = HashSet::new();
-    let mut libc_data_files: Vec<String> = Vec::new();
 
     // On NixOS: pre-expand cache for libs already in the dest dir from previous runs,
     // so their transitive nix deps are discoverable.
@@ -1613,13 +1890,14 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // The data the library reads from a compiled-in path goes
                 // with it, before any skip: a tree bundled before the data
                 // was carried has the library but not the data.
-                carry_lib_data(
+                plan_carried_data(
                     &opts.directory,
                     &soname,
                     &resolved,
-                    opts.dry_run,
                     &mut carried_data,
-                );
+                    &mut plan,
+                    &mut actions,
+                )?;
                 // A plugin keeping its subdirectory is already bundled on
                 // a re-run, or the candidate is the tree's own file, found
                 // through a search dir inside the tree. A flat copy is
@@ -1627,7 +1905,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // looks.
                 if dest.exists() || is_same_file(&resolved, &dest) {
                     if stale_flat {
-                        migrate_flat_plugin(&lib_dest.join(&soname), &rel, &lib_dest, opts.dry_run);
+                        actions.push(WalkAction::MigrateFlat {
+                            flat: lib_dest.join(&soname),
+                            new_rel: rel.clone(),
+                        });
                     }
                     continue;
                 }
@@ -1671,6 +1952,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let bytes = fs::read(&resolved).ok();
                 let content_hash: Option<[u8; 32]> =
                     bytes.as_deref().map(|b| blake3::hash(b).into());
+                if let Some(b) = bytes.as_deref() {
+                    plan.note_source(&resolved, b)?;
+                }
                 if soname == "libc.so.6" {
                     // `compat` is still a module on every glibc, and a host
                     // whose nsswitch.conf names it with nothing after it
@@ -1695,121 +1979,60 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 if let Some(hash) = content_hash
                     && let Some(existing) = bundled_by_hash.get(&hash).cloned()
                 {
-                    eprintln!(
-                        "  {} {} -> {} (alias for {}, {})",
-                        color::bold_green("Linked"),
-                        soname,
-                        existing.display(),
-                        color::cyan(&requirer),
-                        color::dim(&format_size(size))
-                    );
-                    if !opts.dry_run {
-                        if let Some(dir) = dest.parent() {
-                            fs::create_dir_all(dir)?;
-                        }
-                        if dest.exists() || dest.is_symlink() {
-                            let _ = fs::remove_file(&dest);
-                        }
-                        let target = link_target(rel.parent().unwrap_or(Path::new("")), &existing);
-                        if let Err(e) = std::os::unix::fs::symlink(&target, &dest) {
-                            eprintln!(
-                                "  {} failed to symlink {} -> {}: {e}",
-                                color::bold_red("warning:"),
-                                soname,
-                                target
-                            );
-                        }
+                    let target = link_target(rel.parent().unwrap_or(Path::new("")), &existing);
+                    let app_rel = opts.lib_dir.join(&rel);
+                    if plan.admit_link(
+                        &app_rel,
+                        &target,
+                        &format!("{soname} (needed by {requirer})"),
+                        Existing::Overwrite,
+                    )? == Admission::Write
+                    {
+                        actions.push(WalkAction::LinkAlias {
+                            soname: soname.clone(),
+                            resolved: resolved.clone(),
+                            rel: rel.clone(),
+                            existing: existing.clone(),
+                            requirer: requirer.clone(),
+                            size,
+                            stale_flat,
+                        });
                     }
                     if stale_flat {
-                        migrate_flat_plugin(&lib_dest.join(&soname), &rel, &lib_dest, opts.dry_run);
+                        actions.push(WalkAction::MigrateFlat {
+                            flat: lib_dest.join(&soname),
+                            new_rel: rel.clone(),
+                        });
                     }
                     continue;
                 }
 
-                eprintln!(
-                    "  {} <- {} (needed by {}, {})",
-                    color::bold_green(&rel.to_string_lossy()),
-                    resolved.display(),
-                    color::cyan(&requirer),
-                    color::dim(&format_size(size))
-                );
-                if !opts.dry_run {
-                    if let Some(dir) = dest.parent() {
-                        fs::create_dir_all(dir)?;
+                let app_rel = opts.lib_dir.join(&rel);
+                let write = match bytes.as_deref() {
+                    Some(b) => {
+                        plan.admit_file(
+                            &app_rel,
+                            plan::file_hash(b),
+                            &format!("{soname} (needed by {requirer})"),
+                            Existing::SkipOnAny,
+                        )? == Admission::Write
                     }
-                    // Copying onto an existing alias symlink corrupts the
-                    // alias target; drop the symlink first.
-                    if dest.is_symlink() {
-                        let _ = fs::remove_file(&dest);
-                    }
-                    ensure_writable(&dest);
-                    fs::copy(&resolved, &dest)?;
-                    let _ = fs::set_permissions(
-                        &dest,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-                    );
-                    normalize_mtime(&dest);
-                    // The dynamic loader itself ships with baked-in absolute
-                    // paths (ld.so.cache location, preload hook, fallback
-                    // library dirs). On the packer's system those resolve to
-                    // real files (e.g. /nix/store/.../glibc/etc/ld.so.cache);
-                    // on someone else's system they're dead paths at best and
-                    // wrong-content paths at worst. Scrub before shipping.
-                    // musl's libc is its loader too, and whichever of its
-                    // names is copied first is the file the other links to.
-                    let is_loader = is_dynamic_loader(&soname)
-                        || libc_family_of_soname(&soname) == Some(LibcFamily::Musl);
-                    if is_loader
-                        && let Err(e) = scrub_loader_paths(
-                            &dest,
-                            libc_family_of_soname(&soname).unwrap_or(LibcFamily::Glibc),
-                        )
-                    {
-                        eprintln!(
-                            "  {} failed to scrub loader paths in {}: {e}",
-                            color::bold_red("warning:"),
-                            soname
-                        );
-                    }
-                    if opts.strip {
-                        strip_debug(&dest);
-                    }
-                }
-                if stale_flat {
-                    migrate_flat_plugin(&lib_dest.join(&soname), &rel, &lib_dest, opts.dry_run);
+                    None => true,
+                };
+                if write {
+                    actions.push(WalkAction::CopyLib {
+                        soname: soname.clone(),
+                        resolved: resolved.clone(),
+                        rel: rel.clone(),
+                        size,
+                        requirer: requirer.clone(),
+                        stale_flat,
+                        libc_data: soname == "libc.so.6",
+                    });
                 }
 
                 if let Some(hash) = content_hash {
                     bundled_by_hash.insert(hash, rel.clone());
-                }
-                copied.push((soname.clone(), rel, size, requirer));
-                if soname == "libc.so.6" && !opts.dry_run {
-                    match bundle_gconv(&resolved, &lib_dest, opts.strip) {
-                        Ok(files) if !files.is_empty() => {
-                            eprintln!(
-                                "  {} {} gconv module(s) beside libc",
-                                color::bold_green("Copied"),
-                                files.len()
-                            );
-                            libc_data_files = files;
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!(
-                            "  {} could not copy gconv modules: {e}",
-                            color::bold_red("warning:")
-                        ),
-                    }
-                    match bundle_c_utf8(&resolved, &lib_dest) {
-                        Ok(files) if !files.is_empty() => {
-                            eprintln!("  {} the C.UTF-8 locale", color::bold_green("Copied"));
-                            libc_data_files.extend(files);
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!(
-                            "  {} could not copy the C.UTF-8 locale: {e}",
-                            color::bold_red("warning:")
-                        ),
-                    }
                 }
 
                 // Collect RPATHs from resolved lib for transitive dep resolution
@@ -1855,6 +2078,55 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
         }
     }
+
+    // The interpreter alias links the loader needs, planned here so a
+    // finding anywhere in the plan stops the build before the first
+    // copy runs.
+    let mut interp_links: Vec<(String, String)> = Vec::new();
+    {
+        let mut interp_names: Vec<String> = elf_files
+            .iter()
+            .filter_map(|p| {
+                parse_interp(p).and_then(|i| {
+                    Path::new(&i)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                })
+            })
+            .collect();
+        interp_names.sort();
+        interp_names.dedup();
+        for interp_name in interp_names {
+            let target = lib_dest.join(&interp_name);
+            if target.exists() || target.is_symlink() {
+                continue;
+            }
+            let Some(libc_name) = libc_alias_for(&interp_name) else {
+                continue;
+            };
+            let app_rel = opts.lib_dir.join(&interp_name);
+            let origin = format!("{interp_name} (loader alias of {libc_name})");
+            if plan.admit_link(&app_rel, &libc_name, &origin, Existing::SkipOnAny)?
+                == Admission::Write
+            {
+                interp_links.push((interp_name, libc_name));
+            }
+        }
+    }
+    if plan.has_findings() {
+        return Err(plan.error());
+    }
+    let WalkOutcome {
+        mut copied,
+        libc_data_files,
+    } = execute_walk(
+        &opts.directory,
+        opts.dry_run,
+        opts.strip,
+        &lib_dest,
+        &actions,
+        &plan,
+    )?;
 
     // Summary
     copied.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1936,34 +2208,19 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Ensure each ELF's PT_INTERP basename exists in lib_dest as a file or
     // symlink. On musl the loader is referenced as ld-musl-*.so.1 but bundled
     // as libc.musl-*.so.1 (both are names for the same file on disk); without
-    // the alias the kernel can't find the interpreter at runtime.
+    // the alias the kernel can't find the interpreter at runtime. The links
+    // were planned before anything was written; this only executes them.
     if !opts.dry_run {
-        let mut interp_names: Vec<String> = elf_files
-            .iter()
-            .filter_map(|p| {
-                parse_interp(p).and_then(|i| {
-                    Path::new(&i)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
-            })
-            .collect();
-        interp_names.sort();
-        interp_names.dedup();
-
-        for interp_name in interp_names {
-            let target = lib_dest.join(&interp_name);
+        for (interp_name, libc_name) in &interp_links {
+            let target = lib_dest.join(interp_name);
             if target.exists() || target.is_symlink() {
                 continue;
             }
-            let Some(libc_name) = libc_alias_for(&interp_name) else {
-                continue;
-            };
-            let libc_path = lib_dest.join(&libc_name);
+            let libc_path = lib_dest.join(libc_name);
             if !libc_path.exists() {
                 continue;
             }
-            if let Err(e) = std::os::unix::fs::symlink(&libc_name, &target) {
+            if let Err(e) = std::os::unix::fs::symlink(libc_name, &target) {
                 eprintln!(
                     "  {} failed to create {} -> {}: {e}",
                     color::bold_red("warning:"),
@@ -2023,6 +2280,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 color::bold_red("warning:"),
             ),
         }
+        attest_staged_outputs(opts)?;
         datadirs::report(&datadirs::unanswered(
             &opts.directory,
             &find_elf_files(&opts.directory),
@@ -2823,6 +3081,38 @@ mod plugin_dir_tests {
         fs::write(root.join("usr/share/alsa/alsa.conf"), b"conf").unwrap();
         fs::write(root.join("usr/share/alsa/cards/aliases.conf"), b"cards").unwrap();
         (root.clone(), root.join("usr/lib/libasound.so.2"))
+    }
+
+    /// Plan and execute a carry for one library, the way the planned
+    /// walk does, so the carry tests run against the real path.
+    fn carry_lib_data(
+        directory: &Path,
+        soname: &str,
+        resolved: &Path,
+        dry_run: bool,
+        carried: &mut HashSet<String>,
+    ) {
+        let mut plan = DestinationPlan::load(directory).unwrap();
+        let mut actions: Vec<WalkAction> = Vec::new();
+        plan_carried_data(
+            directory,
+            soname,
+            resolved,
+            carried,
+            &mut plan,
+            &mut actions,
+        )
+        .unwrap();
+        assert!(!plan.has_findings(), "{:?}", plan.findings());
+        execute_walk(
+            directory,
+            dry_run,
+            false,
+            &directory.join("lib"),
+            &actions,
+            &plan,
+        )
+        .unwrap();
     }
 
     #[test]
