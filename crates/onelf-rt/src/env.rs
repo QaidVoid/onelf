@@ -721,9 +721,13 @@ fn set_alsa_config_path(roots: &[&Path]) {
     }
 }
 
-/// File-name order the way alsa-lib's versionsort works: runs of digits
-/// compare as numbers, so `99-x.conf` sorts before `100-y.conf`, the
-/// opposite of bytewise order.
+/// File-name order for the carried snippet list: runs of digits compare
+/// as numbers, so `99-x.conf` loads after `100-y.conf`, the opposite of
+/// bytewise order. This matches alsa-lib's versionsort for the names
+/// distros actually ship, which pad consistently. It differs from glibc's
+/// strverscmp when runs of equal value carry different zero padding or a
+/// padded run meets an unpadded one (`09-x.conf` against `0-y.conf`);
+/// no naming scheme produces those, and any deterministic order does.
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (a, b) = (a.as_bytes(), b.as_bytes());

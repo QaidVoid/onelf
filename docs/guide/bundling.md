@@ -51,7 +51,11 @@ With no flags, this:
    GUI toolkit's libxkbcommon brings roughly 3 MB of keymap data,
    libasound about 150 KB. A tree bundled by an older onelf is
    repaired on the next run: the missing data is carried then, and a
-   plugin left flat in `lib/` moves into its subdirectory. On a host
+   plugin left flat in `lib/` moves into its subdirectory. Because of
+   that repair work a re-run re-resolves every library instead of
+   stopping at the first "all present" answer, which costs a few
+   seconds more on a large tree and copies nothing when everything
+   is current. On a host
    without the owning package,
    ALSA without `share/alsa` has no `alsa.conf` and cannot open any
    device at all, bundled plugins included. The carried `alsa.conf`
