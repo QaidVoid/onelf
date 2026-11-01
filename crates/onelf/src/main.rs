@@ -1,3 +1,4 @@
+mod assembly;
 mod bundle;
 mod cache;
 mod compress;
@@ -20,9 +21,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use onelf_format::WorkingDir;
-
-const RUNTIME_BINARY_SLIM: &[u8] = include_bytes!(env!("ONELF_RT_PATH"));
-const RUNTIME_BINARY_UPDATE: &[u8] = include_bytes!(env!("ONELF_RT_UPDATE_PATH"));
 
 #[derive(Parser)]
 #[command(name = "onelf", about = "Single-binary packaging tool", version)]
@@ -728,7 +726,7 @@ fn main() {
                 WorkingDirArg::Package => WorkingDir::PackageRoot,
                 WorkingDirArg::Command => WorkingDir::EntrypointParent,
             };
-            let pins_https = pins_https_build(&directory);
+            let pins_https = assembly::pins_https_build(&directory);
 
             let entrypoints = entrypoint
                 .into_iter()
@@ -753,9 +751,9 @@ fn main() {
                 .transpose();
             let profile = prefetch.as_deref().map(pack::read_profile).transpose();
             let runtime: &[u8] = if (update_url.is_some() && !no_embed_updater) || pins_https {
-                RUNTIME_BINARY_UPDATE
+                assembly::RUNTIME_BINARY_UPDATE
             } else {
-                RUNTIME_BINARY_SLIM
+                assembly::RUNTIME_BINARY_SLIM
             };
             match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),
@@ -1025,7 +1023,12 @@ fn main() {
                             named.join(", ")
                         );
                     }
-                    sysroot_cmd::pack_gl(&dir, &output, sysroot.as_deref(), RUNTIME_BINARY_SLIM)
+                    sysroot_cmd::pack_gl(
+                        &dir,
+                        &output,
+                        sysroot.as_deref(),
+                        assembly::RUNTIME_BINARY_SLIM,
+                    )
                 })
             }
             SysrootAction::PackSet {
@@ -1069,7 +1072,7 @@ fn main() {
                         &output,
                         &name,
                         sysroot.as_deref(),
-                        RUNTIME_BINARY_SLIM,
+                        assembly::RUNTIME_BINARY_SLIM,
                     )
                 })
             }
@@ -1082,383 +1085,26 @@ fn main() {
     }
 }
 
-/// What a recipe's `[sysroot]` section resolves to for a build.
-struct ResolvedSysroot {
-    /// The package database the bundle's contents are taken from. `None`
-    /// when the recipe names no `path`: the AppDir then stands as the
-    /// author assembled it.
-    root: Option<bundle::SysrootOptions>,
-    /// The sets recorded for the runtime to fetch at launch.
-    sets: Vec<bundle::sysroot::SharedSet>,
-    /// A GL build pin, when the recipe names one whole.
-    pin: Option<onelf_sysroot::platform::Pin>,
-}
-
-/// The sysroot a recipe names, materialized from its archive when the
-/// directory does not exist yet. Paths resolve against the recipe's
-/// directory. Without a `path` there is no database to consult: only the
-/// sets and the pin are carried, and `validate` has refused everything
-/// else.
-fn sysroot_from_recipe(
-    dir: &std::path::Path,
-    command: &str,
-    sr: &recipe::Sysroot,
-) -> std::io::Result<ResolvedSysroot> {
-    let sets = sr
-        .sets
-        .iter()
-        .map(|(name, set)| bundle::sysroot::SharedSet {
-            name: name.clone(),
-            packages: set.packages.clone(),
-            url: set.url.clone(),
-            blake3: set.blake3.clone(),
-        })
-        .collect();
-    let Some(path) = &sr.path else {
-        return Ok(ResolvedSysroot {
-            root: None,
-            sets,
-            pin: bundle::sysroot::pin_without_root(
-                sr.platform_url.as_ref(),
-                sr.platform_hash.as_ref(),
-            )?,
-        });
-    };
-    let resolve = |p: &std::path::Path| {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            dir.join(p)
-        }
-    };
-    let root = resolve(path);
-    bundle::sysroot::refuse_inside(&root, dir)?;
-    if !root.is_dir() {
-        let Some(archive) = &sr.archive else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "{}: sysroot does not exist and [sysroot] names no archive",
-                    root.display()
-                ),
-            ));
-        };
-        // A URL is handed over as written; only a path is relative to the
-        // recipe.
-        let archive_str = archive.to_string_lossy();
-        let source = if archive_str.contains("://") {
-            archive_str.into_owned()
-        } else {
-            resolve(archive).to_string_lossy().into_owned()
-        };
-        sysroot_cmd::fetch(&source, &root, sr.hash.as_deref())?;
-    }
-    let platform = sr
-        .platform
-        .clone()
-        .unwrap_or_else(|| bundle::sysroot::default_label(&root, sr.archive.as_deref()));
-    Ok(ResolvedSysroot {
-        root: Some(bundle::SysrootOptions {
-            root,
-            command: command.to_string(),
-            platform,
-            optional: sr.optional.clone(),
-            platform_line: sr.platform_line.as_deref().map(resolve),
-            policy: sr.policy.as_deref().map(resolve),
-            trace: sr.trace.as_deref().map(resolve),
-            keep: sr.keep.as_deref().map(resolve),
-            platform_url: sr.platform_url.clone(),
-            platform_hash: sr.platform_hash.clone(),
-            sets,
-        }),
-        sets: Vec::new(),
-        pin: None,
-    })
-}
-
-/// Whether the AppDir pins a GL build over HTTPS, which only the
-/// update-capable runtime can fetch.
-fn pins_https_build(dir: &std::path::Path) -> bool {
-    [bundle::sysroot::PLATFORM_FILE, bundle::sysroot::SETS_FILE]
-        .iter()
-        .any(|f| {
-            std::fs::read_to_string(dir.join(f))
-                .map(|t| t.lines().any(|l| l.starts_with("url = \"https://")))
-                .unwrap_or(false)
-        })
-}
-
+/// Build the package a recipe describes: resolve the recipe once into an
+/// assembly request, stage the AppDir from it, then pack the result.
 fn run_build(
     path: &std::path::Path,
     output_override: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let recipe_path = recipe::resolve(path)?;
     let recipe = recipe::load(&recipe_path)?;
-    let dir = recipe_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    // A build from a sysroot's package database does not use the
-    // framework bundlers, so their flags would do nothing. `--sysroot`
-    // refuses them, and so does a recipe. A `[sysroot]` without `path`
-    // leaves the AppDir to the host scan, where the flags keep working.
-    let b = &recipe.bundle;
-    let frameworks: Vec<&str> = [
-        ("gl", b.gl),
-        ("dri", b.dri),
-        ("vulkan", b.vulkan),
-        ("wayland", b.wayland),
-        ("gtk", b.gtk),
-    ]
-    .into_iter()
-    .filter_map(|(name, on)| on.then_some(name))
-    .collect();
-    let sysroot_db = recipe.sysroot.as_ref().is_some_and(|sr| sr.path.is_some());
-    if sysroot_db && !frameworks.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{}: [bundle] {} cannot be used with [sysroot]. A sysroot \
-                 build takes the bundle's contents from the sysroot and does \
-                 not use the framework bundlers",
-                recipe_path.display(),
-                frameworks.join(", ")
-            ),
-        ));
-    }
-
-    let (sysroot, recipe_sets, platform_pin) = match &recipe.sysroot {
-        Some(sr) => {
-            let resolved = sysroot_from_recipe(&dir, &recipe.package.command, sr)?;
-            (resolved.root, resolved.sets, resolved.pin)
-        }
-        None => (None, Vec::new(), None),
-    };
-
-    // A sysroot build is reproducible from its archive and recipe alone,
-    // so the time the AppDir was written does not reach the package
-    // unless the recipe or SOURCE_DATE_EPOCH asks for a time.
-    let mtime = recipe
-        .package
-        .mtime
-        .or((recipe.sysroot.is_some() && pack::source_date_epoch().is_none()).then_some(0));
-
-    // Stage 1: bundle-libs. A sysroot is applied by bundle-libs, so it
-    // runs even when the recipe would otherwise skip bundling. A recipe
-    // that skips bundling and pins sets without a sysroot keeps its AppDir
-    // exactly as it stands: only the records the runtime fetches by are
-    // written, with no scan and no verification.
-    if recipe.bundle.skip && sysroot.is_none() {
-        if !recipe_sets.is_empty() || platform_pin.is_some() {
-            bundle::sysroot::record_sets(&dir, &recipe_sets, platform_pin.as_ref())?;
-        }
-    } else {
-        let search_path: Vec<PathBuf> = recipe
-            .bundle
-            .search_paths
-            .iter()
-            .map(|s| PathBuf::from(s.as_str()))
-            .collect();
-
-        bundle::bundle_libs(&bundle::BundleOptions {
-            directory: dir.clone(),
-            target: None,
-            primary: Some(PathBuf::from(&recipe.package.command)),
-            lib_dir: PathBuf::from("lib"),
-            exclude: recipe.bundle.exclude.clone(),
-            include: recipe.bundle.include.clone(),
-            search_path,
-            dry_run: false,
-            recursive: true,
-            gl: recipe.bundle.gl,
-            dri: recipe.bundle.dri,
-            vulkan: recipe.bundle.vulkan,
-            wayland: recipe.bundle.wayland,
-            gtk: recipe.bundle.gtk,
-            no_gl: recipe.bundle.no_gl,
-            no_dri: recipe.bundle.no_dri,
-            no_vulkan: recipe.bundle.no_vulkan,
-            no_wayland: recipe.bundle.no_wayland,
-            no_gtk: recipe.bundle.no_gtk,
-            strip: recipe.bundle.strip,
-            strict_libc: recipe.bundle.strict_libc,
-            scan_dlopen: recipe.bundle.scan_dlopen,
-            dlopen_extra: recipe.bundle.dlopen.clone(),
-            trace_run: recipe.bundle.trace_run,
-            trace_seconds: recipe.bundle.trace_seconds.unwrap_or(5),
-            trace_args: recipe.bundle.trace_args.clone(),
-            sysroot,
-            sets: recipe_sets,
-            platform_pin,
-        })?;
-    }
-
-    // Stage 2: pack. Relative output paths in the recipe are resolved
-    // against the recipe's directory.
-    let output = match output_override {
-        Some(o) => o.to_path_buf(),
-        None => match recipe.package.output.clone() {
-            Some(o) if o.is_absolute() => o,
-            Some(o) => dir.join(o),
-            None => {
-                let name = recipe.package.name.clone().unwrap_or_else(|| {
-                    recipe
-                        .package
-                        .command
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("app")
-                        .to_string()
-                });
-                dir.join(format!("{name}.onelf"))
-            }
-        },
-    };
-
-    let entrypoints: Vec<(String, String, Vec<String>)> = recipe
-        .entrypoint
-        .iter()
-        .map(|e| (e.name.clone(), e.path.clone(), e.args.clone()))
-        .collect();
-    let default_entrypoint = recipe
-        .entrypoint
-        .iter()
-        .find(|e| e.default)
-        .map(|e| e.name.clone());
-
-    let lib_dirs = recipe
-        .bundle
-        .lib_dirs
-        .clone()
-        .unwrap_or_else(|| vec!["auto".to_string()]);
-
-    let update_url = recipe.update.as_ref().map(|u| u.url.clone());
-    let update_key = recipe
-        .update
-        .as_ref()
-        .and_then(|u| u.key.clone())
-        .map(|k| if k.is_absolute() { k } else { dir.join(k) })
-        .map(|path| {
-            std::fs::read(&path).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("recipe [update] key {}: {e}", path.display()),
-                )
-            })
-        })
-        .transpose()?;
-    let update_revision = recipe.update.as_ref().and_then(|u| u.revision);
-    let update_unsigned = recipe.update.as_ref().map(|u| u.unsigned).unwrap_or(false);
-    let embed_updater = recipe.update.as_ref().and_then(|u| u.embed).unwrap_or(true);
-    let runtime: &[u8] = if (update_url.is_some() && embed_updater) || pins_https_build(&dir) {
-        RUNTIME_BINARY_UPDATE
-    } else {
-        RUNTIME_BINARY_SLIM
-    };
-    let runtime_note = onelf_format::elf::probe_capability_note(runtime)?;
-
-    let package_info = build_package_info(&recipe.package);
-    let profile = match &recipe.compression.prefetch {
-        Some(path) => pack::read_profile(&dir.join(path))?,
+    let request = assembly::AssemblyRequest::plan(&recipe_path, recipe, output_override)?;
+    let _report = request.stage()?;
+    let update_key = request.update.read_key()?;
+    let runtime = assembly::embed_runtime(&request)?;
+    let profile = match &request.compression.profile {
+        Some(p) => pack::read_profile(p)?,
         None => Vec::new(),
     };
-
-    let payload: pack::Payload = recipe.compression.payload.into();
     pack::pack(
-        &pack::PackOptions {
-            directory: dir,
-            output,
-            command: recipe.package.command,
-            name: recipe.package.name,
-            entrypoints,
-            default_entrypoint,
-            lib_dirs,
-            level: recipe.compression.level,
-            block_size: recipe
-                .compression
-                .block_size
-                .unwrap_or(payload.default_block_size()),
-            payload,
-            use_dict: recipe.compression.dict,
-            no_compress: recipe.compression.store,
-            memfd: recipe.package.memfd,
-            working_dir: recipe.package.working_dir.into(),
-            host_libs: recipe
-                .package
-                .host_libs
-                .map(Into::into)
-                .unwrap_or(pack::HostLibs::Auto),
-            cache: recipe.package.cache,
-            prefer_cache: recipe.package.prefer_cache,
-            update_url,
-            embed_updater,
-            update_key,
-            update_revision,
-            update_unsigned,
-            exclude: recipe.package.exclude,
-            package_info,
-            mtime,
-            env: recipe.env.into_iter().collect(),
-            paths: recipe.paths.into_iter().collect(),
-            preload: recipe.preload,
-            needs_setuid: recipe.package.needs_setuid,
-            profile,
-            provider_index: None,
-            runtime_note,
-        },
-        runtime,
+        &request.pack_options(update_key, runtime.note, profile),
+        runtime.bytes,
     )
-}
-
-/// Serialize optional package metadata fields to TOML. Returns None if no
-/// metadata is present.
-fn build_package_info(pkg: &recipe::Package) -> Option<String> {
-    let mut lines = Vec::new();
-    if let Some(ref s) = pkg.name {
-        lines.push(format!("name = {}", toml_str(s)));
-    }
-    if let Some(ref s) = pkg.version {
-        lines.push(format!("version = {}", toml_str(s)));
-    }
-    if let Some(ref s) = pkg.description {
-        lines.push(format!("description = {}", toml_str(s)));
-    }
-    if let Some(ref s) = pkg.license {
-        lines.push(format!("license = {}", toml_str(s)));
-    }
-    if let Some(ref s) = pkg.homepage {
-        lines.push(format!("homepage = {}", toml_str(s)));
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n") + "\n")
-    }
-}
-
-/// Quote `s` as a TOML basic string, escaping backslash, double quote, and
-/// control characters (per the TOML spec) so a value containing a newline or
-/// other control char cannot produce a malformed `.onelf/package-info.toml`.
-fn toml_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`
