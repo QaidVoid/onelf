@@ -273,6 +273,20 @@ impl FileSource {
             FileSource::Memory(bytes) => Ok(Cow::Borrowed(bytes)),
         }
     }
+
+    fn encode(&self, opts: &PackOptions, dict: Option<&[u8]>) -> io::Result<compress::EncodedFile> {
+        let encode = |reader: &mut dyn Read| {
+            if opts.no_compress {
+                compress::store_in_blocks(reader, opts.block_size)
+            } else {
+                compress::compress_in_blocks(reader, opts.level, dict, opts.block_size)
+            }
+        };
+        match self {
+            FileSource::Disk(path) => encode(&mut open_walked(path)?),
+            FileSource::Memory(bytes) => encode(&mut bytes.as_slice()),
+        }
+    }
 }
 
 struct CollectedFile {
@@ -328,8 +342,10 @@ fn default_entrypoint_path(opts: &PackOptions) -> PathBuf {
 /// instead of bytes does not: a chunk of 64 files is most of a tree that has
 /// 82 of them, so the whole thing ends up resident anyway.
 ///
-/// Peak usage is roughly this budget plus the compressed output of the same
-/// chunk. Override with `ONELF_PACK_CHUNK_BYTES`.
+/// Input is read one block at a time per worker. The budget bounds retained
+/// output even in store mode or for incompressible content, while avoiding
+/// transient whole-file buffers that allocator arenas could keep resident.
+/// Override with `ONELF_PACK_CHUNK_BYTES`.
 fn compression_budget() -> u64 {
     const DEFAULT: u64 = 64 * 1024 * 1024;
     std::env::var("ONELF_PACK_CHUNK_BYTES")
@@ -1306,23 +1322,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 .par_iter()
                 .enumerate()
                 .map(|(i, f)| -> io::Result<_> {
-                    let content = f.source.read()?;
-                    let hash: [u8; 32] = *blake3::hash(&content).as_bytes();
-                    let blocks = if opts.no_compress {
-                        compress::store_in_blocks(&content, opts.block_size)
-                    } else {
-                        compress::compress_in_blocks(
-                            &content,
-                            opts.level,
-                            dict.as_deref(),
-                            opts.block_size,
-                        )
-                        .map_err(|e| {
-                            io::Error::other(format!("compress {}: {e}", f.rel_path.display()))
-                        })?
-                    };
+                    let encoded = f.source.encode(opts, dict.as_deref()).map_err(|e| {
+                        io::Error::new(e.kind(), format!("encode {}: {e}", f.rel_path.display()))
+                    })?;
                     pb.inc(1);
-                    Ok((i, hash, blocks))
+                    Ok((i, encoded.content_hash, encoded.blocks))
                 })
                 .collect::<io::Result<Vec<_>>>()?;
 

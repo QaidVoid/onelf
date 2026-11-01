@@ -2238,6 +2238,45 @@ fn packing_does_not_hold_the_whole_tree() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Freed whole-file buffers can remain resident in each compression
+/// worker's allocator arena even after a bounded batch finishes. Pinning
+/// glibc's mmap and trim thresholds exposes that retention independently
+/// of its adaptive defaults. Other allocators can ignore these settings
+/// and must still meet the same memory bound.
+#[test]
+fn packing_keeps_memory_bounded_with_retained_allocations() {
+    let td = workdir("packmem-retained");
+    let app = td.join("app");
+    write(&app.join("bin/run"), "#!/bin/sh\necho PACKED\n");
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    for i in 0..40 {
+        std::fs::File::create(app.join(format!("data/f{i:03}.bin")))
+            .unwrap()
+            .set_len(10 << 20)
+            .unwrap();
+    }
+
+    let pkg = td.join("big.onelf");
+    let mut cmd = Command::new(onelf());
+    cmd.args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--level", "1"])
+        .env("MALLOC_MMAP_THRESHOLD_", "33554432")
+        .env("MALLOC_TRIM_THRESHOLD_", "67108864")
+        .env("RAYON_NUM_THREADS", "16");
+    let (status, peak) = peak_rss_kb(&mut cmd);
+    assert!(status.success(), "pack failed");
+    assert!(
+        peak < 200 * 1024,
+        "packing with retained allocations peaked at {} MB, over the 200 MB ceiling",
+        peak / 1024,
+    );
+}
+
 /// A library the bundle does not provide is resolved from the host at
 /// runtime, silently, into a process already holding the bundled libc.
 ///
