@@ -13,6 +13,9 @@ pub mod manifest;
 pub mod payload;
 pub mod reader;
 pub mod resolve;
+pub mod rules;
+#[cfg(feature = "rules-toml")]
+pub mod rules_toml;
 pub mod update;
 pub mod verdef;
 
