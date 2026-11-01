@@ -12206,6 +12206,55 @@ fn run_import_package(pkg: &Path, td: &Path) -> std::process::Output {
     run_package(&mut c)
 }
 
+/// Scaffolding and building work from any working directory: the
+/// imported binary resolves against the recipe's directory, not the
+/// caller's, so `onelf build <recipe>` from elsewhere finds the same
+/// upstream source and leaves it untouched.
+#[test]
+fn init_and_build_work_from_a_different_working_directory() {
+    let td = workdir("import-init-cwd");
+    let src = elf_source(&td, "ELF_IMPORT_CWD_OK");
+    let upstream = td.join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    let source = upstream.join("app");
+    if !cc(&src, &source) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    let before = std::fs::read(&source).unwrap();
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let out = run_onelf(&["init", "--binary", "../upstream/app"], Some(&pkg));
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recipe = pkg.join("onelf.toml");
+    let out = run_onelf(&["build", &format!("{}", recipe.display())], Some(&td));
+    assert!(
+        out.status.success(),
+        "build from {} failed: {}",
+        td.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        before,
+        "the import must not modify the upstream file"
+    );
+    assert!(pkg.join("bin/app").is_file());
+    let run = run_import_package(&pkg.join("app.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_CWD_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A recipe that imports a bare binary builds the binary into an
 /// executable without a pre-existing AppDir. The upstream file itself
 /// is never modified, the package carries the command, and a rebuild
