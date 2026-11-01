@@ -12,6 +12,7 @@ pub mod entry;
 pub mod footer;
 pub mod manifest;
 pub mod payload;
+pub mod provider_index;
 pub mod reader;
 pub mod resolve;
 pub mod rules;

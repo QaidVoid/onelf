@@ -153,6 +153,10 @@ pub struct PackOptions {
     /// read them, from [`read_profile`]. Packed as `.onelf/prefetch` for the
     /// runtime to decompress ahead of the app.
     pub profile: Vec<(String, u64)>,
+    /// Encoded provider index of a pinned set build, injected verbatim as
+    /// `.onelf/providers`. `None` injects nothing, which is the shape of
+    /// every build that is not a set.
+    pub provider_index: Option<Vec<u8>>,
     /// What the embedded runtime advertises, probed from its actual bytes
     /// including any `ONELF_RT_PATH` substitution. Assembly refuses a
     /// runtime whose note exists but cannot be read, and later metadata
@@ -1050,6 +1054,17 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             &mut files,
             ".onelf/package-info.toml",
             info.as_bytes().to_vec(),
+            inject_mtime,
+        );
+    }
+
+    // Inject .onelf/providers if the build is a set
+    if let Some(ref index) = opts.provider_index {
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/providers",
+            index.clone(),
             inject_mtime,
         );
     }
@@ -2288,6 +2303,7 @@ mod tests {
             preload: Vec::new(),
             needs_setuid: false,
             profile: Vec::new(),
+            provider_index: None,
             runtime_note: onelf_format::elf::RuntimeNote::Absent,
         }
     }

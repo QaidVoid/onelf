@@ -521,8 +521,15 @@ pub const SETS_FILE: &str = ".onelf/sets";
 
 /// The name every shared object in a dependency build answers to, one
 /// per line, written by `pack-set` and read by the packages that leave
-/// the build's contents out of their own bundle.
+/// the build's contents out of their own bundle. A hint the build's
+/// provider index supersedes when it is present: the listing never adds
+/// to or contradicts what the index records.
 pub const SHIPPED_FILE: &str = ".onelf/sonames";
+
+/// The packed path a set artifact records its verified provider index
+/// at. Absent from builds published before indexes existed; those keep
+/// answering from [`SHIPPED_FILE`] as before.
+pub const PROVIDER_INDEX_FILE: &str = ".onelf/providers";
 
 /// Absolute paths the runtime makes bundle directories answer for, one
 /// `ABSOLUTE<tab>RELATIVE` pair per line.
@@ -755,9 +762,37 @@ fn set_build(set: &SharedSet) -> Result<PathBuf, String> {
     fetched.map(|()| stored)
 }
 
-/// The sonames a set's pinned build records, or why they cannot be read.
+/// The loader-namespace names a set's pinned build verifiably exports,
+/// or why they cannot be read.
+///
+/// A build carrying a provider index answers from it: the index is
+/// packed inside the pinned build, the build itself has already matched
+/// the recipe's pin, and the index must name that set, so its exports
+/// belong to exactly that build. A hand-edited `.onelf/sonames` cannot
+/// add to or change them. A build without an index, one published
+/// before indexes were written, answers from its recorded sonames as
+/// before and needs no republishing. An index that is present but
+/// malformed is an error naming the build, never a reason to fall back
+/// to the listing.
 fn shipped_sonames(set: &SharedSet) -> Result<Vec<String>, String> {
     let build = set_build(set)?;
+    let pin = set
+        .blake3
+        .parse::<blake3::Hash>()
+        .map_err(|_| format!("set {}: pin is not a blake3 digest", set.name))?;
+    if let Some(bytes) = crate::metadata::read_packed_file(&build, PROVIDER_INDEX_FILE)
+        .map_err(|e| format!("{}: {e}", build.display()))?
+    {
+        let index = onelf_format::provider_index::ProviderIndex::decode(&bytes)
+            .map_err(|e| format!("{}: {e}", build.display()))?;
+        index
+            .verify(&onelf_format::provider_index::ArtifactIdentity {
+                set: set.name.clone(),
+                blake3: *pin.as_bytes(),
+            })
+            .map_err(|e| format!("{}: {e}", build.display()))?;
+        return Ok(index.exports);
+    }
     let bytes = crate::metadata::read_packed_file(&build, SHIPPED_FILE)
         .map_err(|e| format!("{}: {e}", build.display()))?
         .ok_or_else(|| format!("{} records no sonames", build.display()))?;
@@ -769,12 +804,103 @@ fn shipped_sonames(set: &SharedSet) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The loader-namespace names the ELF objects in `dir` verifiably
+/// export: the `DT_SONAME` of every object, parsed from the bytes that
+/// get packed. An object that exports no soname, a private plugin say,
+/// contributes nothing, however its basename reads.
+pub(crate) fn verified_exports(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names: Vec<String> = jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| super::elf::parse_soname(&e.path()))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Encode the provider index of the set `name` from the verified
+/// objects `dir` carries. The packer injects the bytes as
+/// `.onelf/providers`, so the source tree is never written to and the
+/// index describes exactly the build that is packed: the audit has
+/// already dropped what it cannot load by the time this runs.
+pub(crate) fn encode_provider_index(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
+    let index = onelf_format::provider_index::ProviderIndex::new(name, &verified_exports(dir)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    index
+        .encode()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Check a decoded index against the set, pin and verified exports the
+/// packed artifact must have: the index has to name that set, and its
+/// exports have to be exactly what the artifact's objects export.
+/// Anything else is a bounded failure, never a hint.
+fn check_index(
+    index: &onelf_format::provider_index::ProviderIndex,
+    name: &str,
+    pin: [u8; 32],
+    exports: &[String],
+) -> io::Result<()> {
+    index
+        .verify(&onelf_format::provider_index::ArtifactIdentity {
+            set: name.to_string(),
+            blake3: pin,
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if index.exports != exports {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider index does not match the exports the set's objects verify",
+        ));
+    }
+    Ok(())
+}
+
+/// Read the packed set artifact at `output` back and verify it carries
+/// the provider index of `name` with exactly the `exports` its objects
+/// verifiably export, then return its hash to pin. Called after
+/// packing, so the pin is only ever printed for a build whose recorded
+/// providers were checked rather than taken on faith.
+pub(crate) fn verify_set_artifact(
+    output: &Path,
+    name: &str,
+    exports: &[String],
+) -> io::Result<String> {
+    let hash = crate::sysroot_cmd::hash_file(output)?;
+    let pin = hash
+        .parse::<blake3::Hash>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "hash is not a blake3 digest"))?;
+    let bytes =
+        crate::metadata::read_packed_file(output, PROVIDER_INDEX_FILE)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: the packed set records no provider index",
+                    output.display()
+                ),
+            )
+        })?;
+    let index = onelf_format::provider_index::ProviderIndex::decode(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {e}", output.display()),
+        )
+    })?;
+    check_index(&index, name, *pin.as_bytes(), exports)?;
+    Ok(hash)
+}
+
 /// The sonames a set-only build's pinned sets supply, split out of the
 /// verifier's findings and reported as theirs.
 ///
-/// Each set's pinned build is read for `.onelf/sonames`, fetched first
-/// when it is not at hand, so a name is attributed to a set only when
-/// that set's build ships it. A set whose build cannot be had is
+/// Each set's pinned build is read for its provider index, falling back
+/// to its `.onelf/sonames` record when it predates indexes, fetched
+/// first when it is not at hand, so a name is attributed to a set only
+/// when that set's build ships it. A set whose build cannot be had is
 /// returned with the reason, and claims nothing: what it may supply
 /// stays among the findings rather than being taken on the recipe's
 /// word.
@@ -1721,5 +1847,109 @@ mod tests {
         let err = set_build(&set("http://example.com/set.onelf".to_string())).unwrap_err();
         assert!(err.contains("neither https:// nor file://"), "{err}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build a minimal ELF64 shared object whose `DT_SONAME` is
+    /// `soname`, so the index derivation runs against real objects
+    /// without a toolchain.
+    fn soname_object(soname: &str) -> Vec<u8> {
+        let strtab = {
+            let mut s = vec![0u8];
+            s.extend_from_slice(soname.as_bytes());
+            s.push(0);
+            s
+        };
+        let dyn_off = 64 + 2 * 56;
+        let dyn_size = 4 * 16;
+        let str_off = dyn_off + dyn_size;
+        let total = str_off + strtab.len();
+        let strtab_value = str_off as u64;
+
+        let mut elf = Vec::new();
+        elf.extend_from_slice(b"\x7fELF");
+        elf.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        elf.extend_from_slice(&3u16.to_le_bytes());
+        elf.extend_from_slice(&62u16.to_le_bytes());
+        elf.extend_from_slice(&1u32.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&64u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u32.to_le_bytes());
+        elf.extend_from_slice(&64u16.to_le_bytes());
+        elf.extend_from_slice(&56u16.to_le_bytes());
+        elf.extend_from_slice(&2u16.to_le_bytes());
+        elf.extend_from_slice(&[0u8; 6]);
+        // PT_LOAD covering the whole file, then PT_DYNAMIC.
+        elf.extend_from_slice(&1u32.to_le_bytes());
+        elf.extend_from_slice(&6u32.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&(total as u64).to_le_bytes());
+        elf.extend_from_slice(&(total as u64).to_le_bytes());
+        elf.extend_from_slice(&0x1000u64.to_le_bytes());
+        elf.extend_from_slice(&2u32.to_le_bytes());
+        elf.extend_from_slice(&6u32.to_le_bytes());
+        for _ in 0..3 {
+            elf.extend_from_slice(&(dyn_off as u64).to_le_bytes());
+        }
+        elf.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+        elf.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+        elf.extend_from_slice(&8u64.to_le_bytes());
+        // DT_STRTAB, DT_STRSZ, DT_SONAME, DT_NULL.
+        elf.extend_from_slice(&5u64.to_le_bytes());
+        elf.extend_from_slice(&strtab_value.to_le_bytes());
+        elf.extend_from_slice(&10u64.to_le_bytes());
+        elf.extend_from_slice(&(strtab.len() as u64).to_le_bytes());
+        elf.extend_from_slice(&14u64.to_le_bytes());
+        elf.extend_from_slice(&1u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&strtab);
+        assert_eq!(elf.len(), total);
+        elf
+    }
+
+    /// The index encoded for a set tree records exactly the sonames the
+    /// tree's objects export. A file whose basename merely shares a
+    /// string with an exported name, a private plugin say, stays out,
+    /// and two objects exporting the same soname record it once.
+    #[test]
+    fn the_provider_index_records_verified_sonames() {
+        let dir = std::env::temp_dir().join(format!("onelf-pindex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lib/plugins")).unwrap();
+        fs::write(
+            dir.join("lib/libcraft.so.9.1"),
+            soname_object("libcraft.so.9"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("libcraft.so.9.1", dir.join("lib/libcraft.so.9")).unwrap();
+        fs::write(dir.join("lib/plugins/libcraft.so.9"), b"not an elf object").unwrap();
+        fs::write(dir.join("lib/readme"), b"neither").unwrap();
+        let bytes = encode_provider_index(&dir, "gtk").unwrap();
+
+        let index = onelf_format::provider_index::ProviderIndex::decode(&bytes).unwrap();
+        assert_eq!(index.set, "gtk");
+        assert_eq!(index.exports, ["libcraft.so.9"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A published index that disagrees about the set or the exports is
+    /// a failure naming the disagreement, never a hint.
+    #[test]
+    fn a_published_index_must_match_the_verified_exports() {
+        let exports = vec!["liba.so.1".to_owned()];
+        let index = onelf_format::provider_index::ProviderIndex::new("gtk", &exports).unwrap();
+        let pin = [9u8; 32];
+
+        check_index(&index, "gtk", pin, &exports).unwrap();
+        assert!(check_index(&index, "qt", pin, &exports).is_err());
+        let other = vec!["libb.so.2".to_owned()];
+        assert!(check_index(&index, "gtk", pin, &other).is_err());
+        let mut extra = exports.clone();
+        extra.push("libb.so.2".to_owned());
+        assert!(check_index(&index, "gtk", pin, &extra).is_err());
+        assert!(check_index(&index, "gtk", pin, &[]).is_err());
     }
 }

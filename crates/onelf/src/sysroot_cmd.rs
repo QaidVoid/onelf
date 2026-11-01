@@ -113,13 +113,30 @@ pub fn pack_gl(
     sysroot: Option<&Path>,
     runtime: &[u8],
 ) -> io::Result<()> {
-    pack_tree(dir, output, sysroot, runtime, GL_ENTRYPOINT, "onelf-gl")
+    pack_tree(
+        dir,
+        output,
+        sysroot,
+        runtime,
+        GL_ENTRYPOINT,
+        "onelf-gl",
+        None,
+    )?;
+    let hash = hash_file(output)?;
+    println!("blake3 = \"{hash}\"");
+    Ok(())
 }
 
 /// Pack the shared set tree at `dir` into `output` under `name` and print
 /// the hash to pin. The same rules as a GL build: glibc stays out, and
 /// a library the set needs beyond glibc and the driver families has to
 /// be inside it.
+///
+/// The packed build carries a provider index derived from the objects it
+/// verified during assembly, and it is only published once the packed
+/// artifact has been read back and found to carry exactly that index:
+/// the pin printed below is for a build whose exported names were
+/// checked, not for one whose word was taken.
 pub fn pack_set(
     dir: &Path,
     output: &Path,
@@ -135,7 +152,12 @@ pub fn pack_set(
         runtime,
         SET_ENTRYPOINT,
         &format!("onelf-set-{name}"),
-    )
+        Some(name),
+    )?;
+    let exports = crate::bundle::sysroot::verified_exports(dir)?;
+    let hash = crate::bundle::sysroot::verify_set_artifact(output, name, &exports)?;
+    println!("blake3 = \"{hash}\"");
+    Ok(())
 }
 
 /// Record the name every shared object in `dir` answers to.
@@ -170,6 +192,7 @@ fn pack_tree(
     runtime: &[u8],
     entrypoint: &str,
     name: &str,
+    set: Option<&str>,
 ) -> io::Result<()> {
     let entry = dir.join(entrypoint);
     if !entry.exists() {
@@ -296,6 +319,10 @@ fn pack_tree(
     // before: a package pinning a set left out a library the set had
     // never carried, and nothing held it at launch.
     write_shipped_sonames(dir)?;
+    let provider_index = match set {
+        Some(set) => Some(crate::bundle::sysroot::encode_provider_index(dir, set)?),
+        None => None,
+    };
 
     crate::pack::pack(
         &PackOptions {
@@ -329,6 +356,7 @@ fn pack_tree(
             preload: Vec::new(),
             needs_setuid: false,
             profile: Vec::new(),
+            provider_index,
             // A sysroot build states no capability requirements of its
             // own; the caller that embeds the runtime probes it.
             runtime_note: onelf_format::elf::RuntimeNote::Absent,
@@ -336,8 +364,6 @@ fn pack_tree(
         runtime,
     )?;
 
-    let hash = hash_file(output)?;
-    println!("blake3 = \"{hash}\"");
     Ok(())
 }
 
