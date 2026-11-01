@@ -38,6 +38,12 @@ macro_rules! bitflags {
             pub const fn contains(&self, other: Self) -> bool {
                 (self.bits & other.bits) == other.bits
             }
+
+            pub const fn union(self, other: Self) -> Self {
+                Self {
+                    bits: self.bits | other.bits,
+                }
+            }
         }
 
         impl std::ops::BitOr for $Name {

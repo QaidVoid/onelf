@@ -329,6 +329,9 @@ fn pack_tree(
             preload: Vec::new(),
             needs_setuid: false,
             profile: Vec::new(),
+            // A sysroot build states no capability requirements of its
+            // own; the caller that embeds the runtime probes it.
+            runtime_note: onelf_format::elf::RuntimeNote::Absent,
         },
         runtime,
     )?;

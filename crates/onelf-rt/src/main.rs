@@ -1,4 +1,5 @@
 mod cache;
+mod capability;
 mod doctor;
 mod env;
 mod ephemeral;

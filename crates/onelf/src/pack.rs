@@ -25,7 +25,7 @@ use rayon::prelude::*;
 
 use onelf_format::{
     Entry, EntryKind, EntryPoint, EntryPointFlags, Flags, Footer, Manifest, ManifestHeader,
-    StringTableBuilder, WorkingDir,
+    StringTableBuilder, WorkingDir, elf,
 };
 
 use crate::compress;
@@ -153,6 +153,12 @@ pub struct PackOptions {
     /// read them, from [`read_profile`]. Packed as `.onelf/prefetch` for the
     /// runtime to decompress ahead of the app.
     pub profile: Vec<(String, u64)>,
+    /// What the embedded runtime advertises, probed from its actual bytes
+    /// including any `ONELF_RT_PATH` substitution. Assembly refuses a
+    /// runtime whose note exists but cannot be read, and later metadata
+    /// emission narrows the accepted set to runtimes advertising the
+    /// required capabilities.
+    pub runtime_note: elf::RuntimeNote,
 }
 
 /// Where the runtime looks for the blocks to prefetch.
@@ -699,6 +705,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             ),
         ));
     }
+    // Nothing is emitted yet, so a note-free legacy runtime stays
+    // acceptable while a runtime advertising an unreadable note is refused.
+    elf::check_runtime_support(&opts.runtime_note, elf::RuntimeRequirements::NONE)?;
     if opts.payload == Payload::Stipple {
         if !opts.block_size.is_power_of_two() {
             return Err(io::Error::new(
@@ -2279,6 +2288,7 @@ mod tests {
             preload: Vec::new(),
             needs_setuid: false,
             profile: Vec::new(),
+            runtime_note: onelf_format::elf::RuntimeNote::Absent,
         }
     }
 

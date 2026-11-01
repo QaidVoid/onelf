@@ -752,50 +752,54 @@ fn main() {
                 })
                 .transpose();
             let profile = prefetch.as_deref().map(pack::read_profile).transpose();
+            let runtime: &[u8] = if (update_url.is_some() && !no_embed_updater) || pins_https {
+                RUNTIME_BINARY_UPDATE
+            } else {
+                RUNTIME_BINARY_SLIM
+            };
             match update_key.and_then(|key| Ok((key, profile?.unwrap_or_default()))) {
                 Err(e) => Err(e),
-                Ok((update_key, profile)) => pack::pack(
-                    &pack::PackOptions {
-                        directory,
-                        output,
-                        command,
-                        name,
-                        entrypoints,
-                        default_entrypoint,
-                        lib_dirs: lib_dir,
-                        level,
-                        block_size: block_size.unwrap_or(payload.default_block_size()),
-                        payload,
-                        use_dict: dict,
-                        no_compress,
-                        memfd: memfd_opt,
-                        working_dir: wd,
-                        host_libs: host_libs.into(),
-                        cache,
-                        prefer_cache,
-                        update_url: update_url.clone(),
-                        embed_updater: !no_embed_updater,
-                        update_key,
-                        update_revision,
-                        update_unsigned,
-                        exclude,
-                        package_info: None,
-                        mtime,
-                        env: Vec::new(),
-                        paths: Vec::new(),
-                        preload,
-                        needs_setuid,
-                        profile,
-                    },
-                    // Pick the runtime: the slim one by default, the
-                    // update-capable one when the user configures
-                    // self-updates or the package pins a GL build over HTTPS.
-                    if (update_url.is_some() && !no_embed_updater) || pins_https {
-                        RUNTIME_BINARY_UPDATE
-                    } else {
-                        RUNTIME_BINARY_SLIM
-                    },
-                ),
+                Ok((update_key, profile)) => {
+                    match onelf_format::elf::probe_capability_note(runtime) {
+                        Err(e) => Err(e.into()),
+                        Ok(runtime_note) => pack::pack(
+                            &pack::PackOptions {
+                                directory,
+                                output,
+                                command,
+                                name,
+                                entrypoints,
+                                default_entrypoint,
+                                lib_dirs: lib_dir,
+                                level,
+                                block_size: block_size.unwrap_or(payload.default_block_size()),
+                                payload,
+                                use_dict: dict,
+                                no_compress,
+                                memfd: memfd_opt,
+                                working_dir: wd,
+                                host_libs: host_libs.into(),
+                                cache,
+                                prefer_cache,
+                                update_url: update_url.clone(),
+                                embed_updater: !no_embed_updater,
+                                update_key,
+                                update_revision,
+                                update_unsigned,
+                                exclude,
+                                package_info: None,
+                                mtime,
+                                env: Vec::new(),
+                                paths: Vec::new(),
+                                preload,
+                                needs_setuid,
+                                profile,
+                                runtime_note,
+                            },
+                            runtime,
+                        ),
+                    }
+                }
             }
         }
         Commands::Init {
@@ -1352,6 +1356,7 @@ fn run_build(
     } else {
         RUNTIME_BINARY_SLIM
     };
+    let runtime_note = onelf_format::elf::probe_capability_note(runtime)?;
 
     let package_info = build_package_info(&recipe.package);
     let profile = match &recipe.compression.prefetch {
@@ -1399,6 +1404,7 @@ fn run_build(
             preload: recipe.preload,
             needs_setuid: recipe.package.needs_setuid,
             profile,
+            runtime_note,
         },
         runtime,
     )
