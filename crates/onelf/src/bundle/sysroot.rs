@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use onelf_sysroot::path::{entry_in_root, in_root};
@@ -299,7 +299,10 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         }
     };
 
-    remove_generated(appdir)?;
+    let conflicts = dispose_generated(appdir, root, &pruned.kept)?;
+    if !conflicts.is_empty() {
+        return Err(generated_conflict_error(&conflicts));
+    }
     let mut generated: Vec<String> = Vec::new();
     // The host packages' own libraries on the line are reported as
     // host-provided like any other, so the report reads the same whether
@@ -1170,34 +1173,363 @@ fn copy_generated_caches(root: &Path, tree: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Where a sysroot build lists what it put into the AppDir, relative to
-/// the AppDir. The next build removes those files first, so a changed
-/// policy or closure takes effect without touching anything the
-/// publisher added by hand. Never packed.
+/// the AppDir, with the hash of the bytes it wrote to each. The next
+/// build judges every listed path by content before it copies anything:
+/// its own unchanged output goes, so a changed policy or closure takes
+/// effect, while a file holding something else was edited by the
+/// publisher and stops the build instead of being deleted or packed.
+/// Never packed.
 pub const GENERATED_FILE: &str = ".onelf/generated";
 
-/// Remove what the previous sysroot build generated, and the directories
-/// that emptied as a result.
-pub fn remove_generated(appdir: &Path) -> io::Result<()> {
+/// First line of the versioned ledger format. A record without it is a
+/// legacy path-only list from a build that recorded no hashes, and its
+/// entries are adopted only with provenance, never deleted on faith.
+const GENERATED_LEDGER_HEADER: &str = "generated-v2";
+
+/// The largest ledger read whole, so a hand-mangled record errors out
+/// instead of costing unbounded memory.
+const GENERATED_LEDGER_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// One entry of the generated-file ledger: a path the build wrote,
+/// relative to the AppDir, and the BLAKE3 of the bytes it wrote there
+/// when known. An entry without a hash is legacy: what the build last
+/// wrote to the path is unknown, so the file can only be judged against
+/// an output the current plan reproduces. A pending entry carries the
+/// hash of what the build copied before its own ELF rewriting ran, so
+/// the bytes on disk may differ from it through no publisher's hand;
+/// the entry is judged softly until the staging flow attests the final
+/// bytes through [`attest_generated`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedEntry {
+    /// The path, relative to the AppDir.
+    pub path: String,
+    /// The hash of the bytes the build last wrote, when the entry
+    /// carries one.
+    pub hash: Option<blake3::Hash>,
+    /// Whether the hash predates the build's own ELF rewriting, which
+    /// makes a difference on disk the build's own doing rather than
+    /// proof of an edit.
+    pub pending: bool,
+}
+
+/// Why a formerly generated path stops publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GeneratedConflict {
+    /// The file's bytes differ from the hash the ledger recorded.
+    Edited {
+        /// The hash of what the build last wrote.
+        recorded: blake3::Hash,
+        /// The hash of what the path holds now.
+        actual: blake3::Hash,
+    },
+    /// The ledger entry carries no hash and no current output proves
+    /// the bytes, so they may hold publisher edits.
+    Unproven {
+        /// The hash of what the path holds now.
+        actual: blake3::Hash,
+    },
+}
+
+/// A formerly generated path publication stops on: the path, whether
+/// the plan in hand would write there again, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFinding {
+    /// The path, relative to the AppDir.
+    pub path: String,
+    /// Whether the plan in hand would write to the path again.
+    pub refreshable: bool,
+    /// Why the file is not trusted as generated output.
+    pub why: GeneratedConflict,
+}
+
+/// What a build may do with a formerly generated path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Nothing is at the path; there is nothing to dispose of.
+    Absent,
+    /// The bytes match the record. The build may remove the file and
+    /// write its own output there when the plan still names the path.
+    Dispose,
+    /// The record cannot attest these bytes: the entry is pending the
+    /// build's own ELF rewriting, or carries no hash and the current
+    /// plan reproduces the path. The build re-derives the path, which
+    /// is no grounds to stop on, and no license to skip the rewrite.
+    Excuse,
+    /// The bytes differ from an attested record, or a path-only record
+    /// proves nothing and nothing reproduces the path. The file stays
+    /// and publication stops until the author resolves it.
+    Conflict(GeneratedConflict),
+}
+
+/// Judge a formerly generated path by content: the ledger's recorded
+/// hash against the hash of what the path holds now, `None` when
+/// nothing is there. Shared with host assembly, which can adopt a
+/// legacy entry first by setting its hash to the hash of its own
+/// staged output when the file provably equals that output, and which
+/// attests entries after its own ELF rewriting through
+/// [`attest_generated`].
+pub(crate) fn decide_generated_disposal(
+    record: &GeneratedEntry,
+    actual: Option<blake3::Hash>,
+) -> Disposition {
+    match (&record.hash, actual) {
+        (_, None) => Disposition::Absent,
+        (None, Some(actual)) => Disposition::Conflict(GeneratedConflict::Unproven { actual }),
+        (Some(recorded), Some(actual)) if recorded == &actual => Disposition::Dispose,
+        (Some(_), Some(_)) if record.pending => Disposition::Excuse,
+        (Some(recorded), Some(actual)) => Disposition::Conflict(GeneratedConflict::Edited {
+            recorded: *recorded,
+            actual,
+        }),
+    }
+}
+
+/// Read the ledger. A record without the version header is the legacy
+/// path-only form; either way a line that names no plain path inside
+/// the AppDir was never ours and stays ignored.
+pub(crate) fn read_generated(appdir: &Path) -> io::Result<Vec<GeneratedEntry>> {
     let record = appdir.join(GENERATED_FILE);
-    let text = match fs::read_to_string(&record) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+    let file = match fs::File::open(&record) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    // The record sits in the AppDir and anyone can edit it, so a line
-    // that is not a plain path inside the AppDir is no file of ours.
-    let inside = |line: &&str| {
-        !line.is_empty()
-            && Path::new(line)
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
+    let mut text = String::new();
+    file.take(GENERATED_LEDGER_LIMIT + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", record.display())))?;
+    if text.len() as u64 > GENERATED_LEDGER_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: larger than the {} MiB ledger limit",
+                record.display(),
+                GENERATED_LEDGER_LIMIT / (1024 * 1024)
+            ),
+        ));
+    }
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    match lines.first() {
+        Some(&GENERATED_LEDGER_HEADER) => parse_hashed_ledger(&record, &lines[1..]),
+        Some(_) => Ok(lines
+            .into_iter()
+            .filter(|line| inside_appdir(line))
+            .map(|path| GeneratedEntry {
+                path: path.to_string(),
+                hash: None,
+                pending: false,
+            })
+            .collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Parse the versioned record: a path per entry, with the hash of what
+/// the build wrote there on a `#` line under it. A `#~` line marks a
+/// pending entry, one whose hash predates the build's own ELF
+/// rewriting. A hash line that has no path to belong to, or a path
+/// with two, is a malformed record and a bounded error, never a guess.
+fn parse_hashed_ledger(record: &Path, lines: &[&str]) -> io::Result<Vec<GeneratedEntry>> {
+    let mut entries: Vec<GeneratedEntry> = Vec::new();
+    let mut awaiting: Option<usize> = None;
+    for line in lines {
+        let (hex, pending) = match line.strip_prefix("#~") {
+            Some(hex) => (hex, true),
+            None => match line.strip_prefix('#') {
+                Some(hex) => (hex, false),
+                None => {
+                    if inside_appdir(line) {
+                        entries.push(GeneratedEntry {
+                            path: (*line).to_string(),
+                            hash: None,
+                            pending: false,
+                        });
+                        awaiting = Some(entries.len() - 1);
+                    } else {
+                        awaiting = None;
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(index) = awaiting else {
+            return Err(malformed_ledger(
+                record,
+                line,
+                "a hash line with no path above it",
+            ));
+        };
+        if entries[index].hash.is_some() {
+            return Err(malformed_ledger(record, line, "a second hash for one path"));
+        }
+        let hex = hex.to_ascii_lowercase();
+        let owner = entries[index].path.clone();
+        entries[index].hash = Some(hex.parse::<blake3::Hash>().map_err(|_| {
+            malformed_ledger(record, line, &format!("not a blake3 digest for {owner}"))
+        })?);
+        entries[index].pending = pending;
+        awaiting = None;
+    }
+    Ok(entries)
+}
+
+/// A bounded parse error naming the record and the offending line.
+fn malformed_ledger(record: &Path, line: &str, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {}: {why}", record.display(), line),
+    )
+}
+
+/// Whether `line` names a plain path inside the AppDir: the ledger sits
+/// in the AppDir and anyone can edit it, so a line that reaches outside
+/// is no file of ours.
+fn inside_appdir(line: &str) -> bool {
+    !line.is_empty()
+        && Path::new(line)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// The BLAKE3 of what `path` holds, under a tag for its kind so a file
+/// replaced by a link of the same text still hashes differently.
+/// `None` when nothing is there.
+pub(crate) fn hash_entry(path: &Path) -> io::Result<Option<blake3::Hash>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
     };
-    for line in text.lines().filter(inside) {
-        let path = appdir.join(line);
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            dirs.push(parent.to_path_buf());
+    let mut hasher = blake3::Hasher::new();
+    if meta.file_type().is_symlink() {
+        hasher.update(b"link ");
+        hasher.update(fs::read_link(path)?.as_os_str().as_encoded_bytes());
+    } else if meta.is_dir() {
+        hasher.update(b"dir");
+    } else if meta.is_file() {
+        hasher.update(b"file ");
+        hasher.update_reader(fs::File::open(path)?)?;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: not a regular file, link or directory", path.display()),
+        ));
+    }
+    Ok(Some(hasher.finalize()))
+}
+
+/// The hash of what this build would write for the sysroot path `rel`,
+/// or `None` when it would write nothing there: the sysroot lacks the
+/// entry, or flattening folds its link onto itself. This is the
+/// provenance a legacy ledger entry is adopted against.
+fn expected_output_hash(root: &Path, rel: &str) -> io::Result<Option<blake3::Hash>> {
+    let src = match entry_in_root(root, Path::new(rel)) {
+        Ok(src) => src,
+        Err(_) => return Ok(None),
+    };
+    let meta = match fs::symlink_metadata(&src) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut hasher = blake3::Hasher::new();
+    if meta.file_type().is_symlink() {
+        let Some(target) = relink(rel, &fs::read_link(&src)?) else {
+            return Ok(None);
+        };
+        hasher.update(b"link ");
+        hasher.update(target.as_os_str().as_encoded_bytes());
+    } else if meta.is_file() {
+        hasher.update(b"file ");
+        hasher.update_reader(fs::File::open(&src)?)?;
+    } else {
+        return Ok(None);
+    }
+    Ok(Some(hasher.finalize()))
+}
+
+/// Remove what a previous build generated, judging each recorded path
+/// by content before anything is touched: a file whose bytes still
+/// match its recorded hash goes, and the directories it emptied go
+/// with it, while a file whose bytes differ from an attested hash was
+/// edited by the publisher. The edited file stays, and the findings
+/// returned stop publication. A pending entry, one whose hash predates
+/// the build's own ELF rewriting, cannot attest the bytes on disk: the
+/// plan re-derives its path, so the file is removed when the plan no
+/// longer names it and left for the copy to replace when it does. A
+/// path-only legacy entry is adopted, and its file removed, when the
+/// file provably equals the output this build would write for it,
+/// which `kept`, the sysroot paths the plan copies, supplies; a legacy
+/// path the plan no longer writes proves nothing and stops publication
+/// with a finding rather than being guessed safe to delete. Nothing is
+/// removed while any path conflicts.
+pub(crate) fn dispose_generated(
+    appdir: &Path,
+    root: &Path,
+    kept: &[String],
+) -> io::Result<Vec<GeneratedFinding>> {
+    let entries = read_generated(appdir)?;
+    if entries.is_empty() {
+        let _ = fs::remove_file(appdir.join(GENERATED_FILE));
+        return Ok(Vec::new());
+    }
+    // Where the plan writes: the AppDir path to the sysroot path that
+    // supplies it.
+    let planned: std::collections::HashMap<&str, &str> = kept
+        .iter()
+        .map(|rel| (appdir_path(rel), rel.as_str()))
+        .collect();
+    let mut removals: Vec<String> = Vec::new();
+    let mut findings: Vec<GeneratedFinding> = Vec::new();
+    for entry in &entries {
+        let actual = hash_entry(&appdir.join(&entry.path))?;
+        let mut judged = entry.clone();
+        // A path-only record proves nothing on its own. When the plan
+        // still writes the path and the file equals that output, the
+        // entry is adopted as the build's own.
+        if judged.hash.is_none()
+            && let Some(actual) = actual
+            && let Some(rel) = planned.get(entry.path.as_str())
+            && let Some(expected) = expected_output_hash(root, rel)?
+            && expected == actual
+        {
+            judged.hash = Some(expected);
+        }
+        match decide_generated_disposal(&judged, actual) {
+            Disposition::Absent => {}
+            Disposition::Dispose => removals.push(entry.path.clone()),
+            Disposition::Excuse => {
+                // The plan re-derives the path. Left in place when the
+                // copy overwrites it, removed when nothing will.
+                if !planned.contains_key(entry.path.as_str()) {
+                    removals.push(entry.path.clone());
+                }
+            }
+            Disposition::Conflict(why) => {
+                // A legacy path the plan still writes is re-derived by
+                // this build either way, so its unproven bytes are
+                // replaced rather than packed; only a path nothing
+                // reproduces has to stand on proof.
+                if judged.hash.is_none() && planned.contains_key(entry.path.as_str()) {
+                    continue;
+                }
+                findings.push(GeneratedFinding {
+                    path: entry.path.clone(),
+                    refreshable: planned.contains_key(entry.path.as_str()),
+                    why,
+                });
+            }
+        }
+    }
+    if !findings.is_empty() {
+        findings.sort_by(|a, b| a.path.cmp(&b.path));
+        return Ok(findings);
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for rel in &removals {
+        let _ = fs::remove_file(appdir.join(rel));
+        if let Some(parent) = Path::new(rel).parent() {
+            dirs.push(appdir.join(parent));
         }
     }
     // Deepest first, so a directory is tried after its children.
@@ -1210,26 +1542,125 @@ pub fn remove_generated(appdir: &Path) -> io::Result<()> {
             dir = parent;
         }
     }
-    fs::remove_file(&record)
+    fs::remove_file(appdir.join(GENERATED_FILE))?;
+    Ok(Vec::new())
 }
 
-/// Add `paths`, relative to the AppDir, to the record of generated files.
+/// Re-hash every recorded entry from the bytes on disk and clear the
+/// pending mark, so each entry attests the bytes the tree now holds.
+/// The staging flow calls this after its own ELF rewriting is done,
+/// which is the point from which a difference on disk is a publisher's
+/// edit rather than the build's own doing, and every later rebuild
+/// stops on one instead of excusing it.
+#[allow(dead_code)]
+pub(crate) fn attest_generated(appdir: &Path) -> io::Result<()> {
+    let mut entries = read_generated(appdir)?;
+    for entry in &mut entries {
+        entry.hash = hash_entry(&appdir.join(&entry.path))?;
+        entry.pending = false;
+    }
+    write_generated(appdir, &entries)
+}
+
+/// The error a build stops with when a formerly generated file no
+/// longer holds what the ledger recorded: every such path with the
+/// recorded state against the actual one, and how the author resolves
+/// it. Publication happens only after a build that reports no
+/// conflicts, so nothing here is ever packed.
+pub(crate) fn generated_conflict_error(findings: &[GeneratedFinding]) -> io::Error {
+    const SHOWN: usize = 8;
+    let mut text = String::from(
+        "generated files were changed since the build that wrote them; publication stops until each is resolved:\n",
+    );
+    for finding in findings.iter().take(SHOWN) {
+        text.push_str("  ");
+        text.push_str(&finding_line(finding));
+        text.push('\n');
+    }
+    if findings.len() > SHOWN {
+        text.push_str(&format!("  and {} more\n", findings.len() - SHOWN));
+    }
+    text.push_str(
+        "  for each one, remove the file, or move it to a path the build does not generate to keep it as publisher-owned input\n",
+    );
+    io::Error::new(io::ErrorKind::InvalidData, text)
+}
+
+/// One finding as the error spells it: the path, the recorded state
+/// against the actual one, and whether the plan would have replaced
+/// the file.
+fn finding_line(finding: &GeneratedFinding) -> String {
+    let replaced = if finding.refreshable {
+        ", and this build would have replaced it"
+    } else {
+        ", and no current output writes it anymore"
+    };
+    match &finding.why {
+        GeneratedConflict::Edited { recorded, actual } => format!(
+            "{}: the ledger records blake3 {recorded} but the file hashes to {actual}{replaced}",
+            finding.path
+        ),
+        GeneratedConflict::Unproven { actual } => format!(
+            "{}: the ledger entry carries no hash, so the file's blake3 {actual} cannot be proven to be generated output{replaced}",
+            finding.path
+        ),
+    }
+}
+
+/// Add `paths`, relative to the AppDir, to the record of generated
+/// files, hashing what each path holds so the next build can tell the
+/// build's own output from a publisher's edits. Paths recorded before
+/// and not named again keep their recorded hash; a path named again is
+/// hashed anew, since the build just wrote it. An ELF object is
+/// recorded pending: the build's own rewriting may still change its
+/// bytes, so the entry attests them only once [`attest_generated`]
+/// runs after that rewriting. A path that names no plain location
+/// inside the AppDir is not recorded.
 pub fn record_generated(appdir: &Path, paths: Vec<String>) -> io::Result<()> {
-    let record = appdir.join(GENERATED_FILE);
-    let mut all: Vec<String> = fs::read_to_string(&record)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(String::from)
+    let mut merged: std::collections::BTreeMap<String, GeneratedEntry> = read_generated(appdir)?
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
         .collect();
-    all.extend(paths);
-    all.sort();
-    all.dedup();
+    for path in paths {
+        if !inside_appdir(&path) {
+            continue;
+        }
+        // An ELF object the build copied is not final until the
+        // rewriting has run over it, so its hash attests nothing yet.
+        let pending = is_elf(&appdir.join(&path));
+        let hash = hash_entry(&appdir.join(&path))?;
+        merged.insert(
+            path.clone(),
+            GeneratedEntry {
+                path,
+                hash,
+                pending,
+            },
+        );
+    }
+    let entries: Vec<GeneratedEntry> = merged.into_values().collect();
+    write_generated(appdir, &entries)
+}
+
+/// Write the ledger: the version header, then a path per entry with the
+/// hash of the bytes the build wrote on a `#` line under it, `#~` for a
+/// pending entry. Paths sort, so the same tree writes the same record.
+fn write_generated(appdir: &Path, entries: &[GeneratedEntry]) -> io::Result<()> {
+    let record = appdir.join(GENERATED_FILE);
     if let Some(parent) = record.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut text = all.join("\n");
+    let mut text = String::from(GENERATED_LEDGER_HEADER);
     text.push('\n');
+    for entry in entries {
+        text.push_str(&entry.path);
+        text.push('\n');
+        if let Some(hash) = entry.hash {
+            text.push_str(if entry.pending { "#~" } else { "#" });
+            text.push_str(hash.to_hex().as_ref());
+            text.push('\n');
+        }
+    }
     fs::write(&record, text)
 }
 
@@ -1463,7 +1894,6 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
 }
 
 fn is_elf(path: &Path) -> bool {
-    use std::io::Read;
     let Ok(mut f) = fs::File::open(path) else {
         return false;
     };
@@ -1697,20 +2127,514 @@ mod tests {
         fs::write(appdir.join("lib/sub/libfoo.so"), b"elf").unwrap();
         fs::write(root.join("outside/keep"), b"keep").unwrap();
         fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        let hash = hash_entry(&appdir.join("lib/sub/libfoo.so"))
+            .unwrap()
+            .unwrap();
         fs::write(
             appdir.join(GENERATED_FILE),
             format!(
-                "lib/sub/libfoo.so\n../outside/keep\nlib/../../outside/empty/x\n{}\n",
-                root.join("outside/keep").display()
+                "{GENERATED_LEDGER_HEADER}\n\
+                 ../outside/keep\n\
+                 lib/../../outside/empty/x\n\
+                 {}\n\
+                 lib/sub/libfoo.so\n\
+                 #{}\n",
+                root.join("outside/keep").display(),
+                hash.to_hex()
             ),
         )
         .unwrap();
 
-        remove_generated(&appdir).unwrap();
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
         assert!(!appdir.join("lib").exists(), "the emptied directories go");
         assert!(appdir.is_dir(), "the AppDir stays");
+        assert!(!appdir.join(GENERATED_FILE).exists(), "the record goes too");
         assert!(root.join("outside/keep").is_file());
         assert!(root.join("outside/empty").is_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Cleanup judged by content: a generated file still holding the
+    /// bytes the record wrote goes, and the directories it emptied go
+    /// with it.
+    #[test]
+    fn an_unchanged_generated_file_is_removed_by_its_recorded_hash() {
+        let root = std::env::temp_dir().join(format!("onelf-dispose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib/sub")).unwrap();
+        fs::write(appdir.join("lib/sub/cache.bin"), b"generated").unwrap();
+        record_generated(&appdir, vec!["lib/sub/cache.bin".to_string()]).unwrap();
+
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(!appdir.join("lib/sub/cache.bin").exists());
+        assert!(!appdir.join("lib").exists(), "the emptied directories go");
+        assert!(!appdir.join(GENERATED_FILE).exists(), "the record goes too");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A file the publisher placed is not in the record, so the cleanup
+    /// never considers it, however much it looks like generated output.
+    #[test]
+    fn a_publisher_file_survives_the_cleanup_of_generated_ones() {
+        let root = std::env::temp_dir().join(format!("onelf-publisher-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(appdir.join("lib/generated.so"), b"generated").unwrap();
+        fs::write(appdir.join("lib/mine.so"), b"mine").unwrap();
+        record_generated(&appdir, vec!["lib/generated.so".to_string()]).unwrap();
+
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(!appdir.join("lib/generated.so").exists());
+        assert_eq!(fs::read(appdir.join("lib/mine.so")).unwrap(), b"mine");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An obsolete generated file whose bytes differ from the record was
+    /// edited by the publisher: it stays, the record stays, and the
+    /// finding stops publication naming the recorded and actual state
+    /// and how the author resolves it.
+    #[test]
+    fn an_edited_generated_file_is_kept_and_stops_publication() {
+        let root = std::env::temp_dir().join(format!("onelf-edited-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        let path = appdir.join("lib/plugin.so");
+        fs::write(&path, b"generated").unwrap();
+        record_generated(&appdir, vec!["lib/plugin.so".to_string()]).unwrap();
+        let recorded = hash_entry(&path).unwrap().unwrap();
+        fs::write(&path, b"publisher edit").unwrap();
+        let edited = hash_entry(&path).unwrap().unwrap();
+
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(!conflicts[0].refreshable);
+        assert_eq!(
+            conflicts[0].why,
+            GeneratedConflict::Edited {
+                recorded,
+                actual: edited,
+            }
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"publisher edit",
+            "the edit stays"
+        );
+        assert!(appdir.join(GENERATED_FILE).is_file(), "nothing was mutated");
+
+        let text = generated_conflict_error(&conflicts).to_string();
+        assert!(text.contains("lib/plugin.so"), "{text}");
+        assert!(text.contains(recorded.to_hex().as_ref()), "{text}");
+        assert!(text.contains("remove"), "{text}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same edit on a path the plan would write again names the
+    /// replacement, so the author knows the build would have overwritten
+    /// their work.
+    #[test]
+    fn an_edited_generated_file_the_plan_would_refresh_names_the_replacement() {
+        let root = std::env::temp_dir().join(format!("onelf-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        let path = appdir.join("lib/libfoo.so");
+        fs::write(&path, b"generated").unwrap();
+        record_generated(&appdir, vec!["lib/libfoo.so".to_string()]).unwrap();
+        fs::write(&path, b"publisher edit").unwrap();
+
+        let kept = vec!["usr/lib/libfoo.so".to_string()];
+        let conflicts = dispose_generated(&appdir, &root, &kept).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].refreshable);
+        assert!(
+            generated_conflict_error(&conflicts)
+                .to_string()
+                .contains("replaced"),
+            "the replacement is named"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"publisher edit");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A path-only legacy record is adopted when the file provably
+    /// equals the output the plan reproduces: the entry is judged like a
+    /// hashed one and the file goes, so the rebuild starts clean.
+    #[test]
+    fn a_legacy_record_adopts_a_file_the_plan_reproduces() {
+        let root = std::env::temp_dir().join(format!("onelf-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        let appdir = root.join("appdir");
+        fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
+        fs::create_dir_all(appdir.join("lib/.onelf")).unwrap();
+        fs::write(sysroot.join("usr/lib/libfoo.so"), b"same bytes").unwrap();
+        fs::write(appdir.join("lib/libfoo.so"), b"same bytes").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        fs::write(appdir.join(GENERATED_FILE), "lib/libfoo.so\n").unwrap();
+
+        let kept = vec!["usr/lib/libfoo.so".to_string()];
+        let conflicts = dispose_generated(&appdir, &sysroot, &kept).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(
+            !appdir.join("lib/libfoo.so").exists(),
+            "adopted, so it goes"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Without a hash and without an output the plan reproduces, a
+    /// legacy entry proves nothing: the file stays and the finding names
+    /// it, rather than guessing an unproven file safe to delete.
+    #[test]
+    fn a_legacy_record_without_provenance_is_kept_and_reported() {
+        let root = std::env::temp_dir().join(format!("onelf-unproven-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib/.onelf")).unwrap();
+        fs::write(appdir.join("lib/old.so"), b"something").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        fs::write(appdir.join(GENERATED_FILE), "lib/old.so\n").unwrap();
+
+        let held = hash_entry(&appdir.join("lib/old.so")).unwrap().unwrap();
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(
+            conflicts[0].why,
+            GeneratedConflict::Unproven { actual: held }
+        );
+        assert!(appdir.join("lib/old.so").is_file(), "the file stays");
+        assert!(appdir.join(GENERATED_FILE).is_file(), "nothing was mutated");
+        let text = generated_conflict_error(&conflicts).to_string();
+        assert!(text.contains("no hash"), "{text}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A legacy entry whose file matches nothing the plan writes is
+    /// not adopted, but the plan rewrites the path, so the file is
+    /// left for the copy to replace and nothing conflicts: the next
+    /// record names the build's own bytes, and the ledger has
+    /// migrated.
+    #[test]
+    fn a_mismatched_legacy_file_the_plan_writes_is_left_for_the_copy() {
+        let root = std::env::temp_dir().join(format!("onelf-legacyedit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        let appdir = root.join("appdir");
+        fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
+        fs::create_dir_all(appdir.join("lib/.onelf")).unwrap();
+        fs::write(sysroot.join("usr/lib/libfoo.so"), b"current output").unwrap();
+        fs::write(appdir.join("lib/libfoo.so"), b"something else").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        fs::write(appdir.join(GENERATED_FILE), "lib/libfoo.so\n").unwrap();
+
+        let kept = vec!["usr/lib/libfoo.so".to_string()];
+        let stale = appdir.join("lib/libfoo.so");
+        let conflicts = dispose_generated(&appdir, &sysroot, &kept).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(
+            fs::read(&stale).unwrap(),
+            b"something else",
+            "cleanup does not guess an unproven file safe to delete"
+        );
+
+        // The copy writes the path, and the record is taken anew.
+        fs::write(&stale, b"current output").unwrap();
+        record_generated(&appdir, vec!["lib/libfoo.so".to_string()]).unwrap();
+        let fresh = hash_entry(&stale).unwrap().unwrap();
+        assert_eq!(
+            read_generated(&appdir).unwrap(),
+            vec![GeneratedEntry {
+                path: "lib/libfoo.so".to_string(),
+                hash: Some(fresh),
+                pending: false,
+            }],
+            "the legacy path-only record has migrated to a hash"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The ledger round trips with hashes, parses the legacy path-only
+    /// form, and answers a malformed record with a bounded error instead
+    /// of a guess.
+    #[test]
+    fn the_ledger_round_trips_and_rejects_malformed_records() {
+        let root = std::env::temp_dir().join(format!("onelf-ledger-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(appdir.join("lib/a.so"), b"\x7fELFobject").unwrap();
+        std::os::unix::fs::symlink("a.so", appdir.join("lib/b.so")).unwrap();
+        record_generated(
+            &appdir,
+            vec!["lib/a.so".to_string(), "lib/b.so".to_string()],
+        )
+        .unwrap();
+        let link_hash = hash_entry(&appdir.join("lib/b.so")).unwrap().unwrap();
+        let a_hash = hash_entry(&appdir.join("lib/a.so")).unwrap().unwrap();
+        assert_eq!(
+            read_generated(&appdir).unwrap(),
+            vec![
+                GeneratedEntry {
+                    path: "lib/a.so".to_string(),
+                    hash: Some(a_hash),
+                    pending: true,
+                },
+                GeneratedEntry {
+                    path: "lib/b.so".to_string(),
+                    hash: Some(link_hash),
+                    pending: true,
+                },
+            ],
+            "an ELF object and the link onto it are pending the rewriting"
+        );
+        assert!(
+            appdir.join(GENERATED_FILE).is_file(),
+            "the record stays for the next build"
+        );
+
+        fs::write(appdir.join(GENERATED_FILE), "lib/a.so\nlib/b.so\n").unwrap();
+        assert_eq!(
+            read_generated(&appdir).unwrap(),
+            vec![
+                GeneratedEntry {
+                    path: "lib/a.so".to_string(),
+                    hash: None,
+                    pending: false,
+                },
+                GeneratedEntry {
+                    path: "lib/b.so".to_string(),
+                    hash: None,
+                    pending: false,
+                },
+            ],
+            "the legacy path-only form parses"
+        );
+
+        fs::write(
+            appdir.join(GENERATED_FILE),
+            format!("{GENERATED_LEDGER_HEADER}\nlib/a.so\n#nothex\n"),
+        )
+        .unwrap();
+        let err = read_generated(&appdir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("lib/a.so"), "{err}");
+
+        fs::write(
+            appdir.join(GENERATED_FILE),
+            format!("{GENERATED_LEDGER_HEADER}\n#0123456789abcdef\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_generated(&appdir).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a hash line with no path above it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A pending entry, one whose hash the build recorded before its
+    /// own ELF rewriting ran, attests nothing: a difference on disk is
+    /// excused, so an obsolete object the rewriting touched still goes
+    /// and one the plan still writes is left for the copy to replace,
+    /// never a false conflict over the build's own doing.
+    #[test]
+    fn a_pending_entry_is_excused_whatever_the_plan_decides() {
+        let appdir = |root: &Path| root.join("appdir");
+        let seed = |root: &Path| {
+            let appdir = appdir(root);
+            fs::create_dir_all(appdir.join("lib")).unwrap();
+            let object = appdir.join("lib/rewritten.so");
+            fs::write(&object, b"\x7fELFsource").unwrap();
+            record_generated(&appdir, vec!["lib/rewritten.so".to_string()]).unwrap();
+            fs::write(&object, b"\x7fELFrewritten").unwrap();
+            appdir
+        };
+
+        // Obsolete: nothing plans the path, so the excused object goes
+        // like any other generated output.
+        let root = std::env::temp_dir().join(format!("onelf-pending-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = seed(&root);
+        let object = appdir.join("lib/rewritten.so");
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(!object.exists(), "the excused object still goes");
+        let _ = fs::remove_dir_all(&root);
+
+        // Refreshable: the plan writes the path, so the file is left
+        // for the copy to replace and nothing conflicts.
+        let root = std::env::temp_dir().join(format!("onelf-pending-plan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = seed(&root);
+        let object = appdir.join("lib/rewritten.so");
+        let conflicts =
+            dispose_generated(&appdir, &root, &["lib/rewritten.so".to_string()]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(object.is_file(), "the plan replaces it, nothing else may");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Attesting after the rewriting pins the final bytes: from then on
+    /// a difference on disk is a publisher's edit and stops
+    /// publication, and the record carries the final hash for the next
+    /// build.
+    #[test]
+    fn attesting_pins_the_bytes_the_tree_now_holds() {
+        let root = std::env::temp_dir().join(format!("onelf-attest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        let object = appdir.join("lib/app.so");
+        fs::write(&object, b"\x7fELFsource").unwrap();
+        record_generated(&appdir, vec!["lib/app.so".to_string()]).unwrap();
+        assert!(
+            read_generated(&appdir).unwrap()[0].pending,
+            "pending at first"
+        );
+
+        fs::write(&object, b"\x7fELFrewritten").unwrap();
+        attest_generated(&appdir).unwrap();
+        let final_hash = hash_entry(&object).unwrap().unwrap();
+        assert_eq!(
+            read_generated(&appdir).unwrap(),
+            vec![GeneratedEntry {
+                path: "lib/app.so".to_string(),
+                hash: Some(final_hash),
+                pending: false,
+            }],
+            "the record now attests the rewritten bytes"
+        );
+
+        fs::write(&object, b"\x7fELFpublisher edit").unwrap();
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(fs::read(&object).unwrap(), b"\x7fELFpublisher edit");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The disposition is a pure function of the recorded and actual
+    /// hashes, shared with host assembly.
+    #[test]
+    fn the_disposition_is_decided_by_content() {
+        let recorded = blake3::hash(b"recorded");
+        let other = blake3::hash(b"other");
+        let entry = |hash: Option<blake3::Hash>, pending: bool| GeneratedEntry {
+            path: "lib/x.so".to_string(),
+            hash,
+            pending,
+        };
+        assert_eq!(
+            decide_generated_disposal(&entry(None, false), None),
+            Disposition::Absent
+        );
+        assert_eq!(
+            decide_generated_disposal(&entry(Some(recorded), false), None),
+            Disposition::Absent
+        );
+        assert_eq!(
+            decide_generated_disposal(&entry(Some(recorded), false), Some(recorded)),
+            Disposition::Dispose
+        );
+        assert_eq!(
+            decide_generated_disposal(&entry(Some(recorded), false), Some(other)),
+            Disposition::Conflict(GeneratedConflict::Edited {
+                recorded,
+                actual: other,
+            })
+        );
+        assert_eq!(
+            decide_generated_disposal(&entry(None, false), Some(other)),
+            Disposition::Conflict(GeneratedConflict::Unproven { actual: other })
+        );
+        // A pending entry attests nothing: its bytes may differ through
+        // the build's own rewriting, so the difference is excused.
+        assert_eq!(
+            decide_generated_disposal(&entry(Some(recorded), true), Some(recorded)),
+            Disposition::Dispose
+        );
+        assert_eq!(
+            decide_generated_disposal(&entry(Some(recorded), true), Some(other)),
+            Disposition::Excuse
+        );
+    }
+
+    /// The hash tags what a path holds, so a file swapped for a link of
+    /// the same text still differs, and a missing path hashes to
+    /// nothing.
+    #[test]
+    fn the_hash_tags_what_a_path_holds() {
+        let root = std::env::temp_dir().join(format!("onelf-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("dir")).unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"same text").unwrap();
+        std::os::unix::fs::symlink("file", root.join("link")).unwrap();
+
+        assert_eq!(hash_entry(&root.join("absent")).unwrap(), None);
+        let file_hash = hash_entry(&file).unwrap().unwrap();
+        let link_hash = hash_entry(&root.join("link")).unwrap().unwrap();
+        assert_ne!(link_hash, file_hash, "a link is not the file it names");
+        let dir_hash = hash_entry(&root.join("dir")).unwrap().unwrap();
+        assert_ne!(dir_hash, file_hash);
+        fs::write(root.join("other"), b"same text").unwrap();
+        assert_eq!(
+            hash_entry(&root.join("other")).unwrap().unwrap(),
+            file_hash,
+            "the same bytes hash the same"
+        );
+        std::os::unix::fs::symlink("file", root.join("link2")).unwrap();
+        assert_eq!(
+            hash_entry(&root.join("link2")).unwrap().unwrap(),
+            link_hash,
+            "the same target hashes the same"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A path recorded again is hashed anew, since the build just wrote
+    /// it; a path left from the previous record keeps its recorded hash,
+    /// so an edit made after that record still shows up next build.
+    #[test]
+    fn recording_again_refreshes_only_the_paths_named() {
+        let root = std::env::temp_dir().join(format!("onelf-rerecord-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(appdir.join("lib/a.so"), b"a1").unwrap();
+        fs::write(appdir.join("lib/b.so"), b"b1").unwrap();
+        record_generated(
+            &appdir,
+            vec!["lib/a.so".to_string(), "lib/b.so".to_string()],
+        )
+        .unwrap();
+        fs::write(appdir.join("lib/a.so"), b"a2").unwrap();
+        fs::write(appdir.join("lib/b.so"), b"b2").unwrap();
+        record_generated(&appdir, vec!["lib/a.so".to_string()]).unwrap();
+
+        let tagged = |bytes: &[u8]| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"file ");
+            hasher.update(bytes);
+            hasher.finalize()
+        };
+        let entries = read_generated(&appdir).unwrap();
+        assert_eq!(
+            entries[0].hash,
+            Some(tagged(b"a2")),
+            "the path named again is hashed anew"
+        );
+        assert_eq!(
+            entries[1].hash,
+            Some(tagged(b"b1")),
+            "the path left alone keeps its record"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
