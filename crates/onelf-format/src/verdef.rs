@@ -1,42 +1,30 @@
-//! Dynamic-section facts of a shared object: the versions it defines and
-//! the sonames it needs.
+//! Bounded ELF metadata inspection shared by the packer and runtime.
 //!
-//! A versioned library lists the versions it defines in its
-//! `SHT_GNU_verdef` section. Two copies of the same soname can be ordered
-//! by those sets: under symbol versioning a newer build only ever adds
-//! versions, so the copy whose set contains the other's can stand in for
-//! it. That ordering is what lets a host library and a bundled one be
-//! compared without running either.
-//!
-//! Only the sections involved are read, so a large library costs a few
-//! small reads rather than a whole-file parse. Every offset and count is
-//! checked against the file before it is used, since the host's libraries
-//! are not the package's to trust.
+//! Version-set ordering is a compatibility heuristic, not proof of ABI
+//! compatibility. Facts come from the inspected file, never the host platform.
+//! Only the relevant sections and program headers are read. Little-endian
+//! ELF32 and ELF64 are supported without a whole-file parser dependency.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// The versions a shared object defines, excluding the base version that
-/// only names the object itself.
+/// Versions defined by an object, excluding its base object-name version.
 pub type VersionSet = BTreeSet<String>;
 
 /// Which copy of a soname the version comparison chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    /// The host's copy defines every version the bundled one does, and
-    /// more.
+    /// The host defines every bundled version and additional versions.
     Host,
-    /// The bundled copy defines everything the host's does.
+    /// The bundle defines every host version, including equal sets.
     Bundle,
-    /// Each copy defines a version the other lacks. Reported so the
-    /// publisher can see it; the bundled copy is used.
+    /// Each copy defines a version the other lacks. Use the bundle.
     Incomparable,
 }
 
-/// Order two version sets. Equal sets and two empty sets choose the
-/// bundle, since nothing about the host copy is known to be better.
+/// Order version sets. Equal sets, including empty sets, choose the bundle.
 pub fn compare(bundle: &VersionSet, host: &VersionSet) -> Choice {
     if host.is_subset(bundle) {
         Choice::Bundle
@@ -47,32 +35,110 @@ pub fn compare(bundle: &VersionSet, host: &VersionSet) -> Choice {
     }
 }
 
+/// ELF address and word size. This is separate from the machine identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfClass {
+    /// ELFCLASS32.
+    Elf32,
+    /// ELFCLASS64.
+    Elf64,
+}
+
+/// Libc-family evidence in actual dependency names and the interpreter.
+///
+/// This name-based heuristic is not an ABI guarantee. In particular, an
+/// object with no libc dependency has unknown family, not universal compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibcFamily {
+    /// No recognized family evidence.
+    Unknown,
+    /// A glibc dependency or loader name was found.
+    Glibc,
+    /// A musl dependency or loader name was found.
+    Musl,
+    /// Both families were named. This must not be treated as compatible.
+    Conflicting,
+}
+
+/// A GNU version requirement associated with its `vn_file` dependency name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredVersion {
+    /// The required version's string-table name.
+    pub name: String,
+    /// The original GNU `vna_flags`, including `VER_FLG_WEAK` (bit 1).
+    pub flags: u16,
+}
+
+impl RequiredVersion {
+    /// Whether the loader treats this version requirement as weak.
+    /// Weak requirements must not be enforced like mandatory versions.
+    pub fn is_weak(&self) -> bool {
+        self.flags & 2 != 0
+    }
+}
+
+/// Metadata from one inspected ELF file. Missing versioning or SONAME is valid.
+///
+/// The basename alone does not imply export into a loader namespace. A provider
+/// index must classify its manifest path and verify any additional symlink aliases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElfFacts {
+    /// The ELF class, independent of the host architecture.
+    pub class: ElfClass,
+    /// The ELF `e_machine` value, such as 3, 62, or 183.
+    pub machine: u16,
+    /// `DT_SONAME`, if the object declares one.
+    pub soname: Option<String>,
+    /// Basename of the inspected path, without canonicalizing symlinks.
+    pub inspected_basename: String,
+    /// `DT_NEEDED` dependency names in dynamic-table order.
+    pub needed: Vec<String>,
+    /// Defined GNU versions, excluding the base object name.
+    pub defined_versions: VersionSet,
+    /// Required GNU versions keyed by their `vn_file` dependency name.
+    pub required_versions: BTreeMap<String, Vec<RequiredVersion>>,
+    /// The actual `PT_INTERP` string, if present.
+    pub interpreter: Option<String>,
+    /// Family inferred only from dependency and interpreter names.
+    pub libc_family: LibcFamily,
+}
+
+impl ElfFacts {
+    /// Known loader-name candidates: declared SONAME and inspected basename.
+    /// This does not discover filesystem aliases or establish namespace membership.
+    pub fn known_loader_names(&self) -> BTreeSet<&str> {
+        self.soname
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.inspected_basename.as_str()))
+            .collect()
+    }
+}
+
+const SHT_STRTAB: u32 = 3;
 const SHT_DYNAMIC: u32 = 6;
 const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
-const VER_FLG_BASE: u16 = 0x1;
+const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
+const VER_FLG_BASE: u16 = 1;
 const VERDEF_ENTRY: usize = 20;
 const VERDAUX_ENTRY: usize = 8;
 const DT_NULL: u64 = 0;
 const DT_NEEDED: u64 = 1;
-
-/// The section header table is bounded so a corrupt count cannot drive a
-/// large allocation; a real table is a few kilobytes.
-const MAX_SHDR_TABLE: usize = 1 << 20;
-/// A version definition or dynamic section is a few hundred bytes; a
-/// string table can be large in a library with many symbols.
+const DT_SONAME: u64 = 14;
+const DT_VERNEED: u64 = 0x6fff_fffe;
+const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
+const MAX_HEADER_TABLE: usize = 1 << 20;
 const MAX_SECTION: usize = 1 << 20;
 const MAX_STRTAB: usize = 64 << 20;
+const MAX_NAME: usize = 4096;
+const MAX_RECORDS: usize = 4096;
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// Read the version definitions of the shared object at `path`.
-///
-/// An object without a version definition section yields an empty set. A
-/// file that is not an ELF object, or whose tables point outside the file,
-/// is an error rather than an empty set, so the caller can tell "defines
-/// nothing" from "cannot be read".
+/// Read GNU version definitions. An unversioned object yields an empty set.
+/// Malformed metadata is an error, never evidence of compatibility.
 pub fn read(path: &Path) -> io::Result<VersionSet> {
     let mut object = Object::open(path)?;
     let Some((defs, strings)) = object.section_with_strings(SHT_GNU_VERDEF)? else {
@@ -81,50 +147,148 @@ pub fn read(path: &Path) -> io::Result<VersionSet> {
     parse_verdef(&defs, &strings)
 }
 
-/// Read the sonames the shared object at `path` needs, in table order.
-/// An object without a dynamic section needs nothing.
+/// Read dependency names in dynamic-table order. A static object needs nothing.
+/// Sectionless dynamic objects are unsupported and return `InvalidData`.
 pub fn read_needed(path: &Path) -> io::Result<Vec<String>> {
     let mut object = Object::open(path)?;
+    object.check_dynamic_coverage()?;
     let Some((dynamic, strings)) = object.section_with_strings(SHT_DYNAMIC)? else {
         return Ok(Vec::new());
     };
-    parse_needed(&dynamic, &strings, object.layout.class64)
+    Ok(parse_dynamic(&dynamic, &strings, object.layout.class64)?.needed)
 }
 
-/// An opened ELF object with its section header table loaded.
+/// Read bounded ELF facts without consulting the host or executing the object.
+///
+/// Relevant sections are limited to 1 MiB, string tables to 64 MiB, tables to
+/// 4096 decoded records and names to 4096 bytes. Header tables are each at most
+/// 1 MiB. Unsupported endian or extended numbering, sectionless `PT_DYNAMIC`,
+/// malformed links, truncated chains and out-of-file ranges return `InvalidData`.
+/// A sectionless static object is supported. No parse failure becomes empty facts.
+pub fn read_facts(path: &Path) -> io::Result<ElfFacts> {
+    let mut object = Object::open(path)?;
+    object.check_dynamic_coverage()?;
+    let dynamic = match object.section_with_strings(SHT_DYNAMIC)? {
+        Some((bytes, strings)) => parse_dynamic(&bytes, &strings, object.layout.class64)?,
+        None => Dynamic::default(),
+    };
+    let defined_versions = match object.section_with_strings(SHT_GNU_VERDEF)? {
+        Some((bytes, strings)) => parse_verdef(&bytes, &strings)?,
+        None => VersionSet::new(),
+    };
+    let requirements = object.section_with_strings(SHT_GNU_VERNEED)?;
+    if dynamic.verneed.is_some() && requirements.is_none() {
+        return Err(invalid("dynamic version requirements have no section"));
+    }
+    let required_versions = match requirements {
+        Some((bytes, strings)) => {
+            let (versions, count) = parse_verneed(&bytes, &strings, &dynamic.needed)?;
+            if dynamic.verneed_num.is_some_and(|n| n != count as u64) {
+                return Err(invalid(
+                    "dynamic version requirement count disagrees with section",
+                ));
+            }
+            let section = object
+                .layout
+                .find_section(&object.table, SHT_GNU_VERNEED)?
+                .unwrap();
+            if dynamic
+                .verneed
+                .is_some_and(|address| address != section.address)
+            {
+                return Err(invalid(
+                    "dynamic version requirement address disagrees with section",
+                ));
+            }
+            if section.info != count {
+                return Err(invalid(
+                    "version requirement section count disagrees with chain",
+                ));
+            }
+            versions
+        }
+        None => {
+            if dynamic.verneed_num.is_some_and(|n| n != 0) {
+                return Err(invalid("version requirement count has no section"));
+            }
+            BTreeMap::new()
+        }
+    };
+    let interpreter = object.interpreter()?;
+    let libc_family = infer_libc(&dynamic.needed, interpreter.as_deref());
+    let inspected_basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("inspected basename is not UTF-8"))?;
+    if inspected_basename.len() > MAX_NAME {
+        return Err(invalid("inspected basename is too long"));
+    }
+    Ok(ElfFacts {
+        class: if object.layout.class64 {
+            ElfClass::Elf64
+        } else {
+            ElfClass::Elf32
+        },
+        machine: object.layout.machine,
+        soname: dynamic.soname,
+        inspected_basename: inspected_basename.to_owned(),
+        needed: dynamic.needed,
+        defined_versions,
+        required_versions,
+        interpreter,
+        libc_family,
+    })
+}
+
+fn infer_libc(needed: &[String], interpreter: Option<&str>) -> LibcFamily {
+    let mut glibc = false;
+    let mut musl = false;
+    for name in needed.iter().map(String::as_str).chain(interpreter) {
+        let name = match name.rsplit_once('/') {
+            Some((_, base)) => base,
+            None => name,
+        };
+        glibc |= name == "libc.so.6"
+            || name.starts_with("ld-linux")
+            || name == "ld64.so.1"
+            || name == "ld64.so.2";
+        musl |= name.starts_with("libc.musl-") || name.starts_with("ld-musl-");
+    }
+    match (glibc, musl) {
+        (true, false) => LibcFamily::Glibc,
+        (false, true) => LibcFamily::Musl,
+        (true, true) => LibcFamily::Conflicting,
+        (false, false) => LibcFamily::Unknown,
+    }
+}
+
 struct Object {
     file: File,
     file_len: u64,
     layout: Layout,
     table: Vec<u8>,
+    programs: Vec<u8>,
 }
 
 impl Object {
     fn open(path: &Path) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
-        let mut header = [0u8; 64];
-        let n = file.read(&mut header)?;
-        let layout = Layout::parse(&header[..n])?;
-
-        let table_len = layout
-            .shnum
-            .checked_mul(layout.shentsize)
-            .ok_or_else(|| invalid("section header table overflows"))?;
-        if table_len > MAX_SHDR_TABLE {
-            return Err(invalid("section header table is implausibly large"));
-        }
+        let header = read_at(&mut file, file_len, 0, file_len.min(64) as usize)?;
+        let layout = Layout::parse(&header)?;
+        let table_len = bounded_table(layout.shnum, layout.shentsize)?;
         let table = read_at(&mut file, file_len, layout.shoff, table_len)?;
-        Ok(Object {
+        let program_len = bounded_table(layout.phnum, layout.phentsize)?;
+        let programs = read_at(&mut file, file_len, layout.phoff, program_len)?;
+        Ok(Self {
             file,
             file_len,
             layout,
             table,
+            programs,
         })
     }
 
-    /// The first section of type `kind` and the string table it links to,
-    /// or `None` when the object has no such section.
     fn section_with_strings(&mut self, kind: u32) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
         let Some(section) = self.layout.find_section(&self.table, kind)? else {
             return Ok(None);
@@ -133,6 +297,9 @@ impl Object {
             return Err(invalid("section is implausibly large"));
         }
         let strtab = self.layout.section(&self.table, section.link)?;
+        if strtab.kind != SHT_STRTAB {
+            return Err(invalid("linked section is not a string table"));
+        }
         if strtab.size > MAX_STRTAB {
             return Err(invalid("string table is implausibly large"));
         }
@@ -140,174 +307,402 @@ impl Object {
         let strings = read_at(&mut self.file, self.file_len, strtab.offset, strtab.size)?;
         Ok(Some((body, strings)))
     }
+
+    fn check_dynamic_coverage(&self) -> io::Result<()> {
+        let mut found = false;
+        for entry in self.programs.chunks_exact(self.layout.phentsize.max(1)) {
+            if u32_at(entry, 0) != 2 {
+                continue;
+            }
+            if found {
+                return Err(invalid("multiple dynamic program headers"));
+            }
+            found = true;
+            let section = self
+                .layout
+                .find_section(&self.table, SHT_DYNAMIC)?
+                .ok_or_else(|| invalid("PT_DYNAMIC without a dynamic section is unsupported"))?;
+            let (offset, size) = if self.layout.class64 {
+                (u64_at(entry, 8), u64_at(entry, 32))
+            } else {
+                (u32_at(entry, 4) as u64, u32_at(entry, 16) as u64)
+            };
+            if offset != section.offset || size != section.size as u64 {
+                return Err(invalid("dynamic program header disagrees with section"));
+            }
+        }
+        Ok(())
+    }
+
+    fn interpreter(&mut self) -> io::Result<Option<String>> {
+        let mut out = None;
+        for entry in self.programs.chunks_exact(self.layout.phentsize.max(1)) {
+            if u32_at(entry, 0) != 3 {
+                continue;
+            }
+            if out.is_some() {
+                return Err(invalid("multiple ELF interpreters"));
+            }
+            let (offset, size) = if self.layout.class64 {
+                (u64_at(entry, 8), u64_at(entry, 32))
+            } else {
+                (u32_at(entry, 4) as u64, u32_at(entry, 16) as u64)
+            };
+            if size == 0 || size > MAX_NAME as u64 {
+                return Err(invalid("invalid interpreter length"));
+            }
+            let bytes = read_at(&mut self.file, self.file_len, offset, size as usize)?;
+            if bytes.last() != Some(&0) || bytes[..bytes.len() - 1].contains(&0) {
+                return Err(invalid("interpreter is not a terminated path"));
+            }
+            out = Some(string_at(&bytes, 0)?);
+        }
+        Ok(out)
+    }
 }
 
-/// Read `len` bytes at `offset`, refusing before the read if the range does
-/// not fit the file.
+fn bounded_table(count: usize, stride: usize) -> io::Result<usize> {
+    let len = count
+        .checked_mul(stride)
+        .ok_or_else(|| invalid("ELF table length overflows"))?;
+    if len > MAX_HEADER_TABLE {
+        return Err(invalid("ELF header table is implausibly large"));
+    }
+    Ok(len)
+}
+
 fn read_at(file: &mut File, file_len: u64, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let end = offset
         .checked_add(len as u64)
-        .ok_or_else(|| invalid("section range overflows"))?;
+        .ok_or_else(|| invalid("ELF range overflows"))?;
     if end > file_len {
-        return Err(invalid("section lies outside the file"));
+        return Err(invalid("ELF range lies outside the file"));
     }
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            invalid("ELF data was truncated while reading")
+        } else {
+            e
+        }
+    })?;
     Ok(buf)
 }
 
-struct Section {
-    offset: u64,
-    size: usize,
-    link: usize,
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+}
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
-/// Where the section header table sits and how its entries are laid out,
-/// for the ELF class of the file.
+struct Section {
+    kind: u32,
+    offset: u64,
+    address: u64,
+    size: usize,
+    link: usize,
+    info: usize,
+}
+
 struct Layout {
     class64: bool,
+    machine: u16,
     shoff: u64,
     shentsize: usize,
     shnum: usize,
+    phoff: u64,
+    phentsize: usize,
+    phnum: usize,
 }
 
 impl Layout {
     fn parse(header: &[u8]) -> io::Result<Self> {
-        if header.len() < 64 || header[0..4] != *b"\x7fELF" {
+        if header.len() < 16 || header[..4] != *b"\x7fELF" {
             return Err(invalid("not an ELF object"));
         }
         if header[5] != 1 {
             return Err(invalid("big-endian ELF is not supported"));
         }
-        let layout = match header[4] {
-            2 => Layout {
-                class64: true,
-                shoff: u64::from_le_bytes(header[40..48].try_into().unwrap()),
-                shentsize: u16::from_le_bytes(header[58..60].try_into().unwrap()) as usize,
-                shnum: u16::from_le_bytes(header[60..62].try_into().unwrap()) as usize,
-            },
-            1 => Layout {
-                class64: false,
-                shoff: u32::from_le_bytes(header[32..36].try_into().unwrap()) as u64,
-                shentsize: u16::from_le_bytes(header[46..48].try_into().unwrap()) as usize,
-                shnum: u16::from_le_bytes(header[48..50].try_into().unwrap()) as usize,
-            },
+        let class64 = match header[4] {
+            1 => false,
+            2 => true,
             _ => return Err(invalid("unknown ELF class")),
         };
-        let min_entry = if layout.class64 { 64 } else { 40 };
-        if layout.shnum > 0 && layout.shentsize < min_entry {
-            return Err(invalid("section header entries are too small"));
+        if header.len() < if class64 { 64 } else { 52 } {
+            return Err(invalid("truncated ELF header"));
+        }
+        let layout = if class64 {
+            Self {
+                class64,
+                machine: u16_at(header, 18),
+                shoff: u64_at(header, 40),
+                shentsize: u16_at(header, 58) as usize,
+                shnum: u16_at(header, 60) as usize,
+                phoff: u64_at(header, 32),
+                phentsize: u16_at(header, 54) as usize,
+                phnum: u16_at(header, 56) as usize,
+            }
+        } else {
+            Self {
+                class64,
+                machine: u16_at(header, 18),
+                shoff: u32_at(header, 32) as u64,
+                shentsize: u16_at(header, 46) as usize,
+                shnum: u16_at(header, 48) as usize,
+                phoff: u32_at(header, 28) as u64,
+                phentsize: u16_at(header, 42) as usize,
+                phnum: u16_at(header, 44) as usize,
+            }
+        };
+        if (layout.shnum == 0 && layout.shoff != 0) || layout.phnum == 0xffff {
+            return Err(invalid("extended ELF table numbering is unsupported"));
+        }
+        if layout.shnum > 0
+            && (layout.shoff == 0 || layout.shentsize < if class64 { 64 } else { 40 })
+        {
+            return Err(invalid("invalid section header layout"));
+        }
+        if layout.phnum > 0
+            && (layout.phoff == 0 || layout.phentsize < if class64 { 56 } else { 32 })
+        {
+            return Err(invalid("invalid program header layout"));
         }
         Ok(layout)
     }
 
     fn section(&self, table: &[u8], index: usize) -> io::Result<Section> {
+        if index >= self.shnum {
+            return Err(invalid("section index outside the table"));
+        }
         let start = index
             .checked_mul(self.shentsize)
             .ok_or_else(|| invalid("section index overflows"))?;
+        let end = start
+            .checked_add(self.shentsize)
+            .ok_or_else(|| invalid("section range overflows"))?;
         let entry = table
-            .get(start..start + self.shentsize)
-            .ok_or_else(|| invalid("section index outside the table"))?;
-        let (offset, size, link) = if self.class64 {
+            .get(start..end)
+            .ok_or_else(|| invalid("section outside the table"))?;
+        let (offset, size, link, info) = if self.class64 {
             (
-                u64::from_le_bytes(entry[24..32].try_into().unwrap()),
-                u64::from_le_bytes(entry[32..40].try_into().unwrap()),
-                u32::from_le_bytes(entry[40..44].try_into().unwrap()),
+                u64_at(entry, 24),
+                u64_at(entry, 32),
+                u32_at(entry, 40),
+                u32_at(entry, 44),
             )
         } else {
             (
-                u32::from_le_bytes(entry[16..20].try_into().unwrap()) as u64,
-                u32::from_le_bytes(entry[20..24].try_into().unwrap()) as u64,
-                u32::from_le_bytes(entry[24..28].try_into().unwrap()),
+                u32_at(entry, 16) as u64,
+                u32_at(entry, 20) as u64,
+                u32_at(entry, 24),
+                u32_at(entry, 28),
             )
         };
-        let size = usize::try_from(size).map_err(|_| invalid("section size overflows"))?;
         Ok(Section {
+            kind: u32_at(entry, 4),
             offset,
-            size,
+            address: if self.class64 {
+                u64_at(entry, 16)
+            } else {
+                u32_at(entry, 12) as u64
+            },
+            size: usize::try_from(size).map_err(|_| invalid("section size overflows"))?,
             link: link as usize,
+            info: info as usize,
         })
     }
 
     fn find_section(&self, table: &[u8], kind: u32) -> io::Result<Option<Section>> {
+        let mut found = None;
         for i in 0..self.shnum {
-            let start = i * self.shentsize;
-            let entry = &table[start..start + self.shentsize];
-            let sh_type = u32::from_le_bytes(entry[4..8].try_into().unwrap());
-            if sh_type == kind {
-                return self.section(table, i).map(Some);
+            let section = self.section(table, i)?;
+            if section.kind == kind {
+                if found.is_some() {
+                    return Err(invalid("duplicate ELF metadata section"));
+                }
+                found = Some(section);
             }
         }
-        Ok(None)
+        Ok(found)
     }
 }
 
-/// Walk the `Elf_Verdef` chain in `defs`, taking each definition's first
-/// `Elf_Verdaux` as its name.
+fn record(bytes: &[u8], pos: usize, len: usize) -> io::Result<&[u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| invalid("ELF record range overflows"))?;
+    bytes
+        .get(pos..end)
+        .ok_or_else(|| invalid("ELF record outside its section"))
+}
+
+fn advance(pos: usize, delta: usize, minimum: usize) -> io::Result<usize> {
+    if delta < minimum {
+        return Err(invalid("ELF chain overlaps or cycles"));
+    }
+    pos.checked_add(delta)
+        .ok_or_else(|| invalid("ELF chain overflows"))
+}
+
 fn parse_verdef(defs: &[u8], strings: &[u8]) -> io::Result<VersionSet> {
     let mut out = VersionSet::new();
     if defs.is_empty() {
         return Ok(out);
     }
-    let mut pos = 0usize;
-    // A chain cannot legitimately have more links than fit in the section;
-    // a corrupt one that never reaches zero is cut here.
-    for _ in 0..=defs.len() / VERDEF_ENTRY {
-        let entry = defs
-            .get(pos..pos + VERDEF_ENTRY)
-            .ok_or_else(|| invalid("version definition outside its section"))?;
-        let flags = u16::from_le_bytes(entry[2..4].try_into().unwrap());
-        let aux = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
-        let next = u32::from_le_bytes(entry[16..20].try_into().unwrap()) as usize;
-
-        if flags & VER_FLG_BASE == 0 {
-            let aux_at = pos
-                .checked_add(aux)
-                .ok_or_else(|| invalid("version auxiliary offset overflows"))?;
-            let vda = defs
-                .get(aux_at..aux_at + VERDAUX_ENTRY)
-                .ok_or_else(|| invalid("version name entry outside its section"))?;
-            let name_at = u32::from_le_bytes(vda[0..4].try_into().unwrap()) as usize;
-            out.insert(string_at(strings, name_at)?);
+    let mut pos = 0;
+    let mut total_aux = 0usize;
+    for _ in 0..MAX_RECORDS {
+        let entry = record(defs, pos, VERDEF_ENTRY)?;
+        if u16_at(entry, 0) != 1 {
+            return Err(invalid("unsupported version definition format"));
         }
-
+        let count = u16_at(entry, 6) as usize;
+        total_aux += count;
+        if count == 0 || total_aux > MAX_RECORDS {
+            return Err(invalid("invalid version definition auxiliary count"));
+        }
+        let mut aux_at = advance(pos, u32_at(entry, 12) as usize, VERDEF_ENTRY)?;
+        for i in 0..count {
+            let aux = record(defs, aux_at, VERDAUX_ENTRY)?;
+            let name = string_at(strings, u32_at(aux, 0) as usize)?;
+            if i == 0 && u16_at(entry, 2) & VER_FLG_BASE == 0 {
+                out.insert(name);
+            }
+            let next = u32_at(aux, 4) as usize;
+            if i + 1 == count {
+                if next != 0 {
+                    return Err(invalid(
+                        "version definition auxiliary count disagrees with chain",
+                    ));
+                }
+            } else {
+                aux_at = advance(aux_at, next, VERDAUX_ENTRY)?;
+            }
+        }
+        let next = u32_at(entry, 16) as usize;
         if next == 0 {
             return Ok(out);
         }
-        pos = pos
-            .checked_add(next)
-            .ok_or_else(|| invalid("version definition chain overflows"))?;
+        pos = advance(pos, next, aux_at - pos + VERDAUX_ENTRY)?;
     }
-    Err(invalid("version definition chain does not terminate"))
+    Err(invalid("too many version definitions"))
 }
 
-/// Collect the `DT_NEEDED` entries of a dynamic section.
-fn parse_needed(dynamic: &[u8], strings: &[u8], class64: bool) -> io::Result<Vec<String>> {
-    let entry_len = if class64 { 16 } else { 8 };
-    let mut out = Vec::new();
-    for entry in dynamic.chunks_exact(entry_len) {
+#[derive(Default)]
+struct Dynamic {
+    needed: Vec<String>,
+    soname: Option<String>,
+    verneed: Option<u64>,
+    verneed_num: Option<u64>,
+}
+
+fn parse_dynamic(dynamic: &[u8], strings: &[u8], class64: bool) -> io::Result<Dynamic> {
+    let stride = if class64 { 16 } else { 8 };
+    if !dynamic.len().is_multiple_of(stride) {
+        return Err(invalid("truncated dynamic entry"));
+    }
+    let mut out = Dynamic::default();
+    for (i, entry) in dynamic.chunks_exact(stride).enumerate() {
+        if i >= MAX_RECORDS {
+            return Err(invalid("too many dynamic entries"));
+        }
         let (tag, value) = if class64 {
-            (
-                u64::from_le_bytes(entry[0..8].try_into().unwrap()),
-                u64::from_le_bytes(entry[8..16].try_into().unwrap()),
-            )
+            (u64_at(entry, 0), u64_at(entry, 8))
         } else {
-            (
-                u32::from_le_bytes(entry[0..4].try_into().unwrap()) as u64,
-                u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64,
-            )
+            (u32_at(entry, 0) as u64, u32_at(entry, 4) as u64)
         };
         match tag {
-            DT_NULL => break,
-            DT_NEEDED => {
-                let at = usize::try_from(value).map_err(|_| invalid("needed name overflows"))?;
-                out.push(string_at(strings, at)?);
+            DT_NULL => return Ok(out),
+            DT_NEEDED | DT_SONAME => {
+                let name = string_at(
+                    strings,
+                    usize::try_from(value).map_err(|_| invalid("dynamic name offset overflows"))?,
+                )?;
+                if name.is_empty() {
+                    return Err(invalid("empty dynamic loader name"));
+                }
+                if tag == DT_NEEDED {
+                    out.needed.push(name);
+                } else if out.soname.replace(name).is_some() {
+                    return Err(invalid("duplicate SONAME"));
+                }
+            }
+            DT_VERNEED if out.verneed.replace(value).is_some() => {
+                return Err(invalid("duplicate version requirement address"));
+            }
+            DT_VERNEEDNUM if out.verneed_num.replace(value).is_some() => {
+                return Err(invalid("duplicate version requirement count"));
             }
             _ => {}
         }
     }
-    Ok(out)
+    Err(invalid("dynamic section has no terminator"))
+}
+
+fn parse_verneed(
+    bytes: &[u8],
+    strings: &[u8],
+    needed: &[String],
+) -> io::Result<(BTreeMap<String, Vec<RequiredVersion>>, usize)> {
+    let mut out = BTreeMap::new();
+    if bytes.is_empty() {
+        return Ok((out, 0));
+    }
+    let mut pos = 0;
+    let mut total_aux = 0usize;
+    for count in 1..=MAX_RECORDS {
+        let entry = record(bytes, pos, 16)?;
+        if u16_at(entry, 0) != 1 {
+            return Err(invalid("unsupported version requirement format"));
+        }
+        let name = string_at(strings, u32_at(entry, 4) as usize)?;
+        if !needed.contains(&name) {
+            return Err(invalid(
+                "version requirement does not name a needed dependency",
+            ));
+        }
+        let aux_count = u16_at(entry, 2) as usize;
+        total_aux = total_aux
+            .checked_add(aux_count)
+            .ok_or_else(|| invalid("version requirement count overflows"))?;
+        if aux_count == 0 || total_aux > MAX_RECORDS {
+            return Err(invalid("invalid version requirement auxiliary count"));
+        }
+        let versions = out.entry(name).or_insert_with(Vec::new);
+        let mut aux_at = advance(pos, u32_at(entry, 8) as usize, 16)?;
+        for i in 0..aux_count {
+            let aux = record(bytes, aux_at, 16)?;
+            let name = string_at(strings, u32_at(aux, 8) as usize)?;
+            if name.is_empty() {
+                return Err(invalid("empty required version name"));
+            }
+            versions.push(RequiredVersion {
+                name,
+                flags: u16_at(aux, 4),
+            });
+            let next = u32_at(aux, 12) as usize;
+            if i + 1 == aux_count {
+                if next != 0 {
+                    return Err(invalid(
+                        "version requirement auxiliary count disagrees with chain",
+                    ));
+                }
+            } else {
+                aux_at = advance(aux_at, next, 16)?;
+            }
+        }
+        let next = u32_at(entry, 12) as usize;
+        if next == 0 {
+            return Ok((out, count));
+        }
+        pos = advance(pos, next, aux_at - pos + 16)?;
+    }
+    Err(invalid("too many version requirements"))
 }
 
 fn string_at(strings: &[u8], at: usize) -> io::Result<String> {
@@ -316,13 +711,13 @@ fn string_at(strings: &[u8], at: usize) -> io::Result<String> {
         .ok_or_else(|| invalid("name outside the string table"))?;
     let end = rest
         .iter()
+        .take(MAX_NAME + 1)
         .position(|&b| b == 0)
-        .ok_or_else(|| invalid("name is not terminated"))?;
+        .ok_or_else(|| invalid("name is unterminated or exceeds 4096 bytes"))?;
     std::str::from_utf8(&rest[..end])
         .map(String::from)
         .map_err(|_| invalid("name is not UTF-8"))
 }
-
 /// Builders for synthetic shared objects, shared with the resolver's tests.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -587,5 +982,397 @@ mod tests {
             needed.iter().any(|n| n.starts_with("ld-linux")),
             "{needed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::fixture::{shared_object, shared_object_with_interp, temp_dir};
+    use super::*;
+
+    struct Fixture {
+        bytes: Vec<u8>,
+        shoff: usize,
+        shstride: usize,
+        dynamic_at: usize,
+        requirements_at: usize,
+    }
+
+    fn intern(strings: &mut Vec<u8>, name: &str) -> u32 {
+        let offset = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        offset
+    }
+
+    fn facts_elf(
+        class64: bool,
+        machine: u16,
+        soname: Option<&str>,
+        needed: &[&str],
+        requirements: &[(&str, &[(u16, &str)])],
+    ) -> Fixture {
+        let mut strings = vec![0];
+        let mut dynamic = Vec::new();
+        let mut dyn_entry = |tag: u64, value: u64| {
+            if class64 {
+                dynamic.extend_from_slice(&tag.to_le_bytes());
+                dynamic.extend_from_slice(&value.to_le_bytes());
+            } else {
+                dynamic.extend_from_slice(&(tag as u32).to_le_bytes());
+                dynamic.extend_from_slice(&(value as u32).to_le_bytes());
+            }
+        };
+        for name in needed {
+            dyn_entry(DT_NEEDED, intern(&mut strings, name) as u64);
+        }
+        if let Some(name) = soname {
+            dyn_entry(DT_SONAME, intern(&mut strings, name) as u64);
+        }
+        if !requirements.is_empty() {
+            dyn_entry(DT_VERNEED, 0x5000);
+            dyn_entry(DT_VERNEEDNUM, requirements.len() as u64);
+        }
+        dyn_entry(DT_NULL, 0);
+        let mut verneed = Vec::new();
+        for (i, (file, versions)) in requirements.iter().enumerate() {
+            let start = verneed.len();
+            let size = 16 + 16 * versions.len();
+            verneed.resize(start + size, 0);
+            verneed[start..start + 2].copy_from_slice(&1u16.to_le_bytes());
+            verneed[start + 2..start + 4].copy_from_slice(&(versions.len() as u16).to_le_bytes());
+            verneed[start + 4..start + 8]
+                .copy_from_slice(&intern(&mut strings, file).to_le_bytes());
+            verneed[start + 8..start + 12].copy_from_slice(&16u32.to_le_bytes());
+            if i + 1 < requirements.len() {
+                verneed[start + 12..start + 16].copy_from_slice(&(size as u32).to_le_bytes());
+            }
+            for (j, (flags, name)) in versions.iter().enumerate() {
+                let at = start + 16 + j * 16;
+                verneed[at + 4..at + 6].copy_from_slice(&flags.to_le_bytes());
+                verneed[at + 6..at + 8].copy_from_slice(&((j + 2) as u16).to_le_bytes());
+                verneed[at + 8..at + 12].copy_from_slice(&intern(&mut strings, name).to_le_bytes());
+                if j + 1 < versions.len() {
+                    verneed[at + 12..at + 16].copy_from_slice(&16u32.to_le_bytes());
+                }
+            }
+        }
+        let shoff = if class64 { 64 } else { 52 };
+        let shstride = if class64 { 64 } else { 40 };
+        let strings_at = shoff + 4 * shstride;
+        let dynamic_at = strings_at + strings.len();
+        let requirements_at = dynamic_at + dynamic.len();
+        let mut bytes = vec![0; requirements_at + verneed.len()];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = if class64 { 2 } else { 1 };
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        if class64 {
+            bytes[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+            bytes[58..60].copy_from_slice(&(shstride as u16).to_le_bytes());
+            bytes[60..62].copy_from_slice(&4u16.to_le_bytes());
+        } else {
+            bytes[32..36].copy_from_slice(&(shoff as u32).to_le_bytes());
+            bytes[46..48].copy_from_slice(&(shstride as u16).to_le_bytes());
+            bytes[48..50].copy_from_slice(&4u16.to_le_bytes());
+        }
+        for (i, kind, offset, size, address, link, info) in [
+            (1, SHT_STRTAB, strings_at, strings.len(), 0, 0, 0),
+            (2, SHT_DYNAMIC, dynamic_at, dynamic.len(), 0, 1, 0),
+            (
+                3,
+                SHT_GNU_VERNEED,
+                requirements_at,
+                verneed.len(),
+                0x5000,
+                1,
+                requirements.len(),
+            ),
+        ] {
+            let at = shoff + i * shstride;
+            bytes[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
+            if class64 {
+                bytes[at + 16..at + 24].copy_from_slice(&(address as u64).to_le_bytes());
+                bytes[at + 24..at + 32].copy_from_slice(&(offset as u64).to_le_bytes());
+                bytes[at + 32..at + 40].copy_from_slice(&(size as u64).to_le_bytes());
+                bytes[at + 40..at + 44].copy_from_slice(&(link as u32).to_le_bytes());
+                bytes[at + 44..at + 48].copy_from_slice(&(info as u32).to_le_bytes());
+            } else {
+                bytes[at + 12..at + 16].copy_from_slice(&(address as u32).to_le_bytes());
+                bytes[at + 16..at + 20].copy_from_slice(&(offset as u32).to_le_bytes());
+                bytes[at + 20..at + 24].copy_from_slice(&(size as u32).to_le_bytes());
+                bytes[at + 24..at + 28].copy_from_slice(&(link as u32).to_le_bytes());
+                bytes[at + 28..at + 32].copy_from_slice(&(info as u32).to_le_bytes());
+            }
+        }
+        bytes[strings_at..dynamic_at].copy_from_slice(&strings);
+        bytes[dynamic_at..requirements_at].copy_from_slice(&dynamic);
+        bytes[requirements_at..].copy_from_slice(&verneed);
+        Fixture {
+            bytes,
+            shoff,
+            shstride,
+            dynamic_at,
+            requirements_at,
+        }
+    }
+
+    fn inspect(bytes: &[u8]) -> io::Result<ElfFacts> {
+        let dir = temp_dir("elf-facts");
+        let path = dir.join("libalias.so");
+        std::fs::write(&path, bytes).unwrap();
+        let result = read_facts(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    fn assert_invalid(bytes: &[u8]) {
+        assert_eq!(
+            inspect(bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn class_machine_soname_and_known_alias_are_file_facts() {
+        for (class64, machine, class) in [
+            (false, 3, ElfClass::Elf32),
+            (true, 62, ElfClass::Elf64),
+            (true, 183, ElfClass::Elf64),
+        ] {
+            let fixture = facts_elf(class64, machine, Some("libreal.so.1"), &["libc.so.6"], &[]);
+            let facts = inspect(&fixture.bytes).unwrap();
+            assert_eq!(facts.class, class);
+            assert_eq!(facts.machine, machine);
+            assert_eq!(facts.soname.as_deref(), Some("libreal.so.1"));
+            assert_eq!(
+                facts.known_loader_names(),
+                BTreeSet::from(["libalias.so", "libreal.so.1"])
+            );
+            assert_eq!(facts.libc_family, LibcFamily::Glibc);
+            assert!(facts.required_versions.is_empty());
+        }
+    }
+
+    #[test]
+    fn requirements_keep_dependency_relationships_and_weak_flags() {
+        for class64 in [false, true] {
+            let fixture = facts_elf(
+                class64,
+                3,
+                None,
+                &["libc.so.6", "libfoo.so"],
+                &[
+                    ("libc.so.6", &[(0, "GLIBC_2.17"), (2, "GLIBC_2.34")]),
+                    ("libfoo.so", &[(0x82, "FOO_OPTIONAL"), (0, "FOO_1")]),
+                ],
+            );
+            let facts = inspect(&fixture.bytes).unwrap();
+            assert_eq!(facts.needed, ["libc.so.6", "libfoo.so"]);
+            assert_eq!(facts.required_versions.len(), 2);
+            let libc = &facts.required_versions["libc.so.6"];
+            assert_eq!(libc[0].name, "GLIBC_2.17");
+            assert!(!libc[0].is_weak());
+            assert_eq!(libc[1].name, "GLIBC_2.34");
+            assert!(libc[1].is_weak());
+            assert_eq!(facts.required_versions["libfoo.so"][0].flags, 0x82);
+            assert!(facts.required_versions["libfoo.so"][0].is_weak());
+            assert_eq!(facts.soname, None);
+        }
+    }
+
+    #[test]
+    fn unversioned_and_static_old_objects_are_not_host_classified() {
+        let facts = inspect(&shared_object(&[], &[])).unwrap();
+        assert!(facts.defined_versions.is_empty());
+        assert!(facts.required_versions.is_empty());
+        assert_eq!(facts.libc_family, LibcFamily::Unknown);
+        for (length, class, expected) in [(52, 1, ElfClass::Elf32), (64, 2, ElfClass::Elf64)] {
+            let mut bytes = vec![0; length];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = class;
+            bytes[5] = 1;
+            let facts = inspect(&bytes).unwrap();
+            assert_eq!(facts.class, expected);
+            assert!(facts.needed.is_empty());
+            assert_eq!(facts.libc_family, LibcFamily::Unknown);
+        }
+        let facts = inspect(&shared_object(&[(0, "FOO_1")], &[])).unwrap();
+        assert_eq!(
+            facts.defined_versions,
+            BTreeSet::from(["FOO_1".to_string()])
+        );
+    }
+
+    #[test]
+    fn libc_family_uses_actual_dependencies_and_interpreter() {
+        for (needed, interp, expected) in [
+            (vec![], Some("/lib/ld-musl-x86_64.so.1"), LibcFamily::Musl),
+            (vec!["libc.musl-aarch64.so.1"], None, LibcFamily::Musl),
+            (
+                vec![],
+                Some("/lib64/ld-linux-x86-64.so.2"),
+                LibcFamily::Glibc,
+            ),
+            (
+                vec!["libc.so.6"],
+                Some("/lib/ld-musl-i386.so.1"),
+                LibcFamily::Conflicting,
+            ),
+            (
+                vec!["libfoo.so"],
+                Some("/custom/loader"),
+                LibcFamily::Unknown,
+            ),
+        ] {
+            let facts = inspect(&shared_object_with_interp(&[], &needed, interp)).unwrap();
+            assert_eq!(facts.interpreter.as_deref(), interp);
+            assert_eq!(facts.libc_family, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_version_requirements_fail_instead_of_becoming_empty() {
+        let fixture = facts_elf(
+            true,
+            62,
+            None,
+            &["libc.so.6"],
+            &[("libc.so.6", &[(0, "GLIBC_2.17"), (2, "GLIBC_2.34")])],
+        );
+        let at = fixture.requirements_at;
+        for (offset, value) in [
+            (at + 4, u32::MAX),
+            (at + 8, 0),
+            (at + 8, u32::MAX),
+            (at + 12, 1),
+            (at + 12, u32::MAX),
+            (at + 16 + 8, u32::MAX),
+            (at + 16 + 12, 0),
+            (at + 16 + 12, 1),
+            (at + 32 + 12, 16),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_invalid(&bytes);
+        }
+        let mut bytes = fixture.bytes.clone();
+        bytes[at + 2..at + 4].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert_invalid(&bytes);
+        let unrelated = facts_elf(
+            true,
+            62,
+            None,
+            &["libfoo.so"],
+            &[("libc.so.6", &[(0, "GLIBC_2.17")])],
+        );
+        assert_invalid(&unrelated.bytes);
+        for cut in 0..fixture.bytes.len() {
+            assert_invalid(&fixture.bytes[..cut]);
+        }
+    }
+
+    #[test]
+    fn malformed_section_links_addresses_counts_and_dynamic_entries_fail() {
+        let fixture = facts_elf(
+            true,
+            62,
+            None,
+            &["libc.so.6"],
+            &[("libc.so.6", &[(0, "GLIBC_2.17")])],
+        );
+        let need_sh = fixture.shoff + 3 * fixture.shstride;
+        for (offset, value) in [
+            (need_sh + 40, 0),
+            (need_sh + 40, 99),
+            (need_sh + 44, 99),
+            (fixture.shoff + fixture.shstride + 4, SHT_DYNAMIC),
+            (need_sh + 4, 0),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_invalid(&bytes);
+        }
+        for (offset, value) in [
+            (need_sh + 16, 0x6000u64),
+            (need_sh + 24, u64::MAX),
+            (need_sh + 32, (MAX_SECTION + 1) as u64),
+            (fixture.dynamic_at + 8, u64::MAX),
+            (fixture.dynamic_at + 40, 99),
+            (fixture.dynamic_at + 48, DT_NEEDED),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert_invalid(&bytes);
+        }
+        let mut bytes = fixture.bytes.clone();
+        let dynamic_size = fixture.shoff + 2 * fixture.shstride + 32;
+        bytes[dynamic_size..dynamic_size + 8].copy_from_slice(&63u64.to_le_bytes());
+        assert_invalid(&bytes);
+    }
+
+    #[test]
+    fn sectionless_dynamic_is_explicitly_unsupported_and_interp_is_bounded() {
+        let mut bytes = shared_object_with_interp(&[], &[], Some("/lib/ld-musl-x86_64.so.1"));
+        let phoff = u64_at(&bytes, 32) as usize;
+        let interp_at = u64_at(&bytes[phoff..], 8) as usize;
+        bytes[interp_at] = 0;
+        assert_invalid(&bytes);
+        bytes[phoff + 32..phoff + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_invalid(&bytes);
+        bytes[40..48].copy_from_slice(&0u64.to_le_bytes());
+        bytes[60..62].copy_from_slice(&0u16.to_le_bytes());
+        bytes[phoff..phoff + 4].copy_from_slice(&2u32.to_le_bytes());
+        let dir = temp_dir("sectionless-dynamic");
+        let path = dir.join("dynamic.so");
+        std::fs::write(&path, &bytes).unwrap();
+        for error in [
+            read_facts(&path).unwrap_err(),
+            read_needed(&path).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("unsupported"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn names_and_record_counts_are_bounded() {
+        assert!(string_at(&vec![b'a'; MAX_NAME + 2], 0).is_err());
+        let mut strings = vec![b'a'; MAX_NAME];
+        strings.push(0);
+        assert_eq!(string_at(&strings, 0).unwrap().len(), MAX_NAME);
+        let mut dynamic = Vec::new();
+        for _ in 0..MAX_RECORDS {
+            dynamic.extend_from_slice(&[2u64.to_le_bytes(), 0u64.to_le_bytes()].concat());
+        }
+        dynamic.extend_from_slice(&[0; 16]);
+        assert!(parse_dynamic(&dynamic, b"\0", true).is_err());
+        assert!(bounded_table(usize::MAX, 64).is_err());
+        assert!(record(&[], usize::MAX, 16).is_err());
+    }
+
+    #[test]
+    fn real_consumer_smoke_without_a_compiler() {
+        let path = Path::new("/proc/self/exe");
+        if !path.exists() {
+            return;
+        }
+        let facts = read_facts(path).unwrap();
+        assert_eq!(
+            facts.class,
+            if usize::BITS == 64 {
+                ElfClass::Elf64
+            } else {
+                ElfClass::Elf32
+            }
+        );
+        assert!(facts.soname.is_none());
+        for dependency in facts.required_versions.keys() {
+            assert!(facts.needed.contains(dependency));
+        }
     }
 }
