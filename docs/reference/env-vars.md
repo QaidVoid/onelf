@@ -53,7 +53,8 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `LIBHEIF_PLUGIN_PATH` | a library directory has `libheif/` | colon-joined list of their `plugins/` subdirs, or of the dirs themselves where they have none. Replaces a value the caller set. |
 | `BABL_PATH`, `GEGL_PATH` | a library directory has `babl-0.1/` or `gegl-0.4/` | colon-joined list of those dirs. Replaces a value the caller set. |
 | `TCL_LIBRARY`, `TK_LIBRARY` | a library directory or `share/tcltk/` has `tcl<version>/init.tcl` or `tk<version>/tk.tcl` | that dir. Replaces a value the caller set. |
-| `ALSA_CONFIG_DIR`, `ALSA_CONFIG_PATH` | the package or a set has `share/alsa/` with `alsa.conf` | that dir and that file |
+| `ALSA_CONFIG_DIR` | the package or a set has `share/alsa/` | that dir. Replaces a value the caller set: the carried `alsa.conf` hook is anchored at the data directory. |
+| `ALSA_CONFIG_PATH` | `share/alsa/` has `alsa.conf` and the caller set no `ALSA_CONFIG_PATH` | a list of `alsa.conf` followed by each `*.conf` in its `alsa.conf.d/`, in alsa-lib's numeric order; a fallback for alsa-lib builds with no conf.d hook. Left unset rather than set broken when a path holds a space. |
 | `XLOCALEDIR` | `share/X11/locale/` exists | that dir |
 | `MAGIC` | `share/file/misc/magic.mgc` or `share/misc/magic.mgc` exists | that file |
 | `TEXTDOMAINDIR` | `share/locale/` exists | that dir |

@@ -174,8 +174,21 @@ a multiarch `lib/x86_64-linux-gnu/` count:
 Data a library reads from a fixed path is looked for in the package's
 root, then in the sets':
 
-- `ALSA_CONFIG_DIR` for `share/alsa/` and `ALSA_CONFIG_PATH` for
-  `share/alsa/alsa.conf`
+- `ALSA_CONFIG_DIR` for `share/alsa/`, replacing a value the caller
+  set: the carried `alsa.conf` hook loads its snippets from the data
+  directory, so it must name the package's own copy.
+- `ALSA_CONFIG_PATH` naming `share/alsa/alsa.conf` followed by each
+  `*.conf` in `share/alsa/alsa.conf.d/`, in alsa-lib's numeric name
+  order. The hooks inside `alsa.conf` load the host's `/etc` snippet
+  directories after this list, so on a stock alsa-lib the host's
+  distro snippets keep the last word; what stops them is the hook
+  entry the bundler inserts into the carried `alsa.conf`, which loads
+  the carried snippets after the host's. `/etc/asound.conf` and the
+  user's own `asoundrc` files still come after both. The list is a
+  fallback for alsa-lib builds without a conf.d hook, which would
+  otherwise never see the carried snippets, and it is left unset
+  rather than set broken when a path holds a space, which alsa-lib
+  treats as a separator.
 - `XLOCALEDIR` for `share/X11/locale/`, the X11 compose and locale
   tables
 - `MAGIC` for `share/file/misc/magic.mgc` or `share/misc/magic.mgc`,
@@ -289,8 +302,11 @@ them for, and the drivers they name are the host's by design. These are
 and `VK_ADD_DRIVER_FILES`, which stop the runtime from building
 `VK_DRIVER_FILES` at all),
 `DRIRC_CONFIGDIR`, `LIBDRM_IDS_PATH` and `XKB_CONFIG_ROOT`. So do
-the data variables a user sets to choose other data: `ALSA_CONFIG_DIR`,
-`ALSA_CONFIG_PATH`, `XLOCALEDIR`, `MAGIC` and `TEXTDOMAINDIR`.
+the data variables a user sets to choose other data: `ALSA_CONFIG_PATH`,
+`XLOCALEDIR`, `MAGIC` and `TEXTDOMAINDIR`. `ALSA_CONFIG_DIR` is the
+exception: the carried `alsa.conf` hook is anchored at the data
+directory, so an inherited value would point the hook away from the
+package's own snippets, and the package's copy replaces it.
 `TERMINFO_DIRS` is extended rather than replaced, as described above.
 `SSL_CERT_FILE` and `CURL_CA_BUNDLE` are set only when the caller set
 neither.

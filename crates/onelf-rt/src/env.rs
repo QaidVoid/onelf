@@ -566,11 +566,12 @@ const GST_SCANNER_IN_ROOT: &str = "libexec/gstreamer-1.0/gst-plugin-scanner";
 /// Data a library reads from a compiled-in path, by the variable that
 /// names it instead, with where a package may carry it. A user sets these
 /// to choose other data, so a value the caller set is kept.
+/// `ALSA_CONFIG_DIR` is not among them: the carried `alsa.conf` hook is
+/// anchored at `{ @func datadir }`, so it must name the carried
+/// directory, and like `ALSA_PLUGIN_DIR` it replaces an inherited value.
 const DATA_PATHS: &[(&str, &[&str])] = &[
     ("TEXTDOMAINDIR", &["share/locale"]),
     ("XLOCALEDIR", &["share/X11/locale"]),
-    ("ALSA_CONFIG_DIR", &["share/alsa"]),
-    ("ALSA_CONFIG_PATH", &["share/alsa/alsa.conf"]),
     (
         "MAGIC",
         &["share/file/misc/magic.mgc", "share/misc/magic.mgc"],
@@ -651,6 +652,118 @@ fn setup_plugin_dirs(pkg: &Path, lib_dirs: &[PathBuf], set_roots: &[PathBuf]) {
             set_path(var, path.as_os_str());
         }
     }
+
+    // The carried `alsa.conf` anchors its snippet directory at
+    // `{ @func datadir }`, so an inherited `ALSA_CONFIG_DIR` would point
+    // the hook at the wrong snippets and hand the default back to the
+    // host. Like `ALSA_PLUGIN_DIR`, the package's own copy replaces an
+    // inherited value; a caller who wants different ALSA configuration
+    // altogether sets `ALSA_CONFIG_PATH`, which stays theirs.
+    if let Some(dir) = roots
+        .iter()
+        .map(|root| root.join("share/alsa"))
+        .find(|dir| dir.is_dir())
+    {
+        set_path("ALSA_CONFIG_DIR", dir.as_os_str());
+    }
+    set_alsa_config_path(&roots);
+}
+
+/// ALSA reads its top-level config from `ALSA_CONFIG_PATH` when set, and
+/// `alsa.conf`'s own `@hooks` then load the host's `/etc/alsa/conf.d` by
+/// absolute path after everything this list names, so the host's
+/// snippets keep the last word unless the carried `alsa.conf` was
+/// patched to load the carried directory too (the bundler's
+/// `patch_alsa_conf_hooks`). The list is a fallback for alsa-lib builds
+/// whose `alsa.conf` has no conf.d hook at all, which would otherwise
+/// never see the carried snippets. A caller-set value is kept. The list
+/// is not set at all when a path holds a space: alsa-lib splits this
+/// variable on spaces as well as colons, and a broken list loses the
+/// carried `alsa.conf` itself.
+fn set_alsa_config_path(roots: &[&Path]) {
+    if env::var_os("ALSA_CONFIG_PATH").is_some() {
+        return;
+    }
+    for root in roots {
+        let alsa = root.join("share/alsa");
+        let conf = alsa.join("alsa.conf");
+        if !conf.is_file() {
+            continue;
+        }
+        let mut list = vec![conf];
+        if let Ok(entries) = std::fs::read_dir(alsa.join("alsa.conf.d")) {
+            // Only `*.conf`, as alsa-lib's own directory load does: any
+            // other file in the list makes the whole config update fail.
+            // The order is alsa-lib's numeric one, where `99-x.conf`
+            // loads after `100-y.conf`, not bytewise order.
+            let mut confs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "conf"))
+                .collect();
+            confs.sort_by(|a, b| {
+                natural_cmp(
+                    &a.file_name().unwrap_or_default().to_string_lossy(),
+                    &b.file_name().unwrap_or_default().to_string_lossy(),
+                )
+            });
+            list.extend(confs);
+        }
+        let representable = list
+            .iter()
+            .all(|path| !path.to_string_lossy().contains([' ', '\t']));
+        if representable
+            && let Ok(joined) = env::join_paths(list.iter().map(|path| path.as_os_str()))
+        {
+            set_path("ALSA_CONFIG_PATH", &joined);
+        }
+        return;
+    }
+}
+
+/// File-name order for the carried snippet list: runs of digits compare
+/// as numbers, so `99-x.conf` loads after `100-y.conf`, the opposite of
+/// bytewise order. This matches alsa-lib's versionsort for the names
+/// distros actually ship, which pad consistently. It differs from glibc's
+/// strverscmp when runs of equal value carry different zero padding or a
+/// padded run meets an unpadded one (`09-x.conf` against `0-y.conf`);
+/// no naming scheme produces those, and any deterministic order does.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (ai, bj) = (i, j);
+            i = digit_run(a, i);
+            j = digit_run(b, j);
+            let av = &a[ai..i];
+            let bv = &b[bj..j];
+            let zeros_a = av.iter().take_while(|&&d| d == b'0').count();
+            let zeros_b = bv.iter().take_while(|&&d| d == b'0').count();
+            let ord = av[zeros_a..]
+                .len()
+                .cmp(&bv[zeros_b..].len())
+                .then_with(|| av[zeros_a..].cmp(&bv[zeros_b..]));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else {
+            return a[i].cmp(&b[j]);
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
+/// The end of the run of ASCII digits starting at `at`.
+fn digit_run(bytes: &[u8], at: usize) -> usize {
+    bytes[at..]
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .map_or(bytes.len(), |off| at + off)
 }
 
 /// The script libraries of a bundled Tcl and Tk, `tcl8.6/` holding
@@ -1347,7 +1460,13 @@ mod fontconfig_conf_tests {
 
 #[cfg(test)]
 mod plugin_dir_tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// The environment is process-global and the test runner parallel:
+    /// the tests here set and assert variables, so they take turns.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tree(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("onelf-plugins-{tag}-{}", std::process::id()));
@@ -1365,6 +1484,9 @@ mod plugin_dir_tests {
     /// package's.
     #[test]
     fn modules_replace_and_data_fills() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let work = tree("rule");
         let pkg = work.join("pkg");
         let set = work.join("set");
@@ -1389,7 +1511,7 @@ mod plugin_dir_tests {
         unsafe {
             env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", "/usr/lib/gstreamer-1.0");
             env::set_var("ALSA_CONFIG_PATH", "/home/a/my-alsa.conf");
-            env::remove_var("ALSA_CONFIG_DIR");
+            env::set_var("ALSA_CONFIG_DIR", "/usr/share/alsa");
             env::remove_var("XLOCALEDIR");
             env::remove_var("PIPEWIRE_MODULE_DIR");
         }
@@ -1425,6 +1547,8 @@ mod plugin_dir_tests {
         );
         assert!(env::var_os("PIPEWIRE_MODULE_DIR").is_none());
         assert_eq!(var("ALSA_CONFIG_PATH"), "/home/a/my-alsa.conf");
+        // The carried alsa.conf hook is anchored at `{ @func datadir }`,
+        // so the carried directory replaces an inherited value.
         assert_eq!(
             var("ALSA_CONFIG_DIR"),
             pkg.join("share/alsa").to_string_lossy()
@@ -1437,10 +1561,105 @@ mod plugin_dir_tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
+    /// `alsa.conf` first, then the carried `alsa.conf.d` files in
+    /// alsa-lib's numeric name order, `*.conf` only. The list is a
+    /// fallback for alsa-lib builds with no conf.d hook: against a hook,
+    /// the carried `alsa.conf` patch decides, not this order.
+    #[test]
+    fn alsa_config_path_appends_the_carried_conf_d() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("alsaconf");
+        let pkg = work.join("pkg");
+        let alsa = pkg.join("share/alsa");
+        touch(&alsa.join("alsa.conf"));
+        touch(&alsa.join("alsa.conf.d/99-pulseaudio-default.conf"));
+        touch(&alsa.join("alsa.conf.d/100-extra.conf"));
+        touch(&alsa.join("alsa.conf.d/README"));
+        std::fs::create_dir_all(alsa.join("alsa.conf.d/10-not-a-file")).unwrap();
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        set_alsa_config_path(&[pkg.as_path()]);
+
+        let paths: Vec<String> = env::split_paths(&env::var_os("ALSA_CONFIG_PATH").unwrap())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                alsa.join("alsa.conf").to_string_lossy().into_owned(),
+                alsa.join("alsa.conf.d/99-pulseaudio-default.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+                alsa.join("alsa.conf.d/100-extra.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A path alsa-lib cannot parse is worse than no list: the variable
+    /// splits on spaces as well as colons, so a bundle below a directory
+    /// with a space in its name stays unset and the carried `alsa.conf`
+    /// is still found through `ALSA_CONFIG_DIR`.
+    #[test]
+    fn alsa_config_path_is_skipped_when_a_path_holds_a_space() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("alsaconf-space");
+        let pkg = work.join("My App");
+        let alsa = pkg.join("share/alsa");
+        touch(&alsa.join("alsa.conf"));
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        set_alsa_config_path(&[pkg.as_path()]);
+
+        assert!(env::var_os("ALSA_CONFIG_PATH").is_none());
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Without a carried `alsa.conf` the variable is left unset so ALSA
+    /// falls back to its compiled-in data directory.
+    #[test]
+    fn alsa_config_path_needs_a_carried_alsa_conf() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("alsaconf-missing");
+        let pkg = work.join("pkg");
+        std::fs::create_dir_all(pkg.join("share/alsa")).unwrap();
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        set_alsa_config_path(&[pkg.as_path()]);
+
+        assert!(env::var_os("ALSA_CONFIG_PATH").is_none());
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Numeric order, the way alsa-lib sorts its snippet directory:
+    /// `99-x.conf` after `100-y.conf`, which bytewise order inverts.
+    #[test]
+    fn natural_order_puts_nine_before_100() {
+        use std::cmp::Ordering::{Equal, Less};
+        assert_eq!(natural_cmp("99-x.conf", "100-y.conf"), Less);
+        assert_eq!(natural_cmp("50-a.conf", "99-b.conf"), Less);
+        assert_eq!(natural_cmp("abc.conf", "abd.conf"), Less);
+        assert_eq!(natural_cmp("10-x.conf", "10-x.conf"), Equal);
+    }
+
     /// The caller's terminfo stays ahead of the package's, which is added
     /// once however often the package is launched from itself.
     #[test]
     fn terminfo_comes_after_the_callers() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let work = tree("terminfo");
         let pkg = work.join("pkg");
         std::fs::create_dir_all(pkg.join("share/terminfo")).unwrap();
