@@ -1,0 +1,24 @@
+schema = 1
+id = "xkb"
+
+[[triggers]]
+soname-prefix = "libxkbcommon.so"
+
+[[resources.data]]
+id = "data"
+kind = "directory"
+destination = "share/X11/xkb"
+requirement = "required"
+candidates = [
+  { base = "installation-prefix", path = "share/X11/xkb" },
+]
+
+[[runtime.paths]]
+id = "data"
+kind = "directory"
+variables = ["XKB_CONFIG_ROOT"]
+selection = "first"
+inheritance = "preserve"
+candidates = [
+  { base = "package-root", path = "share/X11/xkb" },
+]

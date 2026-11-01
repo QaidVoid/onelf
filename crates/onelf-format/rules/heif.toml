@@ -1,0 +1,23 @@
+schema = 1
+id = "heif"
+
+[[triggers]]
+soname-prefix = "libheif.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/libheif"
+requirement = "optional"
+candidates = [{ base = "library-dir", path = "libheif" }]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["LIBHEIF_PLUGIN_PATH"]
+selection = "first-per-library-root"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "libheif/plugins" },
+  { base = "library-root", path = "libheif" },
+]

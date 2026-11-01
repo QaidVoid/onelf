@@ -1,0 +1,24 @@
+schema = 1
+id = "pipewire"
+
+[[triggers]]
+soname-prefix = "libpipewire-0.3.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/pipewire-0.3"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "pipewire-0.3" },
+]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["PIPEWIRE_MODULE_DIR"]
+selection = "all"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "pipewire-0.3" },
+]

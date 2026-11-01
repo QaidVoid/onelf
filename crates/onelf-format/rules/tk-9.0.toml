@@ -1,0 +1,18 @@
+schema = 1
+id = "tk-9.0"
+
+[[triggers]]
+soname-prefix = "libtk9.0.so"
+
+[[triggers]]
+soname-prefix = "libtcl9tk9.0.so"
+
+[[resources.data]]
+id = "scripts"
+kind = "directory"
+destination = "lib/tk9.0"
+requirement = "required"
+candidates = [
+  { base = "library-dir", path = "tk9.0" },
+  { base = "installation-prefix", path = "share/tcltk/tk9.0" },
+]

@@ -1,0 +1,27 @@
+schema = 1
+id = "gi"
+
+[[triggers]]
+soname-prefix = "libgirepository-1.0.so"
+
+[[triggers]]
+soname-prefix = "libgirepository-2.0.so"
+
+[[resources.data]]
+id = "typelibs"
+kind = "directory"
+destination = "lib/girepository-1.0"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "girepository-1.0" },
+]
+
+[[runtime.paths]]
+id = "typelibs"
+kind = "directory"
+variables = ["GI_TYPELIB_PATH"]
+selection = "all"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "girepository-1.0" },
+]

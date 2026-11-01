@@ -1,0 +1,24 @@
+schema = 1
+id = "translations"
+
+[[triggers]]
+soname-prefix = "libintl.so"
+
+[[resources.data]]
+id = "messages"
+kind = "directory"
+destination = "share/locale"
+requirement = "optional"
+candidates = [
+  { base = "installation-prefix", path = "share/locale" },
+]
+
+[[runtime.paths]]
+id = "messages"
+kind = "directory"
+variables = ["TEXTDOMAINDIR"]
+selection = "first"
+inheritance = "preserve"
+candidates = [
+  { base = "package-root", path = "share/locale" },
+]

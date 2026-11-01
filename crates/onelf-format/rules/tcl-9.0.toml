@@ -1,0 +1,15 @@
+schema = 1
+id = "tcl-9.0"
+
+[[triggers]]
+soname-prefix = "libtcl9.0.so"
+
+[[resources.data]]
+id = "scripts"
+kind = "directory"
+destination = "lib/tcl9.0"
+requirement = "required"
+candidates = [
+  { base = "library-dir", path = "tcl9.0" },
+  { base = "installation-prefix", path = "share/tcltk/tcl9.0" },
+]

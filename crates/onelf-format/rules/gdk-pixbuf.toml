@@ -1,0 +1,17 @@
+schema = 1
+id = "gdk-pixbuf"
+
+[[triggers]]
+soname-prefix = "libgdk_pixbuf-2.0.so"
+
+[[resources.plugins]]
+id = "loaders"
+kind = "directory"
+destination = "lib/gdk-pixbuf-2.0"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "gdk-pixbuf-2.0" },
+]
+
+[runtime]
+hooks = ["gdk_cache_absolutise"]

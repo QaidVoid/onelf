@@ -1,0 +1,13 @@
+schema = 1
+id = "qt"
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["QT_PLUGIN_PATH"]
+selection = "all"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "qt6/plugins" },
+  { base = "library-root", path = "qt5/plugins" },
+]

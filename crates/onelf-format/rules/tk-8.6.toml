@@ -1,0 +1,15 @@
+schema = 1
+id = "tk-8.6"
+
+[[triggers]]
+soname-prefix = "libtk8.6.so"
+
+[[resources.data]]
+id = "scripts"
+kind = "directory"
+destination = "lib/tk8.6"
+requirement = "required"
+candidates = [
+  { base = "library-dir", path = "tk8.6" },
+  { base = "installation-prefix", path = "share/tcltk/tk8.6" },
+]

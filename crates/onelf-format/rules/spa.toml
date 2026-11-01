@@ -1,0 +1,27 @@
+schema = 1
+id = "spa"
+
+[[triggers]]
+soname-prefix = "libspa-0.2.so"
+
+[[triggers]]
+soname-prefix = "libpipewire-0.3.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/spa-0.2"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "spa-0.2" },
+]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["SPA_PLUGIN_DIR"]
+selection = "all"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "spa-0.2" },
+]

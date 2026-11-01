@@ -1,0 +1,37 @@
+alsa/plugins Directory First Replace ALSA_PLUGIN_DIR
+  LibraryRoot:alsa-lib
+alsa/configuration Directory First Replace ALSA_CONFIG_DIR
+  PackageRoot:share/alsa
+babl/plugins Directory All Replace BABL_PATH
+  LibraryRoot:babl-0.1
+gegl/plugins Directory All Replace GEGL_PATH
+  LibraryRoot:gegl-0.4
+gi/typelibs Directory All Replace GI_TYPELIB_PATH
+  LibraryRoot:girepository-1.0
+gstreamer/plugins Directory All Replace GST_PLUGIN_SYSTEM_PATH_1_0,GST_PLUGIN_SYSTEM_PATH
+  LibraryRoot:gstreamer-1.0
+gstreamer/scanner File First Replace GST_PLUGIN_SCANNER_1_0,GST_PLUGIN_SCANNER
+  LibraryRoot:gstreamer-1.0/gst-plugin-scanner
+  LibraryRoot:gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
+  PackageRoot:libexec/gstreamer-1.0/gst-plugin-scanner
+gtk3/modules Directory All Replace GTK_PATH
+  LibraryRoot:gtk-3.0
+heif/plugins Directory FirstPerLibraryRoot Replace LIBHEIF_PLUGIN_PATH
+  LibraryRoot:libheif/plugins
+  LibraryRoot:libheif
+magic/database File First Preserve MAGIC
+  PackageRoot:share/file/misc/magic.mgc
+  PackageRoot:share/misc/magic.mgc
+pipewire/plugins Directory All Replace PIPEWIRE_MODULE_DIR
+  LibraryRoot:pipewire-0.3
+qt/plugins Directory All Replace QT_PLUGIN_PATH
+  LibraryRoot:qt6/plugins
+  LibraryRoot:qt5/plugins
+spa/plugins Directory All Replace SPA_PLUGIN_DIR
+  LibraryRoot:spa-0.2
+translations/messages Directory First Preserve TEXTDOMAINDIR
+  PackageRoot:share/locale
+x11/data Directory First Preserve XLOCALEDIR
+  PackageRoot:share/X11/locale
+xkb/data Directory First Preserve XKB_CONFIG_ROOT
+  PackageRoot:share/X11/xkb

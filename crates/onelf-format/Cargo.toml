@@ -15,3 +15,6 @@ blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 stipplefs = { workspace = true, features = ["read", "zstd"] }
 toml = { workspace = true, optional = true }
+
+[build-dependencies]
+toml = { workspace = true }

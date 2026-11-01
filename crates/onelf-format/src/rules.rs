@@ -72,7 +72,8 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub struct RuleError(String);
 
 impl RuleError {
-    pub(crate) fn new(field: &str, reason: &str) -> Self {
+    /// Build a bounded error for a named descriptor field.
+    pub fn new(field: &str, reason: &str) -> Self {
         let reason: String = reason.chars().take(512).collect();
         Self(format!("{field}: {reason}"))
     }
@@ -567,8 +568,34 @@ impl Descriptor {
         for helper in &self.resources.helpers {
             unique(&mut groups, &helper.id, "resource id")?;
         }
+        self.runtime.validate_fields()?;
+        let mut build_hooks = BTreeSet::new();
+        for hook in &self.build.hooks {
+            unique(&mut build_hooks, hook, "build hook")?;
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeRules {
+    /// Check record bounds, identities, aliases, policies and hook dedup.
+    ///
+    /// Validation is lexical and filesystem-independent. The record bound is
+    /// checked before allocating validation indexes.
+    pub fn validate(&self) -> Result<(), RuleError> {
+        let mut budget = RecordBudget::default();
+        budget.add(self.paths.len())?;
+        budget.add(self.hooks.len())?;
+        for path in &self.paths {
+            budget.add(path.candidates.len())?;
+            budget.add(path.variables.len())?;
+        }
+        self.validate_fields()
+    }
+
+    fn validate_fields(&self) -> Result<(), RuleError> {
         let mut paths = BTreeSet::new();
-        for path in &self.runtime.paths {
+        for path in &self.paths {
             unique(&mut paths, &path.id, "runtime path id")?;
             require_candidates(&path.candidates, path.id.as_str())?;
             if path.variables.is_empty() {
@@ -595,12 +622,8 @@ impl Descriptor {
                 ));
             }
         }
-        let mut build_hooks = BTreeSet::new();
-        for hook in &self.build.hooks {
-            unique(&mut build_hooks, hook, "build hook")?;
-        }
         let mut runtime_hooks = BTreeSet::new();
-        for hook in &self.runtime.hooks {
+        for hook in &self.hooks {
             unique(&mut runtime_hooks, hook, "runtime hook")?;
         }
         Ok(())

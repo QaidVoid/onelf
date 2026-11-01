@@ -4,6 +4,7 @@
 mod macros;
 
 pub mod cache_layout;
+pub mod catalog;
 pub mod desktop;
 pub mod drivers;
 pub mod elf;
@@ -16,6 +17,7 @@ pub mod resolve;
 pub mod rules;
 #[cfg(feature = "rules-toml")]
 pub mod rules_toml;
+pub mod runtime_metadata;
 pub mod update;
 pub mod verdef;
 

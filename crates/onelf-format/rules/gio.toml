@@ -1,0 +1,17 @@
+schema = 1
+id = "gio"
+
+[[triggers]]
+soname-prefix = "libgio-2.0.so"
+
+[[resources.plugins]]
+id = "modules"
+kind = "directory"
+destination = "lib/gio/modules"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "gio/modules" },
+]
+
+[runtime]
+hooks = ["gio_module_paths"]

@@ -1,0 +1,24 @@
+schema = 1
+id = "x11"
+
+[[triggers]]
+soname-prefix = "libX11.so"
+
+[[resources.data]]
+id = "data"
+kind = "directory"
+destination = "share/X11/locale"
+requirement = "required"
+candidates = [
+  { base = "installation-prefix", path = "share/X11/locale" },
+]
+
+[[runtime.paths]]
+id = "data"
+kind = "directory"
+variables = ["XLOCALEDIR"]
+selection = "first"
+inheritance = "preserve"
+candidates = [
+  { base = "package-root", path = "share/X11/locale" },
+]

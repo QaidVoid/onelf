@@ -1,0 +1,44 @@
+schema = 1
+id = "gstreamer"
+
+[[triggers]]
+soname-prefix = "libgstreamer-1.0.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/gstreamer-1.0"
+requirement = "optional"
+candidates = [{ base = "library-dir", path = "gstreamer-1.0" }]
+
+[[resources.helpers]]
+id = "scanner"
+group = "plugins"
+kind = "file"
+destination = "libexec/gstreamer-1.0/gst-plugin-scanner"
+requirement = "required"
+candidates = [
+  { base = "library-dir", path = "gstreamer-1.0/gst-plugin-scanner" },
+  { base = "library-dir", path = "gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" },
+  { base = "installation-prefix", path = "libexec/gstreamer-1.0/gst-plugin-scanner" },
+]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH"]
+selection = "all"
+inheritance = "replace"
+candidates = [{ base = "library-root", path = "gstreamer-1.0" }]
+
+[[runtime.paths]]
+id = "scanner"
+kind = "file"
+variables = ["GST_PLUGIN_SCANNER_1_0", "GST_PLUGIN_SCANNER"]
+selection = "first"
+inheritance = "replace"
+candidates = [
+  { base = "library-root", path = "gstreamer-1.0/gst-plugin-scanner" },
+  { base = "library-root", path = "gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" },
+  { base = "package-root", path = "libexec/gstreamer-1.0/gst-plugin-scanner" },
+]

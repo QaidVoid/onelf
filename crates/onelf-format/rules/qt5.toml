@@ -1,0 +1,14 @@
+schema = 1
+id = "qt5"
+
+[[triggers]]
+soname-prefix = "libQt5Core.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/qt5/plugins"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "qt5/plugins" },
+]
