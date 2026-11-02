@@ -146,6 +146,11 @@ pub struct Package {
     pub prefer_cache: bool,
     /// Mark the default entrypoint memfd-eligible (overrides auto-detect).
     pub memfd: Option<bool>,
+    /// The sets the package command selects, as written. An omitted list
+    /// selects every declared set, an empty list selects none, and names
+    /// select exactly those. Normalized against the recipe's
+    /// `[sysroot]` declarations by [`SetSelections::normalize`].
+    pub sets: Option<Vec<String>>,
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Pin every entry's mtime to this Unix timestamp for reproducible
@@ -194,6 +199,102 @@ pub struct Entrypoint {
     pub args: Vec<String>,
     #[serde(default)]
     pub default: bool,
+    /// The sets this entrypoint selects, as written. An omitted list
+    /// selects every declared set, independently of the package
+    /// command's list; an empty list selects none; names select exactly
+    /// those.
+    pub sets: Option<Vec<String>>,
+}
+
+/// Which of a recipe's declared sets one entrypoint selects.
+///
+/// An omitted `sets` list and a written one are deliberately distinct:
+/// omission keeps the all-declared-set default every recipe without the
+/// key has always had, while a written list, empty or not, says exactly
+/// what applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SetSelection {
+    /// No `sets` list was written: every declared set applies.
+    #[default]
+    All,
+    /// A `sets` list was written, in canonical (sorted) order: exactly
+    /// these sets apply, possibly none.
+    Names(Vec<String>),
+}
+
+impl SetSelection {
+    /// Whether a `sets` list was written. An explicit selection makes
+    /// the build nonlegacy, so it requires a runtime advertising the
+    /// support carrying selection records needs.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, SetSelection::Names(_))
+    }
+}
+
+/// The normalized primary and named set selections a recipe declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetSelections {
+    /// What the package command selects.
+    pub primary: SetSelection,
+    /// What each named entrypoint selects, by entrypoint name.
+    pub named: BTreeMap<String, SetSelection>,
+}
+
+impl SetSelections {
+    /// Normalize a recipe's `sets` lists into canonical form. Within one
+    /// list, a repeated name and a name the recipe's `[sysroot]` does not
+    /// declare are refused, naming the list they were written in, so a
+    /// broken recipe fails at load and never reaches a build.
+    ///
+    /// A named entrypoint's omitted list stays omitted: it selects all
+    /// declared sets and does not inherit the package command's list.
+    pub fn normalize(recipe: &Recipe) -> std::io::Result<Self> {
+        let declared: std::collections::BTreeSet<&str> = recipe
+            .sysroot
+            .as_ref()
+            .map(|sr| sr.sets.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let primary = normalize_list("[package]", recipe.package.sets.as_deref(), &declared)?;
+        let mut named = BTreeMap::new();
+        for entrypoint in &recipe.entrypoint {
+            let what = format!("entrypoint '{}'", entrypoint.name);
+            let selection = normalize_list(&what, entrypoint.sets.as_deref(), &declared)?;
+            named.insert(entrypoint.name.clone(), selection);
+        }
+        Ok(Self { primary, named })
+    }
+}
+
+/// Normalize one written `sets` list against the declared names: a
+/// repeated name or a name nothing declares is refused naming the list
+/// it was written in, and a written list is sorted into the canonical
+/// order selection metadata uses.
+fn normalize_list(
+    what: &str,
+    written: Option<&[String]>,
+    declared: &std::collections::BTreeSet<&str>,
+) -> std::io::Result<SetSelection> {
+    let Some(names) = written else {
+        return Ok(SetSelection::All);
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{what}: duplicate set name '{name}'"),
+            ));
+        }
+        if !declared.contains(name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{what}: unknown set name '{name}': the recipe declares no such set"),
+            ));
+        }
+    }
+    let mut canonical: Vec<String> = names.to_vec();
+    canonical.sort();
+    Ok(SetSelection::Names(canonical))
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +607,12 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
             )
         })?;
     }
+    SetSelections::normalize(&recipe).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })?;
     Ok(recipe)
 }
 
@@ -830,6 +937,141 @@ mod expand_tests {
         );
     }
 }
+#[cfg(test)]
+mod selection_tests {
+    use super::{SetSelection, SetSelections, load};
+
+    fn load_result(body: &str) -> std::io::Result<super::Recipe> {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-recipe-sets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("onelf.toml");
+        std::fs::write(&path, body).unwrap();
+        let recipe = load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        recipe
+    }
+
+    fn load_str(body: &str) -> super::Recipe {
+        load_result(body).unwrap()
+    }
+
+    fn selections(body: &str) -> SetSelections {
+        SetSelections::normalize(&load_str(body)).unwrap()
+    }
+
+    const SETS: &str = "[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\n[sysroot.sets.audio]\npackages = [\"pipewire\"]\nurl = \"https://e/audio.onelf\"\nblake3 = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n";
+
+    fn recipe(body: &str) -> String {
+        format!("[package]\ncommand = \"bin/app\"\n{body}\n{SETS}\n")
+    }
+
+    /// Omission and an explicit empty list are distinct answers: the
+    /// first keeps every declared set, the second keeps none.
+    #[test]
+    fn an_omitted_list_selects_all_and_an_empty_list_selects_none() {
+        let s = selections(&recipe(
+            "\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
+        ));
+        assert_eq!(s.primary, SetSelection::All);
+        assert_eq!(s.named["cli"], SetSelection::Names(Vec::new()));
+        assert!(s.named["cli"].is_explicit());
+        let all = selections(&recipe(
+            "\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        ));
+        assert_eq!(all.primary, SetSelection::All);
+        assert_eq!(all.named["cli"], SetSelection::All);
+        assert!(!all.named["cli"].is_explicit());
+    }
+
+    /// A written list normalizes to canonical order, whatever order the
+    /// author wrote, so selection metadata never depends on list order.
+    #[test]
+    fn an_explicit_list_is_normalized_to_canonical_order() {
+        let s = selections(&recipe("sets = [\"audio\", \"gtk\"]\n"));
+        assert_eq!(
+            s.primary,
+            SetSelection::Names(vec!["audio".to_string(), "gtk".to_string()])
+        );
+        assert!(s.primary.is_explicit());
+    }
+
+    /// One name written twice in one list is refused, for the package
+    /// command and for a named entrypoint alike, naming the list.
+    #[test]
+    fn a_duplicate_set_name_is_refused_with_attribution() {
+        let err = load_result(&recipe("sets = [\"gtk\", \"gtk\"]\n")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[package]: duplicate set name 'gtk'"),
+            "{err}"
+        );
+        let err = load_result(&recipe(
+            "\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = [\"audio\", \"audio\"]\n",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entrypoint 'cli': duplicate set name 'audio'"),
+            "{err}"
+        );
+    }
+
+    /// A name the recipe's `[sysroot]` does not declare is refused,
+    /// naming the list it was written in.
+    #[test]
+    fn an_unknown_set_name_is_refused_with_attribution() {
+        let err = load_result(&recipe("sets = [\"gui\"]\n")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[package]: unknown set name 'gui'"),
+            "{err}"
+        );
+        let err = load_result(&recipe(
+            "\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = [\"gtk\", \"gfx\"]\n",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("entrypoint 'cli': unknown set name 'gfx'"),
+            "{err}"
+        );
+    }
+
+    /// A named entrypoint's omitted list does not inherit the package
+    /// command's explicit list: each list is its own answer.
+    #[test]
+    fn a_named_omission_does_not_inherit_the_primary_list() {
+        let s = selections(&recipe(
+            "sets = [\"gtk\"]\n\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        ));
+        assert_eq!(s.primary, SetSelection::Names(vec!["gtk".to_string()]));
+        assert_eq!(s.named["cli"], SetSelection::All);
+    }
+
+    /// With nothing declared, an omitted list still selects all (of
+    /// nothing) and an explicit empty list is still valid, but any name
+    /// is unknown.
+    #[test]
+    fn selections_without_declared_sets_stay_consistent() {
+        let s = selections(
+            "[package]\ncommand = \"bin/app\"\n\n[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        );
+        assert_eq!(s.primary, SetSelection::All);
+        assert_eq!(s.named["cli"], SetSelection::All);
+        let s = selections("[package]\ncommand = \"bin/app\"\nsets = []\n");
+        assert_eq!(s.primary, SetSelection::Names(Vec::new()));
+        let err = load_result("[package]\ncommand = \"bin/app\"\nsets = [\"gtk\"]\n").unwrap_err();
+        assert!(err.to_string().contains("unknown set name 'gtk'"), "{err}");
+    }
+}
+
 // The `${VAR}` injection-safety regression is covered by an integration
 // test (`recipe_expansion_cannot_inject_keys` in tests/pipeline.rs), which
 // sets the variable on a child process rather than mutating this process's

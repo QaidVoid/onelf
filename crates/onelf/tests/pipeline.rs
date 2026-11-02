@@ -7309,6 +7309,201 @@ fn recipe_expansion_cannot_inject_keys() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Every path under `dir` with its contents, sorted, so a failed build
+/// can be proven to have left the tree exactly as it found it.
+fn tree_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = jwalk::WalkDir::new(dir)
+        .sort(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| {
+            let rel = e
+                .path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let bytes = std::fs::read(e.path()).unwrap();
+            (rel, bytes)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// A sets-only recipe: the AppDir stands as authored and the declared
+/// sets are what the runtime would fetch, so selection lists have
+/// declarations to be validated against.
+fn sets_recipe(command_sets: &str, entrypoints: &str) -> String {
+    format!(
+        "[package]\ncommand = \"bin/run.sh\"\nmtime = 0\n{command_sets}\n\
+         [bundle]\nskip = true\n\n\
+         [sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\n\
+         blake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         {entrypoints}"
+    )
+}
+
+/// A `sets` list naming a set the recipe does not declare fails at
+/// recipe load, before the build touches the tree: nothing is staged,
+/// nothing is recorded, and no output is written.
+#[test]
+fn an_unknown_set_name_fails_before_the_tree_is_written() {
+    let td = workdir("sets-unknown");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(
+        &app.join("onelf.toml"),
+        &sets_recipe("sets = [\"ghost\"]", ""),
+    );
+    let before = tree_snapshot(&app);
+    let pkg = td.join("u.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            pkg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("[package]: unknown set name 'ghost'"), "{err}");
+    assert!(!pkg.exists(), "a refused build writes no output");
+    assert_eq!(tree_snapshot(&app), before, "the tree must stand untouched");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A name repeated within one selection list is refused at load, with
+/// the list it was written in named, and the tree stands untouched.
+#[test]
+fn a_duplicate_set_name_fails_before_the_tree_is_written() {
+    let td = workdir("sets-dup");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    write(
+        &app.join("onelf.toml"),
+        &sets_recipe(
+            "",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/run.sh\"\nsets = [\"gtk\", \"gtk\"]\n",
+        ),
+    );
+    let before = tree_snapshot(&app);
+    let pkg = td.join("d.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            pkg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("entrypoint 'cli': duplicate set name 'gtk'"),
+        "{err}"
+    );
+    assert!(!pkg.exists(), "a refused build writes no output");
+    assert_eq!(tree_snapshot(&app), before, "the tree must stand untouched");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Explicit selections are validated and gated, but their records are
+/// not emitted yet: the package structure and every generated record
+/// stay exactly what the same recipe without the lists produces, so a
+/// legacy build's output is unchanged. The packed recipe text itself
+/// differs between the two builds, so its own entry is set aside
+/// before the comparison.
+#[test]
+fn an_explicit_selection_changes_nothing_the_package_carries() {
+    let td = workdir("sets-legacy");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+
+    let selected = sets_recipe(
+        "sets = [\"gtk\"]",
+        "[[entrypoint]]\nname = \"cli\"\npath = \"bin/run.sh\"\nargs = [\"--cli\"]\nsets = []\n",
+    );
+    write(&app.join("onelf.toml"), &selected);
+    let with = td.join("with.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            with.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "an explicit selection builds onto a capable runtime: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let legacy = sets_recipe(
+        "",
+        "[[entrypoint]]\nname = \"cli\"\npath = \"bin/run.sh\"\nargs = [\"--cli\"]\n",
+    );
+    write(&app.join("onelf.toml"), &legacy);
+    let without = td.join("without.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            without.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "the legacy recipe still builds: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // The packed recipe text differs by the lists themselves, so its row
+    // is set aside; everything else the package carries must match.
+    let listing = |pkg: &Path| {
+        let out = run_onelf(&["list", pkg.to_str().unwrap()], None);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.ends_with(" onelf.toml"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        listing(&with),
+        listing(&without),
+        "selection lists must not change the package structure"
+    );
+    let recorded = |pkg: &Path| {
+        let out = run_onelf(
+            &[
+                "extract",
+                pkg.to_str().unwrap(),
+                "-o",
+                "-",
+                "--file",
+                ".onelf/sets",
+            ],
+            None,
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(recorded(&with).contains("gtk.onelf"), "the pin is recorded");
+    assert_eq!(
+        recorded(&with),
+        recorded(&without),
+        "the recorded sets must not depend on the selection lists"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The documented user asset dirs `.onelf/icons/` and `.onelf/desktop/`
 /// are accepted from source and round-trip through `icon`/`desktop`,
 /// while the rest of the `.onelf/` namespace stays reserved.

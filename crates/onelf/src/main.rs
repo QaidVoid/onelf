@@ -1094,10 +1094,16 @@ fn run_build(
 ) -> std::io::Result<()> {
     let recipe_path = recipe::resolve(path)?;
     let recipe = recipe::load(&recipe_path)?;
+    // Selections normalize and resolve before anything is staged, so a
+    // recipe naming an unknown or repeated set fails while the AppDir
+    // stands exactly as its author left it.
+    let selections = recipe::SetSelections::normalize(&recipe)?;
     let request = assembly::AssemblyRequest::plan(&recipe_path, recipe, output_override)?;
+    let selected = resolve_set_selections(&selections, &request)?;
     let _report = request.stage()?;
     let update_key = request.update.read_key()?;
     let runtime = assembly::embed_runtime(&request)?;
+    require_selection_runtime(&runtime.note, &selected)?;
     let profile = match &request.compression.profile {
         Some(p) => pack::read_profile(p)?,
         None => Vec::new(),
@@ -1106,6 +1112,128 @@ fn run_build(
         &request.pack_options(update_key, runtime.note, profile),
         runtime.bytes,
     )
+}
+
+/// One final manifest entrypoint and the sets its recipe selects.
+#[derive(Debug)]
+struct ResolvedSelection {
+    /// The name the manifest gives the entrypoint.
+    name: String,
+    /// The normalized selection the recipe declares for it.
+    sets: recipe::SetSelection,
+}
+
+impl ResolvedSelection {
+    /// Whether the recipe wrote an explicit list, which makes the
+    /// selection nonlegacy and capability-gated.
+    fn is_explicit(&self) -> bool {
+        self.sets.is_explicit()
+    }
+}
+
+/// Pair the recipe's normalized selections with the final entrypoint
+/// table the packer emits: the package command under its manifest name,
+/// then every named entrypoint the default does not already cover. The
+/// entrypoint the default names carries its own selection into the
+/// primary record rather than a second record under the same name.
+///
+/// Two records answering to one name would leave which selection a
+/// launch reads up to table order, so the ambiguity is refused here,
+/// before the AppDir is touched.
+fn resolve_set_selections(
+    selections: &recipe::SetSelections,
+    request: &assembly::AssemblyRequest,
+) -> std::io::Result<Vec<ResolvedSelection>> {
+    let default_name = request
+        .default_entrypoint
+        .clone()
+        .or_else(|| {
+            std::path::Path::new(&request.package.command)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "main".to_string());
+    let named_by_default = request
+        .default_entrypoint
+        .as_deref()
+        .and_then(|name| request.entrypoints.iter().find(|e| e.name == name));
+    let primary = match named_by_default {
+        Some(entrypoint) => set_selection_named(&selections.named, &entrypoint.name)?,
+        None => selections.primary.clone(),
+    };
+    let mut table = vec![ResolvedSelection {
+        name: default_name,
+        sets: primary,
+    }];
+    for entrypoint in &request.entrypoints {
+        if request.default_entrypoint.as_deref() == Some(entrypoint.name.as_str()) {
+            continue;
+        }
+        table.push(ResolvedSelection {
+            name: entrypoint.name.clone(),
+            sets: set_selection_named(&selections.named, &entrypoint.name)?,
+        });
+    }
+    if let Some(dup) = table
+        .iter()
+        .enumerate()
+        .find(|(i, e)| table[..*i].iter().any(|m| m.name == e.name))
+        .map(|(_, e)| e.name.clone())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("duplicate entrypoint name '{dup}'"),
+        ));
+    }
+    Ok(table)
+}
+
+/// The selection a named entrypoint declares. Every final entrypoint
+/// comes from the recipe the selections were normalized from, so a
+/// missing entry means the table was built from something else.
+fn set_selection_named(
+    named: &std::collections::BTreeMap<String, recipe::SetSelection>,
+    name: &str,
+) -> std::io::Result<recipe::SetSelection> {
+    named.get(name).cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("entrypoint '{name}': no declared set selection"),
+        )
+    })
+}
+
+/// A nonlegacy selection, an explicit `sets` list whether empty or not,
+/// only packs onto a runtime advertising the payload metadata and
+/// selection-view support carrying its records will need, so a
+/// substitution that would silently ignore the selections is refused. A
+/// legacy build, every list omitted, stays acceptable on any embeddable
+/// runtime.
+fn require_selection_runtime(
+    note: &onelf_format::elf::RuntimeNote,
+    table: &[ResolvedSelection],
+) -> std::io::Result<()> {
+    if !table.iter().any(ResolvedSelection::is_explicit) {
+        return Ok(());
+    }
+    let mut required = onelf_format::elf::RuntimeRequirements::metadata(
+        onelf_format::elf::RUNTIME_METADATA_VERSION,
+    );
+    required.capabilities = required
+        .capabilities
+        .union(onelf_format::elf::RuntimeCapabilities::SELECTION_VIEW);
+    onelf_format::elf::check_runtime_support(note, required).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the recipe declares explicit set selections, so the embedded runtime \
+                 must advertise payload metadata and selection-view support, and this \
+                 one does not: {e}. Build with a runtime that carries that support, or \
+                 drop the explicit `sets` lists to select every declared set"
+            ),
+        )
+    })
 }
 
 /// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`
@@ -1167,5 +1295,176 @@ mod block_size_tests {
         assert!(parse_block_size("-1M").is_err());
         // Must error, not wrap to a small block.
         assert!(parse_block_size("18014398509481985M").is_err());
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::{ResolvedSelection, require_selection_runtime, resolve_set_selections};
+    use crate::assembly;
+    use crate::recipe;
+    use onelf_format::elf::{RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote};
+
+    const SETS: &str = "[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n";
+
+    /// A recipe body: package-level keys beyond the command, then the
+    /// declared sets, then any named entrypoints.
+    fn recipe(package: &str, entrypoints: &str) -> String {
+        format!("[package]\ncommand = \"bin/app\"\n{package}\n{SETS}\n{entrypoints}")
+    }
+
+    /// Load, normalize and plan a recipe written into a scratch
+    /// directory: the exact prefix `run_build` runs, minus staging.
+    /// Plan reads nothing from the tree, so the recipe file is the only
+    /// file the scratch needs.
+    fn resolve(body: &str) -> std::io::Result<Vec<ResolvedSelection>> {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-selection-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("onelf.toml"), body).unwrap();
+        let path = recipe::resolve(&dir).unwrap();
+        let recipe = recipe::load(&path).unwrap();
+        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
+        let request = assembly::AssemblyRequest::plan(&path, recipe, None).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        resolve_set_selections(&selections, &request)
+    }
+
+    /// The table mirrors the manifest: the package command under its
+    /// manifest name, then each named entrypoint, all selecting every
+    /// declared set when no list was written.
+    #[test]
+    fn an_omitted_selection_resolves_over_the_final_table() {
+        let table = resolve(&recipe(
+            "",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        ))
+        .unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0].name, "app");
+        assert_eq!(table[0].sets, recipe::SetSelection::All);
+        assert!(!table[0].is_explicit());
+        assert_eq!(table[1].name, "cli");
+        assert_eq!(table[1].sets, recipe::SetSelection::All);
+    }
+
+    /// An explicit empty list keeps nothing, and a named explicit list
+    /// keeps exactly its names in canonical order.
+    #[test]
+    fn explicit_lists_resolve_to_what_they_wrote() {
+        let table = resolve(&recipe(
+            "sets = []",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = [\"gtk\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(table[0].sets, recipe::SetSelection::Names(Vec::new()));
+        assert!(table[0].is_explicit());
+        assert_eq!(
+            table[1].sets,
+            recipe::SetSelection::Names(vec!["gtk".to_string()])
+        );
+    }
+
+    /// The named entrypoint's omitted list selects all declared sets
+    /// even though the package command wrote one: the lists are
+    /// independent.
+    #[test]
+    fn a_named_omission_does_not_inherit_an_explicit_primary_list() {
+        let table = resolve(&recipe(
+            "sets = [\"gtk\"]",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            table[0].sets,
+            recipe::SetSelection::Names(vec!["gtk".to_string()])
+        );
+        assert_eq!(table[1].sets, recipe::SetSelection::All);
+        assert!(!table[1].is_explicit());
+    }
+
+    /// A default naming a declared entrypoint folds into one record
+    /// carrying that entrypoint's own selection, not a second one under
+    /// the same name.
+    #[test]
+    fn the_default_entrypoint_carries_its_own_selection() {
+        let table = resolve(&recipe(
+            "",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\ndefault = true\nsets = [\"gtk\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].name, "cli");
+        assert_eq!(
+            table[0].sets,
+            recipe::SetSelection::Names(vec!["gtk".to_string()])
+        );
+    }
+
+    /// The command's manifest name and a named entrypoint colliding
+    /// would leave which selection a launch reads up to table order, so
+    /// the ambiguity is refused before the AppDir is touched.
+    #[test]
+    fn a_duplicate_name_in_the_final_table_is_refused() {
+        let err = resolve(&recipe(
+            "",
+            "[[entrypoint]]\nname = \"app\"\npath = \"bin/app\"\n",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate entrypoint name 'app'"),
+            "{err}"
+        );
+    }
+
+    /// A nonlegacy selection needs a runtime advertising metadata and
+    /// selection-view support; a note-free legacy runtime is refused
+    /// with guidance.
+    #[test]
+    fn an_explicit_selection_requires_a_capable_runtime() {
+        let table = vec![ResolvedSelection {
+            name: "app".to_string(),
+            sets: recipe::SetSelection::Names(Vec::new()),
+        }];
+        let err = require_selection_runtime(&RuntimeNote::Absent, &table).unwrap_err();
+        assert!(err.to_string().contains("explicit set selections"), "{err}");
+        let note = RuntimeNote::Present {
+            metadata_version: RUNTIME_METADATA_VERSION,
+            capabilities: RuntimeCapabilities::SELECTION_VIEW,
+        };
+        require_selection_runtime(&note, &table).unwrap();
+        // A runtime short on the capability itself stays refused.
+        let err = require_selection_runtime(
+            &RuntimeNote::Present {
+                metadata_version: RUNTIME_METADATA_VERSION,
+                capabilities: RuntimeCapabilities::empty(),
+            },
+            &table,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("selection-view"), "{err}");
+    }
+
+    /// A legacy build, every list omitted, packs onto any embeddable
+    /// runtime, note or not.
+    #[test]
+    fn a_legacy_selection_stays_acceptable_on_any_runtime() {
+        let table = vec![
+            ResolvedSelection {
+                name: "app".to_string(),
+                sets: recipe::SetSelection::All,
+            },
+            ResolvedSelection {
+                name: "cli".to_string(),
+                sets: recipe::SetSelection::All,
+            },
+        ];
+        require_selection_runtime(&RuntimeNote::Absent, &table).unwrap();
     }
 }
