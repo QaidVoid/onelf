@@ -296,6 +296,19 @@ pub fn resolve_selection_store(package_id: &[u8; 32], selection_key: &str) -> Op
     Some(resolve_store(package_id)?.join(dir))
 }
 
+/// The per-identity view directory of the package `package_id`: where a
+/// launch keeps a view and its configuration record, named by the view's
+/// canonical identity key, so launches whose isolating inputs differ
+/// never share one and lists that differ only in order share one.
+///
+/// `key` is a directory name the view identity mints; anything else
+/// names nothing.
+#[allow(dead_code)]
+pub fn view_dir(package_id: &[u8; 32], key: &str) -> Option<PathBuf> {
+    let dir = crate::links::view::dir_name(key)?;
+    Some(resolve_store(package_id)?.join(dir))
+}
+
 /// How long an unclaimed leftover must have sat untouched before a sweep may
 /// reclaim it.
 ///
@@ -741,6 +754,26 @@ mod tests {
         let sel = resolve_selection_store(&id, &key).unwrap();
         assert_eq!(sel, store.join(format!("sel-{key}")));
         assert_eq!(sel.parent(), Some(store.as_path()));
+    }
+
+    /// The view directory is named by a key the view identity minted. A
+    /// caller passing anything else, however crafted, names nothing.
+    #[test]
+    fn the_view_directory_refuses_what_the_identity_did_not_mint() {
+        let id = [11u8; 32];
+        for key in ["", "../escape", "a/b", "ABC", "gg", " a", &"a".repeat(65)] {
+            assert_eq!(view_dir(&id, key), None, "key {key:?} must name nothing");
+        }
+    }
+
+    #[test]
+    fn the_view_directory_lives_beside_the_resolver_store() {
+        let id = [11u8; 32];
+        let key = "cd".repeat(16);
+        let store = resolve_store(&id).expect("a private runtime directory");
+        let dir = view_dir(&id, &key).unwrap();
+        assert_eq!(dir, store.join(format!("view-{key}")));
+        assert_eq!(dir.parent(), Some(store.as_path()));
     }
 }
 
