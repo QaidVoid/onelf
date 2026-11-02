@@ -4,40 +4,48 @@
 //! and the cache fallback) must never live at a shared, world-writable
 //! path like `/tmp/onelf`, where another local user could pre-create or
 //! tamper with entries. [`private_dir`] returns a `0700`, current-uid-owned
-//! base instead.
+//! base instead. A privileged launch refuses every environment-named
+//! candidate outright: `XDG_RUNTIME_DIR` and the HOME/XDG-derived cache
+//! roots were chosen by the unprivileged caller that started the launch,
+//! so root keeps only its own per-uid base.
 
 use std::path::{Path, PathBuf};
 
 use std::os::unix::fs::DirBuilderExt;
 
-/// Current real uid.
-fn uid() -> u32 {
+/// Current real uid, the target user the runtime's state is owned by.
+pub(crate) fn uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
-/// True if `path` is a real directory (not a symlink) owned by the current
-/// uid with no group/other permission bits.
-fn is_safe_owned_dir(path: &Path) -> bool {
-    onelf_format::cache_layout::is_safe_owned_dir(path, uid())
-}
-
-/// Return a `0700`, current-uid-owned scratch base directory, or `None`
-/// when no safe location can be established.
+/// The private base directory for `uid`, or `None` when no safe location
+/// can be established.
 ///
-/// Prefers `$XDG_RUNTIME_DIR` (systemd already makes it `0700` per-uid);
-/// otherwise creates `/tmp/onelf-<uid>` with mode `0700` and confirms via
-/// `symlink_metadata` that it is a real directory owned by us. A
-/// pre-existing path that is a symlink or owned by another user is refused
-/// (never chmod'd through), so the caller falls back to failing closed.
-pub fn private_dir() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(x);
-        if is_safe_owned_dir(&p) {
-            return Some(p);
-        }
+/// `xdg_runtime_dir` is the environment's suggestion, accepted only when
+/// it is a real directory `uid` owns with no group or other access
+/// (systemd already makes it `0700` per-uid). A privileged uid refuses
+/// the suggestion outright: the value was left behind by the
+/// unprivileged caller that started the launch, so no root-owned state is
+/// ever named by the environment, however safe the named directory looks.
+/// The decision falls to `<fallback>/onelf-<uid>`, created atomically at
+/// `0700` and confirmed through `symlink_metadata` to be a real directory
+/// owned by `uid`. A pre-existing path that is a symlink or owned by
+/// another user is refused (never chmod'd through), so the caller fails
+/// closed.
+fn private_dir_for(
+    uid: u32,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    fallback: &Path,
+) -> Option<PathBuf> {
+    let safe = |p: &Path| onelf_format::cache_layout::is_safe_owned_dir(p, uid);
+    if uid != 0
+        && let Some(dir) = xdg_runtime_dir
+        && safe(Path::new(dir))
+    {
+        return Some(PathBuf::from(dir));
     }
 
-    let p = PathBuf::from(format!("/tmp/onelf-{}", uid()));
+    let p = fallback.join(format!("onelf-{uid}"));
     // Create with mode 0700 atomically via mkdir(2) so there is never a
     // window where the directory is group/other-accessible. umask can only
     // clear bits, so the result is never looser than 0700.
@@ -48,7 +56,18 @@ pub fn private_dir() -> Option<PathBuf> {
         Err(_) => return None,
     }
 
-    is_safe_owned_dir(&p).then_some(p)
+    safe(&p).then_some(p)
+}
+
+/// Return a `0700`, current-uid-owned scratch base directory, or `None`
+/// when no safe location can be established. See [`private_dir_for`] for
+/// the decision and its refusals.
+pub fn private_dir() -> Option<PathBuf> {
+    private_dir_for(
+        uid(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        Path::new("/tmp"),
+    )
 }
 
 /// Open a lock file leaving the descriptor inheritable (no `CLOEXEC`), so a
@@ -432,20 +451,78 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A scratch fallback root standing in for `/tmp`, so a simulated
+    /// root's per-uid directory never touches the real one.
+    fn fallback_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("onelf-pbase-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn prefers_safe_xdg_runtime_dir() {
+        let fb = fallback_root("prefers");
+        let dir = fb.join("xdg");
+
         // A 0700 dir we own is accepted as the private base.
-        let dir = std::env::temp_dir().join(format!("onelf-priv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).unwrap();
-        assert!(is_safe_owned_dir(&dir));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        assert_eq!(
+            private_dir_for(uid(), Some(dir.as_os_str()), &fb),
+            Some(dir.clone())
+        );
 
-        // A world-accessible dir is rejected (would fall through / refuse).
+        // A world-accessible dir is rejected in favour of the per-uid one.
         std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).unwrap();
-        assert!(!is_safe_owned_dir(&dir));
+        let fell = private_dir_for(uid(), Some(dir.as_os_str()), &fb).unwrap();
+        assert_ne!(fell, dir);
+        assert_eq!(fell, fb.join(format!("onelf-{}", uid())));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fb);
+    }
+
+    /// The per-uid fallback stays at the mode it is created with: no
+    /// group or other access, whatever the umask and the caller's
+    /// permissions on the parent are.
+    #[test]
+    fn the_fallback_base_is_created_private() {
+        let fb = fallback_root("mode");
+        let got = private_dir_for(uid(), None, &fb).unwrap();
+        let mode = std::fs::symlink_metadata(&got)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&fb);
+    }
+
+    /// A privileged uid refuses the environment's base however safe it
+    /// looks, because the value was chosen by the unprivileged caller.
+    /// Its per-uid directory decides instead; here that directory is
+    /// user-owned, so on a non-root run the decision fails closed. The
+    /// two outcomes are identical with and without the env value, which
+    /// is the refusal itself.
+    #[test]
+    fn root_refuses_the_env_base() {
+        let fb = fallback_root("root");
+        let xdg = fb.join("xdg");
+        std::fs::DirBuilder::new().mode(0o700).create(&xdg).unwrap();
+
+        let with_env = private_dir_for(0, Some(xdg.as_os_str()), &fb);
+        let without_env = private_dir_for(0, None, &fb);
+        assert_eq!(
+            with_env, without_env,
+            "the env value must not change root's base"
+        );
+        if uid() != 0 {
+            assert_eq!(
+                with_env, None,
+                "a user-owned per-uid base is refused for root"
+            );
+        }
+        assert!(xdg.is_dir(), "the refused candidate is left untouched");
+
+        let _ = std::fs::remove_dir_all(&fb);
     }
 
     /// A live instance's mountpoint must survive a concurrent launch's
@@ -624,9 +701,8 @@ mod tests {
 
     #[test]
     fn rejects_non_directory_and_missing() {
-        assert!(!is_safe_owned_dir(std::path::Path::new(
-            "/nonexistent/onelf/private/xyz"
-        )));
+        let safe = onelf_format::cache_layout::is_safe_owned_dir;
+        assert!(!safe(Path::new("/nonexistent/onelf/private/xyz"), uid()));
     }
 }
 
