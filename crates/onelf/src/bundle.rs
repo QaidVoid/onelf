@@ -35,11 +35,14 @@ mod datadirs;
 mod discover;
 pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
+mod activate;
 mod plan;
 mod resolve;
 pub(crate) use resolve::*;
 pub(crate) mod elf;
 pub mod sysroot;
+use activate::{Discovery, WorkItem, publish_activations};
+pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
@@ -1178,6 +1181,36 @@ fn attest_staged_outputs(opts: &BundleOptions) -> io::Result<()> {
     Ok(())
 }
 
+/// Report the rules the closure activated, in catalog order, each with
+/// the soname that activated it, and how many resource groups activation
+/// queued. Bounded like every summary, so no catalog can flood output.
+fn report_activations(activations: &[RuleActivation]) {
+    if activations.is_empty() {
+        return;
+    }
+    const SHOWN_RULES: usize = 8;
+    let shown: Vec<String> = activations
+        .iter()
+        .take(SHOWN_RULES)
+        .map(|a| format!("{} ({})", a.rule, a.reason))
+        .collect();
+    let hidden = activations.len().saturating_sub(SHOWN_RULES);
+    let more = if hidden > 0 {
+        format!(" and {hidden} more")
+    } else {
+        String::new()
+    };
+    let groups: usize = activations.iter().map(|a| a.groups.len()).sum();
+    eprintln!(
+        "  {} {} activated by soname prefix: {}{}; {} group(s) queued",
+        color::bold("Rules:"),
+        activations.len(),
+        shown.join(", "),
+        more,
+        groups
+    );
+}
+
 /// Bundle the shared libraries the tree's ELF files need into its
 /// library directory, rewrite the ELF files for the bundled layout,
 /// and record what the build generated.
@@ -1596,8 +1629,25 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .filter(|name| name.contains(".so"))
         .collect();
 
+    // Descriptor activation seeds from every soname already in play: the
+    // libraries the tree already bundles and the sonames the packaged
+    // sets supply. No recipe surface for project-local descriptors or
+    // rule disabling exists yet, so both lists are empty until that
+    // lands; the activator already takes them.
+    let mut discovery = Discovery::new(onelf_format::catalog::builtins(), &[], &[])?;
+    let mut present: Vec<String> = reachable.iter().cloned().collect();
+    present.extend(set_sonames.iter().cloned());
+    present.sort();
+    present.dedup();
+    for soname in &present {
+        discovery.observe_present(soname)?;
+    }
+
     if needed_by.is_empty() {
         eprintln!("All dependencies satisfied, nothing to bundle.");
+        let activations = discovery.activations();
+        report_activations(&activations);
+        publish_activations(activations);
         // PT_INTERP + RUNPATH rewrites still need to run. A prior bundle
         // may have left stale paths (e.g. from an older onelf version)
         // that either don't resolve under the current CWD policy or
@@ -1766,8 +1816,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // writes themselves queued for the executor.
     let mut plan = DestinationPlan::load(&opts.directory)?;
     let mut actions: Vec<WalkAction> = Vec::new();
-    let mut queue: Vec<String> = needed_by.keys().cloned().collect();
-    queue.sort();
+    // The walk's initial objects enter the shared discovery queue, and
+    // their sonames activate rules. Seeds are sorted, so the drain order
+    // is a function of the input set, not of enumeration order.
+    let mut seeds: Vec<String> = needed_by.keys().cloned().collect();
+    seeds.sort();
+    for soname in &seeds {
+        discovery.observe_present(soname)?;
+    }
+    discovery.seed(&seeds);
     // Name service modules glibc loads by dlopen, let through the excluded
     // `libnss_` prefix when libc lands: `compat` on every glibc, and
     // `files` and `dns` too before 2.34 folded those into libc.so.6.
@@ -1804,7 +1861,12 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
-    while let Some(soname) = queue.pop() {
+    while let Some(item) = discovery.pop() {
+        // A queued group is collected by the resource discovery phases;
+        // popping it here keeps the queue draining so the walk ends.
+        let WorkItem::Object(soname) = item else {
+            continue;
+        };
         if already_processed.contains(&soname)
             || (is_excluded(&soname, &excludes) && !nss_allow.contains(&soname))
         {
@@ -1973,7 +2035,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         needed_by
                             .entry(module.to_string())
                             .or_insert_with(|| "libc.so.6 (nsswitch)".into());
-                        queue.push(module.to_string());
+                        discovery.enqueue(module)?;
                     }
                 }
                 if let Some(hash) = content_hash
@@ -2063,7 +2125,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         needed_by
                             .entry(dep.clone())
                             .or_insert_with(|| soname.clone());
-                        queue.push(dep);
+                        discovery.enqueue(&dep)?;
                     }
                 }
             }
@@ -2078,6 +2140,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
         }
     }
+
+    // Activation has reached its fixed point: every soname the closure
+    // encountered has been matched, and no group queues further work
+    // until the resource discovery phases feed their objects back.
+    let activations = discovery.activations();
+    report_activations(&activations);
+    publish_activations(activations);
 
     // The interpreter alias links the loader needs, planned here so a
     // finding anywhere in the plan stops the build before the first

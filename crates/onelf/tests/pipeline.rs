@@ -646,6 +646,156 @@ fn build_is_byte_deterministic() {
     );
 }
 
+/// Compile a bare `main` that carries `libs` as versioned DT_NEEDED
+/// entries (`-l:` links the exact file, `--no-as-needed` keeps the
+/// dependency recorded although nothing is called). Returns false when
+/// the compiler or a named library is missing, the two conditions where
+/// no DT_NEEDED can be produced.
+fn cc_link_needed(src: &Path, out: &Path, libs: &[&str]) -> bool {
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        return false;
+    };
+    write(src, "int main(void){return 0;}\n");
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut args: Vec<String> = vec![
+        "-o".to_string(),
+        out.to_string_lossy().into_owned(),
+        "-Wl,--no-as-needed".to_string(),
+    ];
+    args.extend(libs.iter().map(|lib| format!("-l:{lib}")));
+    args.push(src.to_string_lossy().into_owned());
+    Command::new(compiler)
+        .args(&args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A DT_NEEDED entry naming a framework soname must activate that
+/// framework's descriptor rule during bundle-libs, with no --include and
+/// no manual flag, and the report must name the activating soname. The
+/// dependency is linked directly when the host library allows it and is
+/// added with patchelf otherwise, so activation is observable even on a
+/// host without the library installed (activation happens at scan time,
+/// before resolution).
+#[test]
+fn a_framework_soname_dependency_activates_its_rule_without_includes() {
+    for (soname, rule) in [
+        ("libasound.so.2", "alsa"),
+        ("libgstreamer-1.0.so.0", "gstreamer"),
+    ] {
+        let td = workdir("rule-activation");
+        let app = td.join("app");
+        let linked = cc_link_needed(&td.join("dep.c"), &app.join("bin/app"), &[soname]);
+        if !linked {
+            if !have("patchelf") {
+                skip(&format!(
+                    "neither {soname} nor patchelf is available to give a binary the need"
+                ));
+                continue;
+            }
+            write(&td.join("plain.c"), "int main(void){return 0;}\n");
+            assert!(
+                cc(&td.join("plain.c"), &app.join("bin/app")),
+                "compiler vanished mid-test"
+            );
+            let st = Command::new("patchelf")
+                .args(["--add-needed", soname])
+                .arg(app.join("bin/app"))
+                .status()
+                .expect("spawn patchelf");
+            assert!(st.success(), "patchelf --add-needed {soname} failed");
+        }
+        let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "bundle-libs: {err}");
+        let want = format!("{rule} ({soname})");
+        assert!(
+            err.contains("Rules:"),
+            "activation must be reported for {soname}; stderr:\n{err}"
+        );
+        assert!(
+            err.contains(&want),
+            "{soname} must activate {rule} with no include flag; stderr:\n{err}"
+        );
+    }
+}
+
+/// Reversing the enumeration order of equivalent recipe inputs (the
+/// `[bundle] include` list) must leave the activation report and every
+/// derived package entry identical: the walk seeds from a sorted set,
+/// so input order cannot reach the closure. The package embeds the
+/// recipe text verbatim, so that one entry carries the reversed list
+/// by construction; the comparison excludes it.
+#[test]
+fn reversed_input_order_leaves_identical_packages_and_activation() {
+    let build = |tag: &str, include: &str| -> (String, String) {
+        let td = workdir(tag);
+        let app = td.join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        assert!(
+            cc_libm(&td.join("prog.c"), &app.join("bin/prog")),
+            "compiler vanished mid-test"
+        );
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\nname=\"rev\"\ncommand=\"bin/prog\"\n\n\
+                 [bundle]\ninclude = {include}\n"
+            ),
+        );
+        let mut c = Command::new(onelf());
+        c.arg("build")
+            .current_dir(&app)
+            .env("SOURCE_DATE_EPOCH", "1700000000");
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        let o = c.output().expect("spawn onelf build");
+        assert!(
+            o.status.success(),
+            "build: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        let rules: Vec<&str> = err.lines().filter(|l| l.contains("Rules:")).collect();
+        let pkg = app.join("rev.onelf");
+        let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
+        assert!(
+            listing.status.success(),
+            "list: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&listing.stdout);
+        let entries: Vec<&str> = stdout
+            .lines()
+            .filter(|l| !l.trim_end().ends_with("onelf.toml"))
+            .collect();
+        (entries.join("\n"), rules.join("\n"))
+    };
+
+    let (entries_a, lines_a) = build("rev-a", "[\"libasound.so.2\", \"libm.so.6\"]");
+    let (entries_b, lines_b) = build("rev-b", "[\"libm.so.6\", \"libasound.so.2\"]");
+    assert!(
+        lines_a.contains("alsa (libasound.so.2)"),
+        "alsa must activate in both enumeration orders: {lines_a}"
+    );
+    assert_eq!(
+        lines_a, lines_b,
+        "the activation report must not depend on input order"
+    );
+    assert_eq!(
+        entries_a, entries_b,
+        "every derived entry must be identical regardless of input order"
+    );
+}
+
 /// A package whose footer manifest-checksum is corrupted must fail to run
 /// (the runtime verifies XXH32 over the manifest before deserializing).
 #[test]

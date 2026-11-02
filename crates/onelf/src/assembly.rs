@@ -211,6 +211,10 @@ pub struct AssemblyReport {
     /// Names of the shared sets recorded for the runtime to fetch, in
     /// recipe order.
     pub sets: Vec<String>,
+    /// Framework descriptor rules whose soname triggers matched during
+    /// the walk, in catalog order, each naming the soname that activated
+    /// it and the resource groups queued for it.
+    pub active_rules: Vec<bundle::RuleActivation>,
     /// Whether a whole GL build was pinned.
     pub pinned_gl: bool,
 }
@@ -528,6 +532,7 @@ impl AssemblyRequest {
                 frameworks: Vec::new(),
                 sets,
                 pinned_gl: self.bundle.platform_pin.is_some(),
+                active_rules: Vec::new(),
             });
         }
         bundle::bundle_libs(&self.bundle_options())?;
@@ -557,6 +562,7 @@ impl AssemblyRequest {
             },
             sets,
             pinned_gl: self.bundle.platform_pin.is_some(),
+            active_rules: bundle::take_activations(),
         })
     }
 
@@ -1253,6 +1259,7 @@ mod tests {
                 frameworks: Vec::new(),
                 sets: Vec::new(),
                 pinned_gl: false,
+                active_rules: Vec::new(),
             }
         );
         assert!(!dir.join(".onelf").exists());
