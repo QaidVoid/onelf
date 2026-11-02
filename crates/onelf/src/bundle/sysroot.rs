@@ -83,6 +83,169 @@ pub struct SysrootReport {
     pub sets: Vec<(String, Vec<String>)>,
     /// Sonames a shared set provides, which the verifier accepts.
     pub set_sonames: HashSet<String>,
+    /// What the build admitted, which descriptor discovery draws from.
+    #[allow(dead_code)]
+    pub(crate) universe: SysrootUniverse,
+}
+
+/// Why a sysroot build refuses a path descriptor discovery named. A
+/// component the source never had is distinct from one the build
+/// deliberately left out, and the report owes it that distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// No package in the sysroot owns it and the sysroot does not hold
+    /// it.
+    Absent,
+    /// A package the build left to the host or to a shared set whole
+    /// owns it.
+    HostPackage {
+        /// The owning package's name.
+        owner: String,
+    },
+    /// A package the recipe never selected owns it. Discovery never
+    /// selects packages.
+    UnselectedPackage {
+        /// The owning package's name.
+        owner: String,
+    },
+    /// A selected package owns it, but the policy or a trace removed it.
+    Pruned {
+        /// The owning package's name.
+        owner: String,
+    },
+}
+
+/// What a populated sysroot build admits, and why it refuses the rest.
+///
+/// Descriptor discovery draws its candidates from the file universe the
+/// build put into the AppDir: the closure of the application's package
+/// and the optional packages the recipe named, after the platform line,
+/// the policy and a trace pruned it. Everything else the sysroot tree
+/// may still hold is refused with the reason. The universe holds the
+/// sysroot root and nothing beyond it, so a sysroot build's discovery
+/// never reads the packer's own machine, never selects an unselected
+/// optional package, and never restores what the policy or a trace
+/// removed.
+#[derive(Debug, Default)]
+pub struct SysrootUniverse {
+    /// The sysroot the universe answers for. Empty when the build had
+    /// no sysroot.
+    root: PathBuf,
+    /// The sysroot-relative files the build copied.
+    kept: HashSet<String>,
+    /// The kept files' ancestor directories, so a directory is admitted
+    /// exactly when it still holds admitted content.
+    kept_dirs: HashSet<String>,
+    /// The sysroot-relative files of packages the build left to the
+    /// host or to a shared set whole.
+    left_out: HashSet<String>,
+    /// The admitted package names.
+    closure: HashSet<String>,
+    /// The sysroot's package database, which attributes a refusal to
+    /// the package owning the refused path.
+    db: Database,
+}
+
+#[allow(dead_code)]
+impl SysrootUniverse {
+    /// The universe a populated build admits: `kept` are the
+    /// sysroot-relative files the closure and the pruning tiers left
+    /// in, `left_out` the files of packages handed to the host or a
+    /// shared set whole, and `closure` the admitted package names. The
+    /// decisions are populate's; this only records them.
+    pub(crate) fn admit(
+        root: &Path,
+        db: Database,
+        kept: &[String],
+        left_out: &HashSet<String>,
+        closure: &[String],
+    ) -> Self {
+        let mut universe = Self {
+            root: root.to_path_buf(),
+            kept: kept.iter().cloned().collect(),
+            left_out: left_out.clone(),
+            closure: closure.iter().cloned().collect(),
+            db,
+            ..Default::default()
+        };
+        for file in &universe.kept {
+            for dir in Path::new(file).ancestors().skip(1) {
+                if dir.as_os_str().is_empty() {
+                    continue;
+                }
+                universe
+                    .kept_dirs
+                    .insert(dir.to_string_lossy().into_owned());
+            }
+        }
+        universe
+    }
+
+    /// The sysroot root the universe answers for. Discovery resolves
+    /// every candidate against it and nothing outside it.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether a sysroot-relative path is admitted: a file the build
+    /// copied, or a directory that still holds copied files.
+    pub(crate) fn admits(&self, rel: &str) -> bool {
+        let rel = rel.trim_start_matches('/');
+        self.kept.contains(rel) || self.kept_dirs.contains(rel)
+    }
+
+    /// The admitted files under a sysroot-relative directory, sorted, so
+    /// a directory candidate is walked no further than the build's own
+    /// content and never restores what pruning removed.
+    pub(crate) fn admitted_under(&self, dir: &str) -> Vec<String> {
+        let prefix = format!("{}/", dir.trim_start_matches('/'));
+        let mut files: Vec<String> = self
+            .kept
+            .iter()
+            .filter(|f| f.starts_with(&prefix))
+            .cloned()
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Why a sysroot-relative path is not admitted. A path
+    /// [`Self::admits`] answers for has no refusal. A directory is
+    /// owned by no package, so its refusal is the content under it: the
+    /// first owning package in the database's order speaks for it.
+    pub(crate) fn refusal(&self, rel: &str) -> Refusal {
+        let rel = rel.trim_start_matches('/');
+        if let Some(owner) = self.db.owner(rel) {
+            return self.classify(rel, &owner.name);
+        }
+        let prefix = format!("{rel}/");
+        for package in self.db.packages() {
+            for file in &package.files {
+                if file.starts_with(&prefix) {
+                    return self.classify(file, &package.name);
+                }
+            }
+        }
+        Refusal::Absent
+    }
+
+    /// The refusal for `file`, which `owner` owns, against the build's
+    /// decisions.
+    fn classify(&self, file: &str, owner: &str) -> Refusal {
+        if self.left_out.contains(file) {
+            Refusal::HostPackage {
+                owner: owner.to_string(),
+            }
+        } else if self.closure.contains(owner) {
+            Refusal::Pruned {
+                owner: owner.to_string(),
+            }
+        } else {
+            Refusal::UnselectedPackage {
+                owner: owner.to_string(),
+            }
+        }
+    }
 }
 
 /// Copy the closure of the entrypoint's package into `appdir`. Returns
@@ -321,13 +484,18 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
     host_provided.sort();
     host_provided.dedup();
 
+    let packages: Vec<(String, String)> = closure
+        .packages
+        .iter()
+        .filter_map(|n| db.package(n))
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    // What this build admitted is what descriptor discovery may draw
+    // from: the closure and the pruning tiers above decided it, and the
+    // universe records the decision.
+    let universe = SysrootUniverse::admit(root, db, &pruned.kept, &host_files, &closure.packages);
     let mut report = SysrootReport {
-        packages: closure
-            .packages
-            .iter()
-            .filter_map(|n| db.package(n))
-            .map(|p| (p.name.clone(), p.version.clone()))
-            .collect(),
+        packages,
         unsatisfied: closure.unsatisfied.clone(),
         host_provided,
         removed_platform,
@@ -337,6 +505,7 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         host_files,
         sets: set_report,
         set_sonames,
+        universe,
         ..Default::default()
     };
     for rel in &pruned.kept {
@@ -1975,9 +2144,55 @@ pub fn print_report(opts: &SysrootOptions, report: &SysrootReport) {
     }
 }
 
+/// Fixtures the sysroot and discovery tests share: packages in memory
+/// and the universe a populate over them would admit, decided by the
+/// same closure and pruning calls populate makes.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    use onelf_sysroot::prune::prune;
+    use onelf_sysroot::{Database, Package, Policy, Trace};
+
+    use super::SysrootUniverse;
+
+    /// A package owning `files`, relative to the root.
+    pub(crate) fn package(name: &str, files: &[&str]) -> Package {
+        Package {
+            name: name.to_string(),
+            version: "1.0-1".to_string(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The universe a populate of `owner` and `optional` admits from the
+    /// packages, with the platform line out of the way and the policy
+    /// and trace the caller supplies.
+    pub(crate) fn populate_universe(
+        root: &Path,
+        packages: &[Package],
+        owner: &str,
+        optional: &[String],
+        policy: Option<&Policy>,
+        trace: Option<&Trace>,
+    ) -> SysrootUniverse {
+        let mut db = Database::default();
+        for package in packages {
+            db.insert(package.clone());
+        }
+        let closure = db.closure(owner, optional);
+        let files = db.files_of(&closure);
+        let pruned = prune(&files, None, policy, trace, &HashSet::new(), None);
+        SysrootUniverse::admit(root, db, &pruned.kept, &HashSet::new(), &closure.packages)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onelf_sysroot::Package;
 
     /// A module cache names the packaging distribution's own filesystem.
     /// Left that way it sends the bundle to the host's modules, which on
@@ -2875,5 +3090,207 @@ mod tests {
         extra.push("libb.so.2".to_owned());
         assert!(check_index(&index, "gtk", pin, &extra).is_err());
         assert!(check_index(&index, "gtk", pin, &[]).is_err());
+    }
+
+    /// The database and sysroot tree the eligibility tests share: an
+    /// application, its library, and a plugin package nothing depends on
+    /// and the recipe does not name.
+    fn selectable_sysroot(root: &Path) -> Vec<Package> {
+        let mut app = fixture::package("app", &["usr/bin/app"]);
+        app.depends = vec!["glib".into()];
+        let glib = fixture::package(
+            "glib",
+            &[
+                "usr/lib/libglib-2.0.so.0",
+                "usr/share/glib-2.0/schemas/gschemas.compiled",
+            ],
+        );
+        let extra = fixture::package("extra", &["usr/lib/gstreamer-1.0/libgstextra.so"]);
+        for package in [&app, &glib, &extra] {
+            for file in &package.files {
+                let path = root.join(file);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&path, b"x").unwrap();
+            }
+        }
+        vec![app, glib, extra]
+    }
+
+    /// A plugin package the recipe never selected stays out of the
+    /// universe, and naming it explicitly is what brings it in.
+    #[test]
+    fn an_unselected_optional_package_is_never_expanded() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-universe-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("sys");
+        let packages = selectable_sysroot(&root);
+
+        let universe = fixture::populate_universe(&root, &packages, "app", &[], None, None);
+        assert_eq!(universe.root(), root);
+        assert!(
+            !universe.admits("usr/lib/gstreamer-1.0"),
+            "the plugin directory of an unselected package is not admitted"
+        );
+        assert_eq!(
+            universe.admitted_under("usr/lib/gstreamer-1.0"),
+            Vec::<String>::new(),
+            "discovery never walks into an unselected package"
+        );
+        assert_eq!(
+            universe.refusal("usr/lib/gstreamer-1.0/libgstextra.so"),
+            Refusal::UnselectedPackage {
+                owner: "extra".to_string()
+            }
+        );
+        assert!(
+            universe.admits("usr/lib/libglib-2.0.so.0"),
+            "the selected closure is admitted"
+        );
+
+        let named = vec!["extra".to_string()];
+        let universe = fixture::populate_universe(&root, &packages, "app", &named, None, None);
+        assert!(
+            universe.admits("usr/lib/gstreamer-1.0"),
+            "an explicitly selected package is admitted"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Content the policy or a trace removed stays out of the universe,
+    /// with the refusal naming the selected package that owns it rather
+    /// than claiming the source lacks it.
+    #[test]
+    fn policy_and_trace_pruned_content_is_never_resurrected() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-universe-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("sys");
+        let mut packages = selectable_sysroot(&root);
+        let mut gst = fixture::package(
+            "gst",
+            &[
+                "usr/lib/gstreamer-1.0/libgstcore.so",
+                "usr/lib/gstreamer-1.0/libgstbad.so",
+                "usr/share/gstreamer-1.0/taglists.def",
+            ],
+        );
+        gst.depends = vec!["glib".into()];
+        for file in &gst.files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+        }
+        packages.push(gst);
+        packages[0].depends.push("gst".into());
+
+        let policy_path = dir.join("policy.txt");
+        fs::write(&policy_path, "usr/lib/gstreamer-1.0/libgstbad.so\n").unwrap();
+        let policy = Policy::load(&policy_path).unwrap();
+        let universe =
+            fixture::populate_universe(&root, &packages, "app", &[], Some(&policy), None);
+        assert_eq!(
+            universe.refusal("usr/lib/gstreamer-1.0/libgstbad.so"),
+            Refusal::Pruned {
+                owner: "gst".to_string()
+            },
+            "a policy removal is named as one, not as absence"
+        );
+        assert_eq!(
+            universe.admitted_under("usr/lib/gstreamer-1.0"),
+            ["usr/lib/gstreamer-1.0/libgstcore.so"],
+            "the surviving members of a pruned directory stay admitted"
+        );
+
+        let trace = Trace::from_paths(vec![
+            "/usr/bin/app".into(),
+            "/usr/lib/gstreamer-1.0/libgstcore.so".into(),
+        ]);
+        let universe = fixture::populate_universe(&root, &packages, "app", &[], None, Some(&trace));
+        assert_eq!(
+            universe.refusal("usr/share/gstreamer-1.0/taglists.def"),
+            Refusal::Pruned {
+                owner: "gst".to_string()
+            },
+            "a trace removal is named as one too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file of a package left to the host or a shared set whole is
+    /// refused with its owner named, and a path nothing owns is absent
+    /// rather than pruned.
+    #[test]
+    fn host_package_files_and_unowned_paths_are_refused_by_reason() {
+        let root = Path::new("/fixture").join("sys");
+        let gst = fixture::package(
+            "gst",
+            &[
+                "usr/lib/libgstreamer-1.0.so.0",
+                "usr/lib/libnvidia-glcore.so.1",
+            ],
+        );
+        let mut left_out = HashSet::new();
+        left_out.insert("usr/lib/libnvidia-glcore.so.1".to_string());
+        let kept = vec!["usr/lib/libgstreamer-1.0.so.0".to_string()];
+        let universe = SysrootUniverse::admit(
+            &root,
+            {
+                let mut db = Database::default();
+                db.insert(gst);
+                db
+            },
+            &kept,
+            &left_out,
+            &["gst".to_string()],
+        );
+        assert_eq!(
+            universe.refusal("usr/lib/libnvidia-glcore.so.1"),
+            Refusal::HostPackage {
+                owner: "gst".to_string()
+            },
+            "the package left to the host is the one named"
+        );
+        assert!(!universe.admits("usr/lib/libnvidia-glcore.so.1"));
+        assert_eq!(universe.refusal("usr/share/nothing"), Refusal::Absent);
+    }
+
+    /// A directory is admitted exactly while it holds admitted content:
+    /// once everything under it is pruned, the directory is no longer a
+    /// discovery root either.
+    #[test]
+    fn a_directory_is_admitted_only_while_it_holds_admitted_content() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-universe-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("sys");
+        let mut packages = selectable_sysroot(&root);
+        let mut gst = fixture::package(
+            "gst",
+            &[
+                "usr/lib/gstreamer-1.0/libgstcore.so",
+                "usr/lib/gstreamer-1.0/libgstbad.so",
+            ],
+        );
+        gst.depends = vec!["glib".into()];
+        for file in &gst.files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+        }
+        packages.push(gst);
+
+        let policy_path = dir.join("policy.txt");
+        fs::write(&policy_path, "usr/lib/gstreamer-1.0/**\n").unwrap();
+        let policy = Policy::load(&policy_path).unwrap();
+        let universe =
+            fixture::populate_universe(&root, &packages, "app", &[], Some(&policy), None);
+        assert!(
+            !universe.admits("usr/lib/gstreamer-1.0"),
+            "a directory whose every file was pruned holds nothing admitted"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

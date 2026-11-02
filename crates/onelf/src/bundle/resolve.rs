@@ -3,6 +3,13 @@
 
 use super::*;
 
+mod candidates;
+#[allow(unused_imports)]
+pub(crate) use candidates::{
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, CandidateMiss, GroupClassification,
+    GroupOutcome, GroupQuery, MissReason, discover_group,
+};
+
 /// Scan `dir` for existing shared libraries. Returns the set of sonames
 /// found and, separately, the paths of any NixOS stub loaders. The scan
 /// never deletes: the caller removes stubs only in the non-dry-run copy
