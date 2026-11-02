@@ -14,6 +14,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use onelf_format::knowledge::{self, ValueShape};
+
 /// The record of what the runtime changed, read by the `onelf-env` exec
 /// hooks. See [`record_host_env`] for the format.
 const HOST_ENV_VAR: &str = "ONELF_HOST_ENV";
@@ -25,52 +27,6 @@ const ROOTS_VAR: &str = "ONELF_ROOTS";
 /// [`capture_starting_env`] cleaned it.
 static STARTING_ENV: OnceLock<BTreeMap<OsString, OsString>> = OnceLock::new();
 
-/// Variables naming modules, drivers or data that a library loads into
-/// the process reading them. A value pointing into another onelf package
-/// is that package's, and is never right for this one.
-const MODULE_VARS: &[&str] = &[
-    "QT_PLUGIN_PATH",
-    "GIO_MODULE_DIR",
-    "GIO_EXTRA_MODULES",
-    "GDK_PIXBUF_MODULE_FILE",
-    "GTK_IM_MODULE_FILE",
-    "GTK_PATH",
-    "GCONV_PATH",
-    "FONTCONFIG_FILE",
-    "LIBDECOR_PLUGIN_DIR",
-    "LIBGL_DRIVERS_PATH",
-    "LIBVA_DRIVERS_PATH",
-    "GBM_BACKENDS_PATH",
-    "__EGL_VENDOR_LIBRARY_DIRS",
-    "VK_DRIVER_FILES",
-    "VK_ADD_DRIVER_FILES",
-    "DRIRC_CONFIGDIR",
-    "LIBDRM_IDS_PATH",
-    "XKB_CONFIG_ROOT",
-    "GST_PLUGIN_SYSTEM_PATH_1_0",
-    "GST_PLUGIN_SYSTEM_PATH",
-    "GST_PLUGIN_SCANNER_1_0",
-    "GST_PLUGIN_SCANNER",
-    "PIPEWIRE_MODULE_DIR",
-    "SPA_PLUGIN_DIR",
-    "GI_TYPELIB_PATH",
-    "LIBHEIF_PLUGIN_PATH",
-    "BABL_PATH",
-    "GEGL_PATH",
-    "ALSA_PLUGIN_DIR",
-    "ALSA_CONFIG_DIR",
-    "ALSA_CONFIG_PATH",
-    "TCL_LIBRARY",
-    "TK_LIBRARY",
-    "TEXTDOMAINDIR",
-    "XLOCALEDIR",
-    "MAGIC",
-    "TERMINFO_DIRS",
-    "SSL_CERT_FILE",
-    "CURL_CA_BUNDLE",
-    "LOCPATH",
-];
-
 /// Clean the environment this runtime was started with and remember it,
 /// before anything else here changes it.
 ///
@@ -79,7 +35,10 @@ const MODULE_VARS: &[&str] = &[
 /// cannot see (a static binary, `system`, `execl`) still carries the
 /// launching package's record, which is applied here instead. A module
 /// variable that still points into another package after that is
-/// dropped.
+/// dropped: the launch maps these names from the package and its sets
+/// instead. Nothing here has been applied yet, so a value naming any
+/// package tree comes from an outer launch, the application's own
+/// included.
 pub fn capture_starting_env() {
     if let Some(record) = env::var_os(HOST_ENV_VAR) {
         for entry in parse_record(record.as_bytes()) {
@@ -96,18 +55,41 @@ pub fn capture_starting_env() {
         }
         unsafe { env::remove_var(HOST_ENV_VAR) };
     }
-    for var in MODULE_VARS {
-        let foreign = env::var_os(var).is_some_and(|value| {
-            value
-                .as_bytes()
-                .split(|&b| b == b':')
-                .any(|p| in_onelf_package(Path::new(OsStr::from_bytes(p))))
-        });
-        if foreign {
-            unsafe { env::remove_var(var) };
+    purge_foreign_modules();
+    let _ = STARTING_ENV.set(env::vars_os().collect());
+}
+
+/// Drop every mapped module variable still pointing into another
+/// package.
+///
+/// The names and their shapes come from the catalog's runtime path
+/// definitions and the closed hook and procedure lists beside them, so
+/// a mapping added there is classified here without a further list.
+fn purge_foreign_modules() {
+    for name in knowledge::names() {
+        if let Some(class) = knowledge::classify(name) {
+            drop_foreign(name, class);
         }
     }
-    let _ = STARTING_ENV.set(env::vars_os().collect());
+}
+
+/// Drop `name` when its present value names another package's modules,
+/// drivers or data: a path list is answered by any entry inside a
+/// package, a single path by the whole value. Returns whether the
+/// variable was dropped.
+fn drop_foreign(name: &str, class: onelf_format::knowledge::NameClass) -> bool {
+    let foreign = env::var_os(name).is_some_and(|value| match class.shape {
+        ValueShape::List => value
+            .as_bytes()
+            .split(|&b| b == b':')
+            .any(|part| in_onelf_package(Path::new(OsStr::from_bytes(part)))),
+        ValueShape::Single => in_onelf_package(Path::new(OsStr::from_bytes(value.as_bytes()))),
+    });
+    if foreign {
+        // SAFETY: the runtime is single-threaded at this point
+        unsafe { env::remove_var(name) };
+    }
+    foreign
 }
 
 /// Whether `path` lies in an onelf package tree, or in what a runtime
@@ -395,5 +377,230 @@ mod tests {
     fn the_hash_is_fnv1a() {
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use onelf_format::knowledge;
+
+    use super::drop_foreign;
+
+    /// The environment is process-global and the test runner runs tests
+    /// in parallel: every test here that sets or asserts a variable
+    /// holds this lock while it does. The variables named here are ones
+    /// no other test in this crate touches.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set(name: &str, value: &Path) {
+        // SAFETY: the tests hold the environment lock
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    fn dropped(name: &str) -> bool {
+        let class = knowledge::classify(name).expect("the name is classified");
+        drop_foreign(name, class)
+    }
+
+    /// The names the classification covers are exactly the module
+    /// variables this file listed by hand before the derivation
+    /// replaced that list.
+    #[test]
+    fn the_mapped_names_are_classified_without_a_local_table() {
+        let legacy: BTreeSet<&str> = [
+            "QT_PLUGIN_PATH",
+            "GIO_MODULE_DIR",
+            "GIO_EXTRA_MODULES",
+            "GDK_PIXBUF_MODULE_FILE",
+            "GTK_IM_MODULE_FILE",
+            "GTK_PATH",
+            "GCONV_PATH",
+            "FONTCONFIG_FILE",
+            "LIBDECOR_PLUGIN_DIR",
+            "LIBGL_DRIVERS_PATH",
+            "LIBVA_DRIVERS_PATH",
+            "GBM_BACKENDS_PATH",
+            "__EGL_VENDOR_LIBRARY_DIRS",
+            "VK_DRIVER_FILES",
+            "VK_ADD_DRIVER_FILES",
+            "DRIRC_CONFIGDIR",
+            "LIBDRM_IDS_PATH",
+            "XKB_CONFIG_ROOT",
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SYSTEM_PATH",
+            "GST_PLUGIN_SCANNER_1_0",
+            "GST_PLUGIN_SCANNER",
+            "PIPEWIRE_MODULE_DIR",
+            "SPA_PLUGIN_DIR",
+            "GI_TYPELIB_PATH",
+            "LIBHEIF_PLUGIN_PATH",
+            "BABL_PATH",
+            "GEGL_PATH",
+            "ALSA_PLUGIN_DIR",
+            "ALSA_CONFIG_DIR",
+            "ALSA_CONFIG_PATH",
+            "TCL_LIBRARY",
+            "TK_LIBRARY",
+            "TEXTDOMAINDIR",
+            "XLOCALEDIR",
+            "MAGIC",
+            "TERMINFO_DIRS",
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "LOCPATH",
+        ]
+        .into_iter()
+        .collect();
+        let mapped: BTreeSet<&str> = knowledge::names().collect();
+        assert_eq!(mapped, legacy);
+    }
+
+    /// A value under another package's tree names that package's
+    /// modules, drivers or data and is dropped; the application's own
+    /// tree reads the same way, since nothing has been applied yet when
+    /// the starting environment is captured. Host paths stay.
+    #[test]
+    fn a_foreign_package_value_is_dropped_and_a_host_value_kept() {
+        let _guard = env_lock();
+        let work = std::env::temp_dir().join(format!("onelf-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let other = work.join("other-package");
+        std::fs::create_dir_all(other.join(".onelf")).unwrap();
+
+        set(
+            "VK_ADD_DRIVER_FILES",
+            &other.join("share/vulkan/icd.d/a.json"),
+        );
+        set(
+            "LIBDECOR_PLUGIN_DIR",
+            &other.join("share/libdecor/plugins-1"),
+        );
+        assert!(dropped("VK_ADD_DRIVER_FILES"));
+        assert!(dropped("LIBDECOR_PLUGIN_DIR"));
+
+        set(
+            "VK_ADD_DRIVER_FILES",
+            Path::new("/usr/share/vulkan/icd.d/a.json"),
+        );
+        set(
+            "LIBDECOR_PLUGIN_DIR",
+            Path::new("/usr/lib/x86_64-linux-gnu/libdecor/plugins-1"),
+        );
+        assert!(!dropped("VK_ADD_DRIVER_FILES"));
+        assert!(!dropped("LIBDECOR_PLUGIN_DIR"));
+        assert_eq!(
+            std::env::var("VK_ADD_DRIVER_FILES").as_deref(),
+            Ok("/usr/share/vulkan/icd.d/a.json")
+        );
+        assert_eq!(
+            std::env::var("LIBDECOR_PLUGIN_DIR").as_deref(),
+            Ok("/usr/lib/x86_64-linux-gnu/libdecor/plugins-1")
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A path list is answered by any entry inside a package, and a
+    /// single path by the whole value: one foreign entry poisons a list,
+    /// while a single-path value that does not itself lie in a package
+    /// stays.
+    #[test]
+    fn a_path_list_is_answered_by_any_entry_inside_a_package() {
+        let _guard = env_lock();
+        let work = std::env::temp_dir().join(format!("onelf-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let other = work.join("other-package");
+        std::fs::create_dir_all(other.join(".onelf")).unwrap();
+
+        let foreign_list = format!(
+            "{}:/usr/share/vulkan/icd.d",
+            other.join("share/vulkan/icd.d").display()
+        );
+        let foreign_single = format!(
+            "/usr/lib64:{}",
+            other.join("share/libdecor/plugins-1").display()
+        );
+        set("VK_ADD_DRIVER_FILES", Path::new(&foreign_list));
+        set("LIBDECOR_PLUGIN_DIR", Path::new(&foreign_single));
+        assert!(dropped("VK_ADD_DRIVER_FILES"));
+        assert!(!dropped("LIBDECOR_PLUGIN_DIR"));
+        assert_eq!(
+            std::env::var("LIBDECOR_PLUGIN_DIR").as_deref(),
+            Ok(foreign_single.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A value under what a runtime generated for a package, the 0700
+    /// private base, is the package's too, and is dropped.
+    #[test]
+    fn a_private_runtime_output_value_is_dropped() {
+        let _guard = env_lock();
+        let base = crate::paths::private_dir().expect("private base exists in tests");
+        let generated = base.join("onelf-fixture/share/drirc.d");
+        set("DRIRC_CONFIGDIR", &generated);
+        assert!(dropped("DRIRC_CONFIGDIR"));
+    }
+
+    /// Every alternative location the catalog declares is found by the
+    /// runtime evaluator, with the group's own aliases and value: the
+    /// definitions the lint's carried-place check derives from are the
+    /// ones the launch evaluates.
+    #[test]
+    fn every_catalog_alternative_the_runtime_finds_matches_the_definitions() {
+        use crate::env::{Scope, builtin_path_groups, evaluate_path_groups};
+        use onelf_format::rules::{EnvironmentName, ResourceKind, RuntimeBase};
+
+        let work = std::env::temp_dir().join(format!("onelf-alt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let mut checked = 0;
+        for group in builtin_path_groups() {
+            for (index, candidate) in group.candidates.iter().enumerate() {
+                let root = work.join(format!("{}-{}", group.id.as_str(), index));
+                let base = match candidate.base {
+                    RuntimeBase::PackageRoot => root.clone(),
+                    RuntimeBase::LibraryRoot => root.join("lib"),
+                };
+                let path = base.join(candidate.path.as_str());
+                match group.kind {
+                    ResourceKind::File => {
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(&path, "").unwrap();
+                    }
+                    ResourceKind::Directory => std::fs::create_dir_all(&path).unwrap(),
+                }
+                let lib = root.join("lib");
+                let scopes = [Scope {
+                    packages: &[root.as_path()],
+                    libraries: std::slice::from_ref(&lib),
+                }];
+
+                let got = evaluate_path_groups([group], &scopes);
+
+                assert_eq!(got.len(), 1, "{}", group.id.as_str());
+                assert_eq!(
+                    got[0].variables,
+                    group
+                        .variables
+                        .iter()
+                        .map(EnvironmentName::as_str)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(got[0].value, path.into_os_string());
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no catalog candidates evaluated");
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
