@@ -16403,3 +16403,728 @@ fn a_fallback_launch_keeps_its_isolation() {
     }
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// The late-loader fixture's C source. One app covers every scenario
+/// through its environment: it reports the tree it runs from on stdout,
+/// optionally double-forks into a helper that drops every inherited
+/// descriptor (`$DAEMON`, `$READY` marks the moment), waits for `$GATE`,
+/// loads every soname named in `$PLUGIN`, defaulting to its own bundled
+/// plugin and a host driver by name, and writes one
+/// `late=<soname>:<value>` line per load to `$RESULT`, then waits for
+/// `$HOLD` and marks `$DONE` on its way out. The bundled plugin answers
+/// 42 and a fixture host driver answers its own value, so the report
+/// names which copy each load reached. The soname defaults stay in the
+/// binary, which is how a driver-reaching package tells the packer it
+/// needs the launch resolver.
+const LATE_LOADER_SRC: &str = r#"#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void wait_for_file(const char *path) {
+    if (!path || !*path) {
+        return;
+    }
+    for (int i = 0; i < 600; i++) {
+        FILE *g = fopen(path, "r");
+        if (g) {
+            fclose(g);
+            return;
+        }
+        usleep(50000);
+    }
+}
+
+int main(void) {
+    const char *daemon = getenv("DAEMON");
+    const char *ready = getenv("READY");
+    const char *gate = getenv("GATE");
+    const char *plugin = getenv("PLUGIN");
+    const char *result = getenv("RESULT");
+    const char *hold = getenv("HOLD");
+    const char *done = getenv("DONE");
+    const char *dir = getenv("ONELF_DIR");
+    if (!plugin || !*plugin) {
+        plugin = "libplugin.so.1:libGL.so.1";
+    }
+    printf("dir=%s\n", dir ? dir : "unset");
+    fflush(stdout);
+    if (daemon && *daemon) {
+        if (fork() != 0) {
+            _exit(0);
+        }
+        setsid();
+#ifdef SYS_close_range
+        if (syscall(SYS_close_range, 0u, 0xffffffffu, 0u) != 0)
+#endif
+        {
+            for (int fd = 0; fd < 1024; fd++) {
+                close(fd);
+            }
+        }
+        if (ready && *ready) {
+            FILE *r = fopen(ready, "w");
+            if (r) {
+                fputs("closed", r);
+                fclose(r);
+            }
+        }
+    }
+    wait_for_file(gate);
+    if (result && *result) {
+        FILE *out = fopen(result, "w");
+        if (out) {
+            const char *rest = plugin ? plugin : "";
+            while (*rest) {
+                const char *end = rest;
+                while (*end && *end != ':') {
+                    end++;
+                }
+                char name[256];
+                size_t len = (size_t)(end - rest);
+                if (len >= sizeof(name)) {
+                    len = sizeof(name) - 1;
+                }
+                memcpy(name, rest, len);
+                name[len] = 0;
+                void *h = dlopen(name, RTLD_NOW);
+                if (!h) {
+                    fprintf(out, "late=%s:failed\n", name);
+                } else {
+                    int (*value)(void) = (int (*)(void))dlsym(h, "plugin_value");
+                    if (value) {
+                        fprintf(out, "late=%s:%d\n", name, value());
+                    } else {
+                        fprintf(out, "late=%s:nosym\n", name);
+                    }
+                }
+                rest = *end ? end + 1 : end;
+            }
+            fclose(out);
+        }
+    }
+    wait_for_file(hold);
+    if (done && *done) {
+        FILE *b = fopen(done, "w");
+        if (b) {
+            fputs("gone", b);
+            fclose(b);
+        }
+    }
+    return 0;
+}
+"#;
+
+/// Pack the late-loader fixture: the compiled app as `bin/run` beside
+/// the bundled plugin `lib/libplugin.so.1`, and nothing else, so the
+/// package carries no sets of any kind and every late load resolves the
+/// ordinary way. Returns an empty path when no compiler is available,
+/// the fixture's only soft-skip condition.
+fn pack_late_loader(td: &Path, name: &str) -> PathBuf {
+    let app = td.join(name);
+    let src = td.join(format!("{name}.c"));
+    let bin = app.join("bin/run");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    write(&src, LATE_LOADER_SRC);
+    if !cc_with(&[src.to_str().unwrap(), "-ldl"], &bin) {
+        return PathBuf::new();
+    }
+    let plugin_src = td.join(format!("{name}-plugin.c"));
+    write(&plugin_src, "int plugin_value(void){return 42;}\n");
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libplugin.so.1",
+            plugin_src.to_str().unwrap(),
+        ],
+        &app.join("lib/libplugin.so.1"),
+    ) {
+        return PathBuf::new();
+    }
+    let pkg = td.join(format!("{name}.onelf"));
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", name])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    pkg
+}
+
+/// Start the late-loader package in `mode` with `envs` laid on, and
+/// return the child with its first output line, which names the tree or
+/// view the launch runs from.
+fn start_late_loader(
+    pkg: &Path,
+    td: &Path,
+    mode: &str,
+    envs: &[(&str, &str)],
+) -> (std::process::Child, PathBuf) {
+    let mut run = Command::new(pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", mode)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut run, td);
+    for (name, value) in envs {
+        run.env(name, value);
+    }
+    let mut child = spawn_package(&mut run);
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let tree = PathBuf::from(line.trim().strip_prefix("dir=").unwrap_or(""));
+    (child, tree)
+}
+
+/// Compile a host driver pair into `dir`: `libGL.so.1` whose
+/// `plugin_value` calls through `libfixture.so.1`. A package carrying
+/// neither library reaches them only through the resolver's farm, so a
+/// late load of `libGL.so.1` proves both the farm link and its
+/// dependency resolved from the same host state. Returns false when no
+/// compiler is available.
+fn host_driver_pair(td: &Path, tag: &str, dir: &Path, value: i32) -> bool {
+    std::fs::create_dir_all(dir).unwrap();
+    let fixture_src = td.join(format!("{tag}-fixture.c"));
+    write(
+        &fixture_src,
+        &format!("int fix_extra(void){{return {value};}}\n"),
+    );
+    let fixture = dir.join("libfixture.so.1");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfixture.so.1",
+            fixture_src.to_str().unwrap(),
+        ],
+        &fixture,
+    ) {
+        return false;
+    }
+    let gl_src = td.join(format!("{tag}-gl.c"));
+    write(
+        &gl_src,
+        "extern int fix_extra(void);\nint plugin_value(void){return fix_extra();}\n",
+    );
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            gl_src.to_str().unwrap(),
+            &format!("-L{}", dir.display()),
+            "-l:libfixture.so.1",
+        ],
+        &dir.join("libGL.so.1"),
+    ));
+    true
+}
+
+/// The resolver's link farms under the private runtime directory: one
+/// per host state, named by its fingerprint and its winners.
+fn farms_of(td: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let run_dir = td.join("xdg-run");
+    for store in std::fs::read_dir(&run_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("resolve-"))
+    {
+        for entry in std::fs::read_dir(store.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("farm-"))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// How many view directories the cache view store holds.
+fn view_count(views: &Path) -> usize {
+    std::fs::read_dir(views)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Run `onelf cache gc --max-age 0` against `cache` and return its
+/// report.
+fn cache_gc(cache: &Path, home: &Path) -> String {
+    let o = Command::new(onelf())
+        .args(["cache", "gc", "--max-age", "0"])
+        .env("XDG_CACHE_HOME", cache)
+        .env("HOME", home.to_str().unwrap())
+        .output()
+        .expect("spawn onelf cache gc");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// A package with no sets loads its plugins late, once the launch
+/// machinery is fully up: one from its own tree or view, and one that
+/// only the host supplies, reached through the resolver's farm. Every
+/// execution mode that can hold the launch open shows the same outcome,
+/// and nothing in the view or the leases stands in the load's way.
+#[test]
+fn a_late_plugin_load_survives_a_launch_without_sets() {
+    let td = workdir("latenosets");
+    let host = td.join("host/lib");
+    if !host_driver_pair(&td, "host", &host, 2) {
+        return; // no compiler: documented soft-skip
+    }
+    let cache = td.join("ld.so.cache");
+    std::fs::write(
+        &cache,
+        ld_so_cache(&[&host.join("libGL.so.1"), &host.join("libfixture.so.1")]),
+    )
+    .unwrap();
+    let pkg = pack_late_loader(&td, "late");
+    if pkg.as_os_str().is_empty() {
+        return; // no compiler: documented soft-skip
+    }
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let private_run = td.join("xdg-run");
+    let views = td.join("xdg-cache/onelf/views");
+
+    let mut modes: Vec<(&str, PathBuf)> =
+        vec![("rundir", private_run.clone()), ("cache", views.clone())];
+    if tmpfs_available() {
+        modes.push(("tmpfs", private_run.clone()));
+    }
+    if fuse_available() {
+        modes.push(("fuse", private_run.clone()));
+    }
+    for (mode, base) in modes {
+        let _ = std::fs::remove_file(&gate);
+        let _ = std::fs::remove_file(&result);
+        let (mut child, view) = start_late_loader(
+            &pkg,
+            &td,
+            mode,
+            &[
+                ("PLUGIN", "libplugin.so.1:libGL.so.1"),
+                ("GATE", gate.to_str().unwrap()),
+                ("RESULT", result.to_str().unwrap()),
+                ("ONELF_LD_CACHE", cache.to_str().unwrap()),
+            ],
+        );
+        assert!(
+            view.starts_with(&base),
+            "{mode}: the launch runs from its own tree: {}",
+            view.display()
+        );
+        assert!(
+            view.is_dir(),
+            "{mode}: the tree is up while the load is held: {}",
+            view.display()
+        );
+        std::fs::write(&gate, "").unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{mode}: the launcher failed: {status}");
+        let report = std::fs::read_to_string(&result).unwrap_or_default();
+        assert!(
+            report.contains("late=libplugin.so.1:42"),
+            "{mode}: the bundled plugin did not load: {report}"
+        );
+        assert!(
+            report.contains("late=libGL.so.1:2"),
+            "{mode}: the host driver did not load: {report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The host's loader cache is rewritten to name a different driver copy
+/// while a launch sits held before its late load. The next launch
+/// resolves the changed host state into its own farm beside the old one
+/// and answers with the new value, and the held launch still answers
+/// with the copy it resolved, from a tree or view nothing edited.
+#[test]
+fn a_late_plugin_load_survives_a_changed_host_view() {
+    let td = workdir("latehostview");
+    let host_a = td.join("host-a/lib");
+    let host_b = td.join("host-b/lib");
+    if !host_driver_pair(&td, "host-a", &host_a, 2) {
+        return; // no compiler: documented soft-skip
+    }
+    assert!(host_driver_pair(&td, "host-b", &host_b, 3));
+    let cache = td.join("ld.so.cache");
+    let pkg = pack_late_loader(&td, "viewkeep");
+    if pkg.as_os_str().is_empty() {
+        return; // no compiler: documented soft-skip
+    }
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let result_b = td.join("result-b");
+    let views = td.join("xdg-cache/onelf/views");
+
+    for mode in ["rundir", "cache"] {
+        for file in [&gate, &result, &result_b] {
+            let _ = std::fs::remove_file(file);
+        }
+        std::fs::write(
+            &cache,
+            ld_so_cache(&[&host_a.join("libGL.so.1"), &host_a.join("libfixture.so.1")]),
+        )
+        .unwrap();
+        // A launch on a mode that can take the host's libc describes a
+        // different host state than one that cannot, so the farms count
+        // from where this mode starts.
+        let farms_before = farms_of(&td).len();
+        let (mut held, view) = start_late_loader(
+            &pkg,
+            &td,
+            mode,
+            &[
+                ("PLUGIN", "libGL.so.1"),
+                ("GATE", gate.to_str().unwrap()),
+                ("RESULT", result.to_str().unwrap()),
+                ("ONELF_LD_CACHE", cache.to_str().unwrap()),
+            ],
+        );
+        assert_eq!(
+            farms_of(&td).len(),
+            farms_before + 1,
+            "{mode}: the first host state built one farm"
+        );
+
+        std::fs::write(
+            &cache,
+            ld_so_cache(&[&host_b.join("libGL.so.1"), &host_b.join("libfixture.so.1")]),
+        )
+        .unwrap();
+        let (mut fresh, _) = start_late_loader(
+            &pkg,
+            &td,
+            mode,
+            &[
+                ("PLUGIN", "libGL.so.1"),
+                ("RESULT", result_b.to_str().unwrap()),
+                ("ONELF_LD_CACHE", cache.to_str().unwrap()),
+            ],
+        );
+        let fresh_status = fresh.wait().unwrap();
+        assert!(
+            fresh_status.success(),
+            "{mode}: the launch on the changed host failed: {fresh_status}"
+        );
+        let fresh_report = std::fs::read_to_string(&result_b).unwrap_or_default();
+        assert!(
+            fresh_report.contains("late=libGL.so.1:3"),
+            "{mode}: the changed host supplied its own copy: {fresh_report}"
+        );
+
+        let farms = farms_of(&td);
+        assert_eq!(
+            farms.len(),
+            farms_before + 2,
+            "{mode}: the new host state built its farm beside the old: {farms:?}"
+        );
+        let (mut from_a, mut from_b) = (false, false);
+        for farm in &farms {
+            let target = std::fs::read_link(farm.join("libGL.so.1"));
+            if target.as_ref().is_ok_and(|t| t.starts_with(&host_a)) {
+                from_a = true;
+            }
+            if target.as_ref().is_ok_and(|t| t.starts_with(&host_b)) {
+                from_b = true;
+            }
+        }
+        assert!(
+            from_a && from_b,
+            "{mode}: each farm serves its own host state: {farms:?}"
+        );
+        assert!(
+            view.is_dir(),
+            "{mode}: the changed host left the held launch's view alone: {}",
+            view.display()
+        );
+        if mode == "cache" {
+            assert_eq!(
+                view_count(&views),
+                2,
+                "{mode}: two identities run from two views"
+            );
+        }
+
+        std::fs::write(&gate, "").unwrap();
+        let held_status = held.wait().unwrap();
+        assert!(
+            held_status.success(),
+            "{mode}: the held launch failed: {held_status}"
+        );
+        let held_report = std::fs::read_to_string(&result).unwrap_or_default();
+        assert!(
+            held_report.contains("late=libGL.so.1:2"),
+            "{mode}: the held launch still loads the host it resolved: {held_report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A cache sweep runs while two launches share one view and both sit
+/// before their late loads, while one has drained, and while the last
+/// one has loaded but not exited: the view and its package are skipped
+/// every time, and the sweep after the last lease is gone reclaims both.
+#[test]
+fn cache_gc_spares_a_launch_awaiting_a_late_plugin_load() {
+    let td = workdir("lategc");
+    let empty = td.join("empty.cache");
+    std::fs::write(&empty, ld_so_cache(&[])).unwrap();
+    let pkg = pack_late_loader(&td, "gclate");
+    if pkg.as_os_str().is_empty() {
+        return; // no compiler: documented soft-skip
+    }
+    let cache_root = td.join("xdg-cache");
+    let views = cache_root.join("onelf/views");
+    let gate = td.join("gate");
+    let gate_b = td.join("gate-b");
+    let result = td.join("result");
+    let result_b = td.join("result-b");
+    let hold = td.join("hold");
+
+    let holder = |gate: &str, result: &str, hold: &str| {
+        start_late_loader(
+            &pkg,
+            &td,
+            "cache",
+            &[
+                ("PLUGIN", "libplugin.so.1"),
+                ("GATE", gate),
+                ("RESULT", result),
+                ("HOLD", hold),
+                ("ONELF_LD_CACHE", empty.to_str().unwrap()),
+            ],
+        )
+    };
+    let (mut first, view) = holder(
+        gate.to_str().unwrap(),
+        result.to_str().unwrap(),
+        hold.to_str().unwrap(),
+    );
+    // The second holder runs to completion once its gate opens, so the
+    // sweep sees one drained launch and one still living.
+    let (mut second, view_b) = holder(gate_b.to_str().unwrap(), result_b.to_str().unwrap(), "");
+    assert_eq!(view, view_b, "one identity serves both launches");
+    assert!(
+        view.starts_with(&views),
+        "the launch runs from a published view: {}",
+        view.display()
+    );
+    assert_eq!(view_count(&views), 1, "the shared view is published once");
+
+    let while_both_hold = cache_gc(&cache_root, &td);
+    assert!(
+        !while_both_hold.contains("idle view"),
+        "the sweep must leave a view two launches hold: {while_both_hold}"
+    );
+    assert!(
+        while_both_hold.contains("Skipped 1 package"),
+        "the sweep must spare the live package: {while_both_hold}"
+    );
+    assert!(view.is_dir(), "the shared view survives the sweep");
+
+    std::fs::write(&gate_b, "").unwrap();
+    let second_status = second.wait().unwrap();
+    assert!(
+        second_status.success(),
+        "the second launch failed: {second_status}"
+    );
+    let second_report = std::fs::read_to_string(&result_b).unwrap_or_default();
+    assert!(
+        second_report.contains("late=libplugin.so.1:42"),
+        "the second launch's late load failed: {second_report}"
+    );
+    let after_one_left = cache_gc(&cache_root, &td);
+    assert!(
+        !after_one_left.contains("idle view"),
+        "one drained launch must not idle the view the other holds: \
+         {after_one_left}"
+    );
+    assert!(view.is_dir(), "the remaining launch keeps its view");
+
+    std::fs::write(&gate, "").unwrap();
+    assert!(
+        until(|| {
+            std::fs::read_to_string(&result).is_ok_and(|s| s.contains("late=libplugin.so.1:42"))
+        }),
+        "the last launch's late load failed"
+    );
+    let while_loaded = cache_gc(&cache_root, &td);
+    assert!(
+        !while_loaded.contains("idle view"),
+        "a loaded but living launch still leases its view: {while_loaded}"
+    );
+    assert!(view.is_dir());
+
+    std::fs::write(&hold, "").unwrap();
+    let first_status = first.wait().unwrap();
+    assert!(
+        first_status.success(),
+        "the last launch failed: {first_status}"
+    );
+    use rustix::fs::FlockOperation;
+    let lease = views.join(format!(
+        "{}.lease",
+        view.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(
+        until(|| {
+            std::fs::File::open(&lease)
+                .map(|f| rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_ok())
+                .unwrap_or(false)
+        }),
+        "the drained launch's lease is released"
+    );
+    let when_idle = cache_gc(&cache_root, &td);
+    assert!(
+        when_idle.contains("Removed 1 idle view(s)."),
+        "the sweep reclaims the view once its lease is gone: {when_idle}"
+    );
+    assert!(
+        when_idle.contains("Removed 1 stale package"),
+        "the sweep reclaims the package with it: {when_idle}"
+    );
+    assert_eq!(view_count(&views), 0, "nothing of the view is left");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An app double-forks a helper that drops every inherited descriptor,
+/// so nothing the app carried can hold its view open, and the launcher
+/// returns while the helper waits. A cache sweep still finds the view
+/// leased, the helper's late load reads the plugin out of the view with
+/// nothing inherited, and the view is reclaimed only after the helper
+/// finishes. The runtime directory mode shows the same lifetime without
+/// a cache.
+#[test]
+fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
+    let td = workdir("latefdclose");
+    let empty = td.join("empty.cache");
+    std::fs::write(&empty, ld_so_cache(&[])).unwrap();
+    let pkg = pack_late_loader(&td, "fddrain");
+    if pkg.as_os_str().is_empty() {
+        return; // no compiler: documented soft-skip
+    }
+    let cache_root = td.join("xdg-cache");
+    let views = cache_root.join("onelf/views");
+    let ready = td.join("ready");
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let hold = td.join("hold");
+    let done = td.join("done");
+
+    for mode in ["rundir", "cache"] {
+        for file in [&ready, &gate, &result, &hold, &done] {
+            let _ = std::fs::remove_file(file);
+        }
+        let (mut child, view) = start_late_loader(
+            &pkg,
+            &td,
+            mode,
+            &[
+                ("DAEMON", "1"),
+                ("READY", ready.to_str().unwrap()),
+                ("GATE", gate.to_str().unwrap()),
+                ("PLUGIN", "libplugin.so.1"),
+                ("RESULT", result.to_str().unwrap()),
+                ("HOLD", hold.to_str().unwrap()),
+                ("DONE", done.to_str().unwrap()),
+                ("ONELF_LD_CACHE", empty.to_str().unwrap()),
+            ],
+        );
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "{mode}: the launcher returned while the helper lives: {status}"
+        );
+        assert!(
+            until(|| ready.is_file()),
+            "{mode}: the helper never dropped its descriptors"
+        );
+        if mode == "cache" {
+            let while_held = cache_gc(&cache_root, &td);
+            assert!(
+                !while_held.contains("idle view"),
+                "{mode}: a sweep must not idle the view a descriptor-dropping \
+                 helper runs from: {while_held}"
+            );
+        }
+        assert!(
+            view.is_dir(),
+            "{mode}: the view outlives the launcher: {}",
+            view.display()
+        );
+
+        std::fs::write(&gate, "").unwrap();
+        assert!(
+            until(|| {
+                std::fs::read_to_string(&result).is_ok_and(|s| s.contains("late=libplugin.so.1:42"))
+            }),
+            "{mode}: the helper's late load failed after every descriptor \
+             was dropped"
+        );
+        if mode == "cache" {
+            let after_load = cache_gc(&cache_root, &td);
+            assert!(
+                !after_load.contains("idle view"),
+                "{mode}: the working helper's view stays leased: {after_load}"
+            );
+            assert!(view.is_dir(), "{mode}: the view stays while it works");
+        }
+
+        std::fs::write(&hold, "").unwrap();
+        assert!(
+            until(|| done.is_file()),
+            "{mode}: the helper never finished"
+        );
+        if mode == "cache" {
+            use rustix::fs::FlockOperation;
+            let lease = views.join(format!(
+                "{}.lease",
+                view.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                until(|| {
+                    std::fs::File::open(&lease)
+                        .map(|f| {
+                            rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_ok()
+                        })
+                        .unwrap_or(false)
+                }),
+                "{mode}: the finished helper's lease is released"
+            );
+            let when_idle = cache_gc(&cache_root, &td);
+            assert!(
+                when_idle.contains("Removed 1 idle view(s)."),
+                "{mode}: the drained helper's view is reclaimed: {when_idle}"
+            );
+            assert_eq!(view_count(&views), 0, "{mode}: nothing of the view is left");
+        } else {
+            assert!(
+                until(|| std::fs::symlink_metadata(&view).is_err()),
+                "{mode}: the view is taken down after the helper finishes"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
