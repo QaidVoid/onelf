@@ -45,7 +45,7 @@ pub mod sysroot;
 use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
-use onelf_format::rules::{Descriptor, Requirement, ResourceGroup, ResourceKind};
+use onelf_format::rules::{Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind};
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
 
@@ -730,13 +730,133 @@ fn miss_text(reason: &MissReason) -> String {
     }
 }
 
+/// Carry one activated rule's declared helper executable into the tree
+/// through the common object queue. The declared alternatives are
+/// discovered against the libraries the walk admitted, the same way data
+/// groups are, and the executable the first alternative yields is
+/// enqueued as an object: activation, the transitive dependency closure,
+/// the locate and compatibility checks, plan admission, the run path
+/// rewrite and hash aliasing are the walk's ordinary ones, and the final
+/// tree pass finalizes the helper beside every other copied object. The
+/// declared destination is relative to the tree root, and the rule's
+/// runtime mapping resolves the helper there, so the alias keeps working
+/// wherever the tree is moved.
+///
+/// A destination the tree already holds satisfies the group. A required
+/// helper no admitted source holds fails the assembly naming the rule,
+/// the helper and the examined locations; an optional one is reported
+/// and the build continues.
+#[allow(clippy::too_many_arguments)]
+fn collect_helper_group(
+    directory: &Path,
+    descriptor: &Descriptor,
+    declared: &HelperGroup,
+    admitted: &[AdmittedLibrary],
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    search_paths: &mut Vec<PathBuf>,
+    destinations: &mut HashMap<String, PathBuf>,
+    helpers: &mut HashSet<String>,
+    needed_by: &mut HashMap<String, String>,
+    processed: &mut HashSet<String>,
+    discovery: &mut Discovery,
+) -> io::Result<()> {
+    let rule = descriptor.id.as_str();
+    let outcome = discover_group(
+        &GroupQuery {
+            rule,
+            group: declared.id.as_str(),
+            kind: declared.kind,
+            requirement: declared.requirement,
+            destination: &declared.destination,
+            candidates: &declared.candidates,
+        },
+        &AdmittedUniverse {
+            libraries: admitted,
+            sysroot,
+        },
+    )?;
+    let Some(hit) = outcome.found.first() else {
+        if directory.join(declared.destination.as_str()).exists() {
+            return Ok(());
+        }
+        return match declared.requirement {
+            Requirement::Required => Err(required_helper_miss(rule, declared, &outcome)),
+            Requirement::Optional => {
+                report_helper_omission(rule, declared, &outcome);
+                Ok(())
+            }
+        };
+    };
+    let Some(source_name) = hit.resolved.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    if let Some(dir) = hit.resolved.parent()
+        && !search_paths.iter().any(|p| p == dir)
+    {
+        search_paths.push(dir.to_path_buf());
+    }
+    destinations
+        .entry(source_name.to_string())
+        .or_insert_with(|| hit.destination.clone());
+    helpers.insert(source_name.to_string());
+    needed_by
+        .entry(source_name.to_string())
+        .or_insert_with(|| format!("rule {rule} helper {}", declared.id.as_str()));
+    // An object that drained before its group popped chose its flat
+    // destination; the helper's declared destination supersedes it.
+    processed.remove(source_name);
+    discovery.enqueue(source_name)?;
+    eprintln!(
+        "  {} helper {source_name} for {rule}/{} from {}",
+        color::bold_green("Collected"),
+        declared.id.as_str(),
+        hit.resolved.display()
+    );
+    Ok(())
+}
+
+/// The required-helper failure: which rule's helper is missing, at what
+/// destination, and what was examined where, bounded like every finding.
+fn required_helper_miss(rule: &str, declared: &HelperGroup, outcome: &GroupOutcome) -> io::Error {
+    let mut text = format!(
+        "rule {rule} helper {} requires the executable at {}, but none of its declared \
+         locations exist in the selected source",
+        declared.id.as_str(),
+        declared.destination.as_str()
+    );
+    for location in examined_locations(outcome) {
+        text.push_str("; ");
+        text.push_str(&location);
+    }
+    io::Error::new(io::ErrorKind::NotFound, text)
+}
+
+/// The report an optional helper the selected source lacks gets, so the
+/// omission is a decision the packager can see.
+fn report_helper_omission(rule: &str, declared: &HelperGroup, outcome: &GroupOutcome) {
+    let mut text = format!(
+        "  {} {rule}/helper {}: optional executable unavailable",
+        color::bold_red("warning:"),
+        declared.id.as_str()
+    );
+    let examined = examined_locations(outcome);
+    if examined.is_empty() {
+        text.push_str(" (no declared location)");
+    } else {
+        text.push_str(&format!(" ({})", examined.join(", ")));
+    }
+    text.push_str("; the build continues without it");
+    eprintln!("{text}");
+}
+
 /// One write the planned walk performs once the whole plan has resolved
 /// without findings. The executor replays these in planning order, so
 /// the output and the mutations match the single-pass walk this
 /// replaces.
 #[derive(Debug)]
 enum WalkAction {
-    /// Copy a resolved library or plugin into the library directory.
+    /// Copy a resolved library or plugin into its destination, relative
+    /// to the tree root.
     CopyLib {
         soname: String,
         resolved: PathBuf,
@@ -782,7 +902,9 @@ struct WalkOutcome {
 /// Execute the planned walk actions in planning order, each with its
 /// report line, failing the assembly the moment a source no longer
 /// matches what planning read from it. A dry run reports without
-/// writing, as before.
+/// writing, as before. Every copy and link destination is relative to
+/// the tree root: the library directory for the flat sonames and the
+/// plugin trees, the declared location for a carried helper.
 fn execute_walk(
     directory: &Path,
     dry_run: bool,
@@ -791,6 +913,10 @@ fn execute_walk(
     actions: &[WalkAction],
     plan: &DestinationPlan,
 ) -> io::Result<WalkOutcome> {
+    let lib_dir = lib_dest
+        .strip_prefix(directory)
+        .unwrap_or(lib_dest)
+        .to_path_buf();
     let mut outcome = WalkOutcome {
         copied: Vec::new(),
         libc_data_files: Vec::new(),
@@ -807,7 +933,7 @@ fn execute_walk(
                 libc_data,
             } => {
                 plan.verify_source(resolved)?;
-                let dest = lib_dest.join(rel);
+                let dest = directory.join(rel);
                 eprintln!(
                     "  {} <- {} (needed by {}, {})",
                     color::bold_green(&rel.to_string_lossy()),
@@ -858,7 +984,7 @@ fn execute_walk(
                     }
                 }
                 if *stale_flat {
-                    migrate_flat_plugin(&lib_dest.join(soname), rel, lib_dest, dry_run);
+                    migrate_flat_plugin(&lib_dest.join(soname), rel, &lib_dir, lib_dest, dry_run);
                 }
                 outcome
                     .copied
@@ -911,7 +1037,7 @@ fn execute_walk(
                     color::dim(&format_size(*size))
                 );
                 if !dry_run {
-                    let dest = lib_dest.join(rel);
+                    let dest = directory.join(rel);
                     if let Some(dir) = dest.parent() {
                         fs::create_dir_all(dir)?;
                     }
@@ -929,7 +1055,7 @@ fn execute_walk(
                     }
                 }
                 if *stale_flat {
-                    migrate_flat_plugin(&lib_dest.join(soname), rel, lib_dest, dry_run);
+                    migrate_flat_plugin(&lib_dest.join(soname), rel, &lib_dir, lib_dest, dry_run);
                 }
             }
             WalkAction::CarryData {
@@ -987,7 +1113,7 @@ fn execute_walk(
                 patch_carried_alsa_conf(directory, dry_run);
             }
             WalkAction::MigrateFlat { flat, new_rel } => {
-                migrate_flat_plugin(flat, new_rel, lib_dest, dry_run);
+                migrate_flat_plugin(flat, new_rel, &lib_dir, lib_dest, dry_run);
             }
         }
     }
@@ -1018,8 +1144,15 @@ fn patch_carried_alsa_conf(directory: &Path, dry_run: bool) {
 /// is dead weight there: nothing looks for it. With the subdirectory
 /// copy just written, retarget the tree's own alias links that point at
 /// the flat copy and drop it, so a re-bundle repairs the tree instead of
-/// carrying both.
-fn migrate_flat_plugin(flat: &Path, new_rel: &Path, lib_dest: &Path, dry_run: bool) {
+/// carrying both. The new destination and every link are taken relative
+/// to the tree root.
+fn migrate_flat_plugin(
+    flat: &Path,
+    new_rel: &Path,
+    lib_dir: &Path,
+    lib_dest: &Path,
+    dry_run: bool,
+) {
     let links = alias_links_to(lib_dest, flat);
     if dry_run {
         eprintln!(
@@ -1034,8 +1167,8 @@ fn migrate_flat_plugin(flat: &Path, new_rel: &Path, lib_dest: &Path, dry_run: bo
             .strip_prefix(lib_dest)
             .unwrap_or(&link)
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+            .map(|p| lib_dir.join(p))
+            .unwrap_or_else(|| lib_dir.to_path_buf());
         let target = link_target(&from, new_rel);
         if let Err(e) = fs::remove_file(&link) {
             eprintln!(
@@ -1906,10 +2039,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut admitted: Vec<AdmittedLibrary> = Vec::new();
     let mut admitted_names: HashSet<String> = HashSet::new();
     // The AppDir destinations activated groups declared for the plugins
-    // they collected, which supersede flat placement for those sonames.
+    // and helpers they collected, which supersede flat placement for
+    // those sonames.
     let mut group_dests: HashMap<String, PathBuf> = HashMap::new();
+    // The collected helper executables among them, whose declared
+    // destinations sit wherever the tree root keeps them, not
+    // necessarily in the library directory.
+    let mut helper_dests: HashSet<String> = HashSet::new();
     // BLAKE3(content) -> the destination the file was written to,
-    // relative to the library directory, so aliases with identical bytes
+    // relative to the tree root, so aliases with identical bytes
     // symlink instead of copy.
     let mut bundled_by_hash: HashMap<[u8; 32], PathBuf> = HashMap::new();
     // The destinations the walk intends to write, resolved against each
@@ -2030,9 +2168,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     }
                     continue;
                 }
-                // Data groups carry here. A helper group names an
-                // associated plugin or data group and keeps its own
-                // resource phase.
+                // Data groups carry here. Helper groups enqueue their
+                // declared executables into the object queue, and a
+                // helper names an associated plugin or data group.
                 if let Some(declared) = descriptor
                     .resources
                     .data
@@ -2047,6 +2185,26 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         sysroot_universe.as_ref(),
                         &mut plan,
                         &mut actions,
+                    )?;
+                }
+                if let Some(declared) = descriptor
+                    .resources
+                    .helpers
+                    .iter()
+                    .find(|h| h.id.as_str() == group)
+                {
+                    collect_helper_group(
+                        &opts.directory,
+                        descriptor,
+                        declared,
+                        &admitted,
+                        sysroot_universe.as_ref(),
+                        &mut search_paths,
+                        &mut group_dests,
+                        &mut helper_dests,
+                        &mut needed_by,
+                        &mut already_processed,
+                        &mut discovery,
                     )?;
                 }
                 continue;
@@ -2064,8 +2222,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // source (a tree bundled before the data carry existed has the
         // library but not the data) and a plugin left flat where nothing
         // loads it. Both need the host copy resolved; when the host has
-        // none, the tree keeps what it has, as the old skip did.
-        let already_flat = lib_dest.join(&soname).exists();
+        // none, the tree keeps what it has, as the old skip did. For a
+        // collected group member the declared destination is the place
+        // already held; for every other soname the flat library copy.
+        let already_flat = if helper_dests.contains(&soname) {
+            group_dests
+                .get(&soname)
+                .is_some_and(|dest| opts.directory.join(dest).exists())
+        } else {
+            lib_dest.join(&soname).exists()
+        };
 
         let requirer = needed_by
             .get(&soname)
@@ -2134,19 +2300,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     admitted.push(AdmittedLibrary::new(soname.clone(), resolved.clone()));
                 }
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-                // A collected plugin's group declares its destination; every
-                // other soname lies flat in the library directory.
+                // A collected group member's declaration decides its
+                // destination; every other soname lies flat in the
+                // library directory.
                 let rel = match group_dests.get(&soname) {
-                    Some(dest) => dest
-                        .strip_prefix(&opts.lib_dir)
-                        .unwrap_or(dest)
-                        .to_path_buf(),
-                    None => PathBuf::from(&soname),
+                    Some(dest) => dest.clone(),
+                    None => opts.lib_dir.join(&soname),
                 };
-                let dest = lib_dest.join(&rel);
+                let dest = opts.directory.join(&rel);
                 // A plugin a pre-fix run left flat: the subdirectory copy
-                // below replaces it.
-                let stale_flat = already_flat && rel != Path::new(&soname);
+                // below replaces it. A helper never sat flat, so an
+                // existing destination is simply kept.
+                let stale_flat = !helper_dests.contains(&soname)
+                    && already_flat
+                    && rel != opts.lib_dir.join(&soname);
                 // A plugin keeping its subdirectory is already bundled on
                 // a re-run, or the candidate is the tree's own file, found
                 // through a search dir inside the tree. A flat copy is
@@ -2229,9 +2396,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     && let Some(existing) = bundled_by_hash.get(&hash).cloned()
                 {
                     let target = link_target(rel.parent().unwrap_or(Path::new("")), &existing);
-                    let app_rel = opts.lib_dir.join(&rel);
                     if plan.admit_link(
-                        &app_rel,
+                        &rel,
                         &target,
                         &format!("{soname} (needed by {requirer})"),
                         Existing::Overwrite,
@@ -2256,11 +2422,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     continue;
                 }
 
-                let app_rel = opts.lib_dir.join(&rel);
                 let write = match bytes.as_deref() {
                     Some(b) => {
                         plan.admit_file(
-                            &app_rel,
+                            &rel,
                             plan::file_hash(b),
                             &format!("{soname} (needed by {requirer})"),
                             Existing::SkipOnAny,
@@ -2410,7 +2575,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if opts.sysroot.is_some() && !opts.dry_run {
         let generated = copied
             .iter()
-            .map(|(_, rel, _, _)| opts.lib_dir.join(rel).to_string_lossy().into_owned())
+            .map(|(_, rel, _, _)| rel.to_string_lossy().into_owned())
             .chain(
                 libc_data_files
                     .iter()
@@ -3666,7 +3831,8 @@ pcm.default cards.pcm.default
 
         migrate_flat_plugin(
             &flat,
-            Path::new("alsa-lib/libasound_module_pcm_pulse.so"),
+            Path::new("lib/alsa-lib/libasound_module_pcm_pulse.so"),
+            Path::new("lib"),
             &lib,
             false,
         );
@@ -3676,7 +3842,7 @@ pcm.default cards.pcm.default
         assert_eq!(fs::read(&moved).unwrap(), b"plugin");
         assert_eq!(
             fs::read_link(&alias).unwrap(),
-            Path::new("alsa-lib/libasound_module_pcm_pulse.so")
+            Path::new("../lib/alsa-lib/libasound_module_pcm_pulse.so")
         );
         // Same directory now: the bare name, as link_target resolves.
         assert_eq!(
@@ -3684,6 +3850,243 @@ pcm.default cards.pcm.default
             Path::new("libasound_module_pcm_pulse.so")
         );
         let _ = fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use onelf_format::catalog;
+
+    /// Minimal ELF-shaped bytes: magic + EI_CLASS + e_machine, enough
+    /// for the walk's checks to classify a stand-in file.
+    fn fake_elf() -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2;
+        v[18..20].copy_from_slice(&62u16.to_le_bytes());
+        v
+    }
+
+    /// The gstreamer rule's scanner declaration, the one required
+    /// helper the built-in catalog carries.
+    fn scanner_declaration() -> HelperGroup {
+        catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == "gstreamer")
+            .unwrap()
+            .resources
+            .helpers
+            .first()
+            .unwrap()
+            .clone()
+    }
+
+    /// A distribution tree whose framework library sits in `usr/lib`,
+    /// with `files` naming further files below it, each written as a
+    /// stand-in ELF object. Returns the tree and the library's path.
+    fn dist_tree(tag: &str, files: &[&str]) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("onelf-helper-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let lib = root.join("usr/lib");
+        fs::create_dir_all(&lib).unwrap();
+        let gstreamer = lib.join("libgstreamer-1.0.so.0");
+        fs::write(&gstreamer, fake_elf()).unwrap();
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, fake_elf()).unwrap();
+        }
+        (root, gstreamer)
+    }
+
+    /// What one collection recorded, and the queue it fed.
+    struct Collected {
+        destinations: HashMap<String, PathBuf>,
+        helpers: HashSet<String>,
+        discovery: Discovery,
+    }
+
+    /// Collect the scanner over one admitted framework library, the way
+    /// the drain loop would.
+    fn collect(
+        tag: &str,
+        declared: &HelperGroup,
+        tree: &Path,
+        lib: &Path,
+    ) -> io::Result<Collected> {
+        let admitted = [AdmittedLibrary::new("libgstreamer-1.0.so.0", lib)];
+        let mut discovery = Discovery::new(catalog::builtins(), &[], &[]).unwrap();
+        discovery.observe_present("libgstreamer-1.0.so.0").unwrap();
+        let mut destinations = HashMap::new();
+        let mut helpers = HashSet::new();
+        let mut needed_by = HashMap::new();
+        let mut processed = HashSet::new();
+        let mut search_paths = Vec::new();
+        let descriptor = catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == "gstreamer")
+            .unwrap();
+        collect_helper_group(
+            tree,
+            descriptor,
+            declared,
+            &admitted,
+            None,
+            &mut search_paths,
+            &mut destinations,
+            &mut helpers,
+            &mut needed_by,
+            &mut processed,
+            &mut discovery,
+        )?;
+        let _ = tag;
+        Ok(Collected {
+            destinations,
+            helpers,
+            discovery,
+        })
+    }
+
+    /// The objects a collection queued, in queue order.
+    fn queued_objects(collected: &mut Collected) -> Vec<String> {
+        std::iter::from_fn(|| collected.discovery.pop())
+            .filter_map(|item| match item {
+                WorkItem::Object(soname) => Some(soname),
+                WorkItem::Group(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_collected_helper_enters_the_object_queue_at_its_destination() {
+        let (root, lib) = dist_tree("queue", &["usr/lib/gstreamer-1.0/gst-plugin-scanner"]);
+        let mut collected = collect("queue", &scanner_declaration(), &root, &lib).unwrap();
+
+        assert_eq!(
+            collected.destinations.get("gst-plugin-scanner"),
+            Some(&PathBuf::from("libexec/gstreamer-1.0/gst-plugin-scanner"))
+        );
+        assert!(collected.helpers.contains("gst-plugin-scanner"));
+        assert_eq!(queued_objects(&mut collected), ["gst-plugin-scanner"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_helper_source_directory_joins_the_search_path() {
+        let (root, lib) = dist_tree("searchdir", &["usr/lib/gstreamer-1.0/gst-plugin-scanner"]);
+        let admitted = [AdmittedLibrary::new("libgstreamer-1.0.so.0", &lib)];
+        let mut discovery = Discovery::new(catalog::builtins(), &[], &[]).unwrap();
+        let mut destinations = HashMap::new();
+        let mut helpers = HashSet::new();
+        let mut needed_by = HashMap::new();
+        let mut processed = HashSet::new();
+        let mut search_paths = Vec::new();
+        let descriptor = catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == "gstreamer")
+            .unwrap();
+        collect_helper_group(
+            &root,
+            descriptor,
+            &scanner_declaration(),
+            &admitted,
+            None,
+            &mut search_paths,
+            &mut destinations,
+            &mut helpers,
+            &mut needed_by,
+            &mut processed,
+            &mut discovery,
+        )
+        .unwrap();
+        assert!(
+            search_paths.contains(&root.join("usr/lib/gstreamer-1.0")),
+            "{search_paths:?}"
+        );
+        assert_eq!(
+            needed_by.get("gst-plugin-scanner"),
+            Some(&"rule gstreamer helper scanner".to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_required_helper_the_source_lacks_fails_naming_the_locations() {
+        let (root, lib) = dist_tree("required-miss", &[]);
+        let err = match collect("required-miss", &scanner_declaration(), &root, &lib) {
+            Ok(_) => panic!("a required helper with no candidate must fail the assembly"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("rule gstreamer"), "{text}");
+        assert!(text.contains("helper scanner"), "{text}");
+        assert!(
+            text.contains("libexec/gstreamer-1.0/gst-plugin-scanner"),
+            "{text}"
+        );
+        assert!(text.contains("absent"), "{text}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_optional_helper_the_source_lacks_continues_the_build() {
+        let (root, lib) = dist_tree("optional-miss", &[]);
+        let mut declared = scanner_declaration();
+        declared.requirement = Requirement::Optional;
+
+        let mut collected = collect("optional-miss", &declared, &root, &lib).unwrap();
+
+        assert!(collected.destinations.is_empty());
+        assert!(collected.helpers.is_empty());
+        assert!(
+            queued_objects(&mut collected).is_empty(),
+            "nothing is queued"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_first_declared_alternative_serves_the_helper() {
+        let (root, lib) = dist_tree(
+            "first-alt",
+            &[
+                "usr/lib/gstreamer-1.0/gst-plugin-scanner",
+                "usr/libexec/gstreamer-1.0/gst-plugin-scanner",
+            ],
+        );
+        let mut collected = collect("first-alt", &scanner_declaration(), &root, &lib).unwrap();
+
+        assert_eq!(collected.destinations.len(), 1);
+        assert_eq!(
+            collected.helpers,
+            HashSet::from(["gst-plugin-scanner".to_string()])
+        );
+        assert_eq!(queued_objects(&mut collected).len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_destination_the_tree_already_holds_satisfies_the_helper() {
+        let (root, lib) = dist_tree("tree-held", &[]);
+        let tree = root.join("pkg");
+        fs::create_dir_all(tree.join("libexec/gstreamer-1.0")).unwrap();
+        fs::write(
+            tree.join("libexec/gstreamer-1.0/gst-plugin-scanner"),
+            fake_elf(),
+        )
+        .unwrap();
+
+        let mut collected = collect("tree-held", &scanner_declaration(), &tree, &lib)
+            .expect("a held helper satisfies the group");
+
+        assert!(collected.destinations.is_empty());
+        assert!(collected.helpers.is_empty());
+        assert!(
+            queued_objects(&mut collected).is_empty(),
+            "the held helper is not requeued"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
 

@@ -844,6 +844,19 @@ fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) 
             "cards\n",
         );
     }
+    // The gstreamer rule declares the plugin scanner a required helper,
+    // and a distribution's framework library always ships it beside its
+    // plugins.
+    if sonames.contains(&"libgstreamer-1.0.so.0") {
+        std::fs::create_dir_all(libdir.join("gstreamer-1.0")).unwrap();
+        write(&td.join("dist/scanner.c"), "int main(void){return 0;}\n");
+        if !cc_with(
+            &[td.join("dist/scanner.c").to_str().unwrap()],
+            &libdir.join("gstreamer-1.0/gst-plugin-scanner"),
+        ) {
+            return None;
+        }
+    }
     for (group, plugins) in groups {
         for plugin in *plugins {
             let out = libdir.join(group).join(plugin);
@@ -1172,6 +1185,346 @@ fn a_rebundled_flat_plugin_migrates_into_its_group_layout() {
             .is_file(),
         "the group layout copy stays:\n{err}"
     );
+}
+
+/// Where the fake tree puts the plugin scanner: one of the three
+/// layouts the gstreamer rule declares.
+enum ScannerLayout {
+    /// Below the framework library's directory.
+    LibraryDir,
+    /// The nested store layout below the library directory.
+    NestedLibraryDir,
+    /// Below the installation prefix's `libexec`.
+    Libexec,
+}
+
+/// A fake gstreamer distribution tree: the framework library, one
+/// plugin, and a second library only the plugin scanner needs, with the
+/// scanner itself compiled as an executable at `layout`. Returns the
+/// library directory, or None when no compiler is available.
+fn gstreamer_tree_sources(td: &Path, layout: ScannerLayout) -> Option<PathBuf> {
+    let libdir = td.join("dist/usr/lib");
+    std::fs::create_dir_all(libdir.join("gstreamer-1.0")).unwrap();
+    write(
+        &td.join("dist/framework.c"),
+        "int framework(void){return 1;}\n",
+    );
+    let framework_path = td.join("dist/framework.c");
+    let framework = framework_path.to_str().unwrap();
+    for soname in ["libgstreamer-1.0.so.0", "libglib-2.0.so.0"] {
+        let versioned = format!("-Wl,-soname,{soname}");
+        if !cc_with(
+            &["-shared", "-fPIC", &versioned, framework],
+            &libdir.join(soname),
+        ) {
+            return None;
+        }
+    }
+    write(
+        &td.join("dist/plugin.c"),
+        "int plugin_probe(void){return 2;}\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            td.join("dist/plugin.c").to_str().unwrap(),
+        ],
+        &libdir.join("gstreamer-1.0/libgstcoreelements.so"),
+    ) {
+        return None;
+    }
+    write(&td.join("dist/scanner.c"), "int main(void){return 0;}\n");
+    let scanner = match layout {
+        ScannerLayout::LibraryDir => libdir.join("gstreamer-1.0/gst-plugin-scanner"),
+        ScannerLayout::NestedLibraryDir => {
+            libdir.join("gstreamer1.0/gstreamer-1.0/gst-plugin-scanner")
+        }
+        ScannerLayout::Libexec => td.join("dist/usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+    };
+    std::fs::create_dir_all(scanner.parent().unwrap()).unwrap();
+    if !cc_with(
+        &[
+            td.join("dist/scanner.c").to_str().unwrap(),
+            &format!("-L{}", libdir.display()),
+            "-Wl,--no-as-needed",
+            "-l:libglib-2.0.so.0",
+        ],
+        &scanner,
+    ) {
+        return None;
+    }
+    Some(libdir)
+}
+
+/// The plugin scanner arrives from every layout the rule declares, at
+/// the destination the runtime mapping resolves, with the library only
+/// it needs bundled beside it and no flat copy in the library
+/// directory.
+#[test]
+fn the_plugin_scanner_is_collected_from_every_declared_layout() {
+    use std::os::unix::fs::PermissionsExt;
+    for layout in [
+        ScannerLayout::LibraryDir,
+        ScannerLayout::NestedLibraryDir,
+        ScannerLayout::Libexec,
+    ] {
+        let td = workdir("scannerlayout");
+        let Some(libdir) = gstreamer_tree_sources(&td, layout) else {
+            return;
+        };
+        let Some((app, out)) = bundle_with_plugin_tree(&td, &["libgstreamer-1.0.so.0"], &libdir)
+        else {
+            return;
+        };
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "bundle-libs failed:\n{err}");
+        let helper = app.join("libexec/gstreamer-1.0/gst-plugin-scanner");
+        assert!(
+            helper.is_file(),
+            "the scanner is carried at its declared destination:\n{err}"
+        );
+        assert!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111 != 0,
+            "the carried helper stays executable"
+        );
+        assert!(
+            app.join("lib/libglib-2.0.so.0").is_file(),
+            "the library only the helper needs is bundled:\n{err}"
+        );
+        assert!(
+            !app.join("lib/gst-plugin-scanner").exists(),
+            "the helper is not flattened into the library directory"
+        );
+        assert!(
+            err.contains("helper gst-plugin-scanner"),
+            "the report names the helper collection:\n{err}"
+        );
+    }
+}
+
+/// An app that prints the scanner aliases the runtime sets for it, and
+/// whether the aliased file is there to execute.
+fn write_alias_harness(src: &Path) {
+    write(
+        src,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    const char *dir = getenv("ONELF_DIR");
+    const char *scanner = getenv("GST_PLUGIN_SCANNER");
+    const char *scanner10 = getenv("GST_PLUGIN_SCANNER_1_0");
+    printf("scanner:%s\n", scanner ? scanner : "(unset)");
+    printf("scanner10:%s\n", scanner10 ? scanner10 : "(unset)");
+    if (dir && scanner) {
+        char expected[4096];
+        snprintf(expected, sizeof expected,
+                 "%s/libexec/gstreamer-1.0/gst-plugin-scanner", dir);
+        printf("match:%d\n", strcmp(expected, scanner) == 0);
+        printf("present:%d\n", access(scanner, X_OK) == 0);
+    }
+    return 0;
+}
+"#,
+    );
+}
+
+/// The scanner alias keeps working after the tree moves: the runtime
+/// resolves the aliases against the package root at launch, so a
+/// package built from a renamed tree still names its own carried
+/// helper.
+#[test]
+fn the_scanner_alias_survives_moving_the_bundle() {
+    let td = workdir("scannermove");
+    let Some(libdir) = gstreamer_tree_sources(&td, ScannerLayout::Libexec) else {
+        return;
+    };
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libgstreamer-1.0.so.0"], &libdir) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert!(
+        app.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "the scanner is carried:\n{err}"
+    );
+
+    // What the alias must survive: the tree standing somewhere else
+    // than where it was assembled.
+    let moved = td.join("relocated-tree");
+    std::fs::rename(&app, &moved).unwrap();
+
+    // The packaged command prints what the launch handed it.
+    write_alias_harness(&td.join("alias.c"));
+    assert!(
+        cc(&td.join("alias.c"), &moved.join("bin/app")),
+        "compiler vanished mid-test"
+    );
+
+    let pkg = td.join("relocated.onelf");
+    let packed = Command::new(onelf())
+        .args([
+            "pack",
+            moved.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        packed.status.success(),
+        "pack: {}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+
+    let mut run = Command::new(&pkg);
+    run.env_clear().env("PATH", "/usr/bin:/bin");
+    isolate(&mut run, &td);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("scanner:"))
+        .unwrap_or("");
+    assert!(
+        value.ends_with("/libexec/gstreamer-1.0/gst-plugin-scanner"),
+        "the alias names the carried helper:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("match:1"),
+        "the alias is the package's own:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("present:1"),
+        "the aliased helper is executable in the running tree:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.lines().find_map(|l| l.strip_prefix("scanner10:")),
+        Some(value),
+        "both aliases name the same helper:\n{stdout}"
+    );
+}
+
+/// A required helper the selected source lacks fails the assembly,
+/// naming the rule, the helper and the locations examined: wherever the
+/// framework library is selected, the scanner the rule declares
+/// required must come with it.
+#[test]
+fn a_required_helper_the_source_lacks_fails_the_assembly() {
+    let td = workdir("helperrequired");
+    let rootfs = td.join("rootfs");
+    for d in ["usr/bin", "usr/lib"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    write(&td.join("gst.c"), "int gst_probe(void){return 1;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("gst.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libgstreamer-1.0.so.0"),
+    ) {
+        return;
+    }
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libgstreamer-1.0.so.0",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return;
+    }
+    // The sysroot's libc is this machine's, so the closure has a libc
+    // and a loader to bundle and no need reaches the host.
+    let Some(host_libc) = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6") else {
+        return;
+    };
+    let Some(host_ld) = ldd_path(&rootfs.join("usr/bin/app"), "ld-linux") else {
+        return;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    // The framework library without the scanner: no declared location
+    // for the helper exists anywhere in the selected source.
+    write_pacman_entry(
+        &rootfs,
+        "gstreamer",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libgstreamer-1.0.so.0"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "gstreamer"],
+        &[],
+        &["usr/bin/app"],
+    );
+
+    let appdir = td.join("appdir");
+    std::fs::create_dir_all(&appdir).unwrap();
+    let mut c = Command::new(onelf());
+    c.args([
+        "bundle-libs",
+        appdir.to_str().unwrap(),
+        "--target",
+        "bin/app",
+    ])
+    .args(["--sysroot", rootfs.to_str().unwrap()])
+    .args(["--search-path", rootfs.join("usr/lib").to_str().unwrap()]);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !o.status.success(),
+        "the required scanner's absence must fail the assembly:\n{err}"
+    );
+    assert!(
+        err.contains("rule gstreamer") && err.contains("helper scanner"),
+        "the failure names the rule and the helper:\n{err}"
+    );
+    assert!(
+        err.contains("libexec/gstreamer-1.0/gst-plugin-scanner"),
+        "the failure names the declared destination:\n{err}"
+    );
+    assert!(
+        err.contains("absent"),
+        "the failure names what was examined where:\n{err}"
+    );
+    assert!(
+        !appdir.join("libexec").exists(),
+        "the helper's destination is never invented:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// A fake distribution tree for data-carry fixtures: the framework
