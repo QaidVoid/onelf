@@ -21,8 +21,9 @@ use crate::paths::open_lock_inheritable;
 use onelf_format::cache_layout as layout;
 
 /// Monotonic counter making CAS temp-file names unique within a process;
-/// combined with the pid it is unique across concurrent extractions.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// combined with the pid it is unique across concurrent extractions. The
+/// view staging borrows it for the same purpose.
+pub(crate) static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Returns true if the file at `path` hashes to `expected`. Reads the
 /// file incrementally so verifying a large CAS entry uses bounded memory.
