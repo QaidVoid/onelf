@@ -128,6 +128,44 @@ pub fn read_verified_entry(
     Ok(data)
 }
 
+/// The manifest index of the regular file entry at `path`, or `None` when
+/// the package carries no such file.
+pub(crate) fn find_file_entry(pkg: &PackageData, path: &str) -> Option<usize> {
+    (0..pkg.manifest.entries.len()).find(|&i| {
+        pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
+            && pkg.manifest.entry_path(i) == path
+    })
+}
+
+/// Read and verify a package record named by its package path, holding the
+/// manifest's declared decompressed size to `max_bytes` before any
+/// allocation.
+///
+/// `Ok(None)` is the record's absence, which every caller treats as the
+/// legacy default. A present record goes through
+/// [`read_verified_entry`], so bytes that no longer match the entry's
+/// content hash are refused before the caller decodes anything. A record
+/// declaring more than `max_bytes` is refused without a read, which keeps
+/// a crafted manifest from steering the allocation.
+pub(crate) fn read_bounded_record(
+    pkg: &PackageData,
+    path: &str,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(idx) = find_file_entry(pkg, path) else {
+        return Ok(None);
+    };
+    let entry = &pkg.manifest.entries[idx];
+    let declared: u64 = entry.blocks.iter().map(|b| b.original_size).sum();
+    if declared > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path}: declares {declared} bytes, over the {max_bytes}-byte record limit"),
+        ));
+    }
+    read_verified_entry(&pkg.file, &pkg.footer, entry, &pkg.codec).map(Some)
+}
+
 /// Read and concatenate every block of an entry.
 pub fn read_payload_blocks(
     file: &File,

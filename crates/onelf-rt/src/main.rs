@@ -16,6 +16,7 @@ mod memfd;
 mod metadata;
 mod multicall;
 mod paths;
+mod pkgmeta;
 mod platform;
 mod portable;
 mod rundir;
@@ -76,6 +77,16 @@ fn main() {
         .manifest
         .get_string(pkg.manifest.entrypoints[ep_idx].name)
         .to_string();
+
+    // The launch gate for versioned payload metadata: a record that is
+    // present but unreadable, truncated, unsupported, tampered or
+    // self-inconsistent ends the launch here, before the memfd read, set
+    // acquisition, hooks or any environment change. A package with neither
+    // record launches with the legacy defaults.
+    if let Err(e) = pkgmeta::validate(&pkg) {
+        eprintln!("onelf-rt: {e}");
+        std::process::exit(1);
+    }
 
     // Handle --onelf-icon / --onelf-desktop before dispatching
     if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
@@ -438,10 +449,7 @@ fn exec_cache(
 }
 
 pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
-    let idx = (0..pkg.manifest.entries.len()).find(|&i| {
-        pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
-            && pkg.manifest.entry_path(i) == path
-    })?;
+    let idx = loader::find_file_entry(pkg, path)?;
     loader::read_payload_blocks(
         &pkg.file,
         &pkg.footer,
