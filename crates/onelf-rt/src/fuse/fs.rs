@@ -1290,8 +1290,8 @@ fn handle_lookup(
 /// every open against the recorded modes and a wrong answer here cannot
 /// widen what a process may open; this reply only feeds `faccessat(2)`
 /// and the shell's `[ -r ]`-style tests. The check mirrors what the
-/// kernel does for the owner — the mount presents every file as owned
-/// by the launching user — with one deliberate strictness: the mount is
+/// kernel does for the owner (the mount presents every file as owned
+/// by the launching user), with one deliberate strictness: the mount is
 /// read-only, so a write-access question is denied even when the mode
 /// bits would allow it, matching the EROFS an actual open would get.
 fn handle_access(header: &FuseInHeader, body: &[u8], tree: &Tree) -> Vec<u8> {
