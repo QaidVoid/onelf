@@ -4,6 +4,7 @@ mod doctor;
 mod env;
 mod ephemeral;
 mod fuse;
+mod guardian;
 mod hostenv;
 mod hostpaths;
 mod inspect;

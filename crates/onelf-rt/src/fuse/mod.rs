@@ -187,22 +187,7 @@ impl Request<'_> {
 /// every other reader would block until the server exits rather than
 /// until the app is done.
 fn detach_from_caller() {
-    let _ = rustix::process::setsid();
-    if let Ok(null) = rustix::fs::open(
-        "/dev/null",
-        rustix::fs::OFlags::RDWR,
-        rustix::fs::Mode::empty(),
-    ) {
-        for target in 0..=2 {
-            // `dup2` wants to own the descriptor it replaces, but 0, 1 and 2
-            // are not ours to close: the dup is what puts /dev/null there,
-            // and dropping the wrapper afterwards would close it again.
-            use std::os::fd::FromRawFd;
-            let mut slot =
-                std::mem::ManuallyDrop::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(target) });
-            let _ = rustix::io::dup2(&null, &mut slot);
-        }
-    }
+    crate::guardian::detach_stdio();
 }
 
 /// Whether any process other than this one is still running out of `mountpoint`.
@@ -445,6 +430,15 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
     };
 
     use rustix::runtime::{Fork, kernel_fork};
+
+    // The launch's own ancestor becomes the subreaper before the fork, so
+    // a descendant that daemonizes out of the mount re-parents to the
+    // launch that serves it instead of to init. Where the kernel refuses
+    // the attribute, the death pipe and the /proc checks below carry the
+    // launch as they always have.
+    if let Err(e) = crate::guardian::mark_subreaper() {
+        eprintln!("onelf-rt: fuse: child subreaper unavailable: {e}");
+    }
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {

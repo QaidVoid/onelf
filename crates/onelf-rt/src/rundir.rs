@@ -13,11 +13,6 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use rustix::event::{PollFd, PollFlags, poll};
-use rustix::io::FdFlags;
-use rustix::process::{WaitOptions, waitpid};
-use rustix::runtime::{Fork, kernel_fork};
-
 use crate::loader::PackageData;
 
 /// Execute the package from the private runtime directory. Never returns
@@ -34,9 +29,11 @@ pub fn execute_rundir(
 ) -> bool {
     crate::paths::sweep_stale_mountpoints();
 
-    // Held by this process for as long as the tree exists, and inherited by
-    // everything it forks, so a concurrent launch never sweeps a tree in
-    // use. Once every holder is gone the sweep removes what is left.
+    // Claimed before anything exists to lose, and taken along by the
+    // guardian, which holds the claim itself for as long as the tree is
+    // alive: a concurrent launch never sweeps a tree in use, however
+    // thoroughly a descendant of the application discards what it
+    // inherited.
     let claim =
         match crate::paths::create_launch_dir(pkg.manifest.name(), &pkg.manifest.header.package_id)
         {
@@ -72,21 +69,16 @@ pub fn execute_rundir(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
-    // The write end is inherited by the app and everything it forks; the
-    // read end reports a hangup once the last of them has gone.
-    let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("onelf-rt: rundir: pipe: {e}");
-            remove_tree(&tree);
-            return false;
-        }
-    };
-    let _ = rustix::io::fcntl_setfd(&pipe_write, FdFlags::empty());
-
-    match unsafe { kernel_fork() } {
-        Ok(Fork::Child(_)) => {
-            drop(pipe_read);
+    // The guardian owns the launch from here: it holds the claim, forks
+    // the application, reports the application's exit status on the
+    // returned pipe the moment it is reaped, adopts the descendants a
+    // daemonization leaves behind, and removes the tree once a drained
+    // `wait` proves its subtree empty. This process returns as soon as the
+    // report arrives, while the guardian, detached by then, outlives it
+    // for exactly as long as the descendants do.
+    let supervision = match crate::guardian::spawn(
+        claim,
+        || {
             crate::launch::exec(&crate::launch::Launch {
                 pkg,
                 pkg_root: &tree,
@@ -101,82 +93,35 @@ pub fn execute_rundir(
                 tree_writable: true,
                 links: crate::launch::Links::Tree,
             })
-        }
-        Ok(Fork::ParentOf(child)) => {
-            drop(pipe_write);
-            crate::fuse::CHILD_PID.store(child.as_raw_nonzero().get(), Ordering::Relaxed);
-            crate::fuse::install_signal_handlers();
-
-            let status = loop {
-                match waitpid(Some(child), WaitOptions::empty()) {
-                    Ok(Some((_, status))) => break status,
-                    Ok(None) | Err(rustix::io::Errno::INTR) => continue,
-                    Err(e) => {
-                        eprintln!("onelf-rt: rundir: wait: {e}");
-                        remove_tree(&tree);
-                        std::process::exit(1);
-                    }
-                }
-            };
-
-            // An app that daemonizes leaves the tree in use after the
-            // foreground exits. Removing it then would pull the files out
-            // from under the survivor, so a detached reaper waits for the
-            // last user instead and the launcher returns promptly.
-            if tree_quiet(&pipe_read, &tree, 0) {
-                remove_tree(&tree);
-            } else {
-                match unsafe { kernel_fork() } {
-                    Ok(Fork::Child(_)) => {
-                        let _ = rustix::process::setsid();
-                        detach_stdio();
-                        while !tree_quiet(&pipe_read, &tree, 500) {
-                            // A pipe that has hung up no longer makes the
-                            // poll wait, so the pause has to come from here.
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                        remove_tree(&tree);
-                        std::process::exit(0);
-                    }
-                    Ok(Fork::ParentOf(_)) => {}
-                    Err(_) => remove_tree(&tree),
-                }
-            }
-
-            if let Some(code) = status.exit_status() {
-                std::process::exit(code)
-            } else if let Some(sig) = status.terminating_signal() {
-                std::process::exit(128 + sig)
-            } else {
-                std::process::exit(1)
-            }
-        }
+        },
+        |claim| remove_tree(claim.path()),
+    ) {
+        Ok(supervision) => supervision,
         Err(e) => {
             eprintln!("onelf-rt: rundir: fork failed: {e}");
             remove_tree(&tree);
             std::process::exit(1);
         }
-    }
-}
+    };
 
-/// Whether nothing is using the tree any more: every holder of the death
-/// pipe's write end has gone, and no process in this namespace runs out
-/// of it. Waits up to `timeout_ms` for the pipe.
-///
-/// The tree is a plain directory, so the scan is the one for any
-/// directory and not the one for a mount, which finds no users at all
-/// where nothing is mounted.
-fn tree_quiet(pipe_read: &rustix::fd::OwnedFd, tree: &Path, timeout_ms: u32) -> bool {
-    let mut fds = [PollFd::new(pipe_read, PollFlags::IN)];
-    let timeout = rustix::event::Timespec {
-        tv_sec: (timeout_ms / 1000) as _,
-        tv_nsec: ((timeout_ms % 1000) * 1_000_000) as _,
-    };
-    let hung_up = match poll(&mut fds, Some(&timeout)) {
-        Ok(_) => fds[0].revents().contains(PollFlags::HUP),
-        Err(_) => false,
-    };
-    hung_up && !crate::fuse::tree_in_use(tree)
+    // Signals meant for this process still reach the application, one hop
+    // further along: this forwards to the guardian, and the guardian
+    // forwards to the application.
+    crate::fuse::CHILD_PID.store(supervision.pid as i32, Ordering::Relaxed);
+    crate::fuse::install_signal_handlers();
+
+    match crate::guardian::receive(&supervision.status) {
+        Ok(outcome) => {
+            if outcome == crate::guardian::Outcome::Unavailable {
+                eprintln!("onelf-rt: rundir: the lifetime guardian could not be established");
+            }
+            std::process::exit(outcome.exit_code())
+        }
+        Err(e) => {
+            eprintln!("onelf-rt: rundir: guardian status: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Bytes available to this user on the filesystem holding `path`.
@@ -188,57 +133,4 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
 
 fn remove_tree(tree: &Path) {
     let _ = std::fs::remove_dir_all(tree);
-}
-
-/// Let go of the launcher's standard streams, so a caller reading from a
-/// pipe sees it close when the app is done rather than when the reaper is.
-fn detach_stdio() {
-    use std::os::fd::FromRawFd;
-    let Ok(null) = rustix::fs::open(
-        "/dev/null",
-        rustix::fs::OFlags::RDWR,
-        rustix::fs::Mode::empty(),
-    ) else {
-        return;
-    };
-    for target in 0..=2 {
-        let mut slot =
-            std::mem::ManuallyDrop::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(target) });
-        let _ = rustix::io::dup2(&null, &mut slot);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::tree_quiet;
-
-    /// An app that daemonizes closes the death pipe and keeps running from
-    /// the tree. The tree is no mount, so asking whether a mount is in use
-    /// found nobody, and the foreground's exit removed the files under the
-    /// survivor.
-    #[test]
-    fn a_process_still_in_the_tree_keeps_it() {
-        let dir = std::env::temp_dir().join(format!("onelf-rundir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (pipe_read, pipe_write) = rustix::pipe::pipe().unwrap();
-        drop(pipe_write);
-
-        let _forking = crate::test_locks::forking();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(&dir)
-            .spawn()
-            .expect("spawn holder");
-        let quiet = tree_quiet(&pipe_read, &dir, 0);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(!quiet, "a process runs from the tree");
-        assert!(
-            tree_quiet(&pipe_read, &dir, 0),
-            "and once it is gone, nothing does"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
