@@ -810,6 +810,24 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
         )],
         &["qt6"],
     ),
+    (
+        "qt5",
+        &["libQt5Core.so.5"],
+        &[("qt5/plugins", &["platforms/libqminimal.so"])],
+        &["qt5"],
+    ),
+    (
+        "gdk-pixbuf",
+        &["libgdk_pixbuf-2.0.so.0"],
+        &[("gdk-pixbuf-2.0", &["2.10.0/loaders/libpixbuf-png.so"])],
+        &["gdk-pixbuf"],
+    ),
+    (
+        "gtk3",
+        &["libgtk-3.so.0"],
+        &[("gtk-3.0", &["printbackends/libprintbackend-file.so"])],
+        &["gtk3"],
+    ),
 ];
 
 /// Compile the shared objects of a fake distribution tree: the framework
@@ -1524,6 +1542,295 @@ fn a_required_helper_the_source_lacks_fails_the_assembly() {
         !appdir.join("libexec").exists(),
         "the helper's destination is never invented:\n{err}"
     );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// One fake distribution tree holding every framework family: the
+/// framework libraries under `usr/lib`, one compatible plugin beside
+/// each group directory (with the nested layouts the heif, gdk-pixbuf,
+/// Qt and GTK trees keep), the data locations the declarations name,
+/// and the gstreamer scanner. Returns the tree root and its library
+/// directory, or None when no compiler is available.
+fn all_families_dist(td: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dist = td.join("dist");
+    let libdir = dist.join("usr/lib");
+    std::fs::create_dir_all(&libdir).unwrap();
+    write(
+        &dist.join("framework.c"),
+        "int framework(void){return 1;}\n",
+    );
+    let sonames = [
+        "libX11.so.6",
+        "libQt5Core.so.5",
+        "libQt6Core.so.6",
+        "libasound.so.2",
+        "libbabl-0.1.so.0",
+        "libfontconfig.so.1",
+        "libgdk_pixbuf-2.0.so.0",
+        "libgegl-0.4.so.0",
+        "libgio-2.0.so.0",
+        "libgirepository-1.0.so.1",
+        "libgtk-3.so.0",
+        "libgstreamer-1.0.so.0",
+        "libheif.so.1",
+        "libintl.so.8",
+        "libmagic.so.1",
+        "libpipewire-0.3.so.0",
+        "libspa-0.2.so.0",
+        "libtcl8.6.so",
+        "libtk8.6.so",
+        "libxkbcommon.so.0",
+    ];
+    for soname in sonames {
+        if !cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{soname}"),
+                dist.join("framework.c").to_str().unwrap(),
+            ],
+            &libdir.join(soname),
+        ) {
+            return None;
+        }
+    }
+    write(&dist.join("scanner.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(libdir.join("gstreamer-1.0")).unwrap();
+    if !cc_with(
+        &[dist.join("scanner.c").to_str().unwrap()],
+        &libdir.join("gstreamer-1.0/gst-plugin-scanner"),
+    ) {
+        return None;
+    }
+    let plugins = [
+        ("alsa-lib", "libasound_module_pcm_pulse.so"),
+        ("gstreamer-1.0", "libgstcoreelements.so"),
+        ("pipewire-0.3", "libpipewire-module-adapter.so"),
+        ("spa-0.2", "libspa-support.so"),
+        ("gio/modules", "libgiognutls.so"),
+        ("libheif", "libheif-x264.so"),
+        ("libheif/plugins", "libheif-avif.so"),
+        ("babl-0.1", "libbabl-cmyk.so"),
+        ("gegl-0.4", "gegl-brightness.so"),
+        ("qt5/plugins", "platforms/libqminimal.so"),
+        ("qt6/plugins", "platforms/libqsix.so"),
+        ("gdk-pixbuf-2.0/2.10.0/loaders", "libpixbuf-png.so"),
+        ("gtk-3.0/printbackends", "libprintbackend-file.so"),
+    ];
+    write(
+        &dist.join("plugin.c"),
+        "int plugin_probe(void){return 2;}\n",
+    );
+    for (group, plugin) in plugins {
+        let out = libdir.join(group).join(plugin);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        if !cc_with(
+            &["-shared", "-fPIC", dist.join("plugin.c").to_str().unwrap()],
+            &out,
+        ) {
+            return None;
+        }
+    }
+    // The ALSA configuration a distribution ships, with the hooks block
+    // the carried snippet anchor belongs in.
+    write(
+        &dist.join("usr/share/alsa/alsa.conf"),
+        "@hooks [\n\
+        \t{\n\
+        \t\tfunc load\n\
+        \t\tfiles [\n\
+        \t\t\t\"/etc/alsa/conf.d\"\n\
+        \t\t\t\"/etc/asound.conf|||/usr/etc/asound.conf\"\n\
+        \t\t\t\"~/.asoundrc\"\n\
+        \t\t]\n\
+        \t}\n\
+        ]\n\
+        \n\
+        pcm.default cards.pcm.default\n",
+    );
+    let data = [
+        ("usr/share/alsa/cards/aliases.conf", "cards\n"),
+        ("usr/share/X11/xkb/symbols/us", "us\n"),
+        ("usr/share/X11/locale/Compose", "compose\n"),
+        ("usr/share/file/misc/magic.mgc", "compiled-one\n"),
+        ("usr/share/locale/de/LC_MESSAGES/app.mo", "messages\n"),
+        ("usr/lib/tcl8.6/init.tcl", "tcl\n"),
+        ("usr/lib/tk8.6/tk.tcl", "tk\n"),
+        ("usr/lib/girepository-1.0/GLib-2.0.typelib", "typelib\n"),
+    ];
+    for (rel, content) in data {
+        write(&dist.join(rel), content);
+    }
+    Some((dist, libdir))
+}
+
+/// The catalog coverage matrix: one bundling walk over a minimal
+/// fixture holding every framework family. Every family's activation
+/// fires, its plugin groups arrive complete at their declared
+/// destinations with the source layout preserved, its required data
+/// lands where the runtime mappings look, the required gstreamer
+/// scanner helper reaches its `libexec` destination, and the ALSA
+/// configuration patch anchors the carried snippets between the host's
+/// and the user's.
+#[test]
+fn every_framework_family_arrives_complete_from_one_catalog_walk() {
+    let td = workdir("familymatrix");
+    let Some((_, libdir)) = all_families_dist(&td) else {
+        return;
+    };
+    let sonames = [
+        "libX11.so.6",
+        "libQt5Core.so.5",
+        "libQt6Core.so.6",
+        "libasound.so.2",
+        "libbabl-0.1.so.0",
+        "libfontconfig.so.1",
+        "libgdk_pixbuf-2.0.so.0",
+        "libgegl-0.4.so.0",
+        "libgio-2.0.so.0",
+        "libgirepository-1.0.so.1",
+        "libgtk-3.so.0",
+        "libgstreamer-1.0.so.0",
+        "libheif.so.1",
+        "libintl.so.8",
+        "libmagic.so.1",
+        "libpipewire-0.3.so.0",
+        "libspa-0.2.so.0",
+        "libtcl8.6.so",
+        "libtk8.6.so",
+        "libxkbcommon.so.0",
+    ];
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &sonames, &libdir) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+
+    // Every framework library itself is bundled.
+    for soname in sonames {
+        assert!(
+            app.join("lib").join(soname).is_file(),
+            "{soname} is bundled:\n{err}"
+        );
+    }
+    // Every activated rule is reported, twenty distinct rules over the
+    // twenty sonames (the pipewire soname activates spa too).
+    assert!(
+        err.contains("Rules:") && err.contains("20 activated by soname prefix"),
+        "every family's rule activates:\n{err}"
+    );
+
+    // The plugin groups arrive complete, at their declared group
+    // layouts, never flattened into the library directory.
+    let plugins = [
+        ("alsa-lib", "libasound_module_pcm_pulse.so", "alsa"),
+        ("gstreamer-1.0", "libgstcoreelements.so", "gstreamer"),
+        ("pipewire-0.3", "libpipewire-module-adapter.so", "pipewire"),
+        ("spa-0.2", "libspa-support.so", "spa"),
+        ("gio/modules", "libgiognutls.so", "gio"),
+        ("libheif", "libheif-x264.so", "heif"),
+        ("libheif/plugins", "libheif-avif.so", "heif"),
+        ("babl-0.1", "libbabl-cmyk.so", "babl"),
+        ("gegl-0.4", "gegl-brightness.so", "gegl"),
+        ("qt5/plugins", "platforms/libqminimal.so", "qt5"),
+        ("qt6/plugins", "platforms/libqsix.so", "qt6"),
+        (
+            "gdk-pixbuf-2.0/2.10.0/loaders",
+            "libpixbuf-png.so",
+            "gdk-pixbuf",
+        ),
+        ("gtk-3.0/printbackends", "libprintbackend-file.so", "gtk3"),
+    ];
+    for (group, plugin, rule) in plugins {
+        assert!(
+            app.join("lib").join(group).join(plugin).is_file(),
+            "{rule}: {plugin} keeps its place under {group}:\n{err}"
+        );
+        let name = Path::new(plugin).file_name().unwrap();
+        assert!(
+            !app.join("lib").join(name).exists(),
+            "{rule}: {plugin} is not flattened into lib/"
+        );
+    }
+    for rule in [
+        "alsa",
+        "gstreamer",
+        "pipewire",
+        "spa",
+        "gio",
+        "heif",
+        "babl",
+        "gegl",
+        "qt5",
+        "qt6",
+        "gdk-pixbuf",
+        "gtk3",
+    ] {
+        assert!(
+            err.contains(&format!("plugin(s) for {rule}/")),
+            "the report names {rule}'s collection:\n{err}"
+        );
+    }
+
+    // The required gstreamer scanner helper reaches its libexec
+    // destination, whatever layout the source kept it in.
+    assert!(
+        app.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "the scanner helper is collected:\n{err}"
+    );
+
+    // The required and optional data groups land at the destinations
+    // the runtime mappings name, ordered alternatives included: the
+    // first MAGIC alternative is carried to the second's destination.
+    let carried = [
+        ("share/alsa/cards/aliases.conf", "cards\n"),
+        ("share/X11/xkb/symbols/us", "us\n"),
+        ("share/X11/locale/Compose", "compose\n"),
+        ("share/misc/magic.mgc", "compiled-one\n"),
+        ("share/locale/de/LC_MESSAGES/app.mo", "messages\n"),
+        ("lib/tcl8.6/init.tcl", "tcl\n"),
+        ("lib/tk8.6/tk.tcl", "tk\n"),
+        ("lib/girepository-1.0/GLib-2.0.typelib", "typelib\n"),
+    ];
+    for (rel, content) in carried {
+        assert!(app.join(rel).is_file(), "{rel} is carried:\n{err}");
+        assert_eq!(
+            std::fs::read_to_string(app.join(rel)).unwrap(),
+            content,
+            "{rel} carries the alternative the declaration took"
+        );
+    }
+    assert!(
+        !app.join("share/file").exists(),
+        "no later MAGIC alternative:\n{err}"
+    );
+    for rule in [
+        "alsa",
+        "magic",
+        "xkb",
+        "x11",
+        "tcl-8.6",
+        "tk-8.6",
+        "gi",
+        "translations",
+    ] {
+        assert!(
+            err.contains(&format!("(data of {rule}")),
+            "the report names {rule}'s data carry:\n{err}"
+        );
+    }
+
+    // The registered ALSA build hook anchors the carried snippets
+    // between the host's and the user's own configuration.
+    let alsa = std::fs::read_to_string(app.join("share/alsa/alsa.conf")).unwrap();
+    let host = alsa.find("\"/etc/alsa/conf.d\"").unwrap();
+    let carried_anchor = alsa
+        .find("{ @func datadir } \"/alsa.conf.d\"")
+        .expect("the carried snippet directory is anchored");
+    let user = alsa.find("\"/etc/asound.conf").unwrap();
+    assert!(host < carried_anchor && carried_anchor < user, "{alsa}");
+
     let _ = std::fs::remove_dir_all(&td);
 }
 

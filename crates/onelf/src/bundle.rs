@@ -45,7 +45,9 @@ pub mod sysroot;
 use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
-use onelf_format::rules::{Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind};
+use onelf_format::rules::{
+    BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind,
+};
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
 
@@ -585,10 +587,7 @@ fn carry_data_group(
     actions: &mut Vec<WalkAction>,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
-    let patch_alsa = descriptor
-        .build
-        .hooks
-        .contains(&onelf_format::rules::BuildHookId::AlsaConfPatch);
+    let hooks: Vec<BuildHookId> = descriptor.build.hooks.clone();
     let origin = format!("rule {rule} group {} data carry", declared.id.as_str());
     let owners: Vec<AdmittedLibrary> = admitted
         .iter()
@@ -617,8 +616,8 @@ fn carry_data_group(
     if let Some(hit) = outcome.found.first() {
         let dest = directory.join(hit.destination.as_path());
         if dest.exists() {
-            if patch_alsa {
-                actions.push(WalkAction::PatchCarriedAlsa);
+            if !hooks.is_empty() {
+                actions.push(WalkAction::RunStagedHooks { hooks });
             }
             if hit.kind == ResourceKind::File {
                 plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?;
@@ -632,14 +631,14 @@ fn carry_data_group(
                 rule: rule.to_string(),
                 src: hit.resolved.clone(),
                 rel: hit.destination.clone(),
-                patch_alsa,
+                hooks,
             });
         }
         return Ok(());
     }
     if directory.join(declared.destination.as_str()).exists() {
-        if patch_alsa {
-            actions.push(WalkAction::PatchCarriedAlsa);
+        if !hooks.is_empty() {
+            actions.push(WalkAction::RunStagedHooks { hooks });
         }
         return Ok(());
     }
@@ -878,15 +877,16 @@ enum WalkAction {
         stale_flat: bool,
     },
     /// Copy one carried data path beside the tree root, from the
-    /// alternative the group took.
+    /// alternative the group took, then run the rule's declared hooks.
     CarryData {
         rule: String,
         src: PathBuf,
         rel: PathBuf,
-        patch_alsa: bool,
+        hooks: Vec<BuildHookId>,
     },
-    /// Anchor the hooks of an existing carried `share/alsa/alsa.conf`.
-    PatchCarriedAlsa,
+    /// Run a rule's declared hooks over a destination the tree already
+    /// holds.
+    RunStagedHooks { hooks: Vec<BuildHookId> },
     /// Retarget a plugin's alias links and drop the flat copy the
     /// subdirectory copy replaces.
     MigrateFlat { flat: PathBuf, new_rel: PathBuf },
@@ -1062,7 +1062,7 @@ fn execute_walk(
                 rule,
                 src,
                 rel,
-                patch_alsa,
+                hooks,
             } => {
                 if src.is_dir() {
                     plan.verify_tree(src, rel)?;
@@ -1089,9 +1089,7 @@ fn execute_walk(
                             color::cyan(rule),
                             color::dim(&format_size(bytes))
                         );
-                        if *patch_alsa {
-                            patch_carried_alsa_conf(directory, dry_run);
-                        }
+                        run_staged_hooks(hooks, directory, dry_run);
                     }
                     Err(e) => {
                         // A half-copied path reads as carried to the lint
@@ -1109,8 +1107,8 @@ fn execute_walk(
                     }
                 }
             }
-            WalkAction::PatchCarriedAlsa => {
-                patch_carried_alsa_conf(directory, dry_run);
+            WalkAction::RunStagedHooks { hooks } => {
+                run_staged_hooks(hooks, directory, dry_run);
             }
             WalkAction::MigrateFlat { flat, new_rel } => {
                 migrate_flat_plugin(flat, new_rel, &lib_dir, lib_dest, dry_run);
@@ -1137,6 +1135,32 @@ fn patch_carried_alsa_conf(directory: &Path, dry_run: bool) {
             "  {} could not patch share/alsa/alsa.conf hooks: {e}",
             color::bold_red("warning:")
         ),
+    }
+}
+
+/// A registered staged-resource procedure: the tree root it works on,
+/// and whether the run reports without writing.
+type StagedHook = fn(&Path, bool);
+
+/// The registered staged-resource procedure of one build-hook identity.
+///
+/// Every staged mutation a rule requests dispatches through this
+/// lookup, so the walk holds no branch keyed to one rule's identity,
+/// and a descriptor reaches a procedure only by declaring the identity
+/// in its build hooks. The match is exhaustive over the closed
+/// registry, so adding a variant without registering its procedure
+/// fails to compile.
+fn staged_hook(id: BuildHookId) -> StagedHook {
+    match id {
+        BuildHookId::AlsaConfPatch => patch_carried_alsa_conf,
+    }
+}
+
+/// Run a rule's declared build hooks through the registry, in
+/// declaration order. The procedures themselves honor a dry run.
+fn run_staged_hooks(hooks: &[BuildHookId], directory: &Path, dry_run: bool) {
+    for id in hooks {
+        staged_hook(*id)(directory, dry_run);
     }
 }
 
@@ -5041,6 +5065,506 @@ mod locale_tests {
             fs::read_to_string(dest.join("locale/C.utf8/LC_CTYPE")).unwrap(),
             "ctype"
         );
+        let _ = fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod catalog_coverage_tests {
+    use std::collections::BTreeSet;
+
+    use onelf_format::catalog;
+    use onelf_format::rules::{Inheritance, PathSelection, RuntimeHookId, SCHEMA_VERSION};
+
+    use super::*;
+
+    /// One framework family's declared surfaces: the descriptors it is
+    /// carried through, the resource groups and their destinations and
+    /// requirement classes, the runtime mappings and their policies, the
+    /// registered hooks, and the sonames that activate it.
+    struct Family {
+        name: &'static str,
+        descriptors: &'static [&'static str],
+        /// (rule, group, destination, requirement)
+        plugins: &'static [(&'static str, &'static str, &'static str, Requirement)],
+        data: &'static [(&'static str, &'static str, &'static str, Requirement)],
+        helpers: &'static [(&'static str, &'static str, &'static str, Requirement)],
+        /// (variable, selection, inheritance)
+        paths: &'static [(&'static str, PathSelection, Inheritance)],
+        runtime_hooks: &'static [RuntimeHookId],
+        build_hooks: &'static [BuildHookId],
+        sonames: &'static [&'static str],
+    }
+
+    const FAMILIES: &[Family] = &[
+        Family {
+            name: "alsa",
+            descriptors: &["alsa"],
+            plugins: &[("alsa", "plugins", "lib/alsa-lib", Requirement::Optional)],
+            data: &[("alsa", "configuration", "share/alsa", Requirement::Required)],
+            helpers: &[],
+            paths: &[
+                (
+                    "ALSA_PLUGIN_DIR",
+                    PathSelection::First,
+                    Inheritance::Replace,
+                ),
+                (
+                    "ALSA_CONFIG_DIR",
+                    PathSelection::First,
+                    Inheritance::Replace,
+                ),
+            ],
+            runtime_hooks: &[RuntimeHookId::AlsaConfigPathNaturalSort],
+            build_hooks: &[BuildHookId::AlsaConfPatch],
+            sonames: &["libasound.so.2"],
+        },
+        Family {
+            name: "gstreamer",
+            descriptors: &["gstreamer"],
+            plugins: &[(
+                "gstreamer",
+                "plugins",
+                "lib/gstreamer-1.0",
+                Requirement::Optional,
+            )],
+            data: &[],
+            helpers: &[(
+                "gstreamer",
+                "scanner",
+                "libexec/gstreamer-1.0/gst-plugin-scanner",
+                Requirement::Required,
+            )],
+            paths: &[
+                (
+                    "GST_PLUGIN_SYSTEM_PATH_1_0",
+                    PathSelection::All,
+                    Inheritance::Replace,
+                ),
+                (
+                    "GST_PLUGIN_SYSTEM_PATH",
+                    PathSelection::All,
+                    Inheritance::Replace,
+                ),
+                (
+                    "GST_PLUGIN_SCANNER_1_0",
+                    PathSelection::First,
+                    Inheritance::Replace,
+                ),
+                (
+                    "GST_PLUGIN_SCANNER",
+                    PathSelection::First,
+                    Inheritance::Replace,
+                ),
+            ],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libgstreamer-1.0.so.0"],
+        },
+        Family {
+            name: "pipewire-spa",
+            descriptors: &["pipewire", "spa"],
+            plugins: &[
+                (
+                    "pipewire",
+                    "plugins",
+                    "lib/pipewire-0.3",
+                    Requirement::Optional,
+                ),
+                ("spa", "plugins", "lib/spa-0.2", Requirement::Optional),
+            ],
+            data: &[],
+            helpers: &[],
+            paths: &[
+                (
+                    "PIPEWIRE_MODULE_DIR",
+                    PathSelection::All,
+                    Inheritance::Replace,
+                ),
+                ("SPA_PLUGIN_DIR", PathSelection::All, Inheritance::Replace),
+            ],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libpipewire-0.3.so.0", "libspa-0.2.so.0"],
+        },
+        Family {
+            name: "gio-gi",
+            descriptors: &["gio", "gi"],
+            plugins: &[("gio", "modules", "lib/gio/modules", Requirement::Optional)],
+            data: &[(
+                "gi",
+                "typelibs",
+                "lib/girepository-1.0",
+                Requirement::Optional,
+            )],
+            helpers: &[],
+            paths: &[("GI_TYPELIB_PATH", PathSelection::All, Inheritance::Replace)],
+            runtime_hooks: &[RuntimeHookId::GioModulePaths],
+            build_hooks: &[],
+            sonames: &["libgio-2.0.so.0", "libgirepository-1.0.so.1"],
+        },
+        Family {
+            name: "xkb-x11",
+            descriptors: &["xkb", "x11"],
+            plugins: &[],
+            data: &[
+                ("xkb", "data", "share/X11/xkb", Requirement::Required),
+                ("x11", "data", "share/X11/locale", Requirement::Required),
+            ],
+            helpers: &[],
+            paths: &[
+                (
+                    "XKB_CONFIG_ROOT",
+                    PathSelection::First,
+                    Inheritance::Preserve,
+                ),
+                ("XLOCALEDIR", PathSelection::First, Inheritance::Preserve),
+            ],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libxkbcommon.so.0", "libX11.so.6"],
+        },
+        Family {
+            name: "magic",
+            descriptors: &["magic"],
+            plugins: &[],
+            data: &[(
+                "magic",
+                "database",
+                "share/misc/magic.mgc",
+                Requirement::Required,
+            )],
+            helpers: &[],
+            paths: &[("MAGIC", PathSelection::First, Inheritance::Preserve)],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libmagic.so.1"],
+        },
+        Family {
+            name: "heif",
+            descriptors: &["heif"],
+            plugins: &[("heif", "plugins", "lib/libheif", Requirement::Optional)],
+            data: &[],
+            helpers: &[],
+            paths: &[(
+                "LIBHEIF_PLUGIN_PATH",
+                PathSelection::FirstPerLibraryRoot,
+                Inheritance::Replace,
+            )],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libheif.so.1"],
+        },
+        Family {
+            name: "babl-gegl",
+            descriptors: &["babl", "gegl"],
+            plugins: &[
+                ("babl", "plugins", "lib/babl-0.1", Requirement::Optional),
+                ("gegl", "plugins", "lib/gegl-0.4", Requirement::Optional),
+            ],
+            data: &[],
+            helpers: &[],
+            paths: &[
+                ("BABL_PATH", PathSelection::All, Inheritance::Replace),
+                ("GEGL_PATH", PathSelection::All, Inheritance::Replace),
+            ],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libbabl-0.1.so.0", "libgegl-0.4.so.0"],
+        },
+        Family {
+            name: "tcl-tk",
+            descriptors: &["tcl-8.6", "tcl-9.0", "tk-8.6", "tk-9.0", "tcl-tk"],
+            plugins: &[],
+            data: &[
+                ("tcl-8.6", "scripts", "lib/tcl8.6", Requirement::Required),
+                ("tcl-9.0", "scripts", "lib/tcl9.0", Requirement::Required),
+                ("tk-8.6", "scripts", "lib/tk8.6", Requirement::Required),
+                ("tk-9.0", "scripts", "lib/tk9.0", Requirement::Required),
+            ],
+            helpers: &[],
+            paths: &[],
+            runtime_hooks: &[RuntimeHookId::TclTkLibraries],
+            build_hooks: &[],
+            sonames: &[
+                "libtcl8.6.so",
+                "libtcl9.0.so",
+                "libtk8.6.so",
+                "libtcl9tk9.0.so",
+            ],
+        },
+        Family {
+            name: "translations",
+            descriptors: &["translations"],
+            plugins: &[],
+            data: &[(
+                "translations",
+                "messages",
+                "share/locale",
+                Requirement::Optional,
+            )],
+            helpers: &[],
+            paths: &[("TEXTDOMAINDIR", PathSelection::First, Inheritance::Preserve)],
+            runtime_hooks: &[],
+            build_hooks: &[],
+            sonames: &["libintl.so.8"],
+        },
+        Family {
+            name: "qt-gdk-gtk",
+            descriptors: &["qt", "qt5", "qt6", "gdk-pixbuf", "gtk3"],
+            plugins: &[
+                ("qt5", "plugins", "lib/qt5/plugins", Requirement::Optional),
+                ("qt6", "plugins", "lib/qt6/plugins", Requirement::Optional),
+                (
+                    "gdk-pixbuf",
+                    "loaders",
+                    "lib/gdk-pixbuf-2.0",
+                    Requirement::Optional,
+                ),
+                ("gtk3", "modules", "lib/gtk-3.0", Requirement::Optional),
+            ],
+            data: &[],
+            helpers: &[],
+            paths: &[
+                ("QT_PLUGIN_PATH", PathSelection::All, Inheritance::Replace),
+                ("GTK_PATH", PathSelection::All, Inheritance::Replace),
+            ],
+            runtime_hooks: &[RuntimeHookId::GdkCacheAbsolutise],
+            build_hooks: &[],
+            sonames: &[
+                "libQt5Core.so.5",
+                "libQt6Core.so.6",
+                "libgdk_pixbuf-2.0.so.0",
+                "libgtk-3.so.0",
+            ],
+        },
+        Family {
+            name: "fontconfig",
+            descriptors: &["fontconfig"],
+            plugins: &[],
+            data: &[],
+            helpers: &[],
+            paths: &[],
+            runtime_hooks: &[RuntimeHookId::FontconfigGenerate],
+            build_hooks: &[],
+            sonames: &["libfontconfig.so.1"],
+        },
+    ];
+
+    fn descriptor(id: &str) -> &'static Descriptor {
+        catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == id)
+            .unwrap_or_else(|| panic!("descriptor {id} is missing from the catalog"))
+    }
+
+    /// Every schema 1 descriptor the twelve families are carried
+    /// through exists, is valid, and the catalog holds nothing else.
+    #[test]
+    fn the_catalog_is_exactly_the_families_descriptors() {
+        let expected: BTreeSet<&str> = FAMILIES
+            .iter()
+            .flat_map(|family| family.descriptors.iter().copied())
+            .collect();
+        let actual: BTreeSet<&str> = catalog::builtins().iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(actual, expected, "catalog drift against the families");
+        for descriptor in catalog::builtins() {
+            assert_eq!(
+                descriptor.schema,
+                SCHEMA_VERSION,
+                "{}",
+                descriptor.id.as_str()
+            );
+            descriptor.validate().expect("built-ins validate");
+        }
+    }
+
+    /// Every family's descriptors declare exactly the groups, runtime
+    /// mappings, policies and hooks the family is carried through, and
+    /// each activating soname is a real prefix of the declaring rule.
+    #[test]
+    fn every_family_declares_its_groups_mappings_and_hooks() {
+        for family in FAMILIES {
+            let mut plugins: Vec<String> = Vec::new();
+            let mut data: Vec<String> = Vec::new();
+            let mut helpers: Vec<String> = Vec::new();
+            let mut paths: Vec<(String, PathSelection, Inheritance)> = Vec::new();
+            let mut runtime_hooks: Vec<RuntimeHookId> = Vec::new();
+            let mut build_hooks: Vec<BuildHookId> = Vec::new();
+            for id in family.descriptors {
+                let descriptor = descriptor(id);
+                for group in &descriptor.resources.plugins {
+                    plugins.push(format!(
+                        "{}/{}/{} {:?}",
+                        id,
+                        group.id.as_str(),
+                        group.destination.as_str(),
+                        group.requirement
+                    ));
+                }
+                for group in &descriptor.resources.data {
+                    data.push(format!(
+                        "{}/{}/{} {:?}",
+                        id,
+                        group.id.as_str(),
+                        group.destination.as_str(),
+                        group.requirement
+                    ));
+                }
+                for helper in &descriptor.resources.helpers {
+                    helpers.push(format!(
+                        "{}/{}/{} {:?}",
+                        id,
+                        helper.id.as_str(),
+                        helper.destination.as_str(),
+                        helper.requirement
+                    ));
+                }
+                for path in &descriptor.runtime.paths {
+                    for variable in &path.variables {
+                        paths.push((
+                            variable.as_str().to_string(),
+                            path.selection,
+                            path.inheritance,
+                        ));
+                    }
+                }
+                runtime_hooks.extend(descriptor.runtime.hooks.iter().copied());
+                build_hooks.extend(descriptor.build.hooks.iter().copied());
+            }
+            let want_plugins = family
+                .plugins
+                .iter()
+                .map(|(rule, group, dest, requirement)| {
+                    format!("{rule}/{group}/{dest} {requirement:?}")
+                })
+                .collect::<Vec<_>>();
+            let want_data = family
+                .data
+                .iter()
+                .map(|(rule, group, dest, requirement)| {
+                    format!("{rule}/{group}/{dest} {requirement:?}")
+                })
+                .collect::<Vec<_>>();
+            let want_helpers = family
+                .helpers
+                .iter()
+                .map(|(rule, group, dest, requirement)| {
+                    format!("{rule}/{group}/{dest} {requirement:?}")
+                })
+                .collect::<Vec<_>>();
+            let want_paths = family
+                .paths
+                .iter()
+                .map(|(v, s, i)| ((*v).to_string(), *s, *i))
+                .collect::<Vec<_>>();
+            assert_eq!(plugins, want_plugins, "{} plugin groups", family.name);
+            assert_eq!(data, want_data, "{} data groups", family.name);
+            assert_eq!(helpers, want_helpers, "{} helper groups", family.name);
+            assert_eq!(paths, want_paths, "{} runtime mappings", family.name);
+            assert_eq!(runtime_hooks, family.runtime_hooks, "{}", family.name);
+            assert_eq!(build_hooks, family.build_hooks, "{}", family.name);
+        }
+    }
+
+    /// Every triggered descriptor of every family activates from one of
+    /// the family's sonames and queues exactly its declared groups, and
+    /// the prefix predicate is a real prefix of that soname.
+    #[test]
+    fn every_family_activates_from_its_sonames_and_queues_its_groups() {
+        for family in FAMILIES {
+            let mut discovery = Discovery::new(catalog::builtins(), &[], &[]).unwrap();
+            for soname in family.sonames {
+                discovery.observe_present(soname).unwrap();
+            }
+            let activated: Vec<RuleActivation> = discovery
+                .activations()
+                .into_iter()
+                .filter(|a| family.descriptors.contains(&a.rule.as_str()))
+                .collect();
+            let mut want: Vec<&str> = family
+                .descriptors
+                .iter()
+                .copied()
+                .filter(|id| !descriptor(id).triggers.is_empty())
+                .collect();
+            let mut got: Vec<&str> = activated
+                .iter()
+                .map(|a| a.rule.as_str())
+                .collect::<Vec<_>>();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "{} activation", family.name);
+            for activation in &activated {
+                let d = descriptor(&activation.rule);
+                let declared: Vec<String> = d
+                    .resources
+                    .plugins
+                    .iter()
+                    .map(|g| g.id.as_str().to_string())
+                    .chain(d.resources.data.iter().map(|g| g.id.as_str().to_string()))
+                    .chain(
+                        d.resources
+                            .helpers
+                            .iter()
+                            .map(|g| g.id.as_str().to_string()),
+                    )
+                    .collect();
+                assert_eq!(activation.groups, declared, "{}", activation.rule);
+                assert!(
+                    d.triggers
+                        .iter()
+                        .any(|t| t.matches_soname(&activation.reason)),
+                    "{} activated by {} which matches no trigger",
+                    activation.rule,
+                    activation.reason
+                );
+            }
+        }
+    }
+
+    /// The registered build hooks are exactly the identities the
+    /// catalog declares, and the declared identity resolves.
+    #[test]
+    fn the_registry_holds_exactly_the_catalog_declared_build_hooks() {
+        let declared: BTreeSet<BuildHookId> = catalog::builtins()
+            .iter()
+            .flat_map(|d| d.build.hooks.iter().copied())
+            .collect();
+        assert_eq!(declared, BTreeSet::from([BuildHookId::AlsaConfPatch]));
+        let _ = staged_hook(BuildHookId::AlsaConfPatch);
+    }
+
+    /// Dispatching a declared hook through the registry runs its
+    /// procedure: a dry run writes nothing, a real run anchors the
+    /// carried snippets in a carried `alsa.conf`.
+    #[test]
+    fn every_declared_build_hook_dispatches_and_honors_a_dry_run() {
+        let work = std::env::temp_dir().join(format!("onelf-hook-dispatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let tree = work.join("tree");
+        let conf = tree.join("share/alsa/alsa.conf");
+        fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        fs::write(
+            &conf,
+            "@hooks [\n\t{\n\t\tfiles [\n\t\t\t\"/etc/alsa/conf.d\"\n\t\t]\n\t}\n]\n",
+        )
+        .unwrap();
+
+        run_staged_hooks(&[BuildHookId::AlsaConfPatch], &tree, true);
+        assert_eq!(
+            fs::read_to_string(&conf).unwrap(),
+            "@hooks [\n\t{\n\t\tfiles [\n\t\t\t\"/etc/alsa/conf.d\"\n\t\t]\n\t}\n]\n",
+            "a dry run writes nothing"
+        );
+
+        run_staged_hooks(&[BuildHookId::AlsaConfPatch], &tree, false);
+        let patched = fs::read_to_string(&conf).unwrap();
+        let host = patched.find("\"/etc/alsa/conf.d\"").unwrap();
+        let carried = patched
+            .find("{ @func datadir } \"/alsa.conf.d\"")
+            .expect("the carried snippet directory is anchored");
+        assert!(host < carried, "{patched}");
         let _ = fs::remove_dir_all(&work);
     }
 }

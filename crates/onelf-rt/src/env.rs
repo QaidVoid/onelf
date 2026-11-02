@@ -2464,6 +2464,86 @@ mod path_mapping_tests {
         assert!(builtin_path_groups().any(|g| g.kind == ResourceKind::File));
     }
 
+    /// Every runtime mapping the catalog declares evaluates end to end:
+    /// with only its first candidate present, each of its aliases
+    /// receives that candidate's path, under every selection mode the
+    /// catalog uses.
+    #[test]
+    fn every_catalog_mapping_evaluates_its_first_present_candidate() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut checked = 0usize;
+        for descriptor in onelf_format::catalog::builtins() {
+            for group in &descriptor.runtime.paths {
+                let work = tree(&format!(
+                    "eval-{}-{}",
+                    descriptor.id.as_str(),
+                    group.id.as_str()
+                ));
+                let pkg = work.join("pkg");
+                let lib = pkg.join("lib");
+                mkdir(&lib);
+                let first = &group.candidates[0];
+                let path = match first.base {
+                    RuntimeBase::PackageRoot => pkg.clone(),
+                    RuntimeBase::LibraryRoot => lib.clone(),
+                }
+                .join(first.path.as_str());
+                match group.kind {
+                    ResourceKind::File => touch(&path),
+                    ResourceKind::Directory => mkdir(&path),
+                }
+                let pkg_ref = pkg.as_path();
+                let lib_ref = lib.clone();
+                let scopes = [Scope {
+                    packages: std::slice::from_ref(&pkg_ref),
+                    libraries: std::slice::from_ref(&lib_ref),
+                }];
+                for variable in &group.variables {
+                    unsafe { env::remove_var(variable.as_str()) };
+                }
+
+                let assignments = evaluate_path_groups(std::iter::once(group), &scopes);
+                apply_path_assignments(&assignments);
+                let got = assignments;
+
+                assert_eq!(
+                    got.len(),
+                    1,
+                    "{}/{} assigns nothing with its first candidate present",
+                    descriptor.id.as_str(),
+                    group.id.as_str()
+                );
+                let assigned: Vec<&str> = got[0].variables.to_vec();
+                let want: Vec<&str> = group.variables.iter().map(|v| v.as_str()).collect();
+                assert_eq!(assigned, want, "{}", descriptor.id.as_str());
+                assert_eq!(
+                    got[0].value,
+                    path.clone().into_os_string(),
+                    "{}/{}",
+                    descriptor.id.as_str(),
+                    group.id.as_str()
+                );
+                for variable in &group.variables {
+                    assert_eq!(
+                        env::var_os(variable.as_str()),
+                        Some(got[0].value.clone()),
+                        "{}",
+                        variable.as_str()
+                    );
+                    unsafe { env::remove_var(variable.as_str()) };
+                }
+                checked += 1;
+                let _ = std::fs::remove_dir_all(&work);
+            }
+        }
+        assert!(
+            checked >= 15,
+            "the catalog declares only {checked} mappings"
+        );
+    }
+
     /// The built-in mappings reproduce the outcomes of the path tables
     /// they replaced for every framework those tables covered: aliases,
     /// kinds, per-library-root nesting, application-before-set order,
