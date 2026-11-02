@@ -18,6 +18,8 @@ path = "src/env.rs"
 [[bin]]
 name = "onelf-bootstrap"
 path = "src/bootstrap.rs"
+# Its freestanding `no_main` entry cannot host the test harness.
+test = false
 
 [profile.dev]
 panic = "abort"

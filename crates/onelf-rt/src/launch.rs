@@ -5,16 +5,37 @@
 //! exist on disk and in nothing after that, so they share this one path.
 //! The memfd mode has no tree and no libraries and does not come here.
 
-use std::ffi::OsString;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use onelf_format::HostLibsPolicy;
 use onelf_format::drivers;
 use onelf_format::resolve::{self, Gl, Request, Resolution};
+use onelf_format::rules::Inheritance;
 
 use crate::loader::PackageData;
+
+/// Where the launch publishes the evaluated per-view environment input the
+/// payload constructor reads back.
+const VIEW_ENV_FILE: &str = ".onelf/runtime-env";
+/// The generated input is capped at one mebibyte, the bound the
+/// constructor enforces when it reads the file back; the two numbers must
+/// stay equal.
+const MAX_VIEW_ENV_BYTES: usize = 1024 * 1024;
+/// The most entries the input may carry, as the constructor counts them.
+const MAX_VIEW_ENV_ENTRIES: usize = 4096;
+/// The longest variable name an entry may carry.
+const MAX_VIEW_ENV_NAME: usize = 128;
+/// The longest value an entry or scalar record may carry.
+const MAX_VIEW_ENV_VALUE: usize = 32 * 1024;
+const VIEW_ENV_HEADER: &[u8] = b"ONELF-RUNTIME-ENV 1 ";
+const HOST_ENV_VAR: &str = "ONELF_HOST_ENV";
+const ROOTS_VAR: &str = "ONELF_ROOTS";
 
 /// Everything a launch needs beyond the package itself.
 pub struct Launch<'a> {
@@ -116,6 +137,7 @@ fn run(launch: &Launch) {
         return;
     }
 
+    let env_before = snapshot_env();
     let lib_path = crate::env::setup_env(
         pkg_root_s,
         launch.argv0,
@@ -133,6 +155,7 @@ fn run(launch: &Launch) {
         crate::env::apply_custom_env(data, pkg_root_s);
     }
     crate::hostenv::record_host_env(launch.pkg_root, &set_roots);
+    publish_view_env(launch, &env_before, &lib_dirs, &set_lib_dirs, &set_roots);
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
     crate::hostpaths::apply(launch.pkg_root);
@@ -238,6 +261,215 @@ fn place_links(
         }
         Links::Served => crate::links::served(manifest, launch.pkg_root, &dir, &links, lib_dirs),
     }
+}
+
+/// The environment this launch found, before it changed any of it.
+fn snapshot_env() -> BTreeMap<OsString, OsString> {
+    std::env::vars_os().collect()
+}
+
+/// One evaluated assignment encoded for the constructor.
+struct ViewEnvEntry {
+    name: Vec<u8>,
+    value: Vec<u8>,
+    policy: Inheritance,
+    applied: Option<u64>,
+}
+
+/// Why a generated input was refused instead of written short.
+#[derive(Debug)]
+enum ViewEnvError {
+    /// The whole input would exceed the bound the constructor reads back.
+    TooLarge,
+}
+
+impl fmt::Display for ViewEnvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("beyond the record bound the constructor reads back")
+    }
+}
+
+/// Whether this launch may write the per-view environment input into its
+/// tree: the tree must belong to this launch alone, so a shared extracted
+/// tree or a mount another launch serves is never written to. Views that
+/// carry no file run on the packaged `.onelf/env` alone.
+fn publishes_view_env(links: &Links<'_>, tree_writable: bool, private_ns: bool) -> bool {
+    matches!(links, Links::Tree) && (tree_writable || private_ns)
+}
+
+/// The launch's framework mappings, evaluated against the application and
+/// set roots the same pass `crate::env` applied them with, so the record
+/// carries each mapping's value and inheritance policy.
+fn view_env_assignments(
+    pkg_root: &Path,
+    lib_dirs: &[&str],
+    set_lib_dirs: &[PathBuf],
+    set_roots: &[PathBuf],
+) -> Vec<crate::env::PathAssignment<'static>> {
+    let app_lib_dirs: Vec<PathBuf> = lib_dirs.iter().map(|d| pkg_root.join(d)).collect();
+    let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
+    let packages = [pkg_root];
+    let scopes = [
+        crate::env::Scope {
+            packages: &packages,
+            libraries: &app_lib_dirs,
+        },
+        crate::env::Scope {
+            packages: &set_packages,
+            libraries: set_lib_dirs,
+        },
+    ];
+    crate::env::evaluate_path_groups(crate::env::builtin_path_groups(), &scopes)
+}
+
+/// Generate and publish this launch's evaluated per-view environment input.
+///
+/// The record holds one entry per framework mapping alias and per variable
+/// the launch changed, the active roots, and the host-restoration record.
+/// The constructor reads it back after a sandboxed `clearenv`, restoring
+/// the mappings the clearing took away and re-materializing the records
+/// the exec hooks need. An input beyond the constructor's bounds is
+/// refused whole rather than written short; the packaged `.onelf/env`
+/// still covers the launch, as it does without a record.
+fn publish_view_env(
+    launch: &Launch,
+    base: &BTreeMap<OsString, OsString>,
+    lib_dirs: &[&str],
+    set_lib_dirs: &[PathBuf],
+    set_roots: &[PathBuf],
+) {
+    if !publishes_view_env(&launch.links, launch.tree_writable, launch.private_ns) {
+        return;
+    }
+    let assignments = view_env_assignments(launch.pkg_root, lib_dirs, set_lib_dirs, set_roots);
+    let now = snapshot_env();
+    let roots = now.get(OsStr::new(ROOTS_VAR)).map(OsString::as_os_str);
+    let host_record = now.get(OsStr::new(HOST_ENV_VAR)).map(OsString::as_os_str);
+    match encode_view_env(base, &now, &assignments, roots, host_record) {
+        Ok(bytes) if !bytes.is_empty() => {
+            if let Err(e) = std::fs::write(launch.pkg_root.join(VIEW_ENV_FILE), &bytes) {
+                eprintln!("onelf-rt: cannot write {VIEW_ENV_FILE}: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("onelf-rt: the generated environment input is {e} and is not written"),
+    }
+}
+
+/// Encode the evaluated per-view environment input.
+///
+/// Every framework mapping alias is listed with the mapping's own value,
+/// what the launch left in the environment to compare against, and the
+/// mapping's inheritance policy. Every other variable the launch changed
+/// is listed with the value it left, under a replace policy. A variable
+/// the launch left unset is not listed: restoration never invents an
+/// unset. A name or value beyond what the constructor reads back is
+/// skipped, since the packaged `.onelf/env` still carries recipe values.
+fn encode_view_env(
+    base: &BTreeMap<OsString, OsString>,
+    now: &BTreeMap<OsString, OsString>,
+    assignments: &[crate::env::PathAssignment<'_>],
+    roots: Option<&OsStr>,
+    host_record: Option<&OsStr>,
+) -> Result<Vec<u8>, ViewEnvError> {
+    let mut mapped = BTreeSet::new();
+    let mut entries: Vec<ViewEnvEntry> = Vec::new();
+    for assignment in assignments {
+        for name in &assignment.variables {
+            if !mapped.insert(OsString::from(*name)) {
+                continue;
+            }
+            let applied = now
+                .get(OsStr::new(name))
+                .map(|left| crate::hostenv::fnv1a(left.as_bytes()));
+            entries.push(ViewEnvEntry {
+                name: name.as_bytes().to_vec(),
+                value: assignment.value.as_bytes().to_vec(),
+                policy: assignment.inheritance,
+                applied,
+            });
+        }
+    }
+    for (name, value) in now {
+        if base.get(name) == Some(value)
+            || name.as_bytes() == HOST_ENV_VAR.as_bytes()
+            || name.as_bytes() == ROOTS_VAR.as_bytes()
+            || mapped.contains(name)
+        {
+            continue;
+        }
+        let (name, value) = (name.as_bytes(), value.as_bytes());
+        if name.is_empty()
+            || name.len() > MAX_VIEW_ENV_NAME
+            || name.contains(&0)
+            || name.contains(&b'=')
+            || value.len() > MAX_VIEW_ENV_VALUE
+            || value.contains(&0)
+        {
+            continue;
+        }
+        entries.push(ViewEnvEntry {
+            name: name.to_vec(),
+            value: value.to_vec(),
+            policy: Inheritance::Replace,
+            applied: Some(crate::hostenv::fnv1a(value)),
+        });
+    }
+    if entries.len() > MAX_VIEW_ENV_ENTRIES {
+        return Err(ViewEnvError::TooLarge);
+    }
+
+    let mut out = Vec::new();
+    put(&mut out, VIEW_ENV_HEADER)?;
+    put(&mut out, entries.len().to_string().as_bytes())?;
+    put(&mut out, b"\n")?;
+    for entry in &entries {
+        put(&mut out, &entry.name)?;
+        put(&mut out, b"=")?;
+        put(
+            &mut out,
+            match entry.policy {
+                Inheritance::Preserve => b".",
+                Inheritance::Replace => b"!",
+            },
+        )?;
+        put(&mut out, entry.value.len().to_string().as_bytes())?;
+        put(&mut out, b":")?;
+        put(&mut out, &entry.value)?;
+        match entry.applied {
+            Some(hash) => {
+                put(&mut out, b"@")?;
+                put(&mut out, format!("{hash:016x}").as_bytes())?;
+            }
+            None => put(&mut out, b"-")?,
+        }
+        put(&mut out, b";\n")?;
+    }
+    for (tag, scalar) in [(b'R', roots), (b'H', host_record)] {
+        let Some(bytes) = scalar else {
+            continue;
+        };
+        let bytes = bytes.as_bytes();
+        if bytes.len() > MAX_VIEW_ENV_VALUE || bytes.contains(&0) {
+            continue;
+        }
+        put(&mut out, &[tag])?;
+        put(&mut out, bytes.len().to_string().as_bytes())?;
+        put(&mut out, b":")?;
+        put(&mut out, bytes)?;
+        put(&mut out, b";\n")?;
+    }
+    Ok(out)
+}
+
+/// Append `bytes` while the whole input stays within the constructor's
+/// bound. The first byte past it refuses the input whole.
+fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ViewEnvError> {
+    if out.len() + bytes.len() > MAX_VIEW_ENV_BYTES {
+        return Err(ViewEnvError::TooLarge);
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// `LD_LIBRARY_PATH` for an ELF without a `$ORIGIN` run path that the
@@ -465,5 +697,168 @@ fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathB
         resolution,
         platform_root,
         _platform_lock: lock,
+    }
+}
+
+#[cfg(test)]
+mod view_env_tests {
+    use super::{
+        HOST_ENV_VAR, ROOTS_VAR, VIEW_ENV_HEADER, encode_view_env, publishes_view_env, snapshot_env,
+    };
+    use onelf_format::rules::Inheritance;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<OsString, OsString> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(*name), OsString::from(*value)))
+            .collect()
+    }
+
+    fn assignments<'a>(
+        items: &[(&'a str, &'a str, Inheritance)],
+    ) -> Vec<crate::env::PathAssignment<'a>> {
+        items
+            .iter()
+            .map(|(name, value, inheritance)| crate::env::PathAssignment {
+                variables: vec![name],
+                value: (*value).into(),
+                inheritance: *inheritance,
+            })
+            .collect()
+    }
+
+    fn hash(value: &str) -> u64 {
+        crate::hostenv::fnv1a(value.as_bytes())
+    }
+
+    /// The one entry line the encoder writes for these fields.
+    fn expected_entry(name: &str, policy: char, value: &str, applied: Option<u64>) -> String {
+        match applied {
+            Some(hash) => {
+                format!("{name}={policy}{}:{value}@{hash:016x};\n", value.len())
+            }
+            None => format!("{name}={policy}{}:{value}-;\n", value.len()),
+        }
+    }
+
+    #[test]
+    fn the_generated_input_lists_changed_and_mapped_variables() {
+        let base = map(&[
+            ("UNCHANGED", "same"),
+            ("MAPPED", "caller"),
+            ("CHANGED", "old"),
+        ]);
+        let now = map(&[
+            ("UNCHANGED", "same"),
+            ("MAPPED", "caller"),
+            ("CHANGED", "new"),
+            ("HOOKOUT", "/private/font.conf"),
+            (HOST_ENV_VAR, "rec"),
+            (ROOTS_VAR, "/view"),
+        ]);
+        let maps = assignments(&[("MAPPED", "/view/plugins", Inheritance::Preserve)]);
+        let bytes = encode_view_env(
+            &base,
+            &now,
+            &maps,
+            Some(OsStr::new("/view")),
+            Some(OsStr::new("rec")),
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("ONELF-RUNTIME-ENV 1 3\n"));
+        assert!(text.contains(&expected_entry(
+            "MAPPED",
+            '.',
+            "/view/plugins",
+            Some(hash("caller"))
+        )));
+        assert!(text.contains(&expected_entry("CHANGED", '!', "new", Some(hash("new")))));
+        assert!(text.contains(&expected_entry(
+            "HOOKOUT",
+            '!',
+            "/private/font.conf",
+            Some(hash("/private/font.conf"))
+        )));
+        assert!(!text.contains("UNCHANGED"));
+        assert!(!text.contains("ONELF_HOST_ENV="));
+        assert!(text.ends_with("R5:/view;\nH3:rec;\n"));
+    }
+
+    #[test]
+    fn an_unchanged_launch_still_records_its_mappings() {
+        let env_state = map(&[("MAPPED", "caller"), ("OTHER", "same")]);
+        let maps = assignments(&[("MAPPED", "/view/plugins", Inheritance::Replace)]);
+        let bytes = encode_view_env(&env_state, &env_state, &maps, None, None).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("ONELF-RUNTIME-ENV 1 1\n"));
+        assert!(text.contains(&expected_entry(
+            "MAPPED",
+            '!',
+            "/view/plugins",
+            Some(hash("caller"))
+        )));
+        assert!(!text.contains("OTHER"));
+
+        let plain = map(&[("OTHER", "same")]);
+        let bytes = encode_view_env(&plain, &plain, &[], None, None).unwrap();
+        assert!(bytes.starts_with(VIEW_ENV_HEADER));
+        assert!(bytes.ends_with(b"0\n"));
+    }
+
+    #[test]
+    fn a_value_beyond_the_per_entry_bounds_is_skipped() {
+        let base = map(&[]);
+        let now = map(&[
+            ("HUGE", &"x".repeat(40_000)),
+            (&"L".repeat(200), "value"),
+            ("KEPT", "fine"),
+        ]);
+        let bytes = encode_view_env(&base, &now, &[], None, None).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("ONELF-RUNTIME-ENV 1 1\n"));
+        assert!(text.contains(&expected_entry("KEPT", '!', "fine", Some(hash("fine")))));
+        assert!(!text.contains("HUGE"));
+    }
+
+    #[test]
+    fn an_input_beyond_the_total_cap_is_refused_not_truncated() {
+        let base = BTreeMap::new();
+        let mut now = BTreeMap::new();
+        for i in 0..4000u32 {
+            now.insert(
+                OsString::from(format!("V{i:04}")),
+                OsString::from(format!("{:0300}", "")),
+            );
+        }
+        let got = encode_view_env(&base, &now, &[], None, None);
+        assert!(matches!(got, Err(super::ViewEnvError::TooLarge)));
+    }
+
+    #[test]
+    fn only_a_private_tree_publishes_the_input() {
+        let (sender, _receiver) = crate::links::channel().unwrap();
+        assert!(publishes_view_env(&super::Links::Tree, true, false));
+        assert!(publishes_view_env(&super::Links::Tree, false, true));
+        assert!(!publishes_view_env(&super::Links::Tree, false, false));
+        assert!(!publishes_view_env(
+            &super::Links::Server(&sender),
+            true,
+            true
+        ));
+        assert!(!publishes_view_env(&super::Links::Served, true, true));
+    }
+
+    #[test]
+    fn the_snapshot_is_the_process_environment() {
+        let snapshot = snapshot_env();
+        assert!(
+            snapshot
+                .contains_key(OsString::from("PATH").as_os_str())
+                .then_some(())
+                .is_some()
+        );
     }
 }

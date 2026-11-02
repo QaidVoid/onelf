@@ -9,12 +9,15 @@
 //! Ported from the former `payload/bootstrap_{x86_64,aarch64}.c` +
 //! `trampoline_*.S`. The trampoline layout is byte-compatible with the
 //! metadata-pointer patch offsets in `onelf`'s `payload.rs`.
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(test, allow(dead_code))]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     arch::exit(127)

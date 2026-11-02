@@ -4,9 +4,12 @@
 //! own, bundled into a package's lib/ and injected as a `DT_NEEDED` of the
 //! entrypoint. Its `.init_array` constructor runs on every exec (surviving a
 //! sandboxed `clearenv()` + re-exec): it self-locates via `/proc/self/maps`,
-//! walks to the package root (the dir containing `.onelf/`), and re-applies
-//! `.onelf/env` (KEY=VALUE, `${ONELF_DIR}`/`${VAR:-word}` expanded) and
-//! `.onelf/preload` (one dlopen'd lib per line).
+//! walks to the package root (the dir containing `.onelf/`), first applies
+//! the launch's evaluated per-view input `.onelf/runtime-env` (see [`rtenv`]
+//! for the format and the bounds), which restores the generated framework
+//! mappings and the exec-hook records a sandboxed `clearenv()` took away,
+//! then re-applies `.onelf/env` (KEY=VALUE, `${ONELF_DIR}`/`${VAR:-word}`
+//! expanded) and `.onelf/preload` (one dlopen'd lib per line).
 //!
 //! `setenv`/`dlopen`/`getenv` are left UNDEFINED and resolve from the
 //! application's own libc at load time, so one per-arch blob serves both
@@ -15,13 +18,20 @@
 //! It also carries the exec and spawn hooks in [`exec`], which start a
 //! program outside the package with the environment the runtime was
 //! started with.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod exec;
 
+mod rtenv;
+
+#[cfg(test)]
+pub(crate) mod harness;
+
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &PanicInfo) -> ! {
     // The constructor must never unwind into the loader. Exiting with a
@@ -64,6 +74,7 @@ const RTLD_GLOBAL: i32 = 0x0100;
 // ---- raw syscalls ---------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -92,7 +103,9 @@ mod sys {
     }
     pub unsafe fn exit_group(code: i32) -> ! {
         sys3(231, code as i64, 0, 0);
-        loop {}
+        loop {
+            core::hint::spin_loop();
+        }
     }
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         sys3(1, 2, buf as i64, n as i64);
@@ -123,6 +136,7 @@ mod sys {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -143,7 +157,9 @@ mod sys {
     }
     pub unsafe fn exit_group(code: i32) -> ! {
         svc4(94, code as i64, 0, 0, 0);
-        loop {}
+        loop {
+            core::hint::spin_loop();
+        }
     }
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         svc4(64, 2, buf as i64, n as i64, 0);
@@ -173,6 +189,7 @@ mod sys {
 }
 
 #[cfg(target_arch = "x86")]
+#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -204,7 +221,9 @@ mod sys {
     }
     pub unsafe fn exit_group(code: i32) -> ! {
         sys3(252, code, 0, 0);
-        loop {}
+        loop {
+            core::hint::spin_loop();
+        }
     }
     pub unsafe fn write_stderr(buf: *const u8, n: usize) {
         sys3(4, 2, buf as i32, n as i32);
@@ -246,10 +265,14 @@ mod sys {
 const MAPS_CAP: usize = 65536;
 const ROOT_CAP: usize = 4096;
 const BUF_CAP: usize = 65536;
+/// The evaluated per-view environment input, bounded by the same cap the
+/// runtime enforces when it generates the file.
+const RENV_CAP: usize = rtenv::MAX_RECORD_BYTES;
 
 static mut G_MAPS: [u8; MAPS_CAP] = [0; MAPS_CAP];
 static mut G_ROOT: [u8; ROOT_CAP] = [0; ROOT_CAP];
 static mut G_BUF: [u8; BUF_CAP] = [0; BUF_CAP];
+static mut G_RENV: [u8; RENV_CAP + 1] = [0; RENV_CAP + 1];
 
 // ---- tiny freestanding helpers --------------------------------------------
 
@@ -261,24 +284,44 @@ unsafe fn slen(s: *const u8) -> usize {
     n
 }
 
-/// Read a whole file into `buf` (capacity `cap`). Returns byte count, or -1 on
-/// open failure. Silently truncates past `cap` (env/preload files are tiny).
-unsafe fn read_file(path: *const u8, buf: *mut u8, cap: usize) -> i64 {
+/// Read a whole file into `buf`, which must hold `cap` bytes plus one.
+/// Returns the byte count, [`READ_ABSENT`] when the file cannot be opened,
+/// [`READ_IO`] on a read error, or [`READ_OVERFLOW`] when the file is
+/// longer than `cap`: an oversized file is refused, never truncated.
+unsafe fn read_bounded(path: *const u8, buf: *mut u8, cap: usize) -> i64 {
     let fd = sys::openat_rdonly(path);
     if fd < 0 {
-        return -1;
+        return READ_ABSENT;
     }
     let mut off = 0usize;
-    while off < cap {
-        let r = sys::read(fd as i32, buf.add(off), (cap - off) as u64);
-        if r <= 0 {
+    let mut failed = false;
+    while off <= cap {
+        let r = sys::read(fd as i32, buf.add(off), (cap + 1 - off) as u64);
+        if r < 0 {
+            failed = true;
+            break;
+        }
+        if r == 0 {
             break;
         }
         off += r as usize;
     }
     sys::close(fd as i32);
+    if failed {
+        return READ_IO;
+    }
+    if off > cap {
+        return READ_OVERFLOW;
+    }
     off as i64
 }
+
+/// [`read_bounded`] result: the file cannot be opened.
+const READ_ABSENT: i64 = -1;
+/// [`read_bounded`] result: the file is longer than the cap.
+const READ_OVERFLOW: i64 = -2;
+/// [`read_bounded`] result: a read failed part way through.
+const READ_IO: i64 = -3;
 
 /// Copy `src[..n]` into `dst` (capacity `cap`, NUL-terminated). Returns the
 /// length written, or -1 on overflow.
@@ -367,7 +410,7 @@ unsafe fn expand(dst: *mut u8, cap: usize, src: *const u8, n: usize, root: *cons
                         k += 1;
                     }
                     name[nl] = 0;
-                    let rep: *const u8 = if seq(name.as_ptr(), b"ONELF_DIR\0".as_ptr()) {
+                    let rep: *const u8 = if seq(name.as_ptr(), c"ONELF_DIR".as_ptr().cast()) {
                         root
                     } else {
                         getenv(name.as_ptr())
@@ -446,7 +489,7 @@ unsafe fn find_root() -> bool {
     // hundred libraries before any constructor runs), and this object is
     // an early dependency at a high address, so it sits near the end.
     let maps = &raw mut G_MAPS as *mut u8;
-    let fd = sys::openat_rdonly(b"/proc/self/maps\0".as_ptr());
+    let fd = sys::openat_rdonly(c"/proc/self/maps".as_ptr().cast());
     if fd < 0 {
         return false;
     }
@@ -533,7 +576,11 @@ unsafe fn find_root() -> bool {
         cand[l - 1] = 0; // drop the slash -> directory path
 
         let cl = slen(cand.as_ptr());
-        for suffix in [b"/.onelf/env\0".as_slice(), b"/.onelf/preload\0".as_slice()] {
+        for suffix in [
+            b"/.onelf/env\0".as_slice(),
+            b"/.onelf/preload\0".as_slice(),
+            b"/.onelf/runtime-env\0".as_slice(),
+        ] {
             let mut probe = [0u8; 4096];
             if cl + suffix.len() > probe.len() {
                 continue;
@@ -559,13 +606,14 @@ unsafe fn find_root() -> bool {
     false
 }
 
-/// Read `<root>/.onelf/<name>` into `G_BUF`; returns the byte count or <=0.
-unsafe fn read_onelf_file(name: &[u8]) -> i64 {
+/// Read `<root>/.onelf/<name>` into `buf` (capacity `cap`, plus one byte
+/// for the overflow check, see [`read_bounded`]).
+unsafe fn read_onelf_file(name: &[u8], buf: *mut u8, cap: usize) -> i64 {
     let root = &raw const G_ROOT as *const u8;
     let mut path = [0u8; 4096];
     let rl = slen(root);
     if rl + name.len() > path.len() {
-        return 0;
+        return READ_ABSENT;
     }
     let mut i = 0;
     while i < rl {
@@ -577,17 +625,82 @@ unsafe fn read_onelf_file(name: &[u8]) -> i64 {
         path[rl + m] = name[m];
         m += 1;
     }
-    read_file(path.as_ptr(), &raw mut G_BUF as *mut u8, BUF_CAP)
+    read_bounded(path.as_ptr(), buf, cap)
+}
+
+/// One line of a diagnostic on stderr.
+unsafe fn warn(message: &[u8]) {
+    sys::write_stderr(message.as_ptr(), message.len());
+}
+
+/// Apply the launch's evaluated per-view input, `.onelf/runtime-env`.
+///
+/// A record that is missing is nothing to do: packages the constructor
+/// cannot serve a record for, and views that publish none, keep working
+/// from `.onelf/env` alone. A record that is oversized or malformed is
+/// rejected whole, with a diagnostic, and nothing from it is applied:
+/// reading it back must not trust or truncate what it did not verify.
+unsafe fn apply_runtime_env() {
+    let n = read_onelf_file(
+        b"/.onelf/runtime-env\0",
+        &raw mut G_RENV as *mut u8,
+        RENV_CAP,
+    );
+    match n {
+        n if n < 0 => {
+            if n == READ_OVERFLOW {
+                const MSG: &[u8] =
+                    b"onelf-env: .onelf/runtime-env is beyond the record cap and is not applied\n";
+                warn(MSG);
+            } else if n == READ_IO {
+                const MSG: &[u8] =
+                    b"onelf-env: .onelf/runtime-env could not be read and is not applied\n";
+                warn(MSG);
+            }
+        }
+        n => {
+            let bytes = core::slice::from_raw_parts(&raw const G_RENV as *const u8, n as usize);
+            if let Err(reject) = rtenv::apply(bytes) {
+                const A: &[u8] = b"onelf-env: .onelf/runtime-env rejected: ";
+                const B: &[u8] = b", nothing applied from it\n";
+                warn(A);
+                let reason = reject.reason().as_bytes();
+                warn(reason);
+                warn(B);
+            }
+        }
+    }
 }
 
 unsafe fn apply_env() {
-    let n = read_onelf_file(b"/.onelf/env\0");
-    if n <= 0 {
-        return;
+    let n = read_onelf_file(b"/.onelf/env\0", &raw mut G_BUF as *mut u8, BUF_CAP);
+    match n {
+        n if n < 0 => {
+            if n == READ_OVERFLOW {
+                const MSG: &[u8] =
+                    b"onelf-env: .onelf/env is beyond the buffer cap and is not applied\n";
+                warn(MSG);
+            } else if n == READ_IO {
+                const MSG: &[u8] = b"onelf-env: .onelf/env could not be read and is not applied\n";
+                warn(MSG);
+            }
+        }
+        n => {
+            let bytes = core::slice::from_raw_parts(&raw const G_BUF as *const u8, n as usize);
+            apply_env_bytes(bytes)
+        }
     }
-    let buf = &raw const G_BUF as *const u8;
+}
+
+/// Apply `.onelf/env` bytes: one `KEY=VALUE` per line, `${ONELF_DIR}` and
+/// `${VAR:-word}` expanded against the live environment, a value that
+/// wraps its own variable left alone once applied. Recipe values are
+/// applied after the generated record and overwrite it, so what the
+/// package declares itself still wins.
+unsafe fn apply_env_bytes(bytes: &[u8]) {
+    let buf = bytes.as_ptr();
     let root = &raw const G_ROOT as *const u8;
-    let end = n as usize;
+    let end = bytes.len();
     let mut cur = 0usize;
     while cur < end {
         let ls = cur;
@@ -665,7 +778,8 @@ unsafe fn already_applied(key: *const u8, src: *const u8, n: usize, root: *const
             return false;
         }
         let mut name_end = i + 2;
-        while name_end + 1 < close && !(*src.add(name_end) == b':' && *src.add(name_end + 1) == b'-')
+        while name_end + 1 < close
+            && !(*src.add(name_end) == b':' && *src.add(name_end + 1) == b'-')
         {
             name_end += 1;
         }
@@ -708,8 +822,23 @@ unsafe fn wraps_current(
 }
 
 unsafe fn apply_preload() {
-    let n = read_onelf_file(b"/.onelf/preload\0");
-    if n <= 0 {
+    let n = read_onelf_file(b"/.onelf/preload\0", &raw mut G_BUF as *mut u8, BUF_CAP);
+    match n {
+        n if n < 0 => {
+            if n == READ_OVERFLOW {
+                const MSG: &[u8] =
+                    b"onelf-env: .onelf/preload is beyond the buffer cap and is not applied\n";
+                warn(MSG);
+            } else if n == READ_IO {
+                const MSG: &[u8] =
+                    b"onelf-env: .onelf/preload could not be read and is not applied\n";
+                warn(MSG);
+            }
+            return;
+        }
+        _ => {}
+    }
+    if n == 0 {
         return;
     }
     if !have_dlopen() {
@@ -747,6 +876,7 @@ extern "C" fn onelf_env_init() {
         if !find_root() {
             return;
         }
+        apply_runtime_env();
         apply_env();
         apply_preload();
     }
@@ -757,3 +887,156 @@ extern "C" fn onelf_env_init() {
 #[used]
 #[unsafe(link_section = ".init_array")]
 static ONELF_ENV_CTOR: extern "C" fn() = onelf_env_init;
+
+#[cfg(test)]
+mod tests {
+    use super::{READ_ABSENT, READ_OVERFLOW, apply_env, apply_runtime_env, read_bounded};
+    use crate::harness::{
+        c_path, env, env_lock, fnv1a, runtime_entry, runtime_record, set_env, set_root, unset_env,
+        view,
+    };
+    use crate::rtenv::Policy;
+
+    /// `bytes` written to `<view>/.onelf/<name>`.
+    fn write_onelf(view_dir: &std::path::Path, name: &str, bytes: &[u8]) {
+        std::fs::write(view_dir.join(".onelf").join(name), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_recipe_value_wins_over_a_generated_mapping() {
+        let _guard = env_lock();
+        let view_dir = view("precedence");
+        let recipe = b"ONELF_T_PRECEDENCE=recipe\n";
+        write_onelf(&view_dir, "env", recipe);
+        unsafe {
+            unset_env("ONELF_T_PRECEDENCE");
+            set_root(&view_dir);
+            let record = runtime_record(
+                &[runtime_entry(
+                    "ONELF_T_PRECEDENCE",
+                    Policy::Replace,
+                    b"generated",
+                    Some(fnv1a(b"generated")),
+                )],
+                None,
+                None,
+            );
+            crate::rtenv::apply(&record).unwrap();
+            assert_eq!(env("ONELF_T_PRECEDENCE").as_deref(), Some("generated"));
+            apply_env();
+        }
+        assert_eq!(env("ONELF_T_PRECEDENCE").as_deref(), Some("recipe"));
+        unsafe { unset_env("ONELF_T_PRECEDENCE") };
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+
+    #[test]
+    fn a_self_referential_path_is_applied_once() {
+        let _guard = env_lock();
+        let view_dir = view("path-once");
+        let recipe = b"PATH=${ONELF_DIR}/bin:${PATH:-/usr/bin:/bin}\n";
+        write_onelf(&view_dir, "env", recipe);
+        unsafe {
+            set_env("PATH", "/usr/bin:/bin");
+            set_root(&view_dir);
+            apply_env();
+            let once = env("PATH");
+            apply_env();
+            assert_eq!(env("PATH"), once);
+        }
+        assert_eq!(
+            env("PATH").as_deref(),
+            Some(format!("{}/bin:/usr/bin:/bin", view_dir.display()).as_str())
+        );
+        unsafe { unset_env("PATH") };
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+
+    #[test]
+    fn an_oversized_env_file_is_refused_not_truncated() {
+        let _guard = env_lock();
+        let view_dir = view("oversize-env");
+        let mut big = b"ONELF_T_OVERSIZE_ENV=yes\n".to_vec();
+        big.resize(super::BUF_CAP + 4096, b'#');
+        big.push(b'\n');
+        write_onelf(&view_dir, "env", &big);
+        unsafe {
+            unset_env("ONELF_T_OVERSIZE_ENV");
+            set_root(&view_dir);
+            apply_env();
+        }
+        assert_eq!(env("ONELF_T_OVERSIZE_ENV"), None);
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+
+    #[test]
+    fn a_generated_record_in_the_view_is_applied() {
+        let _guard = env_lock();
+        let view_dir = view("record-view");
+        let value = b"/view/lib/qt6/plugins";
+        let record = runtime_record(
+            &[runtime_entry(
+                "ONELF_T_FROM_VIEW",
+                Policy::Replace,
+                value,
+                Some(fnv1a(value)),
+            )],
+            Some(b"/view"),
+            None,
+        );
+        write_onelf(&view_dir, "runtime-env", &record);
+        unsafe {
+            unset_env("ONELF_T_FROM_VIEW");
+            unset_env("ONELF_ROOTS");
+            set_root(&view_dir);
+            apply_runtime_env();
+        }
+        assert_eq!(
+            env("ONELF_T_FROM_VIEW").as_deref(),
+            Some("/view/lib/qt6/plugins")
+        );
+        assert_eq!(env("ONELF_ROOTS").as_deref(), Some("/view"));
+        unsafe {
+            unset_env("ONELF_T_FROM_VIEW");
+            unset_env("ONELF_ROOTS");
+        }
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+
+    #[test]
+    fn a_garbled_record_in_the_view_applies_nothing() {
+        let _guard = env_lock();
+        let view_dir = view("garbled-view");
+        write_onelf(&view_dir, "runtime-env", b"ONELF-RUNTIME-ENV 1 1\nA=!1:v");
+        unsafe {
+            unset_env("A");
+            set_root(&view_dir);
+            apply_runtime_env();
+        }
+        assert_eq!(env("A"), None);
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+
+    #[test]
+    fn a_file_beyond_the_cap_is_refused_not_truncated() {
+        let view_dir = view("read-cap");
+        let path = view_dir.join("nine");
+        std::fs::write(&path, b"123456789").unwrap();
+        let mut buf = [0u8; 9];
+        let got = unsafe { read_bounded(c_path(&path).as_ptr(), buf.as_mut_ptr(), 8) };
+        assert_eq!(got, READ_OVERFLOW);
+        std::fs::write(&path, b"12345678").unwrap();
+        let got = unsafe { read_bounded(c_path(&path).as_ptr(), buf.as_mut_ptr(), 8) };
+        assert_eq!(got, 8);
+        assert_eq!(&buf[..8], b"12345678");
+        let got = unsafe {
+            read_bounded(
+                c_path(&view_dir.join("absent")).as_ptr(),
+                buf.as_mut_ptr(),
+                8,
+            )
+        };
+        assert_eq!(got, READ_ABSENT);
+        let _ = std::fs::remove_dir_all(&view_dir);
+    }
+}

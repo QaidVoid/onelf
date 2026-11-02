@@ -360,9 +360,9 @@ unsafe fn search(file: *const u8, buf: *mut u8) -> *const u8 {
         }
         i += 1;
     }
-    let mut path = getenv(b"PATH\0".as_ptr());
+    let mut path = getenv(c"PATH".as_ptr().cast());
     if path.is_null() {
-        path = b"/bin:/usr/bin\0".as_ptr();
+        path = c"/bin:/usr/bin".as_ptr().cast();
     }
     let mut start = 0usize;
     loop {
@@ -904,5 +904,122 @@ impl Table {
             return 0;
         }
         self.base.wrapping_add(sym.st_value as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scratch, restored};
+    use core::ptr::null;
+
+    /// A record entry in the shape `record_host_env` writes: applied hash
+    /// or marker, then the original value or `-`.
+    fn entry(name: &str, applied: &str, original: Option<&[u8]>) -> String {
+        match original {
+            Some(value) => format!(
+                "{name}={applied}{}:{};",
+                value.len(),
+                String::from_utf8_lossy(value)
+            ),
+            None => format!("{name}={applied}-;"),
+        }
+    }
+
+    /// The hash marker for `value`, as the runtime encodes it.
+    fn applied(value: &[u8]) -> String {
+        let hash = unsafe { super::fnv1a(value.as_ptr(), value.len()) };
+        format!("{hash:016x}")
+    }
+
+    /// A whole record, NUL-terminated.
+    fn record(entries: &[String]) -> Vec<u8> {
+        let mut bytes = entries.concat().into_bytes();
+        bytes.push(0);
+        bytes
+    }
+
+    /// The pointer array `envp` hands over for NUL-terminated variables.
+    fn envp(vars: &[Vec<u8>]) -> Vec<*const u8> {
+        let mut pointers: Vec<*const u8> = vars.iter().map(|v| v.as_ptr()).collect();
+        pointers.push(null());
+        pointers
+    }
+
+    /// The variables of a restored environment, sorted for comparison.
+    unsafe fn vars(of: *const *const u8) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while !(*of.add(i)).is_null() {
+            out.push(
+                core::ffi::CStr::from_ptr((*of.add(i)).cast())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            i += 1;
+        }
+        out.sort();
+        out
+    }
+
+    unsafe fn restore(record_bytes: &[u8], vars_given: &[Vec<u8>]) -> Vec<String> {
+        let pointers = envp(vars_given);
+        let mut scratch = Scratch::new();
+        let got = restored(record_bytes.as_ptr(), pointers.as_ptr(), &mut scratch);
+        vars(got)
+    }
+
+    #[test]
+    fn a_host_child_regains_the_callers_values() {
+        let pkg_home = b"/pkg-home".to_vec();
+        let pkg_path = b"/pkg/bin:/usr/bin".to_vec();
+        let record_bytes = record(&[
+            entry("HOME", &applied(&pkg_home), Some(b"/home/u")),
+            entry("PATH", &applied(&pkg_path), Some(b"/usr/bin")),
+            entry("ADDED", &applied(b"by-the-launch"), None),
+        ]);
+        let rec = record(&[entry("ONELF_HOST_ENV", "-", None)]);
+        let given = vec![
+            [b"HOME=".to_vec(), pkg_home.clone(), [0].to_vec()].concat(),
+            [b"PATH=".to_vec(), pkg_path, [0].to_vec()].concat(),
+            [b"ADDED=by-the-launch\0".to_vec()].concat(),
+            [b"ONELF_HOST_ENV=".to_vec(), rec, [0].to_vec()].concat(),
+            b"KEPT=x\0".to_vec(),
+        ];
+        let got = unsafe { restore(&record_bytes, &given) };
+        assert_eq!(got, ["HOME=/home/u", "KEPT=x", "PATH=/usr/bin"]);
+    }
+
+    #[test]
+    fn a_change_the_app_made_is_passed_on() {
+        let pkg_home = b"/pkg-home".to_vec();
+        let record_bytes = record(&[entry("HOME", &applied(&pkg_home), Some(b"/home/u"))]);
+        let given = vec![b"HOME=/changed-by-app\0".to_vec()];
+        let got = unsafe { restore(&record_bytes, &given) };
+        assert_eq!(got, ["HOME=/changed-by-app"]);
+    }
+
+    #[test]
+    fn an_unset_by_the_launch_returns_and_an_app_unset_is_not_restored() {
+        let record_bytes = record(&[
+            entry("GONE", "-", Some(b"caller-value")),
+            entry("SET", &applied(b"applied"), Some(b"caller-set")),
+        ]);
+        let given = vec![b"OTHER=1\0".to_vec()];
+        let got = unsafe { restore(&record_bytes, &given) };
+        assert_eq!(got, ["GONE=caller-value", "OTHER=1"]);
+    }
+
+    #[test]
+    fn restoring_twice_does_not_grow_the_path() {
+        let pkg_path = b"/pkg/bin:/usr/bin".to_vec();
+        let record_bytes = record(&[entry("PATH", &applied(&pkg_path), Some(b"/usr/bin"))]);
+        let given = vec![[b"PATH=".to_vec(), pkg_path, [0].to_vec()].concat()];
+        let once = unsafe { restore(&record_bytes, &given) };
+        assert_eq!(once, ["PATH=/usr/bin"]);
+
+        let mut again = once[0].clone().into_bytes();
+        again.push(0);
+        let twice = unsafe { restore(&record_bytes, &[again]) };
+        assert_eq!(twice, ["PATH=/usr/bin"]);
     }
 }
