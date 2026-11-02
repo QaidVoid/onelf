@@ -9640,6 +9640,500 @@ fn a_publisher_file_with_an_unmet_need_is_a_finding_not_dropped() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A small sysroot for the outcome-classification tests: the core
+/// library the app links, a carried library whose own dependency is
+/// absent, two plugin files of its package whose dependencies are
+/// absent or sit in an unselected optional package, a library a policy
+/// can name, and an optional package the recipe never selects.
+/// Returns the rootfs and its archive, or None without a compiler.
+fn classification_sysroot(td: &Path) -> Option<(PathBuf, PathBuf)> {
+    let rootfs = td.join("rootfs");
+    for d in [
+        "usr/bin",
+        "usr/lib",
+        "usr/lib/core/plugins",
+        "usr/lib/optprov",
+    ] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    write(&src.join("absent.c"), "int absent(void){return 0;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libabsent.so.7",
+            src.join("absent.c").to_str().unwrap(),
+        ],
+        &src.join("libabsent.so.7"),
+    ) {
+        return None;
+    }
+    write(&src.join("opt.c"), "int opt(void){return 4;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libopt.so.1",
+            src.join("opt.c").to_str().unwrap(),
+        ],
+        &src.join("libopt.so.1"),
+    ) {
+        return None;
+    }
+
+    write(&src.join("core.c"), "int core(void){return 1;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libcore.so.2",
+            src.join("core.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libcore.so.2"),
+    ));
+    // A carried library whose own need the source never had: only the
+    // link-time copy exists, in the scratch directory.
+    write(
+        &src.join("carry.c"),
+        "int absent(void);\nint carry(void){return absent();}\n",
+    );
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libcarry.so.1",
+            src.join("carry.c").to_str().unwrap(),
+            &format!("-L{}", src.display()),
+            "-l:libabsent.so.7",
+        ],
+        &rootfs.join("usr/lib/libcarry.so.1"),
+    ));
+    // A library a policy line can name.
+    write(&src.join("pinned.c"), "int pinned(void){return 3;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libpinned.so.1",
+            src.join("pinned.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libpinned.so.1"),
+    ));
+    // The core package's plugins: one needs a library only an unselected
+    // optional package holds, one needs one nothing holds at all.
+    write(
+        &src.join("backend.c"),
+        "int opt(void);\nint backend(void){return opt();}\n",
+    );
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libcore-backend.so",
+            src.join("backend.c").to_str().unwrap(),
+            &format!("-L{}", src.display()),
+            "-l:libopt.so.1",
+        ],
+        &rootfs.join("usr/lib/core/plugins/libcore-backend.so"),
+    ));
+    write(
+        &src.join("broken.c"),
+        "int absent(void);\nint broken(void){return absent();}\n",
+    );
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libcore-broken.so",
+            src.join("broken.c").to_str().unwrap(),
+            &format!("-L{}", src.display()),
+            "-l:libabsent.so.7",
+        ],
+        &rootfs.join("usr/lib/core/plugins/libcore-broken.so"),
+    ));
+    std::fs::copy(
+        src.join("libopt.so.1"),
+        rootfs.join("usr/lib/optprov/libopt.so.1"),
+    )
+    .unwrap();
+
+    write(
+        &src.join("app.c"),
+        "int core(void);\nint pinned(void);\nint main(void){return core() + pinned();}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libcore.so.2",
+            "-l:libpinned.so.1",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ));
+
+    // This machine's glibc, so the closure holds a libc and a loader.
+    let host_libc = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6")?;
+    let host_ld = ldd_path(&rootfs.join("usr/bin/app"), "ld-linux")?;
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "core",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &[
+            "usr/lib/libcore.so.2",
+            "usr/lib/libcarry.so.1",
+            "usr/lib/libpinned.so.1",
+            "usr/lib/core/plugins/libcore-backend.so",
+            "usr/lib/core/plugins/libcore-broken.so",
+        ],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "optprov",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/optprov/libopt.so.1"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["core", "glibc"],
+        &["optprov: extra features"],
+        &["usr/bin/app"],
+    );
+
+    let archive = td.join("root.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+    Some((rootfs, archive))
+}
+
+/// Build the classification fixture's recipe: `extra` goes into the
+/// `[sysroot]` section, `policy` and `trace` name a policy or trace
+/// file's contents.
+fn classification_build(
+    td: &Path,
+    recipe_dir: &str,
+    policy: Option<&str>,
+    trace: Option<&str>,
+    extra: &str,
+) -> std::process::Output {
+    let dir = td.join(recipe_dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut sysroot = format!(
+        "[sysroot]\npath = \"../sysroot-{recipe_dir}\"\narchive = \"{}\"\n",
+        td.join("root.tar").display()
+    );
+    if let Some(policy) = policy {
+        let path = td.join(recipe_dir).join("policy.txt");
+        write(&path, policy);
+        sysroot.push_str(&format!("policy = \"{}\"\n", path.display()));
+    }
+    if let Some(trace) = trace {
+        let path = td.join(recipe_dir).join("trace.txt");
+        write(&path, trace);
+        sysroot.push_str(&format!("trace = \"{}\"\n", path.display()));
+    }
+    write(
+        &dir.join("onelf.toml"),
+        &format!("[package]\ncommand = \"bin/app\"\nmtime = 0\n\n{sysroot}{extra}"),
+    );
+    let mut c = Command::new(onelf());
+    c.arg("build").current_dir(&dir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    c.output().expect("spawn onelf build")
+}
+
+/// The omitted auto-selected backends say which class took them out: a
+/// dependency nothing holds reads one way, a dependency only an
+/// unselected optional package holds reads the other, and neither
+/// fails the build or pulls the unselected provider in.
+#[test]
+fn omitted_backends_name_an_absent_need_and_an_unselected_provider_apart() {
+    let td = workdir("verdicts");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let out = classification_build(&td, "app", None, None, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the omissions are not failures:\n{stderr}"
+    );
+    let dir = td.join("app");
+    assert!(
+        stderr.contains("Dropped 3 file(s)"),
+        "the plugins and the carried library are omitted:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("libcore-broken.so") && stderr.contains("no selected source provides it"),
+        "the absent dependency is named as absent:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("libcore-backend.so")
+            && stderr.contains("provided only by the unselected optional package optprov"),
+        "the unselected provider is named with its package:\n{stderr}"
+    );
+    assert!(
+        !dir.join("lib/core/plugins/libcore-backend.so").exists()
+            && !dir.join("lib/core/plugins/libcore-broken.so").exists(),
+        "both omissions took their objects out:\n{stderr}"
+    );
+    assert!(
+        !dir.join("lib/optprov").exists() && !dir.join("lib/libopt.so.1").exists(),
+        "the unselected package was never selected to fill the gap:\n{stderr}"
+    );
+    assert!(
+        dir.join("lib/libcore.so.2").is_file(),
+        "the framework library itself is bundled:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Without an include, a carried library whose dependency the source
+/// never had is omitted like any other auto-selected object. The same
+/// library asked for by name is required: then the omission is refused
+/// and the build stops naming the include, rather than quietly shipping
+/// without what the author asked for.
+#[test]
+fn an_explicitly_included_library_is_not_omitted_for_an_absent_need() {
+    let td = workdir("include-absent");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let plain = classification_build(&td, "plain", None, None, "");
+    let plain_err = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        plain.status.success(),
+        "the omission is not a failure:\n{plain_err}"
+    );
+    assert!(
+        plain_err.contains("Dropped 3 file(s)") && !td.join("plain/lib/libcarry.so.1").exists(),
+        "without the include the library is omitted like the rest:\n{plain_err}"
+    );
+
+    let out = classification_build(
+        &td,
+        "asked",
+        None,
+        None,
+        "[bundle]\ninclude = [\"libcarry.so.1\"]\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the include is required:\n{stderr}");
+    assert!(
+        stderr.contains("lib/libcarry.so.1 is explicitly included")
+            && stderr.contains("libabsent.so.7")
+            && stderr.contains("an explicit include cannot be dropped"),
+        "the failure names the include, its need and the rule:\n{stderr}"
+    );
+    assert!(
+        td.join("asked/lib/libcarry.so.1").is_file(),
+        "the included library is not deleted to make the finding go away:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An explicit include a policy would remove fails the build: the
+/// classification treats the include as required, the policy is not
+/// undone to carry it, and nothing is restored behind the policy's
+/// back.
+#[test]
+fn an_explicit_include_the_policy_prunes_fails_and_is_not_restored() {
+    let td = workdir("include-policy");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let out = classification_build(
+        &td,
+        "app",
+        Some("usr/lib/libpinned*"),
+        None,
+        "[bundle]\ninclude = [\"libpinned.so.1\"]\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the removal is a conflict:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("explicitly included libpinned.so.1")
+            && stderr.contains("the policy or a trace removed it"),
+        "the conflict names the include and the removal:\n{stderr}"
+    );
+    assert!(
+        !td.join("app/lib/libpinned.so.1").exists(),
+        "the pruned file is not restored to satisfy the include"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A retained object's dependency that only the policy removed stops
+/// the build with the removal named: the object is not dropped as an
+/// omission, the package is not re-selected, and the file stays pruned.
+#[test]
+fn a_policy_removed_need_of_a_retained_object_names_the_removal() {
+    let td = workdir("policy-conflict");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let out = classification_build(&td, "app", Some("usr/lib/libpinned*"), None, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the conflict is fatal:\n{stderr}");
+    assert!(
+        stderr.contains("bin/app needs libpinned.so.1")
+            && stderr.contains("core holds but the policy or a trace removed"),
+        "the failure attributes the dependency to the removal:\n{stderr}"
+    );
+    assert!(
+        !td.join("app/lib/libpinned.so.1").exists(),
+        "the file stays pruned"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A trace that never opened a closure file removes it like the policy
+/// does, and the classification answers the same way: the build without
+/// an include loses the file silently, while an include of that file is
+/// a conflict that names the trace removal and restores nothing.
+#[test]
+fn a_trace_pruned_include_fails_rather_than_restoring() {
+    let td = workdir("include-trace");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let trace = "/usr/bin/app\n/usr/lib/libcore.so.2\n/usr/lib/libpinned.so.1\n/usr/lib/libc.so.6\n/usr/lib/ld-linux-x86-64.so.2\n";
+    let plain = classification_build(&td, "plain", None, Some(trace), "");
+    let plain_err = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        plain.status.success(),
+        "the removal alone is not a failure:\n{plain_err}"
+    );
+    assert!(
+        !td.join("plain/lib/libcarry.so.1").exists(),
+        "the unopened file stays out:\n{plain_err}"
+    );
+    assert!(
+        td.join("plain/lib/libcore.so.2").is_file(),
+        "the opened library stays:\n{plain_err}"
+    );
+
+    let out = classification_build(
+        &td,
+        "asked",
+        None,
+        Some(trace),
+        "[bundle]\ninclude = [\"libcarry.so.1\"]\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the removal is a conflict:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("explicitly included libcarry.so.1")
+            && stderr.contains("core holds it, but the policy or a trace removed it"),
+        "the conflict names the include and the trace removal:\n{stderr}"
+    );
+    assert!(
+        !td.join("asked/lib/libcarry.so.1").exists(),
+        "the trace-pruned file is not restored to satisfy the include"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An explicit include whose provider is only an unselected optional
+/// package fails rather than selecting that package: the finding says
+/// which, and nothing of the provider's comes over.
+#[test]
+fn an_explicit_include_the_source_lacks_fails_rather_than_selecting() {
+    let td = workdir("include-unselected");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let out = classification_build(
+        &td,
+        "app",
+        None,
+        None,
+        "[bundle]\ninclude = [\"libopt.so.1\"]\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the include cannot be met:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("explicitly included libopt.so.1")
+            && stderr.contains("unselected optional package optprov"),
+        "the failure distinguishes the provider from an absent library:\n{stderr}"
+    );
+    assert!(
+        !td.join("app/lib/libopt.so.1").exists() && !td.join("app/lib/optprov").exists(),
+        "the unselected package was not pulled in to satisfy the include"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An include an exclusion would drop is a conflict in the low-level
+/// host scan too: the build refuses to do both, instead of silently
+/// narrowing what the author asked for.
+#[test]
+fn an_include_an_exclusion_would_drop_is_a_conflict() {
+    let td = workdir("include-excluded");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    if !cc(&td.join("main.c"), &app.join("bin/app")) {
+        return;
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--include")
+        .arg("libcuda.so");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !o.status.success(),
+        "the conflict fails the build:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("explicitly included libcuda.so") && stderr.contains("libcuda.so"),
+        "the conflict names both sides:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A recipe can pin the sysroot archive by hash, the way it pins a GL
 /// build. An archive that does not match is not unpacked at all: it is
 /// executable code, and TLS says who served it, not that it is the one

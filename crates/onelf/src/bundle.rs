@@ -1438,6 +1438,382 @@ fn report_collection(collection: &collect::GroupCollection) {
     }
 }
 
+/// How the selected source answers for one needed object. Every
+/// resolution outcome the dependency walk reaches folds into one of
+/// these classes, and every report names the class with the same
+/// wording, so a missing optional dependency is never confused with an
+/// unselected provider or with a deliberate removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceVerdict {
+    /// An admitted source resolved it and the walk carries it.
+    Carried,
+    /// A selected package holds it, but the policy or a trace removed
+    /// it. A removal the build asked for is a conflict, never an
+    /// omission and never a file to restore.
+    Pruned {
+        /// The selected package that owns the removed file.
+        owner: String,
+    },
+    /// Only a package the build handed to the host or to a shared set
+    /// whole holds it.
+    HostProvider {
+        /// The package handed whole to the host.
+        owner: String,
+    },
+    /// Only a package the recipe never selected holds it. The build
+    /// never selects a package on its own.
+    UnselectedProvider {
+        /// The unselected optional package that owns the file.
+        owner: String,
+    },
+    /// Nothing in the selected source provides it.
+    Absent,
+}
+
+impl SourceVerdict {
+    /// Whether the verdict leaves the selected source without a copy
+    /// the loader could reach, so an auto-selected consumer of the
+    /// object may be omitted for it. A deliberate removal is not one
+    /// of these: it stops the build instead.
+    fn omittable(&self) -> bool {
+        matches!(
+            self,
+            SourceVerdict::Absent
+                | SourceVerdict::UnselectedProvider { .. }
+                | SourceVerdict::HostProvider { .. }
+        )
+    }
+
+    /// The reason phrase the reports append, naming the rule and the
+    /// library or package involved.
+    fn reason(&self) -> String {
+        match self {
+            SourceVerdict::Carried => {
+                "the selected source holds it off every loader path".to_string()
+            }
+            SourceVerdict::Pruned { owner } => {
+                format!("{owner} holds it, but the policy or a trace removed it")
+            }
+            SourceVerdict::HostProvider { owner } => format!("left to the host package {owner}"),
+            SourceVerdict::UnselectedProvider { owner } => {
+                format!("provided only by the unselected optional package {owner}")
+            }
+            SourceVerdict::Absent => "no selected source provides it".to_string(),
+        }
+    }
+}
+
+/// Classifies needed sonames against the selected source, so the
+/// dependency walk, the drop pass and the final error all name the same
+/// outcome for the same object.
+struct SourceClassifier<'a> {
+    /// The files named exactly like some soname, with the package that
+    /// owns each, in the database's own order.
+    providers: HashMap<String, Vec<(String, String)>>,
+    /// The populated universe, which records what the build admitted
+    /// and what it left out. `None` without a sysroot, where every
+    /// unmet need is simply absent from the host.
+    universe: Option<&'a sysroot::SysrootUniverse>,
+}
+
+impl<'a> SourceClassifier<'a> {
+    /// The classifier over a database already read, against the
+    /// universe the populated build recorded.
+    fn from_db(db: Database, universe: &'a sysroot::SysrootUniverse) -> Self {
+        let mut providers: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for package in db.packages() {
+            for file in &package.files {
+                if file.ends_with('/') {
+                    continue;
+                }
+                if let Some(name) = Path::new(file).file_name().and_then(|n| n.to_str()) {
+                    providers
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((package.name.clone(), file.clone()));
+                }
+            }
+        }
+        Self {
+            providers,
+            universe: Some(universe),
+        }
+    }
+
+    /// The classifier for a sysroot build: the database at `root`,
+    /// indexed once, against the universe the populated build recorded.
+    fn for_sysroot(root: &Path, universe: &'a sysroot::SysrootUniverse) -> io::Result<Self> {
+        Ok(Self::from_db(Database::read(root)?, universe))
+    }
+
+    /// The classifier for a host-scan build, which has no selected
+    /// source to consult.
+    fn host_only() -> Self {
+        Self {
+            providers: HashMap::new(),
+            universe: None,
+        }
+    }
+
+    /// The verdict for `soname`. A deliberate removal outranks every
+    /// other answer, since a policy conflict stops the build where an
+    /// omission only records one, and a copy the selected source holds
+    /// outranks a provider it never admitted.
+    fn classify(&self, soname: &str) -> SourceVerdict {
+        let Some(universe) = self.universe else {
+            return SourceVerdict::Absent;
+        };
+        let mut verdict = SourceVerdict::Absent;
+        for (_owner, file) in self.providers.get(soname).into_iter().flatten() {
+            let candidate = if universe.admits(file) {
+                SourceVerdict::Carried
+            } else {
+                match universe.refusal(file) {
+                    sysroot::Refusal::Pruned { owner } => SourceVerdict::Pruned { owner },
+                    sysroot::Refusal::UnselectedPackage { owner } => {
+                        SourceVerdict::UnselectedProvider { owner }
+                    }
+                    sysroot::Refusal::HostPackage { owner } => {
+                        SourceVerdict::HostProvider { owner }
+                    }
+                    sysroot::Refusal::Absent => SourceVerdict::Absent,
+                }
+            };
+            if matches!(candidate, SourceVerdict::Pruned { .. }) {
+                return candidate;
+            }
+            verdict = rank_verdicts(verdict, candidate);
+        }
+        verdict
+    }
+}
+
+/// The stronger of two verdicts over providers of one soname, in the
+/// fixed order reports rely on: carried, then unselected, then host,
+/// then absent.
+fn rank_verdicts(a: SourceVerdict, b: SourceVerdict) -> SourceVerdict {
+    fn rank(verdict: &SourceVerdict) -> u8 {
+        match verdict {
+            SourceVerdict::Carried => 3,
+            SourceVerdict::UnselectedProvider { .. } => 2,
+            SourceVerdict::HostProvider { .. } => 1,
+            SourceVerdict::Pruned { .. } | SourceVerdict::Absent => 0,
+        }
+    }
+    if rank(&a) >= rank(&b) { a } else { b }
+}
+
+/// The tree-relative destinations explicitly included sonames occupy:
+/// the library directory's flat copy, since an include is never a
+/// collected group member.
+fn explicit_include_paths(opts: &BundleOptions) -> HashSet<PathBuf> {
+    opts.include
+        .iter()
+        .map(|soname| opts.lib_dir.join(soname))
+        .collect()
+}
+
+#[cfg(test)]
+mod source_verdict_tests {
+    use super::*;
+    use sysroot::fixture::{package, populate_universe};
+
+    /// A test's own scratch root, unique per call site.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("onelf-verdict-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// An in-memory database over `packages` and the universe with
+    /// `owner` selected and `optional` added, pruned by the patterns in
+    /// `policy_lines`.
+    fn classified(
+        root: &Path,
+        packages: &[onelf_sysroot::Package],
+        owner: &str,
+        policy_lines: &[&str],
+    ) -> (Database, sysroot::SysrootUniverse) {
+        let mut db = Database::default();
+        for package in packages {
+            db.insert(package.clone());
+        }
+        let policy = if policy_lines.is_empty() {
+            None
+        } else {
+            let path = root.join("policy.txt");
+            fs::write(&path, policy_lines.join("\n")).unwrap();
+            Some(Policy::load(&path).unwrap())
+        };
+        let u = populate_universe(root, packages, owner, &[], policy.as_ref(), None);
+        (db, u)
+    }
+
+    /// A package with `depends` and `files`, relative to the root.
+    fn pkg(name: &str, depends: &[&str], files: &[&str]) -> onelf_sysroot::Package {
+        onelf_sysroot::Package {
+            name: name.to_string(),
+            version: "1.0-1".to_string(),
+            depends: depends.iter().map(|s| s.to_string()).collect(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_absent_soname_classifies_absent() {
+        let root = scratch("absent");
+        let packages = [package("app", &["usr/bin/app"])];
+        let (db, u) = classified(&root, &packages, "app", &[]);
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libnothing.so.9"),
+            SourceVerdict::Absent,
+            "no package owns a file of that name"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unselected_provider_names_its_package() {
+        let root = scratch("unselected");
+        let packages = [
+            package("app", &["usr/bin/app"]),
+            package("extra", &["usr/lib/extra/libextra.so.1"]),
+        ];
+        let (db, u) = classified(&root, &packages, "app", &[]);
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libextra.so.1"),
+            SourceVerdict::UnselectedProvider {
+                owner: "extra".to_string()
+            },
+            "the provider is real but the recipe never selected it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pruned_provider_names_the_policy_conflict() {
+        let root = scratch("pruned");
+        let packages = [
+            pkg("app", &["core"], &["usr/bin/app"]),
+            pkg("core", &[], &["usr/lib/libpinned.so.1"]),
+        ];
+        let (db, u) = classified(&root, &packages, "app", &["usr/lib/libpinned*"]);
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libpinned.so.1"),
+            SourceVerdict::Pruned {
+                owner: "core".to_string()
+            },
+            "a selected package held it and the policy removed it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_kept_soname_classifies_carried() {
+        let root = scratch("kept");
+        let packages = [
+            pkg("app", &["core"], &["usr/bin/app"]),
+            pkg("core", &[], &["usr/lib/libcore.so.1"]),
+        ];
+        let (db, u) = classified(&root, &packages, "app", &[]);
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libcore.so.1"),
+            SourceVerdict::Carried,
+            "the build copied it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_provider_names_its_package() {
+        let root = scratch("host");
+        let mut db = Database::default();
+        db.insert(package("app", &["usr/bin/app"]));
+        db.insert(package("mesa", &["usr/lib/libGL.so.1"]));
+        let mut left_out = HashSet::new();
+        left_out.insert("usr/lib/libGL.so.1".to_string());
+        let mut for_universe = Database::default();
+        for_universe.insert(package("app", &["usr/bin/app"]));
+        for_universe.insert(package("mesa", &["usr/lib/libGL.so.1"]));
+        let u = sysroot::SysrootUniverse::admit(
+            &root,
+            for_universe,
+            &["usr/bin/app".to_string()],
+            &left_out,
+            &["app".to_string()],
+        );
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libGL.so.1"),
+            SourceVerdict::HostProvider {
+                owner: "mesa".to_string()
+            },
+            "the package was handed to the host whole"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trace_pruned_provider_names_the_conflict_too() {
+        let root = scratch("trace-pruned");
+        let packages = [
+            pkg("app", &["core"], &["usr/bin/app"]),
+            pkg("core", &[], &["usr/lib/libpinned.so.1"]),
+        ];
+        let mut db = Database::default();
+        for package in &packages {
+            db.insert(package.clone());
+        }
+        let trace = onelf_sysroot::Trace::from_paths(vec!["usr/bin/app".to_string()]);
+        let u = populate_universe(&root, &packages, "app", &[], None, Some(&trace));
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libpinned.so.1"),
+            SourceVerdict::Pruned {
+                owner: "core".to_string()
+            },
+            "a trace removal is the conflict class, like a policy removal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pruned_provider_outranks_an_unselected_one() {
+        let root = scratch("outranks");
+        let packages = [
+            pkg("app", &["core"], &["usr/bin/app"]),
+            pkg("core", &[], &["usr/lib/libdual.so.1"]),
+            pkg("extra", &[], &["opt/extra/lib/libdual.so.1"]),
+        ];
+        let (db, u) = classified(&root, &packages, "app", &["usr/lib/libdual*"]);
+        let classifier = SourceClassifier::from_db(db, &u);
+        assert_eq!(
+            classifier.classify("libdual.so.1"),
+            SourceVerdict::Pruned {
+                owner: "core".to_string()
+            },
+            "the removal is the conflict class, ahead of the unselected provider"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_scan_classifies_everything_absent() {
+        let classifier = SourceClassifier::host_only();
+        assert_eq!(
+            classifier.classify("libanything.so.1"),
+            SourceVerdict::Absent,
+            "without a selected source there is nothing to consult"
+        );
+    }
+}
+
 /// Bundle the shared libraries the tree's ELF files need into its
 /// library directory, rewrite the ELF files for the bundled layout,
 /// and record what the build generated.
@@ -1486,6 +1862,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     };
     let frameworks = opts.sysroot.is_none();
+
+    // The classifier every outcome report and every drop decision asks:
+    // it answers, for a soname the bundle does not carry, whether the
+    // selected source is without it, holds it behind an unselected
+    // optional package, handed it to the host, or had it removed by the
+    // policy or a trace.
+    let classifier = match (&opts.sysroot, sysroot_universe.as_ref()) {
+        (Some(sr), Some(universe)) => SourceClassifier::for_sysroot(&sr.root, universe)?,
+        _ => SourceClassifier::host_only(),
+    };
 
     // Auto-detect frameworks from the input binaries' DT_NEEDED entries.
     // User-provided flags are OR'd with detected flags so explicit opt-ins win
@@ -1824,6 +2210,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
+    // An explicit include is a required object, so an exclusion that
+    // would drop it is a conflict the build stops on, never a silent
+    // narrowing of what the author asked for.
+    for lib in &opts.include {
+        if let Some(exclude) = excludes.iter().find(|pat| lib.starts_with(**pat)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "explicitly included {lib} matches the exclusion {exclude}; drop the \
+                     include or the exclusion, the build will not do both"
+                ),
+            ));
+        }
+    }
     // Filter excluded
     needed_by.retain(|soname, _| !is_excluded(soname, &excludes));
 
@@ -1908,7 +2308,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
             attest_staged_outputs(opts)?;
             // After injection, so the audit sees the final DT_NEEDED set.
-            verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
+            verify_needs(opts, sysroot_platform.as_ref(), &set_sonames, &classifier)?;
         }
         return Ok(());
     }
@@ -2010,6 +2410,24 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         src.strip_prefix(&sr.root)
             .ok()
             .is_some_and(|rel| policy.matches(&rel.to_string_lossy()))
+    };
+    // The same hold for whatever else the build deliberately removed
+    // from the selected source: a trace-pruned file stays pruned, and
+    // the walk never restores it from the sysroot tree behind the
+    // pruning's back. A soname the policy names is covered above even
+    // when no package owns it; this covers the rest.
+    let pruned_from_source = |src: &Path| -> bool {
+        pruned_by_policy(src)
+            || opts.sysroot.as_ref().is_some_and(|sr| {
+                let Some(universe) = sysroot_universe.as_ref() else {
+                    return false;
+                };
+                src.strip_prefix(&sr.root).ok().is_some_and(|rel| {
+                    let rel = rel.to_string_lossy();
+                    !universe.admits(&rel)
+                        && matches!(universe.refusal(&rel), sysroot::Refusal::Pruned { .. })
+                })
+            })
     };
     // Likewise a file of a package left to the host whole.
     let with_host_package = |src: &Path| -> bool {
@@ -2252,7 +2670,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }) {
             // The soname link and the file it names are both checked: a
             // policy may name either.
-            Some((src, resolved)) if pruned_by_policy(&src) || pruned_by_policy(&resolved) => {
+            Some((src, resolved)) if pruned_from_source(&src) || pruned_from_source(&resolved) => {
                 if already_flat {
                     continue;
                 }
@@ -2493,6 +2911,48 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
+    // An explicit include is a required object: whatever would remove
+    // it after the fact fails the build instead, naming the include,
+    // the outcome the walk reached and the package involved. The build
+    // neither selects the unselected provider nor restores a pruned
+    // file to satisfy it.
+    for lib in &opts.include {
+        let listed = |list: &[(String, String)]| list.iter().any(|(s, _)| s == lib);
+        let verdict = classifier.classify(lib);
+        let outcome = if listed(&left_out) {
+            Some(match verdict {
+                SourceVerdict::Pruned { owner } => {
+                    format!("{owner} holds it, but the policy or a trace removed it")
+                }
+                _ => "the policy or a trace removes it from the selected source".to_string(),
+            })
+        } else if listed(&left_with_host) {
+            Some(match verdict {
+                SourceVerdict::HostProvider { owner } => {
+                    format!("left to the host package {owner}")
+                }
+                _ => "the selected source hands it to a host package whole".to_string(),
+            })
+        } else if opts.sysroot.is_some()
+            && listed(&not_found)
+            && !matches!(verdict, SourceVerdict::Carried)
+        {
+            Some(verdict.reason())
+        } else {
+            None
+        };
+        if let Some(reason) = outcome {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "explicitly included {lib} does not enter the bundle: {reason}; an \
+                     explicit include cannot be dropped, and the build neither selects a \
+                     package nor restores a file to carry it"
+                ),
+            ));
+        }
+    }
+
     // Activation has reached its fixed point: every soname the closure
     // encountered has been matched, and no group queues further work
     // until the resource discovery phases feed their objects back.
@@ -2552,6 +3012,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // Summary
     copied.sort_by(|a, b| a.0.cmp(&b.0));
     not_found.sort();
+    left_out.sort();
+    left_with_host.sort();
 
     let total_size: u64 = copied.iter().map(|(_, _, s, _)| s).sum();
 
@@ -2585,6 +3047,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         sysroot::record_generated(&opts.directory, generated)?;
     }
 
+    // The outcome lists carry the classification with them, so the
+    // report says whether a library is absent, left to an unselected
+    // optional package, or deliberately removed, and names the
+    // package involved. Deterministic: the lists are sorted and the
+    // classifier answers from the same source every time.
     if !left_with_host.is_empty() {
         eprintln!(
             "\n{} ({})",
@@ -2593,9 +3060,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         );
         for (lib, requirer) in &left_with_host {
             eprintln!(
-                "  {} {}",
+                "  {} {} {}",
                 lib,
-                color::dim(&format!("(needed by {})", color::cyan(requirer)))
+                color::dim(&format!("(needed by {})", color::cyan(requirer))),
+                color::dim(&format!(": {}", classifier.classify(lib).reason()))
             );
         }
     }
@@ -2608,9 +3076,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         );
         for (lib, requirer) in &left_out {
             eprintln!(
-                "  {} {}",
+                "  {} {} {}",
                 lib,
-                color::dim(&format!("(needed by {})", color::cyan(requirer)))
+                color::dim(&format!("(needed by {})", color::cyan(requirer))),
+                color::dim(&format!(": {}", classifier.classify(lib).reason()))
             );
         }
     }
@@ -2618,11 +3087,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if !not_found.is_empty() {
         eprintln!("\n{} ({})", color::bold_red("Not found"), not_found.len());
         for (lib, requirer) in &not_found {
-            eprintln!(
-                "  {} {}",
-                color::red(lib),
-                color::dim(&format!("(needed by {})", color::cyan(requirer)))
-            );
+            if opts.sysroot.is_some() {
+                eprintln!(
+                    "  {} {} {}",
+                    color::red(lib),
+                    color::dim(&format!("(needed by {})", color::cyan(requirer))),
+                    color::dim(&format!(": {}", classifier.classify(lib).reason()))
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    color::red(lib),
+                    color::dim(&format!("(needed by {})", color::cyan(requirer)))
+                );
+            }
         }
     }
 
@@ -2707,38 +3185,36 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             &find_elf_files(&opts.directory),
         ));
         // After injection, so the audit sees the final DT_NEEDED set.
-        verify_needs(opts, sysroot_platform.as_ref(), &set_sonames)?;
+        verify_needs(opts, sysroot_platform.as_ref(), &set_sonames, &classifier)?;
     }
 
     Ok(())
 }
 
-/// Remove bundled objects that could never load: their need is a soname no
-/// package in the sysroot provides, or one that was itself dropped here.
+/// Remove bundled objects that could never load: their need is a soname
+/// the classification found absent from the selected source, held only
+/// behind an unselected optional package, or handed to the host.
 ///
 /// A distribution's closure carries plugins for stacks that were never
 /// installed, Qt modules and Python bindings for optional dependencies,
 /// and each would otherwise be one more line of policy. Only what this
-/// build generated is dropped: a file the publisher placed by hand stays
-/// a finding, as does the entrypoint. A soname the sysroot does hold but
-/// the closure or policy left out stays a finding too, since that is a
-/// choice for the publisher.
+/// build generated is dropped, and only for one of those three verdicts:
+/// the entrypoint, a file the publisher placed by hand, and an object at
+/// an explicitly included soname's destination stay, each as a finding.
+/// A soname a selected package holds but the policy or a trace removed
+/// is a conflict, not a reason to drop the object that needs it, so that
+/// finding stays too and the build fails naming the removal.
 ///
 /// Returns the dropped objects, relative to the tree, with the soname
-/// that condemned each. `findings` is re-audited until nothing changes,
-/// because dropping a library leaves its own dependants unloadable.
+/// that condemned each and the verdict recorded for it. `findings` is
+/// re-audited until nothing changes, because dropping a library leaves
+/// its own dependants unloadable.
 fn drop_unloadable(
     opts: &BundleOptions,
-    root: &Path,
     findings: &mut Vec<(PathBuf, Vec<String>)>,
     audit: impl Fn() -> Vec<(PathBuf, Vec<String>)>,
-) -> io::Result<Vec<(PathBuf, String)>> {
-    let held: HashSet<String> = Database::read(root)?
-        .packages()
-        .flat_map(|p| p.files.iter())
-        .filter_map(|f| Path::new(f).file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .collect();
+    classifier: &SourceClassifier,
+) -> io::Result<Vec<(PathBuf, String, SourceVerdict)>> {
     let generated: HashSet<PathBuf> =
         fs::read_to_string(opts.directory.join(sysroot::GENERATED_FILE))
             .unwrap_or_default()
@@ -2751,19 +3227,27 @@ fn drop_unloadable(
         .as_deref()
         .or(opts.target.as_deref())
         .map(|t| t.strip_prefix(&opts.directory).unwrap_or(t).to_path_buf());
+    let explicit = explicit_include_paths(opts);
     let mut gone: HashSet<String> = HashSet::new();
-    let mut dropped: Vec<(PathBuf, String)> = Vec::new();
+    let mut dropped: Vec<(PathBuf, String, SourceVerdict)> = Vec::new();
     loop {
         let mut progressed = false;
         for (object, libs) in findings.iter() {
             let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
-            if entrypoint.as_deref() == Some(rel) || !generated.contains(rel) {
+            if entrypoint.as_deref() == Some(rel)
+                || !generated.contains(rel)
+                || explicit.contains(rel)
+            {
                 continue;
             }
-            let Some(soname) = libs
-                .iter()
-                .find(|s| !held.contains(*s) || gone.contains(*s))
-            else {
+            // One deliberate removal among the unmet needs keeps the
+            // object, so the conflict surfaces instead of hiding behind
+            // an omission of the object that names it.
+            let condemned = |s: &str| gone.contains(s) || classifier.classify(s).omittable();
+            if !libs.iter().all(|s| condemned(s)) {
+                continue;
+            }
+            let Some(soname) = libs.iter().find(|s| condemned(s)) else {
                 continue;
             };
             // What goes with it: the file's own name, and the soname
@@ -2779,7 +3263,11 @@ fn drop_unloadable(
                 gone.insert(name.to_string_lossy().into_owned());
             }
             gone.extend(dropped_soname);
-            dropped.push((rel.to_path_buf(), soname.clone()));
+            dropped.push((
+                rel.to_path_buf(),
+                soname.clone(),
+                classifier.classify(soname),
+            ));
             progressed = true;
         }
         if !progressed {
@@ -2787,7 +3275,7 @@ fn drop_unloadable(
         }
         *findings = audit();
     }
-    dropped.sort();
+    dropped.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     Ok(dropped)
 }
 
@@ -2835,10 +3323,21 @@ pub(crate) fn remove_dangling_links_beside(object: &Path) {
 /// warning. What a set-only build's pinned sets ship, read from their
 /// builds, is neither: it is reported as theirs, since the launch fetches
 /// it.
+/// Audit the assembled tree for objects whose needs nothing in the
+/// bundle satisfies where the loader will look.
+///
+/// In a sysroot build an auto-selected object left unloadable by the
+/// classification is omitted here, with the recorded reason, and the
+/// audit runs again over the survivors. What the classification cannot
+/// omit stays: the entrypoint, a publisher's file, an explicitly
+/// included object, and any object whose condemning need is a deliberate
+/// policy or trace removal. Those fail the build, and the error names
+/// the class and the package involved.
 fn verify_needs(
     opts: &BundleOptions,
     platform: Option<&PlatformLine>,
     set_sonames: &HashSet<String>,
+    classifier: &SourceClassifier,
 ) -> io::Result<()> {
     let audit = || {
         let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
@@ -2851,20 +3350,26 @@ fn verify_needs(
         findings
     };
     let mut findings = audit();
-    if let Some(sr) = &opts.sysroot {
-        let dropped = drop_unloadable(opts, &sr.root, &mut findings, audit)?;
+    if opts.sysroot.is_some() {
+        let dropped = drop_unloadable(opts, &mut findings, audit, classifier)?;
         if !dropped.is_empty() {
             eprintln!(
                 "\n{} {} file(s) needing libraries the sysroot does not hold:",
                 color::bold("Dropped"),
                 dropped.len()
             );
-            for (object, soname) in &dropped {
+            const SHOWN_DROPS: usize = 8;
+            for (object, soname, verdict) in dropped.iter().take(SHOWN_DROPS) {
                 eprintln!(
-                    "  {} {}",
+                    "  {} omitted, needs {} ({})",
                     object.display(),
-                    color::dim(&format!("(needs {soname})"))
+                    soname,
+                    color::dim(&verdict.reason())
                 );
+            }
+            let hidden = dropped.len().saturating_sub(SHOWN_DROPS);
+            if hidden > 0 {
+                eprintln!("  and {hidden} more omitted");
             }
         }
     }
@@ -2874,25 +3379,60 @@ fn verify_needs(
     }
     report_unbundled_needs(&findings);
     if opts.sysroot.is_some()
-        && let Some((object, libs)) = findings.first()
+        && let Some((object, libs)) = first_failure(opts, &findings)
     {
-        let object = object
-            .strip_prefix(&opts.directory)
-            .unwrap_or(object)
-            .display();
+        let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
+        let object = rel.display();
+        let soname = &libs[0];
+        let verdict = classifier.classify(soname);
+        let explicit = explicit_include_paths(opts).contains(rel);
+        let why = if explicit {
+            format!(
+                "{object} is explicitly included and needs {soname}: {}; an explicit include \
+                 cannot be dropped",
+                verdict.reason()
+            )
+        } else if let SourceVerdict::Pruned { owner } = &verdict {
+            format!(
+                "{object} needs {soname}, which {owner} holds but the policy or a trace \
+                 removed; the conflict stops the build rather than dropping the object or \
+                 restoring the file"
+            )
+        } else if matches!(verdict, SourceVerdict::Absent) {
+            format!(
+                "{object} needs {soname}, which is neither in the sysroot closure, on the \
+                 platform line, nor in a shared set"
+            )
+        } else {
+            format!("{object} needs {soname}: {}", verdict.reason())
+        };
         let more = match findings.len() {
             1 => String::new(),
             n => format!(" ({} more listed above)", n - 1),
         };
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "{} needs {}, which is neither in the sysroot closure, on the platform line, nor in a shared set{more}",
-                object, libs[0]
-            ),
+            format!("{why}{more}"),
         ));
     }
     Ok(())
+}
+
+/// The finding the failure names: an explicit include's own finding
+/// outranks the rest, since dropping what the author explicitly asked
+/// for is the one outcome the build never accepts silently. Within
+/// each rank the audit's order stands.
+fn first_failure<'a>(
+    opts: &BundleOptions,
+    findings: &'a [(PathBuf, Vec<String>)],
+) -> Option<&'a (PathBuf, Vec<String>)> {
+    let explicit = explicit_include_paths(opts);
+    let mut ranked: Vec<&(PathBuf, Vec<String>)> = findings.iter().collect();
+    ranked.sort_by_key(|(object, _)| {
+        let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
+        !explicit.contains(rel)
+    });
+    ranked.into_iter().next()
 }
 
 /// Pin a bundled file's mtime so repeated `bundle-libs` runs produce
