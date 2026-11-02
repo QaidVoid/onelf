@@ -2,7 +2,10 @@
 //!
 //! Sets `ONELF_*` variables and computes a `lib_path` string for the
 //! dynamic linker's `--library-path` flag. Also auto-detects and configures
-//! paths for graphics drivers (OpenGL/EGL/Vulkan/VA-API).
+//! paths for graphics drivers (OpenGL/EGL/Vulkan/VA-API). The resolved
+//! artifact store is exported as `ONELF_PLATFORM_STORE`, a location hint
+//! for the processes the app spawns; acquisition never takes a
+//! destination from it.
 //!
 //! `LD_LIBRARY_PATH` is intentionally NOT set. It would be inherited by
 //! every child process the packed app spawns, including host binaries
@@ -32,6 +35,13 @@ pub(crate) fn set_var_checked(key: &str, value: &str) {
 
 /// Set up environment variables and return a colon-joined lib path
 /// string for use with the dynamic linker's `--library-path` flag.
+///
+/// The store this launch resolves to is exported as
+/// `ONELF_PLATFORM_STORE`, so the processes the app spawns see where the
+/// ordinary store resolves and share its builds. The value is a lookup
+/// location, never a destination: acquisition derives its store from the
+/// target uid, so a privileged launch keeps its own validated store
+/// whatever it inherits here.
 ///
 /// For shebang scripts (non-ELF target), returns an empty string: the
 /// kernel hands off to a host interpreter linked against the host glibc,
@@ -95,6 +105,14 @@ pub fn setup_env(
     let target_is_elf = is_elf_file(target_path);
 
     let mut lib_path = String::new();
+
+    // The store resolution acquisition uses, exported so the processes
+    // the app spawns share this launch's store. Nothing reads the value
+    // back as a destination: a privileged child resolves its own private
+    // store exactly as this launch would have.
+    if let Some(store) = crate::platform::resolved_store() {
+        set_var_checked(crate::platform::STORE_HINT_VAR, &store.to_string_lossy());
+    }
 
     // Build the library search path for ELF entrypoints. Order:
     //   <link farm> : <bundled lib dirs> : <existing LD_LIBRARY_PATH>
@@ -1519,6 +1537,474 @@ mod setup_env_tests {
 
         let returned = call(elf.to_str().unwrap());
         assert!(returned.starts_with("/pkg/lib"));
+    }
+}
+
+#[cfg(test)]
+mod store_hint_tests {
+    use std::path::PathBuf;
+
+    use onelf_format::{Block, Entry, EntryKind, Flags, Footer, Manifest, ManifestHeader};
+
+    use super::test_env_lock::ENV_LOCK;
+    use super::*;
+
+    const HINT: &str = crate::platform::STORE_HINT_VAR;
+    const NO_FETCH: &str = "ONELF_NO_PLATFORM_FETCH";
+
+    /// The one file a test container carries, and its stored bytes.
+    const FILE_NAME: &str = "lib/libdemo.so";
+    const FILE_CONTENT: &[u8] = b"demo store hint bytes\n";
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("onelf-store-hint-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An ordinary launch whose tree carries a `lib` directory.
+    fn call() {
+        setup_env(
+            "/pkg",
+            "app",
+            "/exec",
+            "ep",
+            "test",
+            "lib",
+            "/nonexistent/target",
+            None,
+            None,
+            &[],
+            &[],
+        );
+    }
+
+    /// The store the export resolves to for this process's uid, over the
+    /// hint the seam inherits: the decision acquisition itself makes.
+    fn resolved(hint: &Path) -> PathBuf {
+        crate::platform::owned_store(
+            crate::paths::uid(),
+            Some(hint),
+            crate::cache::base_dir,
+            crate::paths::private_dir,
+        )
+        .expect("the uid's store resolves")
+    }
+
+    /// Where the store keeps the build `digest` names, under label `set`.
+    fn stored_in(store: &Path, digest: &str) -> PathBuf {
+        store.join("set").join(format!("{digest}.onelf"))
+    }
+
+    /// A minimal stored-mode container the runtime loader can open,
+    /// together with the digest that names it in a store. The file sits
+    /// at `lib/libdemo.so` as the entry tree's second node.
+    fn container() -> (Vec<u8>, String) {
+        let prefix = b"onelf store hint fixture";
+        let mut string_table: Vec<u8> = vec![0];
+        let dir_name_offset = string_table.len() as u32;
+        string_table.extend_from_slice(b"lib");
+        string_table.push(0);
+        let name_offset = string_table.len() as u32;
+        string_table.extend_from_slice(b"libdemo.so");
+        string_table.push(0);
+
+        let hash = *blake3::hash(FILE_CONTENT).as_bytes();
+        let dir = Entry {
+            kind: EntryKind::Dir,
+            parent: u32::MAX,
+            name: dir_name_offset,
+            mode: 0o755,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+            content_hash: [0; 32],
+            blocks: Vec::new(),
+            symlink_target: 0,
+        };
+        let file = Entry {
+            kind: EntryKind::File,
+            parent: 0,
+            name: name_offset,
+            mode: 0o755,
+            mtime_secs: 0,
+            mtime_nsec: 0,
+            content_hash: hash,
+            blocks: vec![Block {
+                payload_offset: 0,
+                compressed_size: FILE_CONTENT.len() as u64,
+                original_size: FILE_CONTENT.len() as u64,
+                content_hash: hash,
+            }],
+            symlink_target: 0,
+        };
+        let manifest = Manifest {
+            header: ManifestHeader {
+                version: 3,
+                entry_count: 2,
+                string_table_size: string_table.len() as u32,
+                entrypoint_count: 0,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [0; 32],
+                prefix_hash: *blake3::hash(prefix).as_bytes(),
+                footer_hash: [0; 32],
+            },
+            entrypoints: Vec::new(),
+            entries: vec![dir, file],
+            lib_dir_offsets: Vec::new(),
+            string_table,
+        };
+        let raw = manifest.serialize().unwrap();
+        let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+        let manifest_offset = prefix.len() as u64;
+        let payload_offset = manifest_offset + compressed.len() as u64;
+        let footer = Footer {
+            format_version: onelf_format::footer::FORMAT_VERSION,
+            flags: Flags::STORED,
+            manifest_offset,
+            manifest_compressed: compressed.len() as u64,
+            manifest_original: raw.len() as u64,
+            payload_offset,
+            payload_size: FILE_CONTENT.len() as u64,
+            dict_offset: 0,
+            dict_size: 0,
+            manifest_checksum: onelf_format::manifest::manifest_checksum(&raw).unwrap(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(&compressed);
+        bytes.extend_from_slice(FILE_CONTENT);
+        footer.write_to(&mut bytes).unwrap();
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        (bytes, digest)
+    }
+
+    /// The verified payload of [`FILE_NAME`] as the loader reads it back.
+    /// The build `store_build` serves, extracted through the verified
+    /// handle into the ordinary cache.
+    fn extracted_content(artifact: &crate::platform::VerifiedArtifact) -> Vec<u8> {
+        let (root, _lock) = crate::platform::extract_build(artifact).expect("the build extracts");
+        std::fs::read(root.join(FILE_NAME)).expect("the extracted file is present")
+    }
+
+    /// The store the launch exports, by privilege: an ordinary uid keeps
+    /// the hint it inherited, a privileged uid its own private base.
+    fn expected_export(hint: &Path) -> String {
+        if crate::paths::uid() == 0 {
+            crate::paths::private_dir()
+                .unwrap()
+                .join("platform")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            hint.to_string_lossy().into_owned()
+        }
+    }
+
+    /// An explicit relocation passes through for an ordinary uid; a
+    /// privileged launch exports its own private base in its place, so
+    /// no inherited user-chosen path survives a UID transition.
+    #[test]
+    fn an_explicit_hint_is_exported_as_the_uid_resolves_it() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("explicit");
+        let hint = dir.join("store");
+        unsafe { env::set_var(HINT, &hint) };
+
+        call();
+
+        assert_eq!(
+            env::var(HINT).unwrap(),
+            expected_export(&hint),
+            "the export is the resolved store, not the raw inheritance"
+        );
+
+        unsafe { env::remove_var(HINT) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without an explicit store, the launch exports the resolution
+    /// acquisition would use, so children of a default launch see the
+    /// store too and share its builds.
+    #[test]
+    fn the_default_resolution_is_exported_without_an_inherited_hint() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { env::remove_var(HINT) };
+
+        call();
+
+        let got = env::var(HINT).unwrap();
+        if crate::paths::uid() == 0 {
+            assert_eq!(got, expected_export(&PathBuf::from("/unused")));
+        } else {
+            let base = onelf_format::cache_layout::resolve_root(
+                crate::paths::uid(),
+                crate::paths::private_dir(),
+            )
+            .expect("the test cache base resolves");
+            assert_eq!(got, base.join("platform").to_string_lossy());
+        }
+    }
+
+    /// A launch that never acquires must leave the persistent cache
+    /// untouched: the export names the location the environment proposes
+    /// without creating it, and acquisition creates the root only when a
+    /// build is actually stored.
+    #[test]
+    fn the_export_never_establishes_the_persistent_cache() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if crate::paths::uid() == 0 {
+            // Root resolves its private base, not the persistent cache.
+            return;
+        }
+        let home = temp_dir("nocache");
+        unsafe { env::set_var("HOME", &home) };
+        unsafe { env::remove_var("XDG_CACHE_HOME") };
+        unsafe { env::remove_var(HINT) };
+        let root = home.join(".cache").join("onelf");
+        let _ = std::fs::remove_dir_all(&root);
+
+        call();
+
+        let got = env::var(HINT).unwrap();
+        assert_eq!(got, root.join("platform").to_string_lossy());
+        assert!(!root.exists(), "the export created the persistent cache");
+    }
+
+    /// A preserved escalation environment and a stripped one produce the
+    /// same export: the decision keys on the real uid, never on the
+    /// variables a privilege transition may or may not keep.
+    #[test]
+    fn preserved_and_stripped_escalation_environments_export_identically() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("sudo");
+        let hint = dir.join("store");
+        let escalation = [
+            ("SUDO_USER", "caller"),
+            ("SUDO_UID", "1000"),
+            ("SUDO_GID", "1000"),
+            ("SUDO_COMMAND", "/usr/bin/onelf run app"),
+            ("PKEXEC_UID", "1000"),
+        ];
+        for (name, value) in escalation {
+            unsafe { env::set_var(name, value) };
+        }
+        unsafe { env::set_var(HINT, &hint) };
+        call();
+        let preserved = env::var(HINT).unwrap();
+
+        for (name, _) in escalation {
+            unsafe { env::remove_var(name) };
+        }
+        call();
+        let stripped = env::var(HINT).unwrap();
+
+        assert_eq!(preserved, stripped);
+        assert_eq!(stripped, expected_export(&hint));
+
+        unsafe { env::remove_var(HINT) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exported location is where acquisition looks, and only
+    /// verification decides what may be served from it: a corrupted
+    /// artifact at the exported name is refused on its digest, the
+    /// loader never sees the bytes, and the store is left as it was.
+    #[test]
+    fn a_corrupted_artifact_at_the_exported_store_is_rejected() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("corrupt");
+        let hint = dir.join("store");
+        let (bytes, digest) = container();
+        let store = resolved(&hint);
+        let stored = stored_in(&store, &digest);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let mut damaged = bytes.clone();
+        damaged[5] ^= 0xff;
+        std::fs::write(&stored, &damaged).unwrap();
+
+        unsafe {
+            env::set_var(HINT, &hint);
+            env::set_var(NO_FETCH, "1");
+        }
+        let pin = crate::platform::Pin {
+            label: "set".into(),
+            url: format!("file://{}", dir.join("absent-source").display()),
+            blake3: digest,
+        };
+        let err = crate::platform::store_build(&pin).unwrap_err();
+
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(
+            !err.contains("not a usable build"),
+            "the loader must not run on unverified bytes: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            damaged,
+            "the exported store is left alone"
+        );
+
+        unsafe {
+            env::remove_var(HINT);
+            env::remove_var(NO_FETCH);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fetch prohibition still permits a safe cached import: the
+    /// artifact already at the exported location verifies against the
+    /// pin and is served without any fetch, though the configured source
+    /// could not have served the build at all.
+    #[test]
+    fn fetch_prohibition_still_imports_a_verified_cached_artifact() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("cached-import");
+        let hint = dir.join("store");
+        let (bytes, digest) = container();
+        let store = resolved(&hint);
+        let stored = stored_in(&store, &digest);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, &bytes).unwrap();
+
+        unsafe {
+            env::set_var(HINT, &hint);
+            env::set_var(NO_FETCH, "1");
+        }
+        let pin = crate::platform::Pin {
+            label: "set".into(),
+            url: format!("file://{}", dir.join("absent-source").display()),
+            blake3: digest,
+        };
+        let artifact = crate::platform::store_build(&pin).expect("the cached import is allowed");
+
+        assert_eq!(&*artifact, stored.as_path());
+        assert_eq!(extracted_content(&artifact), FILE_CONTENT);
+
+        unsafe {
+            env::remove_var(HINT);
+            env::remove_var(NO_FETCH);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the build missing from the exported location, fetch
+    /// prohibition stops the source fetch and names itself, leaving the
+    /// store without the build.
+    #[test]
+    fn a_missing_artifact_with_fetch_disabled_names_the_prohibition() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("prohibited");
+        let hint = dir.join("store");
+        let source = dir.join("source");
+        std::fs::write(&source, b"bytes no pin of this test names").unwrap();
+        let store = resolved(&hint);
+
+        unsafe {
+            env::set_var(HINT, &hint);
+            env::set_var(NO_FETCH, "1");
+        }
+        let pin = crate::platform::Pin {
+            label: "set".into(),
+            url: format!("file://{}", source.display()),
+            blake3: "0".repeat(64),
+        };
+        let err = crate::platform::store_build(&pin).unwrap_err();
+
+        assert!(err.contains("fetching is disabled"), "{err}");
+        assert!(err.contains(NO_FETCH), "{err}");
+        assert!(!stored_in(&store, &pin.blake3).exists());
+
+        unsafe {
+            env::remove_var(HINT);
+            env::remove_var(NO_FETCH);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With fetching permitted but the source unreachable, the
+    /// acquisition through the exported store fails with the source's
+    /// reason and publishes nothing: the error every required set exits
+    /// with and every optional GL build warns with, unchanged.
+    #[test]
+    fn an_unreachable_source_fails_acquisition_through_the_exported_store() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("unreachable");
+        let hint = dir.join("store");
+        let store = resolved(&hint);
+        let stored = stored_in(&store, &"0".repeat(64));
+
+        unsafe {
+            env::set_var(HINT, &hint);
+            env::remove_var(NO_FETCH);
+        }
+        let pin = crate::platform::Pin {
+            label: "set".into(),
+            url: format!("file://{}", dir.join("missing-source").display()),
+            blake3: "0".repeat(64),
+        };
+        let err = crate::platform::store_build(&pin).unwrap_err();
+
+        assert!(err.contains("missing-source"), "{err}");
+        assert!(!stored.exists(), "an unreachable source publishes nothing");
+
+        unsafe { env::remove_var(HINT) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pinned GL build reaches acquisition the same way, and a build
+    /// that cannot be had comes back as a reported outcome, the shape
+    /// the launch turns into a warning while it goes on without a GL
+    /// stack.
+    #[test]
+    fn an_unusable_pinned_gl_build_reports_instead_of_aborting() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("gl-optional");
+        let hint = dir.join("store");
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(pkg.join(".onelf")).unwrap();
+        std::fs::write(
+            pkg.join(crate::platform::PIN_FILE),
+            format!(
+                "label = \"gl\"\nurl = \"file://{}\"\nblake3 = \"{}\"\n",
+                dir.join("missing-source").display(),
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        unsafe { env::set_var(HINT, &hint) };
+        let outcome = crate::platform::obtain(&pkg);
+
+        assert!(outcome.is_some_and(|r| r.is_err()));
+
+        unsafe { env::remove_var(HINT) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The export replaces, never accumulates: repeated launches of the
+    /// same package under the same inheritance export one identical
+    /// resolved store, and a launch that inherits the previous launch's
+    /// export re-exports that same resolution.
+    #[test]
+    fn repeated_launches_reexport_one_identical_resolved_store() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("idempotent");
+        let hint = dir.join("store");
+        unsafe { env::set_var(HINT, &hint) };
+
+        call();
+        let first = env::var(HINT).unwrap();
+        call();
+        let second = env::var(HINT).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, expected_export(&hint));
+
+        unsafe { env::remove_var(HINT) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -166,6 +166,10 @@ pub fn extract_build(artifact: &VerifiedArtifact) -> Result<(PathBuf, fs::File),
         .map_err(|e| format!("{}: cannot extract: {e}", artifact.path.display()))
 }
 
+/// The environment name the launch exports the resolved ordinary store
+/// under, and the only name acquisition reads an import hint from.
+pub(crate) const STORE_HINT_VAR: &str = "ONELF_PLATFORM_STORE";
+
 /// The inherited import hint: where the launch that started this one
 /// resolved its ordinary store, exported so the same pinned build is not
 /// downloaded twice. A suggestion only. It pre-fills the store candidates
@@ -174,7 +178,7 @@ pub fn extract_build(artifact: &VerifiedArtifact) -> Result<(PathBuf, fs::File),
 /// user, so a privileged target refuses it as a destination, and no
 /// guarantee depends on a privilege transition keeping it.
 fn import_hint() -> Option<PathBuf> {
-    std::env::var_os("ONELF_PLATFORM_STORE")
+    std::env::var_os(STORE_HINT_VAR)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
@@ -193,7 +197,7 @@ fn import_hint() -> Option<PathBuf> {
 /// The bases are closures so a refusal costs no probe: resolving root's
 /// store must not create or stat anything under the paths the
 /// environment names.
-fn owned_store(
+pub(crate) fn owned_store(
     uid: u32,
     hint: Option<&Path>,
     cache_base: impl FnOnce() -> Option<PathBuf>,
@@ -215,6 +219,43 @@ fn owned_store(
     private_base()
         .map(|base| base.join("platform"))
         .ok_or_else(|| "no root-owned private directory to store a build in".to_string())
+}
+
+/// The store this launch resolves to, the decision [`owned_store`] makes
+/// for the target uid: an ordinary uid's inherited hint or per-user
+/// cache, a privileged uid's own private base. `None` when no safe
+/// location resolves, which is the launch that has nowhere to put a
+/// build. The launch environment exports it under [`STORE_HINT_VAR`] so
+/// the processes the app spawns see where the store resolves; the export
+/// is a location only, and every acquisition re-derives its destination
+/// from the target uid instead of trusting it.
+///
+/// The resolution is read-only: an ordinary uid without a hint gets the
+/// location the environment proposes, without creating or probing the
+/// persistent cache, so a launch that never acquires leaves it
+/// untouched. Acquisition creates whatever it needs on demand through
+/// the checked creation rules, and re-derives the destination from the
+/// uid rather than from this export.
+pub(crate) fn resolved_store() -> Option<PathBuf> {
+    let uid = crate::paths::uid();
+    let hint = import_hint();
+    if uid != 0 {
+        if let Some(dir) = hint {
+            return Some(dir);
+        }
+        return onelf_format::cache_layout::proposed_root(None)
+            .filter(|root| {
+                !root.exists() || onelf_format::cache_layout::is_safe_owned_dir(root, uid)
+            })
+            .map(|base| base.join("platform"));
+    }
+    owned_store(
+        uid,
+        hint.as_deref(),
+        crate::cache::base_dir,
+        crate::paths::private_dir,
+    )
+    .ok()
 }
 
 /// Where the shared store keeps the build `pin` names, whether or not it

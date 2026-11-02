@@ -86,6 +86,29 @@ pub fn resolve_root(uid: u32, fallback: Option<PathBuf>) -> Option<PathBuf> {
     ensure_safe_dir(&onelf, uid).then_some(onelf)
 }
 
+/// Where [`resolve_root`] would place the cache root, computed from the
+/// environment alone: nothing is created and nothing on disk is probed.
+/// The launch export answers this so merely starting a launch never
+/// establishes the persistent cache; acquisition keeps using
+/// [`resolve_root`], which creates the root under its safe-creation
+/// rules on demand. The `fallback` applies only when the environment
+/// names no absolute cache location, mirroring [`resolve_root`].
+pub fn proposed_root(fallback: Option<PathBuf>) -> Option<PathBuf> {
+    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
+        let p = PathBuf::from(v);
+        p.is_absolute().then_some(p)
+    };
+    std::env::var_os("XDG_CACHE_HOME")
+        .and_then(abs)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(abs)
+                .map(|h| h.join(".cache"))
+        })
+        .or(fallback)
+        .map(|base| base.join("onelf"))
+}
+
 /// Extracted tree for `package_id`.
 pub fn pkg_dir(root: &Path, package_id: &str) -> PathBuf {
     root.join("pkg").join(package_id)
