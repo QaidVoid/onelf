@@ -14,6 +14,11 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use onelf_format::rules::{
+    EnvironmentName, Inheritance, PathSelection, ResourceKind, RuntimeBase, RuntimeHookId,
+    RuntimePathGroup,
+};
+
 /// `set_var` for a name and value that came from a file: `std` aborts on
 /// an empty name, a `=` in the name, or a NUL in either, and a stray line
 /// in `.onelf/env` is not worth the whole launch.
@@ -76,10 +81,14 @@ pub fn setup_env(
     }
 
     let pkg = Path::new(onelf_dir);
-    let all_lib_dirs: Vec<PathBuf> = lib_subpath
+    let app_lib_dirs: Vec<PathBuf> = lib_subpath
         .split(':')
         .filter(|p| !p.is_empty())
         .map(|p| pkg.join(p))
+        .collect();
+    let all_lib_dirs: Vec<PathBuf> = app_lib_dirs
+        .iter()
+        .cloned()
         .chain(set_lib_dirs.iter().cloned())
         .collect();
 
@@ -202,10 +211,13 @@ pub fn setup_env(
     // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
-    setup_qt_plugin_path(pkg, set_roots);
-    setup_glib_modules(pkg, set_roots);
-    setup_fontconfig(pkg, set_roots);
-    setup_plugin_dirs(pkg, &all_lib_dirs, set_roots);
+    setup_plugin_dirs(pkg, &app_lib_dirs, set_lib_dirs, set_roots);
+    run_runtime_hooks(&HookContext {
+        pkg,
+        lib_dirs: &app_lib_dirs,
+        set_lib_dirs,
+        set_roots,
+    });
     setup_terminfo(pkg, set_roots);
     setup_ca_bundle(pkg, set_roots);
     setup_locale(&all_lib_dirs);
@@ -254,16 +266,6 @@ pub fn setup_env(
         }
     }
 
-    // Auto-set XKB_CONFIG_ROOT if package has xkb data
-    if env::var("XKB_CONFIG_ROOT").is_err() {
-        let xkb_dir = pkg.join("share/X11/xkb");
-        if xkb_dir.is_dir() {
-            unsafe {
-                env::set_var("XKB_CONFIG_ROOT", xkb_dir.to_string_lossy().as_ref());
-            }
-        }
-    }
-
     // The package's libdecor plugins, which only its own libdecor can
     // load, replace an inherited directory.
     let libdecor_dir = pkg.join("share/libdecor/plugins-1");
@@ -296,23 +298,98 @@ pub(crate) fn is_elf_file(path: &str) -> bool {
     matches!(f.read(&mut buf), Ok(4)) && buf == *b"\x7fELF"
 }
 
-/// Prepend the package's `share/` to `XDG_DATA_DIRS` so GLib/GTK can find
-/// bundled GSettings schemas, icons, MIME types, etc. Host dirs are preserved
-/// so system themes and desktop integrations still work.
-/// The package's `share/` goes first, a fetched GL build's after it so
-/// the Vulkan loader finds the build's ICD files, then the host's.
-/// Point GLib and GTK at the module caches the package and its sets
-/// carry.
+/// The launch context one registered runtime hook evaluates against.
 ///
-/// Each of these has a path compiled into the library that reads it, and
+/// Package roots answer path lookups, and the library directories are
+/// the dynamic linker's search order.
+pub(crate) struct HookContext<'a> {
+    /// The application package root.
+    pub pkg: &'a Path,
+    /// The application's library directories, in search order.
+    pub lib_dirs: &'a [PathBuf],
+    /// The selected sets' library directories, in search order.
+    pub set_lib_dirs: &'a [PathBuf],
+    /// The selected sets' tree roots.
+    pub set_roots: &'a [PathBuf],
+}
+
+/// One registered runtime hook: its closed-registry identity and handler.
+struct RuntimeHook {
+    /// The identity decoded package metadata names for this handler.
+    id: RuntimeHookId,
+    /// The handler, taking the launch context.
+    run: fn(&HookContext<'_>),
+}
+
+/// The registered runtime hooks, in fixed invocation order.
+///
+/// The registry is closed and bounded: five handlers, declared once and
+/// never extended from package data, so every launch runs them in this
+/// order. It is the order the procedural calls used, and each handler
+/// keeps the algorithm it had there.
+fn runtime_hooks() -> &'static [RuntimeHook] {
+    const HOOKS: &[RuntimeHook] = &[
+        RuntimeHook {
+            id: RuntimeHookId::GdkCacheAbsolutise,
+            run: run_gdk_cache_absolutise,
+        },
+        RuntimeHook {
+            id: RuntimeHookId::GioModulePaths,
+            run: run_gio_module_paths,
+        },
+        RuntimeHook {
+            id: RuntimeHookId::FontconfigGenerate,
+            run: run_fontconfig_generate,
+        },
+        RuntimeHook {
+            id: RuntimeHookId::TclTkLibraries,
+            run: run_tcl_tk_libraries,
+        },
+        RuntimeHook {
+            id: RuntimeHookId::AlsaConfigPathNaturalSort,
+            run: run_alsa_config_path_natural_sort,
+        },
+    ];
+    HOOKS
+}
+
+/// Run every registered runtime hook in declaration order.
+///
+/// Dispatch goes through the by-id lookup, so the launch takes the same
+/// path a metadata-declared hook takes.
+pub(crate) fn run_runtime_hooks(context: &HookContext<'_>) {
+    for hook in runtime_hooks() {
+        if let Some(run) = runtime_hook(hook.id) {
+            run(context);
+        }
+    }
+}
+
+/// The handler registered for a metadata hook identity, if there is one.
+///
+/// Decoded package metadata names hooks by [`RuntimeHookId`]; this lookup
+/// is how such a hook reaches its handler. Running the whole registry is
+/// [`run_runtime_hooks`].
+pub(crate) fn runtime_hook(id: RuntimeHookId) -> Option<fn(&HookContext<'_>)> {
+    runtime_hooks()
+        .iter()
+        .find(|hook| hook.id == id)
+        .map(|hook| hook.run)
+}
+
+/// Point GDK and GTK at the module caches the package and its sets
+/// carry, with the module paths absolutised by [`absolutised`].
+///
+/// Each cache has a path compiled into the library that reads it, and
 /// that path is the packaging distribution's. Left alone, a bundle finds
-/// the host's image loaders, input methods and GIO modules, which are
-/// built against the host's libc: on a musl host they cannot be loaded
-/// into a glibc process at all, and on a glibc host they are simply the
-/// wrong versions. An inherited value names exactly those modules, so
-/// the package's replaces it.
-fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
-    let roots = || std::iter::once(pkg).chain(set_roots.iter().map(PathBuf::as_path));
+/// the host's image loaders and input methods, which are built against
+/// the host's libc: on a musl host they cannot be loaded into a glibc
+/// process at all, and on a glibc host they are simply the wrong
+/// versions. An inherited value names exactly those modules, so the
+/// package's replaces it.
+fn run_gdk_cache_absolutise(context: &HookContext<'_>) {
+    let roots =
+        || std::iter::once(context.pkg).chain(context.set_roots.iter().map(PathBuf::as_path));
 
     // The version directory differs between builds, so the cache is
     // looked for one level down rather than named outright.
@@ -328,31 +405,33 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
             .find(|p| p.is_file())
     };
     if let Some(path) =
-        cache("lib/gdk-pixbuf-2.0", "loaders.cache").and_then(|c| absolutised(&c, pkg))
+        cache("lib/gdk-pixbuf-2.0", "loaders.cache").and_then(|c| absolutised(&c, context.pkg))
     {
         set_path("GDK_PIXBUF_MODULE_FILE", path.as_os_str());
     }
-    if let Some(path) = cache("lib/gtk-3.0", "immodules.cache").and_then(|c| absolutised(&c, pkg)) {
+    if let Some(path) =
+        cache("lib/gtk-3.0", "immodules.cache").and_then(|c| absolutised(&c, context.pkg))
+    {
         set_path("GTK_IM_MODULE_FILE", path.as_os_str());
     }
+}
 
+/// Give GIO the module directory the package carries, with the remaining
+/// directories behind it on `GIO_EXTRA_MODULES`.
+///
+/// `GIO_MODULE_DIR` replaces GLib's default module directory, so the
+/// host's modules, built against the host's GLib, never load into the
+/// bundled one. It takes one directory: a set's modules come after the
+/// package's on `GIO_EXTRA_MODULES`. A bundle with no modules leaves the
+/// default alone, and the host's dconf and gvfs serve it.
+fn run_gio_module_paths(context: &HookContext<'_>) {
     let found = |rel: &str| -> Vec<PathBuf> {
-        roots()
+        std::iter::once(context.pkg)
+            .chain(context.set_roots.iter().map(PathBuf::as_path))
             .map(|root| root.join(rel))
             .filter(|d| d.is_dir())
             .collect()
     };
-    let dirs = |rel: &str| -> Option<std::ffi::OsString> {
-        let found = found(rel);
-        (!found.is_empty())
-            .then(|| env::join_paths(found).ok())
-            .flatten()
-    };
-    // GIO_MODULE_DIR replaces GLib's default module directory, so the
-    // host's modules, built against the host's GLib, never load into the
-    // bundled one. It takes one directory: a set's modules come after the
-    // package's on GIO_EXTRA_MODULES. A bundle with no modules leaves the
-    // default alone, and the host's dconf and gvfs serve it.
     let mut gio = found("lib/gio/modules").into_iter();
     if let Some(first) = gio.next() {
         set_path("GIO_MODULE_DIR", first.as_os_str());
@@ -362,12 +441,6 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
         {
             set_path("GIO_EXTRA_MODULES", &rest);
         }
-    }
-    // GTK 3's modules, theme engines and print backends. Only GTK 3's:
-    // GTK 2 reads the same variable and would take GTK 3's modules for
-    // its own.
-    if let Some(gtk) = dirs("lib/gtk-3.0") {
-        set_path("GTK_PATH", &gtk);
     }
 }
 
@@ -389,7 +462,9 @@ fn setup_glib_modules(pkg: &Path, set_roots: &[PathBuf]) {
 /// no management: fontconfig writes per-directory caches under the
 /// user's cache home, keyed by directory path, and the mount paths are
 /// stable across launches.
-fn setup_fontconfig(pkg: &Path, set_roots: &[PathBuf]) {
+fn run_fontconfig_generate(context: &HookContext<'_>) {
+    let pkg = context.pkg;
+    let set_roots = context.set_roots;
     let inherited = env::var_os("FONTCONFIG_FILE").filter(|f| !f.is_empty());
     let include = inherited
         .as_deref()
@@ -514,158 +589,217 @@ fn set_path(name: &str, value: &std::ffi::OsStr) {
     unsafe { env::set_var(name, value) };
 }
 
-/// Point Qt at the plugin directories the package and its sets carry.
+/// One party's roots a runtime mapping evaluates against.
 ///
-/// A relocatable Qt finds its plugins relative to the executable, which
-/// holds while the toolkit sits in the same tree as the application. A
-/// shared set moves it out, and Qt then looks under the application's own
-/// root, finds no platform plugin and aborts before its first window.
-/// Naming the directories outright is what survives either layout. An
-/// inherited value is replaced: the plugins it names were built against
-/// some other Qt.
-fn setup_qt_plugin_path(pkg: &Path, set_roots: &[PathBuf]) {
-    let dirs: Vec<String> = std::iter::once(pkg)
-        .chain(set_roots.iter().map(PathBuf::as_path))
-        .flat_map(|root| ["lib/qt6/plugins", "lib/qt5/plugins"].map(|d| root.join(d)))
-        .filter(|d| d.is_dir())
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
-    if !dirs.is_empty() {
-        // SAFETY: the runtime is single-threaded at this point (before exec)
-        unsafe { env::set_var("QT_PLUGIN_PATH", dirs.join(":")) };
+/// Package roots answer candidates declared against a package root, and
+/// library roots are the directories the dynamic linker searches, below
+/// which candidates declared against a library root are joined. The
+/// application's scope is evaluated first, then the selected sets', so
+/// a set fills only what the application lacks.
+pub(crate) struct Scope<'a> {
+    /// Tree roots of one party: the application package, or set roots.
+    pub packages: &'a [&'a Path],
+    /// Library directories of the same party, in search order.
+    pub libraries: &'a [PathBuf],
+}
+
+/// One evaluated mapping: a single value for every alias.
+pub(crate) struct PathAssignment<'a> {
+    /// Environment aliases that receive [`PathAssignment::value`].
+    pub variables: Vec<&'a str>,
+    /// The selected paths joined the way the receiving library reads them.
+    pub value: std::ffi::OsString,
+    /// What happens to a value the caller already set.
+    pub inheritance: Inheritance,
+}
+
+/// The roots a candidate of `base` is joined against, in search order.
+fn bases<'s>(scope: &'s Scope<'_>, base: RuntimeBase) -> Vec<&'s Path> {
+    match base {
+        RuntimeBase::PackageRoot => scope.packages.to_vec(),
+        RuntimeBase::LibraryRoot => scope.libraries.iter().map(PathBuf::as_path).collect(),
     }
 }
 
-/// Module directories below a library directory, by the variable their
-/// library reads in place of the directory compiled into it. Every one
-/// of these takes a `:`-separated list.
+/// Whether `path` has the kind the group declares.
+fn kind_matches(kind: ResourceKind, path: &Path) -> bool {
+    match kind {
+        ResourceKind::File => path.is_file(),
+        ResourceKind::Directory => path.is_dir(),
+    }
+}
+
+/// The one path a first-match group selects, scopes in order.
 ///
-/// The compiled-in directory is the packaging distribution's, and on
-/// another host it holds modules built against that host's copy of the
-/// library, or nothing. The package's modules were built against its own
-/// copy, so its directories replace an inherited value, as with
-/// `QT_PLUGIN_PATH`.
-const LIB_MODULE_DIRS: &[(&str, &str)] = &[
-    ("GST_PLUGIN_SYSTEM_PATH_1_0", "gstreamer-1.0"),
-    ("GST_PLUGIN_SYSTEM_PATH", "gstreamer-1.0"),
-    ("PIPEWIRE_MODULE_DIR", "pipewire-0.3"),
-    ("SPA_PLUGIN_DIR", "spa-0.2"),
-    ("GI_TYPELIB_PATH", "girepository-1.0"),
-    ("BABL_PATH", "babl-0.1"),
-    ("GEGL_PATH", "gegl-0.4"),
-];
-
-/// Where a bundled GStreamer keeps its plugin scanner: below a library
-/// directory on Arch and Debian, under `libexec/` on Fedora and Alpine.
-const GST_SCANNER_IN_LIB: &[&str] = &[
-    "gstreamer-1.0/gst-plugin-scanner",
-    "gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
-];
-const GST_SCANNER_IN_ROOT: &str = "libexec/gstreamer-1.0/gst-plugin-scanner";
-
-/// Data a library reads from a compiled-in path, by the variable that
-/// names it instead, with where a package may carry it. A user sets these
-/// to choose other data, so a value the caller set is kept.
-/// `ALSA_CONFIG_DIR` is not among them: the carried `alsa.conf` hook is
-/// anchored at `{ @func datadir }`, so it must name the carried
-/// directory, and like `ALSA_PLUGIN_DIR` it replaces an inherited value.
-const DATA_PATHS: &[(&str, &[&str])] = &[
-    ("TEXTDOMAINDIR", &["share/locale"]),
-    ("XLOCALEDIR", &["share/X11/locale"]),
-    (
-        "MAGIC",
-        &["share/file/misc/magic.mgc", "share/misc/magic.mgc"],
-    ),
-];
-
-/// Point the libraries that load plugins or read data from a compiled-in
-/// directory at the copies the package and its sets carry. See
-/// [`LIB_MODULE_DIRS`] and [`DATA_PATHS`] for which value wins.
-fn setup_plugin_dirs(pkg: &Path, lib_dirs: &[PathBuf], set_roots: &[PathBuf]) {
-    let roots: Vec<&Path> = std::iter::once(pkg)
-        .chain(set_roots.iter().map(PathBuf::as_path))
-        .collect();
-    let below_libs = |rel: &str| -> Vec<PathBuf> {
-        let mut found: Vec<PathBuf> = Vec::new();
-        for dir in lib_dirs.iter().map(|d| d.join(rel)) {
-            if dir.exists() && !found.contains(&dir) {
-                found.push(dir);
+/// Candidates evaluate in declaration order, each against its base's
+/// roots in scope order, so the application's match outranks a set's
+/// even when the set's candidate is declared first.
+fn first_match(group: &RuntimePathGroup, scopes: &[Scope<'_>]) -> Vec<PathBuf> {
+    for scope in scopes {
+        for candidate in &group.candidates {
+            for base in bases(scope, candidate.base) {
+                let path = base.join(candidate.path.as_str());
+                if kind_matches(group.kind, &path) {
+                    return vec![path];
+                }
             }
         }
-        found
-    };
+    }
+    Vec::new()
+}
 
-    for (var, rel) in LIB_MODULE_DIRS {
-        let found = below_libs(rel);
-        if let Some(joined) = (!found.is_empty())
-            .then(|| env::join_paths(found).ok())
-            .flatten()
-        {
-            set_path(var, &joined);
+/// Every path an all-match group selects, without duplicates.
+///
+/// The application's matches all come before the sets', and within a
+/// scope the candidates keep their declaration order.
+fn all_matches(group: &RuntimePathGroup, scopes: &[Scope<'_>]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for scope in scopes {
+        for candidate in &group.candidates {
+            for base in bases(scope, candidate.base) {
+                let path = base.join(candidate.path.as_str());
+                if kind_matches(group.kind, &path) && !found.contains(&path) {
+                    found.push(path);
+                }
+            }
         }
     }
-    // libheif keeps its plugins in `libheif/plugins/` on Debian and in
-    // `libheif/` itself on Arch.
-    let heif: Vec<PathBuf> = below_libs("libheif")
-        .into_iter()
-        .map(|dir| {
-            let plugins = dir.join("plugins");
-            if plugins.is_dir() { plugins } else { dir }
-        })
-        .collect();
-    if let Some(joined) = (!heif.is_empty())
-        .then(|| env::join_paths(heif).ok())
-        .flatten()
-    {
-        set_path("LIBHEIF_PLUGIN_PATH", &joined);
+    found
+}
+
+/// The path each library root contributes to a per-library-root group.
+///
+/// Every library root in scope order is answered by its first matching
+/// candidate in declaration order, which is how the nested plugin
+/// directory of a library root is preferred over the library root's own.
+fn first_per_library_root(group: &RuntimePathGroup, scopes: &[Scope<'_>]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for scope in scopes {
+        for base in scope.libraries {
+            for candidate in &group.candidates {
+                let path = base.join(candidate.path.as_str());
+                if kind_matches(group.kind, &path) && !found.contains(&path) {
+                    found.push(path);
+                    break;
+                }
+            }
+        }
     }
-    // alsa-lib takes a single directory.
-    if let Some(dir) = below_libs("alsa-lib").first() {
-        set_path("ALSA_PLUGIN_DIR", dir.as_os_str());
+    found
+}
+
+/// Select and join the paths each mapping finds, in mapping order.
+///
+/// A mapping that finds no candidate of its declared kind assigns
+/// nothing, so it can neither invent a path nor override an inherited
+/// value. Probes are bounded by the codec's caps on candidates and
+/// aliases times the launch's root count.
+pub(crate) fn evaluate_path_groups<'a>(
+    groups: impl IntoIterator<Item = &'a RuntimePathGroup>,
+    scopes: &[Scope<'_>],
+) -> Vec<PathAssignment<'a>> {
+    let mut assignments = Vec::new();
+    for group in groups {
+        let chosen = match group.selection {
+            PathSelection::First => first_match(group, scopes),
+            PathSelection::All => all_matches(group, scopes),
+            PathSelection::FirstPerLibraryRoot => first_per_library_root(group, scopes),
+        };
+        if chosen.is_empty() {
+            continue;
+        }
+        let Some(value) = env::join_paths(&chosen).ok() else {
+            continue;
+        };
+        assignments.push(PathAssignment {
+            variables: group
+                .variables
+                .iter()
+                .map(EnvironmentName::as_str)
+                .collect(),
+            value,
+            inheritance: group.inheritance,
+        });
     }
-    let scanner = GST_SCANNER_IN_LIB
+    assignments
+}
+
+/// Apply assignments to the process environment.
+///
+/// A preserve policy keeps a present caller value, including an
+/// explicitly empty one; a replace policy overrides it. All aliases of
+/// one group follow the group's policy.
+pub(crate) fn apply_path_assignments(assignments: &[PathAssignment<'_>]) {
+    for assignment in assignments {
+        for name in &assignment.variables {
+            if assignment.inheritance == Inheritance::Preserve && env::var_os(name).is_some() {
+                continue;
+            }
+            set_path(name, &assignment.value);
+        }
+    }
+}
+
+/// The built-in catalog's runtime path groups, in catalog order.
+///
+/// These carry the framework knowledge for packages without runtime rule
+/// metadata; decoded package groups evaluate through the same engine.
+pub(crate) fn builtin_path_groups() -> impl Iterator<Item = &'static RuntimePathGroup> {
+    onelf_format::catalog::builtins()
         .iter()
-        .flat_map(|rel| below_libs(rel))
-        .chain(roots.iter().map(|root| root.join(GST_SCANNER_IN_ROOT)))
-        .find(|p| p.is_file());
-    if let Some(scanner) = scanner {
-        set_path("GST_PLUGIN_SCANNER_1_0", scanner.as_os_str());
-        set_path("GST_PLUGIN_SCANNER", scanner.as_os_str());
-    }
-    let (tcl, tk) = tcl_tk_libraries(lib_dirs, &roots);
+        .flat_map(|descriptor| descriptor.runtime.paths.iter())
+}
+
+/// Point the libraries that load plugins or read data from a compiled-in
+/// directory at the copies the package and its sets carry, by evaluating
+/// the catalog's runtime mappings against the application and set roots.
+/// The version-dependent Tcl and Tk script libraries, the carried ALSA
+/// snippet list, the GDK and GTK module caches, GIO's module directories
+/// and fontconfig stay with the registered runtime hooks.
+fn setup_plugin_dirs(
+    pkg: &Path,
+    lib_dirs: &[PathBuf],
+    set_lib_dirs: &[PathBuf],
+    set_roots: &[PathBuf],
+) {
+    let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
+    let scopes = [
+        Scope {
+            packages: std::slice::from_ref(&pkg),
+            libraries: lib_dirs,
+        },
+        Scope {
+            packages: &set_packages,
+            libraries: set_lib_dirs,
+        },
+    ];
+    let assignments = evaluate_path_groups(builtin_path_groups(), &scopes);
+    apply_path_assignments(&assignments);
+}
+
+/// Set `TCL_LIBRARY` and `TK_LIBRARY` to the script libraries matching
+/// the bundled Tcl and Tk, replacing any inherited value.
+fn run_tcl_tk_libraries(context: &HookContext<'_>) {
+    let mut libraries: Vec<PathBuf> = context.lib_dirs.to_vec();
+    libraries.extend_from_slice(context.set_lib_dirs);
+    let roots: Vec<&Path> = std::iter::once(context.pkg)
+        .chain(context.set_roots.iter().map(PathBuf::as_path))
+        .collect();
+    let (tcl, tk) = tcl_tk_libraries(&libraries, &roots);
     if let Some(dir) = tcl {
         set_path("TCL_LIBRARY", dir.as_os_str());
     }
     if let Some(dir) = tk {
         set_path("TK_LIBRARY", dir.as_os_str());
     }
+}
 
-    for (var, rels) in DATA_PATHS {
-        if env::var_os(var).is_some() {
-            continue;
-        }
-        let found = roots
-            .iter()
-            .flat_map(|root| rels.iter().map(|rel| root.join(rel)))
-            .find(|p| p.exists());
-        if let Some(path) = found {
-            set_path(var, path.as_os_str());
-        }
-    }
-
-    // The carried `alsa.conf` anchors its snippet directory at
-    // `{ @func datadir }`, so an inherited `ALSA_CONFIG_DIR` would point
-    // the hook at the wrong snippets and hand the default back to the
-    // host. Like `ALSA_PLUGIN_DIR`, the package's own copy replaces an
-    // inherited value; a caller who wants different ALSA configuration
-    // altogether sets `ALSA_CONFIG_PATH`, which stays theirs.
-    if let Some(dir) = roots
-        .iter()
-        .map(|root| root.join("share/alsa"))
-        .find(|dir| dir.is_dir())
-    {
-        set_path("ALSA_CONFIG_DIR", dir.as_os_str());
-    }
+/// Set `ALSA_CONFIG_PATH` to the carried configuration and its naturally
+/// ordered snippets, keeping a caller's own value.
+fn run_alsa_config_path_natural_sort(context: &HookContext<'_>) {
+    let roots: Vec<&Path> = std::iter::once(context.pkg)
+        .chain(context.set_roots.iter().map(PathBuf::as_path))
+        .collect();
     set_alsa_config_path(&roots);
 }
 
@@ -1459,14 +1593,19 @@ mod fontconfig_conf_tests {
 }
 
 #[cfg(test)]
-mod plugin_dir_tests {
+mod test_env_lock {
     use std::sync::Mutex;
 
-    use super::*;
+    /// The environment is process-global and the test runner runs tests
+    /// in parallel: every test in this file that sets or asserts a
+    /// variable holds this lock while it does.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
 
-    /// The environment is process-global and the test runner parallel:
-    /// the tests here set and assert variables, so they take turns.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+mod plugin_dir_tests {
+    use super::test_env_lock::ENV_LOCK;
+    use super::*;
 
     fn tree(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("onelf-plugins-{tag}-{}", std::process::id()));
@@ -1481,7 +1620,8 @@ mod plugin_dir_tests {
 
     /// Module directories replace what the caller set, data paths fill
     /// only what the caller left unset, and a set's modules follow the
-    /// package's.
+    /// package's. The registry pass behind the same roots keeps the
+    /// caller's ALSA value and sets the Tcl script library.
     #[test]
     fn modules_replace_and_data_fills() {
         let _env = ENV_LOCK
@@ -1516,7 +1656,16 @@ mod plugin_dir_tests {
             env::remove_var("PIPEWIRE_MODULE_DIR");
         }
 
-        setup_plugin_dirs(&pkg, &[lib.clone(), arch.clone(), set_lib.clone()], &[set]);
+        let lib_dirs = [lib.clone(), arch.clone()];
+        let set_libs = [set_lib.clone()];
+        let set_roots = [set.clone()];
+        setup_plugin_dirs(&pkg, &lib_dirs, &set_libs, &set_roots);
+        run_runtime_hooks(&HookContext {
+            pkg: &pkg,
+            lib_dirs: &lib_dirs,
+            set_lib_dirs: &set_libs,
+            set_roots: &set_roots,
+        });
 
         let var = |name| env::var(name).unwrap_or_default();
         assert_eq!(
@@ -1676,6 +1825,938 @@ mod plugin_dir_tests {
             )
         );
         let _ = std::fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::test_env_lock::ENV_LOCK;
+    use super::*;
+
+    fn tree(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("onelf-registry-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    fn mkdir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    /// Every file below `root`, as sorted relative paths, so a test can
+    /// detect any write a handler makes into the payload.
+    fn files_below(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The registry is closed and ordered: exactly the five runtime hook
+    /// identities, once each, in declaration order, and every identity is
+    /// reachable through the by-id lookup.
+    #[test]
+    fn the_registry_holds_every_hook_once_in_a_fixed_order() {
+        let ids: Vec<RuntimeHookId> = runtime_hooks().iter().map(|hook| hook.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                RuntimeHookId::GdkCacheAbsolutise,
+                RuntimeHookId::GioModulePaths,
+                RuntimeHookId::FontconfigGenerate,
+                RuntimeHookId::TclTkLibraries,
+                RuntimeHookId::AlsaConfigPathNaturalSort,
+            ]
+        );
+        assert_eq!(runtime_hooks().len(), 5);
+        for id in ids {
+            assert!(runtime_hook(id).is_some(), "{id:?} has no handler");
+        }
+    }
+
+    /// One registry pass reproduces every previously procedural outcome
+    /// and writes nothing into the payload tree.
+    #[test]
+    fn one_registry_pass_produces_every_handler_outcome() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("golden");
+        let pkg = work.join("regpkg");
+        let lib = pkg.join("lib");
+        let version = lib.join("gdk-pixbuf-2.0/2.10.0");
+        mkdir(&version);
+        mkdir(&lib.join("gtk-3.0/3.0.0"));
+        mkdir(&lib.join("gio/modules"));
+        mkdir(&pkg.join("share/fonts"));
+        mkdir(&lib.join("tcl8.6"));
+        mkdir(&lib.join("tk8.6"));
+        mkdir(&pkg.join("share/alsa/alsa.conf.d"));
+        touch(&lib.join("tcl8.6/init.tcl"));
+        touch(&lib.join("tk8.6/tk.tcl"));
+        touch(&pkg.join("share/alsa/alsa.conf"));
+        touch(&pkg.join("share/alsa/alsa.conf.d/100-extra.conf"));
+        touch(&pkg.join("share/alsa/alsa.conf.d/99-pulse.conf"));
+        std::fs::write(
+            version.join("loaders.cache"),
+            "\"../loaders/libpixbuf-png.so\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("gtk-3.0/3.0.0/immodules.cache"),
+            "\"../im-modules/libim-gif.so\"\n",
+        )
+        .unwrap();
+        unsafe {
+            for name in [
+                "GDK_PIXBUF_MODULE_FILE",
+                "GTK_IM_MODULE_FILE",
+                "GIO_MODULE_DIR",
+                "GIO_EXTRA_MODULES",
+                "FONTCONFIG_FILE",
+                "TCL_LIBRARY",
+                "TK_LIBRARY",
+                "ALSA_CONFIG_PATH",
+            ] {
+                env::remove_var(name);
+            }
+        }
+        let payload_before = files_below(&pkg);
+
+        run_runtime_hooks(&HookContext {
+            pkg: &pkg,
+            lib_dirs: std::slice::from_ref(&lib),
+            set_lib_dirs: &[],
+            set_roots: &[],
+        });
+
+        let base = crate::paths::private_dir().expect("private base exists in tests");
+        let var = |name: &str| env::var(name).unwrap_or_default();
+        assert_eq!(
+            env::var_os("GDK_PIXBUF_MODULE_FILE"),
+            Some(base.join("modules-regpkg/loaders.cache").into_os_string())
+        );
+        assert_eq!(
+            env::var_os("GTK_IM_MODULE_FILE"),
+            Some(base.join("modules-regpkg/immodules.cache").into_os_string())
+        );
+        assert_eq!(
+            var("GIO_MODULE_DIR"),
+            lib.join("gio/modules").to_string_lossy()
+        );
+        assert!(env::var_os("GIO_EXTRA_MODULES").is_none());
+        let fontconfig = PathBuf::from(env::var_os("FONTCONFIG_FILE").unwrap());
+        assert!(fontconfig.starts_with(base.join("fontconfig-regpkg")));
+        let conf = std::fs::read_to_string(&fontconfig).unwrap();
+        assert!(conf.contains("<include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>"));
+        assert!(conf.contains(&format!("<dir>{}</dir>", pkg.join("share/fonts").display())));
+        assert_eq!(var("TCL_LIBRARY"), lib.join("tcl8.6").to_string_lossy());
+        assert_eq!(var("TK_LIBRARY"), lib.join("tk8.6").to_string_lossy());
+        assert_eq!(
+            env::split_paths(&env::var_os("ALSA_CONFIG_PATH").unwrap())
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                pkg.join("share/alsa/alsa.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+                pkg.join("share/alsa/alsa.conf.d/99-pulse.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+                pkg.join("share/alsa/alsa.conf.d/100-extra.conf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+        assert_eq!(files_below(&pkg), payload_before);
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Running the cache handler twice leaves one private copy with the
+    /// same bytes and the same variable value, and the carried cache is
+    /// never rewritten.
+    #[test]
+    fn cache_absolutising_is_idempotent_across_passes() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("idem");
+        let pkg = work.join("idempkg");
+        let cache_dir = pkg.join("lib/gdk-pixbuf-2.0/2.10.0");
+        mkdir(&cache_dir);
+        let carried = cache_dir.join("loaders.cache");
+        let text = "# GdkPixbuf Image Loader Modules file\n\"png\" \"image/png\" \"\"\n\"../loaders/libpixbuf-png.so\"\n";
+        std::fs::write(&carried, text).unwrap();
+        unsafe { env::remove_var("GDK_PIXBUF_MODULE_FILE") };
+        let context = HookContext {
+            pkg: &pkg,
+            lib_dirs: &[],
+            set_lib_dirs: &[],
+            set_roots: &[],
+        };
+
+        run_gdk_cache_absolutise(&context);
+
+        let base = crate::paths::private_dir().expect("private base exists in tests");
+        let dest = base.join("modules-idempkg/loaders.cache");
+        let first = env::var_os("GDK_PIXBUF_MODULE_FILE").unwrap();
+        assert_eq!(first, dest.clone().into_os_string());
+        let first_bytes = std::fs::read(&dest).unwrap();
+        let rewritten = cache_dir
+            .join("../loaders/libpixbuf-png.so")
+            .to_string_lossy()
+            .into_owned();
+        assert!(String::from_utf8_lossy(&first_bytes).contains(&rewritten));
+
+        run_gdk_cache_absolutise(&context);
+
+        assert_eq!(env::var_os("GDK_PIXBUF_MODULE_FILE"), Some(first));
+        assert_eq!(std::fs::read(&dest).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(&carried).unwrap(), text.as_bytes());
+        let copies = std::fs::read_dir(base.join("modules-idempkg"))
+            .unwrap()
+            .count();
+        assert_eq!(copies, 1);
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The generated fontconfig file lands in the package's private
+    /// state, reached through the by-id lookup, and the payload tree
+    /// gains nothing.
+    #[test]
+    fn fontconfig_output_stays_in_private_state() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("fc");
+        let pkg = work.join("fcpkg");
+        mkdir(&pkg.join("share/fonts"));
+        touch(&pkg.join("share/fonts/decoy.ttf"));
+        unsafe { env::remove_var("FONTCONFIG_FILE") };
+        let payload_before = files_below(&pkg);
+        let run = runtime_hook(RuntimeHookId::FontconfigGenerate).expect("registered");
+
+        run(&HookContext {
+            pkg: &pkg,
+            lib_dirs: &[],
+            set_lib_dirs: &[],
+            set_roots: &[],
+        });
+
+        let base = crate::paths::private_dir().expect("private base exists in tests");
+        let written = PathBuf::from(env::var_os("FONTCONFIG_FILE").unwrap());
+        assert!(written.starts_with(base.join("fontconfig-fcpkg")));
+        assert!(written.is_file());
+        assert_eq!(files_below(&pkg), payload_before);
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The registry keeps a caller's `ALSA_CONFIG_PATH` ahead of the
+    /// carried configuration and snippets.
+    #[test]
+    fn the_registry_keeps_a_user_alsa_override() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("alsa");
+        let pkg = work.join("alsapkg");
+        mkdir(&pkg.join("share/alsa/alsa.conf.d"));
+        touch(&pkg.join("share/alsa/alsa.conf"));
+        touch(&pkg.join("share/alsa/alsa.conf.d/50-carried.conf"));
+        unsafe { env::set_var("ALSA_CONFIG_PATH", "/home/a/my-alsa.conf") };
+
+        run_alsa_config_path_natural_sort(&HookContext {
+            pkg: &pkg,
+            lib_dirs: &[],
+            set_lib_dirs: &[],
+            set_roots: &[],
+        });
+
+        assert_eq!(
+            env::var("ALSA_CONFIG_PATH").as_deref(),
+            Ok("/home/a/my-alsa.conf")
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A path holding a space makes the whole ALSA list unrepresentable:
+    /// the registry leaves the variable unset rather than emit a broken
+    /// list.
+    #[test]
+    fn the_registry_skips_an_alsa_list_with_a_space() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("alsa-space");
+        let pkg = work.join("My App");
+        mkdir(&pkg.join("share/alsa"));
+        touch(&pkg.join("share/alsa/alsa.conf"));
+        unsafe { env::remove_var("ALSA_CONFIG_PATH") };
+
+        run_alsa_config_path_natural_sort(&HookContext {
+            pkg: &pkg,
+            lib_dirs: &[],
+            set_lib_dirs: &[],
+            set_roots: &[],
+        });
+
+        assert!(env::var_os("ALSA_CONFIG_PATH").is_none());
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod path_mapping_tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use onelf_format::rules::{RelativePath, RuleId, RuntimeCandidate};
+
+    use super::test_env_lock::ENV_LOCK;
+    use super::*;
+
+    fn tree(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("onelf-mapping-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    fn mkdir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    fn group(
+        id: &str,
+        kind: ResourceKind,
+        selection: PathSelection,
+        inheritance: Inheritance,
+        candidates: &[(RuntimeBase, &str)],
+        variables: &[&str],
+    ) -> RuntimePathGroup {
+        RuntimePathGroup {
+            id: RuleId::new(id).unwrap(),
+            kind,
+            candidates: candidates
+                .iter()
+                .map(|(base, path)| RuntimeCandidate {
+                    base: *base,
+                    path: RelativePath::new(path).unwrap(),
+                })
+                .collect(),
+            variables: variables
+                .iter()
+                .map(|name| EnvironmentName::new(name).unwrap())
+                .collect(),
+            selection,
+            inheritance,
+        }
+    }
+
+    /// A set candidate declared before the application's own loses: the
+    /// scopes are searched application first, whatever the declaration
+    /// order says.
+    #[test]
+    fn first_selection_prefers_the_application_over_an_earlier_set_candidate() {
+        let work = tree("first");
+        let (app, set) = (work.join("app"), work.join("set"));
+        mkdir(&app.join("b"));
+        mkdir(&set.join("a"));
+        mkdir(&set.join("b"));
+        let set_roots = vec![set.as_path()];
+        let scopes = [
+            Scope {
+                packages: &[app.as_path()],
+                libraries: &[],
+            },
+            Scope {
+                packages: &set_roots,
+                libraries: &[],
+            },
+        ];
+        let groups = [group(
+            "g",
+            ResourceKind::Directory,
+            PathSelection::First,
+            Inheritance::Replace,
+            &[
+                (RuntimeBase::PackageRoot, "a"),
+                (RuntimeBase::PackageRoot, "b"),
+            ],
+            &["ONELF_T_FIRST_G"],
+        )];
+
+        let got = evaluate_path_groups(&groups, &scopes);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].variables, ["ONELF_T_FIRST_G"]);
+        assert_eq!(got[0].value, app.join("b").into_os_string());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// An all-match group lists the application's matches before the
+    /// sets', keeps declaration order within a root, and never lists one
+    /// path twice.
+    #[test]
+    fn all_selection_orders_application_before_sets_and_deduplicates() {
+        let work = tree("all");
+        let (app, set) = (work.join("app"), work.join("set"));
+        mkdir(&app.join("m"));
+        mkdir(&app.join("second"));
+        mkdir(&app.join("lib/m"));
+        mkdir(&set.join("m"));
+        let (set_roots, app_libs) = (vec![set.as_path()], vec![app.join("lib")]);
+        let scopes = [
+            Scope {
+                packages: &[app.as_path()],
+                libraries: &app_libs,
+            },
+            Scope {
+                packages: &set_roots,
+                libraries: &[],
+            },
+        ];
+        let groups = [
+            group(
+                "dedup",
+                ResourceKind::Directory,
+                PathSelection::All,
+                Inheritance::Replace,
+                &[
+                    (RuntimeBase::LibraryRoot, "m"),
+                    (RuntimeBase::LibraryRoot, "m"),
+                ],
+                &["ONELF_T_ALL_A"],
+            ),
+            group(
+                "ordered",
+                ResourceKind::Directory,
+                PathSelection::All,
+                Inheritance::Replace,
+                &[
+                    (RuntimeBase::PackageRoot, "second"),
+                    (RuntimeBase::PackageRoot, "m"),
+                ],
+                &["ONELF_T_ALL_B"],
+            ),
+        ];
+
+        let got = evaluate_path_groups(&groups, &scopes);
+
+        assert_eq!(got[0].value, app.join("lib/m").into_os_string());
+        assert_eq!(
+            got[1].value,
+            env::join_paths([app.join("second"), app.join("m"), set.join("m")]).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Each library root contributes its first existing alternative, so
+    /// the nested plugin directory wins where a library root carries one
+    /// and the flat directory serves the others.
+    #[test]
+    fn first_per_library_root_prefers_the_nested_plugin_directory() {
+        let work = tree("heif");
+        let (lib_a, lib_b, set_lib) =
+            (work.join("a/lib"), work.join("b/lib"), work.join("set/lib"));
+        mkdir(&lib_a.join("libheif/plugins"));
+        mkdir(&lib_b.join("libheif"));
+        mkdir(&set_lib.join("libheif"));
+        let (app_libs, set_libs) = (vec![lib_a.clone(), lib_b.clone()], vec![set_lib.clone()]);
+        let scopes = [
+            Scope {
+                packages: &[],
+                libraries: &app_libs,
+            },
+            Scope {
+                packages: &[],
+                libraries: &set_libs,
+            },
+        ];
+        let groups = [group(
+            "plugins",
+            ResourceKind::Directory,
+            PathSelection::FirstPerLibraryRoot,
+            Inheritance::Replace,
+            &[
+                (RuntimeBase::LibraryRoot, "libheif/plugins"),
+                (RuntimeBase::LibraryRoot, "libheif"),
+            ],
+            &["ONELF_T_HEIF"],
+        )];
+
+        let got = evaluate_path_groups(&groups, &scopes);
+
+        assert_eq!(
+            got[0].value,
+            env::join_paths([
+                lib_a.join("libheif/plugins"),
+                lib_b.join("libheif"),
+                set_lib.join("libheif"),
+            ])
+            .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A candidate must have the declared kind: a directory cannot
+    /// satisfy a file group nor a file a directory group, and a later
+    /// candidate of the right kind still serves.
+    #[test]
+    fn a_candidate_of_the_wrong_kind_is_skipped() {
+        let work = tree("kinds");
+        let app = work.join("app");
+        mkdir(&app.join("data"));
+        touch(&app.join("real.mgc"));
+        touch(&app.join("plain"));
+        let scopes = [Scope {
+            packages: &[app.as_path()],
+            libraries: &[],
+        }];
+        let files = [group(
+            "db",
+            ResourceKind::File,
+            PathSelection::First,
+            Inheritance::Preserve,
+            &[
+                (RuntimeBase::PackageRoot, "data"),
+                (RuntimeBase::PackageRoot, "real.mgc"),
+            ],
+            &["ONELF_T_KIND_FILE"],
+        )];
+        let dirs = [group(
+            "solo",
+            ResourceKind::Directory,
+            PathSelection::First,
+            Inheritance::Replace,
+            &[(RuntimeBase::PackageRoot, "plain")],
+            &["ONELF_T_KIND_DIR"],
+        )];
+
+        let got = evaluate_path_groups(&files, &scopes);
+        assert_eq!(got[0].value, app.join("real.mgc").into_os_string());
+        assert!(evaluate_path_groups(&dirs, &scopes).is_empty());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// No present candidate means no assignment: the group can neither
+    /// invent a path nor override an inherited value.
+    #[test]
+    fn a_group_without_a_present_candidate_assigns_nothing() {
+        let work = tree("absent");
+        let app = work.join("app");
+        mkdir(&app);
+        let scopes = [Scope {
+            packages: &[app.as_path()],
+            libraries: &[],
+        }];
+        let groups = [group(
+            "messages",
+            ResourceKind::Directory,
+            PathSelection::First,
+            Inheritance::Preserve,
+            &[(RuntimeBase::PackageRoot, "share/locale")],
+            &["ONELF_T_ABSENT"],
+        )];
+
+        assert!(evaluate_path_groups(&groups, &scopes).is_empty());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Only the roots the launch passes in are searched: a set that is
+    /// not active can neither satisfy a group nor leak a path.
+    #[test]
+    fn an_unselected_set_never_contributes() {
+        let work = tree("inactive");
+        let (app, active, inactive) =
+            (work.join("app"), work.join("active"), work.join("inactive"));
+        mkdir(&inactive.join("share/locale"));
+        let set_roots = vec![active.as_path()];
+        let scopes = [
+            Scope {
+                packages: &[app.as_path()],
+                libraries: &[],
+            },
+            Scope {
+                packages: &set_roots,
+                libraries: &[],
+            },
+        ];
+        let groups = [group(
+            "messages",
+            ResourceKind::Directory,
+            PathSelection::First,
+            Inheritance::Preserve,
+            &[(RuntimeBase::PackageRoot, "share/locale")],
+            &["ONELF_T_INACTIVE"],
+        )];
+
+        assert!(evaluate_path_groups(&groups, &scopes).is_empty());
+
+        mkdir(&active.join("share/locale"));
+        let got = evaluate_path_groups(&groups, &scopes);
+        assert_eq!(got[0].value, active.join("share/locale").into_os_string());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Every variable the replaced path tables set has a mapping in the
+    /// built-in catalog, so no behavior was silently dropped, and the
+    /// catalog exercises all three selection modes.
+    #[test]
+    fn the_builtin_catalog_covers_the_replaced_table_variables() {
+        let names: BTreeSet<&str> = builtin_path_groups()
+            .flat_map(|group| group.variables.iter().map(EnvironmentName::as_str))
+            .collect();
+        let expected = [
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SYSTEM_PATH",
+            "GST_PLUGIN_SCANNER_1_0",
+            "GST_PLUGIN_SCANNER",
+            "PIPEWIRE_MODULE_DIR",
+            "SPA_PLUGIN_DIR",
+            "GI_TYPELIB_PATH",
+            "BABL_PATH",
+            "GEGL_PATH",
+            "LIBHEIF_PLUGIN_PATH",
+            "ALSA_PLUGIN_DIR",
+            "ALSA_CONFIG_DIR",
+            "TEXTDOMAINDIR",
+            "XLOCALEDIR",
+            "MAGIC",
+            "QT_PLUGIN_PATH",
+            "GTK_PATH",
+            "XKB_CONFIG_ROOT",
+        ];
+        for name in expected {
+            assert!(names.contains(name), "{name} has no mapping");
+        }
+        assert!(builtin_path_groups().any(|g| g.selection == PathSelection::FirstPerLibraryRoot));
+        assert!(builtin_path_groups().any(|g| g.selection == PathSelection::All));
+        assert!(builtin_path_groups().any(|g| g.kind == ResourceKind::File));
+    }
+
+    /// The built-in mappings reproduce the outcomes of the path tables
+    /// they replaced for every framework those tables covered: aliases,
+    /// kinds, per-library-root nesting, application-before-set order,
+    /// replace for module lists and preserve for caller-chosen data.
+    #[test]
+    fn builtin_mappings_reproduce_the_replaced_framework_tables() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("golden");
+        let (pkg, set) = (work.join("pkg"), work.join("set"));
+        let lib = pkg.join("lib");
+        let arch = pkg.join("lib/x86_64-linux-gnu");
+        let set_lib = set.join("lib");
+        for dir in [
+            lib.join("gstreamer-1.0"),
+            set_lib.join("gstreamer-1.0"),
+            lib.join("pipewire-0.3"),
+            lib.join("spa-0.2"),
+            lib.join("babl-0.1"),
+            lib.join("gegl-0.4"),
+            arch.join("girepository-1.0"),
+            lib.join("gtk-3.0"),
+            set_lib.join("gtk-3.0"),
+            lib.join("qt6/plugins"),
+            lib.join("qt5/plugins"),
+            lib.join("alsa-lib"),
+            lib.join("libheif/plugins"),
+            set_lib.join("libheif"),
+            pkg.join("share/alsa"),
+            pkg.join("share/locale"),
+            set.join("share/locale"),
+            pkg.join("share/X11/locale"),
+            pkg.join("share/X11/xkb"),
+        ] {
+            mkdir(&dir);
+        }
+        touch(&lib.join("gstreamer-1.0/gst-plugin-scanner"));
+        touch(&pkg.join("share/file/misc/magic.mgc"));
+        let table = [
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SYSTEM_PATH",
+            "GST_PLUGIN_SCANNER_1_0",
+            "GST_PLUGIN_SCANNER",
+            "PIPEWIRE_MODULE_DIR",
+            "SPA_PLUGIN_DIR",
+            "GI_TYPELIB_PATH",
+            "BABL_PATH",
+            "GEGL_PATH",
+            "LIBHEIF_PLUGIN_PATH",
+            "ALSA_PLUGIN_DIR",
+            "ALSA_CONFIG_DIR",
+            "TEXTDOMAINDIR",
+            "XLOCALEDIR",
+            "XKB_CONFIG_ROOT",
+            "MAGIC",
+            "QT_PLUGIN_PATH",
+            "GTK_PATH",
+            "TCL_LIBRARY",
+            "TK_LIBRARY",
+            "ALSA_CONFIG_PATH",
+        ];
+        for name in table {
+            unsafe { env::remove_var(name) };
+        }
+        // A caller value on a replace-policy list is overridden; a
+        // caller value on a preserve-policy data path is kept.
+        unsafe { env::set_var("GST_PLUGIN_SYSTEM_PATH", "/usr/lib/gstreamer-1.0") };
+        unsafe { env::set_var("MAGIC", "/caller/magic.mgc") };
+
+        setup_plugin_dirs(
+            &pkg,
+            &[lib.clone(), arch.clone()],
+            std::slice::from_ref(&set_lib),
+            &[set],
+        );
+
+        let expected = [
+            (
+                "GST_PLUGIN_SYSTEM_PATH_1_0",
+                format!(
+                    "{}:{}",
+                    lib.join("gstreamer-1.0").display(),
+                    set_lib.join("gstreamer-1.0").display()
+                ),
+            ),
+            (
+                "GST_PLUGIN_SYSTEM_PATH",
+                format!(
+                    "{}:{}",
+                    lib.join("gstreamer-1.0").display(),
+                    set_lib.join("gstreamer-1.0").display()
+                ),
+            ),
+            (
+                "GST_PLUGIN_SCANNER_1_0",
+                lib.join("gstreamer-1.0/gst-plugin-scanner")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "GST_PLUGIN_SCANNER",
+                lib.join("gstreamer-1.0/gst-plugin-scanner")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "PIPEWIRE_MODULE_DIR",
+                lib.join("pipewire-0.3").to_string_lossy().into_owned(),
+            ),
+            (
+                "SPA_PLUGIN_DIR",
+                lib.join("spa-0.2").to_string_lossy().into_owned(),
+            ),
+            (
+                "GI_TYPELIB_PATH",
+                arch.join("girepository-1.0").to_string_lossy().into_owned(),
+            ),
+            (
+                "BABL_PATH",
+                lib.join("babl-0.1").to_string_lossy().into_owned(),
+            ),
+            (
+                "GEGL_PATH",
+                lib.join("gegl-0.4").to_string_lossy().into_owned(),
+            ),
+            (
+                "GTK_PATH",
+                format!(
+                    "{}:{}",
+                    lib.join("gtk-3.0").display(),
+                    set_lib.join("gtk-3.0").display()
+                ),
+            ),
+            (
+                "QT_PLUGIN_PATH",
+                format!(
+                    "{}:{}",
+                    lib.join("qt6/plugins").display(),
+                    lib.join("qt5/plugins").display()
+                ),
+            ),
+            (
+                "ALSA_PLUGIN_DIR",
+                lib.join("alsa-lib").to_string_lossy().into_owned(),
+            ),
+            (
+                "LIBHEIF_PLUGIN_PATH",
+                format!(
+                    "{}:{}",
+                    lib.join("libheif/plugins").display(),
+                    set_lib.join("libheif").display()
+                ),
+            ),
+            (
+                "ALSA_CONFIG_DIR",
+                pkg.join("share/alsa").to_string_lossy().into_owned(),
+            ),
+            (
+                "TEXTDOMAINDIR",
+                pkg.join("share/locale").to_string_lossy().into_owned(),
+            ),
+            (
+                "XLOCALEDIR",
+                pkg.join("share/X11/locale").to_string_lossy().into_owned(),
+            ),
+            (
+                "XKB_CONFIG_ROOT",
+                pkg.join("share/X11/xkb").to_string_lossy().into_owned(),
+            ),
+            ("MAGIC", "/caller/magic.mgc".to_string()),
+        ];
+        for (name, value) in expected {
+            assert_eq!(env::var(name).as_deref(), Ok(value.as_str()), "{name}");
+        }
+        for name in ["TCL_LIBRARY", "TK_LIBRARY", "ALSA_CONFIG_PATH"] {
+            assert!(env::var_os(name).is_none(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Both scanner aliases follow the `libexec` staging layout too, and
+    /// the Debian layout below a set's library directory serves when the
+    /// application carries neither.
+    #[test]
+    fn the_scanner_aliases_follow_the_alternative_layouts() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let work = tree("scanner");
+        let pkg = work.join("pkg");
+        touch(&pkg.join("libexec/gstreamer-1.0/gst-plugin-scanner"));
+        unsafe {
+            env::remove_var("GST_PLUGIN_SCANNER_1_0");
+            env::remove_var("GST_PLUGIN_SCANNER");
+        }
+
+        setup_plugin_dirs(&pkg, &[pkg.join("lib")], &[], &[]);
+
+        let libexec = pkg
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            env::var("GST_PLUGIN_SCANNER_1_0").as_deref(),
+            Ok(libexec.as_str())
+        );
+        assert_eq!(
+            env::var("GST_PLUGIN_SCANNER").as_deref(),
+            Ok(libexec.as_str())
+        );
+
+        let pkg = work.join("pkg2");
+        let set = work.join("set");
+        let set_lib = set.join("lib");
+        touch(&set_lib.join("gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"));
+        unsafe {
+            env::remove_var("GST_PLUGIN_SCANNER_1_0");
+            env::remove_var("GST_PLUGIN_SCANNER");
+        }
+
+        setup_plugin_dirs(
+            &pkg,
+            std::slice::from_ref(&pkg.join("lib")),
+            std::slice::from_ref(&set_lib),
+            &[set],
+        );
+
+        let debian = set_lib
+            .join("gstreamer1.0/gstreamer-1.0/gst-plugin-scanner")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            env::var("GST_PLUGIN_SCANNER_1_0").as_deref(),
+            Ok(debian.as_str())
+        );
+        assert_eq!(
+            env::var("GST_PLUGIN_SCANNER").as_deref(),
+            Ok(debian.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Preserve keeps a present value, even an explicitly empty one,
+    /// while replace overrides it.
+    #[test]
+    fn preserve_keeps_present_values_and_replace_overrides() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            env::set_var("ONELF_T_KEEP_a1", "/kept");
+            env::set_var("ONELF_T_EMPTY_a2", "");
+            env::set_var("ONELF_T_OLD_a3", "/old");
+            env::remove_var("ONELF_T_FILL_a4");
+        }
+        let kept = PathAssignment {
+            variables: vec!["ONELF_T_KEEP_a1"],
+            value: "/new".into(),
+            inheritance: Inheritance::Preserve,
+        };
+        let empty = PathAssignment {
+            variables: vec!["ONELF_T_EMPTY_a2"],
+            value: "/new".into(),
+            inheritance: Inheritance::Preserve,
+        };
+        let replaced = PathAssignment {
+            variables: vec!["ONELF_T_OLD_a3"],
+            value: "/new".into(),
+            inheritance: Inheritance::Replace,
+        };
+        let filled = PathAssignment {
+            variables: vec!["ONELF_T_FILL_a4"],
+            value: "/new".into(),
+            inheritance: Inheritance::Replace,
+        };
+
+        apply_path_assignments(&[kept, empty, replaced, filled]);
+
+        assert_eq!(env::var("ONELF_T_KEEP_a1").as_deref(), Ok("/kept"));
+        assert_eq!(env::var("ONELF_T_EMPTY_a2").as_deref(), Ok(""));
+        assert_eq!(env::var("ONELF_T_OLD_a3").as_deref(), Ok("/new"));
+        assert_eq!(env::var("ONELF_T_FILL_a4").as_deref(), Ok("/new"));
+        unsafe {
+            for name in [
+                "ONELF_T_KEEP_a1",
+                "ONELF_T_EMPTY_a2",
+                "ONELF_T_OLD_a3",
+                "ONELF_T_FILL_a4",
+            ] {
+                env::remove_var(name);
+            }
+        }
     }
 }
 
