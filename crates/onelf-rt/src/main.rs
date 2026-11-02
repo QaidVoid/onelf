@@ -28,7 +28,19 @@ mod ulexec;
 mod update;
 
 use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+
+use onelf_format::EntryKind;
+use onelf_format::HostLibsPolicy;
+use onelf_format::resolve::ActivePin;
+
+/// The directory of the cache's execution-view store, under the cache
+/// root. The cache's collection reclaims exactly this layout when the
+/// views it finds are idle, and every cache-mode launch publishes its
+/// view here, keyed by its full identity.
+const VIEW_STORE_DIR: &str = "views";
 
 fn main() {
     hostenv::capture_starting_env();
@@ -384,6 +396,19 @@ fn main() {
 
 /// Run the entrypoint from the persistent cache. Returns only when the
 /// package cannot be run from there.
+///
+/// The shared base extraction is never run from and never edited: the
+/// launch publishes an execution view of its own, keyed by its full
+/// identity, beside it. The view stages the whole package by hardlinks
+/// out of the verified base, installs this launch's library links in
+/// staging, and is published once, completely, ready record and all. Two
+/// launches whose selections, host decisions, or entrypoints differ get
+/// different views, so neither ever adds, removes, or rewrites a link
+/// under the other; two launches with one identity share the view, whose
+/// published links never change. The launch runs from the view under the
+/// lifetime guardian, which holds the base extraction's in-use lock and
+/// the view's in-use lease itself, so the claims outlive the foreground
+/// process however thoroughly a descendant discards what it inherited.
 // Describes a single exec; every argument is distinct and a parameter
 // object would be built at each call site and read once.
 #[allow(clippy::too_many_arguments)]
@@ -398,17 +423,18 @@ fn exec_cache(
     exe_dir: &Path,
     exe_name: &str,
 ) -> std::io::Error {
-    // The lock guard is held (through exec, its fd is left inheritable)
-    // for the lifetime of this instance so a concurrent process's GC
-    // cannot delete the package while it is still in use.
-    let (pkg_dir, _lock_guard) = match cache::ensure_extracted(pkg) {
+    // The lock guard is held by the guardian for the lifetime of this
+    // instance, so a concurrent process's GC cannot delete the package
+    // while it is still in use.
+    let (pkg_dir, pkg_lock) = match cache::ensure_extracted(pkg) {
         Ok(d) => d,
         Err(e) => return std::io::Error::new(e.kind(), format!("extraction failed: {e}")),
     };
 
     let package_id = cache::hex(&pkg.manifest.header.package_id);
 
-    // Auto-GC: prune stale cache entries (best-effort; skip if no cache base)
+    // Auto-GC: prune stale cache entries and reclaim the view store's
+    // idle views (best-effort; skip if no cache base).
     let gc_max_age = std::env::var("ONELF_GC_MAX_AGE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -431,22 +457,248 @@ fn exec_cache(
         );
     }
 
+    // The resolver decision is made before the view exists: which host
+    // libraries win decides the links, and the links are part of the
+    // view's identity. The base shows the same package content the view
+    // will, so judging it here is judging the view.
+    let lib_dirs_empty = pkg.manifest.lib_dirs().is_empty();
+    let resolved =
+        (!lib_dirs_empty).then(|| launch::resolve_launch(pkg, ep_idx, &pkg_dir, false, false));
+    let policy = resolved
+        .as_ref()
+        .map(|r| r.policy)
+        .unwrap_or(HostLibsPolicy::Never);
+    let (link_dir, links) = launch::effective_links(
+        &pkg.manifest,
+        ep_idx,
+        &pkg_dir,
+        resolved.as_ref().and_then(|r| r.resolution.farm.as_deref()),
+    );
+
+    let ep_name = pkg
+        .manifest
+        .get_string(pkg.manifest.entrypoints[ep_idx].name)
+        .to_string();
+    let pins = active_pins(read_package_file(pkg, sets::SETS_FILE).as_deref());
+    let metadata = metadata_digest(
+        read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE),
+        read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE),
+    );
+    let inputs = links::view::ViewInputs {
+        uid: paths::uid(),
+        package: &pkg.manifest.header.package_id,
+        metadata: metadata.as_ref(),
+        pins: &pins,
+        policy,
+        host_libc: false,
+        placement: links::view::Placement::Tree,
+        loader: resolved
+            .as_ref()
+            .and_then(|r| r.resolution.host_interp.as_ref().map(|p| p.as_os_str())),
+        entrypoint: Some(&ep_name),
+        links: &links,
+        runtime_env: &[],
+        root: pkg_dir.as_os_str(),
+    };
+    let Some(identity) = links::view::ViewIdentity::new(&inputs) else {
+        return std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the launch's execution-view identity exceeds the record bounds",
+        );
+    };
+
+    let Some(cache_base) = cache::base_dir() else {
+        return std::io::Error::new(
+            ErrorKind::NotFound,
+            "no safe cache directory (set HOME or XDG_RUNTIME_DIR)",
+        );
+    };
+    let store = cache_base.join(VIEW_STORE_DIR);
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&store)
+        && e.kind() != ErrorKind::AlreadyExists
+    {
+        return std::io::Error::new(e.kind(), format!("the view store: {e}"));
+    };
+    let Some(view_name) = links::view::dir_name(identity.key()) else {
+        return std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the launch's execution-view identity names no directory",
+        );
+    };
+    let view_dir = store.join(&view_name);
+
+    // The view's in-use lease, created and locked before the view is
+    // resolved or built, inheritable, and taken along by the guardian. It
+    // is the claim the cache's collection keys the view's idleness on.
+    let Some(lease_path) = links::view::lease_lock_path(&view_dir) else {
+        return std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "the launch's execution-view identity names no lease",
+        );
+    };
+    let lease = match paths::open_lock_inheritable(&lease_path) {
+        Ok(f) => f,
+        Err(e) => return std::io::Error::new(e.kind(), format!("the view's lease: {e}")),
+    };
+    use rustix::fs::FlockOperation;
+    if rustix::fs::flock(&lease, FlockOperation::LockShared).is_err() {
+        return std::io::Error::other("the view's lease cannot be locked");
+    }
+
+    let built = links::view::ensure_view(&store, &identity, |staging| {
+        stage_view_from_base(staging, &pkg.manifest, &pkg.codec, &pkg_dir)?;
+        if let Some(dir) = &link_dir {
+            staging.place_links(&pkg.manifest, dir, &links)?;
+        }
+        Ok(None)
+    });
+    let view = match built {
+        Ok(view) => view,
+        Err(e) => {
+            return std::io::Error::new(e.kind(), format!("execution view failed: {e}"));
+        }
+    };
+    let view_root = view.dir().to_path_buf();
+
     portable::setup_portable(exe_dir, exe_name);
 
-    launch::exec(&launch::Launch {
-        pkg,
-        pkg_root: &pkg_dir,
-        mode: "cache",
-        ep_idx,
-        argv0,
-        exec_path,
-        args,
-        interp_data,
-        env_data,
-        private_ns: false,
-        tree_writable: false,
-        links: launch::Links::Tree,
-    })
+    // The guardian owns the launch from here: it holds the base
+    // extraction's in-use lock and the view's lease itself, forks the
+    // application, reports its exit status the moment it is reaped,
+    // adopts the descendants a daemonization leaves behind, and lets the
+    // claims go only once a drained `wait` proves its subtree empty. The
+    // lock inodes stay on disk; the protocol keys every claim on them.
+    struct Claims {
+        _pkg: std::fs::File,
+        _view: std::fs::File,
+    }
+    let supervision = match guardian::spawn(
+        Claims {
+            _pkg: pkg_lock,
+            _view: lease,
+        },
+        || {
+            launch::exec(&launch::Launch {
+                pkg,
+                pkg_root: &view_root,
+                mode: "cache",
+                ep_idx,
+                argv0,
+                exec_path,
+                args,
+                interp_data,
+                env_data,
+                private_ns: false,
+                tree_writable: false,
+                links: launch::Links::Served,
+                resolved,
+            })
+        },
+        |_claims| {},
+    ) {
+        Ok(supervision) => supervision,
+        Err(e) => {
+            eprintln!("onelf-rt: cache: fork failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Signals meant for this process still reach the application, one hop
+    // further along: this forwards to the guardian, and the guardian
+    // forwards to the application.
+    fuse::CHILD_PID.store(supervision.pid as i32, std::sync::atomic::Ordering::Relaxed);
+    fuse::install_signal_handlers();
+
+    match guardian::receive(&supervision.status) {
+        Ok(outcome) => {
+            if outcome == guardian::Outcome::Unavailable {
+                eprintln!("onelf-rt: cache: the lifetime guardian could not be established");
+            }
+            std::process::exit(outcome.exit_code())
+        }
+        Err(e) => {
+            eprintln!("onelf-rt: cache: guardian status: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Fill a view's staging tree from the verified base extraction. Every
+/// package file is hardlinked out of the base, which shares the verified
+/// bytes without copying them, every symlink is recreated under the
+/// validation the staging surface applies, and the base itself is never
+/// touched. The cache view carries no caller input: everything the
+/// launch evaluates at exec time stays in the process, so one identity's
+/// view can serve every launch that computes it.
+fn stage_view_from_base(
+    staging: &links::view::Staging,
+    manifest: &onelf_format::Manifest,
+    codec: &onelf_format::payload::Codec,
+    base: &Path,
+) -> std::io::Result<()> {
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind == EntryKind::Dir {
+            let rel = manifest.validated_entry_path(i)?;
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            std::fs::create_dir_all(staging.dir().join(rel))?;
+        }
+    }
+    for i in onelf_format::payload::file_order(manifest, codec) {
+        let rel = manifest.validated_entry_path(i)?;
+        let rel = rel
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "entry path"))?;
+        staging.hardlink(&base.join(rel), rel)?;
+    }
+    for (i, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != EntryKind::Symlink {
+            continue;
+        }
+        let rel = manifest.validated_entry_path(i)?;
+        let rel = rel
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "entry path"))?;
+        staging.symlink(rel, manifest.get_string(entry.symlink_target))?;
+    }
+    Ok(())
+}
+
+/// The dependency-set pins a launch obtained from the set table `record`,
+/// in table order. They are the selection the launch materializes set
+/// roots for, so they are what its view's selection identity covers.
+fn active_pins(record: Option<&[u8]>) -> Vec<ActivePin> {
+    let Some(bytes) = record else {
+        return Vec::new();
+    };
+    sets::parse(&String::from_utf8_lossy(bytes))
+        .into_iter()
+        .map(|pin| ActivePin {
+            label: pin.label,
+            hash: pin.blake3.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// The content digest of the validated runtime metadata a launch applies,
+/// or `None` for a package on the built-in defaults. The digest covers
+/// the records' whole bytes, length-prefixed, so any change to validated
+/// metadata yields another execution-view identity.
+fn metadata_digest(rules: Option<Vec<u8>>, table: Option<Vec<u8>>) -> Option<[u8; 32]> {
+    if rules.is_none() && table.is_none() {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    for part in [rules, table] {
+        if let Some(bytes) = part {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        } else {
+            hasher.update(&0u64.to_le_bytes());
+        }
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
 pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
@@ -458,6 +710,289 @@ pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Op
         &pkg.codec,
     )
     .ok()
+}
+
+#[cfg(test)]
+mod cache_view_tests {
+    use super::{active_pins, metadata_digest, stage_view_from_base};
+    use crate::links;
+    use onelf_format::entry::{Entry, EntryKind};
+    use onelf_format::payload::Codec;
+    use onelf_format::{Manifest, ManifestHeader};
+    use std::cell::Cell;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A sequence number keeping every test's directories apart.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-cache-view-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A manifest whose entries are `(name, kind, parent, symlink target
+    /// offset)`, over a string table that holds every name and target.
+    fn manifest(parts: &[(&str, EntryKind, u32, Option<&str>)]) -> Manifest {
+        let mut table: Vec<u8> = Vec::new();
+        let offset = |text: &str, table: &mut Vec<u8>| {
+            let at = table.len() as u32;
+            table.extend_from_slice(text.as_bytes());
+            table.push(0);
+            at
+        };
+        let entries: Vec<Entry> = parts
+            .iter()
+            .map(|(name, kind, parent, target)| Entry {
+                kind: *kind,
+                parent: *parent,
+                name: offset(name, &mut table),
+                mode: match kind {
+                    EntryKind::Dir => 0o755,
+                    _ => 0o644,
+                },
+                mtime_secs: 0,
+                mtime_nsec: 0,
+                content_hash: [0; 32],
+                blocks: Vec::new(),
+                symlink_target: target.map(|t| offset(t, &mut table)).unwrap_or_default(),
+            })
+            .collect();
+        Manifest {
+            header: ManifestHeader {
+                version: 3,
+                entry_count: entries.len() as u32,
+                string_table_size: table.len() as u32,
+                entrypoint_count: 0,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [1; 32],
+                prefix_hash: [0; 32],
+                footer_hash: [0; 32],
+            },
+            entrypoints: Vec::new(),
+            entries,
+            lib_dir_offsets: Vec::new(),
+            string_table: table,
+        }
+    }
+
+    /// A base extraction carrying one library and one in-package link.
+    fn base() -> (Manifest, PathBuf) {
+        let manifest = manifest(&[
+            ("lib", EntryKind::Dir, u32::MAX, None),
+            ("libreal.so", EntryKind::File, 0, None),
+            ("liblink.so", EntryKind::Symlink, 0, Some("libreal.so")),
+        ]);
+        let dir = scratch("base");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/libreal.so"), b"verified bytes").unwrap();
+        (manifest, dir)
+    }
+
+    /// One cache view of the fixture, published through the full
+    /// protocol: staging, record, ready marker, one atomic rename.
+    fn publish(manifest: &Manifest, base: &Path) -> (PathBuf, PathBuf) {
+        let store = scratch("store");
+        let identity = links::view::ViewIdentity::new(&links::view::ViewInputs {
+            uid: 1000,
+            package: &[1; 32],
+            metadata: None,
+            pins: &[],
+            policy: onelf_format::HostLibsPolicy::Never,
+            host_libc: false,
+            placement: links::view::Placement::Tree,
+            loader: None,
+            entrypoint: Some("app"),
+            links: &links::Links::new(),
+            runtime_env: &[],
+            root: base.as_os_str(),
+        })
+        .unwrap();
+        let view = links::view::ensure_view(&store, &identity, |staging| {
+            stage_view_from_base(staging, manifest, &Codec::Zstd(None), base)?;
+            Ok(None)
+        })
+        .unwrap();
+        (store, view.dir().to_path_buf())
+    }
+
+    /// The staged view carries the base's content as shared inodes and
+    /// its own links, and the base itself is untouched.
+    #[test]
+    fn a_staged_view_shares_the_base_bytes_and_carries_the_links() {
+        let (manifest, base) = base();
+        let before = std::fs::metadata(base.join("lib/libreal.so"))
+            .unwrap()
+            .ino();
+
+        let (_store, view) = publish(&manifest, &base);
+
+        let staged = view.join("lib/libreal.so");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"verified bytes");
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().ino(),
+            before,
+            "the view shares the base's verified inode"
+        );
+        assert_eq!(
+            std::fs::read_link(view.join("lib/liblink.so")).unwrap(),
+            PathBuf::from("libreal.so")
+        );
+        assert!(links::view::ready(&view), "the view is published ready");
+        assert_eq!(
+            std::fs::read(base.join("lib/libreal.so")).unwrap(),
+            b"verified bytes",
+            "the base is untouched"
+        );
+    }
+
+    /// One identity's view serves every launch that computes it: the
+    /// second publication reuses the published view and builds nothing.
+    #[test]
+    fn a_second_launch_of_one_identity_reuses_the_view() {
+        let (manifest, base) = base();
+        let store = scratch("store");
+        let identity = links::view::ViewIdentity::new(&links::view::ViewInputs {
+            uid: 1000,
+            package: &[2; 32],
+            metadata: None,
+            pins: &[],
+            policy: onelf_format::HostLibsPolicy::Never,
+            host_libc: false,
+            placement: links::view::Placement::Tree,
+            loader: None,
+            entrypoint: Some("app"),
+            links: &links::Links::new(),
+            runtime_env: &[],
+            root: base.as_os_str(),
+        })
+        .unwrap();
+
+        links::view::ensure_view(&store, &identity, |staging| {
+            stage_view_from_base(staging, &manifest, &Codec::Zstd(None), &base)?;
+            Ok(None)
+        })
+        .unwrap();
+
+        let rebuilt = Cell::new(false);
+        let again = links::view::ensure_view(&store, &identity, |_staging| {
+            rebuilt.set(true);
+            Ok(None)
+        })
+        .unwrap();
+        assert!(
+            !rebuilt.get(),
+            "a ready view of the same identity is reused, not rebuilt"
+        );
+        assert!(links::view::ready(again.dir()));
+    }
+
+    /// The staged view's library links are placed through the staging
+    /// surface and are exactly the links the launch wanted.
+    #[test]
+    fn the_staged_view_carries_exactly_the_wanted_links() {
+        let manifest = manifest(&[
+            ("lib", EntryKind::Dir, u32::MAX, None),
+            ("libreal.so", EntryKind::File, 0, None),
+        ]);
+        let base = scratch("links");
+        std::fs::create_dir_all(base.join("lib")).unwrap();
+        std::fs::write(base.join("lib/libreal.so"), b"x").unwrap();
+
+        let (_store, view) = {
+            let store = scratch("store");
+            let mut links = links::Links::new();
+            links.insert(
+                "libhost.so.1".to_string(),
+                PathBuf::from("/host/lib/libhost.so.1"),
+            );
+            let identity = links::view::ViewIdentity::new(&links::view::ViewInputs {
+                uid: 1000,
+                package: &[3; 32],
+                metadata: None,
+                pins: &[],
+                policy: onelf_format::HostLibsPolicy::Never,
+                host_libc: false,
+                placement: links::view::Placement::Tree,
+                loader: None,
+                entrypoint: Some("app"),
+                links: &links,
+                runtime_env: &[],
+                root: base.as_os_str(),
+            })
+            .unwrap();
+            let view = links::view::ensure_view(&store, &identity, |staging| {
+                stage_view_from_base(staging, &manifest, &Codec::Zstd(None), &base)?;
+                staging.place_links(&manifest, "lib", &links)?;
+                Ok(None)
+            })
+            .unwrap();
+            (store, view.dir().to_path_buf())
+        };
+
+        assert_eq!(
+            std::fs::read_link(view.join("lib/libhost.so.1")).unwrap(),
+            PathBuf::from("/host/lib/libhost.so.1")
+        );
+        // What a later launch's verify finds is exactly what was staged.
+        assert!(crate::links::served(
+            &manifest,
+            &view,
+            "lib",
+            &{
+                let mut links = links::Links::new();
+                links.insert(
+                    "libhost.so.1".to_string(),
+                    PathBuf::from("/host/lib/libhost.so.1"),
+                );
+                links
+            },
+            &["lib"],
+        ));
+    }
+
+    /// Validated metadata yields a digest, any change yields another,
+    /// and the built-in defaults yield none.
+    #[test]
+    fn metadata_digests_separate_what_the_launch_applies() {
+        assert_eq!(metadata_digest(None, None), None);
+        let rules = Some(b"a".to_vec());
+        let table = Some(b"b".to_vec());
+        let base = metadata_digest(rules.clone(), table.clone()).unwrap();
+        assert_eq!(metadata_digest(rules.clone(), table.clone()), Some(base));
+        assert_ne!(
+            metadata_digest(Some(b"changed".to_vec()), table.clone()),
+            Some(base)
+        );
+        assert_ne!(
+            metadata_digest(rules.clone(), Some(b"changed".to_vec())),
+            Some(base)
+        );
+        assert_ne!(metadata_digest(None, table), Some(base));
+    }
+
+    /// The pins a launch obtained, in table order, with the digests
+    /// lowercase; a package with no set table obtained none.
+    #[test]
+    fn active_pins_come_from_the_record() {
+        assert!(active_pins(None).is_empty());
+        assert!(active_pins(Some(b"garbage")).is_empty());
+        let hash = "ab".repeat(32);
+        let record = format!("[gtk]\nurl=\"https://example/gtk\"\nblake3=\"{hash}\"\n");
+        let pins = active_pins(Some(record.as_bytes()));
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].label, "gtk");
+        assert_eq!(pins[0].hash, hash);
+    }
 }
 
 /// Keeps the tests that start a process apart from the tests that expect

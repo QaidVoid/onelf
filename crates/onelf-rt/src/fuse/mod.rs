@@ -143,12 +143,15 @@ pub(crate) struct Request<'a> {
 
 impl Request<'_> {
     /// The launch of this request from the package tree at `pkg_root`.
+    /// `resolved` hands in a decision the caller already made, or `None`
+    /// to resolve here.
     fn launch<'b>(
         &'b self,
         pkg: &'b PackageData,
         pkg_root: &'b Path,
         private_ns: bool,
         links: crate::launch::Links<'b>,
+        resolved: Option<crate::launch::Resolved>,
     ) -> crate::launch::Launch<'b> {
         crate::launch::Launch {
             pkg,
@@ -163,6 +166,7 @@ impl Request<'_> {
             private_ns,
             tree_writable: false,
             links,
+            resolved,
         }
     }
 
@@ -445,12 +449,17 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
             drop(links_rx);
             // Everything that reads the mount has to happen in the child,
             // after the fork: the parent's FUSE event loop is what serves
-            // it, and that loop is only now starting.
+            // it, and that loop is only now starting. The mount of this
+            // launch is the launch's view: its content is the verified
+            // package, the links the child resolves are served into it
+            // and never change afterwards, and sharing it is decided by
+            // the served-links match in `share`.
             crate::launch::exec(&req.launch(
                 pkg,
                 &mountpoint,
                 used_namespace,
                 crate::launch::Links::Server(&links_tx),
+                None,
             ))
         }
         Ok(Fork::ParentOf(child_pid)) => {

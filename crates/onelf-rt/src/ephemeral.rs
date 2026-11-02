@@ -6,11 +6,20 @@
 //! automatically by the kernel when the last process in the namespace
 //! exits - no cleanup code, no files left on disk.
 //!
+//! The tree is an ephemeral execution view: the tmpfs is mounted on a
+//! claimed staging directory, filled, and moved onto the claimed
+//! mountpoint in one atomic mount move, so the view the application runs
+//! from is complete from the first moment it exists. The mountpoint's
+//! claim is the lease the launch's guardian holds; the guardian adopts
+//! the descendants a daemonization leaves behind, and the kernel takes
+//! the tmpfs back when the last of them is gone.
+//!
 //! Trade-off vs. FUSE: the whole package sits in RAM (vs. on-demand).
 //! Fine for AppImage-scale bundles, use FUSE for very large packages.
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use crate::fuse::mount;
 use crate::loader::PackageData;
@@ -65,8 +74,9 @@ pub fn execute_tmpfs(
 ) -> bool {
     crate::paths::sweep_stale_mountpoints();
 
-    // Held through the exec below, so a concurrently starting instance
-    // cannot reclaim this directory while the app is using it.
+    // The mountpoint is claimed before anything exists, and its claim is
+    // taken along by the guardian, which holds the lease for as long as
+    // any process of this launch lives.
     let claim =
         match crate::paths::create_mountpoint(pkg.manifest.name(), &pkg.manifest.header.package_id)
         {
@@ -75,8 +85,23 @@ pub fn execute_tmpfs(
         };
     let mountpoint = claim.path().to_path_buf();
 
+    // Filled on a staging mount and moved onto the mountpoint in one
+    // atomic move, so the view is complete the moment it exists at its
+    // name. The staging claim is released once the move is done.
+    let stage = match crate::paths::create_launch_stage(
+        pkg.manifest.name(),
+        &pkg.manifest.header.package_id,
+    ) {
+        Some(m) => m,
+        None => {
+            claim.release();
+            return false;
+        }
+    };
+
     let size = tmpfs_size_for(pkg);
     if !fits_in_memory(size) {
+        stage.release();
         claim.release();
         return false;
     }
@@ -88,20 +113,25 @@ pub fn execute_tmpfs(
     // a failure is terminal.
     if let Err(e) = mount::enter_namespace() {
         eprintln!("onelf-rt: tmpfs: enter_namespace failed: {e}");
+        stage.release();
         claim.release();
         return false;
     }
 
-    if let Err(e) = mount::mount_tmpfs(&mountpoint, size) {
+    if let Err(e) = mount::mount_tmpfs(stage.path(), size) {
         eprintln!("onelf-rt: tmpfs: mount failed: {e}");
-        claim.release();
         std::process::exit(1);
     }
 
-    if let Err(e) = crate::cache::extract_direct(pkg, &mountpoint) {
+    if let Err(e) = crate::cache::extract_direct(pkg, stage.path()) {
         eprintln!("onelf-rt: tmpfs: extract failed: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = rustix::mount::mount_move(stage.path(), &mountpoint) {
+        eprintln!("onelf-rt: tmpfs: publish failed: {e}");
+        std::process::exit(1);
+    }
+    stage.release();
 
     let exe_path = Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(Path::new("/"));
@@ -111,20 +141,55 @@ pub fn execute_tmpfs(
         .unwrap_or("onelf");
     crate::portable::setup_portable(exe_dir, exe_name);
 
-    // Exec directly: no fork, no FUSE server. When this process exits
-    // the namespace is released and the tmpfs disappears with it.
-    crate::launch::exec(&crate::launch::Launch {
-        pkg,
-        pkg_root: &mountpoint,
-        mode: "tmpfs",
-        ep_idx,
-        argv0,
-        exec_path,
-        args,
-        interp_data,
-        env_data,
-        private_ns: true,
-        tree_writable: false,
-        links: crate::launch::Links::Tree,
-    })
+    // The guardian forks the application and holds the mountpoint claim
+    // itself, so the lease outlives the foreground process however
+    // thoroughly a daemonized descendant discards what it inherited. When
+    // its subtree has drained, the claim goes; the kernel takes the
+    // namespace and the tmpfs with it.
+    let supervision = match crate::guardian::spawn(
+        claim,
+        || {
+            crate::launch::exec(&crate::launch::Launch {
+                pkg,
+                pkg_root: &mountpoint,
+                mode: "tmpfs",
+                ep_idx,
+                argv0,
+                exec_path,
+                args,
+                interp_data,
+                env_data,
+                private_ns: true,
+                tree_writable: false,
+                links: crate::launch::Links::Tree,
+                resolved: None,
+            })
+        },
+        |_claim| {},
+    ) {
+        Ok(supervision) => supervision,
+        Err(e) => {
+            eprintln!("onelf-rt: tmpfs: fork failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Signals meant for this process still reach the application, one hop
+    // further along: this forwards to the guardian, and the guardian
+    // forwards to the application.
+    crate::fuse::CHILD_PID.store(supervision.pid as i32, Ordering::Relaxed);
+    crate::fuse::install_signal_handlers();
+
+    match crate::guardian::receive(&supervision.status) {
+        Ok(outcome) => {
+            if outcome == crate::guardian::Outcome::Unavailable {
+                eprintln!("onelf-rt: tmpfs: the lifetime guardian could not be established");
+            }
+            std::process::exit(outcome.exit_code())
+        }
+        Err(e) => {
+            eprintln!("onelf-rt: tmpfs: guardian status: {e}");
+            std::process::exit(1);
+        }
+    }
 }

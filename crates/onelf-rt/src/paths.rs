@@ -154,6 +154,24 @@ pub fn create_launch_dir(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
     Some(Mountpoint { path, _lock: lock })
 }
 
+/// Create the staging tree this launch fills before publishing its
+/// runtime-directory view, claimed the way [`create_launch_dir`] claims
+/// the view itself.
+///
+/// The name carries the launch directory's name, so the staging tree
+/// belongs to one launch and is never confused with a published tree. It
+/// keeps the `onelf-` prefix, so a launch killed mid-build leaves a
+/// staging tree the next launch's sweep reclaims through its lock, like
+/// any other claimed directory.
+pub fn create_launch_stage(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
+    let dir_name = format!(
+        "{}.staging",
+        launch_dir_name(package_name, package_id, std::process::id())
+    );
+    let (path, lock) = claim_mountpoint(&dir_name)?;
+    Some(Mountpoint { path, _lock: lock })
+}
+
 /// The mountpoint concurrent launches of a package share (see
 /// `fuse::share`), claimed the way [`create_mountpoint`] claims one.
 pub fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {

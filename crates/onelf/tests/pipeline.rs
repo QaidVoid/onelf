@@ -87,6 +87,50 @@ fn fuse_available() -> bool {
     })
 }
 
+/// Whether this machine can run the tmpfs mode at all: a user namespace
+/// whose mount the launch may fill. Like FUSE, being permitted is not
+/// something an environment check can decide, so this runs the real mode
+/// once and reports what it saw.
+fn tmpfs_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let td = workdir("tmpfsprobe");
+        let app = td.join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        write(&app.join("bin/run"), "#!/bin/sh\necho TMPFS_OK\n");
+        std::fs::set_permissions(
+            app.join("bin/run"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+
+        let pkg = td.join("probe.onelf");
+        let packed = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args(["--command", "bin/run", "--mtime", "0"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let ok = packed && {
+            let mut run = Command::new(&pkg);
+            run.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", td.to_str().unwrap())
+                .env("ONELF_MODE", "tmpfs");
+            isolate(&mut run, &td);
+            let out = run_package(&mut run);
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("TMPFS_OK")
+        };
+
+        if !ok {
+            skip("the tmpfs mode is not mountable here, as with FUSE and cc");
+        }
+        let _ = std::fs::remove_dir_all(&td);
+        ok
+    })
+}
+
 /// How this suite can run a child as root.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RootFlavor {
@@ -8297,6 +8341,64 @@ fn servers_gone(pkg: &Path) -> bool {
     false
 }
 
+/// When the process `pid` started, in clock ticks since boot, or None
+/// when it has exited. Together with the pid this names one process, the
+/// way the runtime's own record check does.
+fn started_at(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(") ")?;
+    let mut fields = rest.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X") {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
+}
+
+/// The live shared-mount servers under `td`, as each server's record
+/// names one: the server writes its own pid and start time, so a record
+/// naming a running process is a server. A launch that joins the mount
+/// writes no record, and neither does the guardian it runs under, so
+/// this counts servers and never launches.
+fn share_servers(td: &Path) -> Vec<(u32, u64)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(td.join("xdg-run")) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().into_string().unwrap_or_default();
+        if !name.ends_with(".share") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut fields = text.split_whitespace();
+        if !matches!(fields.next(), Some("ns") | Some("host")) {
+            continue;
+        }
+        let pid: u32 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let start: u64 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        if pid > 0 && started_at(pid) == Some(start) {
+            found.push((pid, start));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Wait for every shared server under `td` to leave. False when one is
+/// still running after twice the time a server takes to notice it is
+/// unused.
+fn share_gone(td: &Path) -> bool {
+    for _ in 0..300 {
+        if share_servers(td).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
 /// What a mount leaves in the test's runtime directory: its mountpoint,
 /// and the record and lease of a shared one. The mountpoints' claim locks
 /// are reclaimed by a later sweep and are not counted.
@@ -8336,7 +8438,7 @@ fn concurrent_launches_share_one_mount_and_server() {
         let _ = std::fs::remove_file(td.join("release"));
         let (a, a_line) = start_share_app(&pkg, &td, envs);
         let (b, b_line) = start_share_app(&pkg, &td, envs);
-        let servers = servers_of(&pkg);
+        let servers = share_servers(&td);
         let rest = release_share_apps(&td, vec![a, b]);
 
         assert!(a_line.contains("data=one"), "helper={helper}: {a_line}");
@@ -8350,7 +8452,7 @@ fn concurrent_launches_share_one_mount_and_server() {
             "helper={helper}: one server for both launches, found {servers:?}"
         );
         assert!(rest.iter().all(|r| r.contains("data=one")), "{rest:?}");
-        assert!(servers_gone(&pkg), "helper={helper}: the server stays");
+        assert!(share_gone(&td), "helper={helper}: the server stays");
         assert_eq!(
             mount_leftovers(&td),
             Vec::<String>::new(),
@@ -8541,6 +8643,192 @@ fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
             }
         }
         assert_eq!(left, Vec::<String>::new(), "helper={helper}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A launch that joins a running instance's mount keeps the mount with a
+/// lifetime guardian of its own, and the server it shares stays only a
+/// transport.
+///
+/// Two launches of one package share a mount. The second one's app
+/// daemonizes, drops every descriptor it inherited, and replaces itself
+/// with a program that runs from outside the mount. From then on nothing
+/// of that launch runs out of the mount and no descriptor of its claims
+/// exists anywhere in it, so the only thing that still holds the mount is
+/// its guardian's lease. The first launch then dies while that is true,
+/// and the mount must stay: not because a process of the first launch
+/// lives, and not because the server holds a claim of its own, but
+/// because the second launch's guardian holds a lease of its own against
+/// the mount they share. When the second launch's last process is gone,
+/// the mount goes with it.
+#[test]
+fn a_join_launch_holds_the_mount_with_its_own_guardian() {
+    if !fuse_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("share-guardian");
+    let app = td.join("app");
+    let src = td.join("role.c");
+    let bin = app.join("bin/run");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    write(&app.join("data.txt"), "payload\n");
+    let pid_file = td.join("daemon.pid");
+    write(
+        &src,
+        &format!(
+            "#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
+             int main(void){{\n\
+             \x20 printf(\"dir=%s\\n\", getenv(\"ONELF_DIR\") ? getenv(\"ONELF_DIR\") : \"unset\");\n\
+             \x20 fflush(stdout);\n\
+             \x20 if (getenv(\"HOLD\")) {{ sleep(30); return 0; }}\n\
+             \x20 if (fork() != 0) {{ _exit(0); }}\n\
+             \x20 setsid();\n\
+             \x20 chdir(\"/\");\n\
+             \x20 for (int fd = 0; fd < 256; fd++) close(fd);\n\
+             \x20 FILE *out = fopen(\"{}\", \"w\");\n\
+             \x20 if (out) {{ fprintf(out, \"%d\", getpid()); fclose(out); }}\n\
+             \x20 execl(\"/bin/sleep\", \"sleep\", \"30\", (char *)0);\n\
+             \x20 return 1;\n}}\n",
+            pid_file.display()
+        ),
+    );
+    if !cc(&src, &bin) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    let pkg = td.join("shared.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", "shared"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    for helper in [false, true] {
+        if helper && !have("fusermount3") {
+            continue;
+        }
+        let envs: &[(&str, &str)] = if helper {
+            &[("ONELF_FUSE_NO_NAMESPACE", "1")]
+        } else {
+            &[]
+        };
+        let _ = std::fs::remove_file(&pid_file);
+
+        // The holder prints the mount it runs from and stays.
+        let mut hold = Command::new(&pkg);
+        hold.env("ONELF_MODE", "fuse")
+            .env("HOLD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in envs {
+            hold.env(k, v);
+        }
+        isolate(&mut hold, &td);
+        let mut holding = spawn_package(&mut hold);
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(holding.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let mount_dir = PathBuf::from(line.trim().strip_prefix("dir=").unwrap_or(""));
+
+        // The second launch of the same package finds the record and joins
+        // the same mount. Its foreground returns at once; its daemon lives
+        // on under the launch's guardian.
+        let mut join = Command::new(&pkg);
+        join.env("ONELF_MODE", "fuse")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in envs {
+            join.env(k, v);
+        }
+        isolate(&mut join, &td);
+        let mut joining = spawn_package(&mut join);
+        let mut joined_line = String::new();
+        std::io::BufReader::new(joining.stdout.as_mut().unwrap())
+            .read_line(&mut joined_line)
+            .unwrap();
+        let status = joining.wait().unwrap();
+        assert!(
+            status.success(),
+            "helper={helper}: the joining launch failed"
+        );
+        assert_eq!(
+            joined_line.trim(),
+            line.trim(),
+            "helper={helper}: the launch did not join the running mount"
+        );
+
+        // The daemon writes its pid once every descriptor it inherited is
+        // closed and its executable is outside the mount.
+        let mut daemon = String::new();
+        for _ in 0..200 {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                daemon = pid.trim().to_string();
+                break;
+            }
+            assert!(
+                holding.try_wait().unwrap().is_none(),
+                "helper={helper}: the holder left early"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !daemon.is_empty(),
+            "helper={helper}: the daemon stayed silent"
+        );
+
+        // The holder dies. Its claims go with it; the server and the mount
+        // must stay, held by the joining launch's guardian alone.
+        let _ = holding.kill();
+        let _ = holding.wait();
+        let servers = share_servers(&td);
+        assert_eq!(
+            servers.len(),
+            1,
+            "helper={helper}: exactly the one shared server, found {servers:?}"
+        );
+        let daemon_pid: u32 = daemon.parse().expect("the daemon's pid");
+        // The server must stay up continuously: with the daemon running
+        // from outside the mount, the lease is the only thing that can
+        // hold it, so a window in which it is gone is a window in which
+        // the mount was torn down under the joining launch.
+        let mut stayed = true;
+        for _ in 0..40 {
+            if share_servers(&td) != servers || started_at(daemon_pid).is_none() {
+                stayed = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            stayed,
+            "helper={helper}: the shared mount did not outlive a launch \
+             whose only claim was its guardian's lease"
+        );
+
+        // The joining launch's last process goes, its guardian lets the
+        // lease go, and the server takes the mount down and its record
+        // with it.
+        Command::new("kill")
+            .arg(daemon_pid.to_string())
+            .status()
+            .expect("kill the daemon");
+        assert!(
+            share_gone(&td),
+            "helper={helper}: the server stays past its last launch"
+        );
+        assert_eq!(
+            mount_leftovers(&td),
+            Vec::<String>::new(),
+            "helper={helper}"
+        );
+        assert!(
+            !mount_dir.as_os_str().is_empty() && std::fs::symlink_metadata(&mount_dir).is_err(),
+            "helper={helper}: the mountpoint directory is gone"
+        );
     }
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -12359,7 +12647,22 @@ fn a_launch_whose_library_links_differ_gets_its_own_mount() {
                 "helper={helper}: {stderr}"
             );
             assert!(!stderr.contains("its own"), "helper={helper}: {stderr}");
-            assert_eq!(servers_of(&pkg), servers, "helper={helper}");
+            // The launch that joined leaves no process of its own behind:
+            // its app has exited and its guardian has let its claim go. A
+            // server of its own would be there to stay, so waiting for the
+            // baseline to come back cannot pass one.
+            let mut quiet = false;
+            for _ in 0..200 {
+                if servers_of(&pkg) == servers {
+                    quiet = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                quiet,
+                "helper={helper}: the launch that joined left something behind"
+            );
         };
         same();
 
@@ -15581,5 +15884,522 @@ fn init_seeds_a_buildable_binary_input() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(stdout.contains("IMPORT_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A shared app source for the lifetime tests: one launch's foreground
+/// daemonizes, drops every descriptor it inherited including the standard
+/// streams, waits, then reads a package file through the tree it still
+/// runs from and writes what it saw. It prints its tree first, so the
+/// test can watch that tree. After the read it waits for the gate file,
+/// so the test decides when the launch's descendants end; then it marks
+/// that and exits.
+fn daemon_reader(gate: &Path, result: &Path, done: &Path) -> String {
+    format!(
+        "#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\n\
+         int main(void){{\n\
+         \x20 printf(\"dir=%s\\n\", getenv(\"ONELF_DIR\") ? getenv(\"ONELF_DIR\") : \"unset\");\n\
+         \x20 fflush(stdout);\n\
+         \x20 if (fork() != 0) {{ _exit(0); }}\n\
+         \x20 setsid();\n\
+         \x20 for (int fd = 0; fd < 256; fd++) close(fd);\n\
+         \x20 sleep(1);\n\
+         \x20 const char *d = getenv(\"ONELF_DIR\");\n\
+         \x20 char p[512];\n\
+         \x20 snprintf(p, sizeof p, \"%s/data.txt\", d ? d : \"/nonexistent\");\n\
+         \x20 FILE *in = fopen(p, \"r\");\n\
+         \x20 FILE *out = fopen(\"{}\", \"w\");\n\
+         \x20 if (out) {{ fprintf(out, in ? \"READ-OK\" : \"READ-FAILED\"); fclose(out); }}\n\
+         \x20 for (int i = 0; i < 600; i++) {{\n\
+         \x20  FILE *g = fopen(\"{}\", \"r\");\n\
+         \x20  if (g) {{ fclose(g); break; }}\n\
+         \x20  usleep(100000);\n\
+         \x20 }}\n\
+         \x20 FILE *bye = fopen(\"{}\", \"w\");\n\
+         \x20 if (bye) {{ fputs(\"gone\", bye); fclose(bye); }}\n\
+         \x20 return 0;\n}}\n",
+        result.display(),
+        gate.display(),
+        done.display()
+    )
+}
+
+/// Wait until `probe` succeeds, for a bounded time.
+fn until(mut probe: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if probe() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// Pack the daemon-reader app and return its package, or an empty path
+/// when no compiler is available.
+fn pack_daemon_reader(td: &Path, name: &str, gate: &Path, result: &Path, done: &Path) -> PathBuf {
+    let app = td.join(name);
+    let src = td.join(format!("{name}.c"));
+    let bin = app.join("bin/run");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    write(&app.join("data.txt"), "payload\n");
+    write(&src, &daemon_reader(gate, result, done));
+    if !cc(&src, &bin) {
+        return PathBuf::new();
+    }
+    let pkg = td.join(format!("{name}.onelf"));
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", name])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    pkg
+}
+
+/// Start the daemon-reader package in `mode` and return the child with its
+/// first output line, which names the tree the launch runs from.
+fn start_daemon_reader(pkg: &Path, td: &Path, mode: &str) -> (std::process::Child, PathBuf) {
+    let mut run = Command::new(pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", mode)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut run, td);
+    let mut child = spawn_package(&mut run);
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let tree = PathBuf::from(line.trim().strip_prefix("dir=").unwrap_or(""));
+    (child, tree)
+}
+
+/// A runtime-directory launch whose app daemonizes keeps its own view
+/// under its own guardian: the tree stays past the launcher, past the app
+/// dropping every descriptor it inherited, and goes when the launch's
+/// last process is gone, not before and not after.
+#[test]
+fn a_rundir_descendant_keeps_its_view_past_the_launcher() {
+    let td = workdir("rundirdaemon");
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let done = td.join("done");
+    let pkg = pack_daemon_reader(&td, "rd", &gate, &result, &done);
+    if !pkg.as_os_str().is_empty() {
+        let (mut child, tree) = start_daemon_reader(&pkg, &td, "rundir");
+        let status = child.wait().unwrap();
+        assert!(status.success(), "the launcher failed: {status}");
+        assert!(
+            tree.starts_with(td.join("xdg-run")),
+            "the view lives in the private runtime directory: {}",
+            tree.display()
+        );
+        assert!(
+            tree.is_dir(),
+            "the view stays past the launcher: {}",
+            tree.display()
+        );
+
+        // The daemon reads its own view with nothing inherited, which no
+        // unclaimed tree would survive.
+        assert!(
+            until(|| std::fs::read_to_string(&result).is_ok_and(|s| s == "READ-OK")),
+            "the daemon could not read its view after dropping everything"
+        );
+        assert!(tree.is_dir(), "the view stays while its launch lives");
+
+        // The launch's last process goes; the guardian lets the claim go
+        // and takes the view with it.
+        std::fs::write(&gate, "").unwrap();
+        assert!(until(|| done.is_file()), "the daemon never finished");
+        assert!(
+            until(|| std::fs::symlink_metadata(&tree).is_err()),
+            "the view is taken down after its launch's last process"
+        );
+        assert_eq!(
+            std::fs::read_dir(td.join("xdg-cache")).unwrap().count(),
+            0,
+            "the persistent cache is untouched"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The same contract in the tmpfs mode: the launcher returns when the
+/// foreground is gone, the daemonized descendant still reads its view,
+/// the launch's guardian holds the mountpoint's claim for as long as the
+/// launch lives, another launch's sweep leaves that claim alone, and it
+/// is released once the launch's last process is gone.
+#[test]
+fn a_tmpfs_descendant_keeps_its_view_past_the_launcher() {
+    if !tmpfs_available() {
+        return; // documented soft-skip
+    }
+    let td = workdir("tmpfsdaemon");
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let done = td.join("done");
+    let pkg = pack_daemon_reader(&td, "tmpd", &gate, &result, &done);
+    if !pkg.as_os_str().is_empty() {
+        let (mut child, tree) = start_daemon_reader(&pkg, &td, "tmpfs");
+        let status = child.wait().unwrap();
+        assert!(status.success(), "the launcher failed: {status}");
+        assert!(
+            tree.starts_with(td.join("xdg-run")),
+            "the mountpoint lives in the private runtime directory: {}",
+            tree.display()
+        );
+
+        // The daemon reads the tmpfs view with nothing inherited, so the
+        // namespace outlived the launcher.
+        assert!(
+            until(|| std::fs::read_to_string(&result).is_ok_and(|s| s == "READ-OK")),
+            "the daemon could not read its view after dropping everything"
+        );
+        use rustix::fs::FlockOperation;
+        let claim = td.join("xdg-run").join(format!(
+            ".{}.lock",
+            tree.file_name().unwrap().to_string_lossy()
+        ));
+        let claim_taken = || {
+            std::fs::File::open(&claim)
+                .map(|f| rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_err())
+                .unwrap_or(false)
+        };
+        assert!(
+            claim_taken(),
+            "the launch's guardian holds the mountpoint's claim while the \
+             launch lives"
+        );
+
+        // A second launch of the package runs meanwhile, and the first
+        // launch's claim is not something its sweep may touch. The path is
+        // per package; the mount on it is per launch, made inside each
+        // launch's own namespace.
+        let second_ok = {
+            let mut run = Command::new(&pkg);
+            run.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", td.to_str().unwrap())
+                .env("ONELF_MODE", "tmpfs")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            isolate(&mut run, &td);
+            run_package(&mut run).status.success()
+        };
+        assert!(second_ok, "the second launch runs");
+        assert!(
+            claim_taken(),
+            "another launch's sweep leaves a claimed mountpoint alone"
+        );
+
+        // The first launch's descendants end, its guardian lets the claim
+        // go, and nothing of the launch holds the mountpoint any more.
+        std::fs::write(&gate, "").unwrap();
+        assert!(until(|| done.is_file()), "the daemon never finished");
+        assert!(
+            until(|| {
+                std::fs::File::open(&claim)
+                    .map(|f| {
+                        rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_ok()
+                    })
+                    .unwrap_or(false)
+            }),
+            "the drained launch's claim is released"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A cache launch publishes an execution view of its own identity beside
+/// the shared base extraction, runs from it under its guardian, and the
+/// view's lease outlives the foreground process: another launch's
+/// collection must leave a leased view alone and may reclaim it once its
+/// launch is truly gone.
+#[test]
+fn a_cache_view_is_leased_by_its_guardian_and_reclaimed_when_idle() {
+    let td = workdir("cacheview");
+    let gate = td.join("gate");
+    let result = td.join("result");
+    let done = td.join("done");
+    let holder = pack_daemon_reader(&td, "holder", &gate, &result, &done);
+    if !holder.as_os_str().is_empty() {
+        let other = pack_script(&td, "other", "#!/bin/sh\necho dir=$ONELF_DIR\n");
+        let views = td.join("xdg-cache/onelf/views");
+
+        // The holder's launch publishes its view and daemonizes; the
+        // launcher returns while the view's lease stays with the launch's
+        // guardian.
+        let (mut child, view) = start_daemon_reader(&holder, &td, "cache");
+        let status = child.wait().unwrap();
+        assert!(status.success(), "the launcher failed: {status}");
+        assert!(
+            view.starts_with(&views),
+            "the launch runs from its published view: {}",
+            view.display()
+        );
+        assert!(
+            view.is_dir(),
+            "the view stays past the launcher: {}",
+            view.display()
+        );
+
+        // Another launch of another package collects what is idle, and the
+        // holder's view is not idle: its guardian still holds its lease.
+        let mut second = Command::new(&other);
+        second
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        isolate(&mut second, &td);
+        let out = run_package(&mut second);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let second_view = PathBuf::from(
+            stdout
+                .trim()
+                .strip_prefix("dir=")
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        assert_ne!(view, second_view, "two identities get two views");
+        assert!(
+            view.is_dir(),
+            "a leased view survives another launch's collection"
+        );
+
+        // The holder's last process goes, its guardian lets the lease go,
+        // and the next launch's collection reclaims the idle view.
+        std::fs::write(&gate, "").unwrap();
+        assert!(until(|| done.is_file()), "the daemon never finished");
+        let mut third = Command::new(&other);
+        third
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .stderr(std::process::Stdio::piped());
+        isolate(&mut third, &td);
+        let out = run_package(&mut third);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&views)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                second_view
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+            "the idle view is reclaimed, the live one stays: {left:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// When the mode the launch prefers is unavailable, the launch falls back
+/// and the fallback keeps every bit of the isolation it must: its own
+/// tree in the private runtime directory, no shared mount record, and
+/// nothing in the persistent cache. Two fallback launches of the same
+/// package run side by side without running from one another's state, and
+/// neither leaves anything behind.
+#[test]
+fn a_fallback_launch_keeps_its_isolation() {
+    let td = workdir("fallback");
+    let pkg = pack_script(
+        &td,
+        "fb",
+        "#!/bin/sh\necho mode=$ONELF_ACTIVE_MODE\necho dir=$ONELF_DIR\n",
+    );
+
+    // FUSE cannot be established here: the helper is named away and the
+    // namespace path is turned off, so the launch falls through to the
+    // modes that isolate in other ways.
+    let degraded = |cmd: &mut Command| {
+        cmd.env("ONELF_FUSE_NO_NAMESPACE", "1")
+            .env("FUSERMOUNT_PROG", "/nonexistent/fusermount3");
+    };
+
+    let mut run = Command::new(&pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut run, &td);
+    degraded(&mut run);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the fallback launch runs:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mode = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("mode="))
+        .expect("the app reports its mode");
+    assert!(
+        matches!(mode, "tmpfs" | "rundir"),
+        "the launch fell back to an isolating mode, got {mode}:\n{stdout}"
+    );
+    let tree = PathBuf::from(
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("dir="))
+            .expect("the app reports its directory"),
+    );
+    assert!(
+        tree.starts_with(td.join("xdg-run")),
+        "the fallback launch runs from its own tree in the private \
+         runtime directory: {}",
+        tree.display()
+    );
+    assert_eq!(
+        std::fs::read_dir(td.join("xdg-cache")).unwrap().count(),
+        0,
+        "a fallback launch never writes the persistent cache"
+    );
+    assert!(
+        std::fs::read_dir(td.join("xdg-run"))
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".share")),
+        "a fallback launch never finds or leaves a shared mount record"
+    );
+
+    // The launch's hold on its tree goes once it is done: a rundir tree is
+    // taken down by its own guardian, and a tmpfs mountpoint's claim is
+    // released, so nothing runs from either any more.
+    let mut again = Command::new(&pkg);
+    again
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .stderr(std::process::Stdio::piped());
+    isolate(&mut again, &td);
+    degraded(&mut again);
+    let out = run_package(&mut again);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if mode == "rundir" {
+        assert!(
+            until(|| std::fs::symlink_metadata(&tree).is_err()),
+            "the fallback launch's tree is taken down after it exits"
+        );
+    } else {
+        use rustix::fs::FlockOperation;
+        let claim = td.join("xdg-run").join(format!(
+            ".{}.lock",
+            tree.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            until(|| {
+                std::fs::File::open(&claim)
+                    .map(|f| {
+                        rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_ok()
+                    })
+                    .unwrap_or(false)
+            }),
+            "the drained tmpfs launch's claim on its mountpoint is released"
+        );
+    }
+
+    // Two fallback launches side by side: neither runs from the other's
+    // state. A rundir fallback names a tree of its own; a tmpfs fallback
+    // mounts its own filesystem at the per-package path inside its own
+    // namespace, which is where the isolation lives.
+    let launch = || {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .stderr(std::process::Stdio::null());
+        isolate(&mut cmd, &td);
+        degraded(&mut cmd);
+        let out = run_package(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{stdout}");
+        let mode = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("mode="))
+            .unwrap_or_default()
+            .to_owned();
+        let tree = PathBuf::from(
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("dir="))
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        (mode, tree)
+    };
+    let (first_mode, first_tree) = launch();
+    let (second_mode, second_tree) = launch();
+    assert_eq!(
+        (
+            matches!(first_mode.as_str(), "tmpfs" | "rundir"),
+            matches!(second_mode.as_str(), "tmpfs" | "rundir"),
+            first_mode == second_mode
+        ),
+        (true, true, true),
+        "both launches fall back the same way: {first_mode} and {second_mode}"
+    );
+    assert!(first_tree.starts_with(td.join("xdg-run")));
+    assert!(second_tree.starts_with(td.join("xdg-run")));
+    if first_mode == "rundir" {
+        assert_ne!(
+            first_tree, second_tree,
+            "two rundir fallbacks never run from one tree"
+        );
+    }
+    if first_mode == "rundir" {
+        assert!(
+            until(|| std::fs::symlink_metadata(&first_tree).is_err())
+                && until(|| std::fs::symlink_metadata(&second_tree).is_err()),
+            "both fallback trees go when their launches do"
+        );
+    } else {
+        use rustix::fs::FlockOperation;
+        let claim = td.join("xdg-run").join(format!(
+            ".{}.lock",
+            first_tree.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            until(|| {
+                std::fs::File::open(&claim)
+                    .map(|f| {
+                        rustix::fs::flock(&f, FlockOperation::NonBlockingLockExclusive).is_ok()
+                    })
+                    .unwrap_or(false)
+            }),
+            "the launches' hold on their mountpoint is released once they are done"
+        );
+    }
     let _ = std::fs::remove_dir_all(&td);
 }

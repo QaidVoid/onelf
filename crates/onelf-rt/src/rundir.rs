@@ -6,8 +6,14 @@
 //! removed again once the last process using it is gone. Nothing here
 //! needs a namespace, a helper, or the persistent cache.
 //!
-//! The tree is this launch's own, so a host library the resolver chose can
-//! be placed over its bundled copy with a plain symlink.
+//! The tree is an ephemeral execution view of this launch alone: it is
+//! built in a claimed staging tree and moved onto the tree's name in one
+//! rename, so the application only ever sees the complete view, and the
+//! claim lock is the lease the launch's guardian holds against the
+//! sweep. Its library links are this launch's own, so a host library the
+//! resolver chose can be placed over its bundled copy with a plain
+//! symlink, and the per-view environment input is written to the tree
+//! before the application starts.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -42,6 +48,21 @@ pub fn execute_rundir(
         };
     let tree = claim.path().to_path_buf();
 
+    // Filled beside the tree and moved onto it in one rename, so the
+    // tree the application runs from is complete from the first moment
+    // it is visible. The staging tree is claimed like the tree, so a
+    // launch killed mid-build leaves it to the next launch's sweep.
+    let stage = match crate::paths::create_launch_stage(
+        pkg.manifest.name(),
+        &pkg.manifest.header.package_id,
+    ) {
+        Some(m) => m,
+        None => {
+            claim.release();
+            return false;
+        }
+    };
+
     let needed = crate::ephemeral::tmpfs_size_for(pkg);
     if let Some(free) = free_space(&tree)
         && free < needed
@@ -52,14 +73,26 @@ pub fn execute_rundir(
             free >> 20,
             needed >> 20
         );
-        let _ = std::fs::remove_dir(&tree);
+        let _ = std::fs::remove_dir(stage.path());
+        stage.release();
+        claim.release();
         return false;
     }
-    if let Err(e) = crate::cache::extract_direct(pkg, &tree) {
+    if let Err(e) = crate::cache::extract_direct(pkg, stage.path()) {
         eprintln!("onelf-rt: rundir: extract failed: {e}");
-        remove_tree(&tree);
+        let _ = std::fs::remove_dir_all(stage.path());
+        stage.release();
+        claim.release();
         return false;
     }
+    if let Err(e) = std::fs::rename(stage.path(), &tree) {
+        eprintln!("onelf-rt: rundir: publish failed: {e}");
+        let _ = std::fs::remove_dir_all(stage.path());
+        stage.release();
+        claim.release();
+        return false;
+    }
+    stage.release();
 
     let exe_path = Path::new(exec_path);
     let exe_dir = exe_path.parent().unwrap_or(Path::new("/"));
@@ -92,6 +125,7 @@ pub fn execute_rundir(
                 private_ns: false,
                 tree_writable: true,
                 links: crate::launch::Links::Tree,
+                resolved: None,
             })
         },
         |claim| remove_tree(claim.path()),

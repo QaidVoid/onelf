@@ -30,11 +30,24 @@
 //! A package file replaced on disk has a new package id, so a launch of it
 //! never finds the old server's record, and a launch whose library links
 //! differ from what the mount serves mounts its own.
+//!
+//! Lifetime: the server is a transport, never a launch's guardian. The
+//! first launch execs the application itself, so its claims follow the
+//! exec: the lease is inheritable and stays with the application and its
+//! descendants, while the record lock and the launched pipe close at the
+//! exec, which is what tells the server the launch has started and other
+//! launches may decide whether to join. A launch that joins runs under a
+//! lifetime guardian of its own that holds its lease, so a descendant
+//! that closes everything it inherited keeps the mount claimed and no
+//! server or other launch's guardian ever stands in for it. A descendant
+//! of the first launch that closes its descriptors is covered by the
+//! server's scan of the processes still running out of the mount.
 
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use rustix::fs::FlockOperation;
 use rustix::io::FdFlags;
@@ -207,6 +220,16 @@ pub(crate) fn launch(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -
 }
 
 /// Run from the mount the server in `record` serves.
+///
+/// The server is only a transport: this launch resolves the mount itself,
+/// checks that what it serves is exactly the links this launch needs, and
+/// then runs under a lifetime guardian of its own that holds the lease.
+/// The guardian, not the server and not the first launch's guardian, is
+/// this launch's ancestor: its subreaper adopts every descendant this
+/// launch leaves behind, and it holds the lease itself, so a descendant
+/// that closes everything it inherited keeps the mount claimed until its
+/// subtree has drained. What this launch shares with the first one is the
+/// mount and nothing else.
 fn join(
     pkg: &PackageData,
     req: &Request,
@@ -230,20 +253,81 @@ fn join(
         return Declined::Private;
     }
     req.setup_portable();
-    crate::launch::exec_served(&req.launch(
-        pkg,
+
+    // The mount is visible and served by the first launch's server, so
+    // this launch can read it here: what it shows decides the links, and
+    // the check below needs those before anything runs.
+    let resolved =
+        crate::launch::resolve_launch(pkg, req.ep_idx, &share.mountpoint, record.namespace, false);
+    let (dir, links) = crate::launch::effective_links(
+        &pkg.manifest,
+        req.ep_idx,
         &share.mountpoint,
-        record.namespace,
-        Links::Served,
-    ));
-    // The links that mount serves were placed for a launch that resolved
-    // the host differently, and only that launch could have chosen them.
-    drop(lease);
-    eprintln!(
-        "onelf-rt: fuse: the running instance's mount serves other host \
-         libraries than this launch needs; mounting its own"
+        resolved.resolution.farm.as_deref(),
     );
-    Declined::Private
+    let manifest = &pkg.manifest;
+    if let Some(dir) = &dir
+        && !crate::links::served(
+            manifest,
+            &share.mountpoint,
+            dir,
+            &links,
+            &manifest.lib_dirs(),
+        )
+    {
+        // The links that mount serves were placed for a launch that
+        // resolved the host differently, and only that launch could have
+        // chosen them.
+        drop(lease);
+        eprintln!(
+            "onelf-rt: fuse: the running instance's mount serves other host \
+             libraries than this launch needs; mounting its own"
+        );
+        return Declined::Private;
+    }
+
+    let mountpoint = share.mountpoint.clone();
+    let private_ns = record.namespace;
+    let supervision = match crate::guardian::spawn(
+        lease,
+        || {
+            crate::launch::exec_served(&req.launch(
+                pkg,
+                &mountpoint,
+                private_ns,
+                Links::Served,
+                Some(resolved),
+            ));
+            eprintln!("onelf-rt: fuse: the mount stopped serving the links this launch needs");
+            std::process::exit(1);
+        },
+        |_lease| {},
+    ) {
+        Ok(supervision) => supervision,
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: fork failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Signals meant for this process still reach the application, one hop
+    // further along: this forwards to the guardian, and the guardian
+    // forwards to the application.
+    super::CHILD_PID.store(supervision.pid as i32, Ordering::Relaxed);
+    super::install_signal_handlers();
+
+    match crate::guardian::receive(&supervision.status) {
+        Ok(outcome) => {
+            if outcome == crate::guardian::Outcome::Unavailable {
+                eprintln!("onelf-rt: fuse: the lifetime guardian could not be established");
+            }
+            std::process::exit(outcome.exit_code())
+        }
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: guardian status: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Enter the user and mount namespaces of the server in `record`, then a
@@ -451,7 +535,7 @@ fn create(
     req.setup_portable();
     // The record lock and the pipe close at the exec. The lease does not.
     let _held = (record_lock, lease, launched_w);
-    crate::launch::exec(&req.launch(pkg, &mountpoint, private_ns, Links::Server(&links_tx)))
+    crate::launch::exec(&req.launch(pkg, &mountpoint, private_ns, Links::Server(&links_tx), None))
 }
 
 /// What the first launch hands its server.

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use onelf_format::HostLibsPolicy;
+use onelf_format::Manifest;
 use onelf_format::drivers;
 use onelf_format::resolve::{self, Gl, Request, Resolution};
 use onelf_format::rules::Inheritance;
@@ -62,6 +63,10 @@ pub struct Launch<'a> {
     /// How the libraries the launch takes from outside the package come to
     /// show in its library directory.
     pub links: Links<'a>,
+    /// A resolver decision the caller made before the launch's tree was
+    /// materialized, which the mode needed to know the effective links
+    /// before it could build or join a view. `None` resolves here.
+    pub resolved: Option<Resolved>,
 }
 
 /// Where a launch's library links (see [`crate::links`]) are put.
@@ -111,11 +116,25 @@ fn run(launch: &Launch) {
         .collect();
 
     // The resolver judges the package, not the entrypoint: a script
-    // execs the bundled binaries too.
-    let resolved = if lib_dirs.is_empty() {
-        Resolved::default()
-    } else {
-        resolve_for(launch, &lib_dirs, &set_roots)
+    // execs the bundled binaries too. A mode that had to know the
+    // decision before it could materialize its tree hands it in.
+    let resolved_owned;
+    let resolved = match &launch.resolved {
+        Some(resolved) => resolved,
+        None => {
+            resolved_owned = if lib_dirs.is_empty() {
+                Resolved::never()
+            } else {
+                resolve_launch(
+                    launch.pkg,
+                    launch.ep_idx,
+                    launch.pkg_root,
+                    launch.private_ns,
+                    launch.tree_writable,
+                )
+            };
+            &resolved_owned
+        }
     };
     let resolution = &resolved.resolution;
     for name in &resolution.incomparable {
@@ -605,19 +624,23 @@ fn exec_under_host_loader(
 }
 
 /// What the resolver decided, with the GL build it was given, if any.
-#[derive(Default)]
-struct Resolved {
-    resolution: Resolution,
+pub(crate) struct Resolved {
+    /// The resolver's decision: the link farm, the host loader if it won,
+    /// and the sonames that could not be ordered.
+    pub(crate) resolution: Resolution,
+    /// The launch's effective policy over host libraries, after
+    /// `ONELF_NO_RESOLVER` had its say.
+    pub(crate) policy: HostLibsPolicy,
     /// The fetched GL build's extracted root.
-    platform_root: Option<std::path::PathBuf>,
+    pub(crate) platform_root: Option<std::path::PathBuf>,
     /// Held through exec so the extraction is not collected while this
     /// instance runs. The fd is inheritable.
     _platform_lock: Option<std::fs::File>,
 }
 
-/// Run the resolver for this package on this host. `ONELF_NO_RESOLVER`
-/// turns it off for one launch, which is the way to tell whether a
-/// failure is the resolver's doing.
+/// Run the resolver for this package on this host, against the tree at
+/// `pkg_root`. `ONELF_NO_RESOLVER` turns it off for one launch, which is
+/// the way to tell whether a failure is the resolver's doing.
 ///
 /// A launch that can put no host file in place of a bundled one, neither
 /// by mount nor by editing its tree, never takes the host's glibc: the
@@ -627,8 +650,14 @@ struct Resolved {
 /// one and the build can be had; the resolver then indexes that build
 /// ahead of the host. Anything that stops that is a warning, and the
 /// launch goes on without a GL stack.
-fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathBuf]) -> Resolved {
-    let (pkg, pkg_root) = (launch.pkg, launch.pkg_root);
+pub(crate) fn resolve_launch(
+    pkg: &PackageData,
+    ep_idx: usize,
+    pkg_root: &Path,
+    private_ns: bool,
+    tree_writable: bool,
+) -> Resolved {
+    let lib_dirs = pkg.manifest.lib_dirs();
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
     let policy = if disabled {
         HostLibsPolicy::Never
@@ -636,25 +665,26 @@ fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathB
         HostLibsPolicy::from_flags(pkg.footer.flags)
     };
     if policy == HostLibsPolicy::Never {
-        return Resolved::default();
+        return Resolved::never();
     }
     let Some(store) = crate::paths::resolve_store(&pkg.manifest.header.package_id) else {
-        return Resolved::default();
+        return Resolved::never();
     };
     let ld_cache = drivers::cache_file();
 
     let mut platform = None;
     // A set holds the toolkit, and the toolkit is what usually names a
     // GL entry point, so its directories count towards the decision.
+    let set_roots = crate::sets::roots();
     let set_lib_dirs: Vec<std::path::PathBuf> = set_roots
         .iter()
         .flat_map(|root| crate::sets::lib_dirs(root))
         .collect();
-    let ep = &pkg.manifest.entrypoints[launch.ep_idx];
+    let ep = &pkg.manifest.entrypoints[ep_idx];
     let executable = pkg_root.join(pkg.manifest.entry_path(ep.target_entry as usize));
     let gl = resolve::gl_situation(
         pkg_root,
-        lib_dirs,
+        &lib_dirs,
         &set_lib_dirs,
         Some(&executable),
         &ld_cache,
@@ -684,20 +714,59 @@ fn resolve_for(launch: &Launch, lib_dirs: &[&str], set_roots: &[std::path::PathB
 
     let resolution = resolve::resolve(&Request {
         pkg_root,
-        lib_dirs,
+        lib_dirs: &lib_dirs,
         policy,
         store: &store,
         ld_cache: &ld_cache,
         icd_dirs: resolve::ICD_DIRS,
         extra_root: platform_root.as_deref(),
-        set_roots,
-        host_libc: launch.private_ns || launch.tree_writable,
+        set_roots: &set_roots,
+        host_libc: private_ns || tree_writable,
     });
     Resolved {
         resolution,
+        policy,
         platform_root,
         _platform_lock: lock,
     }
+}
+
+/// A decision that takes nothing from the host: the resolver is off.
+impl Resolved {
+    fn never() -> Self {
+        Self {
+            resolution: Resolution::default(),
+            policy: HostLibsPolicy::Never,
+            platform_root: None,
+            _platform_lock: None,
+        }
+    }
+}
+
+/// The library links this launch takes from outside the package, and the
+/// directory of the package they go in, as the resolver's farm and the
+/// dependency sets decided.
+///
+/// Modes that materialize their tree or join a mount before the launch
+/// runs need the links first: the links are what a view's identity
+/// covers and what a shared mount must already serve.
+pub(crate) fn effective_links(
+    manifest: &Manifest,
+    ep_idx: usize,
+    pkg_root: &Path,
+    farm: Option<&Path>,
+) -> (Option<String>, crate::links::Links) {
+    let lib_dirs = manifest.lib_dirs();
+    let target =
+        pkg_root.join(manifest.entry_path(manifest.entrypoints[ep_idx].target_entry as usize));
+    let runpath = crate::links::origin_runpath(&target);
+    let dir = crate::links::dir(manifest, pkg_root, &runpath, &lib_dirs);
+    let set_roots = crate::sets::roots();
+    let links = match &dir {
+        Some(dir) => crate::links::wanted(manifest, dir, farm, &set_roots),
+        None => crate::links::Links::new(),
+    };
+    (dir, links)
 }
 
 #[cfg(test)]
