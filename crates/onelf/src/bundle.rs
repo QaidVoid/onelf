@@ -45,6 +45,7 @@ pub mod sysroot;
 use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
+use onelf_format::rules::{Descriptor, Requirement, ResourceGroup, ResourceKind};
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
 
@@ -417,43 +418,6 @@ fn link_target(from_dir: &Path, to: &Path) -> String {
     target
 }
 
-/// The data directories a bundled library reads from a path compiled into
-/// it, by soname prefix, matched against what the walk resolves. The
-/// runtime points each variable at the copy below the tree root (the
-/// runtime's `DATA_PATHS` and `XKB_CONFIG_ROOT` setup), and the
-/// `datadirs` lint names the same directories. Without the copy the
-/// library reads the host's data or, on a host without the owning
-/// package, none at all: an alsa-less host leaves a bundled libasound
-/// without `alsa.conf`, and it cannot open any device, plugins included.
-const LIB_DATA_DIRS: &[(&str, &[&str])] = &[
-    // alsa.conf and the PCM definitions that say what `default` is.
-    ("libasound.so", &["share/alsa"]),
-    // Keymaps libxkbcommon compiles keycodes from.
-    ("libxkbcommon.so", &["share/X11/xkb"]),
-    // Locale and compose data of the Xlib encodings.
-    ("libX11.so", &["share/X11/locale"]),
-    // The compiled database libmagic reads; `magic` without the suffix
-    // is the source text, not what `MAGIC` names.
-    (
-        "libmagic.so",
-        &["share/file/misc/magic.mgc", "share/misc/magic.mgc"],
-    ),
-];
-
-/// The data directory or file a resolved library was found beside:
-/// `share/alsa` of the tree the library's own directory belongs to. One
-/// and two directory climbs cover the flat `/usr/lib` and the Debian
-/// multiarch layouts, and a Nix store path carries its `share` beside
-/// `lib`. libmagic's compiled database is a file, not a directory.
-fn data_dir_beside(resolved: &Path, rel: &str) -> Option<PathBuf> {
-    let dir = resolved.parent()?;
-    ["..", "../.."]
-        .iter()
-        .map(|up| dir.join(up).join(rel))
-        .find(|p| p.is_file() || p.is_dir())
-        .and_then(|p| fs::canonicalize(p).ok())
-}
-
 /// Copy a data directory into the tree, pinning each file's mtime like
 /// every other copy. Regular files and relative symlinks go; absolute
 /// symlinks stay behind with a warning, since their target has no place
@@ -589,73 +553,188 @@ fn hooks_block(lines: &[&str]) -> Option<(usize, usize)> {
     None
 }
 
-/// Plan the data directories and files of a resolved library into the
-/// tree, once per path: a re-run and a tree that already carries a path
-/// are left alone, except that an existing `share/alsa` still has its
-/// `alsa.conf` anchored (a tree bundled before the patch existed carries
-/// the directory but not the entry that loads its snippets). An existing
-/// path is judged by content, so the tree cannot silently stand in for
-/// data it does not match, and the writes themselves are queued for the
-/// executor after the whole plan resolves. What the host has not,
-/// nothing is carried, and the lint keeps saying so.
-fn plan_carried_data(
+/// Carry one activated rule's declared data group into the tree. The
+/// group's ordered alternatives are tried in declaration order against
+/// the roots of the libraries that triggered the rule, an installation
+/// prefix or the directory the resolved library sits in, and the first
+/// existing alternative is the one taken; a later alternative is
+/// examined only where the earlier ones do not exist. The declared
+/// destination is relative to the tree root, so the carried layout is
+/// where the runtime's mappings look. The roots are the triggering
+/// libraries' own, so data another installation happens to keep in a
+/// directory the walk admitted never answers for a framework whose own
+/// source lacks it.
+///
+/// A destination the tree already holds satisfies the group: a carried
+/// directory is the tree's own, its configuration anchored in place,
+/// and a carried file is judged by content rather than rewritten. When
+/// no alternative exists on any admitted root, a tree-held destination
+/// still satisfies the group, a required group otherwise fails the
+/// assembly naming the rule and the examined locations, and an optional
+/// one is reported and the build continues. Nothing is admitted to the
+/// plan here that the plan has not judged, and what no admitted root
+/// holds is never taken from elsewhere: in a sysroot build the
+/// alternatives are the admitted files of the selected closure alone.
+fn carry_data_group(
     directory: &Path,
-    soname: &str,
-    resolved: &Path,
-    carried: &mut HashSet<String>,
+    descriptor: &Descriptor,
+    declared: &ResourceGroup,
+    admitted: &[AdmittedLibrary],
+    sysroot: Option<&sysroot::SysrootUniverse>,
     plan: &mut DestinationPlan,
     actions: &mut Vec<WalkAction>,
 ) -> io::Result<()> {
-    for (prefix, rels) in LIB_DATA_DIRS {
-        if !soname.starts_with(prefix) {
-            continue;
+    let rule = descriptor.id.as_str();
+    let patch_alsa = descriptor
+        .build
+        .hooks
+        .contains(&onelf_format::rules::BuildHookId::AlsaConfPatch);
+    let origin = format!("rule {rule} group {} data carry", declared.id.as_str());
+    let owners: Vec<AdmittedLibrary> = admitted
+        .iter()
+        .filter(|lib| {
+            descriptor
+                .triggers
+                .iter()
+                .any(|t| t.matches_soname(lib.soname()))
+        })
+        .cloned()
+        .collect();
+    let outcome = discover_group(
+        &GroupQuery {
+            rule,
+            group: declared.id.as_str(),
+            kind: declared.kind,
+            requirement: declared.requirement,
+            destination: &declared.destination,
+            candidates: &declared.candidates,
+        },
+        &AdmittedUniverse {
+            libraries: &owners,
+            sysroot,
+        },
+    )?;
+    if let Some(hit) = outcome.found.first() {
+        let dest = directory.join(hit.destination.as_path());
+        if dest.exists() {
+            if patch_alsa {
+                actions.push(WalkAction::PatchCarriedAlsa);
+            }
+            if hit.kind == ResourceKind::File {
+                plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?;
+            }
+            return Ok(());
         }
-        for rel in *rels {
-            if carried.contains(*rel) {
-                continue;
-            }
-            let alsa = *rel == "share/alsa";
-            let dest = directory.join(rel);
-            let src = data_dir_beside(resolved, rel);
-            if dest.exists() {
-                carried.insert((*rel).to_string());
-                if alsa {
-                    actions.push(WalkAction::PatchCarriedAlsa);
-                }
-                let Some(src) = src else {
-                    continue;
-                };
-                // A carried directory the tree already holds is the
-                // tree's own: the build anchors its config in place, so
-                // presence satisfies the carry. A carried file is never
-                // rewritten by the build, so its content is judged.
-                if !src.is_dir() {
-                    plan.admit_carried(Path::new(*rel), &src, &format!("{soname} data carry"))?;
-                }
-                continue;
-            }
-            let Some(src) = src else {
-                continue;
-            };
-            carried.insert((*rel).to_string());
-            if plan.admit_carried(Path::new(*rel), &src, &format!("{soname} data carry"))?
-                == Admission::Write
-            {
-                actions.push(WalkAction::CarryData {
-                    soname: soname.to_string(),
-                    src,
-                    rel,
-                });
-            }
+        if plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?
+            == Admission::Write
+        {
+            actions.push(WalkAction::CarryData {
+                rule: rule.to_string(),
+                src: hit.resolved.clone(),
+                rel: hit.destination.clone(),
+                patch_alsa,
+            });
+        }
+        return Ok(());
+    }
+    if directory.join(declared.destination.as_str()).exists() {
+        if patch_alsa {
+            actions.push(WalkAction::PatchCarriedAlsa);
+        }
+        return Ok(());
+    }
+    match declared.requirement {
+        Requirement::Required => Err(required_data_miss(rule, declared, &outcome)),
+        Requirement::Optional => {
+            report_data_omission(rule, declared, &outcome);
+            Ok(())
         }
     }
-    Ok(())
+}
+
+/// The required-data failure: which rule's data is missing, at what
+/// destination, and what was examined where, bounded like every
+/// finding.
+fn required_data_miss(rule: &str, declared: &ResourceGroup, outcome: &GroupOutcome) -> io::Error {
+    let mut text = format!(
+        "rule {rule} group {} requires {} data at {}, but none of its declared \
+         locations exist in the selected source",
+        declared.id.as_str(),
+        match declared.kind {
+            ResourceKind::File => "file",
+            ResourceKind::Directory => "directory",
+        },
+        declared.destination.as_str()
+    );
+    for location in examined_locations(outcome) {
+        text.push_str("; ");
+        text.push_str(&location);
+    }
+    io::Error::new(io::ErrorKind::NotFound, text)
+}
+
+/// The report an optional data group the selected source lacks gets, so
+/// the omission is a decision the packager can see.
+fn report_data_omission(rule: &str, declared: &ResourceGroup, outcome: &GroupOutcome) {
+    let mut text = format!(
+        "  {} {rule}/{}: optional data unavailable",
+        color::bold_red("warning:"),
+        declared.id.as_str()
+    );
+    let examined = examined_locations(outcome);
+    if examined.is_empty() {
+        text.push_str(" (no declared location)");
+    } else {
+        text.push_str(&format!(" ({})", examined.join(", ")));
+    }
+    text.push_str("; the build continues without it");
+    eprintln!("{text}");
+}
+
+/// Where the group looked and why each location held nothing, with the
+/// same location under several alternatives named once, bounded like
+/// every finding.
+fn examined_locations(outcome: &GroupOutcome) -> Vec<String> {
+    let mut shown: Vec<String> = Vec::new();
+    for miss in outcome.misses.iter().take(12) {
+        let text = format!("{}: {}", miss.root.display(), miss_text(&miss.reason));
+        if !shown.contains(&text) {
+            shown.push(text);
+        }
+    }
+    shown.truncate(3);
+    shown
+}
+
+/// Why one examined alternative is not the carry, in the shared wording.
+fn miss_text(reason: &MissReason) -> String {
+    match reason {
+        MissReason::Absent => "absent".to_string(),
+        MissReason::WrongKind {
+            actual: ResourceKind::File,
+        } => "a file where a directory is declared".to_string(),
+        MissReason::WrongKind {
+            actual: ResourceKind::Directory,
+        } => "a directory where a file is declared".to_string(),
+        MissReason::OutsideRoot => "outside the admitted root".to_string(),
+        MissReason::NotAdmitted(refusal) => match refusal {
+            sysroot::Refusal::Absent => "not in the selected source".to_string(),
+            sysroot::Refusal::HostPackage { owner } => {
+                format!("left to the host package {owner}")
+            }
+            sysroot::Refusal::UnselectedPackage { owner } => {
+                format!("owned by the unselected package {owner}")
+            }
+            sysroot::Refusal::Pruned { owner } => format!("pruned from the package {owner}"),
+        },
+    }
 }
 
 /// One write the planned walk performs once the whole plan has resolved
 /// without findings. The executor replays these in planning order, so
 /// the output and the mutations match the single-pass walk this
 /// replaces.
+#[derive(Debug)]
 enum WalkAction {
     /// Copy a resolved library or plugin into the library directory.
     CopyLib {
@@ -678,11 +757,13 @@ enum WalkAction {
         size: u64,
         stale_flat: bool,
     },
-    /// Copy one carried data path beside the tree root.
+    /// Copy one carried data path beside the tree root, from the
+    /// alternative the group took.
     CarryData {
-        soname: String,
+        rule: String,
         src: PathBuf,
-        rel: &'static str,
+        rel: PathBuf,
+        patch_alsa: bool,
     },
     /// Anchor the hooks of an existing carried `share/alsa/alsa.conf`.
     PatchCarriedAlsa,
@@ -851,9 +932,14 @@ fn execute_walk(
                     migrate_flat_plugin(&lib_dest.join(soname), rel, lib_dest, dry_run);
                 }
             }
-            WalkAction::CarryData { soname, src, rel } => {
+            WalkAction::CarryData {
+                rule,
+                src,
+                rel,
+                patch_alsa,
+            } => {
                 if src.is_dir() {
-                    plan.verify_tree(src, Path::new(rel))?;
+                    plan.verify_tree(src, rel)?;
                 } else {
                     plan.verify_source(src)?;
                 }
@@ -862,8 +948,8 @@ fn execute_walk(
                     eprintln!(
                         "  {} {} (data of {})",
                         color::bold("Would copy"),
-                        rel,
-                        color::cyan(soname)
+                        rel.display(),
+                        color::cyan(rule)
                     );
                     continue;
                 }
@@ -872,12 +958,12 @@ fn execute_walk(
                         eprintln!(
                             "  {} {} <- {} (data of {}, {})",
                             color::bold_green("Copied"),
-                            rel,
+                            rel.display(),
                             src.display(),
-                            color::cyan(soname),
+                            color::cyan(rule),
                             color::dim(&format_size(bytes))
                         );
-                        if *rel == "share/alsa" {
+                        if *patch_alsa {
                             patch_carried_alsa_conf(directory, dry_run);
                         }
                     }
@@ -892,7 +978,7 @@ fn execute_walk(
                         eprintln!(
                             "  {} could not carry {}: {e}",
                             color::bold_red("warning:"),
-                            rel
+                            rel.display()
                         );
                     }
                 }
@@ -1826,8 +1912,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // relative to the library directory, so aliases with identical bytes
     // symlink instead of copy.
     let mut bundled_by_hash: HashMap<[u8; 32], PathBuf> = HashMap::new();
-    // The data directories the walk already carried or found in the tree.
-    let mut carried_data: HashSet<String> = HashSet::new();
     // The destinations the walk intends to write, resolved against each
     // other and against the tree before any of them is written, with the
     // writes themselves queued for the executor.
@@ -1895,50 +1979,75 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let Some((rule, group)) = group_queue.pop_front() else {
                     continue;
                 };
-                // Data and helper groups are the resource phases that own
-                // them; plugin groups collect here, into the object queue.
-                let declared = onelf_format::catalog::builtins()
+                let descriptor = onelf_format::catalog::builtins()
                     .iter()
-                    .find(|d| d.id.as_str() == rule)
-                    .and_then(|d| d.resources.plugins.iter().find(|g| g.id.as_str() == group));
-                let Some(declared) = declared else {
+                    .find(|d| d.id.as_str() == rule);
+                let Some(descriptor) = descriptor else {
                     continue;
                 };
-                let collection = collect::collect_group(
-                    &rule,
-                    declared,
-                    &admitted,
-                    sysroot_universe.as_ref(),
-                    target_class,
-                    target_machine,
-                )?;
-                for dir in &collection.search_dirs {
-                    if !search_paths.contains(dir) {
-                        search_paths.push(dir.clone());
-                    }
-                }
-                for plugin in &collection.plugins {
-                    if let Some(dir) = plugin.resolved.parent() {
-                        let dir = dir.to_path_buf();
-                        if !search_paths.contains(&dir) {
-                            search_paths.push(dir);
+                // Plugin groups collect here, into the object queue.
+                if let Some(declared) = descriptor
+                    .resources
+                    .plugins
+                    .iter()
+                    .find(|g| g.id.as_str() == group)
+                {
+                    let collection = collect::collect_group(
+                        &rule,
+                        declared,
+                        &admitted,
+                        sysroot_universe.as_ref(),
+                        target_class,
+                        target_machine,
+                    )?;
+                    for dir in &collection.search_dirs {
+                        if !search_paths.contains(dir) {
+                            search_paths.push(dir.clone());
                         }
                     }
+                    for plugin in &collection.plugins {
+                        if let Some(dir) = plugin.resolved.parent() {
+                            let dir = dir.to_path_buf();
+                            if !search_paths.contains(&dir) {
+                                search_paths.push(dir);
+                            }
+                        }
+                    }
+                    report_collection(&collection);
+                    for plugin in &collection.plugins {
+                        group_dests
+                            .entry(plugin.soname.clone())
+                            .or_insert_with(|| plugin.destination.clone());
+                        needed_by
+                            .entry(plugin.soname.clone())
+                            .or_insert_with(|| format!("rule {rule} group {group}"));
+                        // An object that drained before its group popped chose
+                        // its destination flat; the group's declared destination
+                        // supersedes it, so the object runs again with the
+                        // repair that move implies.
+                        already_processed.remove(&plugin.soname);
+                        discovery.enqueue(&plugin.soname)?;
+                    }
+                    continue;
                 }
-                report_collection(&collection);
-                for plugin in &collection.plugins {
-                    group_dests
-                        .entry(plugin.soname.clone())
-                        .or_insert_with(|| plugin.destination.clone());
-                    needed_by
-                        .entry(plugin.soname.clone())
-                        .or_insert_with(|| format!("rule {rule} group {group}"));
-                    // An object that drained before its group popped chose
-                    // its destination flat; the group's declared destination
-                    // supersedes it, so the object runs again with the
-                    // repair that move implies.
-                    already_processed.remove(&plugin.soname);
-                    discovery.enqueue(&plugin.soname)?;
+                // Data groups carry here. A helper group names an
+                // associated plugin or data group and keeps its own
+                // resource phase.
+                if let Some(declared) = descriptor
+                    .resources
+                    .data
+                    .iter()
+                    .find(|g| g.id.as_str() == group)
+                {
+                    carry_data_group(
+                        &opts.directory,
+                        descriptor,
+                        declared,
+                        &admitted,
+                        sysroot_universe.as_ref(),
+                        &mut plan,
+                        &mut actions,
+                    )?;
                 }
                 continue;
             }
@@ -2038,17 +2147,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // A plugin a pre-fix run left flat: the subdirectory copy
                 // below replaces it.
                 let stale_flat = already_flat && rel != Path::new(&soname);
-                // The data the library reads from a compiled-in path goes
-                // with it, before any skip: a tree bundled before the data
-                // was carried has the library but not the data.
-                plan_carried_data(
-                    &opts.directory,
-                    &soname,
-                    &resolved,
-                    &mut carried_data,
-                    &mut plan,
-                    &mut actions,
-                )?;
                 // A plugin keeping its subdirectory is already bundled on
                 // a re-run, or the candidate is the tree's own file, found
                 // through a search dir inside the tree. A flat copy is
@@ -3183,26 +3281,32 @@ mod plugin_dir_tests {
         (root.clone(), root.join("usr/lib/libasound.so.2"))
     }
 
-    /// Plan and execute a carry for one library, the way the planned
-    /// walk does, so the carry tests run against the real path.
-    fn carry_lib_data(
-        directory: &Path,
-        soname: &str,
-        resolved: &Path,
-        dry_run: bool,
-        carried: &mut HashSet<String>,
-    ) {
+    /// Carry every data group of the rule `soname` activates, the way
+    /// the planned walk does: the resolved library is the one admitted
+    /// root, and the group's declared alternatives are examined in
+    /// order. A soname no descriptor triggers returns without a carry.
+    fn carry_soname_data(directory: &Path, soname: &str, resolved: &Path, dry_run: bool) {
+        let descriptor = onelf_format::catalog::builtins()
+            .iter()
+            .find(|d| d.triggers.iter().any(|t| t.matches_soname(soname)));
+        let Some(descriptor) = descriptor else {
+            return;
+        };
+        let admitted = [AdmittedLibrary::new(soname, resolved)];
         let mut plan = DestinationPlan::load(directory).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
-        plan_carried_data(
-            directory,
-            soname,
-            resolved,
-            carried,
-            &mut plan,
-            &mut actions,
-        )
-        .unwrap();
+        for declared in &descriptor.resources.data {
+            carry_data_group(
+                directory,
+                descriptor,
+                declared,
+                &admitted,
+                None,
+                &mut plan,
+                &mut actions,
+            )
+            .unwrap();
+        }
         assert!(!plan.has_findings(), "{:?}", plan.findings());
         execute_walk(
             directory,
@@ -3221,19 +3325,17 @@ mod plugin_dir_tests {
         let tree = root.join("tree");
         fs::create_dir_all(tree.join("lib")).unwrap();
 
-        let mut carried = HashSet::new();
-        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libasound.so.2", &lib, false);
 
         assert_eq!(
             fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap(),
             "conf"
         );
         assert!(tree.join("share/alsa/cards/aliases.conf").is_file());
-        assert_eq!(carried, HashSet::from(["share/alsa".to_string()]));
 
         // A second run is a no-op, not a second copy.
         let before = fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap();
-        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libasound.so.2", &lib, false);
         assert_eq!(
             fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap(),
             before
@@ -3306,43 +3408,123 @@ pcm.default cards.pcm.default
     }
 
     #[test]
-    fn multiarch_and_store_layouts_are_both_found() {
+    fn multiarch_and_store_layouts_are_both_served() {
         // Debian: the library two levels below the one share serves.
         let root = std::env::temp_dir().join(format!("onelf-libdata-arch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let multiarch = root.join("usr/lib/x86_64-linux-gnu");
         fs::create_dir_all(&multiarch).unwrap();
-        let alsa = root.join("usr/share/alsa");
-        fs::create_dir_all(&alsa).unwrap();
-        fs::write(alsa.join("alsa.conf"), b"conf").unwrap();
-        assert_eq!(
-            data_dir_beside(&multiarch.join("libasound.so.2"), "share/alsa"),
-            Some(alsa)
+        fs::create_dir_all(root.join("usr/share/alsa/cards")).unwrap();
+        fs::write(root.join("usr/share/alsa/alsa.conf"), b"conf").unwrap();
+        fs::write(root.join("usr/share/alsa/cards/aliases.conf"), b"cards").unwrap();
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        carry_soname_data(
+            &tree,
+            "libasound.so.2",
+            &multiarch.join("libasound.so.2"),
+            false,
         );
+        assert_eq!(
+            fs::read_to_string(tree.join("share/alsa/alsa.conf")).unwrap(),
+            "conf"
+        );
+        assert!(tree.join("share/alsa/cards/aliases.conf").is_file());
 
         // Nix: the store path carries its own share beside lib.
-        let store = root.join("nix/store/x-alsa-lib");
+        let store = root.join("nix/store/x-xkb-data");
         fs::create_dir_all(store.join("lib")).unwrap();
         fs::create_dir_all(store.join("share/X11/xkb/symbols")).unwrap();
+        fs::write(store.join("share/X11/xkb/symbols/us"), b"us").unwrap();
+        let tree = root.join("store-tree");
+        fs::create_dir_all(&tree).unwrap();
+        carry_soname_data(
+            &tree,
+            "libxkbcommon.so.0",
+            &store.join("lib/libxkbcommon.so.0"),
+            false,
+        );
         assert_eq!(
-            data_dir_beside(&store.join("lib/libxkbcommon.so.0"), "share/X11/xkb"),
-            Some(store.join("share/X11/xkb"))
+            fs::read_to_string(tree.join("share/X11/xkb/symbols/us")).unwrap(),
+            "us"
         );
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A required data group whose alternatives exist nowhere in the
+    /// source that provided the library fails the assembly, naming the
+    /// rule, the destination and the examined locations.
     #[test]
-    fn missing_data_is_skipped_and_the_lint_still_answers_for_it() {
-        let (root, lib) = dist_tree("missing");
-        // No share/X11/locale on this host.
+    fn required_data_the_source_lacks_fails_the_assembly() {
+        let (root, lib) = dist_tree("required-miss");
         let tree = root.join("tree");
         fs::create_dir_all(&tree).unwrap();
 
-        let mut carried = HashSet::new();
-        carry_lib_data(&tree, "libX11.so.6", &lib, false, &mut carried);
-
+        let descriptor = onelf_format::catalog::builtins()
+            .iter()
+            .find(|d| d.triggers.iter().any(|t| t.matches_soname("libX11.so.6")))
+            .unwrap();
+        let admitted = [AdmittedLibrary::new("libX11.so.6", &lib)];
+        let mut plan = DestinationPlan::load(&tree).unwrap();
+        let mut actions: Vec<WalkAction> = Vec::new();
+        let declared = descriptor.resources.data.first().unwrap();
+        let err = carry_data_group(
+            &tree,
+            descriptor,
+            declared,
+            &admitted,
+            None,
+            &mut plan,
+            &mut actions,
+        )
+        .expect_err("a required data miss must fail the assembly");
+        let text = err.to_string();
+        assert!(text.contains("rule x11"), "{text}");
+        assert!(text.contains("requires directory data"), "{text}");
+        assert!(text.contains("share/X11/locale"), "{text}");
+        assert!(text.contains("absent"), "{text}");
+        assert!(actions.is_empty(), "{actions:?}");
         assert!(!tree.join("share").exists());
-        assert!(carried.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An optional data group the source lacks is reported and the
+    /// carry goes on without it.
+    #[test]
+    fn optional_data_the_source_lacks_warns_and_continues() {
+        let root = std::env::temp_dir().join(format!("onelf-libdata-opt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        let lib = root.join("usr/lib/libgirepository-1.0.so.1");
+        fs::write(&lib, b"elf").unwrap();
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        let descriptor = onelf_format::catalog::builtins()
+            .iter()
+            .find(|d| {
+                d.triggers
+                    .iter()
+                    .any(|t| t.matches_soname("libgirepository-1.0.so.1"))
+            })
+            .unwrap();
+        let admitted = [AdmittedLibrary::new("libgirepository-1.0.so.1", &lib)];
+        let mut plan = DestinationPlan::load(&tree).unwrap();
+        let mut actions: Vec<WalkAction> = Vec::new();
+        let declared = descriptor.resources.data.first().unwrap();
+        carry_data_group(
+            &tree,
+            descriptor,
+            declared,
+            &admitted,
+            None,
+            &mut plan,
+            &mut actions,
+        )
+        .unwrap();
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(!plan.has_findings());
+        assert!(!tree.join("lib/girepository-1.0").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3352,15 +3534,13 @@ pcm.default cards.pcm.default
         let tree = root.join("tree");
         fs::create_dir_all(&tree).unwrap();
 
-        let mut carried = HashSet::new();
         // The x11 variant links libxkbcommon but owns no data; the soname
         // prefix must not match it.
-        carry_lib_data(&tree, "libxkbcommon-x11.so.0", &lib, false, &mut carried);
-        assert!(carried.is_empty());
+        carry_soname_data(&tree, "libxkbcommon-x11.so.0", &lib, false);
         assert!(!tree.join("share/X11").exists());
 
         // An unrelated library carries nothing either.
-        carry_lib_data(&tree, "libpulse.so.0", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libpulse.so.0", &lib, false);
         assert!(!tree.join("share/alsa").exists());
         let _ = fs::remove_dir_all(&root);
     }
@@ -3380,22 +3560,21 @@ pcm.default cards.pcm.default
         )
         .unwrap();
 
-        let mut carried = HashSet::new();
-        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libasound.so.2", &lib, false);
 
-        assert_eq!(carried, HashSet::from(["share/alsa".to_string()]));
         let out = fs::read_to_string(alsa.join("alsa.conf")).unwrap();
         assert!(out.contains("{ @func datadir } \"/alsa.conf.d\""));
 
         // Nothing is rewritten again, and nothing else is copied over it.
         let before = out;
-        carry_lib_data(&tree, "libasound.so.2", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libasound.so.2", &lib, false);
         assert_eq!(fs::read_to_string(alsa.join("alsa.conf")).unwrap(), before);
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// libmagic's compiled database is a file beside the library, not a
-    /// directory, and it lands where `MAGIC` and the lint look.
+    /// libmagic's compiled database is a file, not a directory, and it
+    /// lands at the one destination the declaration and the runtime's
+    /// `MAGIC` mapping name, whichever alternative served it.
     #[test]
     fn a_carried_magic_database_is_the_file_the_runtime_names() {
         let root = std::env::temp_dir().join(format!("onelf-libdata-mg-{}", std::process::id()));
@@ -3407,16 +3586,58 @@ pcm.default cards.pcm.default
         let tree = root.join("tree");
         fs::create_dir_all(&tree).unwrap();
 
-        let mut carried = HashSet::new();
-        carry_lib_data(&tree, "libmagic.so.1", &lib, false, &mut carried);
+        carry_soname_data(&tree, "libmagic.so.1", &lib, false);
 
         assert_eq!(
-            fs::read(tree.join("share/file/misc/magic.mgc")).unwrap(),
+            fs::read(tree.join("share/misc/magic.mgc")).unwrap(),
             b"compiled"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The declared alternatives are ordered: the first that exists on
+    /// the admitted root is the one taken, and a later alternative is
+    /// never examined once one is found.
+    #[test]
+    fn the_first_existing_data_alternative_wins() {
+        let root = std::env::temp_dir().join(format!("onelf-libdata-alt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(root.join("usr/share/file/misc")).unwrap();
+        fs::create_dir_all(root.join("usr/share/misc")).unwrap();
+        fs::write(root.join("usr/share/file/misc/magic.mgc"), b"first").unwrap();
+        fs::write(root.join("usr/share/misc/magic.mgc"), b"second").unwrap();
+        let lib = root.join("usr/lib/libmagic.so.1");
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        carry_soname_data(&tree, "libmagic.so.1", &lib, false);
+
         assert_eq!(
-            carried,
-            HashSet::from(["share/file/misc/magic.mgc".to_string()])
+            fs::read(tree.join("share/misc/magic.mgc")).unwrap(),
+            b"first"
+        );
+        assert!(!tree.join("share/file").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// With the first alternative absent, the next one serves.
+    #[test]
+    fn a_later_data_alternative_serves_when_the_first_is_absent() {
+        let root = std::env::temp_dir().join(format!("onelf-libdata-alt2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::create_dir_all(root.join("usr/share/misc")).unwrap();
+        fs::write(root.join("usr/share/misc/magic.mgc"), b"second").unwrap();
+        let lib = root.join("usr/lib/libmagic.so.1");
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        carry_soname_data(&tree, "libmagic.so.1", &lib, false);
+
+        assert_eq!(
+            fs::read(tree.join("share/misc/magic.mgc")).unwrap(),
+            b"second"
         );
         let _ = fs::remove_dir_all(&root);
     }

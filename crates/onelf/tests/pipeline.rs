@@ -814,8 +814,9 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
 
 /// Compile the shared objects of a fake distribution tree: the framework
 /// libraries and every plugin file their group directories hold, laid
-/// out the way a distribution installs them. Returns the library
-/// directory, or None when no compiler is available.
+/// out the way a distribution installs them. The alsa configuration the
+/// framework's required data group declares is part of the tree. Returns
+/// the library directory, or None when no compiler is available.
 fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) -> Option<PathBuf> {
     let libdir = td.join("dist/usr/lib");
     std::fs::create_dir_all(&libdir).unwrap();
@@ -836,6 +837,13 @@ fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) 
             return None;
         }
     }
+    if sonames.contains(&"libasound.so.2") {
+        write(&td.join("dist/usr/share/alsa/alsa.conf"), "conf\n");
+        write(
+            &td.join("dist/usr/share/alsa/cards/aliases.conf"),
+            "cards\n",
+        );
+    }
     for (group, plugins) in groups {
         for plugin in *plugins {
             let out = libdir.join(group).join(plugin);
@@ -853,13 +861,13 @@ fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) 
 
 /// Compile an app naming `sonames`, bundle it with only the framework
 /// tree's own library directory on the search path, and return the
-/// AppDir with the build's stderr. Returns None when no compiler is
+/// AppDir with the build's output. Returns None when no compiler is
 /// available.
 fn bundle_with_plugin_tree(
     td: &Path,
     sonames: &[&str],
     libdir: &Path,
-) -> Option<(PathBuf, String)> {
+) -> Option<(PathBuf, std::process::Output)> {
     let app = td.join("app");
     write(&td.join("main.c"), "int main(void){return 0;}\n");
     let mut args: Vec<String> = vec![
@@ -882,8 +890,7 @@ fn bundle_with_plugin_tree(
     if let Some(pe) = patchelf() {
         c.env("ONELF_PATCHELF", pe);
     }
-    let o = c.output().expect("spawn onelf bundle-libs");
-    Some((app, String::from_utf8_lossy(&o.stderr).into_owned()))
+    Some((app, c.output().expect("spawn onelf bundle-libs")))
 }
 
 /// Every activated framework group arrives complete and in its
@@ -899,9 +906,11 @@ fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
         let Some(libdir) = plugin_tree_sources(&td, sonames, groups) else {
             return;
         };
-        let Some((app, err)) = bundle_with_plugin_tree(&td, sonames, &libdir) else {
+        let Some((app, out)) = bundle_with_plugin_tree(&td, sonames, &libdir) else {
             return;
         };
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{tag}: bundle-libs failed:\n{err}");
         assert!(
             app.join("bin/app").is_file(),
             "{tag}: the app itself must survive: {err}"
@@ -966,9 +975,11 @@ fn incompatible_plugins_are_skipped_without_shadowing_valid_ones() {
         "this is not an ELF object\n",
     );
 
-    let Some((app, err)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
         return;
     };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
     assert!(
         app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
             .is_file(),
@@ -1051,15 +1062,18 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
         &[],
         &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
     );
-    // The ALSA library without its plugin directory: the group has
-    // nowhere to look inside the sysroot.
+    // The ALSA library with its required configuration but without its
+    // plugin directory: the data group has its declared location, the
+    // plugin group has nowhere to look inside the sysroot.
+    std::fs::create_dir_all(rootfs.join("usr/share/alsa")).unwrap();
+    write(&rootfs.join("usr/share/alsa/alsa.conf"), "conf\n");
     write_pacman_entry(
         &rootfs,
         "alsa-lib",
         "1.0-1",
         &["glibc"],
         &[],
-        &["usr/lib/libasound.so.2"],
+        &["usr/lib/libasound.so.2", "usr/share/alsa/alsa.conf"],
     );
     write_pacman_entry(
         &rootfs,
@@ -1100,6 +1114,10 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
         "no group directory is invented:\n{err}"
     );
     assert!(
+        appdir.join("share/alsa/alsa.conf").is_file(),
+        "the required data group is still carried from the sysroot:\n{err}"
+    );
+    assert!(
         err.contains("no usable plugin group") && err.contains("alsa/"),
         "the omission names the rule and group:\n{err}"
     );
@@ -1116,9 +1134,11 @@ fn a_rebundled_flat_plugin_migrates_into_its_group_layout() {
     let Some(libdir) = plugin_tree_sources(&td, &["libasound.so.2"], &groups) else {
         return;
     };
-    let Some((app, err)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
         return;
     };
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "first run failed:\n{err}");
     assert!(
         app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
             .is_file(),
@@ -1152,6 +1172,364 @@ fn a_rebundled_flat_plugin_migrates_into_its_group_layout() {
             .is_file(),
         "the group layout copy stays:\n{err}"
     );
+}
+
+/// A fake distribution tree for data-carry fixtures: the framework
+/// libraries under `usr/lib`, and `files` written at their
+/// dist-root-relative paths, which are the locations the declared data
+/// alternatives name. Returns the tree root, or None when no compiler
+/// is available.
+fn data_tree_sources(td: &Path, sonames: &[&str], files: &[(&str, &str)]) -> Option<PathBuf> {
+    let root = td.join("dist");
+    let libdir = root.join("usr/lib");
+    std::fs::create_dir_all(&libdir).unwrap();
+    write(
+        &td.join("dist/framework.c"),
+        "int framework(void){return 1;}\n",
+    );
+    for soname in sonames {
+        if !cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{soname}"),
+                td.join("dist/framework.c").to_str().unwrap(),
+            ],
+            &libdir.join(soname),
+        ) {
+            return None;
+        }
+    }
+    for (rel, content) in files {
+        write(&root.join(rel), content);
+    }
+    Some(root)
+}
+
+/// The declared data alternatives are ordered and land at the
+/// destinations the runtime mappings name: the MAGIC database takes the
+/// first alternative that exists and never a later one, and the Tcl
+/// script library prefers the directory beside it while Tk falls back
+/// to the versioned share layout under the installation prefix.
+#[test]
+fn declared_data_takes_the_first_alternative_that_exists() {
+    let td = workdir("data-alternatives");
+    let Some(dist) = data_tree_sources(
+        &td,
+        &["libmagic.so.1", "libtcl8.6.so", "libtk8.6.so"],
+        &[
+            ("usr/share/file/misc/magic.mgc", "compiled-one\n"),
+            ("usr/share/misc/magic.mgc", "compiled-two\n"),
+            ("usr/lib/tcl8.6/init.tcl", "tcl-beside\n"),
+            ("usr/share/tcltk/tcl8.6/init.tcl", "tcl-prefix\n"),
+            ("usr/share/tcltk/tk8.6/init.tcl", "tk-prefix\n"),
+        ],
+    ) else {
+        return;
+    };
+    let sonames = ["libmagic.so.1", "libtcl8.6.so", "libtk8.6.so"];
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &sonames, &dist.join("usr/lib")) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/misc/magic.mgc")).unwrap(),
+        "compiled-one\n",
+        "the first MAGIC alternative is the one carried:\n{err}"
+    );
+    assert!(
+        !app.join("share/file").exists(),
+        "no later alternative:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("lib/tcl8.6/init.tcl")).unwrap(),
+        "tcl-beside\n",
+        "the alternative beside the library comes first:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("lib/tk8.6/init.tcl")).unwrap(),
+        "tk-prefix\n",
+        "the prefix alternative serves where the library directory has none:\n{err}"
+    );
+}
+
+/// With the first declared alternative absent, the next one serves.
+#[test]
+fn a_later_declared_alternative_serves_when_the_first_is_absent() {
+    let td = workdir("data-later-alt");
+    let Some(dist) = data_tree_sources(
+        &td,
+        &["libmagic.so.1"],
+        &[("usr/share/misc/magic.mgc", "compiled-two\n")],
+    ) else {
+        return;
+    };
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libmagic.so.1"], &dist.join("usr/lib"))
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/misc/magic.mgc")).unwrap(),
+        "compiled-two\n",
+        "the second MAGIC alternative is carried when the first is absent:\n{err}"
+    );
+}
+
+/// XKB keymaps and the Xlib locale and compose data are carried beside
+/// the libraries that read them from compiled-in paths.
+#[test]
+fn xkb_and_x11_data_are_carried_beside_their_libraries() {
+    let td = workdir("data-xkb-x11");
+    let Some(dist) = data_tree_sources(
+        &td,
+        &["libxkbcommon.so.0", "libX11.so.6"],
+        &[
+            ("usr/share/X11/xkb/symbols/us", "us\n"),
+            ("usr/share/X11/locale/Compose", "compose\n"),
+        ],
+    ) else {
+        return;
+    };
+    let sonames = ["libxkbcommon.so.0", "libX11.so.6"];
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &sonames, &dist.join("usr/lib")) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert!(
+        app.join("share/X11/xkb/symbols/us").is_file(),
+        "the keymaps are carried:\n{err}"
+    );
+    assert!(
+        app.join("share/X11/locale/Compose").is_file(),
+        "the locale data is carried:\n{err}"
+    );
+}
+
+/// GI typelibs ride along in the library directory the runtime's
+/// `GI_TYPELIB_PATH` mapping names, laid out as the source kept them.
+#[test]
+fn gi_typelibs_are_carried_into_the_library_directory() {
+    let td = workdir("data-gi");
+    let Some(dist) = data_tree_sources(
+        &td,
+        &["libgirepository-1.0.so.1"],
+        &[("usr/lib/girepository-1.0/GLib-2.0.typelib", "typelib\n")],
+    ) else {
+        return;
+    };
+    let Some((app, out)) =
+        bundle_with_plugin_tree(&td, &["libgirepository-1.0.so.1"], &dist.join("usr/lib"))
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert!(
+        app.join("lib/girepository-1.0/GLib-2.0.typelib").is_file(),
+        "the typelibs are carried:\n{err}"
+    );
+    assert!(
+        !err.contains("optional data unavailable"),
+        "a present group is not reported unavailable:\n{err}"
+    );
+}
+
+/// Translation catalogs come from the installation prefix the
+/// declaration names and land under the tree root the runtime's
+/// `TEXTDOMAINDIR` mapping names.
+#[test]
+fn translations_are_carried_from_the_installation_prefix() {
+    let td = workdir("data-locale");
+    let Some(dist) = data_tree_sources(
+        &td,
+        &["libintl.so.8"],
+        &[("usr/share/locale/de/LC_MESSAGES/app.mo", "messages\n")],
+    ) else {
+        return;
+    };
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libintl.so.8"], &dist.join("usr/lib"))
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert!(
+        app.join("share/locale/de/LC_MESSAGES/app.mo").is_file(),
+        "the catalogs are carried:\n{err}"
+    );
+}
+
+/// A required data group with no existing alternative fails the
+/// assembly with a finding naming the rule and the destination, and
+/// nothing is invented in the tree.
+#[test]
+fn required_data_the_source_lacks_fails_the_build() {
+    let td = workdir("data-required-miss");
+    let Some(dist) = data_tree_sources(&td, &["libmagic.so.1"], &[]) else {
+        return;
+    };
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libmagic.so.1"], &dist.join("usr/lib"))
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a required data miss must fail the build:\n{err}"
+    );
+    assert!(
+        err.contains("rule magic") && err.contains("share/misc/magic.mgc"),
+        "the failure names the rule and the destination:\n{err}"
+    );
+    assert!(
+        !app.join("share/misc/magic.mgc").exists(),
+        "no data is invented:\n{err}"
+    );
+}
+
+/// An optional data group the selected source lacks warns and the
+/// build continues without it.
+#[test]
+fn optional_data_the_source_lacks_warns_and_the_build_continues() {
+    let td = workdir("data-optional-miss");
+    let Some(dist) = data_tree_sources(&td, &["libgirepository-1.0.so.1"], &[]) else {
+        return;
+    };
+    let Some((app, out)) =
+        bundle_with_plugin_tree(&td, &["libgirepository-1.0.so.1"], &dist.join("usr/lib"))
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an optional data miss is not a failure:\n{err}"
+    );
+    assert!(
+        err.contains("gi/typelibs") && err.contains("optional data unavailable"),
+        "the omission names the rule and group:\n{err}"
+    );
+    assert!(
+        !app.join("lib/girepository-1.0").exists(),
+        "no group directory is invented:\n{err}"
+    );
+}
+
+/// Data the selected sysroot closure does not hold is never taken from
+/// the packer's machine or from an unselected package: a required data
+/// group fails the build naming the owner of the refused location, and
+/// nothing appears in the tree.
+#[test]
+fn sysroot_data_is_never_taken_outside_the_selected_closure() {
+    let td = workdir("data-sysroot");
+    let rootfs = td.join("rootfs");
+    for d in ["usr/bin", "usr/lib", "usr/share/X11/xkb/symbols"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    write(&td.join("xkb.c"), "int xkb_keysym(void){return 1;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libxkbcommon.so.0",
+            td.join("xkb.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libxkbcommon.so.0"),
+    ) {
+        return;
+    }
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libxkbcommon.so.0",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return;
+    }
+    // The data exists in the sysroot tree, but its package was never
+    // selected: the xkb package ships the library alone.
+    write(&rootfs.join("usr/share/X11/xkb/symbols/us"), "us\n");
+    let Some(host_libc) = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6") else {
+        return;
+    };
+    let Some(host_ld) = ldd_path(&rootfs.join("usr/bin/app"), "ld-linux") else {
+        return;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "xkb",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libxkbcommon.so.0"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "xkeyboard-config",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/share/X11/xkb/symbols/us"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "xkb"],
+        &[],
+        &["usr/bin/app"],
+    );
+
+    let appdir = td.join("appdir");
+    std::fs::create_dir_all(&appdir).unwrap();
+    let mut c = Command::new(onelf());
+    c.args([
+        "bundle-libs",
+        appdir.to_str().unwrap(),
+        "--target",
+        "bin/app",
+    ])
+    .args(["--sysroot", rootfs.to_str().unwrap()])
+    .args(["--search-path", rootfs.join("usr/lib").to_str().unwrap()]);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !o.status.success(),
+        "a required data miss must fail even with the data on the machine:\n{err}"
+    );
+    assert!(
+        err.contains("rule xkb") && err.contains("share/X11/xkb"),
+        "the failure names the rule and the destination:\n{err}"
+    );
+    assert!(
+        err.contains("unselected package xkeyboard-config"),
+        "the refusal names the package that owns the location:\n{err}"
+    );
+    assert!(
+        !appdir.join("share/X11/xkb").exists(),
+        "no data is taken from the sysroot tree or the machine:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// Reversing the enumeration order of equivalent recipe inputs (the
