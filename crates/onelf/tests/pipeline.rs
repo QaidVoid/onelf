@@ -87,6 +87,382 @@ fn fuse_available() -> bool {
     })
 }
 
+/// How this suite can run a child as root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootFlavor {
+    /// The suite itself is uid 0, so every child it spawns inherits that.
+    AlreadyRoot,
+    /// `unshare --user --map-root-user` maps this user to a
+    /// namespace-local root over the same filesystem, which is the UID
+    /// transition the privileged guarantees are written against.
+    UserNamespace,
+}
+
+/// Which kind of root this suite can reach, probed once by actually
+/// mapping one, the way [`fuse_available`] probes a mount.
+fn root_flavor() -> Option<RootFlavor> {
+    static FLAVOR: std::sync::OnceLock<Option<RootFlavor>> = std::sync::OnceLock::new();
+    *FLAVOR.get_or_init(|| {
+        use std::os::unix::fs::MetadataExt;
+
+        if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+            return Some(RootFlavor::AlreadyRoot);
+        }
+        let mapped = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        mapped.then_some(RootFlavor::UserNamespace)
+    })
+}
+
+/// Whether this suite can run a child as root: it already is uid 0, or
+/// `unshare` can map the current user to a namespace-local root. When
+/// neither is possible the test announces the skip and returns, the way
+/// [`fuse_available`] does; under `CI` that skip is a failure by design,
+/// because a capability runner has to actually prove these paths.
+fn root_available() -> bool {
+    match root_flavor() {
+        Some(_) => true,
+        None => {
+            skip("no root: the suite is not uid 0 and unshare cannot map one");
+            false
+        }
+    }
+}
+
+/// The fixed per-uid base the runtime itself resolves for uid 0. It is
+/// not a per-test path, so the guard below isolates it for one root test
+/// at a time and never touches what another root left there.
+fn root_base_path() -> PathBuf {
+    PathBuf::from("/tmp/onelf-0")
+}
+
+/// One root test at a time: every root launch shares the fixed base
+/// path, so the tests that use it cannot run beside each other.
+static ROOT_RUNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Root's per-uid base for the length of one test.
+///
+/// The base path is the runtime's own choice for uid 0, not a per-test
+/// path, so the guard keeps the tests that use it serialized and makes
+/// the state under it readable while it lives. When the suite can only
+/// reach root through a user namespace, the base is a `0700` directory
+/// under the test's scratch that each launch bind-mounts onto the fixed
+/// path inside its own mount namespace: whatever root writes turns up in
+/// the test's scratch, and whatever another root left at the fixed path
+/// is never touched. When the suite already runs as root, the fixed path
+/// is cleared for the test and handed back; state there that cannot be
+/// cleared is reported as a skip rather than deleted.
+struct RootBase {
+    /// Where root's base state is readable while the guard lives.
+    view: PathBuf,
+    /// Set when `view` is the backing directory of a bind mount.
+    backing: Option<PathBuf>,
+    /// Set when the fixed base path did not exist and the first launch's
+    /// wrapper creates it, so the guard removes it again.
+    mountpoint_made: bool,
+    flavor: RootFlavor,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Take the base guard for one root test, or `None` with the skip
+/// announced when the base cannot be prepared.
+fn root_base(td: &Path) -> Option<RootBase> {
+    let Some(flavor) = root_flavor() else {
+        skip("no root: the suite is not uid 0 and unshare cannot map one");
+        return None;
+    };
+    let _serial = ROOT_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let fixed = root_base_path();
+    match flavor {
+        RootFlavor::AlreadyRoot => {
+            if fixed.exists() {
+                unmount_under(&fixed);
+                if let Err(e) = std::fs::remove_dir_all(&fixed) {
+                    drop(_serial);
+                    skip(&format!(
+                        "root's base {} is in use and cannot be cleared: {e}",
+                        fixed.display()
+                    ));
+                    return None;
+                }
+            }
+            Some(RootBase {
+                view: fixed,
+                backing: None,
+                mountpoint_made: false,
+                flavor,
+                _serial,
+            })
+        }
+        RootFlavor::UserNamespace => {
+            let backing = td.join("root-base");
+            std::fs::create_dir_all(&backing).unwrap();
+            std::fs::set_permissions(
+                &backing,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
+            Some(RootBase {
+                view: backing.clone(),
+                backing: Some(backing),
+                mountpoint_made: std::fs::symlink_metadata(&fixed).is_err(),
+                flavor,
+                _serial,
+            })
+        }
+    }
+}
+
+impl Drop for RootBase {
+    fn drop(&mut self) {
+        unmount_under(&self.view);
+        let _ = std::fs::remove_dir_all(&self.view);
+        if self.mountpoint_made {
+            let _ = std::fs::remove_dir(root_base_path());
+        }
+    }
+}
+
+/// A command that runs `program` as root within `base`'s isolation.
+///
+/// The caller clears the environment on the returned command afterwards:
+/// root accepts nothing the invoking environment names, and the tests
+/// rely on that refusal. The child's umask is pinned to the conventional
+/// `022` so the modes the test reads afterwards are the ones the runtime
+/// chose rather than the calling shell's.
+fn root_command(base: &RootBase, program: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = match base.flavor {
+        RootFlavor::AlreadyRoot => Command::new(program),
+        RootFlavor::UserNamespace => {
+            let backing = base
+                .backing
+                .as_ref()
+                .expect("the emulated root base has a backing directory")
+                .display()
+                .to_string();
+            let fixed = root_base_path().display().to_string();
+            let script =
+                format!("mkdir -p {fixed} && mount --bind \"{backing}\" {fixed} && exec \"$0\"");
+            let mut wrapped = Command::new("unshare");
+            wrapped
+                .args(["--user", "--map-root-user", "--mount", "--"])
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .arg(program);
+            wrapped
+        }
+    };
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::umask(rustix::fs::Mode::WGRP | rustix::fs::Mode::WOTH);
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// The permission bits of `path`, or `None` when it is gone.
+fn mode_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|md| md.mode() & 0o7777)
+}
+
+/// The relative path of the first entry under `dir` that group or other
+/// can write, or `None` when there is none. Root's private state keeps
+/// whatever privacy it was created with, and the launch's own trees are
+/// executable, not writable.
+fn first_group_or_other_writable(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .flatten()
+        .find(|e| std::fs::symlink_metadata(e.path()).is_ok_and(|md| md.mode() & 0o022 != 0))
+        .map(|e| {
+            let path = e.path();
+            path.strip_prefix(dir)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
+/// Everything about `dir` that "unchanged" can mean: one line per entry
+/// plus the directory itself, each carrying relative path, mode, owner,
+/// group, size, modification time, and a content digest. Sorted, so two
+/// snapshots of an untouched tree compare equal with `==`.
+fn state_of(dir: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let line = |path: &Path| {
+        let md = std::fs::symlink_metadata(path).expect("snapshot entry");
+        let rel = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
+        let content = if md.is_file() {
+            blake3::hash(&std::fs::read(path).expect("snapshot content"))
+                .to_hex()
+                .to_string()
+        } else {
+            "-".to_string()
+        };
+        format!(
+            "{} {:o} {} {} {} {}.{} {}",
+            rel,
+            md.mode() & 0o7777,
+            md.uid(),
+            md.gid(),
+            md.len(),
+            md.mtime(),
+            md.mtime_nsec(),
+            content
+        )
+    };
+    let mut out = vec![line(dir)];
+    for entry in jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .flatten()
+    {
+        out.push(line(entry.path().as_path()));
+    }
+    out.sort();
+    out
+}
+
+/// The names and modes of `dir`'s direct children, hidden ones included,
+/// sorted, so two listings compare with `==`.
+fn entries_of(dir: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .expect("list directory")
+        .flatten()
+        .filter_map(|e| {
+            let md = std::fs::symlink_metadata(e.path()).ok()?;
+            Some(format!(
+                "{:o} {}",
+                md.mode() & 0o7777,
+                e.file_name().to_string_lossy()
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Pack a tiny set build, and an app whose `.onelf/sets` record pins it
+/// by `file://` URL and BLAKE3 digest. The build is an ordinary package,
+/// so acquiring the set at a launch exercises the full store path
+/// without a compiler or a sysroot. The app waits for `$RELEASE` only
+/// when a caller sets it, so the same package can be a held holder or a
+/// run-to-completion launch. Returns the build, its digest, and the app.
+fn pack_pinned_set(td: &Path) -> (PathBuf, String, PathBuf) {
+    const PINNED_APP: &str = r#"#!/bin/sh
+echo start
+echo uid=$(id -u)
+echo store=$ONELF_PLATFORM_STORE
+i=0
+while [ -n "$RELEASE" ] && [ ! -e "$RELEASE" ] && [ $i -lt 2000 ]; do sleep 0.05; i=$((i+1)); done
+echo done
+"#;
+
+    let tree = td.join("set-tree");
+    write(&tree.join("lib/libfixture.so.1"), "set library bytes\n");
+    write(&tree.join("lib/dummy"), "#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(
+        tree.join("lib/dummy"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let build = td.join("set.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "pack",
+            tree.to_str().unwrap(),
+            "-o",
+            build.to_str().unwrap(),
+        ])
+        .args([
+            "--command",
+            "lib/dummy",
+            "--mtime",
+            "0",
+            "--name",
+            "setbuild",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = blake3::hash(&std::fs::read(&build).unwrap())
+        .to_hex()
+        .to_string();
+
+    let dir = td.join("set-app");
+    write(&dir.join("bin/run"), PINNED_APP);
+    std::fs::set_permissions(
+        dir.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join(".onelf/sets"),
+        &format!(
+            "[fixture]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            build.display()
+        ),
+    );
+    let pkg = td.join("set-app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", dir.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", "setapp"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    (build, hash, pkg)
+}
+
+/// Plant the pinned build in a user-owned store at `td/user-store`, the
+/// way an ordinary user's earlier launch leaves one, and return the
+/// store's path for use as the `ONELF_PLATFORM_STORE` hint. Root must
+/// treat the hinted store as untrusted input it writes nothing into.
+fn plant_user_store(td: &Path, build: &Path, hash: &str) -> PathBuf {
+    let store = td.join("user-store");
+    let file = store.join("fixture").join(format!("{hash}.onelf"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::copy(build, &file).unwrap();
+    std::fs::set_permissions(
+        &file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    )
+    .unwrap();
+    store
+}
+
+/// The tree a held rundir launch has extracted under `base`, or `None`
+/// until it appears.
+fn held_tree(base: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("onelf-"))
+                && p.join("bin/run").is_file()
+        })
+}
+
 /// `patchelf` location: `ONELF_PATCHELF`, then `PATH`. `None` if absent.
 fn patchelf() -> Option<String> {
     if let Ok(p) = std::env::var("ONELF_PATCHELF")
@@ -166,27 +542,35 @@ impl Drop for Workdir {
     /// the scratch runtime dir when the test ends, which no removal can
     /// descend into, so those are lazily unmounted first, deepest first.
     fn drop(&mut self) {
-        let prefix = format!("{}/", self.0.display());
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-        let mut mounts: Vec<&str> = mountinfo
-            .lines()
-            .filter_map(|l| l.split(' ').nth(4))
-            .filter(|m| m.starts_with(&prefix))
-            .collect();
-        mounts.sort_by_key(|m| std::cmp::Reverse(m.len()));
-        for mount in mounts {
-            for helper in ["fusermount3", "fusermount"] {
-                if Command::new(helper)
-                    .args(["-u", "-z", mount])
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success())
-                {
-                    break;
-                }
+        unmount_under(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Lazily unmount every mount under `dir`, deepest first, so a removal
+/// can descend into the tree again. A root test's fixed base and a
+/// scratch directory have the same shape of leftovers: a mount whose
+/// server is gone outlives both unless it is detached explicitly.
+fn unmount_under(dir: &Path) {
+    let prefix = format!("{}/", dir.display());
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut mounts: Vec<&str> = mountinfo
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .filter(|m| m.starts_with(&prefix))
+        .collect();
+    mounts.sort_by_key(|m| std::cmp::Reverse(m.len()));
+    for mount in mounts {
+        for helper in ["fusermount3", "fusermount"] {
+            if Command::new(helper)
+                .args(["-u", "-z", mount])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                break;
             }
         }
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -8707,6 +9091,492 @@ fn the_cache_is_used_only_on_request() {
     let out = run_package(&mut run);
     assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("mode=cache"));
 
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Root that needs a pin another user has already mounted serves its own
+/// view from its own verified acquisition, and the user's mount, its
+/// server, and its runtime directory are left exactly as they were. The
+/// app reports the store root's launch exports, which is root's own
+/// store, never the hint naming the user's.
+///
+/// Skips when the suite can reach neither real root nor a user-namespace
+/// root, and when no user FUSE mount can exist here to be left alone.
+/// When the suite itself runs as root there is no other user to hold a
+/// mount, so the root-side assertions run without the holder.
+#[test]
+fn root_serves_its_own_set_view_not_a_users_mount() {
+    if !root_available() {
+        return;
+    }
+    if !fuse_available() || !have("fusermount3") {
+        return; // documented soft-skip
+    }
+    let td = workdir("rootsetview");
+    let Some(base) = root_base(&td) else {
+        return;
+    };
+    let (build, hash, pkg) = pack_pinned_set(&td);
+    let store = plant_user_store(&td, &build, &hash);
+    let run_dir = td.join("xdg-run");
+
+    // A user launch holds a mount of the user's stored copy while root
+    // runs. The first line arrives only after the set is acquired and
+    // mounted, so the mount is live from here on.
+    let held_and_mount = if root_flavor() == Some(RootFlavor::UserNamespace) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut held_cmd = Command::new(&pkg);
+        held_cmd
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache")
+            .env("ONELF_PLATFORM_STORE", &store)
+            .env("RELEASE", td.join("release"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        isolate(&mut held_cmd, &td);
+        let mut held = spawn_package(&mut held_cmd);
+        let mut line = String::new();
+        let read = std::io::BufReader::new(held.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        if read == 0 {
+            let out = held.wait_with_output().unwrap();
+            panic!(
+                "the user launch died before running:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let mut mount = None;
+        for _ in 0..200 {
+            mount = helper_mount_under(&run_dir);
+            if mount.is_some() {
+                break;
+            }
+            assert!(
+                held.try_wait().unwrap().is_none(),
+                "the user launch died before its mount appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let mount = mount.expect("the user mount of the pinned build never appeared");
+        Some((held, mount))
+    } else {
+        None
+    };
+
+    let xdg_before = entries_of(&run_dir);
+    let store_before = state_of(&store);
+
+    let mut run = root_command(&base, &pkg);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONELF_MODE", "cache")
+        .env("ONELF_PLATFORM_STORE", &store);
+    let out = run_package(&mut run);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("uid=0"),
+        "the root launch did not run as root:\n{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "store={}",
+            root_base_path().join("platform").display()
+        )),
+        "root's launch exports its own store, not the user's hint:\n{stdout}"
+    );
+    assert_eq!(
+        files_under(&base.view.join("platform")),
+        [format!("fixture/{hash}.onelf")],
+        "root acquired its own verified copy:\n{stdout}{stderr}"
+    );
+    let set_mountpoint = base.view.join(format!("onelf-set-{}", &hash[..16]));
+    assert!(
+        set_mountpoint.is_dir()
+            || files_under(&base.view.join("onelf").join("pkg"))
+                .iter()
+                .any(|p| p.contains("lib/libfixture.so.1")),
+        "root's set view lives neither at its own mountpoint nor in its own cache:\n{stdout}{stderr}"
+    );
+
+    if let Some((mut held, mount)) = held_and_mount {
+        assert!(
+            held.try_wait().unwrap().is_none(),
+            "the user launch died while root ran"
+        );
+        assert_eq!(
+            helper_mount_under(&run_dir),
+            Some(mount),
+            "the user mount was replaced while root ran"
+        );
+        assert_eq!(
+            entries_of(&run_dir),
+            xdg_before,
+            "root changed the user's runtime directory"
+        );
+        assert_eq!(
+            state_of(&store),
+            store_before,
+            "root changed the user's store while taking its own view"
+        );
+
+        std::fs::write(td.join("release"), "").unwrap();
+        let out = held.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for _ in 0..400 {
+            if helper_mount_under(&run_dir).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(
+            helper_mount_under(&run_dir),
+            None,
+            "the user mount outlived its last claim"
+        );
+    }
+
+    drop(base);
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Root's private base, its store directories, its published artifact,
+/// and its rundir tree keep the privacy they were created with through a
+/// failed acquisition, a successful one, and a held launch, and a failed
+/// acquisition leaves no staging scratch behind. The app inside reports
+/// the base's owner and mode as the runtime's own uid sees them.
+///
+/// Skips when the suite can reach neither real root nor a
+/// user-namespace root.
+#[test]
+fn root_neither_widens_private_state_nor_leaves_acquisition_scratch() {
+    if !root_available() {
+        return;
+    }
+    let td = workdir("rootprivate");
+    let Some(base) = root_base(&td) else {
+        return;
+    };
+    let (build, hash, pkg) = pack_pinned_set(&td);
+    let store = plant_user_store(&td, &build, &hash);
+
+    let root_run = |envs: &[(&str, &str)]| {
+        let mut run = root_command(&base, &pkg);
+        run.env_clear().env("PATH", "/usr/bin:/bin");
+        for (name, value) in envs {
+            run.env(name, value);
+        }
+        run_package(&mut run)
+    };
+
+    // The failed acquisition is tried first, while root's own store is
+    // still empty and the launch has to stage the pinned build itself.
+    // The bytes the pin names are what gets replaced: the fetch copies
+    // whatever the pin's URL serves.
+    let original = std::fs::read(&build).unwrap();
+    let mut bytes = original.clone();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 1;
+    std::fs::write(&build, &bytes).unwrap();
+    let out = root_run(&[
+        ("ONELF_MODE", "cache"),
+        ("ONELF_SET_MODE", "extract"),
+        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a tampered source ran:\n{stderr}");
+    assert!(
+        stderr.contains("dependency set") && stderr.contains("hash mismatch"),
+        "the failure names the set and the reason:\n{stderr}"
+    );
+    std::fs::write(&build, &original).unwrap();
+    let view = base.view.clone();
+    assert_eq!(
+        mode_of(&view),
+        Some(0o700),
+        "root's private base did not stay 0700"
+    );
+    assert_eq!(
+        files_under(&view.join("platform")),
+        Vec::<String>::new(),
+        "the failed acquisition published nothing"
+    );
+    assert_eq!(
+        entries_of(&view.join("platform")),
+        ["444 .fixture.lock", "700 fixture"],
+        "the failed acquisition left something besides the publication lock"
+    );
+    assert_eq!(
+        entries_of(&view.join("platform").join("fixture")),
+        Vec::<String>::new(),
+        "the failed acquisition left staging scratch"
+    );
+    assert_eq!(
+        first_group_or_other_writable(&view),
+        None,
+        "the failed acquisition left something under root's base writable by group or other"
+    );
+
+    // With the tampered source out of the way, the same launch succeeds
+    // and publishes a private artifact in a private store.
+    let out = root_run(&[
+        ("ONELF_MODE", "cache"),
+        ("ONELF_SET_MODE", "extract"),
+        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("uid=0"),
+        "the successful root launch failed:\n{stdout}{stderr}"
+    );
+    assert_eq!(
+        files_under(&view.join("platform")),
+        [format!("fixture/{hash}.onelf")],
+        "{stdout}{stderr}"
+    );
+    assert_eq!(
+        mode_of(&view),
+        Some(0o700),
+        "root's private base did not stay 0700"
+    );
+    assert_eq!(
+        mode_of(&view.join("platform")),
+        Some(0o700),
+        "root's store directory did not stay 0700"
+    );
+    assert_eq!(
+        mode_of(&view.join("platform").join("fixture")),
+        Some(0o700),
+        "the label directory did not stay 0700"
+    );
+    assert_eq!(
+        mode_of(
+            &view
+                .join("platform")
+                .join("fixture")
+                .join(format!("{hash}.onelf"))
+        ),
+        Some(0o600),
+        "the published artifact did not stay 0600"
+    );
+    assert_eq!(
+        first_group_or_other_writable(&view),
+        None,
+        "the successful acquisition left something under root's base writable by group or other"
+    );
+
+    // A held rundir launch keeps its tree private while it runs, and the
+    // tree reports its owner as uid 0 from the inside.
+    let probe = pack_script(
+        &td,
+        "probe",
+        r#"#!/bin/sh
+echo uid=$(id -u)
+echo basemode=$(stat -c %a "$(dirname "$ONELF_DIR")")
+echo baseowner=$(stat -c %u "$(dirname "$ONELF_DIR")")
+echo treemode=$(stat -c %a "$ONELF_DIR")
+sleep 12
+"#,
+    );
+    let mut held_cmd = root_command(&base, &probe);
+    use std::os::unix::process::CommandExt;
+
+    held_cmd
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONELF_MODE", "rundir")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut held = spawn_package(&mut held_cmd);
+    let mut tree = None;
+    for _ in 0..200 {
+        tree = held_tree(&view);
+        if tree.is_some() {
+            break;
+        }
+        assert!(
+            held.try_wait().unwrap().is_none(),
+            "the rundir launch died before its tree appeared"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let Some(tree) = tree else {
+        kill_group(&held);
+        let out = held.wait_with_output().unwrap();
+        panic!(
+            "the root rundir tree never appeared:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    use std::io::BufRead;
+    let mut report = String::new();
+    let mut lines = std::io::BufReader::new(held.stdout.as_mut().unwrap());
+    for _ in 0..4 {
+        let mut line = String::new();
+        lines.read_line(&mut line).unwrap();
+        report.push_str(&line);
+    }
+    let line_of = |key: &str| {
+        report
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {report}"))
+            .to_string()
+    };
+    assert_eq!(
+        line_of("uid="),
+        "0",
+        "the app did not run as root: {report}"
+    );
+    let basemode = u32::from_str_radix(&line_of("basemode="), 8).expect("base mode");
+    assert!(
+        basemode & 0o077 == 0,
+        "root's base is not owner-private from the inside: {report}"
+    );
+    assert_eq!(
+        line_of("baseowner="),
+        "0",
+        "root's base is not owned by uid 0 from the inside: {report}"
+    );
+    let treemode = u32::from_str_radix(&line_of("treemode="), 8).expect("tree mode");
+    assert!(
+        treemode & 0o022 == 0,
+        "the rundir tree is writable by group or other: {report}"
+    );
+    assert_eq!(
+        mode_of(&tree).map(|m| m & 0o022),
+        Some(0),
+        "the rundir tree's mode was widened"
+    );
+    assert_eq!(
+        mode_of(&view),
+        Some(0o700),
+        "root's private base was widened while the launch held it"
+    );
+    kill_group(&held);
+    held.wait().unwrap();
+
+    // The next root launch's sweep takes the abandoned tree away.
+    let sweeper = pack_script(&td, "sweep", "#!/bin/sh\necho swept\n");
+    let mut run = root_command(&base, &sweeper);
+    run.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONELF_MODE", "rundir");
+    let out = run_package(&mut run);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        held_tree(&view).is_none(),
+        "the abandoned tree was not reclaimed"
+    );
+    assert_eq!(mode_of(&view), Some(0o700));
+    assert_eq!(
+        first_group_or_other_writable(&view),
+        None,
+        "the sweep left something under root's base writable by group or other"
+    );
+
+    drop(base);
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// With a user store under the hint and root's own store still empty, a
+/// failed and a successful privileged acquisition both leave the hinted
+/// store byte-for-byte identical: contents, modes, owners, sizes, and
+/// modification times, verified against a snapshot of the whole tree.
+/// Root acquires into its own store instead.
+///
+/// Skips when the suite can reach neither real root nor a
+/// user-namespace root. When the suite already runs as root the planted
+/// store's owner is uid 0 as well, so the owner comparison is weaker
+/// there than the content, mode, and time comparisons.
+#[test]
+fn root_leaves_a_hinted_user_store_byte_identical() {
+    if !root_available() {
+        return;
+    }
+    let td = workdir("rootuserstore");
+    let Some(base) = root_base(&td) else {
+        return;
+    };
+    let (build, hash, pkg) = pack_pinned_set(&td);
+    let store = plant_user_store(&td, &build, &hash);
+    let before = state_of(&store);
+
+    let root_run = |envs: &[(&str, &str)]| {
+        let mut run = root_command(&base, &pkg);
+        run.env_clear().env("PATH", "/usr/bin:/bin");
+        for (name, value) in envs {
+            run.env(name, value);
+        }
+        run_package(&mut run)
+    };
+
+    // The failed acquisition is tried first, while root's own store is
+    // still empty and the launch has to stage the pinned build itself.
+    // The bytes the pin names are what gets replaced: the fetch copies
+    // whatever the pin's URL serves.
+    let original = std::fs::read(&build).unwrap();
+    let mut bytes = original.clone();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 1;
+    std::fs::write(&build, &bytes).unwrap();
+    let out = root_run(&[
+        ("ONELF_MODE", "cache"),
+        ("ONELF_SET_MODE", "extract"),
+        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a tampered source ran:\n{stderr}");
+    assert!(
+        stderr.contains("hash mismatch"),
+        "the failure names the reason:\n{stderr}"
+    );
+    assert_eq!(
+        state_of(&store),
+        before,
+        "a failed privileged acquisition changed the user's store"
+    );
+    std::fs::write(&build, &original).unwrap();
+
+    let out = root_run(&[
+        ("ONELF_MODE", "cache"),
+        ("ONELF_SET_MODE", "extract"),
+        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("uid=0"),
+        "the successful root launch failed:\n{stdout}{stderr}"
+    );
+    assert_eq!(
+        state_of(&store),
+        before,
+        "a successful privileged acquisition changed the user's store"
+    );
+    assert_eq!(
+        files_under(&base.view.join("platform")),
+        [format!("fixture/{hash}.onelf")],
+        "root did not acquire into its own store:\n{stdout}{stderr}"
+    );
+
+    drop(base);
     let _ = std::fs::remove_dir_all(&td);
 }
 
