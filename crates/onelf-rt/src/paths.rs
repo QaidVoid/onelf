@@ -282,6 +282,20 @@ pub fn resolve_store(package_id: &[u8; 32]) -> Option<PathBuf> {
     Some(base.join(format!("resolve-{}", crate::cache::hex(&package_id[0..8]))))
 }
 
+/// Where the resolver keeps the versioned record of one selection's
+/// decision for the package `package_id`.
+///
+/// Every active-pin set records its decision in its own directory of the
+/// resolver's store, named by the selection's canonical identity key, so
+/// selections that differ never read each other's records and lists that
+/// differ only in order share one. `selection_key` is a directory name
+/// the resolver mints; anything else names nothing.
+#[allow(dead_code)]
+pub fn resolve_selection_store(package_id: &[u8; 32], selection_key: &str) -> Option<PathBuf> {
+    let dir = onelf_format::resolve::selection_dir(selection_key)?;
+    Some(resolve_store(package_id)?.join(dir))
+}
+
 /// How long an unclaimed leftover must have sat untouched before a sweep may
 /// reclaim it.
 ///
@@ -703,6 +717,30 @@ mod tests {
     fn rejects_non_directory_and_missing() {
         let safe = onelf_format::cache_layout::is_safe_owned_dir;
         assert!(!safe(Path::new("/nonexistent/onelf/private/xyz"), uid()));
+    }
+
+    /// The selection store is named by a key the resolver mints. A
+    /// caller passing anything else, however crafted, names nothing.
+    #[test]
+    fn the_selection_store_refuses_what_the_resolver_did_not_mint() {
+        let id = [9u8; 32];
+        for key in ["", "../escape", "a/b", "ABC", "gg", " a", &"a".repeat(65)] {
+            assert_eq!(
+                resolve_selection_store(&id, key),
+                None,
+                "key {key:?} must name nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_store_lives_beside_the_resolver_store() {
+        let id = [9u8; 32];
+        let key = "ab".repeat(16);
+        let store = resolve_store(&id).expect("a private runtime directory");
+        let sel = resolve_selection_store(&id, &key).unwrap();
+        assert_eq!(sel, store.join(format!("sel-{key}")));
+        assert_eq!(sel.parent(), Some(store.as_path()));
     }
 }
 

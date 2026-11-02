@@ -17,6 +17,11 @@
 //! directory. No host directory is ever searched, so a soname the bundle
 //! lacks and the resolver did not choose fails by name instead of being
 //! satisfied by whatever the host has.
+//!
+//! A launch that activates only part of the package's dependency sets
+//! records its decision under the canonical identity of the pins it
+//! activated, so two selections never serve each other's decisions while
+//! lists that differ only in order share one.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
@@ -258,10 +263,74 @@ pub fn resolve(req: &Request) -> Resolution {
     if let Some(recorded) = load_recorded(req.store, &fingerprint) {
         return recorded;
     }
-
     let decision = decide_on(req, &host);
-    let winners = &decision.winners;
-    let farm = match materialize(req.store, &fingerprint, winners) {
+    let resolution = materialized(req, &fingerprint, &decision);
+    if let Err(e) = record(req.store, &fingerprint, &resolution, &decision.winners) {
+        eprintln!(
+            "onelf-rt: resolver: cannot record {}: {e}",
+            req.store.display()
+        );
+    }
+    resolution
+}
+
+/// [`resolve`] for a launch that activates part of the package's
+/// dependency sets, named by `pins`.
+///
+/// The decision is read and written under the launch's
+/// [`SelectionIdentity`] instead of the host alone: a changed subset or
+/// pin misses and is recomputed against only its own library universe, an
+/// equivalent list order hits and is served as it stands, and the record
+/// [`resolve`] keeps is never read here. A list outside the identity's
+/// bounds decides afresh every launch rather than being cached under a
+/// guessed key. The host fingerprint, the farm and the vanished-winner
+/// checks are the ones [`resolve`] uses.
+pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
+    if req.policy == HostLibsPolicy::Never {
+        return Resolution::default();
+    }
+    let host = HostIndex::load(req.ld_cache, req.icd_dirs, req.extra_root);
+    if host.libs.is_empty() {
+        return Resolution::default();
+    }
+    let fingerprint = fingerprint(
+        req.ld_cache,
+        req.icd_dirs,
+        req.policy,
+        req.extra_root,
+        req.host_libc,
+    );
+    let fresh = || materialized(req, &fingerprint, &decide_on(req, &host));
+    let Some(identity) = SelectionIdentity::new(pins) else {
+        return fresh();
+    };
+    let Some(dir) = selection_dir(identity.key()).map(|name| req.store.join(name)) else {
+        return fresh();
+    };
+    if let Some(recorded) = load_selection(&dir, &identity, &fingerprint, req.store) {
+        return recorded;
+    }
+    let decision = decide_on(req, &host);
+    let resolution = materialized(req, &fingerprint, &decision);
+    if let Err(e) = record_selection(
+        &dir,
+        &identity,
+        &fingerprint,
+        &resolution,
+        &decision.winners,
+    ) {
+        eprintln!(
+            "onelf-rt: resolver: cannot record {}: {e}",
+            req.store.display()
+        );
+    }
+    resolution
+}
+
+/// The resolution of a fresh decision, with the decision's farm built. A
+/// farm that cannot be written leaves nothing taken from the host.
+fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> Resolution {
+    let farm = match materialize(req.store, fingerprint, &decision.winners) {
         Ok(farm) => farm,
         Err(e) => {
             eprintln!(
@@ -271,18 +340,11 @@ pub fn resolve(req: &Request) -> Resolution {
             return Resolution::default();
         }
     };
-    let resolution = Resolution {
+    Resolution {
         farm,
-        host_interp: decision.host_interp,
-        incomparable: decision.incomparable,
-    };
-    if let Err(e) = record(req.store, &fingerprint, &resolution, winners) {
-        eprintln!(
-            "onelf-rt: resolver: cannot record {}: {e}",
-            req.store.display()
-        );
+        host_interp: decision.host_interp.clone(),
+        incomparable: decision.incomparable.clone(),
     }
-    resolution
 }
 
 /// What the resolver decides for a request, worked out afresh and with
@@ -391,6 +453,137 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
         }
     }
     decision
+}
+
+/// One active dependency set of a launch: the set's canonical
+/// declaration name and the full hash its build is pinned by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActivePin {
+    /// The declaration name, as the package's set table names it.
+    pub label: String,
+    /// The pinned build's BLAKE3 digest in hex.
+    pub hash: String,
+}
+
+/// The canonical identity of a launch's active pin set.
+///
+/// Built by sorting the pins by declaration name and hash, collapsing
+/// exact duplicates and normalizing every hash to lowercase, so lists
+/// that differ only in order or in hash case give one identity and any
+/// difference in membership, name or pin gives two. The identity is
+/// bounded and total: a name over the label bound, a name or hash
+/// carrying a control character, a hash that is not one digest, or more
+/// than the pin-count bound refuses to build, and a launch it cannot
+/// identify is decided afresh rather than cached under a guessed key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionIdentity {
+    pins: Vec<ActivePin>,
+    canonical: String,
+    key: String,
+}
+
+impl SelectionIdentity {
+    /// The identity of `pins`, or `None` when a pin is outside the
+    /// bounds.
+    pub fn new(pins: &[ActivePin]) -> Option<Self> {
+        if pins.len() > MAX_ACTIVE_PINS {
+            return None;
+        }
+        let mut pins: Vec<ActivePin> = pins.to_vec();
+        for pin in &mut pins {
+            pin.hash = pin.hash.to_ascii_lowercase();
+        }
+        pins.sort();
+        pins.dedup();
+        let mut canonical = String::new();
+        for pin in &pins {
+            admitted(pin)?;
+            if !canonical.is_empty() {
+                canonical.push('\n');
+            }
+            canonical.push_str(&pin_line(pin));
+        }
+        let digest = blake3::hash(canonical.as_bytes());
+        let key = hex_prefix(&digest.as_bytes()[..SELECTION_KEY_BYTES]);
+        Some(Self {
+            pins,
+            canonical,
+            key,
+        })
+    }
+
+    /// The pins in their canonical order.
+    pub fn pins(&self) -> &[ActivePin] {
+        &self.pins
+    }
+
+    /// The canonical text the identity is: each pin's record line, in
+    /// canonical order, newline separated, and empty for an empty
+    /// selection. This is the exact text a record stores and the key
+    /// digests.
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The bounded store name the identity is keyed by: lowercase hex
+    /// over a digest of [`Self::canonical`]. Equal identities share it.
+    /// A record still names the full canonical pins and a reader
+    /// compares them whole, so the key only has to find the record,
+    /// never to vouch for it.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The record lines the canonical text is made of.
+    fn identity_lines(&self) -> Vec<&str> {
+        self.canonical.lines().collect()
+    }
+}
+
+/// Whether `pin` is inside the bounds a record can carry: a nonempty
+/// name of at most the label bound, with no control character, and
+/// exactly one BLAKE3 digest in lowercase hex.
+fn admitted(pin: &ActivePin) -> Option<()> {
+    let label = pin.label.as_bytes();
+    if label.is_empty() || label.len() > MAX_PIN_LABEL_BYTES {
+        return None;
+    }
+    if label.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return None;
+    }
+    if pin.hash.len() != 64
+        || !pin
+            .hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some(())
+}
+
+/// One pin's canonical record line, `pin <name length>:<name>\t<hash>`.
+/// The length prefix and the admitted names make the line injective, so
+/// two pins never render one line and a record can be compared as whole
+/// lines.
+fn pin_line(pin: &ActivePin) -> String {
+    format!("pin {}:{}\t{}", pin.label.len(), pin.label, pin.hash)
+}
+
+/// Lowercase hex of `bytes`.
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The store subdirectory for one selection identity key, `sel-<key>`,
+/// or `None` when `key` is not a key [`SelectionIdentity`] mints: the
+/// name is always one bounded lowercase hex component, so nothing a
+/// caller passes can name anything outside the store.
+pub fn selection_dir(key: &str) -> Option<String> {
+    let hex = !key.is_empty()
+        && key.len() <= SELECTION_KEY_BYTES * 2
+        && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    hex.then(|| format!("{SELECTION_DIR_PREFIX}{key}"))
 }
 
 /// A library that cannot be read is treated as defining nothing: an
@@ -669,6 +862,36 @@ fn fingerprint(
 
 const DECISION_FILE: &str = "decision";
 
+/// The record format [`resolve`] reads and writes: one decision per
+/// package store, keyed on the host alone.
+const LEGACY_RECORD_HEADER: &str = "onelf-resolve 2";
+
+/// The record format [`resolve_selected`] reads and writes, keyed on the
+/// host and the launch's selection identity. The version in the header
+/// steps up whenever the layout changes, so a record naming another
+/// version is a miss, never a misread.
+const SELECTION_RECORD_HEADER: &str = "onelf-resolve-selection 1";
+
+/// The store subdirectory a selection's record lives in, named by the
+/// identity's key. Beside the farms, outside the `onelf-` mountpoint
+/// namespace the sweep reclaims.
+const SELECTION_DIR_PREFIX: &str = "sel-";
+
+/// How many active pins an identity may carry, matching the per-selection
+/// count the package metadata enforces on declared and selected sets.
+const MAX_ACTIVE_PINS: usize = 4096;
+
+/// How many bytes an active pin's name may carry, matching the name
+/// bound the package metadata enforces.
+const MAX_PIN_LABEL_BYTES: usize = 128;
+
+/// How many digest bytes a selection's directory key keeps.
+const SELECTION_KEY_BYTES: usize = 16;
+
+/// The largest record a read accepts, so hostile state is a miss rather
+/// than a large read.
+const RECORD_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The link farm for one host state. Keyed by the fingerprint and the
 /// winners themselves: two decisions can share a fingerprint (an
 /// in-place library swap leaves the directory stamps alone) yet pick
@@ -740,15 +963,25 @@ fn materialize(
     Ok(Some(farm))
 }
 
-fn record(
-    store: &Path,
+/// Write `resolution` and the winners it was decided from to `dir`'s
+/// record, replacing any earlier one atomically. The identity lines come
+/// first, then the host state the decision was made about.
+fn write_decision(
+    dir: &Path,
+    header: &str,
+    identity_text: &str,
     fingerprint: &str,
     resolution: &Resolution,
     winners: &BTreeMap<String, PathBuf>,
 ) -> io::Result<()> {
-    fs::create_dir_all(store)?;
+    fs::create_dir_all(dir)?;
     let mut text = String::new();
-    text.push_str("onelf-resolve 2\n");
+    text.push_str(header);
+    text.push('\n');
+    if !identity_text.is_empty() {
+        text.push_str(identity_text);
+        text.push('\n');
+    }
     text.push_str(&format!("fingerprint {fingerprint}\n"));
     if let Some(interp) = &resolution.host_interp {
         text.push_str(&format!("interp {}\n", interp.display()));
@@ -765,9 +998,44 @@ fn record(
     for name in &resolution.incomparable {
         text.push_str(&format!("incomparable {name}\n"));
     }
-    let tmp = store.join(format!(".{DECISION_FILE}.{}", std::process::id()));
+    let tmp = dir.join(format!(".{DECISION_FILE}.{}", std::process::id()));
     fs::File::create(&tmp)?.write_all(text.as_bytes())?;
-    fs::rename(&tmp, store.join(DECISION_FILE))
+    fs::rename(&tmp, dir.join(DECISION_FILE))
+}
+
+/// Record the launch-path decision for this host state.
+fn record(
+    store: &Path,
+    fingerprint: &str,
+    resolution: &Resolution,
+    winners: &BTreeMap<String, PathBuf>,
+) -> io::Result<()> {
+    write_decision(
+        store,
+        LEGACY_RECORD_HEADER,
+        "",
+        fingerprint,
+        resolution,
+        winners,
+    )
+}
+
+/// Record a selection's decision under its identity.
+fn record_selection(
+    dir: &Path,
+    identity: &SelectionIdentity,
+    fingerprint: &str,
+    resolution: &Resolution,
+    winners: &BTreeMap<String, PathBuf>,
+) -> io::Result<()> {
+    write_decision(
+        dir,
+        SELECTION_RECORD_HEADER,
+        identity.canonical(),
+        fingerprint,
+        resolution,
+        winners,
+    )
 }
 
 /// The identity of one file: size, inode, and both times, separated by
@@ -794,16 +1062,68 @@ fn stat_line(path: &Path) -> String {
 /// everything it names still exists.
 fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
     let text = fs::read_to_string(store.join(DECISION_FILE)).ok()?;
-    let mut lines = text.lines();
-    if lines.next()? != "onelf-resolve 2" {
+    let (mut resolution, winners) = parse_decision(&text, LEGACY_RECORD_HEADER, &[], fingerprint)?;
+    if winners.is_empty() {
+        return Some(resolution);
+    }
+    resolution.farm = Some(farm_checked(store, fingerprint, &winners)?);
+    Some(resolution)
+}
+
+/// A selection's recorded decision, when it was made for this exact
+/// identity and host state and everything it names still exists.
+/// `farm_base` is the store the decision's farm lives in.
+fn load_selection(
+    dir: &Path,
+    identity: &SelectionIdentity,
+    fingerprint: &str,
+    farm_base: &Path,
+) -> Option<Resolution> {
+    let text = read_record_bounded(&dir.join(DECISION_FILE))?;
+    let lines = identity.identity_lines();
+    let (mut resolution, winners) =
+        parse_decision(&text, SELECTION_RECORD_HEADER, &lines, fingerprint)?;
+    if winners.is_empty() {
+        return Some(resolution);
+    }
+    resolution.farm = Some(farm_checked(farm_base, fingerprint, &winners)?);
+    Some(resolution)
+}
+
+/// The record's text, read only when it is a small regular file holding
+/// valid UTF-8. Hostile or damaged state is a miss with a clean reason,
+/// never a large read or a partial adoption.
+fn read_record_bounded(path: &Path) -> Option<String> {
+    let md = fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > RECORD_MAX_BYTES {
         return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+/// The decision a record carries, when its version, identity lines and
+/// host state all check out, together with the winners it was decided
+/// from. Anything else is a miss; nothing is adopted partially.
+fn parse_decision(
+    text: &str,
+    header: &str,
+    identity_lines: &[&str],
+    fingerprint: &str,
+) -> Option<(Resolution, BTreeMap<String, PathBuf>)> {
+    let mut lines = text.lines();
+    if lines.next()? != header {
+        return None;
+    }
+    for expected in identity_lines {
+        if lines.next()? != *expected {
+            return None;
+        }
     }
     if lines.next()?.strip_prefix("fingerprint ")? != fingerprint {
         return None;
     }
     let mut resolution = Resolution::default();
     let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut any_host = false;
     for line in lines {
         if let Some(interp) = line.strip_prefix("interp ") {
             let interp = PathBuf::from(interp);
@@ -814,7 +1134,6 @@ fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
         } else if let Some(rest) = line.strip_prefix("host ") {
             let (name, path) = rest.split_once('\t')?;
             winners.insert(name.to_string(), PathBuf::from(path));
-            any_host = true;
         } else if let Some(rest) = line.strip_prefix("stat ") {
             let (name, recorded) = rest.split_once('\t')?;
             let path = winners.get(name)?;
@@ -826,21 +1145,24 @@ fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
             resolution.incomparable.push(name.to_string());
         }
     }
-    if !any_host {
-        return Some(resolution);
-    }
-    // The farm is keyed by the winners as recorded, so the links are
-    // checked where this decision says they are, not where a stale
-    // earlier decision left them.
-    let farm = farm_dir(store, fingerprint, &winners);
-    for (name, path) in &winners {
+    Some((resolution, winners))
+}
+
+/// The farm for `fingerprint` holding `winners`, when every link names
+/// the file the decision chose and the file still exists.
+fn farm_checked(
+    base: &Path,
+    fingerprint: &str,
+    winners: &BTreeMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let farm = farm_dir(base, fingerprint, winners);
+    for (name, path) in winners {
         match fs::read_link(farm.join(name)) {
             Ok(target) if target == path.as_path() && path.is_file() => {}
             _ => return None,
         }
     }
-    resolution.farm = Some(farm);
-    Some(resolution)
+    Some(farm)
 }
 
 #[cfg(test)]
@@ -951,6 +1273,34 @@ mod tests {
             r
         }
 
+        /// [`resolve_selected`] against the given set roots and active
+        /// pins, with the farm the launch produced remembered for
+        /// [`World::farm_link`].
+        fn resolve_selection(
+            &self,
+            policy: HostLibsPolicy,
+            set_roots: &[PathBuf],
+            pins: &[ActivePin],
+        ) -> Resolution {
+            let icd_dir = self.icd_dir.to_string_lossy().into_owned();
+            let r = resolve_selected(
+                &Request {
+                    pkg_root: &self.pkg,
+                    lib_dirs: &["lib"],
+                    policy,
+                    store: &self.store,
+                    ld_cache: &self.cache,
+                    icd_dirs: &[icd_dir.as_str()],
+                    extra_root: None,
+                    set_roots,
+                    host_libc: true,
+                },
+                pins,
+            );
+            *self.last_farm.borrow_mut() = r.farm.clone();
+            r
+        }
+
         fn set_roots(&self) -> Vec<PathBuf> {
             Vec::new()
         }
@@ -993,6 +1343,42 @@ mod tests {
     fn versioned(names: &[&str]) -> Vec<u8> {
         let defs: Vec<(u16, &str)> = names.iter().map(|n| (0, *n)).collect();
         shared_object(&defs, &[])
+    }
+
+    /// A pin named `label` whose build is pinned by the digest `n`
+    /// names.
+    fn pin(label: &str, n: u8) -> ActivePin {
+        ActivePin {
+            label: label.to_string(),
+            hash: format!("{n:02x}").repeat(32),
+        }
+    }
+
+    /// A dependency set root carrying one library in its `lib`
+    /// directory, laid out like a mounted or extracted build.
+    fn set_lib(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib").join(name), bytes).unwrap();
+        dir.to_path_buf()
+    }
+
+    /// The store directory the identity of `pins` records under.
+    fn sel_dir(store: &Path, pins: &[ActivePin]) -> PathBuf {
+        store.join(selection_dir(SelectionIdentity::new(pins).unwrap().key()).unwrap())
+    }
+
+    /// Pin a file's mtime to a fixed past instant, so a later write of
+    /// the same bytes still reads as one.
+    fn backdate(path: &Path) -> std::time::SystemTime {
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)
     }
 
     fn driver_needing(needed: &[&str]) -> Vec<u8> {
@@ -1611,5 +1997,405 @@ mod tests {
             .unwrap();
         w.resolve(HostLibsPolicy::Auto);
         assert_eq!(w.farm_link("libsensors.so.5"), Some(host_sensors));
+    }
+
+    #[test]
+    fn equivalent_selection_lists_share_one_identity() {
+        let (gtk, qt) = (pin("gtk", 1), pin("qt", 2));
+        let one = SelectionIdentity::new(&[gtk.clone(), qt.clone()]).unwrap();
+        let two = SelectionIdentity::new(&[qt.clone(), gtk.clone()]).unwrap();
+        assert_eq!(one, two);
+        assert_eq!(one.canonical(), two.canonical());
+        assert_eq!(one.key(), two.key());
+
+        // A hash written in the other case names the same build.
+        let mut upper = pin("qt", 2);
+        upper.hash = upper.hash.to_ascii_uppercase();
+        assert_eq!(one, SelectionIdentity::new(&[gtk, upper]).unwrap());
+    }
+
+    #[test]
+    fn a_changed_subset_or_pin_changes_the_identity() {
+        let gtk = pin("gtk", 1);
+        let qt = pin("qt", 2);
+        let gtk_repinned = pin("gtk", 3);
+        let gtk_renamed = pin("toolkit", 1);
+
+        let full = SelectionIdentity::new(&[gtk.clone(), qt.clone()]).unwrap();
+        let subset = SelectionIdentity::new(std::slice::from_ref(&gtk)).unwrap();
+        let empty = SelectionIdentity::new(&[]).unwrap();
+        let repinned = SelectionIdentity::new(&[gtk_repinned]).unwrap();
+        assert_ne!(full, subset, "a dropped set is another selection");
+        assert_ne!(subset, empty, "an empty selection is its own");
+        assert_ne!(subset, repinned, "a republished pin is another selection");
+        assert_ne!(
+            subset,
+            SelectionIdentity::new(&[gtk_renamed]).unwrap(),
+            "a renamed declaration is another selection"
+        );
+        assert_ne!(full.key(), subset.key());
+        assert_ne!(subset.key(), empty.key());
+
+        // The key is a bounded lowercase hex name.
+        let key = full.key();
+        assert_eq!(key.len(), 32);
+        assert!(key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
+    fn duplicate_pins_collapse_and_conflicting_ones_do_not() {
+        let (gtk_a, gtk_b) = (pin("gtk", 1), pin("gtk", 2));
+        let twice = SelectionIdentity::new(&[gtk_a.clone(), gtk_a.clone()]).unwrap();
+        assert_eq!(
+            twice,
+            SelectionIdentity::new(std::slice::from_ref(&gtk_a)).unwrap()
+        );
+
+        // The same name pinned two ways stays both pins, in a stable
+        // order, and never shares an identity with either alone.
+        let both = SelectionIdentity::new(&[gtk_a.clone(), gtk_b.clone()]).unwrap();
+        assert_ne!(both, twice);
+        assert_eq!(
+            both,
+            SelectionIdentity::new(&[gtk_b.clone(), gtk_a.clone()]).unwrap()
+        );
+        assert_eq!(both.pins(), &[gtk_a, gtk_b]);
+    }
+
+    #[test]
+    fn a_pin_outside_the_bounds_refuses_an_identity() {
+        let ok = pin("gtk", 1);
+        let refused = |pins: &[ActivePin]| SelectionIdentity::new(pins).is_none();
+        let with_label = |label: &str| ActivePin {
+            label: label.to_string(),
+            hash: ok.hash.clone(),
+        };
+        let with_hash = |hash: String| ActivePin {
+            label: "gtk".to_string(),
+            hash,
+        };
+
+        assert!(refused(&[ActivePin {
+            label: String::new(),
+            hash: ok.hash.clone()
+        }]));
+        assert!(refused(&[with_label(&"g".repeat(129))]));
+        for label in ["a\tb", "a\nb", "a\rb", "a\u{1}b", "a\u{7f}b", "a\u{0}b"] {
+            assert!(refused(&[with_label(label)]), "name {label:?} is refused");
+        }
+        for hash in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+        ] {
+            assert!(refused(&[with_hash(hash)]), "hash is refused");
+        }
+
+        // Exactly the pin-count bound is fine, one past it is not.
+        let at_bound: Vec<ActivePin> = (0..MAX_ACTIVE_PINS as u32)
+            .map(|i| pin(&format!("s{i}"), 1))
+            .collect();
+        assert!(SelectionIdentity::new(&at_bound).is_some());
+        let mut past_bound = at_bound.clone();
+        past_bound.push(pin("extra", 1));
+        assert!(refused(&past_bound));
+    }
+
+    #[test]
+    fn a_selection_directory_refuses_what_it_did_not_mint() {
+        assert_eq!(selection_dir(""), None);
+        assert_eq!(selection_dir("../escape"), None);
+        assert_eq!(selection_dir("a/b"), None);
+        assert_eq!(selection_dir("ABC"), None);
+        assert_eq!(selection_dir("gg"), None);
+        assert_eq!(selection_dir(&"a".repeat(65)), None);
+        assert_eq!(
+            selection_dir(&"a".repeat(32)),
+            Some(format!("sel-{}", "a".repeat(32)))
+        );
+    }
+
+    /// Two launches naming the same active declarations in opposite list
+    /// orders share one record: the second is served from it rather than
+    /// recomputing, seen in the record going untouched while the farm it
+    /// names still serves both.
+    #[test]
+    fn selection_list_order_does_not_invalidate_the_record() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let (gtk, qt) = (pin("gtk", 1), pin("qt", 2));
+
+        let first = w.resolve_selection(HostLibsPolicy::Auto, &[], &[gtk.clone(), qt.clone()]);
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+        let record = sel_dir(&w.store, &[gtk.clone(), qt.clone()]).join(DECISION_FILE);
+        assert!(record.is_file());
+
+        let stamped = backdate(&record);
+        let second = w.resolve_selection(HostLibsPolicy::Auto, &[], &[qt, gtk]);
+        assert_eq!(second, first);
+        assert_eq!(
+            fs::metadata(&record).unwrap().modified().unwrap(),
+            stamped,
+            "an equivalent launch reuses the record instead of rewriting it"
+        );
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo));
+    }
+
+    /// A changed subset or a republished pin is another library universe:
+    /// its record is separate, and the launch decides against only its
+    /// own roots instead of being served the other selection's decision.
+    #[test]
+    fn a_changed_subset_or_pin_recomputes_in_its_own_universe() {
+        let w = World::new();
+        w.host(
+            "libGL.so.1",
+            &driver_needing(&["libfoo.so.1", "libbar.so.1"]),
+        );
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        let host_bar = w.host("libbar.so.1", &versioned(&["BAR_1.0"]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        let root = temp_dir("sel-universe");
+        let one = set_lib(&root.join("one"), "libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let two = set_lib(
+            &root.join("two"),
+            "libbar.so.1",
+            &versioned(&["BAR_1.0", "BAR_2.0"]),
+        );
+        let (gtk, qt) = (pin("gtk", 1), pin("qt", 2));
+
+        w.resolve_selection(
+            HostLibsPolicy::Auto,
+            &[one.clone(), two],
+            &[gtk.clone(), qt.clone()],
+        );
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+        assert!(
+            w.farm_link("libbar.so.1").is_none(),
+            "the set's newer bar stays bundled"
+        );
+        let toolkit_record = sel_dir(&w.store, &[gtk.clone(), qt.clone()]).join(DECISION_FILE);
+        assert!(toolkit_record.is_file());
+
+        // Dropping the set whose library won is another selection: the
+        // host's older bar is now the only bar, and the toolkit's
+        // decision must not stand in for it.
+        let stamped = backdate(&toolkit_record);
+        w.resolve_selection(HostLibsPolicy::Auto, &[one], std::slice::from_ref(&gtk));
+        assert_eq!(w.farm_link("libbar.so.1"), Some(host_bar.clone()));
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+        let gtk_record = sel_dir(&w.store, std::slice::from_ref(&gtk)).join(DECISION_FILE);
+        assert!(gtk_record.is_file());
+        assert_ne!(
+            gtk_record.parent(),
+            toolkit_record.parent(),
+            "another selection records beside, not over"
+        );
+        assert_eq!(
+            fs::metadata(&toolkit_record).unwrap().modified().unwrap(),
+            stamped,
+            "the other selection's record is kept, not edited"
+        );
+
+        // The same declaration republished under a new pin is another
+        // selection again: this build's foo matches the host's, so it
+        // stays bundled where the older pin's foo was farmed.
+        let gtk2 = pin("gtk", 3);
+        let one2 = set_lib(
+            &root.join("one-2"),
+            "libfoo.so.1",
+            &versioned(&["FOO_1.0", "FOO_1.1"]),
+        );
+        w.resolve_selection(HostLibsPolicy::Auto, &[one2], std::slice::from_ref(&gtk2));
+        assert!(
+            w.farm_link("libfoo.so.1").is_none(),
+            "the repinned set's foo stays bundled"
+        );
+        assert!(sel_dir(&w.store, &[gtk2]).join(DECISION_FILE).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A launch with no sets active shares the host with a toolkit launch
+    /// but not its universe: the host's own bar is the only bar, where
+    /// the toolkit's decision kept the set's newer one.
+    #[test]
+    fn an_empty_selection_is_its_own_universe() {
+        let w = World::new();
+        w.host(
+            "libGL.so.1",
+            &driver_needing(&["libfoo.so.1", "libbar.so.1"]),
+        );
+        let host_bar = w.host("libbar.so.1", &versioned(&["BAR_1.0"]));
+        w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libapp.so.1", &versioned(&[]));
+
+        let root = temp_dir("sel-empty");
+        let two = set_lib(
+            &root.join("two"),
+            "libbar.so.1",
+            &versioned(&["BAR_1.0", "BAR_2.0"]),
+        );
+
+        let toolkit = w.resolve_selection(HostLibsPolicy::Auto, &[two], &[pin("qt", 2)]);
+        assert!(toolkit.farm.is_some());
+        assert!(w.farm_link("libbar.so.1").is_none());
+
+        let bare = w.resolve_selection(HostLibsPolicy::Auto, &[], &[]);
+        assert!(bare.farm.is_some());
+        assert_eq!(w.farm_link("libbar.so.1"), Some(host_bar));
+        assert!(sel_dir(&w.store, &[]).join(DECISION_FILE).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The record names its identity in full, so a reader pointed at one
+    /// selection's directory with another selection's identity, or with
+    /// another host state, still refuses it.
+    #[test]
+    fn a_selection_record_is_bound_to_its_identity_and_host() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let pins = [pin("gtk", 1)];
+        let identity = SelectionIdentity::new(&pins).unwrap();
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let set_roots: Vec<PathBuf> = Vec::new();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &[icd_dir.as_str()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+        );
+
+        let decided = w.resolve_selection(HostLibsPolicy::Auto, &set_roots, &pins);
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+        let dir = sel_dir(&w.store, &pins);
+
+        let again = load_selection(&dir, &identity, &fingerprint, &w.store).unwrap();
+        assert_eq!(again.farm.as_ref(), decided.farm.as_ref());
+
+        let other = SelectionIdentity::new(&[pin("qt", 2)]).unwrap();
+        assert_eq!(load_selection(&dir, &other, &fingerprint, &w.store), None);
+        assert_eq!(
+            load_selection(&dir, &identity, "another host", &w.store),
+            None
+        );
+    }
+
+    /// Hostile or damaged state is a miss with nothing adopted: another
+    /// version's header, truncation, bytes that are not a record, a
+    /// tampered identity line and an oversized file all recompute.
+    #[test]
+    fn hostile_selection_records_are_misses() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let pins = [pin("gtk", 1)];
+        let identity = SelectionIdentity::new(&pins).unwrap();
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let set_roots: Vec<PathBuf> = Vec::new();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &[icd_dir.as_str()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+        );
+        w.resolve_selection(HostLibsPolicy::Auto, &set_roots, &pins);
+        let dir = sel_dir(&w.store, &pins);
+        let record = dir.join(DECISION_FILE);
+        let good = fs::read_to_string(&record).unwrap();
+        let miss = |bytes: &[u8]| {
+            fs::write(&record, bytes).unwrap();
+            assert_eq!(
+                load_selection(&dir, &identity, &fingerprint, &w.store),
+                None
+            );
+        };
+
+        miss(b"");
+        miss(b"\xff\xfe not utf-8");
+        miss(b"onelf-resolve 2\nfingerprint x\n");
+        miss(b"onelf-resolve-selection 2\nfingerprint x\n");
+        miss(b"onelf-resolve-selection 1\n");
+        miss(&good.as_bytes()[..good.len() / 2]);
+        miss(
+            good.replacen(identity.canonical(), "pin 3:gtk\tzz", 1)
+                .as_bytes(),
+        );
+        let mut junk = good.clone();
+        junk.push_str("not-a-record-line\n");
+        miss(junk.as_bytes());
+        let oversized = vec![b'x'; (RECORD_MAX_BYTES + 1) as usize];
+        miss(&oversized);
+
+        fs::write(&record, &good).unwrap();
+        assert!(
+            load_selection(&dir, &identity, &fingerprint, &w.store).is_some(),
+            "the intact record is still a hit"
+        );
+    }
+
+    /// The record replaces any earlier one through a temp file and a
+    /// rename, so a directory never holds a half-written decision and no
+    /// scratch file outlives the write.
+    #[test]
+    fn recording_replaces_the_record_atomically() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let pins = [pin("gtk", 1)];
+        let names = |dir: &Path| {
+            let mut out: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            out.sort();
+            out
+        };
+
+        w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
+        let dir = sel_dir(&w.store, &pins);
+        assert_eq!(names(&dir), ["decision"]);
+
+        // A record that fails its checks is rewritten in place, and the
+        // rewrite again leaves only the decision behind.
+        fs::write(dir.join(DECISION_FILE), b"").unwrap();
+        w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
+        assert_eq!(names(&dir), ["decision"]);
+    }
+
+    /// The two record formats share one store without reading each
+    /// other: the launch path keeps its single record keyed on the host,
+    /// the selection path keeps one per identity, and each still hits
+    /// after the other wrote.
+    #[test]
+    fn the_legacy_and_selection_records_share_a_store_without_mixing() {
+        let w = World::new();
+        w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        let pins = [pin("gtk", 1)];
+
+        let legacy = w.resolve(HostLibsPolicy::Auto);
+        assert!(w.store.join(DECISION_FILE).is_file());
+        let selected = w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
+        assert!(sel_dir(&w.store, &pins).join(DECISION_FILE).is_file());
+        assert_eq!(selected, legacy);
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
+
+        assert_eq!(w.resolve(HostLibsPolicy::Auto), legacy);
+        assert_eq!(
+            w.resolve_selection(HostLibsPolicy::Auto, &[], &pins),
+            selected
+        );
+        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo));
     }
 }
