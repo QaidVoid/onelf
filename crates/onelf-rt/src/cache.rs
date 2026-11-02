@@ -56,6 +56,8 @@ fn cache_dir() -> Option<PathBuf> {
     )
 }
 
+/// The lowercase hex of `bytes`: the form package ids, CAS shard names,
+/// and view identity keys take on disk.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -417,45 +419,167 @@ pub fn collect_cas(base: &Path) -> u64 {
     reclaimed
 }
 
-pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
-    let meta_dir = base.join("meta");
-    let entries = match fs::read_dir(&meta_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+/// The view store of a cache root: where cache-mode execution views are
+/// published, `views/view-<key>/`, beside the coordinating lock files the
+/// view module puts there (`view-<key>.lease`, `view-<key>.create`) and
+/// the staging trees a creator fills. The CLI sweep applies the same
+/// rules to the same layout.
+fn view_store(base: &Path) -> PathBuf {
+    base.join("views")
+}
 
-    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        Err(_) => return,
+/// Open a view store's coordinating lock file without truncating it. The
+/// protocol keys every claim on the file's inode, so a collector that
+/// had to create one leaves it behind for the next claimant.
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Reclaim the store's idle views and their scratch, and return how many
+/// view identities were reclaimed.
+///
+/// A view is idle when neither of its two locks can be taken, both
+/// nonblocking: the in-use lease proves a launch or its guardian is
+/// running from the view, and the creation mutex proves a creator is
+/// staging one. Either held means live, and everything of that identity
+/// is skipped. With both taken, the view directory and its staging
+/// trees go, whatever their state: a complete published view, a stale
+/// one whose ready record is missing or damaged, and the scratch a dead
+/// creator left are all idle derivable state that the next launch
+/// rebuilds.
+///
+/// The coordinating lock inodes survive every sweep, held or not: the
+/// flock protocol keys mutual exclusion on the inode, and unlinking one
+/// would let a process that opened the old inode run beside a process
+/// that creates a fresh one, splitting the view's lease.
+///
+/// No store lock is taken here, and none may be held by the caller:
+/// canonical lock order puts the store's lock ahead of every view lock,
+/// so a collector that held the store's lock while waiting for a view's
+/// could cycle against a creator that keeps the store's exclusive lock
+/// through its whole creation. Every view lock is nonblocking, so this
+/// cannot wait on anyone at all.
+fn collect_views(store: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(store) else {
+        return 0;
     };
+    // Only a view directory or a staging tree makes an identity worth
+    // visiting; a bare pair of retained lock files is nothing to reclaim.
+    let identities: std::collections::BTreeSet<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if let Some((base, _)) = name.split_once(crate::links::view::STAGING_SEP) {
+                Some(base.to_string())
+            } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    identities
+        .into_iter()
+        .filter(|name| reclaim_view(store, name))
+        .count()
+}
+
+/// Reclaim one view identity when its locks prove it idle, and return
+/// whether anything was removed. Holds the identity's in-use lease and
+/// creation mutex exclusively across the removal, so a launch can start
+/// using the view only after it is gone and its creator only after the
+/// tree it was staging is history.
+fn reclaim_view(store: &Path, name: &str) -> bool {
+    use rustix::fs::FlockOperation;
+
+    let view = store.join(name);
+    let Some(lease_path) = crate::links::view::lease_lock_path(&view) else {
+        return false;
+    };
+    let Some(create_path) = crate::links::view::creation_lock_path(&view) else {
+        return false;
+    };
+    let lease = match open_lock_file(&lease_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if rustix::fs::flock(&lease, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return false;
+    }
+    let creation = match open_lock_file(&create_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if rustix::fs::flock(&creation, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return false;
+    }
+
+    let mut reclaimed = fs::remove_dir_all(&view).is_ok();
+    let prefix = format!("{name}{}", crate::links::view::STAGING_SEP);
+    if let Ok(entries) = fs::read_dir(store) {
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let path = store.join(&name);
+            if fs::remove_dir_all(&path).is_ok() || fs::remove_file(&path).is_ok() {
+                reclaimed = true;
+            }
+        }
+    }
+    // Dropping the locks releases the identity; the inodes stay on disk.
+    reclaimed
+}
+
+pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
+    // Views never age: a live lease proves liveness, and an idle view is
+    // reclaimable however recently it was built. They go first, so the
+    // store blobs they pinned become collectable in the same sweep, and
+    // without touching the store lock, whose place in the canonical order
+    // is ahead of every view lock.
+    let views = collect_views(&view_store(base));
 
     let mut removed = 0u32;
-    for entry in entries.flatten() {
-        if removed >= 5 {
-            break;
-        }
-
-        let name = entry.file_name();
-        let id = name.to_string_lossy();
-        // Never remove the current package.
-        if id == current_pkg_id {
-            continue;
-        }
-
-        let mtime = match entry.metadata().and_then(|m| m.modified()) {
-            Ok(t) => t
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            Err(_) => continue,
+    if let Ok(entries) = fs::read_dir(base.join("meta")) {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return;
         };
+        let now = now.as_secs();
+        for entry in entries.flatten() {
+            if removed >= 5 {
+                break;
+            }
 
-        if now.saturating_sub(mtime) > max_age_secs && try_remove_locked(base, &id) {
-            removed += 1;
+            let name = entry.file_name();
+            let id = name.to_string_lossy();
+            // Never remove the current package.
+            if id == current_pkg_id {
+                continue;
+            }
+
+            let mtime = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(t) => t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Err(_) => continue,
+            };
+
+            if now.saturating_sub(mtime) > max_age_secs && try_remove_locked(base, &id) {
+                removed += 1;
+            }
         }
     }
 
-    if removed > 0 {
+    if removed > 0 || views > 0 {
         collect_cas(base);
     }
 }
@@ -589,6 +713,376 @@ mod tests {
         assert!(
             !base.join("pkg").join("idle").exists(),
             "idle over-age package must be removed"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A store under a scratch cache root, and the published view `name`
+    /// in it: complete enough that the view module's own readiness check
+    /// accepts it.
+    fn fixture_store(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("onelf-viewgc-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let store = view_store(&base);
+        fs::create_dir_all(&store).unwrap();
+        (base, store)
+    }
+
+    /// Publish view `name` in `store`: a tree with content, a
+    /// configuration record, and the exact ready record this layout
+    /// writes.
+    fn publish_view(store: &Path, name: &str) -> PathBuf {
+        use crate::links::view;
+        let dir = store.join(name);
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib/app.so"), b"view payload").unwrap();
+        fs::write(
+            dir.join(view::CONFIGURATION_FILE),
+            b"onelf-view 1\nuid 1000\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(view::READY_FILE),
+            format!("onelf-view-ready {}\n", view::LAYOUT),
+        )
+        .unwrap();
+        assert!(view::ready(&dir), "the fixture view must be complete");
+        dir
+    }
+
+    /// Hold view `name`'s in-use lease the way a launch does: create the
+    /// inode and take it shared. The descriptor is the whole claim; the
+    /// collector keys idleness on it, not on any recorded pid.
+    fn hold_lease(store: &Path, name: &str) -> fs::File {
+        use rustix::fs::FlockOperation;
+        let view = store.join(name);
+        let path = crate::links::view::lease_lock_path(&view).expect("a lease path");
+        let file = open_lock_file(&path).expect("the lease inode");
+        rustix::fs::flock(&file, FlockOperation::LockShared).expect("the lease");
+        file
+    }
+
+    /// Whether `path` shows up within `secs` seconds.
+    fn wait_for(path: &Path, secs: u64) -> bool {
+        for _ in 0..secs * 20 {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        path.exists()
+    }
+
+    /// A view whose lease is taken is live state, whatever its directory
+    /// holds: collection must skip it whole, and reclaim it only once the
+    /// lease is released. flock arbitration is per open file description,
+    /// so this second descriptor conflicts exactly as another process's
+    /// lease would.
+    #[test]
+    fn a_leased_view_survives_collection_until_its_lease_is_released() {
+        use rustix::fs::FlockOperation;
+        let _locking = crate::test_locks::locking();
+        let (base, store) = fixture_store("leased");
+        let dir = publish_view(&store, "view-aa");
+
+        let lease = hold_lease(&store, "view-aa");
+        // A second descriptor cannot take what the launch holds, which is
+        // the test a collector runs before touching anything.
+        let probe_path =
+            crate::links::view::lease_lock_path(&store.join("view-aa")).expect("a lease path");
+        let probe = open_lock_file(&probe_path).expect("the probe descriptor");
+        assert!(
+            rustix::fs::flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "a held lease is not takeable"
+        );
+        drop(probe);
+
+        assert_eq!(
+            collect_views(&store),
+            0,
+            "a view with a live lease must be skipped"
+        );
+        assert!(
+            crate::links::view::ready(&dir),
+            "collection left the live view whole"
+        );
+        assert!(dir.join("lib/app.so").is_file());
+
+        drop(lease);
+        assert_eq!(
+            collect_views(&store),
+            1,
+            "the view is idle once its lease is released"
+        );
+        assert!(!dir.exists(), "the idle view is reclaimed");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The lease of another process is invisible to this one except
+    /// through the inode: a real holder in a process of its own must
+    /// spare the view exactly as an in-process descriptor does.
+    #[test]
+    fn a_lease_held_by_another_process_spares_the_view() {
+        let _forking = crate::test_locks::forking();
+        let (base, store) = fixture_store("xproc");
+        let dir = publish_view(&store, "view-bb");
+        let up = base.join("up");
+        let drop = base.join("drop");
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("the test binary's path"))
+                .arg("cache::tests::worker_holds_a_view_lease")
+                .args(["--exact", "--ignored"])
+                .env("ONELF_TEST_VIEW_STORE", &store)
+                .env("ONELF_TEST_VIEW_NAME", "view-bb")
+                .env("ONELF_TEST_VIEW_UP", &up)
+                .env("ONELF_TEST_VIEW_DROP", &drop)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the lease holder");
+
+        assert!(wait_for(&up, 30), "the other process never took the lease");
+        assert_eq!(
+            collect_views(&store),
+            0,
+            "another process's lease must spare the view"
+        );
+        assert!(crate::links::view::ready(&dir));
+
+        fs::write(&drop, b"").expect("end the launch");
+        assert!(
+            child.wait().expect("wait for the holder").success(),
+            "the lease holder failed"
+        );
+        assert_eq!(collect_views(&store), 1, "the view is idle at last");
+        assert!(!dir.exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Runs in its own process: holds the fixture view's lease shared
+    /// until the driver ends the launch.
+    #[test]
+    #[ignore = "driven by a_lease_held_by_another_process_spares_the_view, in a process of its own"]
+    fn worker_holds_a_view_lease() {
+        let store = PathBuf::from(std::env::var("ONELF_TEST_VIEW_STORE").expect("the store"));
+        let name = std::env::var("ONELF_TEST_VIEW_NAME").expect("the view name");
+        let up = PathBuf::from(std::env::var("ONELF_TEST_VIEW_UP").expect("the up path"));
+        let drop = PathBuf::from(std::env::var("ONELF_TEST_VIEW_DROP").expect("the drop path"));
+        let _lease = hold_lease(&store, &name);
+        fs::write(&up, b"").expect("announce the lease");
+        for _ in 0..600 {
+            if drop.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the driver never ended the launch");
+    }
+
+    /// An idle view goes, its staging scratch goes with it, and the
+    /// coordinating lock inodes stay for the next claimant: the flock
+    /// protocol keys every claim on the inode, so a sweep that unlinked
+    /// one would let two processes hold competing leases on one view.
+    #[test]
+    fn an_idle_view_is_reclaimed_but_its_lock_inodes_survive_the_sweep() {
+        let _locking = crate::test_locks::locking();
+        let (base, store) = fixture_store("locks");
+        let dir = publish_view(&store, "view-cc");
+        let view = store.join("view-cc");
+        let lease_path = crate::links::view::lease_lock_path(&view).expect("a lease path");
+        let create_path = crate::links::view::creation_lock_path(&view).expect("a creation path");
+        drop(open_lock_file(&lease_path).expect("the lease inode"));
+        drop(open_lock_file(&create_path).expect("the creation inode"));
+        // The scratch a dead creator left.
+        let staging = store.join(format!("view-cc{}42-0", crate::links::view::STAGING_SEP));
+        fs::create_dir_all(staging.join("lib")).unwrap();
+        fs::write(staging.join("lib/half.so"), b"half").unwrap();
+
+        assert_eq!(collect_views(&store), 1, "the idle identity is reclaimed");
+        assert!(!dir.exists(), "the idle view directory is reclaimed");
+        assert!(!staging.exists(), "the dead creator's staging is reclaimed");
+        assert!(
+            lease_path.exists(),
+            "the lease inode is retained across the sweep"
+        );
+        assert!(
+            create_path.exists(),
+            "the creation mutex inode is retained across the sweep"
+        );
+
+        // A later sweep finds nothing to reclaim and still keeps them.
+        assert_eq!(collect_views(&store), 0);
+        assert!(lease_path.exists() && create_path.exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A stale ready record marks scratch, not a publication: an idle
+    /// view whose ready record is damaged or of another layout is not a
+    /// live view under any identity, and collection reclaims it whole.
+    #[test]
+    fn a_stale_ready_record_marks_an_idle_view_for_reclamation() {
+        use crate::links::view;
+        let _locking = crate::test_locks::locking();
+        let (base, store) = fixture_store("stale");
+        let dir = store.join("view-dd");
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib/app.so"), b"payload").unwrap();
+        fs::write(
+            dir.join(view::CONFIGURATION_FILE),
+            b"onelf-view 1\nuid 1000\n",
+        )
+        .unwrap();
+        fs::write(dir.join(view::READY_FILE), b"onelf-view-ready 0\n").unwrap();
+        assert!(!view::ready(&dir), "the stale record is no publication");
+
+        assert_eq!(collect_views(&store), 1);
+        assert!(!dir.exists(), "the stale view is reclaimed");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The launch is gone, its guardian still holds the lease, and the
+    /// snapshot the view was linked from must survive both sweeps while
+    /// that descendant lives. Only when the last lease is released and
+    /// the view is reclaimed does the content store reclaim the bytes.
+    #[test]
+    fn a_guardian_lease_keeps_a_view_and_the_snapshot_it_references() {
+        let _locking = crate::test_locks::locking();
+        let base = std::env::temp_dir().join(format!("onelf-viewgc-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for sub in ["cas/ab", "lock", "views"] {
+            fs::create_dir_all(base.join(sub)).unwrap();
+        }
+        let blob = base.join("cas/ab").join("cc".repeat(32));
+        fs::write(&blob, b"snapshot bytes").unwrap();
+        let store = view_store(&base);
+        let dir = publish_view(&store, "view-ee");
+        fs::hard_link(&blob, dir.join("lib/snap.so")).expect("link the snapshot in");
+
+        // The launcher has exited; the guardian inherited this descriptor
+        // and holds the claim independently of anything recorded on disk.
+        let lease = hold_lease(&store, "view-ee");
+
+        assert_eq!(
+            collect_views(&store),
+            0,
+            "a live descendant's view must be skipped"
+        );
+        assert!(dir.exists());
+        assert_eq!(
+            collect_cas(&base),
+            0,
+            "the snapshot a live view references must be retained"
+        );
+        assert!(blob.exists());
+
+        drop(lease);
+        assert_eq!(collect_views(&store), 1);
+        assert!(!dir.exists());
+        assert_eq!(
+            collect_cas(&base),
+            b"snapshot bytes".len() as u64,
+            "the blob is collectable once its last reference is gone"
+        );
+        assert!(!blob.exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A creating launch keeps the store's exclusive lock through its
+    /// whole creation, the canonical order allowing no other arrangement,
+    /// and holds its lease and creation mutex while at it. Collection
+    /// must run to completion beside it: the view pass may take no store
+    /// lock at all (a store lock held while a view lock is awaited is the
+    /// reversed cycle), and every view lock it takes is nonblocking. The
+    /// watchdog turns a violation into a failed test instead of a hung
+    /// suite.
+    #[test]
+    fn a_collector_runs_beside_a_creating_launch_without_deadlock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let _locking = crate::test_locks::locking();
+        let base = std::env::temp_dir().join(format!("onelf-viewgc-dead-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for sub in ["cas/ab", "lock", "meta", "views"] {
+            fs::create_dir_all(base.join(sub)).unwrap();
+        }
+        let store = view_store(&base);
+        let dir = publish_view(&store, "view-ff");
+        let orphan = base.join("cas/ab").join("dd".repeat(32));
+        fs::write(&orphan, b"orphan bytes").unwrap();
+
+        let cas_path = layout::cas_lock_path(&base);
+        let view = store.join("view-ff");
+        let lease_path = crate::links::view::lease_lock_path(&view).expect("a lease path");
+        let create_path = crate::links::view::creation_lock_path(&view).expect("a create path");
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let creator = std::thread::spawn(move || {
+            use rustix::fs::FlockOperation;
+            let store_lock = open_lock_inheritable(&cas_path).expect("the store lock");
+            rustix::fs::flock(&store_lock, FlockOperation::LockExclusive).expect("the store");
+            let lease = open_lock_file(&lease_path).expect("the lease inode");
+            rustix::fs::flock(&lease, FlockOperation::LockShared).expect("the lease");
+            let creation = open_lock_file(&create_path).expect("the creation inode");
+            rustix::fs::flock(&creation, FlockOperation::LockExclusive).expect("the mutex");
+            held_tx.send(()).expect("report the locks");
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the creating launch took its locks");
+
+        let disarmed = Arc::new(AtomicBool::new(false));
+        let disarm = disarmed.clone();
+        let watchdog = std::thread::spawn(move || {
+            for _ in 0..150 {
+                if disarm.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!("collection deadlocked against a concurrent creation");
+            std::process::exit(101);
+        });
+
+        // Both passes answer immediately beside the creator: the view is
+        // skipped whole, the store pass declines, the orphan survives.
+        assert_eq!(
+            collect_views(&store),
+            0,
+            "a view under a live creation must be skipped"
+        );
+        assert!(
+            crate::links::view::ready(&dir),
+            "the skipped view is untouched"
+        );
+        assert_eq!(
+            collect_cas(&base),
+            0,
+            "the content pass declines while creation holds the store"
+        );
+        assert!(orphan.exists(), "the orphan is spared mid-creation");
+
+        release_tx.send(()).expect("release the creator");
+        creator.join().expect("the creator finished");
+        disarmed.store(true, Ordering::SeqCst);
+        watchdog.join().expect("the watchdog finished");
+
+        // With the creation over, one launch's own sweep reclaims the
+        // view and the bytes it pinned.
+        auto_gc(&base, 0, "none");
+        assert!(!dir.exists(), "the finished view is reclaimed");
+        assert!(
+            !orphan.exists(),
+            "the bytes the view pinned are collectable once it is gone"
         );
 
         let _ = fs::remove_dir_all(&base);

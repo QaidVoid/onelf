@@ -674,8 +674,8 @@ pub(crate) mod view {
     /// The separator that marks a staging tree as one identity's
     /// scratch: `view-<key>.staging-<pid>-<seq>` never matches the name
     /// [`dir_name`] mints, so no reader resolves a staging tree as a
-    /// view.
-    const STAGING_SEP: &str = ".staging-";
+    /// view. Collection classifies a store entry by it, the same way.
+    pub(crate) const STAGING_SEP: &str = ".staging-";
 
     /// Whether `dir` holds a completely published view of this layout:
     /// the ready record must be exactly the bytes this layout writes,
@@ -741,8 +741,20 @@ pub(crate) mod view {
     /// The creation mutex of `view`, a lock file kept beside it. The
     /// descriptor carries no inheritance: the mutex guards the build
     /// only, and dies at exec like any ordinary descriptor.
-    fn creation_lock_path(view: &Path) -> Option<PathBuf> {
+    pub(crate) fn creation_lock_path(view: &Path) -> Option<PathBuf> {
         Some(view.with_file_name(format!("{}.create", view.file_name()?.to_str()?)))
+    }
+
+    /// The in-use lease of `view`, a lock file kept beside it, held
+    /// shared by a launch or its guardian for as long as the view backs
+    /// a live process. A launch creates and locks the lease before it
+    /// resolves or builds the view, and the descriptor is inheritable so
+    /// the claim survives exec and descendant processes. Collection keys
+    /// a view's idleness on this inode's flock alone, never on a pid
+    /// recorded anywhere, so a detached helper that closed everything
+    /// else still keeps its view.
+    pub(crate) fn lease_lock_path(view: &Path) -> Option<PathBuf> {
+        Some(view.with_file_name(format!("{}.lease", view.file_name()?.to_str()?)))
     }
 
     /// Take `view`'s creation mutex exclusively. Every creator of one

@@ -145,6 +145,148 @@ fn cas_size(root: &Path) -> u64 {
         .sum()
 }
 
+/// The layout of a cache root's view store, identical to the runtime
+/// collector's: `views/view-<key>/` is a published execution view,
+/// `views/view-<key>.lease` its in-use lease, `views/view-<key>.create`
+/// its creation mutex, and `views/view-<key>.staging-<pid>-<seq>` the
+/// staging tree a creator fills. These names are the protocol both
+/// collectors speak; a change here must land in the runtime's collector
+/// at the same time.
+const VIEW_STORE_DIR: &str = "views";
+const VIEW_LEASE_SUFFIX: &str = ".lease";
+const VIEW_CREATE_SUFFIX: &str = ".create";
+const VIEW_STAGING_SEP: &str = ".staging-";
+
+/// Open a view store's coordinating lock file without truncating it. The
+/// protocol keys every claim on the file's inode, so a sweep that had to
+/// create one leaves it behind for the next claimant.
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Reclaim the store's idle views and their scratch, and return how many
+/// view identities were reclaimed. The rules are the runtime collector's:
+///
+/// A view is idle when neither of its two locks can be taken, both
+/// nonblocking: the in-use lease proves a launch or its guardian is
+/// running from the view, and the creation mutex proves a creator is
+/// staging one. Either held means live, and everything of that identity
+/// is skipped. With both taken, the view directory and its staging trees
+/// go, whatever their state: a complete published view, a stale one whose
+/// ready record is missing or damaged, and the scratch a dead creator
+/// left are all idle derivable state that the next launch rebuilds.
+///
+/// The coordinating lock inodes survive every sweep, held or not: the
+/// flock protocol keys mutual exclusion on the inode, and unlinking one
+/// would let a process that opened the old inode run beside a process
+/// that creates a fresh one, splitting the view's lease. The store's own
+/// lock file is likewise never a target.
+///
+/// No store lock is taken here, and none may be held by the caller:
+/// canonical lock order puts the store's lock ahead of every view lock,
+/// so a collector that held the store's lock while waiting for a view's
+/// could cycle against a creator that keeps the store's exclusive lock
+/// through its whole creation. Every view lock is nonblocking, so this
+/// cannot wait on anyone at all.
+fn collect_views(root: &Path) -> usize {
+    let store = root.join(VIEW_STORE_DIR);
+    let Ok(entries) = fs::read_dir(&store) else {
+        return 0;
+    };
+    // Only a view directory or a staging tree makes an identity worth
+    // visiting; a bare pair of retained lock files is nothing to reclaim.
+    let identities: std::collections::BTreeSet<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if let Some((base, _)) = name.split_once(VIEW_STAGING_SEP) {
+                Some(base.to_string())
+            } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    identities
+        .into_iter()
+        .filter(|name| reclaim_view(&store, name))
+        .count()
+}
+
+/// Reclaim one view identity when its locks prove it idle, and return
+/// whether anything was removed. Holds the identity's in-use lease and
+/// creation mutex exclusively across the removal, so a launch can start
+/// using the view only after it is gone and its creator only after the
+/// tree it was staging is history.
+fn reclaim_view(store: &Path, name: &str) -> bool {
+    use rustix::fs::FlockOperation;
+
+    let view = store.join(name);
+    let Some(lease_path) = lease_lock_path(&view) else {
+        return false;
+    };
+    let Some(create_path) = create_lock_path(&view) else {
+        return false;
+    };
+    let lease = match open_lock_file(&lease_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if rustix::fs::flock(&lease, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return false;
+    }
+    let creation = match open_lock_file(&create_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if rustix::fs::flock(&creation, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return false;
+    }
+
+    let mut reclaimed = fs::remove_dir_all(&view).is_ok();
+    let prefix = format!("{name}{VIEW_STAGING_SEP}");
+    if let Ok(entries) = fs::read_dir(store) {
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let path = store.join(&name);
+            if fs::remove_dir_all(&path).is_ok() || fs::remove_file(&path).is_ok() {
+                reclaimed = true;
+            }
+        }
+    }
+    // Dropping the locks releases the identity; the inodes stay on disk.
+    reclaimed
+}
+
+/// The in-use lease of `view`, kept beside it, held shared by a live
+/// launch or its guardian. Mirrors the runtime's view module.
+fn lease_lock_path(view: &Path) -> Option<PathBuf> {
+    Some(view.with_file_name(format!(
+        "{}{VIEW_LEASE_SUFFIX}",
+        view.file_name()?.to_str()?
+    )))
+}
+
+/// The creation mutex of `view`, kept beside it. Mirrors the runtime's
+/// view module.
+fn create_lock_path(view: &Path) -> Option<PathBuf> {
+    Some(view.with_file_name(format!(
+        "{}{VIEW_CREATE_SUFFIX}",
+        view.file_name()?.to_str()?
+    )))
+}
+
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / 1_048_576.0
 }
@@ -258,26 +400,35 @@ pub fn cache_list() -> io::Result<()> {
 /// A package still running keeps its tree, since it opens plugins, locale
 /// data, and drivers from there lazily for as long as it runs. Every GL
 /// build file goes: a running instance uses the build's extraction, which
-/// is a package like any other, not the file. Directories left empty are
-/// removed; the root itself stays only while something in it is in use.
+/// is a package like any other, not the file. Idle execution views and
+/// their scratch go the same way, under the lock rules the runtime
+/// collector applies. Directories left empty are removed; the root itself
+/// stays only while something in it is in use.
 pub fn cache_clear() -> io::Result<()> {
     let root = cache_root()?;
+    println!("{}", clear_cache(&root)?);
+    Ok(())
+}
+
+/// [`cache_clear`] against one root, returning what it did. Separate from
+/// the command entry so the reclamation rules can be exercised against a
+/// scratch store without touching the process's own cache.
+fn clear_cache(root: &Path) -> io::Result<String> {
     if !root.exists() {
-        println!("No cache to clear.");
-        return Ok(());
+        return Ok("No cache to clear.".into());
     }
 
     let mut removed = 0u64;
     let mut skipped = 0u64;
-    for id in cached_ids(&root) {
-        if try_remove_locked(&root, &id) {
+    for id in cached_ids(root) {
+        if try_remove_locked(root, &id) {
             removed += 1;
         } else {
             skipped += 1;
         }
     }
     let mut builds = 0u64;
-    for build in stored_builds(&root) {
+    for build in stored_builds(root) {
         if fs::remove_file(&build.file).is_ok() {
             builds += 1;
             if let Some(parent) = build.file.parent() {
@@ -285,19 +436,28 @@ pub fn cache_clear() -> io::Result<()> {
             }
         }
     }
-    let reclaimed = collect_cas(&root);
-    remove_empty_dirs(&root);
+    // Views first, so the store bytes they pinned are collectable in the
+    // same sweep, and without holding any lock the content pass needs.
+    let views = collect_views(root);
+    let reclaimed = collect_cas(root);
+    remove_empty_dirs(root);
 
+    let mut report = Vec::new();
+    if views > 0 {
+        report.push(format!("Removed {views} idle view(s)."));
+    }
     if skipped == 0 {
-        println!("Cache cleared.");
+        report.push("Cache cleared.".into());
     } else {
-        println!(
+        report.push(format!(
             "Removed {removed} package(s) and {builds} GL build(s), reclaimed {:.1} MB.",
             mib(reclaimed)
-        );
-        println!("Skipped {skipped} package(s) still in use by a running instance.");
+        ));
+        report.push(format!(
+            "Skipped {skipped} package(s) still in use by a running instance."
+        ));
     }
-    Ok(())
+    Ok(report.join("\n"))
 }
 
 /// Remove `dir` and every directory under it that holds nothing. Lock files
@@ -316,6 +476,15 @@ fn remove_empty_dirs(dir: &Path) {
 
 pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
     let root = cache_root()?;
+    println!("{}", gc_cache(&root, max_age_days)?);
+    Ok(())
+}
+
+/// [`cache_gc`] against one root, returning what it did. Separate from
+/// the command entry so the reclamation rules can be exercised against a
+/// scratch store without touching the process's own cache.
+fn gc_cache(root: &Path, max_age_days: u64) -> io::Result<String> {
+    let mut report = Vec::new();
     let now = SystemTime::now();
     let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86400));
 
@@ -324,7 +493,7 @@ pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
     // package pass below when idle.
     let mut builds_removed = 0u64;
     let mut build_bytes = 0u64;
-    for build in stored_builds(&root) {
+    for build in stored_builds(root) {
         let idle = match build.used.map(|t| now.duration_since(t)) {
             None => true,
             Some(Ok(age)) => age > max_age,
@@ -340,17 +509,25 @@ pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
         }
     }
     if builds_removed > 0 {
-        println!(
+        report.push(format!(
             "Removed {builds_removed} GL build(s) unused for {max_age_days} days, \
              reclaimed {:.1} MB.",
             mib(build_bytes)
-        );
+        ));
+    }
+
+    // Views never age: a live lease proves liveness, and an idle view is
+    // reclaimable however recently it was built, under the same lock
+    // rules the runtime collector applies.
+    let views = collect_views(root);
+    if views > 0 {
+        report.push(format!("Removed {views} idle view(s)."));
     }
 
     let meta_dir = root.join("meta");
     if !meta_dir.exists() {
-        println!("No cached packages.");
-        return Ok(());
+        report.push("No cached packages.".into());
+        return Ok(report.join("\n"));
     }
 
     let mut removed = 0u64;
@@ -369,22 +546,178 @@ pub fn cache_gc(max_age_days: u64) -> io::Result<()> {
         }
         let name = entry.file_name();
         let id = name.to_string_lossy();
-        if try_remove_locked(&root, &id) {
+        if try_remove_locked(root, &id) {
             removed += 1;
         } else {
             skipped += 1;
         }
     }
 
-    let reclaimed = if removed > 0 { collect_cas(&root) } else { 0 };
+    let reclaimed = if removed > 0 || views > 0 {
+        collect_cas(root)
+    } else {
+        0
+    };
 
-    println!(
+    report.push(format!(
         "Removed {removed} stale packages (older than {max_age_days} days), \
          reclaimed {:.1} MB.",
         mib(reclaimed)
-    );
+    ));
     if skipped > 0 {
-        println!("Skipped {skipped} package(s) still in use by a running instance.");
+        report.push(format!(
+            "Skipped {skipped} package(s) still in use by a running instance."
+        ));
     }
-    Ok(())
+    Ok(report.join("\n"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rustix::fs::FlockOperation;
+
+    /// A scratch cache root, with the directories a store that has run
+    /// anything would have.
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("onelf-cliview-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for sub in ["cas/ab", "lock", "meta", VIEW_STORE_DIR] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        root
+    }
+
+    /// Publish view `name` in `root`'s view store: a tree whose shape
+    /// mirrors what the runtime publishes, whatever its contents are.
+    fn publish_view(root: &Path, name: &str) -> PathBuf {
+        let view = root.join(VIEW_STORE_DIR).join(name);
+        fs::create_dir_all(view.join("lib")).unwrap();
+        fs::write(view.join("lib/app.so"), b"view payload").unwrap();
+        fs::write(view.join("config"), b"onelf-view 1\nuid 1000\n").unwrap();
+        fs::write(view.join("ready"), "onelf-view-ready 1\n").unwrap();
+        view
+    }
+
+    /// Hold view `name`'s in-use lease the way a launch or its guardian
+    /// does: create the inode and take it shared. The descriptor is the
+    /// whole claim; the sweep keys idleness on it, not on any pid.
+    fn hold_lease(root: &Path, name: &str) -> fs::File {
+        let view = root.join(VIEW_STORE_DIR).join(name);
+        let path = view.with_file_name(format!("{name}{VIEW_LEASE_SUFFIX}"));
+        let file = open_lock_file(&path).expect("the lease inode");
+        rustix::fs::flock(&file, FlockOperation::LockShared).expect("the lease");
+        file
+    }
+
+    /// A view whose lease a live launch holds is skipped whole by both
+    /// sweep commands, the snapshot it references survives the content
+    /// pass, and once the lease is released the idle view goes while its
+    /// coordinating lock inodes and the store's own lock file stay.
+    #[test]
+    fn the_sweep_spares_a_leased_view_and_then_reclaims_it_idle() {
+        let root = temp_root("leased");
+        let view = publish_view(&root, "view-aa");
+        let blob = root.join("cas/ab").join("cc".repeat(32));
+        fs::write(&blob, b"snapshot bytes").unwrap();
+        fs::hard_link(&blob, view.join("lib/snap.so")).unwrap();
+        let lease = hold_lease(&root, "view-aa");
+
+        let report = clear_cache(&root).unwrap();
+        assert!(report.contains("Cache cleared."), "{report}");
+        assert!(
+            view.join("ready").is_file(),
+            "a leased view must survive clear: {report}"
+        );
+        assert_eq!(collect_cas(&root), 0, "the referenced snapshot survives");
+        assert!(blob.exists());
+
+        let report = gc_cache(&root, 0).unwrap();
+        assert!(
+            !report.contains("idle view"),
+            "a leased view is not idle, whatever its age: {report}"
+        );
+        assert!(view.join("ready").is_file());
+
+        drop(lease);
+        let report = clear_cache(&root).unwrap();
+        assert!(
+            report.contains("Removed 1 idle view(s)."),
+            "the idle view is reclaimed: {report}"
+        );
+        assert!(!view.exists());
+        assert!(
+            !blob.exists(),
+            "the bytes the view pinned went with the sweep that reclaimed it"
+        );
+
+        let lease_path = root
+            .join(VIEW_STORE_DIR)
+            .join(format!("view-aa{VIEW_LEASE_SUFFIX}"));
+        let create_path = root
+            .join(VIEW_STORE_DIR)
+            .join(format!("view-aa{VIEW_CREATE_SUFFIX}"));
+        assert!(
+            lease_path.exists() && create_path.exists(),
+            "coordinating lock inodes survive the sweep"
+        );
+        assert!(
+            root.join("lock/cas").exists(),
+            "the store's lock inode survives the sweep"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Age says nothing about a view: an idle complete view and a stale
+    /// one with a damaged ready record are reclaimed whatever
+    /// `--max-age` is, their staging scratch with them, while a lease
+    /// held by another process keeps its view.
+    #[test]
+    fn the_sweep_reclaims_idle_views_and_stale_scratch_regardless_of_age() {
+        let root = temp_root("idle");
+        let idle = publish_view(&root, "view-bb");
+        let stale = root.join(VIEW_STORE_DIR).join("view-cc");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("config"), b"onelf-view 1\nuid 1000\n").unwrap();
+        fs::write(stale.join("ready"), b"onelf-view-ready 0\n").unwrap();
+        let staging = root
+            .join(VIEW_STORE_DIR)
+            .join(format!("view-bb{VIEW_STAGING_SEP}42-0"));
+        fs::create_dir_all(staging.join("lib")).unwrap();
+        fs::write(staging.join("lib/half.so"), b"half").unwrap();
+        let live = publish_view(&root, "view-dd");
+        let lease = hold_lease(&root, "view-dd");
+        // A last-used record recent enough that an age-only collector
+        // would keep everything here.
+        let record = fs::File::create(root.join("meta").join("pkghash")).unwrap();
+        drop(record);
+
+        let report = gc_cache(&root, 30).unwrap();
+        assert!(
+            report.contains("Removed 2 idle view(s)."),
+            "idle and stale views are reclaimed whatever the age: {report}"
+        );
+        assert!(!idle.exists());
+        assert!(!stale.exists());
+        assert!(!staging.exists());
+        assert!(
+            live.join("ready").is_file(),
+            "another process's lease spares the view: {report}"
+        );
+        assert!(
+            report.contains("Skipped 0 stale packages") || report.contains("Removed 0 stale"),
+            "the report still speaks the package pass: {report}"
+        );
+
+        drop(lease);
+        let report = gc_cache(&root, 30).unwrap();
+        assert!(
+            report.contains("Removed 1 idle view(s)."),
+            "the view is idle once its lease is released: {report}"
+        );
+        assert!(!live.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
