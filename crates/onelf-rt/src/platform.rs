@@ -23,6 +23,20 @@
 //! is held, or a FIFO, device, socket or directory at the stored name
 //! never activates content I/O. The store root itself is reached by name
 //! and may be a symlink: it is the location the target uid owns or chose.
+//!
+//! Publication into the store is locked, staged, and verified. An
+//! acquirer of a missing build takes the store's exclusive per-label
+//! flock, stages the fetched bytes in an exclusive scratch file created
+//! by descriptor inside the pinned label directory, bounds the fetch so
+//! a source that never ends cannot fill the disk, and verifies those
+//! staged bytes against the pin through the same confined pinning before
+//! one atomic rename publishes them. The loser of the race re-verifies
+//! the winner's publication and uses it: trust stays with the digest,
+//! never with who wrote the bytes. A privileged target stages privately
+//! under validated root-owned directories, and refuses any pre-existing
+//! stored name whose owner or permissions would leave an untrusted uid
+//! write access, repairing it by the same rename, which never opens what
+//! it replaces.
 
 use std::fs;
 use std::io::{self, Read};
@@ -235,77 +249,178 @@ fn stored_location(pin: &Pin) -> Result<(PathBuf, String), String> {
 /// Returns the verified handle every consumer reads through.
 pub fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
     let (store, relative) = stored_location(pin)?;
-    acquire(&store, &relative, pin, !env_set("ONELF_NO_PLATFORM_FETCH"))
+    acquire(
+        &store,
+        &relative,
+        pin,
+        !env_set("ONELF_NO_PLATFORM_FETCH"),
+        crate::paths::uid(),
+    )
 }
 
 /// [`store_build`] against an explicit store root, the store-relative
-/// candidate name, and a fetch policy, so the acquisition the GL build and
-/// the dependency sets share is testable without touching either's
-/// environment.
+/// candidate name, a fetch policy, and the target uid the store belongs
+/// to, so the acquisition the GL build and the dependency sets share is
+/// testable without touching either's environment.
 fn acquire(
     store: &Path,
     relative: &str,
     pin: &Pin,
     allow_fetch: bool,
+    uid: u32,
 ) -> Result<VerifiedArtifact, String> {
     let path = store.join(relative);
     let origin = path.display().to_string();
     let mut refused: Option<String> = None;
-    match open_verified(store, relative, &pin.blake3, &origin) {
-        Ok(file) => {
-            let artifact = VerifiedArtifact { path, file };
-            touch(&artifact.file);
-            return Ok(artifact);
-        }
+    match open_verified(store, relative, &pin.blake3, &origin, uid) {
+        Ok(file) => return Ok(verified(path, file)),
         Err(PinError::Missing) => {}
         Err(PinError::Final(why)) => refused = Some(why),
-        // A component above the candidate cannot be traversed safely, or
-        // the pinned inode has no readable conversion here: neither is
-        // repaired by fetching, and neither may fall back to opening the
-        // untrusted path by name.
         Err(PinError::Intermediate(why) | PinError::Conversion(why)) => return Err(why),
     }
-    // The stored copy is missing or does not match its pin, so it is a
-    // cache miss. What is fetched next repairs the store; when no
-    // replacement is permitted, the refusal is itself the failure.
-    let miss = |why: String| match &refused {
+    let miss = |refused: &Option<String>, why: String| match refused {
         Some(refused) => format!("{refused}; {why}"),
         None => why,
     };
     if !allow_fetch {
-        return Err(miss(format!(
-            "fetching is disabled by ONELF_NO_PLATFORM_FETCH ({} would be fetched from {})",
-            pin.label, pin.url
-        )));
+        return Err(miss(
+            &refused,
+            format!(
+                "fetching is disabled by ONELF_NO_PLATFORM_FETCH ({} would be fetched from {})",
+                pin.label, pin.url
+            ),
+        ));
     }
-    let Some((label, _)) = relative.rsplit_once('/') else {
-        return Err(miss("the candidate names no label directory".to_string()));
+    let Some((label, name)) = relative.rsplit_once('/') else {
+        return Err(miss(
+            &refused,
+            "the candidate names no label directory".to_string(),
+        ));
     };
-    // The walk refused any label component that is not a real directory,
-    // so this creation and the rename below cannot traverse out of the
-    // store.
-    let label_dir = store.join(label);
-    fs::create_dir_all(&label_dir).map_err(|e| miss(format!("{}: {e}", label_dir.display())))?;
-    let tmp_relative = format!("{label}/.{}.onelf.{}", pin.blake3, std::process::id());
-    let tmp = store.join(&tmp_relative);
-    let file = match fetch(&pin.url, &tmp).and_then(|()| {
-        open_verified(store, &tmp_relative, &pin.blake3, &pin.url).map_err(PinError::message)
-    }) {
-        Ok(file) => file,
-        Err(why) => {
-            let _ = fs::remove_file(&tmp);
-            return Err(miss(why));
+    ensure_store_dirs(uid, store, &store.join(label)).map_err(|why| miss(&refused, why))?;
+    // One exclusive flock per label serializes the acquirers of the
+    // label's builds, so exactly one stages and publishes. No other lock
+    // is held while it is taken, and it is released before the build is
+    // served, so a slow download holds up only the acquirers of the same
+    // build.
+    let _publication = publication_lock(store, label).map_err(|why| miss(&refused, why))?;
+    // The winner of the race may have published while this acquirer
+    // waited: re-verify the stored candidate, since trust comes from the
+    // digest, never from who wrote the bytes.
+    match open_verified(store, relative, &pin.blake3, &origin, uid) {
+        Ok(file) => return Ok(verified(path, file)),
+        Err(PinError::Missing) => {}
+        Err(PinError::Final(why)) => refused = Some(why),
+        Err(PinError::Intermediate(why) | PinError::Conversion(why)) => return Err(why),
+    }
+    // Everything the fetch touches from here resolves inside the pinned
+    // label directory: the scratch is created, verified and published by
+    // descriptor, so a name swapped above the directory cannot steer the
+    // staging or the publication.
+    let dir = match PinnedDir::walk(store, &[label], &origin, (uid == 0).then_some(uid)) {
+        Ok(dir) => dir,
+        Err(PinError::Missing) => {
+            return Err(miss(
+                &refused,
+                format!("{origin}: the store directory went away before staging"),
+            ));
         }
+        Err(other) => return Err(miss(&refused, other.message())),
     };
-    // Publishing renames over whatever the stored name held: rename never
-    // opens the entry it replaces, so a planted symlink or special object
-    // at the name is swapped out without being touched.
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        miss(format!("{}: {e}", path.display()))
-    })?;
-    touch(&file);
-    Ok(VerifiedArtifact { path, file })
+    let scratch = format!(".{}.onelf.{}", pin.blake3, std::process::id());
+    let mut staging = match dir.create_file(&scratch, staging_mode(uid)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // A scratch left by a process whose pid this one recycled; the
+            // publication lock proves no live acquirer is staging.
+            let _ = dir.unlink(&scratch);
+            dir.create_file(&scratch, staging_mode(uid))
+                .map_err(|e| miss(&refused, format!("{origin}: {e}")))?
+        }
+        Err(e) => return Err(miss(&refused, format!("{origin}: {e}"))),
+    };
+    let staged = fetch(&pin.url, &store.join(label).join(&scratch), &mut staging).and_then(|()| {
+        verify_staged(&dir, &scratch, &pin.blake3, &pin.url).map_err(PinError::message)
+    });
+    match staged {
+        Ok(file) => {
+            // Publishing renames over whatever the stored name held:
+            // rename never opens the entry it replaces, so a planted
+            // symlink or special object at the name is swapped out
+            // without being touched, and nothing incomplete is ever
+            // served under the stored name.
+            if let Err(e) = dir.rename(&scratch, name) {
+                let _ = dir.unlink(&scratch);
+                return Err(miss(&refused, format!("{}: {e}", path.display())));
+            }
+            Ok(verified(path, file))
+        }
+        Err(why) => {
+            let _ = dir.unlink(&scratch);
+            Err(miss(&refused, why))
+        }
+    }
+}
+
+/// A verified handle together with its stored path, recorded as in use.
+fn verified(path: PathBuf, file: fs::File) -> VerifiedArtifact {
+    let artifact = VerifiedArtifact { path, file };
+    touch(&artifact.file);
+    artifact
+}
+
+/// The publication lock of one label: an exclusive flock every acquirer
+/// of the label's builds holds while it stages, kept in a `.{label}.lock`
+/// file beside the store it guards. Read-only access suffices to hold an
+/// flock, so a store shared through the hint still serializes for every
+/// user that may stage there, and a first creator mints the file readable
+/// to those acquirers.
+fn publication_lock(store: &Path, label: &str) -> Result<fs::File, String> {
+    let path = store.join(format!(".{label}.lock"));
+    let lock = rustix::fs::open(
+        &path,
+        OFlags::CREATE | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::RGRP | Mode::ROTH,
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(fs::File::from(lock))
+}
+
+/// The mode a staged scratch file takes, by privilege. A privileged
+/// target stages privately, so the published artifact is private too; a
+/// user keeps the modes its store always carried, minus the write bit an
+/// untrusted uid must never hold on a stored artifact.
+fn staging_mode(uid: u32) -> Mode {
+    if uid == 0 {
+        Mode::RUSR | Mode::WUSR
+    } else {
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH
+    }
+}
+
+/// Create the store root and the label directory staging writes into,
+/// under the target uid's rules. A user keeps the ordinary directories
+/// `create_dir_all` always produced. A privileged target requires
+/// validated root-owned private directories instead: a pre-existing one
+/// that is a symlink, another uid's, or open to group or other access is
+/// refused (one the target owns is tightened in place), and nothing is
+/// staged through it.
+fn ensure_store_dirs(uid: u32, store: &Path, label_dir: &Path) -> Result<(), String> {
+    if uid != 0 {
+        return fs::create_dir_all(label_dir).map_err(|e| format!("{}: {e}", label_dir.display()));
+    }
+    for dir in [store, label_dir] {
+        if !onelf_format::cache_layout::ensure_safe_dir(dir, uid) {
+            return Err(format!(
+                "{}: not a private directory owned by the target uid, so nothing may be staged \
+                 there",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Why the confined open of a store candidate did not produce a verified
@@ -345,17 +460,72 @@ struct PinnedFile {
     fd: OwnedFd,
 }
 
-impl PinnedFile {
-    /// Pin the store-relative candidate `relative` under `store`.
-    ///
-    /// The store root is opened by name with symlink following kept: it is
-    /// the location the target uid owns or chose. Every component inside
-    /// it is opened with `openat(O_PATH|O_NOFOLLOW)`, so a symlink, FIFO,
+/// A directory pinned by descriptor: reached through a walk that opened
+/// nothing for content and followed nothing inside the store, so every
+/// name under it resolves in exactly the directory the walk validated.
+struct PinnedDir {
+    fd: OwnedFd,
+}
+
+/// Refuse a name that cannot be one component of a stored candidate,
+/// before it is looked up anywhere.
+fn check_component(name: &str, origin: &str) -> Result<(), PinError> {
+    if name.is_empty() || matches!(name, "." | "..") {
+        return Err(PinError::Intermediate(format!(
+            "{origin}: unsafe path component {name}"
+        )));
+    }
+    Ok(())
+}
+
+/// Why a directory may not back a privileged acquirer's staging, given
+/// its owner and mode against the privilege context, or `None` when `uid`
+/// owns it with no group or other access.
+fn insecure_dir(dir_uid: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    if dir_uid != uid {
+        Some("is owned by another uid")
+    } else if mode & 0o077 != 0 {
+        Some("is accessible to group or other")
+    } else {
+        None
+    }
+}
+
+/// Why a pinned regular file must not serve as a stored artifact, given
+/// its owner and mode against the privilege context, or `None` when `uid`
+/// owns it and no untrusted write access remains. A privileged context
+/// refuses group write access as well; a user store keeps accepting what
+/// its owner's umask produces.
+fn insecure_artifact(file_uid: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    if file_uid != uid {
+        Some("is owned by another uid")
+    } else if mode & 0o002 != 0 {
+        Some("is writable by other")
+    } else if uid == 0 && mode & 0o020 != 0 {
+        Some("is writable by group")
+    } else {
+        None
+    }
+}
+
+impl PinnedDir {
+    /// Walk from `store` down `components`, opening each as a real
+    /// directory with `openat(O_PATH|O_NOFOLLOW)`, so a symlink, FIFO,
     /// device, socket or ordinary file in place of a directory stops the
-    /// walk before anything under it is touched, and a symlink or
-    /// non-regular object at the final name is refused by the `fstat`
-    /// file-type check without being opened for I/O.
-    fn pin(store: &Path, relative: &str, origin: &str) -> Result<PinnedFile, PinError> {
+    /// walk before anything under it is touched. The store root itself is
+    /// opened by name with symlink following kept: it is the location the
+    /// target uid owns or chose.
+    ///
+    /// `strict` names the uid whose privilege the walk stages under, and
+    /// then every walked directory must be owned by that uid with no
+    /// group or other access, even when it pre-exists, so an insecure
+    /// store directory cannot back a privileged acquisition.
+    fn walk(
+        store: &Path,
+        components: &[&str],
+        origin: &str,
+        strict: Option<u32>,
+    ) -> Result<PinnedDir, PinError> {
         let mut dir = match rustix::fs::open(
             store,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -365,19 +535,11 @@ impl PinnedFile {
             Err(Errno::NOENT) => return Err(PinError::Missing),
             Err(e) => return Err(PinError::Intermediate(format!("{origin}: {e}"))),
         };
-        let names: Vec<&str> = relative.split('/').collect();
-        if names.len() > 8 {
-            return Err(PinError::Intermediate(format!(
-                "{origin}: too many path components"
-            )));
+        if let Some(uid) = strict {
+            strict_private_dir(&dir, origin, uid)?;
         }
-        let last = names.len() - 1;
-        for (index, name) in names.iter().enumerate() {
-            if name.is_empty() || matches!(*name, "." | "..") {
-                return Err(PinError::Intermediate(format!(
-                    "{origin}: unsafe path component {name}"
-                )));
-            }
+        for name in components {
+            check_component(name, origin)?;
             let pinned = match rustix::fs::openat(
                 &dir,
                 *name,
@@ -390,27 +552,153 @@ impl PinnedFile {
                     return Err(PinError::Intermediate(format!("{origin}: {name}: {e}")));
                 }
             };
-            let kind = kind_name(FileType::from_raw_mode(
-                fstat(&pinned)
-                    .map_err(|e| PinError::Intermediate(format!("{origin}: {name}: {e}")))?
-                    .st_mode,
-            ));
-            if index == last {
-                if kind != KIND_REGULAR {
-                    return Err(PinError::Final(format!(
-                        "{origin}: {kind} at the stored name, not a regular file"
-                    )));
-                }
-                return Ok(PinnedFile { fd: pinned });
-            }
+            let meta = fstat(&pinned)
+                .map_err(|e| PinError::Intermediate(format!("{origin}: {name}: {e}")))?;
+            let kind = kind_name(FileType::from_raw_mode(meta.st_mode));
             if kind != KIND_DIRECTORY {
                 return Err(PinError::Intermediate(format!(
                     "{origin}: {name} is {kind}, not a directory"
                 )));
             }
+            if let Some(uid) = strict {
+                strict_private_dir(&pinned, origin, uid)?;
+            }
             dir = pinned;
         }
-        Err(PinError::Intermediate(format!("{origin}: empty candidate")))
+        Ok(PinnedDir { fd: dir })
+    }
+
+    /// Open `name` in this directory without following anything, and
+    /// return its pinned descriptor together with its metadata, so both
+    /// callers gate on one `fstat`.
+    fn open_pinned(
+        &self,
+        name: &str,
+        origin: &str,
+    ) -> Result<(OwnedFd, rustix::fs::Stat), PinError> {
+        check_component(name, origin)?;
+        let pinned = match rustix::fs::openat(
+            &self.fd,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(pinned) => pinned,
+            Err(Errno::NOENT) => return Err(PinError::Missing),
+            Err(e) => {
+                return Err(PinError::Intermediate(format!("{origin}: {name}: {e}")));
+            }
+        };
+        let meta =
+            fstat(&pinned).map_err(|e| PinError::Intermediate(format!("{origin}: {name}: {e}")))?;
+        Ok((pinned, meta))
+    }
+
+    /// Pin the stored candidate `name` in this directory: it must be a
+    /// regular file whose owner and permissions leave no untrusted write
+    /// access, or the pin is refused before any content open exists.
+    fn pin_file(&self, name: &str, origin: &str, uid: u32) -> Result<PinnedFile, PinError> {
+        let (pinned, meta) = self.open_pinned(name, origin)?;
+        let kind = kind_name(FileType::from_raw_mode(meta.st_mode));
+        if kind != KIND_REGULAR {
+            return Err(PinError::Final(format!(
+                "{origin}: {kind} at the stored name, not a regular file"
+            )));
+        }
+        if let Some(why) = insecure_artifact(meta.st_uid, meta.st_mode, uid) {
+            return Err(PinError::Final(format!(
+                "{origin}: the stored file {why}, so it cannot serve as the pinned build"
+            )));
+        }
+        Ok(PinnedFile { fd: pinned })
+    }
+
+    /// Pin this acquisition's own staging scratch `name`: the regular
+    /// file check only, since the scratch was created exclusively by this
+    /// acquisition and its digest, not a permission gate, decides its
+    /// bytes.
+    fn pin_staging(&self, name: &str, origin: &str) -> Result<PinnedFile, PinError> {
+        let (pinned, meta) = self.open_pinned(name, origin)?;
+        let kind = kind_name(FileType::from_raw_mode(meta.st_mode));
+        if kind != KIND_REGULAR {
+            return Err(PinError::Final(format!(
+                "{origin}: {kind} at the staging name, not a regular file"
+            )));
+        }
+        Ok(PinnedFile { fd: pinned })
+    }
+
+    /// Create the exclusive staging scratch `name` in this directory at
+    /// `mode`, so two acquirers can never share a staging file and a
+    /// scratch left by a dead process is never truncated and reused.
+    fn create_file(&self, name: &str, mode: Mode) -> io::Result<fs::File> {
+        check_component(name, name).map_err(|e| io::Error::other(e.message()))?;
+        Ok(fs::File::from(rustix::fs::openat(
+            &self.fd,
+            name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
+            mode,
+        )?))
+    }
+
+    /// Remove `name` from this directory, for the staging failure paths
+    /// this acquisition owns.
+    fn unlink(&self, name: &str) -> io::Result<()> {
+        check_component(name, name).map_err(|e| io::Error::other(e.message()))?;
+        Ok(rustix::fs::unlinkat(
+            &self.fd,
+            name,
+            rustix::fs::AtFlags::empty(),
+        )?)
+    }
+
+    /// Rename `from` to `to` inside this directory, atomically. Rename
+    /// never opens the entry it replaces, so a planted symlink or special
+    /// object at `to` is swapped out without being touched, and the whole
+    /// publication lands inside the directory the walk validated.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        for name in [from, to] {
+            check_component(name, name).map_err(|e| io::Error::other(e.message()))?;
+        }
+        Ok(rustix::fs::renameat(&self.fd, from, &self.fd, to)?)
+    }
+}
+
+/// Validate a pinned store directory against the privileged rules, so an
+/// insecure or user-controlled pre-existing store path never backs a
+/// privileged acquisition.
+fn strict_private_dir(dir: &OwnedFd, origin: &str, uid: u32) -> Result<(), PinError> {
+    let meta = fstat(dir).map_err(|e| PinError::Intermediate(format!("{origin}: {e}")))?;
+    if let Some(why) = insecure_dir(meta.st_uid, meta.st_mode, uid) {
+        return Err(PinError::Intermediate(format!(
+            "{origin}: the store directory {why}, so it cannot back a privileged acquisition"
+        )));
+    }
+    Ok(())
+}
+
+impl PinnedFile {
+    /// Pin the store-relative candidate `relative` under `store`.
+    ///
+    /// The store root is opened by name with symlink following kept: it is
+    /// the location the target uid owns or chose. Every component inside
+    /// it is opened with `openat(O_PATH|O_NOFOLLOW)`, so a symlink, FIFO,
+    /// device, socket or ordinary file in place of a directory stops the
+    /// walk before anything under it is touched, and a symlink or
+    /// non-regular object at the final name is refused by the `fstat`
+    /// file-type check without being opened for I/O. The final name must
+    /// also be owned by `uid` with no untrusted write access, or it is
+    /// refused as a stored artifact.
+    fn pin(store: &Path, relative: &str, origin: &str, uid: u32) -> Result<PinnedFile, PinError> {
+        let names: Vec<&str> = relative.split('/').collect();
+        if names.len() > 8 {
+            return Err(PinError::Intermediate(format!(
+                "{origin}: too many path components"
+            )));
+        }
+        let (components, name) = names.split_at(names.len() - 1);
+        let dir = PinnedDir::walk(store, components, origin, None)?;
+        dir.pin_file(name[0], origin, uid)
     }
 
     /// Convert the pinned descriptor into a readable [`fs::File`] for the
@@ -500,8 +788,15 @@ fn open_verified(
     relative: &str,
     expected: &str,
     origin: &str,
+    uid: u32,
 ) -> Result<fs::File, PinError> {
-    let pinned = PinnedFile::pin(store, relative, origin)?;
+    let pinned = PinnedFile::pin(store, relative, origin, uid)?;
+    verify_pinned(pinned, expected, origin)
+}
+
+/// Hash the pinned handle's bytes against `expected` and return the
+/// handle, so every consumer reads the bytes whose digest matched.
+fn verify_pinned(pinned: PinnedFile, expected: &str, origin: &str) -> Result<fs::File, PinError> {
     let file = pinned.readable(origin)?;
     let got = hash_stream(&file).map_err(|e| PinError::Final(format!("{origin}: {e}")))?;
     if got != expected {
@@ -510,6 +805,21 @@ fn open_verified(
         )));
     }
     Ok(file)
+}
+
+/// Verify the staged scratch `name` in the pinned label directory against
+/// the pin, returning the readable handle the publication hands to
+/// consumers. The staging is verified through the same confined pinning
+/// as a stored candidate, so the bytes published are exactly the bytes
+/// whose digest matched.
+fn verify_staged(
+    dir: &PinnedDir,
+    name: &str,
+    expected: &str,
+    origin: &str,
+) -> Result<fs::File, PinError> {
+    let pinned = dir.pin_staging(name, origin)?;
+    verify_pinned(pinned, expected, origin)
 }
 
 /// The BLAKE3 digest of everything readable from `file`, in lowercase
@@ -528,28 +838,86 @@ fn hash_stream(file: &fs::File) -> io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Copy or download the build to `into`. The scheme decides: a local
-/// file is copied, `https://` goes through the updater's client, and
-/// anything else is refused before a request is made.
-fn fetch(url: &str, into: &Path) -> Result<(), String> {
+/// The largest fetch a store stages: two gibibytes, an order of magnitude
+/// above the largest builds a GL stack or a dependency set produces, so
+/// the bound never refuses a real build while it still stops a hostile
+/// source, a growing file or a never-ending stream long before it can
+/// fill the store's disk. The container codecs keep their own bounds on
+/// declared sizes; this caps the file the store has to hold.
+const FETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Copy or download the build into the already-created exclusive staging
+/// file. The scheme decides: a local file is copied through the bounded
+/// staging copy, `https://` goes through the updater's client into the
+/// staging path, and anything else is refused before a request is made.
+/// Either scheme is bounded by [`FETCH_MAX_BYTES`], so a source that
+/// never ends cannot fill the store's disk.
+fn fetch(url: &str, staging_path: &Path, staging: &mut fs::File) -> Result<(), String> {
     if let Some(path) = url.strip_prefix("file://") {
-        return fs::copy(path, into)
-            .map(|_| ())
+        // The non-blocking open keeps a FIFO at the pinned name from
+        // hanging the acquisition; a directory fails on its first read,
+        // and a regular file of declared size over the bound is refused
+        // before a byte is staged. The copy bound still applies during
+        // the transfer, for sources that grow or never report a size.
+        let source = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| format!("{url}: {e}"))?;
+        let mut source = fs::File::from(source);
+        if let Ok(meta) = source.metadata()
+            && meta.len() > FETCH_MAX_BYTES
+        {
+            return Err(format!(
+                "{url}: the source is larger than the {FETCH_MAX_BYTES}-byte bound a staged \
+                 build may take"
+            ));
+        }
+        return copy_bounded(&mut source, staging, FETCH_MAX_BYTES)
             .map_err(|e| format!("{url}: {e}"));
     }
     if url.starts_with("https://") {
-        return download(url, into);
+        return download(url, staging_path, staging);
     }
     Err(format!("{url}: a build must be an https:// or file:// URL"))
 }
 
+/// Stream `source` into the staging file from its start, refusing more
+/// than `cap` bytes so a hostile source cannot fill the disk.
+fn copy_bounded(
+    source: &mut impl io::Read,
+    staging: &mut fs::File,
+    cap: u64,
+) -> Result<(), String> {
+    let copied = io::copy(&mut source.take(cap.saturating_add(1)), staging)
+        .map_err(|e| format!("the staged copy failed: {e}"))?;
+    if copied > cap {
+        return Err(format!(
+            "the source is larger than the {cap}-byte bound a staged build may take"
+        ));
+    }
+    Ok(())
+}
+
+/// Download `url` into the staging path through the updater's client.
+/// The client streams the response body with its own timeouts and takes
+/// no reader hook, so the staging bound is enforced on the staged bytes
+/// here, before they can be verified or published.
 #[cfg(feature = "update")]
-fn download(url: &str, into: &Path) -> Result<(), String> {
-    crate::update::download(url, into)
+fn download(url: &str, into: &Path, staging: &mut fs::File) -> Result<(), String> {
+    crate::update::download(url, into)?;
+    let len = staging.metadata().map_err(|e| e.to_string())?.len();
+    if len > FETCH_MAX_BYTES {
+        return Err(format!(
+            "the source is larger than the {FETCH_MAX_BYTES}-byte bound a staged build may take"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "update"))]
-fn download(url: &str, _into: &Path) -> Result<(), String> {
+fn download(url: &str, _into: &Path, _staging: &mut fs::File) -> Result<(), String> {
     Err(format!("this runtime has no HTTPS client to fetch {url}"))
 }
 
@@ -656,6 +1024,13 @@ mod tests {
         dir
     }
 
+    /// The uid this process really runs as: the privilege context of the
+    /// user-side fixtures, against which the store's ownership rules
+    /// decide.
+    fn me() -> u32 {
+        crate::paths::uid()
+    }
+
     /// Where the store keeps a build with `digest` inside `dir`.
     fn stored_in(dir: &Path, digest: &str) -> PathBuf {
         dir.join("set").join(format!("{digest}.onelf"))
@@ -734,13 +1109,15 @@ mod tests {
         let tmp_relative = format!("l/.{}.onelf.{}", pin.blake3, std::process::id());
         let tmp = dir.join(&tmp_relative);
         fs::create_dir_all(tmp.parent().unwrap()).unwrap();
-        let err = fetch(&pin.url, &tmp)
+        let mut staging = fs::File::create(&tmp).unwrap();
+        let err = fetch(&pin.url, &tmp, &mut staging)
             .and_then(|()| {
-                open_verified(&dir, &tmp_relative, &pin.blake3, &pin.url).map_err(PinError::message)
+                open_verified(&dir, &tmp_relative, &pin.blake3, &pin.url, me())
+                    .map_err(PinError::message)
             })
             .unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
-        let err = fetch("http://e/gl.onelf", &tmp).unwrap_err();
+        let err = fetch("http://e/gl.onelf", &tmp, &mut staging).unwrap_err();
         assert!(err.contains("https:// or file://"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -756,7 +1133,7 @@ mod tests {
         fs::write(&stored, &bytes).unwrap();
 
         let pin = pin_for(&c.digest, &dir.join("absent-source"));
-        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false, me()).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
         assert!(
             !err.contains("not a usable build"),
@@ -776,7 +1153,7 @@ mod tests {
         fs::write(&stored, bytes).unwrap();
 
         let pin = pin_for(&c.digest, &dir.join("absent-source"));
-        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false, me()).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
         assert!(
             !err.contains("not a usable build") && !err.contains("too small"),
@@ -794,7 +1171,7 @@ mod tests {
         fs::write(&stored, &c.bytes).unwrap();
 
         let pin = pin_for(&c.digest, &dir.join("absent-source"));
-        let artifact = acquire(&dir, &stored_rel(&c.digest), &pin, false).unwrap();
+        let artifact = acquire(&dir, &stored_rel(&c.digest), &pin, false, me()).unwrap();
         assert_eq!(&*artifact, &*stored);
         assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
 
@@ -820,7 +1197,7 @@ mod tests {
         fs::write(&source, &c.bytes).unwrap();
 
         let pin = pin_for(&c.digest, &source);
-        let artifact = acquire(&dir, &stored_rel(&c.digest), &pin, true).unwrap();
+        let artifact = acquire(&dir, &stored_rel(&c.digest), &pin, true, me()).unwrap();
         assert_eq!(fs::read(&stored).unwrap(), c.bytes, "the store is repaired");
         assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
         assert_eq!(
@@ -842,7 +1219,7 @@ mod tests {
         fs::write(&source, b"not the pinned bytes either").unwrap();
 
         let pin = pin_for(&c.digest, &source);
-        let err = acquire(&dir, &stored_rel(&c.digest), &pin, true).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&c.digest), &pin, true, me()).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
         assert_eq!(
             fs::read_dir(stored.parent().unwrap()).unwrap().count(),
@@ -860,7 +1237,7 @@ mod tests {
         fs::write(&stored, b"").unwrap();
 
         let pin = pin_for(&"0".repeat(64), &dir.join("absent-source"));
-        let err = acquire(&dir, &stored_rel(&"0".repeat(64)), &pin, false).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&"0".repeat(64)), &pin, false, me()).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
         assert!(err.contains("ONELF_NO_PLATFORM_FETCH"), "{err}");
 
@@ -871,6 +1248,7 @@ mod tests {
             &stored_rel(&"1".repeat(64)),
             &pin_for(&"1".repeat(64), &dir.join("absent")),
             false,
+            me(),
         )
         .unwrap_err();
         assert!(err.contains("fetching is disabled"), "{err}");
@@ -892,7 +1270,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &stored).unwrap();
 
         let pin = pin_for(&c.digest, &dir.join("absent-source"));
-        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&c.digest), &pin, false, me()).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         assert!(err.contains("not a regular file"), "{err}");
         assert!(err.contains("ONELF_NO_PLATFORM_FETCH"), "{err}");
@@ -909,6 +1287,7 @@ mod tests {
             &stored_rel(&c.digest),
             &pin_for(&c.digest, &source),
             true,
+            me(),
         )
         .unwrap();
         assert!(!stored.is_symlink(), "the fetched copy is a real file");
@@ -934,7 +1313,7 @@ mod tests {
 
         let pin = pin_for(&c.digest, &source);
         for allow_fetch in [false, true] {
-            let err = acquire(&dir, &stored_rel(&c.digest), &pin, allow_fetch).unwrap_err();
+            let err = acquire(&dir, &stored_rel(&c.digest), &pin, allow_fetch, me()).unwrap_err();
             assert!(err.contains("symlink"), "{err}");
             assert_eq!(
                 fs::read_dir(&evil).unwrap().count(),
@@ -978,7 +1357,7 @@ mod tests {
                 }
             }
             let pin = pin_for(&digest, &dir.join("absent-source"));
-            let err = acquire(&dir, &stored_rel(&digest), &pin, false).unwrap_err();
+            let err = acquire(&dir, &stored_rel(&digest), &pin, false, me()).unwrap_err();
             assert!(err.contains("not a regular file"), "{tag}: {err}");
             assert!(
                 !err.contains("hash mismatch"),
@@ -995,7 +1374,7 @@ mod tests {
         mkfifoat(&root, "set", Mode::RUSR | Mode::WUSR).unwrap();
         drop(root);
         let pin = pin_for(&digest, &dir.join("absent-source"));
-        let err = acquire(&dir, &stored_rel(&digest), &pin, false).unwrap_err();
+        let err = acquire(&dir, &stored_rel(&digest), &pin, false, me()).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
         assert!(
             !err.contains("hash mismatch"),
@@ -1015,8 +1394,13 @@ mod tests {
         fs::create_dir_all(stored.parent().unwrap()).unwrap();
         fs::write(&stored, &c.bytes).unwrap();
 
-        let pinned =
-            PinnedFile::pin(&dir, &stored_rel(&c.digest), &stored.display().to_string()).unwrap();
+        let pinned = PinnedFile::pin(
+            &dir,
+            &stored_rel(&c.digest),
+            &stored.display().to_string(),
+            me(),
+        )
+        .unwrap();
         let hostile = dir.join("hostile");
         fs::write(&hostile, b"hostile replacement").unwrap();
         fs::rename(&hostile, &stored).unwrap();
@@ -1049,8 +1433,13 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(&stored, perms).unwrap();
 
-        let pinned =
-            PinnedFile::pin(&dir, &stored_rel(&c.digest), &stored.display().to_string()).unwrap();
+        let pinned = PinnedFile::pin(
+            &dir,
+            &stored_rel(&c.digest),
+            &stored.display().to_string(),
+            me(),
+        )
+        .unwrap();
         let hostile = dir.join("hostile");
         fs::write(&hostile, b"hostile replacement").unwrap();
         fs::rename(&hostile, &stored).unwrap();
@@ -1090,7 +1479,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let pin = pin_for(&c.digest, &dir.join("absent-source"));
-        let artifact = acquire(&link, &stored_rel(&c.digest), &pin, false).unwrap();
+        let artifact = acquire(&link, &stored_rel(&c.digest), &pin, false, me()).unwrap();
         assert_eq!(&*artifact, link.join(stored_rel(&c.digest)));
         assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
         let _ = fs::remove_dir_all(&dir);
@@ -1177,5 +1566,389 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store, PathBuf::from("/tmp/onelf-0/platform"));
+    }
+
+    /// Two acquirers of one build serialize on the label's publication
+    /// lock: the loser waits out the winner's staging, re-verifies the
+    /// published bytes against the pin, and uses them instead of fetching
+    /// its own copy, so exactly one publication wins. The source cannot
+    /// itself produce the pinned bytes, so the loser's success proves it
+    /// reused the winner's publication rather than fetching.
+    #[test]
+    fn concurrent_acquirers_serialize_and_the_loser_reuses_the_publication() {
+        use rustix::fs::FlockOperation;
+
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-serialize");
+        let c = container();
+        let store = dir.join("store");
+        let stored = stored_in(&store, &c.digest);
+        fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let source = dir.join("source");
+        fs::write(&source, b"never the pinned bytes").unwrap();
+        let pin = pin_for(&c.digest, &source);
+        let lock_path = store.join(".set.lock");
+        let held = fs::File::create(&lock_path).unwrap();
+        rustix::fs::flock(&held, FlockOperation::LockExclusive).unwrap();
+        let winner = {
+            let stored = stored.clone();
+            let bytes = c.bytes.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                fs::write(&stored, &bytes).unwrap();
+                drop(held);
+            })
+        };
+        let artifact = acquire(&store, &stored_rel(&c.digest), &pin, true, me()).unwrap();
+        winner.join().unwrap();
+        assert_eq!(&*artifact, &*stored);
+        assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
+        assert_eq!(
+            fs::read_dir(stored.parent().unwrap()).unwrap().count(),
+            1,
+            "exactly one publication, and none of the loser's staging"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An interrupted copy stages truncated bytes, which the destination
+    /// verification refuses before anything is published, and the failed
+    /// staging is cleaned away: no incomplete file is ever served under
+    /// the stored name.
+    #[test]
+    fn an_interrupted_copy_is_discarded_and_never_published() {
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-interrupted");
+        let c = container();
+        let store = dir.join("store");
+        let source = dir.join("source");
+        fs::write(&source, &c.bytes[..c.bytes.len() - 40]).unwrap();
+        let pin = pin_for(&c.digest, &source);
+        let err = acquire(&store, &stored_rel(&c.digest), &pin, true, me()).unwrap_err();
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(
+            !stored_in(&store, &c.digest).exists(),
+            "nothing incomplete was published"
+        );
+        let label = store.join("set");
+        assert_eq!(
+            fs::read_dir(&label).unwrap().count(),
+            0,
+            "the failed staging is cleaned away"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The staged bytes are verified against the pin before publication:
+    /// staging that does not match is refused with nothing published,
+    /// while staging that matches verifies and loads as the pinned build.
+    #[test]
+    fn a_mismatched_staging_is_never_published() {
+        use std::io::Write;
+
+        let dir = temp_dir("stage-mismatch");
+        let c = container();
+        let store = dir.join("store");
+        fs::create_dir_all(store.join("set")).unwrap();
+        let pinned = PinnedDir::walk(&store, &["set"], "staging", None).unwrap();
+        let mut staging = pinned
+            .create_file(".mismatch.onelf.1", staging_mode(me()))
+            .unwrap();
+        staging.write_all(b"bytes that match nothing").unwrap();
+        let err = verify_staged(&pinned, ".mismatch.onelf.1", &c.digest, "staging")
+            .map_err(PinError::message)
+            .unwrap_err();
+        assert!(err.contains("hash mismatch"), "{err}");
+        assert!(
+            !stored_in(&store, &c.digest).exists(),
+            "nothing was published from mismatched staging"
+        );
+
+        let mut good = pinned
+            .create_file(".mismatch.onelf.2", staging_mode(me()))
+            .unwrap();
+        good.write_all(&c.bytes).unwrap();
+        let file = verify_staged(&pinned, ".mismatch.onelf.2", &c.digest, "staging")
+            .map_err(PinError::message)
+            .unwrap();
+        let pkg = crate::loader::load_file(file).unwrap();
+        assert_eq!(entry_bytes(&pkg), FILE_CONTENT);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-existing stored file an untrusted uid could rewrite is not
+    /// usable: the world-writable file is refused without being touched,
+    /// and a permitted fetch repairs it by renaming a verified staging
+    /// over it, which never opens what it replaces.
+    #[test]
+    fn an_insecure_preexisting_destination_is_refused_and_repaired() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-insecure");
+        let c = container();
+        let store = dir.join("store");
+        let stored = stored_in(&store, &c.digest);
+        fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        fs::write(&stored, &c.bytes).unwrap();
+        fs::set_permissions(&stored, PermissionsExt::from_mode(0o666)).unwrap();
+
+        let pin = pin_for(&c.digest, &dir.join("absent-source"));
+        let err = acquire(&store, &stored_rel(&c.digest), &pin, false, me()).unwrap_err();
+        assert!(err.contains("writable by other"), "{err}");
+        assert_eq!(
+            fs::symlink_metadata(&stored).unwrap().mode() & 0o777,
+            0o666,
+            "the refusal leaves the file alone"
+        );
+
+        let source = dir.join("source");
+        fs::write(&source, &c.bytes).unwrap();
+        let artifact = acquire(
+            &store,
+            &stored_rel(&c.digest),
+            &pin_for(&c.digest, &source),
+            true,
+            me(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&stored).unwrap(), c.bytes);
+        let mode = fs::symlink_metadata(&stored).unwrap().mode() & 0o777;
+        assert_eq!(mode & 0o002, 0, "the repair publishes no other write");
+        // The repaired mode is what the staging always carries under this
+        // process's umask, so a probe scratch created the same way is the
+        // reference.
+        let dir_pin = PinnedDir::walk(&store, &["set"], "probe", None).unwrap();
+        drop(
+            dir_pin
+                .create_file(".probe.onelf.1", staging_mode(me()))
+                .unwrap(),
+        );
+        let probe = fs::symlink_metadata(store.join("set/.probe.onelf.1"))
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, probe, "the repaired mode is the staging mode");
+        assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stored file owned by another uid is refused when the acquisition
+    /// runs with another uid's privilege: ownership, not the bytes,
+    /// decides, so a user-owned file planted under a privileged target's
+    /// stored name is a cache miss, never a usable artifact.
+    #[test]
+    fn a_foreign_owned_stored_file_is_refused_for_a_privileged_context() {
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-foreign");
+        let c = container();
+        let store = dir.join("store");
+        let stored = stored_in(&store, &c.digest);
+        fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        fs::write(&stored, &c.bytes).unwrap();
+
+        let pin = pin_for(&c.digest, &dir.join("absent-source"));
+        let err = acquire(&store, &stored_rel(&c.digest), &pin, false, 0).unwrap_err();
+        assert!(err.contains("owned by another uid"), "{err}");
+        assert_eq!(fs::read(&stored).unwrap(), c.bytes, "the refusal is quiet");
+
+        // The same file serves the uid that owns it: the gate compares
+        // the privilege context, not the bytes' provenance.
+        let artifact = acquire(&store, &stored_rel(&c.digest), &pin, false, me()).unwrap();
+        assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The ownership and permission gates decide by the same rules the
+    /// committed private-directory checks use: no other uid's files, no
+    /// write access for an untrusted uid, and, for a privileged context,
+    /// no group write either, since a directory group member is not
+    /// root's to trust.
+    #[test]
+    fn the_security_gates_decide_by_owner_and_write_bits() {
+        assert_eq!(insecure_artifact(1000, 0o644, 1000), None);
+        assert_eq!(
+            insecure_artifact(1000, 0o644, 0),
+            Some("is owned by another uid")
+        );
+        assert_eq!(
+            insecure_artifact(1000, 0o666, 1000),
+            Some("is writable by other")
+        );
+        assert_eq!(insecure_artifact(1000, 0o664, 1000), None);
+        assert_eq!(insecure_artifact(0, 0o664, 0), Some("is writable by group"));
+        assert_eq!(insecure_artifact(0, 0o600, 0), None);
+
+        assert_eq!(insecure_dir(1000, 0o700, 1000), None);
+        assert_eq!(
+            insecure_dir(1000, 0o700, 0),
+            Some("is owned by another uid")
+        );
+        assert_eq!(
+            insecure_dir(1000, 0o755, 1000),
+            Some("is accessible to group or other")
+        );
+        assert_eq!(insecure_dir(0, 0o700, 0), None);
+    }
+
+    /// A user-owned store directory cannot back a privileged acquirer's
+    /// staging: the directories are validated against the privilege
+    /// context before anything is staged, and the refusal tightens
+    /// nothing and writes nothing.
+    #[test]
+    fn a_user_owned_store_is_refused_for_a_privileged_staging() {
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-rootrefuse");
+        let store = dir.join("store");
+        let label = store.join("set");
+        fs::create_dir_all(&label).unwrap();
+
+        let err = ensure_store_dirs(0, &store, &label).unwrap_err();
+        assert!(
+            err.contains("not a private directory owned by the target uid"),
+            "{err}"
+        );
+        assert!(label.is_dir(), "the refusal leaves the directory alone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A source over the staging bound is refused, whether it declares
+    /// its size or grows past the bound while it is copied, so a hostile
+    /// source cannot fill the disk.
+    #[test]
+    fn an_oversized_source_is_refused_by_the_copy_bound() {
+        let dir = temp_dir("stage-bound");
+        let mut staging = fs::File::create(dir.join("staging")).unwrap();
+        let mut source = &b"0123456789abcdef0123456789abcdef"[..];
+        let err = copy_bounded(&mut source, &mut staging, 16).unwrap_err();
+        assert!(err.contains("larger than the 16-byte bound"), "{err}");
+
+        let mut staging = fs::File::create(dir.join("staging-2")).unwrap();
+        let mut source = &b"0123456789abcdef"[..];
+        copy_bounded(&mut source, &mut staging, 16).unwrap();
+        drop(staging);
+        assert_eq!(
+            fs::read(dir.join("staging-2")).unwrap().len(),
+            16,
+            "the bounded copy stages exactly what the source held"
+        );
+
+        // A source that grows while it is copied is cut off at the same
+        // bound: the fifo has no declared size, so only the bound during
+        // the copy decides.
+        let fifo = dir.join("growing");
+        rustix::fs::mkfifoat(
+            fs::File::open(&dir).unwrap(),
+            "growing",
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let mut sink = fs::File::create(&fifo).unwrap();
+                use std::io::Write;
+                sink.write_all(&[7u8; 64]).unwrap();
+            })
+        };
+        let mut source = fs::File::open(&fifo).unwrap();
+        let mut staging = fs::File::create(dir.join("staging-3")).unwrap();
+        let err = copy_bounded(&mut source, &mut staging, 16).unwrap_err();
+        assert!(err.contains("larger than the 16-byte bound"), "{err}");
+        writer.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The staging mode follows the privilege seam: a privileged target
+    /// stages privately, and a user stages with the write access its own
+    /// store always carried, minus the other-write bit no stored artifact
+    /// may keep.
+    #[test]
+    fn the_staging_mode_follows_the_privilege_seam() {
+        assert_eq!(staging_mode(0).as_raw_mode(), 0o600);
+        assert_eq!(staging_mode(1000).as_raw_mode(), 0o664);
+        assert_eq!(staging_mode(me()).as_raw_mode() & 0o002, 0);
+    }
+
+    /// A scratch left under this acquisition's own pid name by a process
+    /// whose pid was recycled is reclaimed: the exclusive creation
+    /// removes it and stages fresh, so a dead acquirer's partial bytes
+    /// are never reused.
+    #[test]
+    fn a_stale_scratch_from_a_recycled_pid_is_reclaimed() {
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-stale");
+        let c = container();
+        let store = dir.join("store");
+        let source = dir.join("source");
+        fs::write(&source, &c.bytes).unwrap();
+        let pin = pin_for(&c.digest, &source);
+        let scratch = format!("set/.{}.onelf.{}", pin.blake3, std::process::id());
+        fs::create_dir_all(store.join("set")).unwrap();
+        fs::write(store.join(&scratch), b"left by a dead process").unwrap();
+
+        let artifact = acquire(&store, &stored_rel(&c.digest), &pin, true, me()).unwrap();
+        let stored = stored_in(&store, &c.digest);
+        assert_eq!(fs::read(&stored).unwrap(), c.bytes);
+        assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
+        assert_eq!(
+            fs::read_dir(stored.parent().unwrap()).unwrap().count(),
+            1,
+            "the scratch became the published artifact, nothing else remains"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The inherited hint never becomes a privileged target's staging
+    /// ground: its store resolves to the private base alone, and whether
+    /// the privileged acquisition reads, verifies, or fetches, the user
+    /// store's contents, mode and mtime never move.
+    #[test]
+    fn root_stages_nowhere_but_its_own_store() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _locking = crate::test_locks::locking();
+        let dir = temp_dir("stage-user-store");
+        let c = container();
+        let user_store = dir.join("user-store");
+        let stored = stored_in(&user_store, &c.digest);
+        fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        fs::write(&stored, &c.bytes).unwrap();
+        let before = fs::symlink_metadata(&stored).unwrap();
+
+        let resolved = owned_store(
+            0,
+            Some(user_store.as_path()),
+            || Some(dir.join("cache")),
+            || Some(dir.join("private")),
+        )
+        .unwrap();
+        assert_eq!(resolved, dir.join("private").join("platform"));
+
+        let pin = pin_for(&c.digest, &dir.join("absent"));
+        let err = acquire(&resolved, &stored_rel(&c.digest), &pin, false, 0).unwrap_err();
+        assert!(err.contains("fetching is disabled"), "{err}");
+
+        let source = dir.join("source");
+        fs::write(&source, &c.bytes).unwrap();
+        let outcome = acquire(&resolved, &stored_rel(&c.digest), &pin, true, 0);
+        assert!(
+            outcome.is_err(),
+            "a user-owned private base is refused as a privileged store"
+        );
+
+        let after = fs::symlink_metadata(&stored).unwrap();
+        assert_eq!(
+            (after.len(), after.mode(), after.uid(), after.mtime_nsec()),
+            (
+                before.len(),
+                before.mode(),
+                before.uid(),
+                before.mtime_nsec()
+            ),
+            "the user store is untouched"
+        );
+        assert_eq!(fs::read(&stored).unwrap(), c.bytes);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
