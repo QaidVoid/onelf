@@ -248,6 +248,14 @@ fn write(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+/// Write raw bytes, creating parent directories.
+fn write_bytes(path: &Path, content: &[u8]) {
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
 /// Compile a dynamically-linked ELF with the host `cc`. Returns false if
 /// no compiler is available (the only soft-skip condition).
 fn cc(src: &Path, out: &Path) -> bool {
@@ -725,6 +733,425 @@ fn a_framework_soname_dependency_activates_its_rule_without_includes() {
             "{soname} must activate {rule} with no include flag; stderr:\n{err}"
         );
     }
+}
+
+/// One activated framework group's fixture: the sonames the app names,
+/// the group directories of a fake distribution tree with the plugin
+/// files each holds (which may name subdirectories), and the rules whose
+/// collection the report must name.
+/// One fixture: a tag, the framework sonames the app names, each
+/// group directory with its plugins, and the rules whose collection
+/// the report must name.
+type PluginGroupFixture<'a> = (
+    &'a str,
+    &'a [&'a str],
+    &'a [(&'a str, &'a [&'a str])],
+    &'a [&'a str],
+);
+
+const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
+    (
+        "alsa",
+        &["libasound.so.2"],
+        &[(
+            "alsa-lib",
+            &[
+                "libasound_module_pcm_pulse.so",
+                "libasound_module_ctl_oss.so",
+            ],
+        )],
+        &["alsa"],
+    ),
+    (
+        "gstreamer",
+        &["libgstreamer-1.0.so.0"],
+        &[(
+            "gstreamer-1.0",
+            &["libgstcoreelements.so", "libgsttypefindfunctions.so"],
+        )],
+        &["gstreamer"],
+    ),
+    (
+        "pipewire-spa",
+        &["libpipewire-0.3.so.0"],
+        &[
+            ("pipewire-0.3", &["libpipewire-module-adapter.so"]),
+            ("spa-0.2", &["libspa-support.so", "libspa-journal.so"]),
+        ],
+        &["pipewire", "spa"],
+    ),
+    (
+        "gio",
+        &["libgio-2.0.so.0"],
+        &[("gio/modules", &["libgiognutls.so", "libgiolibproxy.so"])],
+        &["gio"],
+    ),
+    (
+        "heif",
+        &["libheif.so.1"],
+        &[("libheif", &["libheif-x264.so", "plugins/libheif-avif.so"])],
+        &["heif"],
+    ),
+    (
+        "babl-gegl",
+        &["libbabl-0.1.so.0", "libgegl-0.4.so.0"],
+        &[
+            ("babl-0.1", &["libbabl-cmyk.so"]),
+            ("gegl-0.4", &["gegl-brightness.so"]),
+        ],
+        &["babl", "gegl"],
+    ),
+    (
+        "qt6",
+        &["libQt6Core.so.6"],
+        &[(
+            "qt6/plugins",
+            &["platforms/libqsix.so", "styles/libqsty.so"],
+        )],
+        &["qt6"],
+    ),
+];
+
+/// Compile the shared objects of a fake distribution tree: the framework
+/// libraries and every plugin file their group directories hold, laid
+/// out the way a distribution installs them. Returns the library
+/// directory, or None when no compiler is available.
+fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) -> Option<PathBuf> {
+    let libdir = td.join("dist/usr/lib");
+    std::fs::create_dir_all(&libdir).unwrap();
+    for soname in sonames {
+        write(
+            &td.join("dist/framework.c"),
+            "int framework(void){return 1;}\n",
+        );
+        if !cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{soname}"),
+                td.join("dist/framework.c").to_str().unwrap(),
+            ],
+            &libdir.join(soname),
+        ) {
+            return None;
+        }
+    }
+    for (group, plugins) in groups {
+        for plugin in *plugins {
+            let out = libdir.join(group).join(plugin);
+            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+            let stem = out.file_stem().unwrap().to_str().unwrap();
+            let src = td.join("dist").join(format!("{stem}.c"));
+            write(&src, "int plugin_probe(void){return 2;}\n");
+            if !cc_with(&["-shared", "-fPIC", src.to_str().unwrap()], &out) {
+                return None;
+            }
+        }
+    }
+    Some(libdir)
+}
+
+/// Compile an app naming `sonames`, bundle it with only the framework
+/// tree's own library directory on the search path, and return the
+/// AppDir with the build's stderr. Returns None when no compiler is
+/// available.
+fn bundle_with_plugin_tree(
+    td: &Path,
+    sonames: &[&str],
+    libdir: &Path,
+) -> Option<(PathBuf, String)> {
+    let app = td.join("app");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    let mut args: Vec<String> = vec![
+        td.join("main.c").to_string_lossy().into_owned(),
+        format!("-L{}", libdir.display()),
+    ];
+    args.extend(sonames.iter().map(|s| format!("-l:{s}")));
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        &app.join("bin/app"),
+    ) {
+        return None;
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--search-path")
+        .arg(libdir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    Some((app, String::from_utf8_lossy(&o.stderr).into_owned()))
+}
+
+/// Every activated framework group arrives complete and in its
+/// preserved layout, with no `--include` and no `--search-path` per
+/// plugin: the app names only the framework sonames, the search path
+/// only holds the framework's own directory, and the packaged tree
+/// carries every plugin the group directories hold, laid out as the
+/// source laid them out, never flattened into the library directory.
+#[test]
+fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
+    for (tag, sonames, groups, rules) in PLUGIN_GROUP_FIXTURES {
+        let td = workdir(&format!("plugingroup-{tag}"));
+        let Some(libdir) = plugin_tree_sources(&td, sonames, groups) else {
+            return;
+        };
+        let Some((app, err)) = bundle_with_plugin_tree(&td, sonames, &libdir) else {
+            return;
+        };
+        assert!(
+            app.join("bin/app").is_file(),
+            "{tag}: the app itself must survive: {err}"
+        );
+        for soname in *sonames {
+            assert!(
+                app.join("lib").join(soname).is_file(),
+                "{tag}: the framework library itself is bundled: {err}"
+            );
+        }
+        for (group, plugins) in *groups {
+            for plugin in *plugins {
+                let name = Path::new(plugin).file_name().unwrap();
+                assert!(
+                    app.join("lib").join(group).join(plugin).is_file(),
+                    "{tag}: {plugin} must keep its place under {group}:\n{err}"
+                );
+                assert!(
+                    !app.join("lib").join(name).exists(),
+                    "{tag}: {plugin} must not be flattened into lib/"
+                );
+            }
+        }
+        for rule in *rules {
+            assert!(
+                err.contains(&format!("plugin(s) for {rule}/")),
+                "{tag}: the report must name {rule}'s collection:\n{err}"
+            );
+        }
+    }
+}
+
+/// Minimal ELF-shaped bytes: magic + EI_CLASS + e_machine, enough for
+/// the plugin compatibility checks to refuse as another architecture.
+fn foreign_plugin_bytes(machine: u16) -> Vec<u8> {
+    let mut v = vec![0u8; 64];
+    v[0..4].copy_from_slice(b"\x7fELF");
+    v[4] = 2;
+    v[18..20].copy_from_slice(&machine.to_le_bytes());
+    v
+}
+
+/// A group directory holding wrong-architecture and non-ELF candidates
+/// beside valid ones keeps the valid ones, names every refusal with its
+/// reason, and never copies an incompatible candidate anywhere in the
+/// tree.
+#[test]
+fn incompatible_plugins_are_skipped_without_shadowing_valid_ones() {
+    let td = workdir("pluginincompatible");
+    let groups = [("alsa-lib", &["libasound_module_pcm_pulse.so"] as &[&str])];
+    let Some(libdir) = plugin_tree_sources(&td, &["libasound.so.2"], &groups) else {
+        return;
+    };
+    write_bytes(
+        &libdir
+            .join("alsa-lib")
+            .join("libasound_module_pcm_foreign.so"),
+        &foreign_plugin_bytes(183),
+    );
+    write(
+        &libdir.join("alsa-lib").join("libasound_module_pcm_junk.so"),
+        "this is not an ELF object\n",
+    );
+
+    let Some((app, err)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
+        return;
+    };
+    assert!(
+        app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
+            .is_file(),
+        "the compatible plugin is collected:\n{err}"
+    );
+    for refused in [
+        "libasound_module_pcm_foreign.so",
+        "libasound_module_pcm_junk.so",
+    ] {
+        assert!(
+            !app.join("lib/alsa-lib").join(refused).exists(),
+            "{refused} must not be copied into the group layout"
+        );
+        assert!(
+            !app.join("lib").join(refused).exists(),
+            "{refused} must not be copied flat either"
+        );
+    }
+    assert!(
+        err.contains("libasound_module_pcm_foreign.so") && err.contains("machine 183"),
+        "the foreign-architecture refusal names the file and the reason:\n{err}"
+    );
+    assert!(
+        err.contains("libasound_module_pcm_junk.so") && err.contains("not an ELF object"),
+        "the non-ELF refusal names the file and the reason:\n{err}"
+    );
+}
+
+/// A source whose framework library carries no group directory leaves
+/// the optional group out with a recorded omission and a successful
+/// build: an unavailable backend is not an error. The sysroot keeps the
+/// host's own plugin directories out of the search, so the omission is
+/// what the fixture says and not what the build machine happens to
+/// have.
+#[test]
+fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
+    let td = workdir("pluginomission");
+    let rootfs = td.join("rootfs");
+    for d in ["usr/bin", "usr/lib"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    write(&td.join("alsa.c"), "int alsa_probe(void){return 1;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libasound.so.2",
+            td.join("alsa.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libasound.so.2"),
+    ) {
+        return;
+    }
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libasound.so.2",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return;
+    }
+    // The sysroot's libc is this machine's, so the closure has a libc
+    // and a loader to bundle and no need reaches the host.
+    let Some(host_libc) = ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6") else {
+        return;
+    };
+    let Some(host_ld) = ldd_path(&rootfs.join("usr/bin/app"), "ld-linux") else {
+        return;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    // The ALSA library without its plugin directory: the group has
+    // nowhere to look inside the sysroot.
+    write_pacman_entry(
+        &rootfs,
+        "alsa-lib",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libasound.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "alsa-lib"],
+        &[],
+        &["usr/bin/app"],
+    );
+
+    let appdir = td.join("appdir");
+    std::fs::create_dir_all(&appdir).unwrap();
+    let mut c = Command::new(onelf());
+    c.args([
+        "bundle-libs",
+        appdir.to_str().unwrap(),
+        "--target",
+        "bin/app",
+    ])
+    .args(["--sysroot", rootfs.to_str().unwrap()])
+    .args(["--search-path", rootfs.join("usr/lib").to_str().unwrap()]);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "the omission is not a failure:\n{err}");
+    assert!(
+        appdir.join("bin/app").is_file(),
+        "the app came over:\n{err}"
+    );
+    assert!(
+        appdir.join("lib/libasound.so.2").is_file(),
+        "the framework library is bundled:\n{err}"
+    );
+    assert!(
+        !appdir.join("lib/alsa-lib").exists(),
+        "no group directory is invented:\n{err}"
+    );
+    assert!(
+        err.contains("no usable plugin group") && err.contains("alsa/"),
+        "the omission names the rule and group:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A plugin a run before group collection existed left flat in the
+/// library directory moves into its group's layout on the next run, the
+/// repair the destination-exists skip keeps performing.
+#[test]
+fn a_rebundled_flat_plugin_migrates_into_its_group_layout() {
+    let td = workdir("pluginmigrate");
+    let groups = [("alsa-lib", &["libasound_module_pcm_pulse.so"] as &[&str])];
+    let Some(libdir) = plugin_tree_sources(&td, &["libasound.so.2"], &groups) else {
+        return;
+    };
+    let Some((app, err)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
+        return;
+    };
+    assert!(
+        app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
+            .is_file(),
+        "first run collects the plugin:\n{err}"
+    );
+
+    // What an older onelf left: the plugin flat, where nothing loads it.
+    std::fs::copy(
+        app.join("lib/alsa-lib/libasound_module_pcm_pulse.so"),
+        app.join("lib/libasound_module_pcm_pulse.so"),
+    )
+    .unwrap();
+
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--search-path")
+        .arg(&libdir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "the rebundle must succeed:\n{err}");
+    assert!(
+        !app.join("lib/libasound_module_pcm_pulse.so").exists(),
+        "the flat copy is gone:\n{err}"
+    );
+    assert!(
+        app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
+            .is_file(),
+        "the group layout copy stays:\n{err}"
+    );
 }
 
 /// Reversing the enumeration order of equivalent recipe inputs (the

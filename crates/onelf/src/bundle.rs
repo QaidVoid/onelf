@@ -20,7 +20,7 @@
 //! used as fallbacks (`/sbin/ldconfig`, `/usr/sbin/ldconfig`) are fixed
 //! constants, not derived from any input.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::PermissionsExt;
@@ -36,6 +36,7 @@ mod discover;
 pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod activate;
+mod collect;
 mod plan;
 mod resolve;
 pub(crate) use resolve::*;
@@ -395,57 +396,6 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 ];
 
 pub(crate) use onelf_sysroot::LIB_PATHS as STANDARD_LIB_PATHS;
-
-/// Library-directory subdirectories whose contents are plugins a library
-/// dlopens by soname, matched against the tail of the directory a resolved
-/// library was found in. A resolved plugin keeps its subdirectory in the
-/// bundle (`lib/alsa-lib/libasound_module_pcm_pulse.so`), which is the one
-/// place its loader looks for it: alsa-lib falls back to `alsa-lib/` beside
-/// the loaded libasound when `ALSA_PLUGIN_DIR` is unset, and the runtime
-/// points the others' variables at the directory below a library directory
-/// (the runtime's `setup_plugin_dirs`, the `datadirs` lint). Written flat,
-/// the copy is dead weight: nothing ever looks for it there.
-const PLUGIN_LIB_SUBDIRS: &[&str] = &[
-    // Longest first: Debian keeps libheif's plugins one level deeper.
-    "libheif/plugins",
-    "alsa-lib",
-    "babl-0.1",
-    "gegl-0.4",
-    "gio/modules",
-    "gstreamer-1.0",
-    "libheif",
-    "pipewire-0.3",
-    "spa-0.2",
-];
-
-/// The plugin subdirectory a resolved library belongs in, read from the
-/// tail of the directory it was found in: `/usr/lib/alsa-lib/x.so`
-/// belongs in `alsa-lib/`. `None` leaves the soname flat.
-fn plugin_subdir(resolved: &Path) -> Option<&'static str> {
-    let dir: Vec<&std::ffi::OsStr> = resolved
-        .parent()?
-        .components()
-        .map(|c| c.as_os_str())
-        .collect();
-    PLUGIN_LIB_SUBDIRS.iter().copied().find(|rel| {
-        let parts: Vec<&str> = rel.split('/').collect();
-        dir.len() >= parts.len()
-            && dir[dir.len() - parts.len()..]
-                .iter()
-                .zip(parts)
-                .all(|(c, part)| c.to_str() == Some(part))
-    })
-}
-
-/// Where a resolved soname is written inside the library directory: the
-/// subdirectory its kind of plugin lives in when it came from one,
-/// otherwise flat.
-fn dest_rel(soname: &str, resolved: &Path) -> PathBuf {
-    match plugin_subdir(resolved) {
-        Some(dir) => Path::new(dir).join(soname),
-        None => PathBuf::from(soname),
-    }
-}
 
 /// A symlink target reaching `to` (relative to the library directory)
 /// from inside `from_dir` (also relative to it), where the link itself
@@ -1211,6 +1161,64 @@ fn report_activations(activations: &[RuleActivation]) {
     );
 }
 
+/// Mirror the groups the activator has queued, appending the rules that
+/// activated since the last call with their groups in declaration order:
+/// the same sequence the queue was filled in, so a popped group item is
+/// identified by taking the front of this.
+fn mirror_new_groups(
+    discovery: &Discovery,
+    known: &mut HashSet<String>,
+    mirror: &mut VecDeque<(String, String)>,
+) {
+    for activation in discovery.activations() {
+        if !known.insert(activation.rule.clone()) {
+            continue;
+        }
+        for group in activation.groups {
+            mirror.push_back((activation.rule.clone(), group));
+        }
+    }
+}
+
+/// Report one plugin group's collection: what was collected, where
+/// from, and every member refused with its reason, bounded so a hostile
+/// directory cannot flood the build log.
+fn report_collection(collection: &collect::GroupCollection) {
+    let label = format!("{}/{}", collection.rule, collection.group);
+    if collection.plugins.is_empty() {
+        eprintln!(
+            "  {} {label}: no usable plugin group ({} location(s) unavailable, {} candidate(s) skipped)",
+            color::bold_red("warning:"),
+            collection.misses.len(),
+            collection.skipped.len()
+        );
+    } else {
+        eprintln!(
+            "  {} {} plugin(s) for {} from {} director{}",
+            color::bold_green("Collected"),
+            collection.plugins.len(),
+            label,
+            collection.search_dirs.len(),
+            if collection.search_dirs.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        );
+    }
+    for reason in collection.misses.iter().take(3) {
+        eprintln!("    {reason}");
+    }
+    const SHOWN_SKIPS: usize = 4;
+    for (name, reason) in collection.skipped.iter().take(SHOWN_SKIPS) {
+        eprintln!("    {} skipped: {reason}", color::dim(name));
+    }
+    let hidden = collection.skipped.len().saturating_sub(SHOWN_SKIPS);
+    if hidden > 0 {
+        eprintln!("    and {hidden} more skipped");
+    }
+}
+
 /// Bundle the shared libraries the tree's ELF files need into its
 /// library directory, rewrite the ELF files for the bundled layout,
 /// and record what the build generated.
@@ -1236,12 +1244,14 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     let mut host_files: HashSet<String> = HashSet::new();
     let mut set_sonames: HashSet<String> = HashSet::new();
+    let mut sysroot_universe: Option<sysroot::SysrootUniverse> = None;
     let sysroot_platform = match &opts.sysroot {
         Some(sr) => {
             let (report, platform) = sysroot::populate(&opts.directory, sr)?;
             sysroot::print_report(sr, &report);
             host_files = report.host_files;
             set_sonames = report.set_sonames;
+            sysroot_universe = Some(report.universe);
             Some(platform)
         }
         None => {
@@ -1805,6 +1815,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut left_with_host: Vec<(String, String)> = Vec::new();
     let mut already_processed: HashSet<String> = HashSet::new();
     let mut expanded_nix: HashSet<PathBuf> = HashSet::new();
+    // The objects the walk resolved, which descriptor discovery searches
+    // its declared group directories against, and the names already in it.
+    let mut admitted: Vec<AdmittedLibrary> = Vec::new();
+    let mut admitted_names: HashSet<String> = HashSet::new();
+    // The AppDir destinations activated groups declared for the plugins
+    // they collected, which supersede flat placement for those sonames.
+    let mut group_dests: HashMap<String, PathBuf> = HashMap::new();
     // BLAKE3(content) -> the destination the file was written to,
     // relative to the library directory, so aliases with identical bytes
     // symlink instead of copy.
@@ -1825,6 +1842,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         discovery.observe_present(soname)?;
     }
     discovery.seed(&seeds);
+    // The groups the activator queued, as rule and identity pairs in
+    // queue order, and the rules already mirrored.
+    let mut known_groups: HashSet<String> = HashSet::new();
+    let mut group_queue: VecDeque<(String, String)> = VecDeque::new();
+    mirror_new_groups(&discovery, &mut known_groups, &mut group_queue);
     // Name service modules glibc loads by dlopen, let through the excluded
     // `libnss_` prefix when libc lands: `compat` on every glibc, and
     // `files` and `dns` too before 2.34 folded those into libc.so.6.
@@ -1862,10 +1884,64 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     }
 
     while let Some(item) = discovery.pop() {
-        // A queued group is collected by the resource discovery phases;
-        // popping it here keeps the queue draining so the walk ends.
-        let WorkItem::Object(soname) = item else {
-            continue;
+        // The activator hands a popped group out as an opaque key; the
+        // activation report names the same rules and groups in the order
+        // the queue was filled, so mirroring it identifies each popped
+        // group without reaching into the activator.
+        mirror_new_groups(&discovery, &mut known_groups, &mut group_queue);
+        let soname = match item {
+            WorkItem::Object(soname) => soname,
+            WorkItem::Group(_) => {
+                let Some((rule, group)) = group_queue.pop_front() else {
+                    continue;
+                };
+                // Data and helper groups are the resource phases that own
+                // them; plugin groups collect here, into the object queue.
+                let declared = onelf_format::catalog::builtins()
+                    .iter()
+                    .find(|d| d.id.as_str() == rule)
+                    .and_then(|d| d.resources.plugins.iter().find(|g| g.id.as_str() == group));
+                let Some(declared) = declared else {
+                    continue;
+                };
+                let collection = collect::collect_group(
+                    &rule,
+                    declared,
+                    &admitted,
+                    sysroot_universe.as_ref(),
+                    target_class,
+                    target_machine,
+                )?;
+                for dir in &collection.search_dirs {
+                    if !search_paths.contains(dir) {
+                        search_paths.push(dir.clone());
+                    }
+                }
+                for plugin in &collection.plugins {
+                    if let Some(dir) = plugin.resolved.parent() {
+                        let dir = dir.to_path_buf();
+                        if !search_paths.contains(&dir) {
+                            search_paths.push(dir);
+                        }
+                    }
+                }
+                report_collection(&collection);
+                for plugin in &collection.plugins {
+                    group_dests
+                        .entry(plugin.soname.clone())
+                        .or_insert_with(|| plugin.destination.clone());
+                    needed_by
+                        .entry(plugin.soname.clone())
+                        .or_insert_with(|| format!("rule {rule} group {group}"));
+                    // An object that drained before its group popped chose
+                    // its destination flat; the group's declared destination
+                    // supersedes it, so the object runs again with the
+                    // repair that move implies.
+                    already_processed.remove(&plugin.soname);
+                    discovery.enqueue(&plugin.soname)?;
+                }
+                continue;
+            }
         };
         if already_processed.contains(&soname)
             || (is_excluded(&soname, &excludes) && !nss_allow.contains(&soname))
@@ -1943,8 +2019,21 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 } else {
                     resolved
                 };
+                // Every object the walk resolved is a root descriptor
+                // discovery may search its group directories against.
+                if admitted_names.insert(soname.clone()) {
+                    admitted.push(AdmittedLibrary::new(soname.clone(), resolved.clone()));
+                }
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-                let rel = dest_rel(&soname, &resolved);
+                // A collected plugin's group declares its destination; every
+                // other soname lies flat in the library directory.
+                let rel = match group_dests.get(&soname) {
+                    Some(dest) => dest
+                        .strip_prefix(&opts.lib_dir)
+                        .unwrap_or(dest)
+                        .to_path_buf(),
+                    None => PathBuf::from(&soname),
+                };
                 let dest = lib_dest.join(&rel);
                 // A plugin a pre-fix run left flat: the subdirectory copy
                 // below replaces it.
@@ -3060,64 +3149,6 @@ fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
 #[cfg(test)]
 mod plugin_dir_tests {
     use super::*;
-
-    #[test]
-    fn a_plugin_from_a_named_dir_keeps_the_dir() {
-        assert_eq!(
-            dest_rel(
-                "libasound_module_pcm_pulse.so",
-                Path::new("/usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so")
-            ),
-            PathBuf::from("alsa-lib/libasound_module_pcm_pulse.so")
-        );
-        assert_eq!(
-            dest_rel("libgstx.so", Path::new("/usr/lib/gstreamer-1.0/libgstx.so")),
-            PathBuf::from("gstreamer-1.0/libgstx.so")
-        );
-    }
-
-    #[test]
-    fn a_flat_library_stays_flat() {
-        assert_eq!(
-            dest_rel("libasound.so.2", Path::new("/usr/lib/libasound.so.2")),
-            PathBuf::from("libasound.so.2")
-        );
-        assert_eq!(
-            dest_rel(
-                "libpulse.so.0",
-                Path::new("/usr/lib/x86_64-linux-gnu/libpulse.so.0")
-            ),
-            PathBuf::from("libpulse.so.0")
-        );
-    }
-
-    #[test]
-    fn the_longest_tail_wins() {
-        // Debian keeps libheif's plugins one level below the directory.
-        assert_eq!(
-            dest_rel(
-                "libheif-x.so",
-                Path::new("/usr/lib/x86_64-linux-gnu/libheif/plugins/libheif-x.so")
-            ),
-            PathBuf::from("libheif/plugins/libheif-x.so")
-        );
-        // Arch keeps them directly in it.
-        assert_eq!(
-            dest_rel("libheif-x.so", Path::new("/usr/lib/libheif/libheif-x.so")),
-            PathBuf::from("libheif/libheif-x.so")
-        );
-    }
-
-    #[test]
-    fn a_sysroot_path_matches_the_same_way() {
-        assert_eq!(
-            dest_rel(
-                "libpipewire-module-x.so",
-                Path::new("/tmp/sysroot/usr/lib/pipewire-0.3/libpipewire-module-x.so")
-            ),
-            PathBuf::from("pipewire-0.3/libpipewire-module-x.so")
-        );
-    }
 
     #[test]
     fn link_targets_stay_inside_the_library_directory() {
