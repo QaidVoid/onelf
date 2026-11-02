@@ -1,0 +1,521 @@
+//! Metadata lowering, capability gating and emission wiring tests.
+//!
+//! The packer is a binary crate, so these tests compile the modules they
+//! exercise straight from source: the lowering and gating APIs are library
+//! shapes no build path wires up yet, and only these tests drive them
+//! ahead of that wiring. Including a module also runs its own unit tests
+//! in this target; the tests at the end of this file are the ones it adds.
+//!
+//! `bundle` is a file module with a child directory in the packer's own
+//! tree, and a module loaded through a path attribute resolves its
+//! children beside the named file. `tests/bundle/` therefore mirrors the
+//! packer's `bundle.rs` and `bundle/` pair with links, so the bundle
+//! include below resolves exactly the files the build compiles.
+//!
+//! Lowering turns validated runtime mappings into the two encoded records
+//! a package can carry, gates them on the embedded runtime's capability
+//! note, and injects them as `.onelf/runtime-rules` and
+//! `.onelf/entrypoint-sets`. Ordinary builds populate none of it, so they
+//! must pack byte-identically to before.
+
+#![allow(dead_code)]
+
+#[rustfmt::skip]
+#[path = "../src/assembly.rs"]
+mod assembly;
+#[rustfmt::skip]
+#[path = "bundle/bundle.rs"]
+mod bundle;
+#[rustfmt::skip]
+#[path = "../src/compress.rs"]
+mod compress;
+#[rustfmt::skip]
+#[path = "../src/extract.rs"]
+mod extract;
+#[rustfmt::skip]
+#[path = "../src/info.rs"]
+mod info;
+#[rustfmt::skip]
+#[path = "../src/metadata.rs"]
+mod metadata;
+#[rustfmt::skip]
+#[path = "../src/pack.rs"]
+mod pack;
+#[rustfmt::skip]
+#[path = "../src/payload.rs"]
+mod payload;
+#[rustfmt::skip]
+#[path = "../src/recipe.rs"]
+mod recipe;
+#[rustfmt::skip]
+#[path = "../src/sysroot_cmd.rs"]
+mod sysroot_cmd;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use onelf_format::elf::{
+    NOTE_NAME, NOTE_TYPE, RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote,
+    probe_capability_note,
+};
+use onelf_format::rules::{
+    EnvironmentName, Inheritance, PathSelection, RelativePath, ResourceKind, RuleId, RuntimeBase,
+    RuntimeCandidate, RuntimeHookId, RuntimePathGroup, RuntimeRules,
+};
+use onelf_format::runtime_metadata::{
+    EntrypointSelection, EntrypointSets, RuntimeRuleMetadata, RuntimeRuleRecord, SetPin,
+};
+
+/// A temp directory unique to one test and call, so parallel tests never
+/// share state.
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "onelf-metadata-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Seed `root` with the app tree every pack in this file starts from:
+/// `bin/app`, the command both the direct packs and the recipes name,
+/// inside the directory the packer walks or the recipe's directory names.
+fn seed_app(root: &Path) {
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::write(root.join("bin/app"), b"#!/bin/sh\necho hi\n").unwrap();
+    fs::set_permissions(root.join("bin/app"), PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// One presence-based mapping: a package-root directory exported as one
+/// environment variable.
+fn mapping(id: &str, path: &str, variable: &str) -> RuntimePathGroup {
+    RuntimePathGroup {
+        id: RuleId::new(id).unwrap(),
+        kind: ResourceKind::Directory,
+        candidates: vec![RuntimeCandidate {
+            base: RuntimeBase::PackageRoot,
+            path: RelativePath::new(path).unwrap(),
+        }],
+        variables: vec![EnvironmentName::new(variable).unwrap()],
+        selection: PathSelection::First,
+        inheritance: Inheritance::Preserve,
+    }
+}
+
+/// One rule record with a path group and one closed hook.
+fn record(id: &str, binding: Option<SetPin>) -> RuntimeRuleRecord {
+    RuntimeRuleRecord {
+        id: RuleId::new(id).unwrap(),
+        binding,
+        runtime: RuntimeRules {
+            paths: vec![mapping("paths", "share/data", "APP_DATA_DIRS")],
+            hooks: vec![RuntimeHookId::FontconfigGenerate],
+        },
+    }
+}
+
+/// A pin table with one declared set and one entrypoint selecting it.
+fn sets_table(name: &str, hash: [u8; 32]) -> EntrypointSets {
+    EntrypointSets {
+        pins: vec![SetPin {
+            name: RuleId::new(name).unwrap(),
+            hash,
+        }],
+        entrypoints: vec![EntrypointSelection {
+            name: "app".to_string(),
+            sets: vec![RuleId::new(name).unwrap()],
+        }],
+    }
+}
+
+/// A runtime advertising exactly what the embedded builds advertise:
+/// payload metadata version 1 and the selection view.
+fn capable_note() -> RuntimeNote {
+    RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: RuntimeCapabilities::SELECTION_VIEW,
+    }
+}
+
+/// A runtime that parses payload metadata but resolves no selections: the
+/// shape of an older embedded build.
+fn note_without_view() -> RuntimeNote {
+    RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: RuntimeCapabilities::empty(),
+    }
+}
+
+/// An ELF64 carrying one onelf capability note whose description cannot
+/// decode, the shape of a runtime whose advertisement is unreadable.
+fn incompatible_note() -> RuntimeNote {
+    const PT_NOTE: u32 = 4;
+    let mut elf = vec![0u8; 152];
+    elf[0..4].copy_from_slice(b"\x7fELF");
+    elf[4] = 2;
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    elf[64..68].copy_from_slice(&PT_NOTE.to_le_bytes());
+    elf[72..80].copy_from_slice(&120u64.to_le_bytes());
+    elf[96..104].copy_from_slice(&32u64.to_le_bytes());
+    elf[120..124].copy_from_slice(&(NOTE_NAME.len() as u32 + 1).to_le_bytes());
+    elf[124..128].copy_from_slice(&12u32.to_le_bytes());
+    elf[128..132].copy_from_slice(&NOTE_TYPE.to_le_bytes());
+    elf[132..132 + NOTE_NAME.len()].copy_from_slice(NOTE_NAME);
+    // A description naming the vendor and type but reserving a nonzero
+    // field, which the decoder refuses.
+    elf[140..144].copy_from_slice(b"OCAP");
+    elf[144..146].copy_from_slice(&1u16.to_le_bytes());
+    elf[146..148].copy_from_slice(&1u16.to_le_bytes());
+    let note = probe_capability_note(&elf).unwrap();
+    match note {
+        RuntimeNote::Incompatible(_) => note,
+        other => panic!("the crafted note probed {other:?}, not incompatible"),
+    }
+}
+
+/// A packable set of options over the seeded app tree, carrying no
+/// metadata and a capable runtime note unless the test replaces either.
+fn test_opts(app: &Path, out: &Path, note: RuntimeNote) -> pack::PackOptions {
+    pack::PackOptions {
+        directory: app.to_path_buf(),
+        output: out.to_path_buf(),
+        command: "bin/app".to_string(),
+        name: None,
+        entrypoints: Vec::new(),
+        default_entrypoint: None,
+        lib_dirs: Vec::new(),
+        level: 3,
+        block_size: compress::DEFAULT_BLOCK_SIZE,
+        payload: pack::Payload::Blocks,
+        use_dict: false,
+        no_compress: false,
+        memfd: Some(false),
+        working_dir: onelf_format::WorkingDir::Inherit,
+        host_libs: pack::HostLibs::default(),
+        cache: false,
+        prefer_cache: false,
+        update_url: None,
+        embed_updater: false,
+        update_key: None,
+        update_revision: None,
+        update_unsigned: false,
+        exclude: Vec::new(),
+        package_info: None,
+        mtime: Some(0),
+        env: Vec::new(),
+        paths: Vec::new(),
+        preload: Vec::new(),
+        needs_setuid: false,
+        profile: Vec::new(),
+        provider_index: None,
+        metadata: pack::MetadataPayload::default(),
+        runtime_note: note,
+    }
+}
+
+#[test]
+fn lowered_rules_round_trip_through_the_codec() {
+    let records = vec![
+        record("alsa", None),
+        record(
+            "gtk",
+            Some(SetPin {
+                name: RuleId::new("gtk").unwrap(),
+                hash: [7; 32],
+            }),
+        ),
+    ];
+    let payload =
+        pack::lower_runtime_metadata(records.clone(), Some(sets_table("gtk", [7; 32]))).unwrap();
+    let rules = RuntimeRuleMetadata::decode(payload.runtime_rules.as_deref().unwrap()).unwrap();
+    // Encoding sorts scoped identities, None before Some.
+    let mut sorted = records;
+    sorted.sort_by_key(|rule| (rule.id.clone(), rule.binding.clone()));
+    assert_eq!(rules.rules, sorted);
+    let sets = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
+    assert_eq!(sets, sets_table("gtk", [7; 32]));
+}
+
+#[test]
+fn lowered_bytes_are_canonical_and_stable() {
+    let reversed = vec![record("zzz", None), record("aaa", None)];
+    let payload = pack::lower_runtime_metadata(reversed, None).unwrap();
+    let bytes = payload.runtime_rules.clone().unwrap();
+    let decoded = RuntimeRuleMetadata::decode(&bytes).unwrap();
+    assert_eq!(
+        decoded
+            .rules
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["aaa", "zzz"],
+        "decoding must observe the canonical identity order"
+    );
+    assert_eq!(decoded.encode().unwrap(), bytes, "decoding re-encodes 1:1");
+    let again =
+        pack::lower_runtime_metadata(vec![record("aaa", None), record("zzz", None)], None).unwrap();
+    assert_eq!(again.runtime_rules, payload.runtime_rules);
+}
+
+#[test]
+fn lowering_refuses_duplicates_and_unknown_pins() {
+    let duplicate =
+        pack::lower_runtime_metadata(vec![record("same", None), record("same", None)], None)
+            .unwrap_err();
+    assert!(
+        duplicate
+            .to_string()
+            .contains("duplicate scoped descriptor identity"),
+        "{duplicate}"
+    );
+    let err = pack::lower_runtime_metadata(
+        vec![record(
+            "bound",
+            Some(SetPin {
+                name: RuleId::new("elsewhere").unwrap(),
+                hash: [1; 32],
+            }),
+        )],
+        Some(sets_table("gtk", [2; 32])),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("runtime binding"), "{err}");
+}
+
+#[test]
+fn nothing_to_lower_emits_nothing() {
+    assert_eq!(
+        pack::lower_runtime_metadata(Vec::new(), None).unwrap(),
+        pack::MetadataPayload::default(),
+        "an ordinary recipe with no rule declarations carries no records"
+    );
+    // An explicit empty selection table is a statement, not absence.
+    let explicit = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: vec![],
+            entrypoints: vec![EntrypointSelection {
+                name: "app".to_string(),
+                sets: vec![],
+            }],
+        }),
+    )
+    .unwrap();
+    assert!(explicit.runtime_rules.is_none());
+    assert!(explicit.entrypoint_sets.is_some());
+}
+
+#[test]
+fn custom_rule_mappings_lower_without_their_sources() {
+    let custom = "local-frobnicator";
+    assert!(
+        !onelf_format::catalog::builtins()
+            .iter()
+            .any(|d| d.id.as_str() == custom),
+        "the fixture must not name a built-in rule"
+    );
+    let payload = pack::lower_runtime_metadata(vec![record(custom, None)], None).unwrap();
+    let decoded = RuntimeRuleMetadata::decode(payload.runtime_rules.as_deref().unwrap()).unwrap();
+    assert_eq!(decoded.rules.len(), 1);
+    assert_eq!(decoded.rules[0].id.as_str(), custom);
+    decoded.validate().unwrap();
+}
+
+#[test]
+fn a_capable_runtime_carries_the_lowered_records() {
+    let root = temp_dir("capable");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let mut opts = test_opts(&root, &out, capable_note());
+    opts.metadata = pack::lower_runtime_metadata(vec![record("alsa", None)], None).unwrap();
+    pack::pack(&opts, b"stub-runtime").unwrap();
+    let bytes = metadata::read_packed_file(&out, ".onelf/runtime-rules")
+        .unwrap()
+        .expect("the rules record is carried");
+    let decoded = RuntimeRuleMetadata::decode(&bytes).unwrap();
+    assert_eq!(decoded.rules[0].id.as_str(), "alsa");
+    assert!(
+        metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn selections_need_the_selection_view_and_are_carried_when_advertised() {
+    let root = temp_dir("view");
+    seed_app(&root);
+    let payload =
+        pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [9; 32]))).unwrap();
+    let out = root.join("pkg.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, note_without_view());
+            opts.metadata = payload.clone();
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("refusing to embed a runtime"), "{text}");
+    assert!(text.contains("selection-view"), "{text}");
+    assert!(!out.exists(), "the refusal must come before any writing");
+
+    let out = root.join("pkg.onelf");
+    let mut opts = test_opts(&root, &out, capable_note());
+    opts.metadata = payload;
+    pack::pack(&opts, b"stub-runtime").unwrap();
+    let bytes = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+        .unwrap()
+        .expect("the selection table is carried");
+    assert_eq!(
+        EntrypointSets::decode(&bytes).unwrap(),
+        sets_table("gtk", [9; 32])
+    );
+}
+
+#[test]
+fn rules_alone_need_only_the_metadata_version() {
+    let root = temp_dir("rules-only");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let mut opts = test_opts(&root, &out, note_without_view());
+    opts.metadata = pack::lower_runtime_metadata(vec![record("alsa", None)], None).unwrap();
+    pack::pack(&opts, b"stub-runtime").unwrap();
+    assert!(
+        metadata::read_packed_file(&out, ".onelf/runtime-rules")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn an_absent_note_passes_only_when_nothing_is_emitted() {
+    let root = temp_dir("absent");
+    seed_app(&root);
+    let out = root.join("legacy.onelf");
+    pack::pack(
+        &test_opts(&root, &out, RuntimeNote::Absent),
+        b"stub-runtime",
+    )
+    .unwrap();
+    assert!(
+        metadata::read_packed_file(&out, ".onelf/runtime-rules")
+            .unwrap()
+            .is_none()
+    );
+
+    let out = root.join("refused.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, RuntimeNote::Absent);
+            opts.metadata = pack::lower_runtime_metadata(vec![record("alsa", None)], None).unwrap();
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("refusing to embed a runtime"), "{text}");
+    assert!(text.contains("no capability note"), "{text}");
+    assert!(text.contains("metadata version 1"), "{text}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn an_unreadable_note_is_refused_even_with_nothing_to_emit() {
+    let root = temp_dir("incompatible");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let refused = pack::pack(
+        &test_opts(&root, &out, incompatible_note()),
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("capability note"), "{refused}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn a_skipped_tree_carries_records_without_discovery() {
+    let root = temp_dir("skip");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let recipe_path = root.join("onelf.toml");
+    fs::write(
+        &recipe_path,
+        "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n",
+    )
+    .unwrap();
+    let recipe = recipe::load(&recipe_path).unwrap();
+    let request =
+        assembly::AssemblyRequest::plan(&recipe_path, recipe, Some(out.as_path())).unwrap();
+    let report = request.stage().unwrap();
+    assert_eq!(report.source, assembly::Source::Unchecked);
+    assert!(report.active_rules.is_empty(), "skip runs no discovery");
+    assert_eq!(
+        request
+            .pack_options(None, RuntimeNote::Absent, Vec::new())
+            .metadata,
+        pack::MetadataPayload::default(),
+        "the wired build path still carries no records"
+    );
+
+    let runtime = assembly::embed_runtime(&request).unwrap();
+    let hash = [0xab; 32];
+    let payload = pack::lower_runtime_metadata(
+        vec![record(
+            "gtk",
+            Some(SetPin {
+                name: RuleId::new("gtk").unwrap(),
+                hash,
+            }),
+        )],
+        Some(sets_table("gtk", hash)),
+    )
+    .unwrap();
+    let mut opts = request.pack_options(None, runtime.note, Vec::new());
+    opts.metadata = payload;
+    pack::pack(&opts, runtime.bytes).unwrap();
+
+    let rules = metadata::read_packed_file(&out, ".onelf/runtime-rules")
+        .unwrap()
+        .expect("the skipped tree carries the record");
+    let decoded = RuntimeRuleMetadata::decode(&rules).unwrap();
+    assert_eq!(decoded.rules[0].id.as_str(), "gtk");
+    let sets = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+        .unwrap()
+        .expect("the skipped tree carries the table");
+    decoded
+        .validate_bindings(&EntrypointSets::decode(&sets).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn a_minimal_recipe_emits_no_metadata_records() {
+    let root = temp_dir("minimal");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let recipe_path = root.join("onelf.toml");
+    fs::write(&recipe_path, "[package]\ncommand = \"bin/app\"\n").unwrap();
+    let recipe = recipe::load(&recipe_path).unwrap();
+    let request =
+        assembly::AssemblyRequest::plan(&recipe_path, recipe, Some(out.as_path())).unwrap();
+    request.stage().unwrap();
+    let runtime = assembly::embed_runtime(&request).unwrap();
+    let opts = request.pack_options(None, runtime.note, Vec::new());
+    assert_eq!(opts.metadata, pack::MetadataPayload::default());
+    pack::pack(&opts, runtime.bytes).unwrap();
+    let (_, manifest) = info::read_footer_and_manifest(&out).unwrap();
+    assert!(metadata::find_entry_by_path(&manifest, ".onelf/runtime-rules").is_none());
+    assert!(metadata::find_entry_by_path(&manifest, ".onelf/entrypoint-sets").is_none());
+}

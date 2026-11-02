@@ -793,6 +793,7 @@ fn main() {
                                 needs_setuid,
                                 profile,
                                 provider_index: None,
+                                metadata: pack::MetadataPayload::default(),
                                 runtime_note,
                             },
                             runtime,

@@ -23,6 +23,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use rayon::prelude::*;
 
+use onelf_format::runtime_metadata::{
+    EntrypointSets, MetadataError, RuntimeRuleMetadata, RuntimeRuleRecord,
+};
 use onelf_format::{
     Entry, EntryKind, EntryPoint, EntryPointFlags, Flags, Footer, Manifest, ManifestHeader,
     StringTableBuilder, WorkingDir, elf,
@@ -59,6 +62,99 @@ pub enum Payload {
     Blocks,
     /// A stipplefs image, deduplicated and compressed across files.
     Stipple,
+}
+
+/// The encoded metadata records a package carries beside its payload:
+/// `.onelf/runtime-rules` and `.onelf/entrypoint-sets`. The default
+/// carries neither, which is the shape of every build that emits no
+/// metadata and changes no packaged byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataPayload {
+    /// Encoded ORUL bytes, or `None` to carry no runtime rule record.
+    pub runtime_rules: Option<Vec<u8>>,
+    /// Encoded OSET bytes, or `None` to carry no selection table.
+    pub entrypoint_sets: Option<Vec<u8>>,
+}
+
+/// Lower validated runtime mappings and an optional selection table into
+/// the encoded records a package carries.
+///
+/// `rules` holds one record per contributing rule: its runtime path groups
+/// and closed hook IDs, plus an optional binding to one pinned set. When
+/// `sets` is given, every binding must name a pin that table declares, and
+/// both records validate together. Encoding sorts the scoped identities,
+/// bounds every record and refuses duplicates, so the result is exactly
+/// what the shared codec decodes and the runtime's launch gate accepts.
+///
+/// Lowering is purely in-memory: neither rule source files nor discovery
+/// state are read, so a preassembled tree lowers its enabled mappings the
+/// same way a scanned one does, and mappings no built-in rule backs lower
+/// identically. An empty rule set with no selection table emits nothing,
+/// while an explicit empty selection table is carried as the statement it
+/// is.
+///
+/// No build path calls this yet: production emission stays unwired while
+/// the runtime consumers that read the records are.
+#[allow(dead_code)]
+pub fn lower_runtime_metadata(
+    rules: Vec<RuntimeRuleRecord>,
+    sets: Option<EntrypointSets>,
+) -> Result<MetadataPayload, MetadataError> {
+    if rules.is_empty() && sets.is_none() {
+        return Ok(MetadataPayload::default());
+    }
+    let rules = RuntimeRuleMetadata { rules };
+    match &sets {
+        Some(sets) => rules.validate_bindings(sets)?,
+        None => rules.validate()?,
+    }
+    Ok(MetadataPayload {
+        runtime_rules: (!rules.rules.is_empty())
+            .then(|| rules.encode())
+            .transpose()?,
+        entrypoint_sets: sets.as_ref().map(EntrypointSets::encode).transpose()?,
+    })
+}
+
+/// The runtime support carrying `metadata` requires of the embedded runtime.
+///
+/// The records are decoded here, so the packer emits only bytes the shared
+/// codec accepts and re-checks every binding against the carried pin table
+/// before anything is written. A selection table carrying entrypoint
+/// selections additionally requires the runtime's selection view. No
+/// record at all requires nothing, which keeps the legacy, note-free
+/// runtimes packable.
+fn metadata_requirements(metadata: &MetadataPayload) -> io::Result<elf::RuntimeRequirements> {
+    let rules = match &metadata.runtime_rules {
+        None => None,
+        Some(bytes) => Some(RuntimeRuleMetadata::decode(bytes).map_err(record_error)?),
+    };
+    let sets = match &metadata.entrypoint_sets {
+        None => None,
+        Some(bytes) => Some(EntrypointSets::decode(bytes).map_err(record_error)?),
+    };
+    if let (Some(rules), Some(sets)) = (&rules, &sets) {
+        rules.validate_bindings(sets).map_err(record_error)?;
+    }
+    if rules.is_none() && sets.is_none() {
+        return Ok(elf::RuntimeRequirements::NONE);
+    }
+    let mut required = elf::RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION);
+    if sets.is_some_and(|sets| !sets.entrypoints.is_empty()) {
+        required.capabilities = required
+            .capabilities
+            .union(elf::RuntimeCapabilities::SELECTION_VIEW);
+    }
+    Ok(required)
+}
+
+/// A metadata record the packer refuses to emit, carrying the codec's
+/// bounded diagnostic.
+fn record_error(why: MetadataError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("runtime metadata: {why}"),
+    )
 }
 
 impl Payload {
@@ -157,6 +253,13 @@ pub struct PackOptions {
     /// `.onelf/providers`. `None` injects nothing, which is the shape of
     /// every build that is not a set.
     pub provider_index: Option<Vec<u8>>,
+    /// Validated metadata records injected as `.onelf/runtime-rules` and
+    /// `.onelf/entrypoint-sets`. The default carries neither. Carrying
+    /// either requires the embedded runtime to advertise the metadata
+    /// support the records need, so `pack` refuses a runtime that falls
+    /// short. No build path populates this yet: production emission stays
+    /// unwired while the runtime consumers that read the records are.
+    pub metadata: MetadataPayload,
     /// What the embedded runtime advertises, probed from its actual bytes
     /// including any `ONELF_RT_PATH` substitution. Assembly refuses a
     /// runtime whose note exists but cannot be read, and later metadata
@@ -712,6 +815,19 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // Nothing is emitted yet, so a note-free legacy runtime stays
     // acceptable while a runtime advertising an unreadable note is refused.
     elf::check_runtime_support(&opts.runtime_note, elf::RuntimeRequirements::NONE)?;
+    // Carrying metadata narrows the accepted runtimes to those advertising
+    // the support the records need, refused here before anything is
+    // written.
+    let required = metadata_requirements(&opts.metadata)?;
+    elf::check_runtime_support(&opts.runtime_note, required).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to embed a runtime that does not advertise the support \
+                 the carried metadata requires: {e}"
+            ),
+        )
+    })?;
     if opts.payload == Payload::Stipple {
         if !opts.block_size.is_power_of_two() {
             return Err(io::Error::new(
@@ -1065,6 +1181,28 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             &mut files,
             ".onelf/providers",
             index.clone(),
+            inject_mtime,
+        );
+    }
+
+    // Inject the validated runtime mappings and the entrypoint selection
+    // table when a build lowers them. No build populates them yet, so
+    // ordinary packages carry neither record.
+    if let Some(ref bytes) = opts.metadata.runtime_rules {
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/runtime-rules",
+            bytes.clone(),
+            inject_mtime,
+        );
+    }
+    if let Some(ref bytes) = opts.metadata.entrypoint_sets {
+        inject_onelf_file(
+            &mut dirs,
+            &mut files,
+            ".onelf/entrypoint-sets",
+            bytes.clone(),
             inject_mtime,
         );
     }
@@ -2304,6 +2442,7 @@ mod tests {
             needs_setuid: false,
             profile: Vec::new(),
             provider_index: None,
+            metadata: MetadataPayload::default(),
             runtime_note: onelf_format::elf::RuntimeNote::Absent,
         }
     }

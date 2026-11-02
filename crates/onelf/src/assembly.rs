@@ -644,6 +644,10 @@ impl AssemblyRequest {
             needs_setuid: self.package.needs_setuid,
             profile,
             provider_index: None,
+            // Production emission stays unwired: no build lowers the
+            // report's active rules into the metadata records yet, so
+            // every package carries neither record.
+            metadata: pack::MetadataPayload::default(),
             runtime_note,
         }
     }

@@ -357,6 +357,7 @@ fn pack_tree(
             needs_setuid: false,
             profile: Vec::new(),
             provider_index,
+            metadata: crate::pack::MetadataPayload::default(),
             // A sysroot build states no capability requirements of its
             // own; the caller that embeds the runtime probes it.
             runtime_note: onelf_format::elf::RuntimeNote::Absent,
