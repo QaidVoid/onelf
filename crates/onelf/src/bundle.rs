@@ -160,6 +160,28 @@ fn is_same_file(src: &Path, dest: &Path) -> bool {
     fs::canonicalize(dest).map(|c| c == src).unwrap_or(false)
 }
 
+/// Whether `dir` may answer a repair for a soname the tree already
+/// carries: a directory of the tree itself, an author-declared search
+/// path, or, in a sysroot build, a directory of the sysroot's own
+/// filesystem. An installation the host happens to have is none of
+/// these, whatever form the build takes, so the sources behind the
+/// declared ones never resolve one.
+fn repair_admits(
+    dir: &Path,
+    tree_root: &Path,
+    tree_dir: &Path,
+    declared: &[PathBuf],
+    sysroot_root: Option<&Path>,
+) -> bool {
+    if dir.starts_with(tree_root) || dir.starts_with(tree_dir) {
+        return true;
+    }
+    if declared.iter().any(|path| path == dir) {
+        return true;
+    }
+    sysroot_root.is_some_and(|root| dir.starts_with(root))
+}
+
 /// Copy libraries matching any of `prefixes` (prefix match on filename) from
 /// `search_dirs` into `dest`. Resolves symlinks, deduplicates by filename,
 /// and filters by ELF class. Returns (files_copied, total_bytes).
@@ -754,15 +776,16 @@ fn miss_text(reason: &MissReason) -> String {
 
 /// Carry one activated rule's declared helper executable into the tree
 /// through the common object queue. The declared alternatives are
-/// discovered against the libraries the walk admitted, the same way data
-/// groups are, and the executable the first alternative yields is
-/// enqueued as an object: activation, the transitive dependency closure,
-/// the locate and compatibility checks, plan admission, the run path
-/// rewrite and hash aliasing are the walk's ordinary ones, and the final
-/// tree pass finalizes the helper beside every other copied object. The
-/// declared destination is relative to the tree root, and the rule's
-/// runtime mapping resolves the helper there, so the alias keeps working
-/// wherever the tree is moved.
+/// discovered against the triggering libraries' own roots, the same
+/// boundary the data groups read, and the executable the first
+/// alternative yields is enqueued as an object: activation, the
+/// transitive dependency closure, the locate and compatibility checks,
+/// plan admission, the run path rewrite and hash aliasing are the
+/// walk's ordinary ones, and the final tree pass finalizes the helper
+/// beside every other copied object. The declared destination is
+/// relative to the tree root, and the rule's runtime mapping resolves
+/// the helper there, so the alias keeps working wherever the tree is
+/// moved.
 ///
 /// A destination the tree already holds satisfies the group. What a
 /// declared set holds is prepared into each supplying pin's subtree
@@ -778,6 +801,7 @@ fn collect_helper_group(
     admitted: &[AdmittedLibrary],
     sysroot: Option<&sysroot::SysrootUniverse>,
     search_paths: &mut Vec<PathBuf>,
+    repair_extra: &mut HashSet<PathBuf>,
     destinations: &mut HashMap<String, PathBuf>,
     helpers: &mut HashSet<String>,
     needed_by: &mut HashMap<String, String>,
@@ -787,6 +811,16 @@ fn collect_helper_group(
     plan: &mut DestinationPlan,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
+    let owners: Vec<AdmittedLibrary> = admitted
+        .iter()
+        .filter(|lib| {
+            descriptor
+                .triggers
+                .iter()
+                .any(|t| t.matches_soname(lib.soname()))
+        })
+        .cloned()
+        .collect();
     let outcome = discover_group(
         &GroupQuery {
             rule,
@@ -797,7 +831,7 @@ fn collect_helper_group(
             candidates: &declared.candidates,
         },
         &AdmittedUniverse {
-            libraries: admitted,
+            libraries: &owners,
             sysroot,
         },
     )?;
@@ -831,10 +865,12 @@ fn collect_helper_group(
     let Some(source_name) = hit.resolved.file_name().and_then(|n| n.to_str()) else {
         return Ok(());
     };
-    if let Some(dir) = hit.resolved.parent()
-        && !search_paths.iter().any(|p| p == dir)
-    {
-        search_paths.push(dir.to_path_buf());
+    if let Some(dir) = hit.resolved.parent() {
+        let dir = dir.to_path_buf();
+        if !search_paths.contains(&dir) {
+            search_paths.push(dir.clone());
+        }
+        repair_extra.insert(dir);
     }
     destinations
         .entry(source_name.to_string())
@@ -2900,9 +2936,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // in the tree (a vendor's `opt/` install, a Python extension's
     // private library) does not satisfy a need; one is copied in.
     // Sonames already here stay in the walk: their data may never have
-    // been carried, and a plugin may sit flat where nothing loads it, and
-    // both repairs need the walk to resolve the host copy. The walk skips
-    // the copy itself and keeps the tree's file.
+    // been carried, and a plugin may sit flat where nothing loads it,
+    // and both repairs need the walk to resolve a source the repair may
+    // answer from. The walk skips the copy itself and keeps the tree's
+    // file.
     let reachable: HashSet<String> = fs::read_dir(opts.directory.join(&opts.lib_dir))
         .into_iter()
         .flatten()
@@ -3045,6 +3082,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     search_paths.extend(opts.search_path.iter().cloned());
     search_paths.extend(rpath_dirs);
     let lib_dest = opts.directory.join(&opts.lib_dir);
+    // The identity the tree admission reads. A development run hands a
+    // canonicalized AppDir over while a build passes the path the
+    // author spelled, so both spellings decide which search
+    // directories are the tree's own.
+    let tree_root = fs::canonicalize(&opts.directory).unwrap_or_else(|_| opts.directory.clone());
+    // The directories the resource groups themselves discovered their
+    // members in. A group draws from the roots the walk admitted, the
+    // same boundary the carried-soname repair reads, so a member's
+    // placement repair follows its group's own discovery.
+    let mut repair_extra: HashSet<PathBuf> = HashSet::new();
 
     let mut not_found: Vec<(String, String)> = Vec::new();
     // In sysroot mode the policy holds for dependencies too: a library it
@@ -3181,6 +3228,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 target_class,
                 target_machine,
                 None,
+                LookupScope::Host,
             ) {
                 let resolved = fs::canonicalize(&src).unwrap_or(src);
                 expand_nix_cache(&resolved, &mut ldconfig_cache, &mut expanded_nix);
@@ -3213,10 +3261,25 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     .iter()
                     .find(|g| g.id.as_str() == group)
                 {
+                    // The roots the rule's own triggering libraries
+                    // admitted: a directory another installation keeps
+                    // beside an unrelated admitted library never answers
+                    // for this rule, the same boundary the data groups
+                    // read.
+                    let owners: Vec<AdmittedLibrary> = admitted
+                        .iter()
+                        .filter(|lib| {
+                            descriptor
+                                .triggers
+                                .iter()
+                                .any(|t| t.matches_soname(lib.soname()))
+                        })
+                        .cloned()
+                        .collect();
                     let collection = collect::collect_group(
                         &rule,
                         declared,
-                        &admitted,
+                        &owners,
                         sysroot_universe.as_ref(),
                         target_class,
                         target_machine,
@@ -3225,13 +3288,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         if !search_paths.contains(dir) {
                             search_paths.push(dir.clone());
                         }
+                        repair_extra.insert(dir.clone());
                     }
                     for plugin in &collection.plugins {
                         if let Some(dir) = plugin.resolved.parent() {
                             let dir = dir.to_path_buf();
                             if !search_paths.contains(&dir) {
-                                search_paths.push(dir);
+                                search_paths.push(dir.clone());
                             }
+                            repair_extra.insert(dir);
                         }
                     }
                     report_collection(&collection);
@@ -3284,6 +3349,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &admitted,
                         sysroot_universe.as_ref(),
                         &mut search_paths,
+                        &mut repair_extra,
                         &mut group_dests,
                         &mut helper_dests,
                         &mut needed_by,
@@ -3307,9 +3373,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // re-run still owes it the repair work below: the data beside its
         // source (a tree bundled before the data carry existed has the
         // library but not the data) and a plugin left flat where nothing
-        // loads it. Both need the host copy resolved; when the host has
-        // none, the tree keeps what it has, as the old skip did. For a
-        // collected group member the declared destination is the place
+        // loads it. Both need a source the repair may answer from; when
+        // none of them holds the soname, the tree keeps what it has, as
+        // the old skip did. For a collected group member the declared destination is the place
         // already held; for every other soname the flat library copy.
         let already_flat = if helper_dests.contains(&soname) {
             group_dests
@@ -3324,15 +3390,45 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .cloned()
             .unwrap_or_else(|| "?".into());
 
-        match locate_lib(
-            &soname,
-            &ldconfig_cache,
-            &search_paths,
-            target_class,
-            target_machine,
-            sysroot_root,
-        )
-        .map(|src| {
+        // A soname the tree already carries repairs only from sources
+        // the build declares or owns; a soname absent from it resolves
+        // the way the host-scan walk always has.
+        let located = if already_flat {
+            let sources: Vec<PathBuf> = search_paths
+                .iter()
+                .filter(|dir| {
+                    repair_extra.contains(*dir)
+                        || repair_admits(
+                            dir,
+                            &tree_root,
+                            &opts.directory,
+                            &opts.search_path,
+                            sysroot_root,
+                        )
+                })
+                .cloned()
+                .collect();
+            locate_lib(
+                &soname,
+                &ldconfig_cache,
+                &sources,
+                target_class,
+                target_machine,
+                sysroot_root,
+                LookupScope::Declared,
+            )
+        } else {
+            locate_lib(
+                &soname,
+                &ldconfig_cache,
+                &search_paths,
+                target_class,
+                target_machine,
+                sysroot_root,
+                LookupScope::Host,
+            )
+        };
+        match located.map(|src| {
             let resolved = real_path(&src);
             (src, resolved)
         }) {
@@ -3355,15 +3451,28 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 // so the search resolves the tree's own copies first, and
                 // a tree cannot be its own source for repair. When the
                 // soname sits flat from an older run and the candidate is
-                // that flat copy, look it up again past the tree's
-                // directories: the data to carry lives beside the host
-                // copy, and a plugin's subdirectory is decided by where
-                // the host keeps it.
+                // that flat copy, look it up again past the tree's own
+                // directories, among the sources a repair may answer
+                // from: the data to carry lives beside that source, and
+                // a plugin's subdirectory is decided by where it keeps
+                // the plugin. When none of them holds the soname, the
+                // tree keeps what it has.
                 let flat = lib_dest.join(&soname);
                 let resolved = if already_flat && is_same_file(&real_path(&src), &flat) {
                     let outside: Vec<PathBuf> = search_paths
                         .iter()
-                        .filter(|dir| !dir.starts_with(&opts.directory))
+                        .filter(|dir| {
+                            (repair_extra.contains(*dir)
+                                || repair_admits(
+                                    dir,
+                                    &tree_root,
+                                    &opts.directory,
+                                    &opts.search_path,
+                                    sysroot_root,
+                                ))
+                                && !dir.starts_with(&tree_root)
+                                && !dir.starts_with(&opts.directory)
+                        })
                         .cloned()
                         .collect();
                     match locate_lib(
@@ -3373,6 +3482,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         target_class,
                         target_machine,
                         sysroot_root,
+                        LookupScope::Declared,
                     ) {
                         Some(host) if !is_same_file(&host, &flat) => real_path(&host),
                         _ => resolved,
@@ -5530,6 +5640,7 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
+        let mut repair_extra = HashSet::new();
         let mut preparation = SetPreparation::new(&[], &[], false);
         let mut plan = DestinationPlan::load(tree)?;
         let descriptor = catalog::builtins()
@@ -5543,6 +5654,7 @@ mod helper_tests {
             &admitted,
             None,
             &mut search_paths,
+            &mut repair_extra,
             &mut destinations,
             &mut helpers,
             &mut needed_by,
@@ -5593,6 +5705,7 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
+        let mut repair_extra = HashSet::new();
         let mut preparation = SetPreparation::new(&[], &[], false);
         let mut plan = DestinationPlan::load(&root).unwrap();
         let descriptor = catalog::builtins()
@@ -5606,6 +5719,7 @@ mod helper_tests {
             &admitted,
             None,
             &mut search_paths,
+            &mut repair_extra,
             &mut destinations,
             &mut helpers,
             &mut needed_by,

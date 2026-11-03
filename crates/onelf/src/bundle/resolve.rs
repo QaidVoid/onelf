@@ -202,10 +202,29 @@ pub(crate) fn expand_nix_cache(
     }
 }
 
-/// `sysroot` limits the search to `search_paths`: in sysroot mode the
-/// packer's own machine is never consulted, and a candidate under the
-/// sysroot is read with its links resolved inside it. The candidate is
+/// Which machine sources past the declared search paths a lookup may
+/// answer from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LookupScope {
+    /// Every source the packer's machine offers: the loader cache, the
+    /// standard library paths, the environment's library paths and the
+    /// store. An absent soname's first resolution searches them; a
+    /// sysroot build never does.
+    Host,
+    /// The declared search paths alone. A repair for a soname the tree
+    /// already carries answers from sources the build itself declares
+    /// or owns, so no installation the host happens to have resolves
+    /// one, whatever build form runs.
+    Declared,
+}
+
+/// Resolve one soname against `search_paths` first and, when `scope`
+/// allows, against the machine's own sources behind them. `sysroot`
+/// limits the search to `search_paths`: in sysroot mode the packer's
+/// own machine is never consulted, and a candidate under the sysroot
+/// is read with its links resolved inside it. The candidate is
 /// returned as found, a soname link say, not what it resolves to.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn locate_lib(
     soname: &str,
     ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
@@ -213,6 +232,7 @@ pub(crate) fn locate_lib(
     target_class: Option<u8>,
     target_machine: Option<u16>,
     sysroot: Option<&Path>,
+    scope: LookupScope,
 ) -> Option<PathBuf> {
     let class_matches = |path: &Path| -> bool {
         match target_class {
@@ -248,7 +268,7 @@ pub(crate) fn locate_lib(
         }
     }
 
-    if sysroot.is_some() {
+    if sysroot.is_some() || scope == LookupScope::Declared {
         return None;
     }
 
@@ -428,7 +448,17 @@ mod tests {
         std::os::unix::fs::symlink(host.join("libhost.so.1"), root.join("usr/lib/libhost.so.1"))
             .unwrap();
         let dirs = [root.join("usr/lib")];
-        let locate = |soname| locate_lib(soname, &HashMap::new(), &dirs, None, None, Some(&root));
+        let locate = |soname| {
+            locate_lib(
+                soname,
+                &HashMap::new(),
+                &dirs,
+                None,
+                None,
+                Some(&root),
+                LookupScope::Host,
+            )
+        };
 
         assert_eq!(
             locate("libfoo.so.1"),
@@ -456,7 +486,15 @@ mod tests {
             "libfoo.so.1".to_string(),
             vec![local.join("libfoo.so.1"), multiarch.join("libfoo.so.1")],
         )]);
-        let found = locate_lib("libfoo.so.1", &cache, &[], None, None, None);
+        let found = locate_lib(
+            "libfoo.so.1",
+            &cache,
+            &[],
+            None,
+            None,
+            None,
+            LookupScope::Host,
+        );
         let _ = fs::remove_dir_all(&root);
         assert_eq!(found, Some(local.join("libfoo.so.1")));
     }

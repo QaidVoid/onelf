@@ -1633,6 +1633,526 @@ fn a_rebundled_flat_plugin_migrates_into_its_group_layout() {
     );
 }
 
+/// A host installation the build machine happens to have, laid out the
+/// way a distribution installs the gstreamer framework: the soname in
+/// its library directory and the scanner the activated rule requires
+/// beside it. Returns the library directory, or None when no compiler
+/// is available.
+fn host_installation_sources(td: &Path) -> Option<PathBuf> {
+    let usr_lib = td.join("hostinstall/usr/lib");
+    std::fs::create_dir_all(usr_lib.join("gstreamer-1.0")).unwrap();
+    write(
+        &td.join("hostframework.c"),
+        "int framework_value(void){return 7;}\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("hostframework.c").to_str().unwrap(),
+        ],
+        &usr_lib.join("libgstreamer-1.0.so.0"),
+    ) {
+        return None;
+    }
+    write(&td.join("hostscanner.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[td.join("hostscanner.c").to_str().unwrap()],
+        &usr_lib.join("gstreamer-1.0/gst-plugin-scanner"),
+    ) {
+        return None;
+    }
+    Some(usr_lib)
+}
+
+/// A tree that already carries the framework soname flat in its
+/// library directory, with an application that needs it and names the
+/// helper alias the rule publishes. The application links the host
+/// installation's own copy by path, so its need carries no run path of
+/// its own beyond the entries given. `search` entries become the
+/// recipe's bundle search paths. Returns the AppDir, or None when no
+/// compiler is available.
+fn carried_flat_tree(
+    td: &Path,
+    tag: &str,
+    hostlib: &Path,
+    rpath: &[&str],
+    search: &[&str],
+) -> Option<PathBuf> {
+    let dir = td.join(tag);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    write(
+        &td.join("carriedframework.c"),
+        "int framework_value(void){return 3;}\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("carriedframework.c").to_str().unwrap(),
+        ],
+        &dir.join("lib/libgstreamer-1.0.so.0"),
+    ) {
+        return None;
+    }
+    write(
+        &td.join("carryapp.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    const char *scanner = getenv("GST_PLUGIN_SCANNER");
+    printf("scanner=%s\n", scanner ? scanner : "(unset)");
+    return 0;
+}
+"#,
+    );
+    let mut args: Vec<String> = vec![td.join("carryapp.c").to_string_lossy().into_owned()];
+    args.push(
+        hostlib
+            .join("libgstreamer-1.0.so.0")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    for entry in rpath {
+        args.push(format!("-Wl,-rpath,{entry}"));
+    }
+    if !cc_with(
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        &dir.join("bin/app"),
+    ) {
+        return None;
+    }
+    let mut recipe = format!("[package]\nname = \"{tag}\"\ncommand = \"bin/app\"\nmtime = 0\n");
+    if !search.is_empty() {
+        let listed: Vec<String> = search.iter().map(|s| format!("\"{s}\"")).collect();
+        recipe.push_str(&format!(
+            "\n[bundle]\nsearch-paths = [{}]\n",
+            listed.join(", ")
+        ));
+    }
+    write(&dir.join("onelf.toml"), &recipe);
+    Some(dir)
+}
+
+/// Run `onelf build` in `dir` with the isolation the packed-form
+/// fixtures use. `loader_path` puts a directory on the loader's
+/// environment path, standing in for an installation the machine
+/// happens to have.
+fn packed_build(td: &Path, dir: &Path, loader_path: Option<&Path>) -> std::process::Output {
+    let mut c = Command::new(onelf());
+    c.arg("build")
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_PLATFORM_STORE", td.join("store"));
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    if let Some(lp) = loader_path {
+        c.env("LD_LIBRARY_PATH", lp);
+    }
+    c.output().expect("spawn onelf build")
+}
+
+/// A development run over a tree whose library directory already holds
+/// the framework soname flat must not let the machine's own
+/// installation answer the rule's helper group for it: the run fails
+/// naming the rule and the helper, and the tree keeps its own copy.
+/// With the author's own search path the same tree repairs from that
+/// declared source, the helper lands at its declared destination, and
+/// the launch names the carried copy.
+#[test]
+fn a_dev_run_repairs_a_carried_soname_only_from_declared_sources() {
+    let td = workdir("devrepair");
+    let Some(hostlib) = host_installation_sources(&td) else {
+        return;
+    };
+    let host_framework = std::fs::read(hostlib.join("libgstreamer-1.0.so.0")).unwrap();
+
+    // The installation is reachable only through the loader's
+    // environment path here, which is one of the machine's own roots.
+    let Some(dir) = carried_flat_tree(&td, "devoid", &hostlib, &["$ORIGIN/../lib"], &[]) else {
+        return;
+    };
+    let mut run = dev_run(&td, &["--bundle"]);
+    run.arg(&dir).env("LD_LIBRARY_PATH", &hostlib);
+    if let Some(pe) = patchelf() {
+        run.env("ONELF_PATCHELF", pe);
+    }
+    let out = run.output().expect("spawn onelf run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the machine's own installation repaired the carried soname:\n{err}"
+    );
+    assert!(
+        err.contains("rule gstreamer") && err.contains("helper scanner"),
+        "the failure names the rule and the helper:\n{err}"
+    );
+    assert!(
+        err.contains("requires the executable"),
+        "the required-helper diagnostic stands:\n{err}"
+    );
+    assert!(
+        !dir.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .exists(),
+        "no helper was taken from the machine:\n{err}"
+    );
+    assert_ne!(
+        std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap(),
+        host_framework,
+        "the tree keeps its own copy"
+    );
+
+    let Some(dir) = carried_flat_tree(
+        &td,
+        "devdeclared",
+        &hostlib,
+        &["$ORIGIN/../lib"],
+        &[hostlib.to_str().unwrap()],
+    ) else {
+        return;
+    };
+    let mut run = dev_run(&td, &["--bundle"]);
+    run.arg(&dir);
+    if let Some(pe) = patchelf() {
+        run.env("ONELF_PATCHELF", pe);
+    }
+    let out = run.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{err}");
+    let carried = dir.join("libexec/gstreamer-1.0/gst-plugin-scanner");
+    assert!(
+        carried.is_file(),
+        "the declared source repaired the helper:\n{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "helper gst-plugin-scanner for gstreamer/scanner from {}",
+            hostlib.join("gstreamer-1.0/gst-plugin-scanner").display()
+        )),
+        "the helper is the declared source's own:\n{err}"
+    );
+    assert_ne!(
+        std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap(),
+        host_framework,
+        "the tree keeps its own copy of the soname"
+    );
+    let scanner = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("scanner="))
+        .expect("the launch names the helper alias");
+    assert!(
+        scanner.starts_with(td.to_str().unwrap())
+            && scanner.ends_with("libexec/gstreamer-1.0/gst-plugin-scanner"),
+        "the launch names the carried copy: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A packed build whose application carries an absolute run path
+/// naming a host installation must not let that installation answer
+/// the rule's helper group for the soname the tree already carries
+/// flat: the build fails naming the rule and the helper, and it
+/// succeeds with the recipe's own search path, whose installation
+/// supplies the helper the packed launch resolves.
+#[test]
+fn a_packed_build_with_absolute_rpaths_repairs_only_from_declared_sources() {
+    let td = workdir("packrepair");
+    let Some(hostlib) = host_installation_sources(&td) else {
+        return;
+    };
+    let host_framework = std::fs::read(hostlib.join("libgstreamer-1.0.so.0")).unwrap();
+
+    let Some(dir) = carried_flat_tree(&td, "packvoid", &hostlib, &[hostlib.to_str().unwrap()], &[])
+    else {
+        return;
+    };
+    let out = packed_build(&td, &dir, None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the run path's own installation repaired the carried soname:\n{err}"
+    );
+    assert!(
+        err.contains("rule gstreamer") && err.contains("helper scanner"),
+        "the failure names the rule and the helper:\n{err}"
+    );
+    assert!(
+        err.contains("requires the executable"),
+        "the required-helper diagnostic stands:\n{err}"
+    );
+    assert!(
+        !dir.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .exists(),
+        "no helper was taken from the machine:\n{err}"
+    );
+    assert_ne!(
+        std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap(),
+        host_framework,
+        "the tree keeps its own copy"
+    );
+
+    let Some(dir) = carried_flat_tree(
+        &td,
+        "packdeclared",
+        &hostlib,
+        &[hostlib.to_str().unwrap()],
+        &[hostlib.to_str().unwrap()],
+    ) else {
+        return;
+    };
+    let out = packed_build(&td, &dir, None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let carried = dir.join("libexec/gstreamer-1.0/gst-plugin-scanner");
+    assert!(
+        carried.is_file(),
+        "the declared source repaired the helper:\n{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "helper gst-plugin-scanner for gstreamer/scanner from {}",
+            hostlib.join("gstreamer-1.0/gst-plugin-scanner").display()
+        )),
+        "the helper is the declared source's own:\n{err}"
+    );
+    assert_ne!(
+        std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap(),
+        host_framework,
+        "the tree keeps its own copy of the soname"
+    );
+    let pkg = dir.join("packdeclared.onelf");
+    assert!(pkg.is_file(), "the build packed the application:\n{err}");
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let scanner = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("scanner="))
+        .expect("the launch names the helper alias");
+    assert!(
+        !scanner.starts_with("/usr")
+            && scanner.ends_with("libexec/gstreamer-1.0/gst-plugin-scanner"),
+        "the packed launch names the carried copy, not the machine's: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A minimal database-backed sysroot whose application needs the
+/// framework soname the sysroot itself does not hold, and a feature
+/// package the recipe's declared set replaces. The application links
+/// the host installation's copy by path, so the need is real and the
+/// sysroot stays without it. Returns the archive a recipe materializes
+/// the sysroot from, or None without a compiler.
+fn carried_sysroot_archive(td: &Path, hostlib: &Path) -> Option<PathBuf> {
+    let rootfs = td.join("rootfs");
+    for d in ["usr/bin", "usr/lib", "usr/share/setfeat"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    let app = helper_spawning_app_source(td);
+    if !cc_with(
+        &[
+            app.to_str().unwrap(),
+            hostlib.join("libgstreamer-1.0.so.0").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return None;
+    }
+    let (Some(host_libc), Some(host_ld)) = (
+        ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6"),
+        ldd_path(&rootfs.join("usr/bin/app"), "ld-linux"),
+    ) else {
+        return None;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write(&rootfs.join("usr/share/setfeat/data.txt"), "setfeat\n");
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "setfeat",
+        "1.0-1",
+        &[],
+        &[],
+        &["usr/share/setfeat/data.txt"],
+    );
+    write_pacman_entry(&rootfs, "app", "1.0-1", &["glibc"], &[], &["usr/bin/app"]);
+    let archive = td.join("root.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+    Some(archive)
+}
+
+/// A sysroot build whose tree already carries the framework soname
+/// flat resolves the repair from its own sources alone: the tree keeps
+/// its copy where the sysroot has none, the declared set prepares the
+/// helper the rule requires, and neither the sysroot, the set nor the
+/// machine carries anything raw that the mapping resolves from the
+/// pin's subtree at launch.
+#[test]
+fn a_sysroot_build_repairs_a_carried_soname_from_the_sysroot_and_sets_alone() {
+    let td = workdir("sysrepair");
+    let Some(hostlib) = host_installation_sources(&td) else {
+        return;
+    };
+    let Some(archive) = carried_sysroot_archive(&td, &hostlib) else {
+        return;
+    };
+    let Some((hash, set_pkg)) = helper_set(&td, "toolkit") else {
+        return;
+    };
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    write(
+        &td.join("carriedframework.c"),
+        "int framework_value(void){return 3;}\n",
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("carriedframework.c").to_str().unwrap(),
+        ],
+        &dir.join("lib/libgstreamer-1.0.so.0"),
+    ) {
+        return;
+    }
+    let carried_framework = std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"sysrepair\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"setfeat\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            archive.display(),
+            set_pkg.display()
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("lib/libgstreamer-1.0.so.0")).unwrap(),
+        carried_framework,
+        "the tree keeps its own flat copy; nothing answered for it"
+    );
+    assert!(
+        !dir.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .exists(),
+        "the set's helper is prepared, not carried raw: {stderr}"
+    );
+    assert!(
+        dir.join(".onelf-prepared/toolkit")
+            .join(&hash)
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "the pin's subtree holds the helper: {stderr}"
+    );
+    assert!(
+        !dir.join("lib/gstreamer-1.0").exists(),
+        "no host installation answered the plugin group: {stderr}"
+    );
+    let pkg = dir.join("sysrepair.onelf");
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_set_helper_ran(&stdout, &td, &dir);
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An ordinary host scan still resolves a soname the tree does not
+/// carry from the machine's own roots: the tightened boundary bounds
+/// only the repair for a soname the tree already holds.
+#[test]
+fn host_scan_discovery_still_resolves_an_absent_soname_from_host_roots() {
+    let td = workdir("hostroots");
+    let caller = td.join("caller-lib");
+    std::fs::create_dir_all(&caller).unwrap();
+    write(&td.join("hole.c"), "int hole_value(void){return 3;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libhole.so.1",
+            td.join("hole.c").to_str().unwrap(),
+        ],
+        &caller.join("libhole.so.1"),
+    ) {
+        return;
+    }
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&td.join("plain.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[
+            td.join("plain.c").to_str().unwrap(),
+            "-Wl,-rpath,$ORIGIN/../lib",
+            caller.join("libhole.so.1").to_str().unwrap(),
+        ],
+        &dir.join("bin/app"),
+    ) {
+        return;
+    }
+    let mut c = Command::new(onelf());
+    c.args(["bundle-libs", dir.to_str().unwrap(), "--target", "bin/app"])
+        .env("LD_LIBRARY_PATH", &caller);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        dir.join("lib/libhole.so.1").is_file(),
+        "the host root resolved the absent soname:\n{err}"
+    );
+    assert!(
+        err.contains("libhole.so.1"),
+        "the report names the resolved soname:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Where the fake tree puts the plugin scanner: one of the three
 /// layouts the gstreamer rule declares.
 enum ScannerLayout {
