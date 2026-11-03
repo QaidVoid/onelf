@@ -32,7 +32,7 @@ use onelf_format::entry::EntryKind;
 pub type Links = BTreeMap<String, PathBuf>;
 
 /// The index of the directory entry at `rel`, relative to the package root.
-pub fn dir_index(manifest: &Manifest, rel: &str) -> Option<usize> {
+pub(crate) fn dir_index(manifest: &Manifest, rel: &str) -> Option<usize> {
     (0..manifest.entries.len())
         .find(|&i| manifest.entries[i].kind == EntryKind::Dir && manifest.entry_path(i) == rel)
 }
@@ -46,7 +46,7 @@ pub fn dir_index(manifest: &Manifest, rel: &str) -> Option<usize> {
 /// directory. A file in a subdirectory of it gets its own directory
 /// first, and any directory its original run path named after, both
 /// deeper than the library directory itself.
-pub fn dir(
+pub(crate) fn dir(
     manifest: &Manifest,
     pkg_root: &Path,
     runpath: &[PathBuf],
@@ -83,7 +83,12 @@ fn carried<'m>(manifest: &'m Manifest, dir: &str) -> HashSet<&'m str> {
 /// subdirectories included. A set library loaded through a link takes the
 /// link's directory as its `$ORIGIN`, so a dependency its run path finds
 /// in a subdirectory of the set has to be reachable from here too.
-pub fn wanted(manifest: &Manifest, dir: &str, farm: Option<&Path>, set_roots: &[PathBuf]) -> Links {
+pub(crate) fn wanted(
+    manifest: &Manifest,
+    dir: &str,
+    farm: Option<&Path>,
+    set_roots: &[PathBuf],
+) -> Links {
     let carried = carried(manifest, dir);
     let mut links = Links::new();
     let mut add = |name: &OsStr, target: PathBuf| {
@@ -151,7 +156,7 @@ fn present(manifest: &Manifest, root: &Path, dir: &str) -> Links {
 /// A published view is refused outright: its links never change, and
 /// anything that wants different ones stages a new view instead (see
 /// [`view::ensure_view`]).
-pub fn place(manifest: &Manifest, root: &Path, dir: &str, links: &Links) {
+pub(crate) fn place(manifest: &Manifest, root: &Path, dir: &str, links: &Links) {
     if view::ready(root) {
         eprintln!(
             "onelf-rt: refusing to change the links of the published view {}: stage a new view instead",
@@ -208,7 +213,7 @@ pub fn served(
 /// The directories an ELF's `$ORIGIN` run path names, resolved against
 /// the file's own directory. Empty for a file that is not an ELF or names
 /// no `$ORIGIN` in either `DT_RPATH` or `DT_RUNPATH`.
-pub fn origin_runpath(target: &Path) -> Vec<PathBuf> {
+pub(crate) fn origin_runpath(target: &Path) -> Vec<PathBuf> {
     let Ok(data) = std::fs::read(target) else {
         return Vec::new();
     };
@@ -252,14 +257,14 @@ pub struct Sender {
 }
 
 /// The FUSE server's side of the hand-off.
-pub struct Receiver {
+pub(crate) struct Receiver {
     rx: OwnedFd,
     ack: OwnedFd,
     buf: Vec<u8>,
 }
 
 /// What the server has heard from the child so far.
-pub enum Received {
+pub(crate) enum Received {
     /// More is on its way.
     Pending,
     /// The child is done: its links, or nothing when it went away or sent
@@ -268,7 +273,7 @@ pub enum Received {
 }
 
 /// The links for one directory, as the server is sent them.
-pub struct Message {
+pub(crate) struct Message {
     /// The directory, relative to the package root.
     pub dir: String,
     /// Each link's name and target.
@@ -279,7 +284,7 @@ pub struct Message {
 /// the server that serves them. Made before the fork; the child keeps the
 /// [`Sender`] and the server the [`Receiver`]. Every descriptor is
 /// close-on-exec, so the app inherits none of them.
-pub fn channel() -> io::Result<(Sender, Receiver)> {
+pub(crate) fn channel() -> io::Result<(Sender, Receiver)> {
     use rustix::pipe::{PipeFlags, pipe_with};
     let (rx, tx) = pipe_with(PipeFlags::CLOEXEC)?;
     let (ack_rx, ack_tx) = pipe_with(PipeFlags::CLOEXEC)?;
@@ -296,7 +301,7 @@ pub fn channel() -> io::Result<(Sender, Receiver)> {
 impl Sender {
     /// Send `links` for `dir` and wait until the server serves them. A
     /// server that has gone away ends the wait as well.
-    pub fn send(&self, dir: &str, links: &Links) {
+    pub(crate) fn send(&self, dir: &str, links: &Links) {
         let mut body = Vec::new();
         body.extend_from_slice(dir.as_bytes());
         body.push(0);
@@ -322,12 +327,12 @@ impl Sender {
 }
 
 impl Receiver {
-    pub fn fd(&self) -> &OwnedFd {
+    pub(crate) fn fd(&self) -> &OwnedFd {
         &self.rx
     }
 
     /// Take what the pipe holds. Call when [`Receiver::fd`] polls readable.
-    pub fn read(&mut self) -> Received {
+    pub(crate) fn read(&mut self) -> Received {
         let mut chunk = [0u8; 64 * 1024];
         match rustix::io::read(&self.rx, &mut chunk) {
             Ok(0) => return Received::Done(None),
@@ -346,7 +351,7 @@ impl Receiver {
     }
 
     /// Tell the child its links are served.
-    pub fn ack(&self) {
+    pub(crate) fn ack(&self) {
         let _ = rustix::io::write(&self.ack, b"k");
     }
 }
@@ -416,7 +421,7 @@ fn decode(body: &[u8]) -> Option<Message> {
 /// goes through a fresh file renamed over the old name, so nothing ever
 /// writes in place through a hardlink taken from the content store.
 /// Changing a published view means staging and publishing a new one.
-pub(crate) mod view {
+pub mod view {
     use std::ffi::OsStr;
     use std::fmt;
     use std::io::{self, Write};
@@ -434,10 +439,10 @@ pub(crate) mod view {
     /// separates every view an older runtime built from the ones the
     /// newer layout builds, and makes any record naming another version
     /// a miss rather than a misread.
-    pub const LAYOUT: u32 = 1;
+    pub(crate) const LAYOUT: u32 = 1;
 
     /// The name of the configuration record inside a view directory.
-    pub const CONFIGURATION_FILE: &str = "config";
+    pub(crate) const CONFIGURATION_FILE: &str = "config";
 
     /// How the launch's library links (see [`crate::links`]) reach the
     /// view.
@@ -594,7 +599,7 @@ pub(crate) mod view {
     /// storage is a miss rather than a misread.
     #[derive(PartialEq, Eq)]
     #[allow(dead_code)]
-    pub struct ViewRecord {
+    pub(crate) struct ViewRecord {
         canonical: Vec<u8>,
         expanded_env: Option<String>,
     }
@@ -605,7 +610,7 @@ pub(crate) mod view {
         /// input as finally expanded into the view, hashed here so no
         /// value is stored or echoed; `None` until the view is built.
         #[allow(dead_code)]
-        pub fn write(
+        pub(crate) fn write(
             dir: &Path,
             identity: &ViewIdentity,
             expanded_env: Option<&[u8]>,
@@ -630,7 +635,7 @@ pub(crate) mod view {
         /// The record beside `dir` that `identity` names, when it is
         /// intact, of this layout, and bound to exactly this identity.
         #[allow(dead_code)]
-        pub fn load(dir: &Path, identity: &ViewIdentity) -> Option<Self> {
+        pub(crate) fn load(dir: &Path, identity: &ViewIdentity) -> Option<Self> {
             let path = dir.join(CONFIGURATION_FILE);
             let md = std::fs::metadata(&path).ok()?;
             if !md.is_file() || md.len() > RECORD_MAX_BYTES {
@@ -649,14 +654,14 @@ pub(crate) mod view {
 
         /// The canonical configuration the record was written from.
         #[allow(dead_code)]
-        pub fn configuration(&self) -> &[u8] {
+        pub(crate) fn configuration(&self) -> &[u8] {
             &self.canonical
         }
 
         /// The content hash of the environment input as finally expanded
         /// into the view, or `None` while the view is still being built.
         #[allow(dead_code)]
-        pub fn expanded_env(&self) -> Option<&str> {
+        pub(crate) fn expanded_env(&self) -> Option<&str> {
             self.expanded_env.as_deref()
         }
     }
@@ -664,7 +669,7 @@ pub(crate) mod view {
     /// The name of the ready record inside a view directory. The
     /// configuration record is [`ViewRecord`]'s; this one marks the
     /// whole view, record and content, as published.
-    pub const READY_FILE: &str = "ready";
+    pub(crate) const READY_FILE: &str = "ready";
 
     /// The deepest relative path a staging write accepts, so a hostile
     /// name fails the build instead of nesting without bound.
@@ -707,7 +712,7 @@ pub(crate) mod view {
     /// [`Staging::edit_file`] replace content by renaming a fresh file
     /// over the name, which leaves the shared inode untouched.
     #[allow(dead_code)]
-    pub fn admit_in_place_write(path: &Path) -> io::Result<()> {
+    pub(crate) fn admit_in_place_write(path: &Path) -> io::Result<()> {
         let md = std::fs::symlink_metadata(path)?;
         if !md.is_file() {
             return Err(io::Error::new(
@@ -753,7 +758,7 @@ pub(crate) mod view {
     /// a view's idleness on this inode's flock alone, never on a pid
     /// recorded anywhere, so a detached helper that closed everything
     /// else still keeps its view.
-    pub(crate) fn lease_lock_path(view: &Path) -> Option<PathBuf> {
+    pub fn lease_lock_path(view: &Path) -> Option<PathBuf> {
         Some(view.with_file_name(format!("{}.lease", view.file_name()?.to_str()?)))
     }
 
@@ -850,7 +855,7 @@ pub(crate) mod view {
 
         /// The configuration record the view was published with,
         /// carrying the hash of the environment input as expanded.
-        pub fn record(&self) -> &ViewRecord {
+        pub(crate) fn record(&self) -> &ViewRecord {
             &self.record
         }
     }

@@ -49,7 +49,7 @@ static FOREGROUND: AtomicI32 = AtomicI32::new(0);
 
 /// How the foreground process ended, as the guardian reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     /// Exited with this status.
     Exit(i32),
     /// Was terminated by this signal.
@@ -64,7 +64,7 @@ pub(crate) enum Outcome {
 impl Outcome {
     /// The exit code the invoking process exits with, the conversion the
     /// launch modes have always applied to a child status.
-    pub(crate) fn exit_code(self) -> i32 {
+    pub fn exit_code(self) -> i32 {
         match self {
             Outcome::Exit(code) => code,
             Outcome::Signaled(sig) => 128 + sig,
@@ -109,14 +109,14 @@ fn outcome(status: WaitStatus) -> Outcome {
 }
 
 /// What the invoking process keeps for one supervised launch.
-pub(crate) struct Supervision {
+pub struct Supervision {
     /// Read end of the pipe the guardian reports on. One two-byte record
     /// arrives the moment the foreground process has been reaped; a hang
     /// up without one means the guardian died without reporting.
-    pub(crate) status: OwnedFd,
+    pub status: OwnedFd,
     /// The guardian's process id. Signals aimed at it reach the foreground
     /// child, forwarded once each, while the child lives.
-    pub(crate) pid: u32,
+    pub pid: u32,
 }
 
 /// Fork the guardian for one launch and, inside it, the foreground child.
@@ -135,7 +135,7 @@ pub(crate) struct Supervision {
 /// This returns in the invoking process only. Launching fails with an
 /// error when the report pipe or a fork fails, and the [`Outcome::Unavailable`]
 /// record says so when the kernel refuses the subreaper attribute.
-pub(crate) fn spawn<L, F, R>(lease: L, start: F, release: R) -> io::Result<Supervision>
+pub fn spawn<L, F, R>(lease: L, start: F, release: R) -> io::Result<Supervision>
 where
     F: FnOnce(),
     R: FnOnce(L),
@@ -325,7 +325,7 @@ fn write_record(report: &OwnedFd, record: [u8; 2]) {
 /// Read the foreground [`Outcome`] the guardian reports, waiting until the
 /// record arrives or the pipe hangs up. A hang up without a record is an
 /// error: the guardian died without reporting.
-pub(crate) fn receive(status: &OwnedFd) -> io::Result<Outcome> {
+pub fn receive(status: &OwnedFd) -> io::Result<Outcome> {
     let mut record = [0u8; 2];
     let mut filled = 0;
     while filled < record.len() {

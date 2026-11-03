@@ -1,30 +1,21 @@
-mod cache;
+//! The packed application's runtime binary. It loads the package it was
+//! invoked from, decides an execution mode, and replaces itself with the
+//! entrypoint through the launch support in this crate's library.
+//!
+//! The binary owns what is genuinely binary-only: the embedded capability
+//! note describing this build, the packed binary's flag handlers
+//! (inspection, diagnostics, desktop metadata and integration), the
+//! in-memory memfd execution of a self-contained payload, the cache-mode
+//! orchestration below, and the updater behind the `update` feature. The
+//! updater registers its HTTPS client with the library's acquisition, so
+//! the slim build, which leaves the feature off, still links and runs
+//! with `file://` acquisition alone.
 mod capability;
 mod doctor;
-mod env;
-mod ephemeral;
-mod fuse;
-mod guardian;
-mod hostenv;
-mod hostpaths;
 mod inspect;
 mod integrate;
-mod interp;
-mod launch;
-mod links;
-mod loader;
 mod memfd;
 mod metadata;
-mod multicall;
-mod paths;
-mod pkgmeta;
-mod platform;
-mod portable;
-mod providers;
-mod rundir;
-mod selfextract;
-mod sets;
-mod ulexec;
 #[cfg(feature = "update")]
 mod update;
 
@@ -35,6 +26,21 @@ use std::path::Path;
 
 use onelf_format::EntryKind;
 use onelf_format::HostLibsPolicy;
+use onelf_rt::cache;
+use onelf_rt::env;
+use onelf_rt::ephemeral;
+use onelf_rt::fuse;
+use onelf_rt::guardian;
+use onelf_rt::hostenv;
+use onelf_rt::launch;
+use onelf_rt::links;
+use onelf_rt::loader;
+use onelf_rt::multicall;
+use onelf_rt::paths;
+use onelf_rt::pkgmeta;
+use onelf_rt::portable;
+use onelf_rt::rundir;
+use onelf_rt::sets;
 
 /// The directory of the cache's execution-view store, under the cache
 /// root. The cache's collection reclaims exactly this layout when the
@@ -43,6 +49,12 @@ use onelf_format::HostLibsPolicy;
 const VIEW_STORE_DIR: &str = "views";
 
 fn main() {
+    // The updater's client serves acquisition's https:// sources. The
+    // slim build leaves the update feature, and with it this client,
+    // out; acquisition then refuses https:// and serves file:// alone.
+    #[cfg(feature = "update")]
+    onelf_rt::platform::supply_https_fetch(update::download);
+
     hostenv::capture_starting_env();
 
     // Bytes, not text: a file manager hands a GUI app whatever name the
@@ -119,7 +131,7 @@ fn main() {
     // "update" feature; the slim runtime omits these to save ~1.3 MB).
     #[cfg(feature = "update")]
     if let Some(flag) = update::parse_flag(&args) {
-        let Some(url_bytes) = read_package_file(&mut pkg, ".onelf/update-url") else {
+        let Some(url_bytes) = loader::read_package_file(&mut pkg, ".onelf/update-url") else {
             eprintln!("onelf-rt: no update URL configured (repack with --update-url)");
             std::process::exit(1);
         };
@@ -136,8 +148,8 @@ fn main() {
         // package carrying both the key and the marker is not merely
         // unconfigured but contradictory, so it exits 2 rather than the
         // benign disabled 1.
-        let unsigned = read_package_file(&mut pkg, ".onelf/update-unsigned").is_some();
-        let key_bytes = read_package_file(&mut pkg, ".onelf/update-key");
+        let unsigned = loader::read_package_file(&mut pkg, ".onelf/update-unsigned").is_some();
+        let key_bytes = loader::read_package_file(&mut pkg, ".onelf/update-key");
         let tampered = unsigned && key_bytes.is_some();
         let key = match update::policy(key_bytes, unsigned) {
             Ok(key) => key,
@@ -245,7 +257,7 @@ fn main() {
                 &[],
             );
             portable::setup_portable(exe_dir, exe_name);
-            if let Some(env_data) = read_package_file(&mut pkg, ".onelf/env") {
+            if let Some(env_data) = loader::read_package_file(&mut pkg, ".onelf/env") {
                 env::apply_custom_env(&env_data, "");
             }
 
@@ -262,10 +274,10 @@ fn main() {
     }
 
     // Read interpreter metadata for cross-libc portability (if packed with interp patching)
-    let interp_data = read_package_file(&mut pkg, ".onelf/interp");
+    let interp_data = loader::read_package_file(&mut pkg, ".onelf/interp");
 
     // Read custom environment variables from recipe [env] section
-    let env_data = read_package_file(&mut pkg, ".onelf/env");
+    let env_data = loader::read_package_file(&mut pkg, ".onelf/env");
 
     // The dependency sets the package left its libraries to. Obtained
     // before any mode is chosen: a set is served from the host mount
@@ -274,8 +286,8 @@ fn main() {
     // The carried selection record scopes acquisition to the invoked
     // entrypoint's selection, and a record the set table cannot back
     // ends the launch here, before any namespace or artifact exists.
-    let sets_table = read_package_file(&mut pkg, sets::SETS_FILE);
-    let set_selections = read_package_file(&mut pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
+    let sets_table = loader::read_package_file(&mut pkg, sets::SETS_FILE);
+    let set_selections = loader::read_package_file(&mut pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
     let selected = match sets::selection(
         sets_table.as_deref(),
         set_selections.as_deref(),
@@ -294,7 +306,7 @@ fn main() {
     // was started in. That rules out the two modes that make one of their
     // own, leaving fusermount3 and, failing that, extraction. The file's
     // presence is the whole message; it holds nothing.
-    let needs_setuid = read_package_file(&mut pkg, ".onelf/needs-setuid").is_some();
+    let needs_setuid = loader::read_package_file(&mut pkg, ".onelf/needs-setuid").is_some();
 
     // The publisher put the cache first: the app records its own path in
     // files that outlive it, so that path has to stay on disk. The other
@@ -498,8 +510,8 @@ fn exec_cache(
         .to_string();
     let pins = sets::pins();
     let metadata = metadata_digest(
-        read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE),
-        read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE),
+        loader::read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE),
+        loader::read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE),
     );
     let inputs = links::view::ViewInputs {
         uid: paths::uid(),
@@ -702,24 +714,13 @@ fn metadata_digest(rules: Option<Vec<u8>>, table: Option<Vec<u8>>) -> Option<[u8
     Some(*hasher.finalize().as_bytes())
 }
 
-pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Option<Vec<u8>> {
-    let idx = loader::find_file_entry(pkg, path)?;
-    loader::read_payload_blocks(
-        &pkg.file,
-        &pkg.footer,
-        &pkg.manifest.entries[idx].blocks,
-        &pkg.codec,
-    )
-    .ok()
-}
-
 #[cfg(test)]
 mod cache_view_tests {
     use super::{metadata_digest, stage_view_from_base};
-    use crate::links;
     use onelf_format::entry::{Entry, EntryKind};
     use onelf_format::payload::Codec;
     use onelf_format::{Manifest, ManifestHeader};
+    use onelf_rt::links;
     use std::cell::Cell;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -945,7 +946,7 @@ mod cache_view_tests {
             PathBuf::from("/host/lib/libhost.so.1")
         );
         // What a later launch's verify finds is exactly what was staged.
-        assert!(crate::links::served(
+        assert!(links::served(
             &manifest,
             &view,
             "lib",
@@ -979,26 +980,5 @@ mod cache_view_tests {
             Some(base)
         );
         assert_ne!(metadata_digest(None, table), Some(base));
-    }
-}
-
-/// Keeps the tests that start a process apart from the tests that expect
-/// a file lock of theirs to be released. A child inherits every descriptor
-/// open when it is forked, a lock that survives an exec among them, and a
-/// lock test running beside it then finds its lock still taken.
-#[cfg(test)]
-pub(crate) mod test_locks {
-    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-    static FORKS: RwLock<()> = RwLock::new(());
-
-    /// Held by a lock test for its whole run.
-    pub(crate) fn locking() -> RwLockReadGuard<'static, ()> {
-        FORKS.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Held by a test for as long as a child it started lives.
-    pub(crate) fn forking() -> RwLockWriteGuard<'static, ()> {
-        FORKS.write().unwrap_or_else(|e| e.into_inner())
     }
 }

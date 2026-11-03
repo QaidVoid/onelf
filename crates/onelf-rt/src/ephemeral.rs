@@ -26,7 +26,7 @@ use crate::loader::PackageData;
 
 /// Compute the tmpfs size needed to hold the extracted package.
 /// Adds 25% headroom for filesystem overhead, minimum 8 MB.
-pub(crate) fn tmpfs_size_for(pkg: &PackageData) -> u64 {
+pub fn tmpfs_size_for(pkg: &PackageData) -> u64 {
     let content_size: u64 = pkg
         .manifest
         .entries
@@ -46,7 +46,7 @@ pub(crate) fn tmpfs_size_for(pkg: &PackageData) -> u64 {
 /// caller can still fall back to on-disk extraction. An unreadable or
 /// unparseable `meminfo` is treated as "no objection", leaving behaviour
 /// unchanged on kernels that do not report it.
-pub(crate) fn fits_in_memory(needed: u64) -> bool {
+pub fn fits_in_memory(needed: u64) -> bool {
     let Ok(info) = std::fs::read_to_string("/proc/meminfo") else {
         return true;
     };

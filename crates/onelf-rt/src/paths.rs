@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::DirBuilderExt;
 
 /// Current real uid, the target user the runtime's state is owned by.
-pub(crate) fn uid() -> u32 {
+pub fn uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
@@ -73,7 +73,7 @@ pub fn private_dir() -> Option<PathBuf> {
 /// Open a lock file leaving the descriptor inheritable (no `CLOEXEC`), so a
 /// lock taken before an `exec` still guards the resource afterwards. `std`'s
 /// `File::open` sets `CLOEXEC`, which would drop the claim at exec time.
-pub(crate) fn open_lock_inheritable(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_lock_inheritable(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(path, OFlags::CREATE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)?;
     Ok(std::fs::File::from(fd))
@@ -92,11 +92,12 @@ fn mountpoint_lock_path(base: &Path, dir_name: &str) -> PathBuf {
 /// requires, so it cannot remove the directory out from under us. The
 /// descriptor is inheritable so the claim survives the `exec` in tmpfs mode.
 pub struct Mountpoint {
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     _lock: std::fs::File,
 }
 
 impl Mountpoint {
+    /// The claimed directory.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -135,7 +136,7 @@ impl Mountpoint {
 /// The shared lock is taken *before* the directory is created, which closes
 /// the window where a freshly created but not yet mounted directory looks
 /// exactly like an abandoned one to a concurrent sweep.
-pub fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
+pub(crate) fn create_mountpoint(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
     let (path, lock) = claim_mountpoint(&package_dir_name(package_name, package_id))?;
     Some(Mountpoint { path, _lock: lock })
 }
@@ -163,7 +164,7 @@ pub fn create_launch_dir(package_name: &str, package_id: &[u8; 32]) -> Option<Mo
 /// keeps the `onelf-` prefix, so a launch killed mid-build leaves a
 /// staging tree the next launch's sweep reclaims through its lock, like
 /// any other claimed directory.
-pub fn create_launch_stage(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
+pub(crate) fn create_launch_stage(package_name: &str, package_id: &[u8; 32]) -> Option<Mountpoint> {
     let dir_name = format!(
         "{}.staging",
         launch_dir_name(package_name, package_id, std::process::id())
@@ -174,7 +175,7 @@ pub fn create_launch_stage(package_name: &str, package_id: &[u8; 32]) -> Option<
 
 /// The mountpoint concurrent launches of a package share (see
 /// `fuse::share`), claimed the way [`create_mountpoint`] claims one.
-pub fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {
+pub(crate) fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {
     let (path, lock) = claim_mountpoint(dir_name)?;
     Some(Mountpoint { path, _lock: lock })
 }
@@ -182,7 +183,7 @@ pub fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {
 /// `onelf-<name prefix>-<longer id prefix>`, the shared mountpoint's
 /// name. It carries more of the id than [`package_dir_name`], so it is
 /// never the directory a launch that does not share mounts at.
-pub fn shared_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
+pub(crate) fn shared_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
     let hash_suffix = crate::cache::hex(&package_id[0..8]);
     format!("onelf-{}-{hash_suffix}", name_stem(package_name))
 }
@@ -191,7 +192,7 @@ pub fn shared_dir_name(package_name: &str, package_id: &[u8; 32]) -> String {
 /// `base`. The record names the server and is locked by every launch
 /// deciding whether to start one. The lease is held shared by every
 /// launch running from the mount.
-pub fn share_files_in(base: &Path, dir_name: &str) -> (PathBuf, PathBuf) {
+pub(crate) fn share_files_in(base: &Path, dir_name: &str) -> (PathBuf, PathBuf) {
     (
         base.join(format!(".{dir_name}.share")),
         base.join(format!(".{dir_name}.lease")),
@@ -199,7 +200,7 @@ pub fn share_files_in(base: &Path, dir_name: &str) -> (PathBuf, PathBuf) {
 }
 
 /// [`share_files_in`] under the private runtime directory.
-pub fn share_files(dir_name: &str) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn share_files(dir_name: &str) -> Option<(PathBuf, PathBuf)> {
     Some(share_files_in(&private_dir()?, dir_name))
 }
 
@@ -217,13 +218,13 @@ fn launch_dir_name(package_name: &str, package_id: &[u8; 32], pid: u32) -> Strin
 /// The mountpoint a dependency set's build is served at, named by the
 /// build's hash so every package that pins that set shares one mount,
 /// with the shared lock claiming it.
-pub fn create_set_mountpoint(hash: &str) -> Option<(PathBuf, std::fs::File)> {
+pub(crate) fn create_set_mountpoint(hash: &str) -> Option<(PathBuf, std::fs::File)> {
     claim_mountpoint(&format!("onelf-set-{}", &hash[..hash.len().min(16)]))
 }
 
 /// The lock file guarding the mountpoint named `dir_name`, for a server
 /// that has to ask whether anyone still holds it.
-pub fn set_lock_path(dir_name: &str) -> Option<PathBuf> {
+pub(crate) fn set_lock_path(dir_name: &str) -> Option<PathBuf> {
     Some(mountpoint_lock_path(&private_dir()?, dir_name))
 }
 
@@ -234,7 +235,7 @@ pub fn set_lock_path(dir_name: &str) -> Option<PathBuf> {
 /// launches starting together would otherwise both find no mount and
 /// both make one, stacking a second mount on the first and leaving a
 /// server with nothing to serve.
-pub fn lock_set_creation(dir_name: &str) -> Option<std::fs::File> {
+pub(crate) fn lock_set_creation(dir_name: &str) -> Option<std::fs::File> {
     let path = private_dir()?.join(format!(".{dir_name}.create"));
     let lock = open_lock_inheritable(&path).ok()?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).ok()?;
@@ -309,7 +310,10 @@ pub fn resolve_store(package_id: &[u8; 32]) -> Option<PathBuf> {
 /// differ only in order share one. `selection_key` is a directory name
 /// the resolver mints; anything else names nothing.
 #[allow(dead_code)]
-pub fn resolve_selection_store(package_id: &[u8; 32], selection_key: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_selection_store(
+    package_id: &[u8; 32],
+    selection_key: &str,
+) -> Option<PathBuf> {
     let dir = onelf_format::resolve::selection_dir(selection_key)?;
     Some(resolve_store(package_id)?.join(dir))
 }
@@ -322,7 +326,7 @@ pub fn resolve_selection_store(package_id: &[u8; 32], selection_key: &str) -> Op
 /// `key` is a directory name the view identity mints; anything else
 /// names nothing.
 #[allow(dead_code)]
-pub fn view_dir(package_id: &[u8; 32], key: &str) -> Option<PathBuf> {
+pub(crate) fn view_dir(package_id: &[u8; 32], key: &str) -> Option<PathBuf> {
     let dir = crate::links::view::dir_name(key)?;
     Some(resolve_store(package_id)?.join(dir))
 }
@@ -359,7 +363,7 @@ fn older_than_grace(path: &Path) -> bool {
 /// mount inside a private namespace, so from any other process the directory
 /// is simply empty, exactly like an abandoned one. Ownership is therefore
 /// proven by the lock the owner holds, not inferred from the directory.
-pub fn sweep_stale_mountpoints() {
+pub(crate) fn sweep_stale_mountpoints() {
     // Only sweep our own 0700 per-uid base, never shared /tmp (where a
     // rmdir could touch another user's planted `onelf-*` dir).
     let Some(base) = private_dir() else {

@@ -12,7 +12,7 @@ use onelf_format::Manifest;
 /// The variable a runtime sets to the entrypoint it exported, so a
 /// package the app launches tells an inherited `ONELF_ENTRYPOINT` apart
 /// from one set on purpose.
-pub const EXPORTED_VAR: &str = "ONELF_ENTRYPOINT_EXPORTED";
+pub(crate) const EXPORTED_VAR: &str = "ONELF_ENTRYPOINT_EXPORTED";
 
 /// Resolve which entrypoint index to use.
 pub fn resolve_entrypoint(manifest: &Manifest, argv0: &str) -> usize {

@@ -7,7 +7,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::loader::PackageData;
+use onelf_rt::loader::PackageData;
 
 const HELP: &str = "\
 Runtime flags, taken by the runtime wherever they appear. Every other
@@ -74,7 +74,7 @@ pub fn handle_flags(args: &[OsString], pkg: &mut PackageData, ep_idx: usize) -> 
 
 fn version(pkg: &mut PackageData) {
     println!("onelf-rt {}", env!("CARGO_PKG_VERSION"));
-    let info = crate::read_package_file(pkg, ".onelf/package-info.toml")
+    let info = onelf_rt::loader::read_package_file(pkg, ".onelf/package-info.toml")
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let version = info_value(&info, "version");
@@ -159,8 +159,8 @@ fn extract(pkg: &mut PackageData, args: &[OsString]) -> i32 {
             patterns.iter().any(|p| matches(p, &rel))
         }
     };
-    if let Err(e) =
-        std::fs::create_dir_all(&dir).and_then(|()| crate::cache::extract_matching(pkg, &dir, keep))
+    if let Err(e) = std::fs::create_dir_all(&dir)
+        .and_then(|()| onelf_rt::cache::extract_matching(pkg, &dir, keep))
     {
         eprintln!("onelf-rt: extraction failed: {e}");
         return 1;
@@ -212,10 +212,10 @@ fn stop_pipe() -> Option<(OwnedFd, OwnedFd)> {
 /// of the user can see. A namespace mount is visible only through this
 /// process, so the path printed reaches it through `/proc`.
 fn mount(pkg: &mut PackageData) -> i32 {
-    use crate::fuse::mount as fmount;
+    use onelf_rt::fuse::mount as fmount;
 
     let Some(claim) =
-        crate::paths::create_launch_dir(pkg.manifest.name(), &pkg.manifest.header.package_id)
+        onelf_rt::paths::create_launch_dir(pkg.manifest.name(), &pkg.manifest.header.package_id)
     else {
         eprintln!("onelf-rt: no private runtime directory to mount in");
         return 1;
@@ -249,7 +249,7 @@ fn mount(pkg: &mut PackageData) -> i32 {
     eprintln!("onelf-rt: serving the package there; interrupt to unmount");
 
     let mut state =
-        crate::fuse::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
+        onelf_rt::fuse::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
     let mut buf = vec![0u8; 1024 * 1024 + 4096];
     state.run_loop(&fuse_fd, Some(&stop_read), None::<&OwnedFd>, &mut buf);
     drop(fuse_fd);

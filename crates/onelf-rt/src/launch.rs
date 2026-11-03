@@ -40,17 +40,25 @@ const ROOTS_VAR: &str = "ONELF_ROOTS";
 
 /// Everything a launch needs beyond the package itself.
 pub struct Launch<'a> {
+    /// The loaded package the entrypoint runs from.
     pub pkg: &'a PackageData,
     /// The package root as the entrypoint will see it: the mount, the
     /// tmpfs, or the extracted directory.
     pub pkg_root: &'a Path,
     /// Reported to the app as `ONELF_ACTIVE_MODE`.
     pub mode: &'static str,
+    /// The manifest entrypoint this launch runs.
     pub ep_idx: usize,
+    /// The `argv[0]` the entrypoint sees.
     pub argv0: &'a str,
+    /// The package path this process was started from, as
+    /// `/proc/self/exe` reports it.
     pub exec_path: &'a str,
+    /// The arguments the entrypoint is exec'd with.
     pub args: &'a [OsString],
+    /// The package's interpreter record, when it packed one.
     pub interp_data: Option<&'a [u8]>,
+    /// The package's custom `[env]` record, when the recipe set one.
     pub env_data: Option<&'a [u8]>,
     /// Whether this process is inside a private mount namespace, which
     /// decides how a self-extracting binary gets its loader and how a host
@@ -89,7 +97,7 @@ pub fn exec(launch: &Launch) -> ! {
 /// [`exec`] on a mount another launch serves. Returns, before anything of
 /// the environment is set up, when that mount serves other library links
 /// than this launch needs, so the caller can choose another mode.
-pub fn exec_served(launch: &Launch) {
+pub(crate) fn exec_served(launch: &Launch) {
     run(launch);
 }
 
@@ -639,15 +647,15 @@ fn exec_under_host_loader(
 }
 
 /// What the resolver decided, with the GL build it was given, if any.
-pub(crate) struct Resolved {
+pub struct Resolved {
     /// The resolver's decision: the link farm, the host loader if it won,
     /// and the sonames that could not be ordered.
-    pub(crate) resolution: Resolution,
+    pub resolution: Resolution,
     /// The launch's effective policy over host libraries, after
     /// `ONELF_NO_RESOLVER` had its say.
-    pub(crate) policy: HostLibsPolicy,
+    pub policy: HostLibsPolicy,
     /// The fetched GL build's extracted root.
-    pub(crate) platform_root: Option<std::path::PathBuf>,
+    pub platform_root: Option<std::path::PathBuf>,
     /// Held through exec so the extraction is not collected while this
     /// instance runs. The fd is inheritable.
     _platform_lock: Option<std::fs::File>,
@@ -665,7 +673,7 @@ pub(crate) struct Resolved {
 /// one and the build can be had; the resolver then indexes that build
 /// ahead of the host. Anything that stops that is a warning, and the
 /// launch goes on without a GL stack.
-pub(crate) fn resolve_launch(
+pub fn resolve_launch(
     pkg: &PackageData,
     ep_idx: usize,
     pkg_root: &Path,
@@ -765,7 +773,7 @@ impl Resolved {
 /// Modes that materialize their tree or join a mount before the launch
 /// runs need the links first: the links are what a view's identity
 /// covers and what a shared mount must already serve.
-pub(crate) fn effective_links(
+pub fn effective_links(
     manifest: &Manifest,
     ep_idx: usize,
     pkg_root: &Path,

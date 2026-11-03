@@ -65,7 +65,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Extract all package contents directly into `target_dir` without CAS.
 /// Used for ephemeral tmpfs-backed extraction inside a private namespace,
 /// where dedup has no value and the whole tree is thrown away on exit.
-pub fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()> {
+pub(crate) fn extract_direct(pkg: &mut PackageData, target_dir: &Path) -> io::Result<()> {
     extract_matching(pkg, target_dir, |_| true)
 }
 
@@ -365,7 +365,7 @@ fn touch_meta(meta_dir: &Path, package_id: &str) {
     let _ = fs::File::create(&meta_path);
 }
 
-pub fn remove_package(base: &Path, package_id: &str) {
+pub(crate) fn remove_package(base: &Path, package_id: &str) {
     // Retire the completion marker before the tree so a concurrent reader
     // never sees the marker without its pkg_dir.
     let _ = fs::remove_file(layout::ready_marker(base, package_id));
@@ -387,7 +387,7 @@ pub fn remove_package(base: &Path, package_id: &str) {
 /// store and the package directories are always on one filesystem (both are
 /// children of the single resolved cache root, and a cross-device hardlink
 /// would already have failed at extraction time).
-pub fn collect_cas(base: &Path) -> u64 {
+pub(crate) fn collect_cas(base: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(lock) = open_lock_inheritable(&layout::cas_lock_path(base)) else {
@@ -539,6 +539,10 @@ fn reclaim_view(store: &Path, name: &str) -> bool {
     reclaimed
 }
 
+/// Sweep the cache for this package's idle state and everything older
+/// than `max_age_secs`, reclaiming the base extraction, its blobs, and
+/// the views it pinned that no live lease holds. A `current_pkg_id` of
+/// an in-use package is never dropped by the sweep here.
 pub fn auto_gc(base: &Path, max_age_secs: u64, current_pkg_id: &str) {
     // Views never age: a live lease proves liveness, and an idle view is
     // reclaimable however recently it was built. They go first, so the
@@ -610,6 +614,8 @@ fn try_remove_locked(base: &Path, id: &str) -> bool {
     true
 }
 
+/// The cache root this uid may use, or `None` when no safe location
+/// can be established from the environment.
 pub fn base_dir() -> Option<PathBuf> {
     cache_dir()
 }

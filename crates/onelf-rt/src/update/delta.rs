@@ -63,7 +63,7 @@ pub(super) fn assemble(
     staged: &std::fs::File,
     src: &dyn RangeSource,
 ) -> Result<Stats, String> {
-    let local = crate::loader::load_from(local_path)
+    let local = onelf_rt::loader::load_from(local_path)
         .map_err(|e| format!("open the running package: {e}"))?;
     if local.manifest.header.version < 3 || remote.manifest.header.version < 3 {
         return Err("delta planning needs version-3 manifests on both sides".into());
@@ -264,7 +264,7 @@ fn coalesce(plan: &mut Plan) {
 // ---------------------------------------------------------------------------
 
 fn plan_blocks(
-    local: &crate::loader::PackageData,
+    local: &onelf_rt::loader::PackageData,
     remote: &RemotePackage,
     src: &dyn RangeSource,
 ) -> Result<Plan, String> {
@@ -544,7 +544,7 @@ fn zip_ranges(dst: Vec<Range<u64>>, src: Vec<Range<u64>>) -> Result<Vec<CopyRang
 }
 
 fn plan_stipple(
-    local: &crate::loader::PackageData,
+    local: &onelf_rt::loader::PackageData,
     remote: &RemotePackage,
     src: &dyn RangeSource,
 ) -> Result<Plan, String> {
@@ -610,7 +610,7 @@ fn plan_stipple(
 /// A fully stored image on both sides: copy content slice by slice through
 /// each image's extent table.
 fn plan_stipple_slices(
-    local: &crate::loader::PackageData,
+    local: &onelf_rt::loader::PackageData,
     local_reader: &Reader<'_>,
     remote: &RemotePackage,
     remote_reader: &Reader<'_>,
@@ -723,7 +723,7 @@ fn plan_stipple_slices(
 /// block whose stored bytes the running package already holds, matched by
 /// the digest, lengths and codec its block index records.
 fn plan_stipple_blocks(
-    local: &crate::loader::PackageData,
+    local: &onelf_rt::loader::PackageData,
     local_reader: &Reader<'_>,
     remote: &RemotePackage,
     remote_reader: &Reader<'_>,
@@ -876,7 +876,7 @@ fn write_group(
     let ok = match group.check {
         Check::Raw(hash) => blake3::hash(bytes).as_bytes() == &hash,
         Check::Decoded { hash, original } => {
-            match crate::loader::decode_block(bytes, original, dict) {
+            match onelf_rt::loader::decode_block(bytes, original, dict) {
                 Ok(decoded) => blake3::hash(&decoded).as_bytes() == &hash,
                 Err(_) => false,
             }

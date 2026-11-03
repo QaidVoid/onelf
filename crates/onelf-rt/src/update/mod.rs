@@ -312,7 +312,7 @@ fn report_available(
 
 /// The running package's id, when this binary is a readable package.
 fn local_package_id(self_path: &Path) -> Option<[u8; 32]> {
-    crate::loader::load_from(self_path)
+    onelf_rt::loader::load_from(self_path)
         .ok()
         .map(|p| p.manifest.header.package_id)
 }
@@ -338,7 +338,7 @@ fn hex(bytes: &[u8]) -> String {
 /// blocks into one file, and a symlink pre-placed at the known name
 /// redirects the write. The pid plus fresh random bytes make the name
 /// unguessable, and [`claim_staging`] refuses anything already sitting
-/// there — the signature check gates the content, never the
+/// there. The signature check gates the content, never the
 /// destination, so the destination must be ours alone.
 fn staged_path(self_path: &Path) -> io::Result<PathBuf> {
     let mut random = [0u8; 8];
@@ -418,7 +418,7 @@ fn save_rollback(running: &std::fs::File, self_path: &Path, prev_path: &Path) ->
 /// error, never "no revision": the packer only writes numbers, and a
 /// missing revision is what lets an older release through the downgrade
 /// gate.
-pub fn package_revision(pkg: &mut crate::loader::PackageData) -> Result<Option<u64>, String> {
+pub fn package_revision(pkg: &mut onelf_rt::loader::PackageData) -> Result<Option<u64>, String> {
     const PATH: &str = ".onelf/update-revision";
     let present = (0..pkg.manifest.entries.len()).any(|i| {
         pkg.manifest.entries[i].kind == onelf_format::EntryKind::File
@@ -427,7 +427,8 @@ pub fn package_revision(pkg: &mut crate::loader::PackageData) -> Result<Option<u
     if !present {
         return Ok(None);
     }
-    let bytes = crate::read_package_file(pkg, PATH).ok_or(format!("{PATH} cannot be read"))?;
+    let bytes =
+        onelf_rt::loader::read_package_file(pkg, PATH).ok_or(format!("{PATH} cannot be read"))?;
     parse_revision(&bytes).map(Some)
 }
 
@@ -450,7 +451,7 @@ struct StagedInfo {
 fn staged_info(file: &std::fs::File) -> Result<StagedInfo, String> {
     let mut pkg = file
         .try_clone()
-        .and_then(crate::loader::load_file)
+        .and_then(onelf_rt::loader::load_file)
         .map_err(|e| format!("the downloaded update is not a readable onelf package: {e}"))?;
     let revision =
         package_revision(&mut pkg).map_err(|why| format!("the downloaded update's {why}"))?;
@@ -467,7 +468,7 @@ fn staged_info(file: &std::fs::File) -> Result<StagedInfo, String> {
 fn verify_unsigned(staged: &std::fs::File) -> Result<(), String> {
     let pkg = staged
         .try_clone()
-        .and_then(crate::loader::load_file)
+        .and_then(onelf_rt::loader::load_file)
         .map_err(|e| format!("read unsigned package: {e}"))?;
     // Older manifests pin no prefix hash, so the executable part of such a
     // package could not be checked at all.
@@ -493,7 +494,7 @@ fn verify_unsigned(staged: &std::fs::File) -> Result<(), String> {
         let mut hasher = blake3::Hasher::new();
         for block in &entry.blocks {
             let bytes =
-                crate::loader::read_payload_entry(&pkg.file, &pkg.footer, block, &pkg.codec)
+                onelf_rt::loader::read_payload_entry(&pkg.file, &pkg.footer, block, &pkg.codec)
                     .map_err(|e| format!("read unsigned payload: {e}"))?;
             hasher.update(&bytes);
         }

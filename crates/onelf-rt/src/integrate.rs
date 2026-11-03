@@ -8,13 +8,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::loader::PackageData;
 use crate::metadata::{resolve_desktop, resolve_icon};
 use onelf_format::desktop::{entry_icon, icon_set, menu_entrypoints, patch_desktop_file};
+use onelf_rt::loader::PackageData;
 
 fn read_entry(pkg: &mut PackageData, entry_idx: usize) -> io::Result<Vec<u8>> {
     let blocks = pkg.manifest.entries[entry_idx].blocks.clone();
-    crate::loader::read_payload_blocks(&pkg.file, &pkg.footer, &blocks, &pkg.codec)
+    onelf_rt::loader::read_payload_blocks(&pkg.file, &pkg.footer, &blocks, &pkg.codec)
 }
 
 fn xdg_data_home_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
@@ -203,7 +203,7 @@ fn integrate_one(pkg: &mut PackageData, ep_name: &str, exec_path: &str, data_hom
     }
     let bundled = resolve_icon(&pkg.manifest, ep_name);
     let read = |i: usize| {
-        crate::loader::read_verified_entry(
+        onelf_rt::loader::read_verified_entry(
             &pkg.file,
             &pkg.footer,
             &pkg.manifest.entries[i],

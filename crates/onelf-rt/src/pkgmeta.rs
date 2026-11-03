@@ -22,11 +22,11 @@ use onelf_format::runtime_metadata::{EntrypointSets, MAX_METADATA_BYTES, Runtime
 use crate::loader::{self, PackageData};
 
 /// Where the package carries its validated runtime rule record.
-pub(crate) const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
+pub const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
 
 /// Where the package carries its canonical pin table and entrypoint
 /// selections.
-pub(crate) const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
+pub const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
 
 /// Read, decode and cross-validate both metadata records ahead of every
 /// dispatch decision.
@@ -34,7 +34,7 @@ pub(crate) const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
 /// Each record is checked on its own when the other is absent. When both
 /// are present, the rules' set-pin bindings must all name pins the
 /// selection table declares.
-pub(crate) fn validate(pkg: &PackageData) -> io::Result<()> {
+pub fn validate(pkg: &PackageData) -> io::Result<()> {
     let rules = runtime_rules(pkg)?;
     let sets = entrypoint_sets(pkg)?;
     if let (Some(rules), Some(sets)) = (&rules, &sets) {

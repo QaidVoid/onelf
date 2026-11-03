@@ -48,7 +48,7 @@ pub const SETS_FILE: &str = ".onelf/sets";
 
 /// One obtained set: the extracted root and the lock that keeps the
 /// extraction alive for this instance.
-pub struct Obtained {
+pub(crate) struct Obtained {
     /// The set table's declaration the build was obtained for.
     pub label: String,
     /// The BLAKE3 digest the build is pinned by, in lowercase hex.
@@ -271,7 +271,7 @@ pub fn pins() -> Vec<ActivePin> {
 }
 
 /// The extracted or mounted root of every set this launch obtained.
-pub fn roots() -> Vec<PathBuf> {
+pub(crate) fn roots() -> Vec<PathBuf> {
     OBTAINED
         .get()
         .map(|sets| sets.iter().map(|s| s.root.clone()).collect())
@@ -477,7 +477,7 @@ fn unclaimed(lock_path: &Path, original: Option<&fs::File>) -> bool {
 /// directory on this launch's library path is what the packer does for a
 /// bundle's own tree, and it is the only thing that reaches a plugin the
 /// loader is asked for by bare soname.
-pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn lib_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = onelf_format::resolve::GL_BUILD_LIB_DIRS
         .iter()
         .map(|d| root.join(d))

@@ -630,6 +630,8 @@ impl Synthetic {
     }
 }
 
+/// One FUSE server's state over a package: what it serves, how it
+/// verifies blocks, and what it records about its own run.
 pub struct FuseState<'a> {
     manifest: &'a Manifest,
     file: &'a mut File,
@@ -652,6 +654,8 @@ pub struct FuseState<'a> {
 }
 
 impl<'a> FuseState<'a> {
+    /// Open a server state over the package `manifest`, reading its
+    /// payload through `file` and `codec`.
     pub fn new(
         manifest: &'a Manifest,
         file: &'a mut File,
@@ -679,7 +683,7 @@ impl<'a> FuseState<'a> {
 
     /// Serve the links the launching child sends through `inbox`, once it
     /// has, and tell it so. Read while [`FuseState::run_loop`] serves.
-    pub fn expect_links(&mut self, inbox: crate::links::Receiver) {
+    pub(crate) fn expect_links(&mut self, inbox: crate::links::Receiver) {
         self.inbox = Some(inbox);
     }
 
@@ -816,7 +820,7 @@ impl<'a> FuseState<'a> {
 
     /// End the prefetch. Its workers do not survive a fork, so a caller
     /// that forks to keep serving calls this first.
-    pub fn stop_prefetch(&mut self) {
+    pub(crate) fn stop_prefetch(&mut self) {
         self.prefetch = None;
     }
 
@@ -837,7 +841,7 @@ impl<'a> FuseState<'a> {
     /// which hangs the pipe up while the real work is still running out of the
     /// mount. There is no descriptor left to wait on, so the caller supplies
     /// the liveness test instead.
-    pub fn serve_detached(
+    pub(crate) fn serve_detached(
         &mut self,
         fuse_fd: &impl AsFd,
         buf: &mut [u8],

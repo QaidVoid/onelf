@@ -134,7 +134,7 @@ fn in_onelf_package(path: &Path) -> bool {
 ///
 /// A hook restores a variable only while it holds what was applied, so
 /// a value the application changes on purpose survives.
-pub fn record_host_env(pkg_root: &Path, set_roots: &[PathBuf]) {
+pub(crate) fn record_host_env(pkg_root: &Path, set_roots: &[PathBuf]) {
     let Some(start) = STARTING_ENV.get() else {
         return;
     };

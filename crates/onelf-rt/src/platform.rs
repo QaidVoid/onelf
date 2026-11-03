@@ -43,9 +43,28 @@ use std::io::{self, Read};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rustix::fs::{FileType, Mode, OFlags, fstat};
 use rustix::io::Errno;
+
+/// An HTTPS transfer a caller supplies: fetch `url` into the exclusive
+/// file at `into`, or fail with a description of what went wrong. The
+/// library carries no client of its own, so every embedding process
+/// hands its existing client over here and nothing in the library's
+/// base dependencies pulls an HTTPS stack in.
+pub type HttpsFetch = fn(&str, &Path) -> Result<(), String>;
+
+static HTTPS_FETCH: OnceLock<HttpsFetch> = OnceLock::new();
+
+/// Supply the HTTPS operation acquisition uses for `https://` sources.
+/// The first registration in the process wins; later ones are ignored,
+/// because one process drives one launch-support stack with one client.
+/// Without any registration, `https://` sources are refused and only
+/// `file://` acquisition works.
+pub fn supply_https_fetch(fetch: HttpsFetch) {
+    let _ = HTTPS_FETCH.set(fetch);
+}
 
 /// Where the package records its pin, relative to the package root.
 pub const PIN_FILE: &str = ".onelf/platform";
@@ -53,8 +72,11 @@ pub const PIN_FILE: &str = ".onelf/platform";
 /// A GL build pinned by hash.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Pin {
+    /// The label the package stores the build under.
     pub label: String,
+    /// The source the build is fetched from.
     pub url: String,
+    /// The BLAKE3 digest the stored build must hash to.
     pub blake3: String,
 }
 
@@ -82,7 +104,7 @@ pub fn parse_pin(text: &str) -> Option<Pin> {
 /// A pin, if the three values can name a stored build: the label is a
 /// directory name and the hash names the file and is compared against
 /// its bytes, so it has to be exactly one BLAKE3 digest in hex.
-pub fn checked_pin(label: String, url: String, blake3: String) -> Option<Pin> {
+pub(crate) fn checked_pin(label: String, url: String, blake3: String) -> Option<Pin> {
     if label.is_empty() || label.contains('/') || label.starts_with('.') {
         return None;
     }
@@ -101,7 +123,7 @@ fn env_set(name: &str) -> bool {
 /// and the lock that keeps the extraction from being collected while
 /// this instance runs, or `None` when the package pins no build. The
 /// error names why the pinned build could not be used.
-pub fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
+pub(crate) fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
     let text = fs::read_to_string(pkg_root.join(PIN_FILE)).ok()?;
     let Some(mut pin) = parse_pin(&text) else {
         return Some(Err(format!("{PIN_FILE} names no usable build")));
@@ -124,7 +146,7 @@ pub fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
 ///
 /// Shared by the GL build and by every dependency set, which differ only
 /// in when they are wanted, not in how they are obtained.
-pub fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
+pub(crate) fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
     let artifact = store_build(pin)?;
     extract_build(&artifact)
 }
@@ -139,7 +161,7 @@ pub fn obtain_build(pin: &Pin) -> Result<(PathBuf, fs::File), String> {
 /// handed a path; the set mount server's re-open of that name is the one
 /// lookup this leaves, closed later by descriptor-based traversal.
 #[derive(Debug)]
-pub struct VerifiedArtifact {
+pub(crate) struct VerifiedArtifact {
     path: PathBuf,
     file: fs::File,
 }
@@ -155,7 +177,7 @@ impl Deref for VerifiedArtifact {
 /// Extract the build `artifact` holds through the ordinary package cache.
 /// The container is loaded from a duplicate of the verified handle, so
 /// the bytes are the ones whose digest matched the pin.
-pub fn extract_build(artifact: &VerifiedArtifact) -> Result<(PathBuf, fs::File), String> {
+pub(crate) fn extract_build(artifact: &VerifiedArtifact) -> Result<(PathBuf, fs::File), String> {
     let file = artifact
         .file
         .try_clone()
@@ -288,7 +310,7 @@ fn stored_location(pin: &Pin) -> Result<(PathBuf, String), String> {
 /// pinned and hashed through confined descriptors, and only a missing or
 /// mismatching file is fetched, verified, and published in its place.
 /// Returns the verified handle every consumer reads through.
-pub fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
+pub(crate) fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
     let (store, relative) = stored_location(pin)?;
     acquire(
         &store,
@@ -941,13 +963,16 @@ fn copy_bounded(
     Ok(())
 }
 
-/// Download `url` into the staging path through the updater's client.
-/// The client streams the response body with its own timeouts and takes
-/// no reader hook, so the staging bound is enforced on the staged bytes
-/// here, before they can be verified or published.
-#[cfg(feature = "update")]
+/// Download `url` into the staging path through the HTTPS operation the
+/// embedding caller supplied. The caller's client streams the response
+/// body with its own timeouts and takes no reader hook, so the staging
+/// bound is enforced on the staged bytes here, before they can be
+/// verified or published.
 fn download(url: &str, into: &Path, staging: &mut fs::File) -> Result<(), String> {
-    crate::update::download(url, into)?;
+    let Some(fetch) = HTTPS_FETCH.get() else {
+        return Err(format!("this runtime has no HTTPS client to fetch {url}"));
+    };
+    fetch(url, into)?;
     let len = staging.metadata().map_err(|e| e.to_string())?.len();
     if len > FETCH_MAX_BYTES {
         return Err(format!(
@@ -955,11 +980,6 @@ fn download(url: &str, into: &Path, staging: &mut fs::File) -> Result<(), String
         ));
     }
     Ok(())
-}
-
-#[cfg(not(feature = "update"))]
-fn download(url: &str, _into: &Path, _staging: &mut fs::File) -> Result<(), String> {
-    Err(format!("this runtime has no HTTPS client to fetch {url}"))
 }
 
 /// Record a use through the verified handle, so collection can tell an

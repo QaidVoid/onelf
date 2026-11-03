@@ -159,7 +159,7 @@ pub fn execute_rundir(
 }
 
 /// Bytes available to this user on the filesystem holding `path`.
-pub(crate) fn free_space(path: &Path) -> Option<u64> {
+pub fn free_space(path: &Path) -> Option<u64> {
     rustix::fs::statvfs(path)
         .ok()
         .map(|s| s.f_bavail.saturating_mul(s.f_frsize))

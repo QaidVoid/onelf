@@ -11,10 +11,18 @@ use std::path::Path;
 use onelf_format::payload::Codec;
 use onelf_format::{Entry, FOOTER_SIZE, Footer, Manifest};
 
+/// A loaded package: its verified footer and manifest, the open file
+/// it was read from, and the payload codec its blocks decode through.
+/// The file stays open because every payload read is pinned to this
+/// inode, never to a re-opened path.
 pub struct PackageData {
+    /// The verified trailer the package closes with.
     pub footer: Footer,
+    /// The decoded manifest: entries, entrypoints, and the string table.
     pub manifest: Manifest,
+    /// The open package file the payload is read through.
     pub file: File,
+    /// The codec the payload blocks were stored with.
     pub codec: Codec,
 }
 
@@ -29,7 +37,7 @@ pub fn load_from(path: &Path) -> io::Result<PackageData> {
 }
 
 /// Load through an already opened handle, preserving the caller's inode pin.
-pub(crate) fn load_file(mut file: File) -> io::Result<PackageData> {
+pub fn load_file(mut file: File) -> io::Result<PackageData> {
     let file_size = file.metadata()?.len();
 
     if file_size < FOOTER_SIZE as u64 {
@@ -211,11 +219,7 @@ fn read_block(
 /// every later offset shifted. Shared with the delta updater, which
 /// verifies a block it copied from the running binary by decoding it and
 /// hashing the content.
-pub(crate) fn decode_block(
-    buf: &[u8],
-    original: usize,
-    dict: Option<&[u8]>,
-) -> io::Result<Vec<u8>> {
+pub fn decode_block(buf: &[u8], original: usize, dict: Option<&[u8]>) -> io::Result<Vec<u8>> {
     let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
     let data = match dict {
         Some(d) => {
@@ -234,6 +238,21 @@ pub(crate) fn decode_block(
         )));
     }
     Ok(data)
+}
+
+/// Read and decompress the payload record at `path` from the package,
+/// or `None` when the package carries no such entry or its bytes fail
+/// to decode. Callers treat the record's presence as configuration and
+/// its failure to read as absence only where the launch policy says so.
+pub fn read_package_file(pkg: &mut PackageData, path: &str) -> Option<Vec<u8>> {
+    let idx = find_file_entry(pkg, path)?;
+    read_payload_blocks(
+        &pkg.file,
+        &pkg.footer,
+        &pkg.manifest.entries[idx].blocks,
+        &pkg.codec,
+    )
+    .ok()
 }
 
 #[cfg(test)]

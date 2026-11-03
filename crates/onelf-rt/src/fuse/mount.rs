@@ -29,7 +29,7 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 /// Enter a private user+mount namespace with our real uid/gid mapped 1:1.
 /// After this returns, the process has CAP_SYS_ADMIN inside the namespace
 /// and subsequent mounts are invisible to the host.
-pub fn enter_namespace() -> io::Result<()> {
+pub(crate) fn enter_namespace() -> io::Result<()> {
     // Entering is one-way: a launcher that unshares and then finds it may
     // not map its ids or mount anything is stuck in a namespace where
     // fusermount3's setuid bit means nothing and every fallback runs as
@@ -66,7 +66,7 @@ fn unshare_and_map() -> io::Result<()> {
 
 /// Whether a forked child can unshare, map its ids and mount a tmpfs.
 /// The mount lands in the child's own namespace and goes with it.
-pub(crate) fn namespace_usable() -> bool {
+pub fn namespace_usable() -> bool {
     use rustix::runtime::{Fork, kernel_fork};
 
     match unsafe { kernel_fork() } {
@@ -147,7 +147,7 @@ pub fn fuse_mount_unshare(mountpoint: &Path) -> io::Result<OwnedFd> {
 
 /// Mount a tmpfs at `mountpoint`. Caller must already be in a private
 /// mount namespace (via `enter_namespace`).
-pub fn mount_tmpfs(mountpoint: &Path, size_bytes: u64) -> io::Result<()> {
+pub(crate) fn mount_tmpfs(mountpoint: &Path, size_bytes: u64) -> io::Result<()> {
     let data = format!("size={size_bytes},mode=0755");
     let data_c = std::ffi::CString::new(data).unwrap();
 
@@ -301,7 +301,7 @@ pub fn fuse_unmount(mountpoint: &Path) {
 
 /// Whether a mount helper is available: `fusermount3`, or one of the
 /// others [`helper`] accepts.
-pub fn fusermount3_available() -> bool {
+pub(crate) fn fusermount3_available() -> bool {
     helper().is_some()
 }
 

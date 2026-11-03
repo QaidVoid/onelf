@@ -7,9 +7,9 @@
 //! while the child runs the target binary, and a death pipe detects child
 //! exit for reliable cleanup.
 
-pub(crate) mod fs;
+pub mod fs;
 pub(crate) use fs::TRACE_ARM;
-pub(crate) mod mount;
+pub mod mount;
 mod protocol;
 pub(crate) mod share;
 
@@ -24,7 +24,11 @@ use rustix::runtime::{KernelSigSet, KernelSigaction, KernelSigactionFlags, kerne
 
 use crate::loader::PackageData;
 
-pub(crate) static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// The foreground child the signal handlers forward to, or `0` while
+/// nothing is running. The launching process stores the pid of the
+/// child a guardian supervises, so a signal aimed at the launcher
+/// reaches the application.
+pub static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Write end of the pipe the `SIGCHLD` handler writes a byte to, so the event
 /// loop can wait on the launched process exiting rather than only on the death
@@ -94,7 +98,9 @@ unsafe extern "C" fn signal_handler(sig: core::ffi::c_int) {
     }
 }
 
-pub(crate) fn install_signal_handlers() {
+/// Install the handlers that forward `SIGINT` and `SIGTERM` to
+/// [`CHILD_PID`] while the application runs.
+pub fn install_signal_handlers() {
     let mut mask = KernelSigSet::empty();
     mask.insert(Signal::INT);
     mask.insert(Signal::TERM);

@@ -11,9 +11,9 @@ use onelf_format::resolve::{self, Gl, Request};
 use onelf_format::verdef::Choice;
 use onelf_format::{HostLibsPolicy, drivers};
 
-use crate::fuse::mount;
-use crate::loader::PackageData;
-use crate::read_package_file;
+use onelf_rt::fuse::mount;
+use onelf_rt::loader::PackageData;
+use onelf_rt::loader::read_package_file;
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
@@ -43,7 +43,7 @@ fn modes(
         .open("/dev/fuse")
         .map(drop);
     let helper = mount::helper();
-    let needed = crate::ephemeral::tmpfs_size_for(pkg);
+    let needed = onelf_rt::ephemeral::tmpfs_size_for(pkg);
 
     let no_ns = if needs_setuid {
         Some("the package runs setuid binaries, which a user namespace disables".to_string())
@@ -74,7 +74,7 @@ fn modes(
     };
     let tmpfs = || match &no_ns {
         Some(why) => Err(why.clone()),
-        None if !crate::ephemeral::fits_in_memory(needed) => Err(format!(
+        None if !onelf_rt::ephemeral::fits_in_memory(needed) => Err(format!(
             "the {} MB package does not fit in available memory",
             needed >> 20
         )),
@@ -83,9 +83,9 @@ fn modes(
             true,
         )),
     };
-    let rundir = || match crate::paths::private_dir() {
+    let rundir = || match onelf_rt::paths::private_dir() {
         None => Err("there is no private runtime directory".to_string()),
-        Some(dir) => match crate::rundir::free_space(&dir) {
+        Some(dir) => match onelf_rt::rundir::free_space(&dir) {
             Some(free) if free < needed => Err(format!(
                 "{} has {} MB free, the package needs {} MB",
                 dir.display(),
@@ -211,8 +211,8 @@ fn libraries(pkg: &mut PackageData, ep_idx: usize, lib_dirs: &[String], places_h
         if disabled { " (ONELF_NO_RESOLVER)" } else { "" }
     );
 
-    let Some(scratch) =
-        crate::paths::private_dir().map(|d| d.join(format!("onelf-doctor-{}", std::process::id())))
+    let Some(scratch) = onelf_rt::paths::private_dir()
+        .map(|d| d.join(format!("onelf-doctor-{}", std::process::id())))
     else {
         println!("  no private runtime directory to read the libraries in");
         return;
@@ -226,7 +226,7 @@ fn libraries(pkg: &mut PackageData, ep_idx: usize, lib_dirs: &[String], places_h
                 .is_some_and(|p| lib_dirs.iter().any(|d| p == Path::new(d)))
     };
     let extracted = std::fs::create_dir(&scratch)
-        .and_then(|()| crate::cache::extract_matching(pkg, &scratch, wanted));
+        .and_then(|()| onelf_rt::cache::extract_matching(pkg, &scratch, wanted));
     match extracted {
         Ok(()) => verdicts(
             pkg,
@@ -266,8 +266,8 @@ fn verdicts(
         Gl::Absent => "none on the host or in the bundle; nothing links one",
     };
     println!("  GL stack: {gl_text}");
-    let pin = read_package_file(pkg, crate::platform::PIN_FILE)
-        .and_then(|b| crate::platform::parse_pin(&String::from_utf8_lossy(&b)));
+    let pin = read_package_file(pkg, onelf_rt::platform::PIN_FILE)
+        .and_then(|b| onelf_rt::platform::parse_pin(&String::from_utf8_lossy(&b)));
     if let Some(pin) = &pin {
         let wanted = if gl.lacking() {
             "the launch uses it"
@@ -284,7 +284,7 @@ fn verdicts(
     if policy == HostLibsPolicy::Never {
         return;
     }
-    let Some(store) = crate::paths::resolve_store(&pkg.manifest.header.package_id) else {
+    let Some(store) = onelf_rt::paths::resolve_store(&pkg.manifest.header.package_id) else {
         println!("  no private runtime directory for the resolver's store");
         return;
     };
@@ -294,7 +294,7 @@ fn verdicts(
     if gl.lacking() && pin.is_some() {
         println!("  the pinned build's libraries are not weighed below");
     }
-    if read_package_file(pkg, crate::sets::SETS_FILE).is_some() {
+    if read_package_file(pkg, onelf_rt::sets::SETS_FILE).is_some() {
         println!("  the dependency sets' libraries are not weighed below");
     }
     let decision = resolve::decide(&Request {
@@ -345,8 +345,8 @@ fn verdicts(
 }
 
 /// Whether the store holds the build `pin` names, or where it comes from.
-fn stored(pin: &crate::platform::Pin) -> String {
-    match crate::platform::stored_path(pin) {
+fn stored(pin: &onelf_rt::platform::Pin) -> String {
+    match onelf_rt::platform::stored_path(pin) {
         Ok(file) if file.is_file() => format!("stored at {}", file.display()),
         _ if env_set("ONELF_NO_PLATFORM_FETCH") => {
             "not stored, and ONELF_NO_PLATFORM_FETCH forbids fetching it".to_string()
@@ -356,11 +356,11 @@ fn stored(pin: &crate::platform::Pin) -> String {
 }
 
 fn sets(pkg: &mut PackageData) {
-    let Some(record) = read_package_file(pkg, crate::sets::SETS_FILE) else {
+    let Some(record) = read_package_file(pkg, onelf_rt::sets::SETS_FILE) else {
         return;
     };
     println!("\nDependency sets");
-    for pin in crate::sets::parse(&String::from_utf8_lossy(&record)) {
+    for pin in onelf_rt::sets::parse(&String::from_utf8_lossy(&record)) {
         println!("  {}: {}", pin.label, stored(&pin));
     }
 }
