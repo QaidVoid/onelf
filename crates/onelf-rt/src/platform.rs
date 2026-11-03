@@ -70,7 +70,7 @@ pub fn supply_https_fetch(fetch: HttpsFetch) {
 pub const PIN_FILE: &str = ".onelf/platform";
 
 /// A GL build pinned by hash.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
     /// The label the package stores the build under.
     pub label: String,
@@ -123,7 +123,12 @@ fn env_set(name: &str) -> bool {
 /// and the lock that keeps the extraction from being collected while
 /// this instance runs, or `None` when the package pins no build. The
 /// error names why the pinned build could not be used.
-pub(crate) fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
+///
+/// Public for a caller that prepares a launch outside a packed package,
+/// as the CLI's development run does: the pin lives in the AppDir's
+/// `.onelf/platform`, and the caller owns the warn-and-continue policy
+/// the packed launch applies to this result.
+pub fn obtain(pkg_root: &Path) -> Option<Result<(PathBuf, fs::File), String>> {
     let text = fs::read_to_string(pkg_root.join(PIN_FILE)).ok()?;
     let Some(mut pin) = parse_pin(&text) else {
         return Some(Err(format!("{PIN_FILE} names no usable build")));

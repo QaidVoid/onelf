@@ -17995,3 +17995,419 @@ fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
     }
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// The environment a development run needs to stay hermetic: a PATH, an
+/// isolated HOME, the launch's own store, and set extraction instead of
+/// a mount. The caller appends the run's spec and flags.
+fn dev_run(td: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(onelf());
+    cmd.arg("run")
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_SET_MODE", "extract")
+        .env("ONELF_PLATFORM_STORE", td.join("store"));
+    isolate(&mut cmd, td);
+    cmd
+}
+
+/// A development `run --bundle` stages the same sysroot closure a build
+/// stages, and the launch resolves against it.
+#[test]
+fn run_bundle_assembles_a_sysroot_recipe() {
+    let td = workdir("runsysroot");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir).env("ONELF_LD_CACHE", &fixture.ld_cache);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("value=42"), "{stdout}{stderr}");
+    assert!(
+        dir.join("lib/libfixture.so.1").is_file(),
+        "the sysroot closure is absent from the staged tree:\n{stderr}"
+    );
+    assert!(
+        dir.join(".onelf/provenance.toml").is_file(),
+        "the sysroot build carries no provenance:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The sysroot rules a recipe names reach the assembly a development run
+/// stages: the policy prunes what never ships, and the platform line
+/// hands its libraries to the host.
+#[test]
+fn run_bundle_applies_the_sysroot_rules() {
+    let td = workdir("runrules");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir).env("ONELF_LD_CACHE", &fixture.ld_cache);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("value=42"), "{stdout}{stderr}");
+    assert!(
+        !dir.join("share/doc").exists(),
+        "the policy's pruning did not reach the staged tree:\n{stderr}"
+    );
+    assert!(
+        !dir.join("lib/libGL.so.1").exists(),
+        "the platform line's host decision did not reach the staged tree:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Host-provided:") && stderr.contains("libGL.so.1"),
+        "the rule's decision is not reported:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A bundle exclusion reaches the development launch: the excluded
+/// soname stays out of the assembled tree, and the launch runs against
+/// exactly that tree.
+#[test]
+fn run_bundle_honors_bundle_exclusions() {
+    let td = workdir("runexclude");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // A host of this test's own making, supplying both sonames through
+    // the recipe's search paths.
+    let host = td.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    write(&src.join("keep.c"), "int keep_value(void){return 5;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libkeep.so.9fixture",
+            src.join("keep.c").to_str().unwrap(),
+        ],
+        &host.join("libkeep.so.9fixture"),
+    ));
+    write(&src.join("extra.c"), "int extra_value(void){return 7;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libextra.so.9fixture",
+            src.join("extra.c").to_str().unwrap(),
+        ],
+        &host.join("libextra.so.9fixture"),
+    ));
+
+    // The application needs one soname outright and opens the other by
+    // name, so the scanner looks for both once dlopen scanning is on.
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &src.join("app.c"),
+        "#include <dlfcn.h>\n#include <stdio.h>\nint keep_value(void);\nint main(void){void *h = dlopen(\"libextra.so.9fixture\", RTLD_NOW);printf(\"extra=%s\\n\", h ? \"loaded\" : \"absent\");if (h) dlclose(h);printf(\"value=%d\\n\", keep_value());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", host.display()),
+            "-l:libkeep.so.9fixture",
+            "-ldl",
+        ],
+        &dir.join("bin/app"),
+    ));
+    let recipe = |dir: &Path, exclude: bool| {
+        write(
+            &dir.join("onelf.toml"),
+            &format!(
+                "[package]\ncommand = \"bin/app\"\n\n[bundle]\nscan-dlopen = true\n\
+                 dlopen = [\"libextra.so.9fixture\"]\nsearch-paths = [\"{}\"]{}",
+                host.display(),
+                if exclude {
+                    "\nexclude = [\"libextra\"]"
+                } else {
+                    ""
+                }
+            ),
+        );
+    };
+
+    // Without the exclusion both libraries land in the bundle.
+    let control = td.join("control");
+    std::fs::create_dir_all(control.join("bin")).unwrap();
+    std::fs::copy(dir.join("bin/app"), control.join("bin/app")).unwrap();
+    recipe(&control, false);
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&control);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("extra=loaded"), "{stdout}{stderr}");
+    assert!(stdout.contains("value=5"), "{stdout}{stderr}");
+    assert!(control.join("lib/libkeep.so.9fixture").is_file());
+    assert!(control.join("lib/libextra.so.9fixture").is_file());
+
+    // With it, the excluded soname stays out and the launch runs against
+    // exactly that tree.
+    recipe(&dir, true);
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("extra=absent"), "{stdout}{stderr}");
+    assert!(stdout.contains("value=5"), "{stdout}{stderr}");
+    assert!(dir.join("lib/libkeep.so.9fixture").is_file());
+    assert!(
+        !dir.join("lib/libextra.so.9fixture").exists(),
+        "the excluded soname was bundled:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A named entrypoint launches with its own set selection: the
+/// entrypoint that declares no sets acquires nothing, and the one that
+/// selects a set acquires exactly that pin.
+#[test]
+fn run_bundle_acquires_the_selected_entrypoints_sets() {
+    let td = workdir("runselect");
+    if set_library(
+        &td,
+        "toolkit",
+        "libtoolkit.so.99fixture",
+        "int toolkit_value(void){return 9;}\n",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let (hash, set_pkg) = pack_set(&td, "toolkit", "toolkit");
+
+    let dir = td.join("app");
+    write(&dir.join("bin/cli"), "#!/bin/sh\necho ran=cli\n");
+    write(&dir.join("bin/gui"), "#!/bin/sh\necho ran=gui\n");
+    for script in ["bin/cli", "bin/gui"] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join(script), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/cli\"\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"libtoolkit\"]\nurl = \"file://{}\"\n\
+             blake3 = \"{hash}\"\n\n\
+             [[entrypoint]]\nname = \"cli\"\npath = \"bin/cli\"\nsets = []\ndefault = true\n\n\
+             [[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\nsets = [\"toolkit\"]\n",
+            set_pkg.display()
+        ),
+    );
+    let store = td.join("store");
+
+    // The CLI entrypoint selects nothing: no acquisition, no store.
+    let mut cmd = dev_run(&td, &["--bundle", "--entrypoint", "cli"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("ran=cli"), "{stdout}{stderr}");
+    assert!(
+        !store.join("toolkit").exists(),
+        "the entrypoint that selects no sets acquired the toolkit:\n{stderr}"
+    );
+
+    // The GUI entrypoint selects the toolkit set: exactly that pin.
+    let mut cmd = dev_run(&td, &["--bundle", "--entrypoint", "gui"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("ran=gui"), "{stdout}{stderr}");
+    assert!(
+        store
+            .join("toolkit")
+            .join(format!("{hash}.onelf"))
+            .is_file(),
+        "the selected set is not in the store:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A development run keeps its unpackaged behavior: nothing assembles
+/// without `--bundle`, and `--bundle` on a recipe-less tree still runs.
+#[test]
+fn run_without_bundle_keeps_the_development_launch() {
+    let td = workdir("rundev");
+
+    // No recipe: the single binary under bin/ launches, with or without
+    // --bundle, and --bundle without a recipe says so and runs anyway.
+    let dir = td.join("app");
+    write(&dir.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("bin/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    for bundle in [false, true] {
+        let mut args = Vec::new();
+        if bundle {
+            args.push("--bundle");
+        }
+        let mut cmd = dev_run(&td, &args);
+        cmd.arg(&dir);
+        let out = cmd.output().expect("spawn onelf run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "bundle={bundle}: {stdout}{stderr}");
+        assert!(stdout.contains("hi"), "bundle={bundle}: {stdout}{stderr}");
+        if bundle {
+            assert!(stderr.contains("--bundle skipped"), "{stderr}");
+        }
+    }
+
+    // Without --bundle nothing assembles: an [input] the recipe imports
+    // is not staged, and the missing target is reported.
+    let upstream = td.join("upstream");
+    write(&upstream.join("app"), "#!/bin/sh\necho imported\n");
+    std::fs::set_permissions(upstream.join("app"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = td.join("imp");
+    std::fs::create_dir_all(&dir).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"../upstream/app\"\n",
+    );
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("entrypoint target not found"), "{stderr}");
+    assert!(
+        !dir.join("bin/app").exists(),
+        "the import ran without --bundle"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The recipe's host-library decision reaches a bundle launch: under
+/// `auto` the driver stack on the host satisfies the application, while
+/// the same tree with `never` refuses the host copy and the launch fails
+/// naming the soname nothing in the tree supplies.
+#[test]
+fn run_bundle_honors_the_host_libs_decision() {
+    let td = workdir("runhostlibs");
+    let src = td.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // A host driver of this test's own making, named by the loader cache.
+    let host = td.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    write(&src.join("gl.c"), "int gl_value(void){return 6;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            src.join("gl.c").to_str().unwrap(),
+        ],
+        &host.join("libGL.so.1"),
+    ));
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&host.join("libGL.so.1")])).unwrap();
+
+    // The application needs the driver soname; the tree holds a library
+    // directory without it, so the resolver is what could satisfy it.
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    write(
+        &src.join("app.c"),
+        "#include <stdio.h>\nextern int gl_value(void);\nint main(void){printf(\"value=%d\\n\", gl_value());return 0;}\n",
+    );
+    assert!(cc_with(
+        &[
+            src.join("app.c").to_str().unwrap(),
+            &format!("-L{}", host.display()),
+            "-l:libGL.so.1",
+        ],
+        &dir.join("bin/app"),
+    ));
+    write(&src.join("placeholder.c"), "int hold(void){return 0;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            src.join("placeholder.c").to_str().unwrap()
+        ],
+        &dir.join("lib/libplaceholder.so"),
+    ));
+
+    let recipe = |dir: &Path, never: bool| {
+        write(
+            &dir.join("onelf.toml"),
+            &format!(
+                "[package]\ncommand = \"bin/app\"{}[bundle]\nskip = true\n",
+                if never {
+                    "\nhost-libs = \"never\"\n\n"
+                } else {
+                    "\n\n"
+                }
+            ),
+        );
+    };
+
+    // Control: the driver family's host copy satisfies the launch.
+    let control = td.join("control");
+    std::fs::create_dir_all(control.join("bin")).unwrap();
+    std::fs::create_dir_all(control.join("lib")).unwrap();
+    std::fs::copy(dir.join("bin/app"), control.join("bin/app")).unwrap();
+    std::fs::copy(
+        dir.join("lib/libplaceholder.so"),
+        control.join("lib/libplaceholder.so"),
+    )
+    .unwrap();
+    recipe(&control, false);
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&control).env("ONELF_LD_CACHE", &cache);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("value=6"), "{stdout}{stderr}");
+
+    // `never`: the host copy must not satisfy the launch. Whether the
+    // loader finds no copy at all or a system one that lacks the
+    // fixture's symbol, the launch ends early and never answers with
+    // the fixture host's value, which the farm would have supplied.
+    recipe(&dir, true);
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir).env("ONELF_LD_CACHE", &cache);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "the launch ran on a host copy the recipe refused: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stdout.contains("value=6"),
+        "the refused host copy satisfied the launch: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}

@@ -19,6 +19,10 @@ goblin = { workspace = true }
 indicatif = { workspace = true }
 onelf-format = { workspace = true }
 onelf-sysroot = { workspace = true }
+# Shared launch support for the development run: acquisition, set
+# selection, and the pinned-artifact store. Default features only, so
+# the updater and its HTTPS dependencies stay out of this build.
+onelf-rt = { path = "../onelf-rt", version = "0.5.1" }
 jwalk = { workspace = true }
 rayon = { workspace = true }
 rustix = { workspace = true }

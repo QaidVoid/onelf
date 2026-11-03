@@ -3,7 +3,14 @@
 //! If the AppDir has an `onelf.toml`, use it for entrypoint/args/working-dir.
 //! Otherwise auto-discover a single binary under `bin/` and run with defaults.
 //! Sets environment variables matching the packed runtime and execs directly.
-//! No packing, mounting, or extraction involved.
+//! No packing and no release executable involved.
+//!
+//! `--bundle` assembles through the same machinery a build uses and
+//! prepares its launch through the shared runtime support: the recipe's
+//! sysroot, sets, rules, exclusions and entrypoints resolve once into an
+//! assembly request, the selected entrypoint's sets and the pinned GL
+//! build are acquired by the shared store with the CLI's own HTTPS
+//! client, and the launch resolves against what was acquired.
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -11,57 +18,61 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use onelf_format::cache_layout as layout;
-use onelf_format::resolve::{self, Request, Resolution};
+use onelf_format::resolve::{self, Gl, Request, Resolution};
 use onelf_format::{HostLibsPolicy, WorkingDir, drivers};
 
-use crate::bundle;
+use crate::assembly;
 use crate::pack::HostLibs;
 use crate::recipe;
+use crate::sysroot_cmd;
 
-/// Translate the recipe's [bundle] section into bundle-libs invocation.
-fn bundle_from_recipe(dir: &Path, r: &recipe::Recipe) -> io::Result<()> {
-    if r.bundle.skip {
-        return Ok(());
-    }
-    let search_path: Vec<PathBuf> = r
-        .bundle
-        .search_paths
-        .iter()
-        .map(|s| PathBuf::from(s.as_str()))
-        .collect();
-    bundle::bundle_libs(&bundle::BundleOptions {
-        directory: dir.to_path_buf(),
-        target: None,
-        primary: Some(PathBuf::from(&r.package.command)),
-        lib_dir: PathBuf::from("lib"),
-        exclude: r.bundle.exclude.clone(),
-        include: r.bundle.include.clone(),
-        search_path,
-        dry_run: false,
-        recursive: true,
-        gl: r.bundle.gl,
-        dri: r.bundle.dri,
-        vulkan: r.bundle.vulkan,
-        wayland: r.bundle.wayland,
-        gtk: r.bundle.gtk,
-        no_gl: r.bundle.no_gl,
-        no_dri: r.bundle.no_dri,
-        no_vulkan: r.bundle.no_vulkan,
-        no_wayland: r.bundle.no_wayland,
-        no_gtk: r.bundle.no_gtk,
-        strip: r.bundle.strip,
-        strict_libc: r.bundle.strict_libc,
-        scan_dlopen: r.bundle.scan_dlopen,
-        dlopen_extra: r.bundle.dlopen.clone(),
-        trace_run: r.bundle.trace_run,
-        trace_seconds: r.bundle.trace_seconds.unwrap_or(5),
-        trace_args: r.bundle.trace_args.clone(),
-        sysroot: None,
-        sets: Vec::new(),
-        platform_pin: None,
+/// The AppDir a run targets, with the recipe found beside it.
+struct Loaded {
+    /// The recipe file an assembly request resolves from.
+    path: PathBuf,
+    /// The loaded recipe.
+    recipe: recipe::Recipe,
+}
+
+/// What a bundle launch assembles before it resolves its entrypoint.
+struct Assembled {
+    /// The shared assembly request a build would pack from.
+    request: assembly::AssemblyRequest,
+    /// The recipe's normalized set selections.
+    selections: recipe::SetSelections,
+}
+
+/// Assemble the AppDir for a bundle launch the way a build assembles it:
+/// the recipe resolves once into the shared assembly request, staging
+/// the sysroot contents, the recorded sets, the rule-driven resources
+/// and the bundle exclusions the recipe names, and refusing a
+/// declaration a build would refuse while the AppDir stands untouched.
+///
+/// Acquisition never carries its own network stack: the CLI's existing
+/// HTTPS client is handed to the shared store before the first
+/// acquisition, so pinned artifacts over `https://` come from the same
+/// client every publisher-side fetch uses, and the updater feature of
+/// the runtime stays out of this build.
+fn assemble_for_launch(loaded: Loaded) -> io::Result<Assembled> {
+    onelf_rt::platform::supply_https_fetch(https_fetch);
+    let selections = recipe::SetSelections::normalize(&loaded.recipe)?;
+    let request = assembly::AssemblyRequest::plan(&loaded.path, loaded.recipe, None)?;
+    request.stage()?;
+    Ok(Assembled {
+        request,
+        selections,
     })
 }
 
+/// The CLI's HTTPS client, supplied as acquisition's `https://`
+/// operation.
+fn https_fetch(url: &str, into: &Path) -> Result<(), String> {
+    sysroot_cmd::download(url, into).map_err(|e| e.to_string())
+}
+
+/// Run an AppDir in place: assemble a bundle launch through the shared
+/// machinery when `run_bundle` is set, then exec the chosen entrypoint
+/// with the environment the packed runtime would set.
 pub fn run(
     app_spec: &Path,
     command_override: Option<&str>,
@@ -70,18 +81,29 @@ pub fn run(
     passthrough_args: &[String],
 ) -> io::Result<()> {
     // Figure out the AppDir: user's spec is either the directory or a recipe file.
-    let (dir, recipe) = resolve_app(app_spec)?;
+    let (dir, mut found) = resolve_app(app_spec)?;
     let dir = dir.canonicalize()?;
 
+    let mut assembled: Option<Assembled> = None;
     if run_bundle {
-        match recipe.as_ref() {
-            Some(r) => bundle_from_recipe(&dir, r)?,
-            None => eprintln!("onelf run: --bundle skipped: no recipe found in AppDir"),
-        }
+        assembled = match found.take() {
+            Some(loaded) => Some(assemble_for_launch(loaded)?),
+            None => {
+                eprintln!("onelf run: --bundle skipped: no recipe found in AppDir");
+                None
+            }
+        };
     }
 
-    let (ep_name, ep_path, ep_args, working_dir) =
-        resolve_entrypoint(&recipe, &dir, command_override, entrypoint)?;
+    let (ep_name, ep_path, ep_args, working_dir) = match &assembled {
+        Some(a) => request_entrypoint(&a.request, command_override, entrypoint)?,
+        None => resolve_entrypoint(
+            found.as_ref().map(|l| &l.recipe),
+            &dir,
+            command_override,
+            entrypoint,
+        )?,
+    };
 
     let target = dir.join(&ep_path);
     if !target.exists() {
@@ -107,17 +129,45 @@ pub fn run(
     // mount in, so a host copy cannot be placed over a bundled one here;
     // the farm still reaches everything the bundle does not carry. That
     // rules out the host's glibc, which only runs once its copy replaces
-    // the bundled one.
-    let policy = match recipe.as_ref().and_then(|r| r.package.host_libs) {
-        Some(spec) => match HostLibs::from(spec) {
-            HostLibs::Always => HostLibsPolicy::Always,
-            HostLibs::Never => HostLibsPolicy::Never,
-            HostLibs::Auto => HostLibsPolicy::Auto,
-        },
-        None => HostLibsPolicy::Auto,
+    // the bundled one. An assembled launch reads the setting off the
+    // request it staged, so the recipe's choice reaches the resolver in
+    // bundle mode exactly as it does in a build.
+    let policy = match &assembled {
+        Some(a) => a.request.package.host_libs,
+        None => found
+            .as_ref()
+            .and_then(|l| l.recipe.package.host_libs)
+            .map(HostLibs::from)
+            .unwrap_or(HostLibs::Auto),
+    };
+    let policy = match policy {
+        HostLibs::Always => HostLibsPolicy::Always,
+        HostLibs::Never => HostLibsPolicy::Never,
+        HostLibs::Auto => HostLibsPolicy::Auto,
     };
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
     let lib_dir_strs: Vec<&str> = lib_dirs.iter().filter_map(|p| p.to_str()).collect();
+
+    // What a bundle launch acquired, through the shared launch-support
+    // surface: the selected entrypoint's sets, then the pinned GL build
+    // when this host lacks the stack. A set the entrypoint requires and
+    // cannot have ends the launch naming the entrypoint and the pin, as
+    // a packed launch does; the pinned build is warn-and-continue.
+    let mut set_roots: Vec<PathBuf> = Vec::new();
+    let mut pinned_gl: Option<(PathBuf, std::fs::File)> = None;
+    if let Some(a) = &assembled {
+        let selection = selected_sets(&a.request, &a.selections, &ep_name)?;
+        acquire_sets(&dir, selection, &ep_name)?;
+        set_roots = onelf_rt::sets::roots();
+        let set_lib_dirs: Vec<PathBuf> = set_roots
+            .iter()
+            .flat_map(|root| onelf_rt::sets::lib_dirs(root))
+            .collect();
+        if target_is_elf && !lib_dirs.is_empty() && !disabled && policy != HostLibsPolicy::Never {
+            pinned_gl = obtain_gl_pin(&dir, &lib_dir_strs, &set_lib_dirs, &target);
+        }
+    }
+
     let resolution = match run_store(&dir) {
         Some(store) if target_is_elf && !lib_dirs.is_empty() && !disabled => {
             resolve::resolve(&Request {
@@ -127,8 +177,8 @@ pub fn run(
                 store: &store,
                 ld_cache: &drivers::cache_file(),
                 icd_dirs: resolve::ICD_DIRS,
-                extra_root: None,
-                set_roots: &[],
+                extra_root: pinned_gl.as_ref().map(|(root, _)| root.as_path()),
+                set_roots: &set_roots,
                 host_libc: false,
             })
         }
@@ -241,20 +291,179 @@ pub fn run(
     Err(io::Error::other(format!("exec failed: {err}")))
 }
 
+/// Pick the entrypoint an assembled launch runs: the `--command`
+/// override, the named entrypoint, the recipe's default entrypoint, or
+/// the package command, in that order. The named entrypoint the caller
+/// asks for is the one that launches, with its own path and arguments.
+fn request_entrypoint(
+    request: &assembly::AssemblyRequest,
+    command_override: Option<&str>,
+    entrypoint: Option<&str>,
+) -> io::Result<(String, String, Vec<String>, WorkingDir)> {
+    let working_dir = request.package.working_dir;
+
+    if let Some(cmd) = command_override {
+        let name = Path::new(cmd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app")
+            .to_string();
+        return Ok((name, cmd.to_string(), Vec::new(), working_dir));
+    }
+
+    if let Some(name) = entrypoint {
+        let ep = request
+            .entrypoints
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("entrypoint '{name}' not defined in recipe"),
+                )
+            })?;
+        return Ok((
+            ep.name.clone(),
+            ep.path.clone(),
+            ep.args.clone(),
+            working_dir,
+        ));
+    }
+
+    if let Some(default) = &request.default_entrypoint
+        && let Some(ep) = request.entrypoints.iter().find(|e| &e.name == default)
+    {
+        return Ok((
+            ep.name.clone(),
+            ep.path.clone(),
+            ep.args.clone(),
+            working_dir,
+        ));
+    }
+
+    let name = request.package.name.clone().unwrap_or_else(|| {
+        request
+            .package
+            .command
+            .rsplit('/')
+            .next()
+            .unwrap_or("app")
+            .to_string()
+    });
+    Ok((
+        name,
+        request.package.command.clone(),
+        Vec::new(),
+        working_dir,
+    ))
+}
+
+/// The set selection the chosen entrypoint launches with, read from the
+/// same resolution table a build lowers into its selection record: the
+/// row naming the chosen entrypoint, or the default row for a
+/// `--command` override or the package command. Refusals a build
+/// raises over that table, a duplicate name or a row without a
+/// declared selection, end the launch here too.
+fn selected_sets(
+    request: &assembly::AssemblyRequest,
+    selections: &recipe::SetSelections,
+    ep_name: &str,
+) -> io::Result<recipe::SetSelection> {
+    let table = crate::resolve_set_selections(selections, request)?;
+    let row = table
+        .iter()
+        .find(|row| row.name == ep_name)
+        .unwrap_or(&table[0]);
+    Ok(row.sets.clone())
+}
+
+/// Acquire the selected entrypoint's sets from the AppDir's record,
+/// through the shared acquisition whose pins and whose provider checks a
+/// packed launch uses. An entrypoint whose selection names nothing
+/// acquires nothing.
+fn acquire_sets(dir: &Path, selection: recipe::SetSelection, ep_name: &str) -> io::Result<()> {
+    let pins = match std::fs::read_to_string(dir.join(onelf_rt::sets::SETS_FILE)) {
+        Ok(text) => onelf_rt::sets::parse(&text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let selected = match selection {
+        recipe::SetSelection::All => pins,
+        recipe::SetSelection::Names(names) => {
+            let mut out = Vec::with_capacity(names.len());
+            for name in names {
+                let found = pins.iter().find(|p| p.label == name).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("entrypoint '{ep_name}': set '{name}' is not declared"),
+                    )
+                })?;
+                out.push(found.clone());
+            }
+            out
+        }
+    };
+    onelf_rt::sets::init(&selected, ep_name);
+    Ok(())
+}
+
+/// Obtain the GL build the AppDir pins, when this host lacks a GL stack
+/// the launch would otherwise have to miss. The same situation a packed
+/// launch resolves, with the same warn-and-continue policy: anything
+/// that stops the pinned build is a warning, and the launch goes on
+/// without a GL stack. Returns the extracted root and the lock that
+/// keeps the extraction from being collected while this instance runs.
+fn obtain_gl_pin(
+    dir: &Path,
+    lib_dirs: &[&str],
+    set_lib_dirs: &[PathBuf],
+    target: &Path,
+) -> Option<(PathBuf, std::fs::File)> {
+    let situation = onelf_format::resolve::gl_situation(
+        dir,
+        lib_dirs,
+        set_lib_dirs,
+        Some(target),
+        &drivers::cache_file(),
+        resolve::ICD_DIRS,
+    );
+    if !situation.lacking() {
+        return None;
+    }
+    match onelf_rt::platform::obtain(dir) {
+        Some(Ok(fetched)) => Some(fetched),
+        Some(Err(why)) => {
+            eprintln!(
+                "onelf run: this host has no GL stack and the pinned build cannot be used \
+                 ({why}); continuing without one"
+            );
+            None
+        }
+        None => {
+            if situation == Gl::Missing {
+                eprintln!(
+                    "onelf run: this host has no GL stack, which the entrypoint links, and \
+                     the recipe pins no GL build; continuing without one"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Build a Command for executing the target binary. Handles the cross-libc
 /// case where the target's PT_INTERP doesn't exist on the host but a matching
 /// interpreter is bundled in the AppDir's lib directories.
-/// Locate the AppDir root and an optional recipe from a user-supplied path.
+/// Locate the AppDir root and its recipe from a user-supplied path.
 /// Accepts a directory (with or without onelf.toml) or a `.toml` file.
-fn resolve_app(spec: &Path) -> io::Result<(PathBuf, Option<recipe::Recipe>)> {
+fn resolve_app(spec: &Path) -> io::Result<(PathBuf, Option<Loaded>)> {
     if spec.is_dir() {
         let toml = spec.join("onelf.toml");
-        let recipe = if toml.is_file() {
-            Some(recipe::load(&toml)?)
-        } else {
-            None
-        };
-        return Ok((spec.to_path_buf(), recipe));
+        let loaded = toml
+            .is_file()
+            .then(|| recipe::load(&toml).map(|recipe| Loaded { path: toml, recipe }))
+            .transpose()?;
+        return Ok((spec.to_path_buf(), loaded));
     }
     if spec.is_file() && spec.extension().and_then(|s| s.to_str()) == Some("toml") {
         let recipe = recipe::load(spec)?;
@@ -262,7 +471,13 @@ fn resolve_app(spec: &Path) -> io::Result<(PathBuf, Option<recipe::Recipe>)> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        return Ok((dir, Some(recipe)));
+        return Ok((
+            dir,
+            Some(Loaded {
+                path: spec.to_path_buf(),
+                recipe,
+            }),
+        ));
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -273,17 +488,17 @@ fn resolve_app(spec: &Path) -> io::Result<(PathBuf, Option<recipe::Recipe>)> {
     ))
 }
 
-/// Pick the entrypoint and its args, consulting (in order): `--command`
-/// override, the recipe's named entrypoints, the recipe's default command,
-/// or an auto-detected binary under `<dir>/bin/`.
+/// Pick the entrypoint and its args for a launch that skips assembly,
+/// consulting (in order): `--command` override, the recipe's named
+/// entrypoints, the recipe's default command, or an auto-detected binary
+/// under `<dir>/bin/`.
 fn resolve_entrypoint(
-    recipe: &Option<recipe::Recipe>,
+    recipe: Option<&recipe::Recipe>,
     dir: &Path,
     command_override: Option<&str>,
     entrypoint: Option<&str>,
 ) -> io::Result<(String, String, Vec<String>, WorkingDir)> {
     let working_dir: WorkingDir = recipe
-        .as_ref()
         .map(|r| r.package.working_dir.into())
         .unwrap_or(WorkingDir::Inherit);
 
@@ -542,4 +757,87 @@ fn detect_lib_dirs(dir: &Path) -> Vec<PathBuf> {
         }
     }
     lib_dirs
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::selected_sets;
+    use crate::assembly::AssemblyRequest;
+    use crate::recipe::{self, SetSelection};
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A temp directory unique per test, so parallel tests never share
+    /// state.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-run-selection-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Plan an assembly request from a recipe body.
+    fn request(dir: &std::path::Path, body: &str) -> AssemblyRequest {
+        let path = dir.join("onelf.toml");
+        std::fs::write(&path, body).unwrap();
+        let recipe = recipe::load(&path).unwrap();
+        AssemblyRequest::plan(&path, recipe, None).unwrap()
+    }
+
+    #[test]
+    fn selection_scopes_resolve_like_a_builds_table() {
+        let dir = temp_dir("scopes");
+        let body = format!(
+            "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"t\"]\nurl = \"https://e/t.onelf\"\n\
+             blake3 = \"{HASH}\"\n\n\
+             [[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\ndefault = true\n\n\
+             [[entrypoint]]\nname = \"gui\"\npath = \"bin/app\"\nsets = [\"toolkit\"]\n"
+        );
+        let request = request(&dir, &body);
+        let path = dir.join("onelf.toml");
+        let recipe = recipe::load(&path).unwrap();
+        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
+
+        assert_eq!(
+            selected_sets(&request, &selections, "gui").unwrap(),
+            SetSelection::Names(vec!["toolkit".to_string()])
+        );
+        assert_eq!(
+            selected_sets(&request, &selections, "cli").unwrap(),
+            SetSelection::Names(Vec::new())
+        );
+        // A --command override names no table row, so the default row's
+        // selection applies.
+        assert_eq!(
+            selected_sets(&request, &selections, "elsewhere").unwrap(),
+            SetSelection::Names(Vec::new())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_package_command_carries_the_primary_selection() {
+        let dir = temp_dir("primary");
+        let body = format!(
+            "[package]\ncommand = \"bin/app\"\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"t\"]\nurl = \"https://e/t.onelf\"\n\
+             blake3 = \"{HASH}\"\n"
+        );
+        let request = request(&dir, &body);
+        let path = dir.join("onelf.toml");
+        let recipe = recipe::load(&path).unwrap();
+        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
+        assert_eq!(
+            selected_sets(&request, &selections, "app").unwrap(),
+            SetSelection::All
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

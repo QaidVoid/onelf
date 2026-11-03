@@ -614,6 +614,7 @@ dependencies = [
  "indicatif",
  "jwalk",
  "onelf-format",
+ "onelf-rt",
  "onelf-sysroot",
  "rayon",
  "rustix",

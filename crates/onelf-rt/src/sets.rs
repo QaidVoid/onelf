@@ -270,8 +270,12 @@ pub fn pins() -> Vec<ActivePin> {
         .unwrap_or_default()
 }
 
-/// The extracted or mounted root of every set this launch obtained.
-pub(crate) fn roots() -> Vec<PathBuf> {
+/// The extracted or mounted root of every set this launch obtained, in
+/// acquisition order. A caller that drives acquisition itself, as the
+/// CLI's development run does, reads these to put what the sets supply
+/// on its launch's own resolution path; a launch that acquired no set
+/// has none.
+pub fn roots() -> Vec<PathBuf> {
     OBTAINED
         .get()
         .map(|sets| sets.iter().map(|s| s.root.clone()).collect())
@@ -476,8 +480,10 @@ fn unclaimed(lock_path: &Path, original: Option<&fs::File>) -> bool {
 /// absolute run path it was built with named the host. Putting each such
 /// directory on this launch's library path is what the packer does for a
 /// bundle's own tree, and it is the only thing that reaches a plugin the
-/// loader is asked for by bare soname.
-pub(crate) fn lib_dirs(root: &Path) -> Vec<PathBuf> {
+/// loader is asked for by bare soname. Public for the same caller
+/// [`roots`](fn@roots) serves: a development launch resolving against
+/// acquired sets needs the directories the resolver indexes.
+pub fn lib_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = onelf_format::resolve::GL_BUILD_LIB_DIRS
         .iter()
         .map(|d| root.join(d))
