@@ -20,6 +20,7 @@ mod paths;
 mod pkgmeta;
 mod platform;
 mod portable;
+mod providers;
 mod rundir;
 mod selfextract;
 mod sets;

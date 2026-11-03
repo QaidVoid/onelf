@@ -52,6 +52,7 @@ mod sysroot_cmd;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use onelf_format::elf::{
     NOTE_NAME, NOTE_TYPE, RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote,
@@ -872,4 +873,147 @@ fn legacy_entrypoint_size_is_kept() {
             "the entrypoint record stays 14 bytes beside the metadata"
         );
     }
+}
+
+#[test]
+fn an_https_pin_refuses_a_runtime_without_the_store_import_advertisement() {
+    let note = RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: RuntimeCapabilities::SELECTION_VIEW,
+    };
+    let refused = pack::require_store_runtime(&note, true).unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("store import"), "{text}");
+    assert!(text.contains("HTTPS"), "{text}");
+}
+
+#[test]
+fn an_https_pin_accepts_a_store_importing_runtime() {
+    let note = RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: RuntimeCapabilities::SELECTION_VIEW | RuntimeCapabilities::STORE_IMPORT,
+    };
+    pack::require_store_runtime(&note, true).unwrap();
+}
+
+#[test]
+fn file_based_pins_never_demand_store_import() {
+    pack::require_store_runtime(&RuntimeNote::Absent, false).unwrap();
+}
+
+/// A freshly built set-carrying package launches on the current runtime:
+/// the slim embedded runtime passes its own gates, the selected set is
+/// acquired from the file-pinned store, the unselected set is never
+/// fetched, and the empty-selection entrypoint still runs.
+#[test]
+fn a_set_carrying_build_launches_on_the_current_runtime() {
+    let root = temp_dir("launch");
+    let (qt_src, gtk_src) = (root.join("qt-src"), root.join("gtk-src"));
+    fs::create_dir_all(qt_src.join("lib")).unwrap();
+    fs::create_dir_all(gtk_src.join("lib")).unwrap();
+    fs::write(qt_src.join("lib/libqt.so.5"), b"qt fixture payload\n").unwrap();
+    fs::write(gtk_src.join("lib/libgtk-3.so.0"), b"gtk fixture payload\n").unwrap();
+
+    let build_set_artifact = |src: &Path, out: &Path| {
+        seed_app(src);
+        let opts = test_opts(src, out, RuntimeNote::Absent);
+        pack::pack(&opts, b"set-build-prefix").unwrap();
+        let bytes = fs::read(out).unwrap();
+        blake3::hash(&bytes).to_hex().to_string()
+    };
+    let (qt_hex, gtk_hex) = (
+        build_set_artifact(&qt_src, &qt_src.join("qt.onelf")),
+        build_set_artifact(&gtk_src, &gtk_src.join("gtk.onelf")),
+    );
+
+    seed_app(&root);
+    fs::write(root.join("bin/app"), b"#!/bin/sh\nexit 7\n").unwrap();
+    let out = root.join("pkg.onelf");
+    let recipe_path = root.join("onelf.toml");
+    fs::write(
+        &recipe_path,
+        format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\nsets = [\"qt\"]\n\n\
+             [bundle]\nskip = true\n\n\
+             [sysroot.sets.qt]\npackages = [\"qt5\"]\nurl = \"file://{}\"\nblake3 = \"{}\"\n\n\
+             [sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"file://{}\"\nblake3 = \"{}\"\n\n\
+             [[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nargs = [\"--cli\"]\nsets = []\n",
+            qt_src.join("qt.onelf").display(),
+            qt_hex,
+            gtk_src.join("gtk.onelf").display(),
+            gtk_hex,
+        ),
+    )
+    .unwrap();
+    let recipe = recipe::load(&recipe_path).unwrap();
+    let request =
+        assembly::AssemblyRequest::plan(&recipe_path, recipe, Some(out.as_path())).unwrap();
+    request.stage().unwrap();
+
+    let runtime = assembly::embed_runtime(&request).unwrap();
+    let payload = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: vec![
+                SetPin {
+                    name: RuleId::new("qt").unwrap(),
+                    hash: hash_from_hex(&qt_hex),
+                },
+                SetPin {
+                    name: RuleId::new("gtk").unwrap(),
+                    hash: hash_from_hex(&gtk_hex),
+                },
+            ],
+            entrypoints: vec![
+                EntrypointSelection {
+                    name: "app".to_string(),
+                    sets: vec![RuleId::new("qt").unwrap()],
+                },
+                EntrypointSelection {
+                    name: "cli".to_string(),
+                    sets: Vec::new(),
+                },
+            ],
+        }),
+    )
+    .unwrap();
+    let mut opts = request.pack_options(None, runtime.note, Vec::new());
+    opts.metadata = payload;
+    pack::pack(&opts, runtime.bytes).unwrap();
+
+    let store = root.join("store");
+    let cache = root.join("cache");
+    fs::set_permissions(out.as_path(), PermissionsExt::from_mode(0o755)).unwrap();
+    let result = Command::new(&out)
+        .env_remove("ONELF_ENTRYPOINT")
+        .env_remove("ONELF_ENTRYPOINT_EXPORTED")
+        .env_remove("ONELF_CACHE")
+        .env_remove("ONELF_NO_PLATFORM_FETCH")
+        .env("ONELF_MODE", "rundir")
+        .env("ONELF_SET_MODE", "extract")
+        .env("ONELF_NO_RESOLVER", "1")
+        .env("ONELF_PLATFORM_STORE", &store)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(
+        result.status.code() == Some(7),
+        "the app ran to its own exit: {:?}\nstderr: {stderr}",
+        result.status
+    );
+    assert!(
+        store.join("qt").is_dir(),
+        "the selected set was acquired: {:?}",
+        fs::read_dir(&store).map(|entries| entries.count())
+    );
+    assert!(
+        !store.join("gtk").exists(),
+        "the unselected set must never be acquired"
+    );
+}
+
+/// The blake3 digest a pin table carries, parsed back from its hex form.
+fn hash_from_hex(hex: &str) -> [u8; 32] {
+    *blake3::Hash::from_hex(hex).unwrap().as_bytes()
 }

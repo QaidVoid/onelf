@@ -17,7 +17,10 @@
 //! exactly those pins; a record the set table cannot back ends the
 //! launch before anything is acquired. The optional pinned GL build
 //! keeps its own warn-and-continue policy in the launch, and a required
-//! set's failure is never folded into it.
+//! set's failure is never folded into it. Each obtained set's objects
+//! are then checked against what the launch can satisfy, in
+//! [`crate::providers`], so an old artifact whose objects cannot run
+//! beside this package ends the launch before the application does.
 //!
 //! What they do with it depends on the mode. Mounted, the set is served
 //! from its stored file by a detached FUSE server at a mountpoint named
@@ -215,12 +218,29 @@ static OBTAINED: OnceLock<Vec<Obtained>> = OnceLock::new();
 /// cannot be had ends the launch naming the entrypoint and the pin: the
 /// bundle carries none of it, so there is nothing to degrade to, and
 /// the failure is never folded into the optional GL build's separate
-/// warn-and-continue policy.
+/// warn-and-continue policy. Each obtained set's objects are inspected
+/// as they arrive, so a build whose ELF data is truncated or malformed
+/// ends the launch here, before any further pin is acquired and before
+/// a mode makes a namespace of its own; the facts stay with the launch
+/// for its provider compatibility check.
 pub fn init(pins: &[Pin], entrypoint: &str) {
     let mut out = Vec::new();
+    let mut prepared = Vec::new();
     for pin in pins {
         match obtain(pin, &out) {
-            Ok(obtained) => out.push(obtained),
+            Ok(obtained) => match crate::providers::prepare(&pin.label, &obtained.root) {
+                Ok(facts) => {
+                    prepared.push(facts);
+                    out.push(obtained);
+                }
+                Err(why) => {
+                    eprintln!(
+                        "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
+                        pin.label
+                    );
+                    std::process::exit(1);
+                }
+            },
             Err(why) => {
                 eprintln!(
                     "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
@@ -230,6 +250,7 @@ pub fn init(pins: &[Pin], entrypoint: &str) {
             }
         }
     }
+    crate::providers::record_selected(prepared);
     let _ = OBTAINED.set(out);
 }
 
@@ -765,12 +786,15 @@ mod selection_tests {
         };
 
         /// A built package carrying `files`, whose entrypoints are
-        /// `(name, target file path)` pairs.
+        /// `(name, target file path)` pairs. `lib_dirs` are the library
+        /// directory names the manifest records, so a launch treats the
+        /// package as carrying its own libraries.
         pub(crate) fn build(
             prefix: &[u8],
             package_id: [u8; 32],
             files: &[(&str, Vec<u8>)],
             entrypoints: &[(&str, &str)],
+            lib_dirs: &[&str],
         ) -> Vec<u8> {
             fn put_text(value: &str, string_table: &mut Vec<u8>) -> u32 {
                 let at = string_table.len() as u32;
@@ -848,6 +872,10 @@ mod selection_tests {
                     flags: EntryPointFlags::empty(),
                 })
                 .collect();
+            let lib_dir_offsets: Vec<u32> = lib_dirs
+                .iter()
+                .map(|dir| put_text(dir, &mut string_table))
+                .collect();
             let manifest = Manifest {
                 header: ManifestHeader {
                     version: 3,
@@ -855,7 +883,7 @@ mod selection_tests {
                     string_table_size: string_table.len() as u32,
                     entrypoint_count: eps.len() as u16,
                     default_entrypoint: 0,
-                    lib_dir_count: 0,
+                    lib_dir_count: lib_dir_offsets.len() as u16,
                     name_offset: 0,
                     package_id,
                     prefix_hash: *blake3::hash(prefix).as_bytes(),
@@ -863,7 +891,7 @@ mod selection_tests {
                 },
                 entrypoints: eps,
                 entries,
-                lib_dir_offsets: Vec::new(),
+                lib_dir_offsets,
                 string_table,
             };
             let raw = manifest.serialize().unwrap();
@@ -946,6 +974,7 @@ mod selection_tests {
             package_id,
             &[("lib/libfake.so.1", b"set bytes".to_vec())],
             &[],
+            &[],
         );
         fs::write(path, &bytes).unwrap();
         *blake3::hash(&bytes).as_bytes()
@@ -957,10 +986,24 @@ mod selection_tests {
     /// that exits 7, so a launch that gets past acquisition runs to a
     /// deterministic end, the mode is forced to rundir, and extraction
     /// mode is forced for the sets so no helper or mount joins the
-    /// picture.
+    /// picture. `lib_dirs` are the library directories the package's
+    /// manifest records.
     fn launch(
         name: &str,
         records: &[(&str, Vec<u8>)],
+        sandbox: &Sandbox,
+        fetch_prohibited: bool,
+    ) -> (Option<i32>, String) {
+        launch_with_lib_dirs(name, records, &[], sandbox, fetch_prohibited)
+    }
+
+    /// [`launch`] over a package that records `lib_dirs` and carries the
+    /// extra files, so a launch has a bundled libc and loader of its own
+    /// to answer providers against.
+    fn launch_with_lib_dirs(
+        name: &str,
+        records: &[(&str, Vec<u8>)],
+        lib_dirs: &[&str],
         sandbox: &Sandbox,
         fetch_prohibited: bool,
     ) -> (Option<i32>, String) {
@@ -968,7 +1011,13 @@ mod selection_tests {
         let runtime = runtime_bytes();
         let mut files: Vec<(&str, Vec<u8>)> = vec![("bin/app", b"#!/bin/sh\nexit 7\n".to_vec())];
         files.extend_from_slice(records);
-        let package = fixture::build(&runtime, [0x5e; 32], &files, &[("app", "bin/app")]);
+        let package = fixture::build(
+            &runtime,
+            [0x5e; 32],
+            &files,
+            &[("app", "bin/app")],
+            lib_dirs,
+        );
         let exe = sandbox.dir.join("run").join(name);
         fs::write(&exe, &package).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1151,6 +1200,204 @@ mod selection_tests {
         assert!(
             !stderr.contains("gtk"),
             "the launch stops at the first required set: {stderr}"
+        );
+    }
+
+    /// A stored artifact whose library is the ELF bytes `lib` names, with
+    /// the digest its pin must carry.
+    fn build_elf_artifact(path: &Path, lib: Vec<u8>) -> [u8; 32] {
+        let bytes = fixture::build(
+            b"onelf fixture prefix",
+            [0x11; 32],
+            &[("lib/libfake.so.1", lib)],
+            &[],
+            &[],
+        );
+        fs::write(path, &bytes).unwrap();
+        *blake3::hash(&bytes).as_bytes()
+    }
+
+    /// The glibc-shaped libc a package bundles for these cases: machine
+    /// 62, defining GLIBC_2.2.5 and nothing newer.
+    fn bundled_libc() -> Vec<u8> {
+        use crate::providers::fixture::elf64;
+        elf64(
+            62,
+            Some("libc.so.6"),
+            &["ld-linux-x86-64.so.2"],
+            &[(1, "libc.so.6"), (0, "GLIBC_2.2.5")],
+            &[],
+        )
+    }
+
+    /// An ELF64 set object with the given machine, dependencies,
+    /// definitions and version requirements.
+    fn set_object(
+        machine: u16,
+        needed: &[&str],
+        definitions: &[(u16, &str)],
+        requirements: &[(&str, &[(u16, &str)])],
+    ) -> Vec<u8> {
+        use crate::providers::fixture::elf64;
+        elf64(
+            machine,
+            Some("libfake.so.1"),
+            needed,
+            definitions,
+            requirements,
+        )
+    }
+
+    /// An old set artifact, published before provider indexes existed,
+    /// keeps working without republishing: the launch reads its objects
+    /// as they stand, and one whose objects this launch can account for
+    /// runs to its own end.
+    #[test]
+    fn an_old_artifact_launches_without_republishing() {
+        let sandbox = sandbox("old-artifact");
+        let src = sandbox.dir.join("src-qt");
+        let qt = build_elf_artifact(&src, set_object(62, &[], &[(1, "libfake.so.1")], &[]));
+        let sets = table(&[("qt", &file_url(&src), &hex(&qt))]);
+        let oset = record(&[("qt", qt)], &[("app", &["qt"])]);
+        let (code, stderr) = launch(
+            "old-artifact",
+            &[
+                (crate::sets::SETS_FILE, sets),
+                (crate::pkgmeta::ENTRYPOINT_SETS_FILE, oset),
+            ],
+            &sandbox,
+            false,
+        );
+        assert_eq!(code, Some(7), "{stderr}");
+        assert!(
+            sandbox
+                .store
+                .join(format!("qt/{}.onelf", hex(&qt)))
+                .is_file()
+        );
+        assert!(!stderr.contains("cannot run"), "{stderr}");
+    }
+
+    /// A selected set whose ELF data is truncated ends the launch during
+    /// preparation, naming the set and the object, before the
+    /// application executes.
+    #[test]
+    fn a_truncated_provider_object_ends_the_launch_before_the_application_runs() {
+        let sandbox = sandbox("truncated-set");
+        let src = sandbox.dir.join("src-qt");
+        let mut lib = set_object(62, &[], &[(1, "libfake.so.1")], &[]);
+        lib.truncate(lib.len() - 8);
+        let qt = build_elf_artifact(&src, lib);
+        let sets = table(&[("qt", &file_url(&src), &hex(&qt))]);
+        let oset = record(&[("qt", qt)], &[("app", &["qt"])]);
+        let (code, stderr) = launch(
+            "truncated-set",
+            &[
+                (crate::sets::SETS_FILE, sets),
+                (crate::pkgmeta::ENTRYPOINT_SETS_FILE, oset),
+            ],
+            &sandbox,
+            false,
+        );
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("dependency set qt"), "{stderr}");
+        assert!(stderr.contains("required by entrypoint app"), "{stderr}");
+        assert!(stderr.contains("lib/libfake.so.1"), "{stderr}");
+        assert!(!stderr.contains("exit 7"), "{stderr}");
+    }
+
+    /// A set object that needs a libc symbol version newer than the
+    /// bundled pair, or than any selected set, ends the launch before
+    /// the application executes.
+    #[test]
+    fn a_libc_requirement_beyond_the_bundled_libc_ends_the_launch() {
+        let sandbox = sandbox("newer-libc");
+        let src = sandbox.dir.join("src-qt");
+        let qt = build_elf_artifact(
+            &src,
+            set_object(
+                62,
+                &["libc.so.6"],
+                &[(1, "libfake.so.1")],
+                &[("libc.so.6", &[(0, "GLIBC_2.999")])],
+            ),
+        );
+        let sets = table(&[("qt", &file_url(&src), &hex(&qt))]);
+        let oset = record(&[("qt", qt)], &[("app", &["qt"])]);
+        let (code, stderr) = launch_with_lib_dirs(
+            "newer-libc",
+            &[
+                ("lib/libc.so.6", bundled_libc()),
+                (crate::sets::SETS_FILE, sets),
+                (crate::pkgmeta::ENTRYPOINT_SETS_FILE, oset),
+            ],
+            &["lib"],
+            &sandbox,
+            false,
+        );
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("GLIBC_2.999"), "{stderr}");
+        assert!(stderr.contains("entrypoint app"), "{stderr}");
+    }
+
+    /// A provider object built for another machine ends the launch
+    /// naming the object, before the application executes.
+    #[test]
+    fn a_wrong_architecture_provider_ends_the_launch() {
+        let sandbox = sandbox("wrong-arch");
+        let src = sandbox.dir.join("src-qt");
+        let qt = build_elf_artifact(&src, set_object(3, &[], &[(1, "libfake.so.1")], &[]));
+        let sets = table(&[("qt", &file_url(&src), &hex(&qt))]);
+        let oset = record(&[("qt", qt)], &[("app", &["qt"])]);
+        let (code, stderr) = launch_with_lib_dirs(
+            "wrong-arch",
+            &[
+                ("lib/libc.so.6", bundled_libc()),
+                (crate::sets::SETS_FILE, sets),
+                (crate::pkgmeta::ENTRYPOINT_SETS_FILE, oset),
+            ],
+            &["lib"],
+            &sandbox,
+            false,
+        );
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("machine 3"), "{stderr}");
+        assert!(stderr.contains("lib/libfake.so.1"), "{stderr}");
+    }
+
+    /// A legacy package whose every declared set is obtainable and
+    /// runnable keeps its documented default: it launches with every
+    /// set obtained, without any selection record.
+    #[test]
+    fn a_legacy_package_runs_with_every_declared_set_obtained() {
+        let sandbox = sandbox("legacy-runs");
+        let (src_qt, src_gtk) = (sandbox.dir.join("src-qt"), sandbox.dir.join("src-gtk"));
+        let (qt, gtk) = (
+            build_artifact(&src_qt, [4; 32]),
+            build_artifact(&src_gtk, [5; 32]),
+        );
+        let sets = table(&[
+            ("qt", &file_url(&src_qt), &hex(&qt)),
+            ("gtk", &file_url(&src_gtk), &hex(&gtk)),
+        ]);
+        let (code, stderr) = launch(
+            "legacy-runs",
+            &[(crate::sets::SETS_FILE, sets)],
+            &sandbox,
+            false,
+        );
+        assert_eq!(code, Some(7), "{stderr}");
+        assert!(
+            sandbox
+                .store
+                .join(format!("qt/{}.onelf", hex(&qt)))
+                .is_file()
+        );
+        assert!(
+            sandbox
+                .store
+                .join(format!("gtk/{}.onelf", hex(&gtk)))
+                .is_file()
         );
     }
 }

@@ -115,6 +115,25 @@ fn run(launch: &Launch) {
         .flat_map(|r| crate::sets::lib_dirs(r))
         .collect();
 
+    // What the selected providers can run beside: their objects against
+    // the application's bundled libc and loader pair, checked before the
+    // resolver edits a tree, the environment is touched, or the app
+    // starts. Wrong-architecture objects, needs beyond the bundled pair
+    // and the selection, and unrelated libc families all end it here.
+    let bundled_interp_rel = launch
+        .interp_data
+        .and_then(crate::interp::parse_bundled_interp_rel);
+    if let Err(why) = crate::providers::validate_selected(
+        launch.pkg_root,
+        &lib_dirs,
+        &target_path,
+        bundled_interp_rel,
+        &ep_name,
+    ) {
+        eprintln!("onelf-rt: {why}");
+        std::process::exit(1);
+    }
+
     // The resolver judges the package, not the entrypoint: a script
     // execs the bundled binaries too. A mode that had to know the
     // decision before it could materialize its tree hands it in.
@@ -209,10 +228,6 @@ fn run(launch: &Launch) {
     } else {
         launch.argv0
     };
-
-    let bundled_interp_rel = launch
-        .interp_data
-        .and_then(crate::interp::parse_bundled_interp_rel);
 
     // The only environment a launch ever adds to the library search, and
     // only for an ELF that has no `$ORIGIN` run path and that the kernel

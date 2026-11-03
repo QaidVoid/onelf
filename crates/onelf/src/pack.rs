@@ -147,6 +147,33 @@ fn metadata_requirements(metadata: &MetadataPayload) -> io::Result<elf::RuntimeR
     Ok(required)
 }
 
+/// The runtime support a build whose pins are fetched over HTTPS requires
+/// of the embedded runtime: store import. Fetching a pinned build at
+/// launch goes through the update-capable runtime's client, which the
+/// capability note advertises as store import, so a substitution whose
+/// note lacks it would ship a package whose builds can never be fetched.
+/// A recipe pinning nothing over HTTPS accepts any embeddable runtime,
+/// the way it always did.
+pub fn require_store_runtime(note: &elf::RuntimeNote, fetches_https: bool) -> io::Result<()> {
+    if !fetches_https {
+        return Ok(());
+    }
+    let mut required = elf::RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION);
+    required.capabilities = required
+        .capabilities
+        .union(elf::RuntimeCapabilities::STORE_IMPORT);
+    elf::check_runtime_support(note, required).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the recipe pins builds over HTTPS, so the embedded runtime must \
+                 advertise store import, and this one does not: {e}. Build with an \
+                 update-capable runtime, or pin the builds with file:// URLs"
+            ),
+        )
+    })
+}
+
 /// A metadata record the packer refuses to emit, carrying the codec's
 /// bounded diagnostic.
 fn record_error(why: MetadataError) -> io::Error {

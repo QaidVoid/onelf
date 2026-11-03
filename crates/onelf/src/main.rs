@@ -1103,6 +1103,7 @@ fn run_build(
     let _report = request.stage()?;
     let update_key = request.update.read_key()?;
     let runtime = assembly::embed_runtime(&request)?;
+    pack::require_store_runtime(&runtime.note, fetches_over_https(&request))?;
     require_selection_runtime(&runtime.note, &selected)?;
     let profile = match &request.compression.profile {
         Some(p) => pack::read_profile(p)?,
@@ -1201,6 +1202,34 @@ fn set_selection_named(
             format!("entrypoint '{name}': no declared set selection"),
         )
     })
+}
+
+/// Whether this build's pins are fetched over HTTPS at launch, which only
+/// the update-capable runtime's client can do: the declared sets of the
+/// bundle and of a named sysroot, and a GL build pinned whole. Sets and
+/// pins on `file://` sources need no network stack, so they gate nothing.
+fn fetches_over_https(request: &assembly::AssemblyRequest) -> bool {
+    let sets = request
+        .bundle
+        .sets
+        .iter()
+        .chain(
+            request
+                .bundle
+                .sysroot
+                .as_ref()
+                .map(|sysroot| sysroot.sets.iter())
+                .into_iter()
+                .flatten(),
+        )
+        .map(|set| set.url.as_str());
+    let pinned = request
+        .bundle
+        .platform_pin
+        .as_ref()
+        .map(|pin| pin.url.as_str())
+        .into_iter();
+    sets.chain(pinned).any(|url| url.starts_with("https://"))
 }
 
 /// A nonlegacy selection, an explicit `sets` list whether empty or not,
