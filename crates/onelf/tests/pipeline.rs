@@ -3104,6 +3104,349 @@ fn a_module_path_into_another_package_is_replaced() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The launch-parity harness: one app whose modes cover printing the
+/// launch's values, deliberately overriding a generated variable before
+/// a re-exec, clearing the environment before a re-exec, and handing the
+/// process to a host program.
+const PARITY_HARNESS: &str = r#"#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+extern char **environ;
+
+static void show(const char *name) {
+    const char *v = getenv(name);
+    printf("app:%s=%s\n", name, v ? v : "(unset)");
+}
+
+int main(int argc, char **argv) {
+    const char *mode = argc > 1 ? argv[1] : "";
+    if (strcmp(mode, "again") == 0) {
+        if (getenv("AFTER")) {
+            const char *dir = getenv("ONELF_DIR");
+            const char *seen = getenv("ONELF_ACTIVE_MODE");
+            const char *xdg = getenv("XDG_DATA_DIRS");
+            printf("after_dir=%s\n", dir ? dir : "(unset)");
+            printf("after_mode=%s\n", seen ? seen : "(unset)");
+            printf("after_xdg=%s\n", xdg ? xdg : "(unset)");
+            return 0;
+        }
+        if (getenv("AGAIN")) {
+            const char *qt = getenv("QT_PLUGIN_PATH");
+            printf("again_qt=%s\n", qt ? qt : "(unset)");
+            return 0;
+        }
+        return 2;
+    }
+    if (strcmp(mode, "override") == 0) {
+        setenv("QT_PLUGIN_PATH", "/app/chose-this", 1);
+        setenv("AGAIN", "1", 1);
+        char *nargv[] = {(char *)"app", (char *)"again", NULL};
+        fflush(stdout);
+        execv("/proc/self/exe", nargv);
+        return 3;
+    }
+    if (strcmp(mode, "clearenv") == 0) {
+        clearenv();
+        setenv("AFTER", "1", 1);
+        char *nargv[] = {(char *)"app", (char *)"again", NULL};
+        fflush(stdout);
+        execv("/proc/self/exe", nargv);
+        return 3;
+    }
+    if (strcmp(mode, "child") == 0) {
+        show("PATH");
+        show("HOME");
+        show("MAGIC");
+        show("QT_PLUGIN_PATH");
+        show("ONELF_DIR");
+        fflush(stdout);
+        char *env_argv[] = {(char *)"env", NULL};
+        execvp("env", env_argv);
+        return 3;
+    }
+    show("MAGIC");
+    show("QT_PLUGIN_PATH");
+    return 0;
+}
+"#;
+
+/// The tree the launch-parity regressions run: the harness app over a
+/// tree the catalog maps, with a Qt plugin directory, a file database
+/// and a share root.
+fn build_parity_fixture(td: &Path, tag: &str) -> Option<PathBuf> {
+    let dir = td.join(tag);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("lib/qt6/plugins")).unwrap();
+    write(&dir.join("share/file/misc/magic.mgc"), "database\n");
+    write(&dir.join("share/data.txt"), "data\n");
+    write(&dir.join("lib/qt6/plugins/keep.txt"), "keep\n");
+    write(&td.join("dummy.c"), "int dummy_value(void) { return 7; }\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdummy.so.0",
+            td.join("dummy.c").to_str().unwrap(),
+        ],
+        &dir.join("lib/libdummy.so.0"),
+    ) {
+        return None;
+    }
+    write(&td.join("parity.c"), PARITY_HARNESS);
+    if !cc(&td.join("parity.c"), &dir.join("bin/app")) {
+        return None;
+    }
+    write(
+        &dir.join("onelf.toml"),
+        &format!("[package]\nname = \"{tag}\"\ncommand = \"bin/app\"\n"),
+    );
+    Some(dir)
+}
+
+/// Build `dir` into its package with the constructor and the exec hooks
+/// injected, and return the package and the build log. `None` without
+/// patchelf, the tool the injection needs.
+fn build_hooked_package(dir: &Path, tag: &str, store: &Path) -> Option<(PathBuf, String)> {
+    let Some(pe) = patchelf() else {
+        skip("no patchelf to inject the onelf-env hooks");
+        return None;
+    };
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(dir)
+        .env("ONELF_PATCHELF", pe)
+        .env("ONELF_PLATFORM_STORE", store)
+        .output()
+        .expect("spawn onelf build");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{log}");
+    assert!(log.contains("Injected onelf-env"), "{log}");
+    Some((dir.join(format!("{tag}.onelf")), log))
+}
+
+/// A packed launch of `pkg` from a clean caller environment that names
+/// the test's store and scratch directories. Rundir keeps the launch
+/// deterministic and holds the private tree the launch needs.
+fn packed_launch(pkg: &Path, td: &Path) -> Command {
+    let mut cmd = Command::new(pkg);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "rundir")
+        .env("ONELF_SET_MODE", "extract")
+        .env("ONELF_PLATFORM_STORE", td.join("store"));
+    isolate(&mut cmd, td);
+    cmd
+}
+
+/// A re-exec that clears the environment: the packed constructor
+/// restores the variables the launch applied, while the development
+/// launch, which carries no constructor, states that limit and loses
+/// them. Each form locks its own documented outcome, so a regression on
+/// either side shows as a failure there.
+#[test]
+fn clearenv_reexec_in_both_launch_forms() {
+    let td = workdir("parity-clearenv");
+    let Some(dir) = build_parity_fixture(&td, "clearenv") else {
+        return;
+    };
+
+    let mut dev = dev_run(&td, &[]);
+    dev.arg(&dir).arg("clearenv");
+    let o = dev.output().expect("spawn onelf run");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("re-exec that clears the environment is not hooked"),
+        "{err}"
+    );
+    assert!(out.contains("after_dir=(unset)"), "{out}");
+    assert!(out.contains("after_mode=(unset)"), "{out}");
+    assert!(out.contains("after_xdg=(unset)"), "{out}");
+
+    let Some((pkg, _)) = build_hooked_package(&dir, "clearenv", &td.join("store")) else {
+        return;
+    };
+    let mut packed = packed_launch(&pkg, &td);
+    packed.arg("clearenv");
+    let o = run_package(&mut packed);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("after_mode=rundir"), "{out}");
+    let tree_line = out.lines().find(|l| l.starts_with("after_dir=")).unwrap();
+    let tree = tree_line.strip_prefix("after_dir=").unwrap();
+    let run = td.join("xdg-run");
+    assert!(tree.starts_with(run.to_str().unwrap()), "{out}");
+    let xdg_line = out.lines().find(|l| l.starts_with("after_xdg=")).unwrap();
+    assert!(
+        xdg_line.starts_with(&format!("after_xdg={tree}/share:")),
+        "{out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An intentional present override: an app that sets a generated
+/// variable on purpose before re-exec keeps its value under both forms,
+/// because the stored application records what the launch last applied
+/// and never clobbers a different present value. The caller's own
+/// present variable is likewise kept by both forms.
+#[test]
+fn an_intentional_override_survives_in_both_launch_forms() {
+    let td = workdir("parity-override");
+    let Some(dir) = build_parity_fixture(&td, "override") else {
+        return;
+    };
+
+    let mut dev = dev_run(&td, &[]);
+    dev.arg(&dir).env("MAGIC", "/caller/magic.mgc");
+    let o = dev.output().expect("spawn onelf run");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let dev_plain = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        dev_plain.contains("app:MAGIC=/caller/magic.mgc"),
+        "{dev_plain}"
+    );
+    assert!(
+        dev_plain.contains("app:QT_PLUGIN_PATH=") && dev_plain.contains("/lib/qt6/plugins"),
+        "{dev_plain}"
+    );
+
+    let Some((pkg, _)) = build_hooked_package(&dir, "override", &td.join("store")) else {
+        return;
+    };
+    let mut packed = packed_launch(&pkg, &td);
+    packed.env("MAGIC", "/caller/magic.mgc");
+    let o = run_package(&mut packed);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let packed_plain = String::from_utf8_lossy(&o.stdout);
+    // The forms name different tree roots for the same mapping, so the
+    // parity is in the values' shape: the caller's own variable kept, the
+    // generated one pointed into the launch's own tree.
+    let plain = |stdout: &str| -> (String, String) {
+        let magic = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("app:MAGIC="))
+            .unwrap_or_else(|| panic!("no MAGIC in {stdout}"));
+        let qt = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("app:QT_PLUGIN_PATH="))
+            .unwrap_or_else(|| panic!("no QT_PLUGIN_PATH in {stdout}"));
+        (magic.to_string(), qt.to_string())
+    };
+    let (dev_magic, dev_qt) = plain(&dev_plain);
+    let (packed_magic, packed_qt) = plain(&packed_plain);
+    assert_eq!(packed_magic, dev_magic);
+    assert_eq!(packed_magic, "/caller/magic.mgc");
+    for qt in [&dev_qt, &packed_qt] {
+        assert!(qt.ends_with("/lib/qt6/plugins"), "{qt}");
+    }
+
+    let mut dev_again = dev_run(&td, &[]);
+    dev_again.arg(&dir).arg("override");
+    let o = dev_again.output().expect("spawn onelf run");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let dev_again_out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        dev_again_out.contains("again_qt=/app/chose-this"),
+        "{dev_again_out}"
+    );
+
+    let mut packed_again = packed_launch(&pkg, &td);
+    packed_again.arg("override");
+    let o = run_package(&mut packed_again);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let packed_again_out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(dev_again_out, packed_again_out);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Host children across the forms: the packed constructor hands the
+/// caller's original values to the programs an app spawns, while the
+/// development launch, unhooked, leaves the launch's own values in its
+/// children, which is the initial-environment limit it states.
+#[test]
+fn a_host_child_in_both_launch_forms() {
+    let td = workdir("parity-child");
+    let Some(dir) = build_parity_fixture(&td, "child") else {
+        return;
+    };
+
+    let mut dev = dev_run(&td, &[]);
+    dev.arg(&dir)
+        .arg("child")
+        .env("MAGIC", "/caller/magic.mgc")
+        .env("QT_PLUGIN_PATH", "/caller/qt");
+    let o = dev.output().expect("spawn onelf run");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let child = String::from_utf8_lossy(&o.stdout);
+    let app_line = |name: &str| {
+        child
+            .lines()
+            .find(|l| l.starts_with(&format!("app:{name}=")))
+            .unwrap_or_else(|| panic!("no app:{name} line in {child}"))
+    };
+    assert_eq!(app_line("PATH"), "app:PATH=/usr/bin:/bin");
+    assert_eq!(app_line("HOME"), format!("app:HOME={}", td.display()));
+    assert_eq!(app_line("MAGIC"), "app:MAGIC=/caller/magic.mgc");
+    let dev_view = app_line("ONELF_DIR")
+        .strip_prefix("app:ONELF_DIR=")
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(
+        app_line("QT_PLUGIN_PATH"),
+        format!("app:QT_PLUGIN_PATH={dev_view}/lib/qt6/plugins"),
+        "{child}"
+    );
+    assert!(!child.contains("QT_PLUGIN_PATH=/caller/qt"), "{child}");
+
+    let Some((pkg, _)) = build_hooked_package(&dir, "child", &td.join("store")) else {
+        return;
+    };
+    let mut packed = packed_launch(&pkg, &td);
+    packed
+        .arg("child")
+        .env("MAGIC", "/caller/magic.mgc")
+        .env("QT_PLUGIN_PATH", "/caller/qt");
+    let o = run_package(&mut packed);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let child = String::from_utf8_lossy(&o.stdout);
+    let packed_tree = child
+        .lines()
+        .find_map(|l| l.strip_prefix("app:ONELF_DIR="))
+        .unwrap_or_else(|| panic!("no app:ONELF_DIR line in {child}"))
+        .to_string();
+    assert!(
+        child.contains(&format!("app:QT_PLUGIN_PATH={packed_tree}/lib/qt6/plugins")),
+        "{child}"
+    );
+    let host_line = |name: &str| {
+        child
+            .lines()
+            .find(|l| l.starts_with(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} line in {child}"))
+    };
+    assert_eq!(host_line("PATH"), "PATH=/usr/bin:/bin");
+    assert_eq!(host_line("HOME"), format!("HOME={}", td.display()));
+    assert_eq!(host_line("MAGIC"), "MAGIC=/caller/magic.mgc");
+    assert_eq!(host_line("QT_PLUGIN_PATH"), "QT_PLUGIN_PATH=/caller/qt");
+    assert!(
+        !child.lines().any(|l| l.starts_with("ONELF_DIR=")),
+        "{child}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Identical content is compressed and stored once, and every path that
 /// shares it still extracts correctly.
 #[test]
@@ -13440,6 +13783,262 @@ fn host_and_set_libraries_load_without_a_library_path() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A set-supplied framework scanner across the forms: the application's
+/// tree holds only itself, the libc family comes from a gathered
+/// directory the recipe's search path names, and the framework soname
+/// it needs is one no build machine's installation provides, so the
+/// bundle rests on no host installation content and the scanner the
+/// rule requires is prepared from the pinned set alone. The launch
+/// names the set's copy for the app under development and packed
+/// execution alike, the scanner the app invokes directly reads its
+/// registry data from beside itself, and it exits clean both ways.
+#[test]
+fn a_set_scanner_serves_both_launch_forms() {
+    let td = workdir("parity-scanner");
+
+    // The toolkit set: the framework soname the application needs, the
+    // scanner the rule that soname activates requires, and the registry
+    // data the scanner reads from beside itself.
+    let Some(set_tree) = set_library(
+        &td,
+        "toolkit",
+        "libgstreamer-1.0.so.9",
+        "int gstreamer_value(void){return 42;}\n",
+    ) else {
+        return;
+    };
+    let scanner_dir = set_tree.join("lib/gstreamer-1.0");
+    std::fs::create_dir_all(&scanner_dir).unwrap();
+    write(
+        &td.join("scanner.c"),
+        r#"#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n < 0) return 2;
+    exe[n] = 0;
+    char *end = strrchr(exe, '/');
+    if (!end) return 2;
+    *end = 0;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/registry.idx", exe);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("registry=(absent)\n");
+        return 0;
+    }
+    char buf[64] = {0};
+    if (!fgets(buf, sizeof buf, f)) {
+        fclose(f);
+        printf("registry=(absent)\n");
+        return 0;
+    }
+    fclose(f);
+    buf[strcspn(buf, "\n")] = 0;
+    printf("registry=%s\n", buf);
+    return 0;
+}
+"#,
+    );
+    if !cc(
+        &td.join("scanner.c"),
+        &scanner_dir.join("gst-plugin-scanner"),
+    ) {
+        return;
+    }
+    write(&scanner_dir.join("registry.idx"), "registry-v1\n");
+    let (hash, set_pkg) = pack_set(&td, "toolkit", "toolkit");
+
+    // The application: it needs the framework soname, which is the
+    // rule's trigger, and invokes the scanner the mapping names.
+    write(
+        &td.join("scanner-app.c"),
+        r#"#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+int main(void) {
+    const char *scanner = getenv("GST_PLUGIN_SCANNER");
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    if (!scanner) {
+        printf("scanner=(unset)\n");
+        return 1;
+    }
+    printf("scanner=%s\n", scanner);
+    fflush(stdout);
+    char *argv[] = {(char *)"gst-plugin-scanner", NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, scanner, NULL, NULL, argv, environ) != 0) {
+        printf("helper=spawn-failed\n");
+        return 1;
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    printf("helper=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+"#,
+    );
+    // The libraries of the machine running the test, gathered where the
+    // recipe's search path alone can find them: the walk then admits no
+    // library root of the host installation itself, so nothing the
+    // installation holds, its own scanner included, can be carried for
+    // the rule the framework soname activates. The name service modules
+    // glibc's loader asks for beside libc join them, so the admission
+    // stays on the gathered side for the whole closure.
+    let hostlibs = td.join("hostlibs");
+    std::fs::create_dir_all(&hostlibs).unwrap();
+    {
+        let probe = td.join("hostlibs-probe");
+        std::fs::create_dir_all(probe.join("bin")).unwrap();
+        if !cc(&td.join("scanner-app.c"), &probe.join("bin/app")) {
+            return;
+        }
+        let gather = |name: &str| {
+            let src = ldd_path(&probe.join("bin/app"), name)
+                .or_else(|| {
+                    [
+                        "/usr/lib",
+                        "/usr/lib64",
+                        "/lib64",
+                        "/lib/x86_64-linux-gnu",
+                        "/usr/lib/x86_64-linux-gnu",
+                    ]
+                    .iter()
+                    .map(|d| Path::new(d).join(name))
+                    .find(|p| p.is_file())
+                })
+                .unwrap_or_else(|| panic!("{name} of this machine"));
+            let name = src.file_name().unwrap().to_owned();
+            std::fs::copy(&src, hostlibs.join(name)).unwrap();
+        };
+        gather("libc.so.6");
+        gather("ld-linux");
+        gather("libnss_compat.so.2");
+        gather("libnss_files.so.2");
+        gather("libnss_dns.so.2");
+    }
+    // Each form builds from its own tree. The tree holds only the
+    // application; libc and its companions come from the gathered
+    // directory, and the framework soname from the pinned set, so the
+    // assembly rests on no host installation content.
+    let build_app_dir = |tag: &str| -> Option<PathBuf> {
+        let dir = td.join(tag);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let app = dir.join("bin/app");
+        if !cc_with(
+            &[
+                td.join("scanner-app.c").to_str().unwrap(),
+                &format!("-L{}", set_tree.join("lib").display()),
+                "-l:libgstreamer-1.0.so.9",
+                "-Wl,-rpath,$ORIGIN/../lib",
+            ],
+            &app,
+        ) {
+            return None;
+        }
+        write(
+            &dir.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"{tag}\"\ncommand = \"bin/app\"\nmtime = 0\n\
+                 \n[bundle]\nsearch-paths = [\"{}\"]\
+                 \n[sysroot.sets.toolkit]\npackages = [\"libgstreamer\"]\
+                 \nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+                hostlibs.display(),
+                set_pkg.display()
+            ),
+        );
+        Some(dir)
+    };
+    let assert_scan = |stdout: &str, app: &Path| {
+        let line = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {stdout}"))
+                .to_string()
+        };
+        let scanner = line("scanner=");
+        assert!(
+            scanner.ends_with("/lib/gstreamer-1.0/gst-plugin-scanner"),
+            "{stdout}"
+        );
+        assert!(
+            !scanner.starts_with("/usr"),
+            "the host installation's own scanner answers: {stdout}"
+        );
+        assert!(scanner.starts_with(td.to_str().unwrap()), "{stdout}");
+        assert!(
+            !scanner.contains(&app.to_string_lossy().to_string()),
+            "the set's copy answers, not the AppDir: {stdout}"
+        );
+        assert_eq!(line("helper="), "0", "{stdout}");
+        assert_eq!(line("registry="), "registry-v1", "{stdout}");
+    };
+
+    // Packed: the build prepares the scanner from the set, and the
+    // launch names the set's extraction for the app.
+    let Some(dir) = build_app_dir("scanner") else {
+        return;
+    };
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_PLATFORM_STORE", td.join("store"))
+        .output()
+        .expect("spawn onelf build");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{log}");
+    assert!(
+        log.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{log}"
+    );
+    let pkg = dir.join("scanner.onelf");
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_scan(&String::from_utf8_lossy(&out.stdout), &dir);
+
+    // Development: the same recipe stages the same preparation, and the
+    // launch resolves the scanner from the set's extraction the same
+    // way.
+    let Some(dev_dir) = build_app_dir("dev-scanner") else {
+        return;
+    };
+    let mut dev = dev_run(&td, &["--bundle"]);
+    dev.arg(&dev_dir);
+    let out = dev.output().expect("spawn onelf run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dev_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        dev_err.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{dev_err}"
+    );
+    assert_scan(&String::from_utf8_lossy(&out.stdout), &dev_dir);
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Wait for a shared mount's server under `td` to record itself. False
 /// when none has after a while.
 fn share_recorded(td: &Path) -> bool {
@@ -18953,6 +19552,139 @@ int main(void) {
         line("record=").contains(&entry),
         "the record lacks the caller's own value: {report}"
     );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two development launches of one tree with different caller
+/// environments build different views: the caller's own values feed the
+/// mappings the launch evaluates and the restoration record it stores,
+/// so a changed caller environment never reuses a stale view, and an
+/// unchanged one reuses the view it built. A packed launch keys on
+/// nothing the caller changes, and each launch still answers with its
+/// own caller's value.
+#[test]
+fn distinct_caller_environments_get_distinct_development_views() {
+    let td = workdir("parity-views");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("share/file/misc")).unwrap();
+    write(&dir.join("share/file/misc/magic.mgc"), "database\n");
+    write(
+        &td.join("views.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    printf("magic=%s\n", getenv("MAGIC") ? getenv("MAGIC") : "(unset)");
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("views.c").to_str().unwrap()],
+        &dir.join("bin/app")
+    ));
+
+    let store = td.join("xdg-cache/onelf/views");
+    let view_count = || {
+        std::fs::read_dir(&store)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                let dir = p.is_dir();
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| dir && n.starts_with("view-"))
+                    .then_some(p)
+            })
+            .count()
+    };
+    let launch = |magic: &str, caller_lib: &Path| -> (String, String) {
+        let mut cmd = dev_run(&td, &["--command", "bin/app"]);
+        cmd.arg(&dir)
+            .env("MAGIC", magic)
+            .env("LD_LIBRARY_PATH", caller_lib);
+        let out = cmd.output().expect("spawn onelf run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{}{}", String::from_utf8_lossy(&out.stderr), stdout);
+        assert!(out.status.success(), "{report}");
+        let line = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {report}"))
+                .to_string()
+        };
+        (line("magic="), line("dir="))
+    };
+
+    let lib_a = td.join("caller-a");
+    let lib_b = td.join("caller-b");
+    std::fs::create_dir_all(&lib_a).unwrap();
+    std::fs::create_dir_all(&lib_b).unwrap();
+
+    // The caller's database and library path are the launch's inputs:
+    // the app keeps the caller's database, and the launch stages a view.
+    let (magic_a, dir_a) = launch("/caller/a.mgc", &lib_a);
+    assert_eq!(magic_a, "/caller/a.mgc");
+    assert!(dir_a.contains("views/view-"), "{dir_a}");
+
+    // A different caller environment stages a second view and answers
+    // with its own values; the first view stays for its caller.
+    let (magic_b, dir_b) = launch("/caller/b.mgc", &lib_b);
+    assert_eq!(magic_b, "/caller/b.mgc");
+    assert_ne!(dir_a, dir_b);
+    assert_eq!(view_count(), 2);
+    assert!(std::path::Path::new(&dir_a).is_dir());
+
+    // The unchanged caller environment reuses its view whole: the same
+    // tree, no restage, no reissue of the records.
+    let view_a = std::path::PathBuf::from(&dir_a);
+    let stamp = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
+    let before = (stamp(&view_a.join("ready")), stamp(&view_a.join("config")));
+    let (magic_again, dir_again) = launch("/caller/a.mgc", &lib_a);
+    assert_eq!(magic_again, "/caller/a.mgc");
+    assert_eq!(dir_again, dir_a);
+    assert_eq!(view_count(), 2);
+    assert_eq!(stamp(&view_a.join("ready")), before.0);
+    assert_eq!(stamp(&view_a.join("config")), before.1);
+
+    // Packed launches key on nothing the caller changes, and each still
+    // answers with its own caller's value.
+    let pkg = td.join("packed.onelf");
+    let o = Command::new(onelf())
+        .args([
+            "pack",
+            dir.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+            "--name",
+            "viewctl",
+        ])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for magic in ["/caller/a.mgc", "/caller/b.mgc"] {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("MAGIC", magic);
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{}{}", String::from_utf8_lossy(&out.stderr), stdout);
+        assert!(out.status.success(), "{report}");
+        assert!(
+            stdout.contains(&format!("magic={magic}")),
+            "the packed launch kept the caller's value: {report}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&td);
 }
