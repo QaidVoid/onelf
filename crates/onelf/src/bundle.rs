@@ -1094,9 +1094,10 @@ struct SupplyQuery<'a> {
 }
 
 /// The set-supplied resources a checked assembly prepares while its
-/// group collection runs: every declared set whose verified payload
-/// holds a resource an activated group declared, keyed by the pin the
-/// bytes were read from.
+/// group collection runs: every set the build declares, whether pinned
+/// without a sysroot or named by a database-backed sysroot's recipe
+/// section, whose verified payload holds a resource an activated group
+/// declared, keyed by the pin the bytes were read from.
 ///
 /// Nothing here executes a helper, an interpreter, or an editing tool.
 /// Resources are read verified out of the pinned build, staged into the
@@ -1104,6 +1105,7 @@ struct SupplyQuery<'a> {
 /// hooks, whose procedures are fixed functions over the staged bytes.
 struct SetPreparation<'a> {
     sets: &'a [sysroot::SharedSet],
+    sysroot_sets: &'a [sysroot::SharedSet],
     dry_run: bool,
     reads: HashMap<String, sysroot::VerifiedSet>,
     pins: BTreeMap<(String, String), PinPreparation>,
@@ -1111,12 +1113,18 @@ struct SetPreparation<'a> {
 }
 
 impl<'a> SetPreparation<'a> {
-    /// The preparation over `sets`. A dry run consults no build: a dry
-    /// run fetches nothing, and a set whose build is not already in the
-    /// store has nothing to read on those terms.
-    fn new(sets: &'a [sysroot::SharedSet], dry_run: bool) -> Self {
+    /// The preparation over `sets` and the sysroot's `sysroot_sets`. A
+    /// dry run consults no build: a dry run fetches nothing, and a set
+    /// whose build is not already in the store has nothing to read on
+    /// those terms.
+    fn new(
+        sets: &'a [sysroot::SharedSet],
+        sysroot_sets: &'a [sysroot::SharedSet],
+        dry_run: bool,
+    ) -> Self {
         Self {
             sets,
+            sysroot_sets,
             dry_run,
             reads: HashMap::new(),
             pins: BTreeMap::new(),
@@ -1128,7 +1136,7 @@ impl<'a> SetPreparation<'a> {
     /// prepares nothing, and a dry run fetches nothing, so its report
     /// never rests on bytes it did not read.
     fn active(&self) -> bool {
-        !self.sets.is_empty() && !self.dry_run
+        !(self.sets.is_empty() && self.sysroot_sets.is_empty()) && !self.dry_run
     }
 
     /// Prepare one activated group's resource out of every declared set
@@ -1147,8 +1155,8 @@ impl<'a> SetPreparation<'a> {
             return Ok(false);
         }
         let mut supplied = false;
-        let sets = self.sets;
-        for set in sets {
+        let lists = [self.sets, self.sysroot_sets];
+        for set in lists.into_iter().flatten() {
             let read = match open_set_read(&mut self.reads, &mut self.warned, set) {
                 Ok(read) => read,
                 Err(_) => continue,
@@ -3120,9 +3128,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut actions: Vec<WalkAction> = Vec::new();
     // What the declared sets supply when an activated group's tree carry
     // misses: read verified out of each pin's build into the pin's own
-    // subtree. A set-less build consults nothing here, and neither does
-    // a dry run, which fetches nothing.
-    let mut preparation = SetPreparation::new(&opts.sets, opts.dry_run);
+    // subtree. The declarations live beside the tree in a build without
+    // a sysroot and in the sysroot section of a database-backed one.
+    // A set-less build consults nothing here, and neither does a dry
+    // run, which fetches nothing.
+    let sysroot_sets = opts
+        .sysroot
+        .as_ref()
+        .map(|sr| sr.sets.as_slice())
+        .unwrap_or(&[]);
+    let mut preparation = SetPreparation::new(&opts.sets, sysroot_sets, opts.dry_run);
     // The walk's initial objects enter the shared discovery queue, and
     // their sonames activate rules. Seeds are sorted, so the drain order
     // is a function of the input set, not of enumeration order.
@@ -5046,7 +5061,7 @@ mod plugin_dir_tests {
         let admitted = [AdmittedLibrary::new(soname, resolved)];
         let mut plan = DestinationPlan::load(directory).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
-        let mut preparation = SetPreparation::new(&[], false);
+        let mut preparation = SetPreparation::new(&[], &[], false);
         for declared in &descriptor.resources.data {
             carry_data_group(
                 directory,
@@ -5221,7 +5236,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
-        let mut preparation = SetPreparation::new(&[], false);
+        let mut preparation = SetPreparation::new(&[], &[], false);
         let err = carry_data_group(
             &tree,
             descriptor,
@@ -5267,7 +5282,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
-        let mut preparation = SetPreparation::new(&[], false);
+        let mut preparation = SetPreparation::new(&[], &[], false);
         carry_data_group(
             &tree,
             descriptor,
@@ -5515,7 +5530,7 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
-        let mut preparation = SetPreparation::new(&[], false);
+        let mut preparation = SetPreparation::new(&[], &[], false);
         let mut plan = DestinationPlan::load(tree)?;
         let descriptor = catalog::builtins()
             .iter()
@@ -5578,7 +5593,7 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
-        let mut preparation = SetPreparation::new(&[], false);
+        let mut preparation = SetPreparation::new(&[], &[], false);
         let mut plan = DestinationPlan::load(&root).unwrap();
         let descriptor = catalog::builtins()
             .iter()
@@ -7302,7 +7317,7 @@ mod set_preparation_tests {
         query: &SupplyQuery,
     ) -> io::Result<Vec<PreparedPin>> {
         let mut plan = DestinationPlan::load(appdir)?;
-        let mut preparation = SetPreparation::new(sets, false);
+        let mut preparation = SetPreparation::new(sets, &[], false);
         assert!(
             preparation.supply_group(&mut plan, query)?,
             "the declared set was expected to hold the resource"
@@ -7421,7 +7436,7 @@ mod set_preparation_tests {
             )],
         );
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&env_set), false);
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&env_set), &[], false);
         let err = preparation
             .supply_group(&mut plan, &helper_query(&candidates))
             .unwrap_err();
@@ -7507,7 +7522,7 @@ mod set_preparation_tests {
             .expect("a build that is not the pin must be refused");
         assert!(err.contains("not the pinned build"), "{err}");
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), false);
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), &[], false);
         assert!(
             !preparation
                 .supply_group(&mut plan, &data_query(&candidates))
@@ -7523,7 +7538,7 @@ mod set_preparation_tests {
             ..set
         };
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&corrupt), false);
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&corrupt), &[], false);
         let err = preparation
             .supply_group(&mut plan, &data_query(&candidates))
             .unwrap_err();
@@ -7680,7 +7695,7 @@ mod set_preparation_tests {
         let (builddir, set) = write_build("dry", &[("share/alsa/alsa.conf", b"conf\n")]);
 
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), true);
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), &[], true);
         assert!(!preparation.active());
         assert!(
             !preparation
@@ -7696,7 +7711,7 @@ mod set_preparation_tests {
             ..set
         };
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&ghost), false);
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&ghost), &[], false);
         assert!(
             !preparation
                 .supply_group(&mut plan, &data_query(&candidates))
@@ -7705,6 +7720,61 @@ mod set_preparation_tests {
         drop(preparation);
         drop(plan);
         assert!(!appdir.join(PREPARED_DIR).exists());
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&builddir);
+    }
+
+    /// A set a database-backed sysroot declares feeds the same
+    /// preparation: its helper prepares into the pin's subtree with the
+    /// executable mode, and a dry run over the sysroot list consults no
+    /// build, the way a dry run over the bundle-level list does.
+    #[test]
+    fn a_sysroot_declared_set_supplies_through_the_same_preparation() {
+        let appdir = tmp("sysroot-supply");
+        let candidates = [at(
+            SourceBase::LibraryDir,
+            "gstreamer-1.0/gst-plugin-scanner",
+        )];
+        let (builddir, set) = write_build(
+            "sysroot-set",
+            &[(
+                "lib/gstreamer-1.0/gst-plugin-scanner",
+                b"\x7fELFfixture-scanner",
+            )],
+        );
+
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(&[], std::slice::from_ref(&set), true);
+        assert!(!preparation.active());
+        assert!(
+            !preparation
+                .supply_group(&mut plan, &helper_query(&candidates))
+                .unwrap()
+        );
+        drop(preparation);
+        drop(plan);
+        assert!(!appdir.join(PREPARED_DIR).exists());
+
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(&[], std::slice::from_ref(&set), false);
+        assert!(
+            preparation
+                .supply_group(&mut plan, &helper_query(&candidates))
+                .unwrap(),
+            "the sysroot's declared set holds the helper"
+        );
+        assert!(!plan.has_findings());
+        let mut actions = Vec::new();
+        let prepared = preparation.queue_actions(&mut actions);
+        execute_walk(&appdir, false, false, &appdir.join("lib"), &actions, &plan).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].set, "audio");
+        assert_eq!(prepared[0].pin, set.blake3);
+        let dest = appdir
+            .join(&prepared[0].root)
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner");
+        assert_eq!(fs::read(&dest).unwrap(), b"\x7fELFfixture-scanner");
+        assert_eq!(mode_of(&dest), 0o755);
         let _ = fs::remove_dir_all(&appdir);
         let _ = fs::remove_dir_all(&builddir);
     }

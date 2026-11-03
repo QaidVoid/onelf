@@ -14039,6 +14039,541 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The application a set-helper fixture runs: it needs the framework
+/// soname, names the helper the rule's mapping publishes, spawns it,
+/// and reports where the helper ran and what it read beside itself.
+fn helper_spawning_app_source(td: &Path) -> PathBuf {
+    let src = td.join("helper-app.c");
+    write(
+        &src,
+        r#"#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+
+extern char **environ;
+
+int main(void) {
+    const char *scanner = getenv("GST_PLUGIN_SCANNER");
+    if (!scanner) {
+        printf("scanner=(unset)\n");
+        return 1;
+    }
+    printf("scanner=%s\n", scanner);
+    fflush(stdout);
+    char *argv[] = {(char *)"gst-plugin-scanner", NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, scanner, NULL, NULL, argv, environ) != 0) {
+        printf("helper=spawn-failed\n");
+        return 1;
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    printf("helper=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+"#,
+    );
+    src
+}
+
+/// The helper a fixture set carries: an ELF executable that reads the
+/// registry data sitting beside itself, so a launch proves the helper
+/// it named is a copy that carries its own data.
+fn registry_scanner_source(td: &Path) -> PathBuf {
+    let src = td.join("scanner.c");
+    write(
+        &src,
+        r#"#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n < 0) return 2;
+    exe[n] = 0;
+    char *end = strrchr(exe, '/');
+    if (!end) return 2;
+    *end = 0;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/registry.idx", exe);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("registry=(absent)\n");
+        return 0;
+    }
+    char buf[64] = {0};
+    if (!fgets(buf, sizeof buf, f)) {
+        fclose(f);
+        printf("registry=(absent)\n");
+        return 0;
+    }
+    fclose(f);
+    buf[strcspn(buf, "\n")] = 0;
+    printf("registry=%s\n", buf);
+    return 0;
+}
+"#,
+    );
+    src
+}
+
+/// Pack a set whose only payload is the helper executable and the
+/// registry data beside it, with no soname of its own, and return the
+/// pin and the artifact a recipe records.
+/// Pack a set that carries the framework soname the fixture
+/// application needs, the helper executable the activated rule
+/// requires, and the registry data beside it. The set names the
+/// framework package, so the sysroot closure leaves that package to
+/// the set's build, and the helper exists in no bundled source.
+fn helper_set(td: &Path, tag: &str) -> Option<(String, PathBuf)> {
+    let Some(tree) = set_library(
+        td,
+        tag,
+        "libgstreamer-1.0.so.0",
+        "int gstreamer_value(void){return 42;}\n",
+    ) else {
+        return None; // no compiler: documented soft-skip
+    };
+    let src = registry_scanner_source(td);
+    std::fs::create_dir_all(tree.join("lib/gstreamer-1.0")).unwrap();
+    if !cc(&src, &tree.join("lib/gstreamer-1.0/gst-plugin-scanner")) {
+        return None; // no compiler: documented soft-skip
+    }
+    write(
+        &tree.join("lib/gstreamer-1.0/registry.idx"),
+        "registry-v1\n",
+    );
+    Some(pack_set(td, tag, tag))
+}
+
+/// A minimal database-backed sysroot whose application activates the
+/// gstreamer rule through a library the selected closure holds, and
+/// whose tree holds nothing at the rule's helper locations. With
+/// `unselected_helper`, the helper does sit in the tree, in a tools
+/// package the application's closure never selects, the way a
+/// distribution ships a scanner beside a framework without depending
+/// on it. Returns the archive a recipe materializes the sysroot from.
+fn helper_sysroot_archive(td: &Path, unselected_helper: bool) -> Option<PathBuf> {
+    let rootfs = td.join("rootfs");
+    for d in ["usr/bin", "usr/lib"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    write(&td.join("gst.c"), "int gstreamer_value(void){return 42;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("gst.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libgstreamer-1.0.so.0"),
+    ) {
+        return None; // no compiler: documented soft-skip
+    }
+    if unselected_helper {
+        let src = registry_scanner_source(td);
+        std::fs::create_dir_all(rootfs.join("usr/libexec/gstreamer-1.0")).unwrap();
+        if !cc(
+            &src,
+            &rootfs.join("usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+        ) {
+            return None; // no compiler: documented soft-skip
+        }
+        write_pacman_entry(
+            &rootfs,
+            "gst-tools",
+            "1.0-1",
+            &[],
+            &[],
+            &["usr/libexec/gstreamer-1.0/gst-plugin-scanner"],
+        );
+    }
+    let app = helper_spawning_app_source(td);
+    if !cc_with(
+        &[
+            app.to_str().unwrap(),
+            &format!("-L{}", rootfs.join("usr/lib").display()),
+            "-l:libgstreamer-1.0.so.0",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return None; // no compiler: documented soft-skip
+    }
+    let (Some(host_libc), Some(host_ld)) = (
+        ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6"),
+        ldd_path(&rootfs.join("usr/bin/app"), "ld-linux"),
+    ) else {
+        return None;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "gst-fake",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libgstreamer-1.0.so.0"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "gst-fake"],
+        &[],
+        &["usr/bin/app"],
+    );
+    let archive = td.join("root.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+    Some(archive)
+}
+
+/// The recipe a sysroot helper fixture builds: the database-backed
+/// sysroot beside the recipe directory, plus the sysroot set
+/// declarations and bundle settings passed in.
+fn helper_sysroot_recipe(dir: &Path, archive: &Path, extra: &str) {
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\n{extra}",
+            archive.display()
+        ),
+    );
+}
+
+/// The helper a fixture launch named ran, and read the registry data
+/// beside itself: the answer is the set's own copy under the test's
+/// tree, never the packer's machine's installation and never the
+/// AppDir the build wrote.
+fn assert_set_helper_ran(stdout: &str, td: &Path, dir: &Path) {
+    let line = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {stdout}"))
+            .to_string()
+    };
+    let scanner = line("scanner=");
+    assert!(scanner.ends_with("gst-plugin-scanner"), "{stdout}");
+    assert!(scanner.starts_with(td.to_str().unwrap()), "{stdout}");
+    assert!(
+        !scanner.starts_with("/usr"),
+        "the host installation's own helper answered: {stdout}"
+    );
+    assert!(
+        !scanner.contains(&dir.to_string_lossy().to_string()),
+        "the AppDir answered instead of the set's copy: {stdout}"
+    );
+    assert_eq!(line("helper="), "0", "{stdout}");
+    assert_eq!(line("registry="), "registry-v1", "{stdout}");
+}
+
+/// A database-backed sysroot build prepares a required helper that
+/// only its recipe's declared set carries: the sysroot closure and the
+/// tree hold nothing at the rule's helper locations, the pinned set's
+/// verified bytes land in the pin's own subtree in the AppDir and in
+/// the packed output, and the packed and development launches alike
+/// run the helper the mapping names. A host-scan build prepares the
+/// same declaration the same way; this is that path over a sysroot
+/// build's own declarations.
+#[test]
+fn a_sysroot_build_prepares_a_set_only_helper() {
+    let td = workdir("syssethelper");
+    let Some(archive) = helper_sysroot_archive(&td, false) else {
+        return;
+    };
+    let Some((hash, set_pkg)) = helper_set(&td, "toolkit") else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    helper_sysroot_recipe(
+        &dir,
+        &archive,
+        &format!(
+            "\n[sysroot.sets.toolkit]\npackages = [\"gst-fake\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{stderr}"
+    );
+    let pin_root = dir.join(".onelf-prepared/toolkit").join(&hash);
+    let helper = pin_root.join("libexec/gstreamer-1.0/gst-plugin-scanner");
+    assert!(helper.is_file(), "{stderr}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111 != 0,
+            "the prepared helper stays executable"
+        );
+    }
+    let ledger = std::fs::read_to_string(dir.join(".onelf/generated")).unwrap();
+    assert!(
+        ledger.contains(&format!(
+            ".onelf-prepared/toolkit/{hash}/libexec/gstreamer-1.0/gst-plugin-scanner"
+        )),
+        "{ledger}"
+    );
+    let sets = std::fs::read_to_string(dir.join(".onelf/sets")).unwrap();
+    assert!(sets.contains("[toolkit]") && sets.contains(&hash), "{sets}");
+
+    // The subtree is the application's own packed content.
+    let pkg = dir.join("app.onelf");
+    let list = Command::new(onelf())
+        .args(["list", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf list");
+    let listing = String::from_utf8_lossy(&list.stdout);
+    assert!(list.status.success(), "{listing}");
+    assert!(
+        listing.contains(&format!(
+            ".onelf-prepared/toolkit/{hash}/libexec/gstreamer-1.0/gst-plugin-scanner"
+        )),
+        "{listing}"
+    );
+
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_set_helper_ran(&stdout, &td, &dir);
+
+    // The development launch over the same recipe stages the same
+    // preparation into a tree of its own and runs the helper the same
+    // way.
+    let dev_dir = td.join("devapp");
+    std::fs::create_dir_all(&dev_dir).unwrap();
+    helper_sysroot_recipe(
+        &dev_dir,
+        &archive,
+        &format!(
+            "\n[sysroot.sets.toolkit]\npackages = [\"gst-fake\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+    let mut dev = dev_run(&td, &["--bundle"]);
+    dev.arg(&dev_dir);
+    let out = dev.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dev_err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{dev_err}");
+    assert!(
+        dev_err.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{dev_err}"
+    );
+    assert!(
+        dev_dir
+            .join(".onelf-prepared/toolkit")
+            .join(&hash)
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "{dev_err}"
+    );
+    assert_set_helper_ran(&stdout, &td, &dev_dir);
+}
+
+/// Preparation consults exactly the sets the recipe declares: a
+/// pinned build that sits in the launch store under a name no recipe
+/// here declares stays untouched, whatever it carries, and the helper
+/// comes from the declaration alone.
+#[test]
+fn a_sysroot_build_prepares_only_from_its_declared_sets() {
+    let td = workdir("syssetbound");
+    let Some(archive) = helper_sysroot_archive(&td, false) else {
+        return;
+    };
+    let Some((hash, set_pkg)) = helper_set(&td, "toolkit") else {
+        return;
+    };
+    // A second pinned build under a name no recipe declares, already
+    // sitting in the store where a launch could acquire it.
+    let Some((ghost_hash, ghost_pkg)) = helper_set(&td, "ghost") else {
+        return;
+    };
+    let store = td.join("store");
+    write_bytes(
+        &store.join("ghost").join(format!("{ghost_hash}.onelf")),
+        &std::fs::read(&ghost_pkg).unwrap(),
+    );
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    helper_sysroot_recipe(
+        &dir,
+        &archive,
+        &format!(
+            "\n[sysroot.sets.toolkit]\npackages = [\"gst-fake\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ghost"),
+        "an undeclared set was consulted: {stderr}"
+    );
+    assert!(
+        !dir.join(".onelf-prepared/ghost").exists(),
+        "an undeclared pin prepared nothing: {stderr}"
+    );
+    assert!(
+        store
+            .join("ghost")
+            .join(format!("{ghost_hash}.onelf"))
+            .is_file(),
+        "the undeclared pin's build stays in the store untouched"
+    );
+}
+
+/// A required helper neither the selected sysroot closure nor a
+/// declared set supplies fails the build naming the examined
+/// locations. Neither the helper's own package sitting unselected in
+/// the sysroot tree nor a complete installation on the packer's
+/// machine repairs the build, while the same machine contents satisfy
+/// a host scan, which is the only build they may serve.
+#[test]
+fn a_sysroot_helper_miss_is_never_repaired_from_the_host() {
+    let td = workdir("syssetmiss");
+    let Some(archive) = helper_sysroot_archive(&td, true) else {
+        return;
+    };
+    // The packer's machine holds a complete installation of the
+    // framework, its helper included, in the layout a host scan
+    // searches.
+    let rootfs = td.join("rootfs");
+    let hostdist = td.join("hostdist");
+    for d in ["usr/lib/gstreamer-1.0", "usr/libexec/gstreamer-1.0"] {
+        std::fs::create_dir_all(hostdist.join(d)).unwrap();
+    }
+    std::fs::copy(
+        rootfs.join("usr/lib/libgstreamer-1.0.so.0"),
+        hostdist.join("usr/lib/libgstreamer-1.0.so.0"),
+    )
+    .unwrap();
+    std::fs::copy(
+        rootfs.join("usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+        hostdist.join("usr/lib/gstreamer-1.0/gst-plugin-scanner"),
+    )
+    .unwrap();
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    helper_sysroot_recipe(
+        &dir,
+        &archive,
+        &format!(
+            "\n[bundle]\nsearch-paths = [\"{}\"]\n",
+            "../hostdist/usr/lib"
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a required helper miss must fail however complete the machine's own \
+         installation is:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rule gstreamer") && stderr.contains("helper scanner"),
+        "the failure names the rule and the helper:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("requires the executable"),
+        "the required-helper diagnostic stands:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unselected package gst-tools"),
+        "the refusal names the package that owns the only copy in the tree:\n{stderr}"
+    );
+    assert!(
+        !dir.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .exists(),
+        "no helper was taken from the tree, the package database or the \
+         machine:\n{stderr}"
+    );
+    assert!(
+        !dir.join(".onelf-prepared").exists(),
+        "no set prepared anything without a declaration:\n{stderr}"
+    );
+    assert!(!dir.join("app.onelf").exists(), "{stderr}");
+
+    // The same machine contents satisfy a host scan of the same
+    // application, so the sysroot refusal is the boundary, not an
+    // empty fixture.
+    let hostdir = td.join("hostapp");
+    std::fs::create_dir_all(hostdir.join("bin")).unwrap();
+    let app = helper_spawning_app_source(&td);
+    if !cc_with(
+        &[
+            app.to_str().unwrap(),
+            &format!("-L{}", hostdist.join("usr/lib").display()),
+            "-l:libgstreamer-1.0.so.0",
+        ],
+        &hostdir.join("bin/app"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    write(
+        &hostdir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\nsearch-paths = [\"{}\"]\n",
+            hostdist.join("usr/lib").display()
+        ),
+    );
+    let o = Command::new(onelf())
+        .args([
+            "bundle-libs",
+            hostdir.to_str().unwrap(),
+            "--target",
+            "bin/app",
+        ])
+        .args(["--search-path", hostdist.join("usr/lib").to_str().unwrap()])
+        .output()
+        .expect("spawn onelf bundle-libs");
+    let host_err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{host_err}");
+    assert!(
+        hostdir
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "the host scan collects the helper the machine installation \
+         supplies:\n{host_err}"
+    );
+}
+
 /// Wait for a shared mount's server under `td` to record itself. False
 /// when none has after a while.
 fn share_recorded(td: &Path) -> bool {
