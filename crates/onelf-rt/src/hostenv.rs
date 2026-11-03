@@ -287,7 +287,7 @@ fn parse_entry(text: &[u8]) -> Option<(RecordEntry, &[u8])> {
 }
 
 /// 64-bit FNV-1a, which the constructor computes the same way.
-pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
     })

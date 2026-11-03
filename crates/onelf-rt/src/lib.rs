@@ -49,7 +49,7 @@ pub mod portable;
 pub mod rundir;
 pub mod sets;
 
-pub(crate) mod hostpaths;
+pub mod hostpaths;
 pub(crate) mod interp;
 pub(crate) mod providers;
 pub(crate) mod selfextract;

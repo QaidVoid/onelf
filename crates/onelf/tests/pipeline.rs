@@ -18012,6 +18012,21 @@ fn dev_run(td: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// The one prepared view in a test's store, which a single-launch test
+/// can name this way.
+fn the_prepared_view(store: &Path) -> PathBuf {
+    std::fs::read_dir(store)
+        .expect("the view store")
+        .find_map(|e| {
+            let p = e.unwrap().path();
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("view-"))
+                .then_some(p)
+        })
+        .expect("the prepared view")
+}
+
 /// A development `run --bundle` stages the same sysroot closure a build
 /// stages, and the launch resolves against it.
 #[test]
@@ -18299,6 +18314,10 @@ fn run_without_bundle_keeps_the_development_launch() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("entrypoint target not found"), "{stderr}");
     assert!(
+        stderr.contains("--bundle"),
+        "the incomplete tree does not name the assembly that stages it: {stderr}"
+    );
+    assert!(
         !dir.join("bin/app").exists(),
         "the import ran without --bundle"
     );
@@ -18493,9 +18512,11 @@ int main(void) {
             .to_string()
     };
     let app_lp = line("app_lp=");
+    let store = td.join("xdg-cache/onelf/views");
+    let view = the_prepared_view(&store);
     assert!(
-        app_lp.contains(app.join("lib").to_str().unwrap()) && !app_lp.contains("caller-lib"),
-        "the app's path is not the tree's own: {app_lp}"
+        app_lp.contains(view.join("lib").to_str().unwrap()) && !app_lp.contains("caller-lib"),
+        "the app's path is not the prepared view's own: {app_lp}"
     );
     let child_lp = line("child_lp=");
     assert!(
@@ -18569,6 +18590,313 @@ fn a_recipe_library_path_is_refused_in_development() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The prepared view a development launch runs from: private to the
+/// launch, carrying the evaluated mappings the constructor reads back,
+/// reused untouched while nothing that changes it changed, and leaving
+/// the AppDir exactly as it stood.
+#[test]
+fn a_dev_run_launches_from_one_prepared_view() {
+    let td = workdir("runview");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("share/data.txt"), "data\n");
+    write(
+        &td.join("app.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char cwd[4096] = {0};
+    getcwd(cwd, sizeof cwd);
+    printf("mode=%s\n", getenv("ONELF_ACTIVE_MODE") ? getenv("ONELF_ACTIVE_MODE") : "(unset)");
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    printf("cwd=%s\n", cwd);
+    printf("data=%s\n", getenv("XDG_DATA_DIRS") ? getenv("XDG_DATA_DIRS") : "(unset)");
+    for (int i = 1; i < argc; i++) printf("arg%d=%s\n", i, argv[i]);
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("app.c").to_str().unwrap()],
+        &dir.join("bin/app")
+    ));
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\nworking-dir = \"package\"\n\n\
+         [[entrypoint]]\nname = \"main\"\npath = \"bin/app\"\nargs = [\"--from-recipe\"]\ndefault = true\n",
+    );
+    let store = td.join("xdg-cache/onelf/views");
+
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir).arg("passed-on");
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = format!("{}{}", String::from_utf8_lossy(&out.stderr), stdout);
+    assert!(out.status.success(), "{report}");
+    let line = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {report}"))
+            .to_string()
+    };
+    assert_eq!(line("mode="), "dev", "{report}");
+    let dir_root = dir.canonicalize().unwrap();
+    assert_eq!(line("cwd="), line("dir="), "{report}");
+    assert_eq!(line("arg1="), "--from-recipe", "{report}");
+    assert_eq!(line("arg2="), "passed-on", "{report}");
+    assert!(!line("dir=").starts_with(dir_root.to_string_lossy().as_ref()));
+    assert!(line("dir=").contains("views/view-"), "{report}");
+    let view = std::path::PathBuf::from(line("dir=").to_string());
+    assert!(view.starts_with(&store), "{report}");
+    let data = line("data=");
+    assert!(
+        data.contains(&view.join("share").to_string_lossy().to_string()),
+        "the evaluated mapping names the view's share: {report}"
+    );
+
+    // The evaluated mappings live in the view alone, named for the view,
+    // and the AppDir is untouched by the launch.
+    let record = view.join(".onelf/runtime-env");
+    assert!(record.is_file(), "the view carries no generated input");
+    let text = std::fs::read_to_string(&record).unwrap();
+    assert!(text.starts_with("ONELF-RUNTIME-ENV 1 "), "{report}");
+    assert!(
+        text.contains(&view.join("share").to_string_lossy().to_string()),
+        "the stored input names the view root: {text}"
+    );
+    assert!(
+        !text.contains(&dir_root.join("share").to_string_lossy().to_string()),
+        "the stored input names the AppDir: {text}"
+    );
+    assert!(!dir_root.join(".onelf/runtime-env").exists());
+    let ready = view.join("ready");
+    let stamp = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
+
+    // The same launch again reuses the view whole: no restage, no
+    // reissue of the records.
+    let before = (stamp(&ready), stamp(&view.join("config")));
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir).arg("passed-on");
+    let out = cmd.output().expect("spawn onelf run");
+    assert!(out.status.success(), "{report}");
+    assert_eq!(line("cwd="), line("dir="), "{report}");
+    assert_eq!(stamp(&ready), before.0, "the iteration rebuilt the view");
+    assert_eq!(stamp(&view.join("config")), before.1);
+
+    // A changed tree is another view, and the old one stays.
+    write(&dir.join("bin/extra"), "#!/bin/sh\necho x\n");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("bin/extra"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir).arg("passed-on");
+    let out = cmd.output().expect("spawn onelf run");
+    assert!(out.status.success());
+    let views = std::fs::read_dir(&store)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            let dir = p.is_dir();
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| dir && n.starts_with("view-"))
+                .then_some(p)
+        })
+        .count();
+    assert_eq!(views, 2, "a changed tree shares the old view");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The capability limits of a development launch are stated outright:
+/// a re-exec that clears the environment starts outside the prepared
+/// environment, the recipe's preload list is not opened, and the
+/// absolute-path overlays say whether they are in effect.
+#[test]
+fn a_dev_run_states_its_capability_limits() {
+    let td = workdir("runlimits");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("share/devov/marker"), "from-view\n");
+    write(
+        &td.join("app.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {
+    if (getenv("REEXEC")) {
+        char *argv[] = {"app", 0};
+        char *envp[] = {"AGAIN=1", 0};
+        fflush(stdout);
+        execve("/proc/self/exe", argv, envp);
+        return 1;
+    }
+    if (getenv("AGAIN")) {
+        printf("again_mode=%s\n", getenv("ONELF_ACTIVE_MODE") ? getenv("ONELF_ACTIVE_MODE") : "(unset)");
+        return 0;
+    }
+    FILE *f = fopen("/usr/share/devov/marker", "r");
+    char buf[16] = {0};
+    if (f && fgets(buf, sizeof buf, f)) printf("marker=%s", buf);
+    else printf("marker=missing\n");
+    if (f) fclose(f);
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("app.c").to_str().unwrap()],
+        &dir.join("bin/app")
+    ));
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "preload = [\"{}\"]\n\n[package]\ncommand = \"bin/app\"\n\n[paths]\n\"/usr/share/devov\" = \"share/devov\"\n",
+            dir.join("bin/app").display()
+        ),
+    );
+    let mut plain = dev_run(&td, &[]);
+    plain.arg(&dir);
+    let out = plain.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report = format!("{stdout}{stderr}");
+    assert!(out.status.success(), "{report}");
+    assert!(
+        stderr.contains("preload list is opened by the packaged constructor"),
+        "the preload limit is not stated: {report}"
+    );
+    assert!(
+        stderr.contains("absolute paths"),
+        "the overlays do not say whether they are in effect: {report}"
+    );
+    if stdout.contains("marker=from-view") {
+        assert!(
+            stderr.contains("answer for the absolute paths"),
+            "an overlay in effect is not reported: {report}"
+        );
+    } else {
+        assert!(
+            stdout.contains("marker=missing"),
+            "the marker neither hit nor missed: {report}"
+        );
+        assert!(
+            stderr.contains("not overlaid"),
+            "a failed overlay is not reported: {report}"
+        );
+    }
+
+    let mut reexec = dev_run(&td, &[]);
+    reexec.arg(&dir).env("REEXEC", "1");
+    let out = reexec.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report = format!("{stdout}{stderr}");
+    assert!(out.status.success(), "{report}");
+    assert!(
+        stderr.contains("re-exec that clears the environment is not hooked"),
+        "the re-exec limit is not stated: {report}"
+    );
+    assert!(
+        stdout.contains("again_mode=(unset)"),
+        "a re-exec that clears the environment stayed inside the prepared environment: {report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A set a development launch activates reaches the launch's mappings:
+/// the set's directories appear where the evaluated mappings put them,
+/// in the app's environment and in the stored input alike.
+#[test]
+fn a_dev_runs_active_set_reaches_the_evaluated_mappings() {
+    let td = workdir("runsetmap");
+    let Some(set_lib) = set_library(
+        &td,
+        "toolkit",
+        "libtoolkit.so.99fixture",
+        "int toolkit_value(void){return 9;}\n",
+    ) else {
+        return;
+    };
+    std::fs::create_dir_all(set_lib.join("lib/qt6/plugins")).unwrap();
+    write(&td.join("qtplugin.c"), "int qt_plugin(void){return 1;}\n");
+    assert!(cc_with(
+        &["-shared", "-fPIC", td.join("qtplugin.c").to_str().unwrap(),],
+        &set_lib.join("lib/qt6/plugins/libqfake.so")
+    ));
+    let (hash, set_pkg) = pack_set(&td, "toolkit", "toolkit");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &td.join("app.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    printf("qt=%s\n", getenv("QT_PLUGIN_PATH") ? getenv("QT_PLUGIN_PATH") : "(unset)");
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("app.c").to_str().unwrap()],
+        &dir.join("bin/app")
+    ));
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"libtoolkit\"]\nurl = \"file://{}\"\n\
+             blake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report = format!("{stdout}{stderr}");
+    assert!(out.status.success(), "{report}");
+    let qt = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("qt="))
+        .unwrap_or_else(|| panic!("no qt= in {report}"));
+    let onelf_dir_listing =
+        std::fs::read_to_string(dir.join(".onelf/sets")).unwrap_or_else(|e| e.to_string());
+    assert!(
+        qt.ends_with("qt6/plugins"),
+        "the active set's plugin directory is not the mapping's value: {report} [.onelf: {onelf_dir_listing}]"
+    );
+    assert!(
+        !qt.contains(&dir.canonicalize().unwrap().to_string_lossy().to_string()),
+        "the mapping names the AppDir instead of the set: {report}"
+    );
+
+    // The stored input carries the same evaluated value, naming the
+    // set root the launch acquired.
+    let store = td.join("xdg-cache/onelf/views");
+    let view = the_prepared_view(&store);
+    let text = std::fs::read_to_string(view.join(".onelf/runtime-env")).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("QT_PLUGIN_PATH="))
+        .unwrap_or_else(|| panic!("the stored input has no QT_PLUGIN_PATH: {text}"));
+    assert!(
+        line.contains("qt6/plugins"),
+        "the stored mapping lost the set's directory: {line}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A development launch leaves the caller's original values in the
 /// restoration record the host programs the app starts read, whatever
 /// the launch resolved for the app itself, and the shared launch
@@ -18616,11 +18944,9 @@ int main(void) {
             .to_string()
     };
     assert_eq!(line("mode="), "dev", "{report}");
-    assert_eq!(
-        line("dir="),
-        app.canonicalize().unwrap().to_string_lossy(),
-        "{report}"
-    );
+    let store = td.join("xdg-cache/onelf/views");
+    let view = the_prepared_view(&store);
+    assert_eq!(line("dir="), view.to_string_lossy(), "{report}");
     let caller_s = caller.to_string_lossy().into_owned();
     let entry = format!("LD_LIBRARY_PATH=*{}:{};", caller_s.len(), caller_s);
     assert!(

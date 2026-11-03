@@ -52,13 +52,26 @@ pub(crate) fn dir(
     runpath: &[PathBuf],
     lib_dirs: &[&str],
 ) -> Option<String> {
-    let exists = |d: &&str| !d.is_empty() && dir_index(manifest, d).is_some();
+    dir_where(pkg_root, runpath, lib_dirs, |d| {
+        !d.is_empty() && dir_index(manifest, d).is_some()
+    })
+}
+
+/// [`dir`] for a tree without a manifest, such as a development view:
+/// `exists` answers whether the package tree really holds the directory
+/// a candidate names.
+pub fn dir_where(
+    pkg_root: &Path,
+    runpath: &[PathBuf],
+    lib_dirs: &[&str],
+    exists: impl Fn(&str) -> bool,
+) -> Option<String> {
     runpath
         .iter()
         .filter_map(|d| d.strip_prefix(pkg_root).ok()?.to_str())
-        .filter(exists)
+        .filter(|d| exists(d))
         .min_by_key(|d| Path::new(d).components().count())
-        .or_else(|| lib_dirs.iter().copied().find(exists))
+        .or_else(|| lib_dirs.iter().copied().find(|d| exists(d)))
         .map(String::from)
 }
 
@@ -89,7 +102,17 @@ pub(crate) fn wanted(
     farm: Option<&Path>,
     set_roots: &[PathBuf],
 ) -> Links {
-    let carried = carried(manifest, dir);
+    let carried: HashSet<String> = carried(manifest, dir)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    wanted_from(farm, set_roots, &carried)
+}
+
+/// [`wanted`] for a tree without a manifest, such as a development view:
+/// `carried` holds the names the tree itself already has in the target
+/// directory, so nothing it carries is linked from outside.
+pub fn wanted_from(farm: Option<&Path>, set_roots: &[PathBuf], carried: &HashSet<String>) -> Links {
     let mut links = Links::new();
     let mut add = |name: &OsStr, target: PathBuf| {
         if let Some(name) = name.to_str()
@@ -129,8 +152,14 @@ pub(crate) fn wanted(
 
 /// The links a launch before this one left in `dir` of the tree at `root`:
 /// symlinks the package does not carry.
-fn present(manifest: &Manifest, root: &Path, dir: &str) -> Links {
+pub(crate) fn present(manifest: &Manifest, root: &Path, dir: &str) -> Links {
     let carried = carried(manifest, dir);
+    present_excluding(root, dir, &carried)
+}
+
+/// [`present`] for a tree without a manifest: `carried` holds the names
+/// the tree itself has in `dir`, which never count as placed links.
+pub fn present_excluding(root: &Path, dir: &str, carried: &HashSet<&str>) -> Links {
     let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
         return Links::new();
     };
@@ -164,8 +193,15 @@ pub(crate) fn place(manifest: &Manifest, root: &Path, dir: &str, links: &Links) 
         );
         return;
     }
+    let carried = carried(manifest, dir);
+    place_excluding(root, dir, links, &carried);
+}
+
+/// [`place`] for a tree without a manifest: `carried` holds the names
+/// the tree itself has in `dir`, which are never removed or relinked.
+pub(crate) fn place_excluding(root: &Path, dir: &str, links: &Links, carried: &HashSet<&str>) {
     let base = root.join(dir);
-    let present = present(manifest, root, dir);
+    let present = present_excluding(root, dir, carried);
     for name in present.keys().filter(|n| !links.contains_key(*n)) {
         if let Err(e) = std::fs::remove_file(base.join(name)) {
             eprintln!(
@@ -213,7 +249,7 @@ pub fn served(
 /// The directories an ELF's `$ORIGIN` run path names, resolved against
 /// the file's own directory. Empty for a file that is not an ELF or names
 /// no `$ORIGIN` in either `DT_RPATH` or `DT_RUNPATH`.
-pub(crate) fn origin_runpath(target: &Path) -> Vec<PathBuf> {
+pub fn origin_runpath(target: &Path) -> Vec<PathBuf> {
     let Ok(data) = std::fs::read(target) else {
         return Vec::new();
     };
@@ -998,6 +1034,30 @@ pub mod view {
             std::fs::create_dir_all(self.dir.join(dir))?;
             super::place(manifest, &self.dir, dir, links);
             if super::present(manifest, &self.dir, dir) != *links {
+                return Err(io::Error::other(
+                    "onelf: the staged view's links are incomplete",
+                ));
+            }
+            Ok(())
+        }
+
+        /// [`Staging::place_links`] for a tree staged without a
+        /// manifest: the names already staged in `dir` are the tree's
+        /// own, so every link named beyond them is placed, nothing the
+        /// tree carries is removed, and the result is verified.
+        pub fn place_free_links(&self, dir: &str, links: &Links) -> io::Result<()> {
+            admit_rel(dir)?;
+            std::fs::create_dir_all(self.dir.join(dir))?;
+            let carried: std::collections::HashSet<String> = std::fs::read_dir(self.dir.join(dir))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect();
+            let borrowed: std::collections::HashSet<&str> =
+                carried.iter().map(String::as_str).collect();
+            super::place_excluding(&self.dir, dir, links, &borrowed);
+            if super::present_excluding(&self.dir, dir, &borrowed) != *links {
                 return Err(io::Error::other(
                     "onelf: the staged view's links are incomplete",
                 ));
@@ -2845,6 +2905,35 @@ pub mod view {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        #[test]
+        fn a_staged_view_keeps_its_own_links_and_takes_the_farm_links() {
+            let work = temp_dir("devfreelinks");
+            let view = work.join("view-x");
+            let staging = Staging::new(&view).unwrap();
+            std::fs::create_dir_all(staging.dir().join("lib")).unwrap();
+            std::fs::write(staging.dir().join("lib/libreal.so.1.0"), "elf").unwrap();
+            std::os::unix::fs::symlink("libreal.so.1.0", staging.dir().join("lib/libreal.so.1"))
+                .unwrap();
+
+            let mut links = Links::new();
+            links.insert(
+                "libfarm.so".to_string(),
+                PathBuf::from("/farm/libfarm.so.1"),
+            );
+            staging.place_free_links("lib", &links).unwrap();
+
+            assert_eq!(
+                std::fs::read_link(staging.dir().join("lib/libreal.so.1")).unwrap(),
+                PathBuf::from("libreal.so.1.0")
+            );
+            assert_eq!(
+                std::fs::read_link(staging.dir().join("lib/libfarm.so")).unwrap(),
+                PathBuf::from("/farm/libfarm.so.1")
+            );
+
+            let _ = std::fs::remove_dir_all(&work);
+        }
     }
 }
 
@@ -2862,6 +2951,64 @@ mod tests {
             normalize(Path::new("/mnt/pkg/opt/x/bin/../../../lib/./sub")),
             PathBuf::from("/mnt/pkg/lib/sub")
         );
+    }
+
+    #[test]
+    fn a_dev_link_dir_prefers_the_shallowest_runpath_directory_inside_the_tree() {
+        let root = Path::new("/pkg");
+        let exists = |d: &str| matches!(d, "lib" | "deep/a/b" | "opt/lib");
+        assert_eq!(
+            dir_where(
+                root,
+                &[root.join("deep/a/b"), root.join("lib")],
+                &["lib"],
+                exists
+            ),
+            Some("lib".to_string())
+        );
+        assert_eq!(
+            dir_where(root, &[root.join("deep/a/b")], &["lib", "opt/lib"], exists),
+            Some("deep/a/b".to_string())
+        );
+        assert_eq!(
+            dir_where(root, &[root.join("ghost")], &["missing", "opt/lib"], exists),
+            Some("opt/lib".to_string())
+        );
+        assert_eq!(
+            dir_where(
+                root,
+                &[PathBuf::from("/elsewhere/lib")],
+                &["missing"],
+                exists
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dev_tree_wants_what_it_does_not_carry() {
+        let work = std::env::temp_dir().join(format!("onelf-devwanted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let farm = work.join("farm");
+        let set = work.join("set");
+        std::fs::create_dir_all(&farm).unwrap();
+        std::fs::create_dir_all(set.join("lib")).unwrap();
+        std::os::unix::fs::symlink("/real/libfarm.so.1", farm.join("libfarm.so")).unwrap();
+        std::fs::write(set.join("lib/libset.so.1"), "elf").unwrap();
+
+        let links = wanted_from(Some(&farm), std::slice::from_ref(&set), &HashSet::new());
+        assert_eq!(
+            links.get("libfarm.so"),
+            Some(&PathBuf::from("/real/libfarm.so.1"))
+        );
+        assert_eq!(links.get("libset.so.1"), Some(&set.join("lib/libset.so.1")));
+
+        let carried = HashSet::from(["libfarm.so".to_string()]);
+        let links = wanted_from(Some(&farm), std::slice::from_ref(&set), &carried);
+        assert!(!links.contains_key("libfarm.so"));
+        assert!(links.contains_key("libset.so.1"));
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

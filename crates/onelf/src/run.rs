@@ -2,9 +2,14 @@
 //!
 //! If the AppDir has an `onelf.toml`, use it for entrypoint/args/working-dir.
 //! Otherwise auto-discover a single binary under `bin/` and run with defaults.
-//! The shared runtime machinery applies the same environment a packed launch
-//! applies, and the entrypoint is exec'd directly. No packing and no release
-//! executable involved.
+//! The launch runs from a prepared private development view: the tree is
+//! staged once, without compression, into a per-view directory under the
+//! cache root, and reused untouched while nothing that changes what it
+//! shows or restores has changed. The staged view carries the evaluated
+//! runtime mappings in the generated file the payload constructor reads
+//! back, the library links the launch resolved, and the recipe's
+//! absolute-path overlays, so the environment the entrypoint starts with
+//! is the one a packed launch starts with.
 //!
 //! `--bundle` assembles through the same machinery a build uses and
 //! prepares its launch through the shared runtime support: the recipe's
@@ -13,6 +18,8 @@
 //! build are acquired by the shared store with the CLI's own HTTPS
 //! client, and the launch resolves against what was acquired.
 
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -95,7 +102,6 @@ pub fn run(
     if let Some(loaded) = &found {
         reject_library_search_env(&loaded.recipe.env)?;
     }
-    let recipe_env = found.as_ref().map(|l| l.recipe.env.clone());
 
     let mut assembled: Option<Assembled> = None;
     if run_bundle {
@@ -118,11 +124,14 @@ pub fn run(
         )?,
     };
 
+    // An incomplete tree is named as such, not left to a deep error
+    // from a launch against a target that does not exist.
     let target = dir.join(&ep_path);
     if !target.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("entrypoint target not found: {}", target.display()),
+        return Err(missing_target_error(
+            &dir,
+            &ep_path,
+            found.as_ref().map(|l| &l.recipe),
         ));
     }
 
@@ -202,31 +211,71 @@ pub fn run(
         eprintln!("onelf run: resolver: cannot order {name}; keeping the bundled copy");
     }
 
-    let requested_cwd = match working_dir {
-        WorkingDir::PackageRoot => Some(dir.clone()),
-        WorkingDir::EntrypointParent => target.parent().map(Path::to_path_buf),
-        WorkingDir::Inherit => None,
+    // The effective links the view must show: the resolver's farm and
+    // the sets, less what the tree already carries in that directory,
+    // placed where the entrypoint's own run path looks first.
+    let runpath_dirs = onelf_rt::links::origin_runpath(&target);
+    let link_dir = onelf_rt::links::dir_where(&dir, &runpath_dirs, &lib_dir_strs, |rel| {
+        dir.join(rel).is_dir()
+    });
+    let links = match &link_dir {
+        Some(rel) => onelf_rt::links::wanted_from(
+            resolution.farm.as_deref(),
+            &set_roots,
+            &carried_names(&dir.join(rel)),
+        ),
+        None => onelf_rt::links::Links::new(),
     };
 
-    // As the packed runtime does: the target's own path, unless the
-    // entrypoint is named apart from it and a multicall binary needs
-    // the name.
+    // The launch declarations the recipe makes, read from the assembly
+    // request a build would pack from when one was staged, so a
+    // development launch sees exactly the declarations a build packs.
+    let (recipe_env, declared_paths, declared_preload, needs_setuid) = match &assembled {
+        Some(a) => (
+            a.request.env.clone(),
+            a.request.paths.clone(),
+            a.request.preload.clone(),
+            a.request.package.needs_setuid,
+        ),
+        None => match found.as_ref() {
+            Some(l) => (
+                l.recipe
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                l.recipe
+                    .paths
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                l.recipe.preload.clone(),
+                l.recipe.package.needs_setuid,
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), false),
+        },
+    };
+    let env_data = env_bytes(&recipe_env);
+
+    // The argv0 decision, taken once for the record pass and the launch
+    // pass alike: the tree the view stages is a copy, so every path the
+    // record names in AppDir form reads the same entry through the view.
     let argv0 = match target.to_str() {
         Some(path) if target.file_name() == Some(ep_name.as_ref()) => path,
         _ => ep_name.as_str(),
     };
 
-    // The launch environment, applied by the same functions a packed
-    // launch runs: the launch variables and the framework mappings and
-    // hooks, then the recipe's own settings, then the restoration record
-    // that keeps the caller's original values for the host programs the
-    // app spawns. The returned search path names the farm, the AppDir's
-    // own directories and the sets, never the caller's inherited value.
+    // Pass one, against the AppDir: apply the same machinery a packed
+    // launch applies, then encode what it changed into the per-view
+    // environment input. This is the generation a build would emit from
+    // the same evaluated mappings, and this process ends the pass as
+    // plain a CLI as it started.
+    let base_env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
     let dir_str = dir.to_string_lossy().into_owned();
     let target_str = target.to_string_lossy().into_owned();
-    let lib_path = onelf_rt::env::setup_env(
+    let _ = onelf_rt::env::setup_env(
         &dir_str,
-        &ep_name,
+        argv0,
         &target_str,
         &ep_name,
         "dev",
@@ -237,14 +286,127 @@ pub fn run(
         &set_lib_dirs,
         &set_roots,
     );
-    if let Some(env) = &recipe_env {
-        let mut data = Vec::new();
-        for (key, value) in env {
-            data.extend_from_slice(format!("{key}={value}\n").as_bytes());
-        }
-        onelf_rt::env::apply_custom_env(&data, &dir_str);
-    }
+    onelf_rt::env::apply_custom_env(&env_data, &dir_str);
     onelf_rt::hostenv::record_host_env(&dir, &set_roots);
+    let applied_env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    let assignments =
+        onelf_rt::env::view_env_assignments(&dir, &lib_dir_strs, &set_lib_dirs, &set_roots);
+    let view_record = onelf_rt::env::encode_view_env(&base_env, &applied_env, &assignments)
+        .map_err(|e| io::Error::other(format!("the generated environment input is {e}")))?;
+    restore_env(&base_env, &applied_env);
+
+    // The prepared private development view: identified by everything
+    // that changes what it shows or restores, built once, and reused
+    // untouched until one of those inputs changes.
+    let tree_id = tree_digest(&dir)?;
+    let pins = onelf_rt::sets::pins();
+    let inputs = onelf_rt::links::view::ViewInputs {
+        uid: rustix::process::getuid().as_raw(),
+        package: &tree_id,
+        metadata: None,
+        pins: &pins,
+        policy,
+        host_libc: false,
+        placement: onelf_rt::links::view::Placement::Tree,
+        loader: resolution.host_interp.as_ref().map(|p| p.as_os_str()),
+        entrypoint: Some(ep_name.as_str()),
+        links: &links,
+        runtime_env: &view_record,
+        root: dir.as_os_str(),
+    };
+    let identity = onelf_rt::links::view::ViewIdentity::new(&inputs).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "this launch's generated environment input is beyond what a development view records",
+        )
+    })?;
+
+    let store = view_store()?;
+    let view_name = onelf_rt::links::view::dir_name(identity.key()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the view identity names no directory",
+        )
+    })?;
+    let view = store.join(view_name);
+    let lease_path = onelf_rt::links::view::lease_lock_path(&view)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the view names no lease"))?;
+    let lease = onelf_rt::paths::open_lock_inheritable(&lease_path)?;
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockShared)
+        .map_err(|e| io::Error::other(format!("the view lease: {e}")))?;
+
+    let paths_bytes = paths_file_bytes(&declared_paths);
+    let published = onelf_rt::links::view::ensure_view(&store, &identity, |staging| {
+        stage_tree(staging, &dir)?;
+        let expanded = expand_view_roots(&view_record, dir.as_os_str(), view.as_os_str());
+        staging.write_file(onelf_rt::env::VIEW_ENV_FILE, &expanded, 0o644)?;
+        if let Some(rel) = &link_dir {
+            staging.place_free_links(rel, &links)?;
+        }
+        if !paths_bytes.is_empty() {
+            staging.write_file(onelf_rt::hostpaths::PATHS_FILE, &paths_bytes, 0o644)?;
+        }
+        if needs_setuid {
+            staging.write_file(".onelf/needs-setuid", b"1\n", 0o644)?;
+        }
+        Ok(Some(expanded))
+    })?;
+
+    // Pass two, against the view: the same machinery, applied to the
+    // prepared tree the entrypoint actually runs from.
+    let view_root = published.dir().to_path_buf();
+    let view_str = view_root.to_string_lossy().into_owned();
+    let view_target = view_root.join(&ep_path);
+    let view_target_str = view_target.to_string_lossy().into_owned();
+    let lib_path = onelf_rt::env::setup_env(
+        &view_str,
+        argv0,
+        &view_target_str,
+        &ep_name,
+        "dev",
+        &lib_subpath,
+        &view_target_str,
+        resolution.farm.as_deref(),
+        pinned_gl.as_ref().map(|(root, _)| root.as_path()),
+        &set_lib_dirs,
+        &set_roots,
+    );
+    onelf_rt::env::apply_custom_env(&env_data, &view_str);
+    onelf_rt::hostenv::record_host_env(&view_root, &set_roots);
+
+    // Capability diagnostics, stated outright: a development launch
+    // carries no packaged constructor, so the recipe's preload list is
+    // not opened, and only the initial environment is prepared, so a
+    // re-exec that clears the environment starts outside the prepared
+    // view. Neither is promised silently.
+    if !declared_preload.is_empty() {
+        eprintln!(
+            "onelf run: the recipe's preload list is opened by the packaged constructor, \
+             which a development launch does not carry"
+        );
+    }
+    eprintln!(
+        "onelf run: a development launch prepares the initial environment only; \
+         a re-exec that clears the environment is not hooked"
+    );
+    if !declared_paths.is_empty() {
+        if onelf_rt::hostpaths::apply(&view_root) {
+            eprintln!(
+                "onelf run: the view's directories answer for the absolute paths the recipe built with"
+            );
+        } else {
+            eprintln!(
+                "onelf run: the recipe's absolute paths are not overlaid: this launch could not \
+                 make the view's directories answer for them, so the application reads the host's"
+            );
+        }
+    }
+
+    let requested_cwd = match working_dir {
+        WorkingDir::PackageRoot => Some(view_root.clone()),
+        WorkingDir::EntrypointParent => view_target.parent().map(Path::to_path_buf),
+        WorkingDir::Inherit => None,
+    };
 
     // A bare kernel exec is given the search path only when the target's
     // own metadata cannot reach what it names: without a `$ORIGIN` run
@@ -253,13 +415,12 @@ pub fn run(
     // reaches them through its links instead, which is why its fallback
     // gate is the run path alone.
     let outside_runpath = resolution.farm.is_some() || !set_lib_dirs.is_empty();
-    let kernel_lib_path = (!lib_path.is_empty()
-        && (outside_runpath || !has_origin_runpath(&target)))
-    .then(|| lib_path.clone());
+    let kernel_lib_path = (!lib_path.is_empty() && (outside_runpath || runpath_dirs.is_empty()))
+        .then(|| lib_path.clone());
 
     let mut cmd = build_exec_command(
-        &target,
-        &dir,
+        &view_target,
+        &view_root,
         &lib_path,
         kernel_lib_path.as_deref(),
         argv0,
@@ -275,6 +436,10 @@ pub fn run(
         );
         cmd.current_dir(c);
     }
+
+    // The lease stays held through the exec, so the view backs a live
+    // process the moment the entrypoint starts.
+    drop(lease);
 
     // exec never returns on success.
     let err = cmd.exec();
@@ -302,6 +467,212 @@ fn reject_library_search_env(env: &std::collections::BTreeMap<String, String>) -
         }
     }
     Ok(())
+}
+
+/// The recipe's `[env]` table as the constructor reads it, keys in the
+/// sorted order the emitted record keeps.
+fn env_bytes(env: &[(String, String)]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (key, value) in env {
+        data.extend_from_slice(format!("{key}={value}\n").as_bytes());
+    }
+    data
+}
+
+/// The absolute-path overlays as the runtime reads them: one
+/// `ABSOLUTE<tab>RELATIVE` line per pair, where the relative path names
+/// the same layout inside the view as inside the AppDir.
+fn paths_file_bytes(pairs: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (abs, rel) in pairs {
+        out.extend_from_slice(format!("{abs}\t{rel}\n").as_bytes());
+    }
+    out
+}
+
+/// The names the tree itself has in `dir`, a path inside the AppDir:
+/// everything staged there under its own name, of any kind, so nothing
+/// of the tree is shadowed or taken for a link a launch placed.
+fn carried_names(dir: &Path) -> HashSet<String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect()
+}
+
+/// Undo one application pass: every variable the pass took from the
+/// caller is given back, every one it added is removed.
+///
+/// The pass ran the shared machinery on this process, as a packed launch
+/// does on the payload's process; a development run has more CLI work
+/// after it, and its own rules apply to that, not the entrypoint's. This
+/// runs single-threaded, before any thread exists to observe the
+/// intermediate states.
+fn restore_env(base: &BTreeMap<OsString, OsString>, applied: &BTreeMap<OsString, OsString>) {
+    for (name, value) in base {
+        if applied.get(name) != Some(value) {
+            // SAFETY: single-threaded, between the two application passes
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+    for name in applied.keys() {
+        if !base.contains_key(name) {
+            // SAFETY: single-threaded, between the two application passes
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+}
+
+/// The development tree's content identity: a digest over every entry's
+/// relative path, kind, link target where one exists, and, for regular
+/// files, mode, size, timestamps and device and inode numbers. A tree
+/// whose content changed in any way digests differently; one that only
+/// moved keeps its digest.
+fn tree_digest(root: &Path) -> io::Result<[u8; 32]> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut hasher = blake3::Hasher::new();
+    for entry in jwalk::WalkDir::new(root).skip_hidden(false).sort(true) {
+        let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("the staged tree escapes its root"))?;
+        hasher.update(rel.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        let kind = entry.file_type();
+        if kind.is_dir() {
+            hasher.update(b"d");
+        } else if kind.is_symlink() {
+            hasher.update(b"l");
+            let target = std::fs::read_link(entry.path())?;
+            hasher.update(target.as_os_str().as_encoded_bytes());
+            hasher.update(b"\0");
+        } else if kind.is_file() {
+            hasher.update(b"f");
+            let md = std::fs::symlink_metadata(entry.path())?;
+            hasher.update(&md.permissions().mode().to_le_bytes());
+            hasher.update(&md.len().to_le_bytes());
+            hasher.update(&md.mtime().to_le_bytes());
+            hasher.update(&md.mtime_nsec().to_le_bytes());
+            hasher.update(&md.dev().to_le_bytes());
+            hasher.update(&md.ino().to_le_bytes());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: not a regular file, directory or symlink",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Copy the development tree into `staging` for publication: directories
+/// created, files hardlinked in and copied where the tree and the view
+/// store live on different filesystems, symlinks remade inside the view,
+/// and anything else refused with the entry named.
+fn stage_tree(staging: &onelf_rt::links::view::Staging, root: &Path) -> io::Result<()> {
+    for entry in jwalk::WalkDir::new(root).skip_hidden(false).sort(true) {
+        let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("the staged tree escapes its root"))?;
+        let rel = rel.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: not a UTF-8 path", path.display()),
+            )
+        })?;
+        if rel.is_empty() {
+            continue;
+        }
+        let kind = entry.file_type();
+        if kind.is_dir() {
+            std::fs::create_dir_all(staging.dir().join(rel))?;
+        } else if kind.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            let target = target.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: not a UTF-8 symlink target", entry.path().display()),
+                )
+            })?;
+            staging.symlink(rel, target)?;
+        } else if kind.is_file() {
+            if staging.hardlink(&entry.path(), rel).is_err() {
+                std::fs::copy(entry.path(), staging.dir().join(rel))?;
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: not a regular file, directory or symlink",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The environment input as it is finally written into the view: every
+/// occurrence of the AppDir replaced by the view that stages the same
+/// entries, the way a packed launch's record names its own tree.
+fn expand_view_roots(bytes: &[u8], from: &OsStr, to: &OsStr) -> Vec<u8> {
+    let (from, to) = (from.as_encoded_bytes(), to.as_encoded_bytes());
+    if from.is_empty() || from == to {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(from.len()).position(|w| w == from) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// The private store of prepared development views, under the cache root
+/// the packed forms share and created `0700`: every view carries a
+/// record of the caller's environment, so nothing here is shared.
+fn view_store() -> io::Result<PathBuf> {
+    let root = layout::resolve_root(rustix::process::getuid().as_raw(), None).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no safe cache directory (set XDG_CACHE_HOME or HOME)",
+        )
+    })?;
+    let store = root.join("views");
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(&store) {
+        Ok(()) => Ok(store),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(store),
+        Err(e) => Err(e),
+    }
+}
+
+/// The entrypoint target's error for a directory that is not a prepared
+/// tree: what is missing, and the assembly that would have staged it.
+fn missing_target_error(dir: &Path, ep_path: &str, staged: Option<&recipe::Recipe>) -> io::Error {
+    let target = dir.join(ep_path);
+    let stages = staged.is_some_and(|r| r.input.is_some() || r.sysroot.is_some());
+    let hint = if stages {
+        " (the recipe stages its contents: run with --bundle, or build first)"
+    } else {
+        ""
+    };
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("entrypoint target not found: {}{hint}", target.display()),
+    )
 }
 
 /// Pick the entrypoint an assembled launch runs: the `--command`
@@ -698,24 +1069,6 @@ fn build_exec_command(
         cmd.env("LD_LIBRARY_PATH", path);
     }
     Ok(cmd)
-}
-
-/// Whether the target's own metadata walks to its libraries from the
-/// binary's location: a `$ORIGIN` entry on DT_RPATH or DT_RUNPATH. Such
-/// a binary needs no search path from the launch, and nothing is
-/// exported for it.
-fn has_origin_runpath(target: &Path) -> bool {
-    let Ok(data) = std::fs::read(target) else {
-        return false;
-    };
-    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
-        return false;
-    };
-    elf.rpaths
-        .iter()
-        .chain(elf.runpaths.iter())
-        .flat_map(|p| p.split(':'))
-        .any(|entry| entry.starts_with("$ORIGIN") || entry.starts_with("${ORIGIN}"))
 }
 
 /// Read PT_INTERP from an ELF file. Returns None for non-ELF or missing interp.
