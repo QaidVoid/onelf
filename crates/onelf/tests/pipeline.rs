@@ -12401,6 +12401,311 @@ fn a_set_pins_without_a_sysroot() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Compile one shared object with a fixed soname into a hand-made set
+/// tree, the shape `pack-set` packs without a sysroot. `None` when the
+/// compile could not run, which on a machine without a C compiler is
+/// the documented soft-skip.
+fn set_library(td: &Path, tag: &str, soname: &str, body: &str) -> Option<PathBuf> {
+    let tree = td.join(format!("{tag}-tree"));
+    std::fs::create_dir_all(tree.join("lib")).unwrap();
+    let src = td.join(format!("{tag}.c"));
+    write(&src, body);
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            &format!("-Wl,-soname,{soname}"),
+            src.to_str().unwrap(),
+        ],
+        &tree.join("lib").join(format!("{soname}.0.0")),
+    ) {
+        return None;
+    }
+    std::os::unix::fs::symlink(format!("{soname}.0.0"), tree.join("lib").join(soname)).unwrap();
+    Some(tree)
+}
+
+/// Compile a private plugin with no soname into a set tree's plugin
+/// directory.
+fn set_plugin(td: &Path, tag: &str, body: &str) {
+    let tree = td.join(format!("{tag}-tree"));
+    std::fs::create_dir_all(tree.join("lib/plugins")).unwrap();
+    let src = td.join(format!("{tag}-plugin.c"));
+    write(&src, body);
+    assert!(cc_with(
+        &["-shared", "-fPIC", src.to_str().unwrap()],
+        &tree.join("lib/plugins/helper.so"),
+    ));
+}
+
+/// Pack a hand-made set tree into the set artifact `pack-set` emits and
+/// return the pin and the file a recipe records.
+fn pack_set(td: &Path, tag: &str, name: &str) -> (String, PathBuf) {
+    let tree = td.join(format!("{tag}-tree"));
+    let out = td.join(format!("{tag}.onelf"));
+    let o = run_onelf(
+        &[
+            "sysroot",
+            "pack-set",
+            tree.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--name",
+            name,
+        ],
+        None,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hash = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("blake3 = \"")
+                .map(|h| h.trim_end_matches('"').to_string())
+        })
+        .expect("the hash to pin");
+    (hash, out)
+}
+
+/// A set-only recipe selecting `sets` by declaration, over an AppDir
+/// whose command needs nothing else.
+fn set_only_recipe(dir: &Path, sets: &str) {
+    write(
+        &dir.join("onelf.toml"),
+        &format!("[package]\ncommand = \"bin/app\"\nmtime = 0\n{sets}"),
+    );
+}
+
+/// An application needing sonames that exist in no tree, linked against
+/// every set tree that supplies one.
+fn set_needing_app(td: &Path, dir: &Path, trees: &[&Path], sonames: &[&str]) -> bool {
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let mut decls = String::new();
+    for soname in sonames {
+        let stem = soname.trim_end_matches(".so.1");
+        decls.push_str(&format!("int {stem}_value(void);\n"));
+    }
+    let mut calls = String::new();
+    for soname in sonames {
+        let stem = soname.trim_end_matches(".so.1");
+        calls.push_str(&format!(" + {stem}_value()"));
+    }
+    write(
+        &td.join("app.c"),
+        &format!(
+            "#include <stdio.h>\n{decls}int main(void){{printf(\"value=%d\\n\", 0{calls});return 0;}}\n"
+        ),
+    );
+    let mut args = vec![td.join("app.c").to_str().unwrap().to_string()];
+    for tree in trees {
+        args.push(format!("-L{}", tree.join("lib").display()));
+    }
+    for soname in sonames {
+        args.push(format!("-l:{soname}"));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    cc_with(&refs, &dir.join("bin/app"))
+}
+
+/// Two declared sets exporting one soname with different pins cannot be
+/// selected together, and the provider audit says so before the
+/// assembly writes anything: no set record, no package, and a tree
+/// exactly as it stood.
+#[test]
+fn differing_set_exports_stop_the_build_before_any_write() {
+    let td = workdir("setdiff");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libshared.so.1",
+        "int libshared_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    // The second build differs in its compiled bytes, so its export is
+    // a different provider of the soname.
+    set_library(
+        &td,
+        "beta",
+        "libshared.so.1",
+        "int libshared_value(void){return 2;}\n",
+    )
+    .expect("compile beta");
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+    assert_ne!(hash_a, hash_b, "different builds pin differently");
+
+    let dir = td.join("app");
+    assert!(set_needing_app(&td, &dir, &[&tree_a], &["libshared.so.1"]));
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.alpha]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n\n[sysroot.sets.beta]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_b}\"\n",
+            set_a.display(),
+            set_b.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("entrypoint 'app'"), "{stderr}");
+    assert!(stderr.contains("libshared.so.1"), "{stderr}");
+    assert!(stderr.contains("alpha"), "{stderr}");
+    assert!(stderr.contains("beta"), "{stderr}");
+    assert!(stderr.contains("exported with different bytes"), "{stderr}");
+    assert!(!dir.join("app.onelf").exists(), "{stderr}");
+    assert!(
+        !dir.join(".onelf/sets").exists(),
+        "the audit runs before the assembly writes: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two builds whose exported library carries the same bytes, however
+/// their artifacts and pins differ, are one provider: the selection is
+/// accepted and both sets are recorded.
+#[test]
+fn identical_set_exports_deduplicate() {
+    let td = workdir("setdedup");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libshared.so.1",
+        "int libshared_value(void){return 7;}\n",
+    ) else {
+        return;
+    };
+    let tree_b = set_library(
+        &td,
+        "beta",
+        "libshared.so.1",
+        "int libshared_value(void){return 7;}\n",
+    )
+    .expect("compile beta");
+    // The exported library is the same bytes in both trees, so the two
+    // builds differ only in the set name their indexes record.
+    std::fs::copy(
+        tree_a.join("lib/libshared.so.1.0.0"),
+        tree_b.join("lib/libshared.so.1.0.0"),
+    )
+    .unwrap();
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+    assert_ne!(hash_a, hash_b, "different artifacts pin differently");
+
+    let dir = td.join("app");
+    assert!(set_needing_app(&td, &dir, &[&tree_a], &["libshared.so.1"]));
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.alpha]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n\n[sysroot.sets.beta]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_b}\"\n",
+            set_a.display(),
+            set_b.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let sets = std::fs::read_to_string(dir.join(".onelf/sets")).unwrap();
+    assert!(
+        sets.contains("[alpha]") && sets.contains("[beta]"),
+        "{sets}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two sets whose private plugins share a basename, and whose pins
+/// differ, export only their own sonames: the basename match alone
+/// never rejects the selection.
+#[test]
+fn private_set_plugins_may_share_a_basename() {
+    let td = workdir("setplugins");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "liba.so.1",
+        "int liba_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    let tree_b = set_library(
+        &td,
+        "beta",
+        "libb.so.1",
+        "int libb_value(void){return 2;}\n",
+    )
+    .expect("compile beta");
+    set_plugin(&td, "alpha", "int alpha_plugin(void){return 1;}\n");
+    set_plugin(&td, "beta", "int beta_plugin(void){return 2;}\n");
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+    assert_ne!(hash_a, hash_b, "different builds pin differently");
+
+    let dir = td.join("app");
+    assert!(set_needing_app(
+        &td,
+        &dir,
+        &[&tree_a, &tree_b],
+        &["liba.so.1", "libb.so.1"]
+    ));
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.alpha]\npackages = [\"liba\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n\n[sysroot.sets.beta]\npackages = [\"libb\"]\nurl = \"file://{}\"\nblake3 = \"{hash_b}\"\n",
+            set_a.display(),
+            set_b.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("liba.so.1"), "{stderr}");
+    assert!(stderr.contains("libb.so.1"), "{stderr}");
+    assert!(!stderr.contains("whose contents differ"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A library the application carries itself is the provider that
+/// counts: a selected set exporting the same soname is shadowed, and
+/// the build accepts the pair.
+#[test]
+fn an_app_owned_provider_shadows_its_set_copies() {
+    let td = workdir("setowned");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libshared.so.1",
+        "int libshared_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    assert!(set_needing_app(&td, &dir, &[&tree_a], &["libshared.so.1"]));
+    std::fs::copy(
+        tree_a.join("lib/libshared.so.1.0.0"),
+        dir.join("lib/libshared.so.1"),
+    )
+    .unwrap();
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.alpha]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n",
+            set_a.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        dir.join("lib/libshared.so.1").is_file(),
+        "the application's own provider stays"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// `[bundle] skip` keeps its meaning with sets pinned and no sysroot: the
 /// AppDir is packed exactly as it stands, nothing is scanned or added,
 /// and only the set records the runtime fetches by are written.

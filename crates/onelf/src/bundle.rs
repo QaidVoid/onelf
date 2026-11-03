@@ -29,6 +29,8 @@ use std::process::Command;
 
 use onelf_sysroot::{Database, PlatformLine, Policy};
 
+use crate::recipe;
+
 pub(crate) mod ui;
 pub(crate) use ui::{color, format_size};
 mod datadirs;
@@ -1861,6 +1863,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
     }
 
+    // The provider audit runs before anything is written, so a pair of
+    // declared sets that cannot be selected together stops the build
+    // with the tree exactly as it stood.
+    if !opts.sets.is_empty() && !opts.dry_run {
+        audit_declared_sets(opts)?;
+    }
+
     let mut host_files: HashSet<String> = HashSet::new();
     let mut set_sonames: HashSet<String> = HashSet::new();
     let mut sysroot_universe: Option<sysroot::SysrootUniverse> = None;
@@ -3457,6 +3466,383 @@ fn first_failure<'a>(
         !explicit.contains(rel)
     });
     ranked.into_iter().next()
+}
+
+/// Findings the provider audit reported. Bounded: the failure shows the
+/// first few and counts the rest, so a broken recipe cannot flood the
+/// terminal.
+const SHOWN_PROVIDER_FINDINGS: usize = 8;
+
+/// Providers listed per collision finding before the rest are counted.
+const SHOWN_COLLIDING_PROVIDERS: usize = 3;
+
+/// One entrypoint the assembly audit covers: the name the manifest
+/// gives it, the executable in the tree its requirements root at, and
+/// the sets its recipe selects.
+///
+/// `path` is `None` when the audit covers the selection alone. The
+/// requirements of the entrypoint's objects are then not audited,
+/// because nothing roots them; the launch's provider view and its
+/// simultaneous-provider collisions still are, and a build can ask for
+/// that much before it has written anything, from inputs that exist
+/// before the assembly starts.
+#[derive(Debug, Clone)]
+pub struct AuditedEntrypoint {
+    /// The name the manifest gives the entrypoint.
+    pub name: String,
+    /// The entrypoint's executable, relative to the AppDir, when its
+    /// requirements are audited.
+    pub path: Option<PathBuf>,
+    /// The normalized selection the recipe declares for it.
+    pub selection: recipe::SetSelection,
+}
+
+/// Audit the required providers and the simultaneous set providers of
+/// every entrypoint given, against the assembled tree. Ok means every
+/// entrypoint's needs resolve inside the tree, its selected sets'
+/// verified exports, or the permitted host closure, and that no two of
+/// its selected sets export one loader-namespace name with different
+/// content. The audit reads the tree and the providers and writes
+/// nothing, so a caller may run it before the assembly touches the
+/// AppDir and fail without leaving a trace.
+///
+/// The audit is per entrypoint and never across them: a provider a
+/// selection does not name satisfies nothing, however many other
+/// entrypoints select it, and two selections that name different
+/// providers of one soname never conflict. Selected providers whose
+/// shared export hashes the same are one provider and deduplicate
+/// without a finding. A set exporting no soname, a private plugin say,
+/// contributes no export, so matching basenames across sets are never a
+/// collision. An object the tree itself carries outranks every set, and
+/// its satisfying the need ends the question.
+///
+/// A need the selection cannot supply is a failure naming the
+/// entrypoint, the requesting object, the soname, and, when some
+/// declared but unselected set exports that soname, that set. Two
+/// selected providers of one soname whose exports hash differently is a
+/// failure naming the entrypoint, the soname, and one provider from
+/// each side of the disagreement, with their pins.
+pub fn audit_entrypoint_providers(
+    directory: &Path,
+    lib_dir: &Path,
+    entrypoints: &[AuditedEntrypoint],
+    providers: &[sysroot::SetProvider],
+    host: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
+    let mut ordered: Vec<&AuditedEntrypoint> = entrypoints.iter().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut findings: Vec<String> = Vec::new();
+    for entrypoint in ordered {
+        match selected_providers(&entrypoint.selection, providers) {
+            Ok(selected) => {
+                findings.extend(provider_collisions(&entrypoint.name, &selected));
+                if let Some(path) = &entrypoint.path {
+                    findings.extend(unsatisfied_requirements(
+                        directory,
+                        lib_dir,
+                        path,
+                        &entrypoint.name,
+                        &selected,
+                        providers,
+                        host,
+                    ));
+                }
+            }
+            Err(name) => findings.push(format!(
+                "entrypoint '{}': the selection names set {name}, which the recipe \
+                 does not declare",
+                entrypoint.name
+            )),
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::from("provider audit failed:");
+    for finding in findings.iter().take(SHOWN_PROVIDER_FINDINGS) {
+        message.push_str("\n  ");
+        message.push_str(finding);
+    }
+    let hidden = findings.len().saturating_sub(SHOWN_PROVIDER_FINDINGS);
+    if hidden > 0 {
+        message.push_str(&format!("\n  and {hidden} more findings"));
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+/// The declared providers a selection names, in canonical order by set
+/// name. A name the recipe never declares is the error, since a launch
+/// would refuse the selection for the same reason.
+fn selected_providers<'a>(
+    selection: &recipe::SetSelection,
+    providers: &'a [sysroot::SetProvider],
+) -> Result<Vec<&'a sysroot::SetProvider>, String> {
+    match selection {
+        recipe::SetSelection::All => Ok(providers.iter().collect()),
+        recipe::SetSelection::Names(names) => {
+            let mut selected = Vec::with_capacity(names.len());
+            for name in names {
+                match providers.iter().find(|p| &p.set == name) {
+                    Some(provider) => selected.push(provider),
+                    None => return Err(name.clone()),
+                }
+            }
+            selected.sort_by(|a, b| a.set.cmp(&b.set));
+            Ok(selected)
+        }
+    }
+}
+
+/// The collision findings one entrypoint's simultaneous providers make:
+/// sonames exported by two or more of them whose exports hash
+/// differently. Exports that hash the same are the same bytes however
+/// many declarations repeat them, and deduplicate silently; the pins in
+/// a finding name the builds whose bytes differ.
+fn provider_collisions(entrypoint: &str, selected: &[&sysroot::SetProvider]) -> Vec<String> {
+    let mut by_export: std::collections::BTreeMap<
+        &str,
+        Vec<(&sysroot::SetProvider, &sysroot::SetExport)>,
+    > = std::collections::BTreeMap::new();
+    for provider in selected {
+        for export in &provider.exports {
+            by_export
+                .entry(export.soname.as_str())
+                .or_default()
+                .push((provider, export));
+        }
+    }
+    let mut findings = Vec::new();
+    for (soname, mut exports) in by_export {
+        // One group per content hash, so a finding names a set from
+        // each side of the disagreement and identical providers stay
+        // out of it.
+        exports.sort_by(|a, b| (&a.1.blake3, &a.0.set).cmp(&(&b.1.blake3, &b.0.set)));
+        let mut groups: Vec<(&[u8; 32], &sysroot::SetProvider)> = Vec::new();
+        for (provider, export) in &exports {
+            match groups.first() {
+                Some((hash, _)) if *hash == &export.blake3 => {}
+                _ => groups.push((&export.blake3, provider)),
+            }
+        }
+        if groups.len() < 2 {
+            continue;
+        }
+        let listed: Vec<String> = groups
+            .iter()
+            .take(SHOWN_COLLIDING_PROVIDERS)
+            .map(|(_, p)| format!("{} (blake3 {})", p.set, short_pin(&p.pin)))
+            .collect();
+        let more = groups.len().saturating_sub(SHOWN_COLLIDING_PROVIDERS);
+        let extra = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        findings.push(format!(
+            "entrypoint '{entrypoint}': {soname} is exported with different bytes by \
+             sets {}{extra}, so they cannot be selected together",
+            listed.join(" and ")
+        ));
+    }
+    findings
+}
+
+/// A pin a finding can name: the head of the digest and its length, so
+/// two pins that differ in the head still read apart.
+fn short_pin(pin: &str) -> String {
+    let head: String = pin.chars().take(12).collect();
+    format!("{head}..({} chars)", pin.chars().count())
+}
+
+/// The requirements one entrypoint's executable and the objects it
+/// reaches ask for and the tree cannot resolve: every `DT_NEEDED` that
+/// names neither the object's own directory under the library root, the
+/// library directory, the `../lib` beside the object, a run path inside
+/// the tree, nor the dynamic loader, with the object that asked for it.
+/// Following a resolved need visits the object it named, so the closure
+/// is the entrypoint's own, never the whole tree's, which is what keeps
+/// one entrypoint's selection from answering for another's needs.
+fn entrypoint_requirements(
+    directory: &Path,
+    lib_root: &Path,
+    entry: &Path,
+) -> Vec<(String, String)> {
+    let lib_names = names_in(lib_root);
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: std::collections::VecDeque<PathBuf> =
+        std::collections::VecDeque::from([entry.to_path_buf()]);
+    let mut requirements: Vec<(String, String)> = Vec::new();
+    while let Some(object) = queue.pop_front() {
+        let Ok(real) = fs::canonicalize(&object) else {
+            continue;
+        };
+        if !seen.insert(real.clone()) {
+            continue;
+        }
+        let Ok(needed) = parse_needed(&real) else {
+            continue;
+        };
+        let parent = real.parent().unwrap_or(directory).to_path_buf();
+        // An object under the library directory resolves against its own
+        // directory, the way its siblings do; elsewhere, the `../lib`
+        // beside the object is the convention the bundled layout keeps.
+        let parent_names = if parent.starts_with(lib_root) {
+            names_in(&parent)
+        } else {
+            HashSet::new()
+        };
+        let origin_names = names_in(&parent.join("../lib"));
+        let mut run_dirs: Vec<(PathBuf, HashSet<String>)> =
+            parse_rpaths_under(&real, Some(directory))
+                .into_iter()
+                .filter(|dir| dir.starts_with(directory))
+                .map(|dir| {
+                    let names = names_in(&dir);
+                    (dir, names)
+                })
+                .collect();
+        run_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        for soname in needed {
+            let bare = Path::new(&soname)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(soname.as_str());
+            if is_dynamic_loader(bare) {
+                continue;
+            }
+            let found = if parent_names.contains(bare) {
+                Some(parent.join(bare))
+            } else if lib_names.contains(bare) {
+                Some(lib_root.join(bare))
+            } else if origin_names.contains(bare) {
+                Some(parent.join("../lib").join(bare))
+            } else {
+                run_dirs
+                    .iter()
+                    .find(|(_, names)| names.contains(bare))
+                    .map(|(dir, _)| dir.join(bare))
+            };
+            match found {
+                Some(path) => queue.push_back(path),
+                None => {
+                    let rel = object
+                        .strip_prefix(directory)
+                        .unwrap_or(&object)
+                        .to_string_lossy()
+                        .into_owned();
+                    requirements.push((rel, soname));
+                }
+            }
+        }
+    }
+    requirements.sort();
+    requirements.dedup();
+    requirements
+}
+
+/// The file names a directory resolves to: an entry whose target is
+/// gone satisfies nothing, so a dangling soname link reads as absent,
+/// the way the loader sees it.
+fn names_in(dir: &Path) -> HashSet<String> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().exists())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect()
+}
+
+/// The findings for one entrypoint's requirements: a need the tree
+/// cannot resolve and its selection cannot supply is one line naming
+/// the entrypoint, the requesting object, the soname, and what was
+/// found instead, which is a declared set that exports the soname the
+/// selection left out, when there is one.
+fn unsatisfied_requirements(
+    directory: &Path,
+    lib_dir: &Path,
+    entry: &Path,
+    entrypoint: &str,
+    selected: &[&sysroot::SetProvider],
+    providers: &[sysroot::SetProvider],
+    host: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let resolved = directory.join(entry);
+    if !resolved.is_file() {
+        return vec![format!(
+            "entrypoint '{entrypoint}': {} is not in the tree",
+            entry.display()
+        )];
+    }
+    let lib_root = directory.join(lib_dir);
+    let requirements = entrypoint_requirements(directory, &lib_root, &resolved);
+    let mut findings = Vec::new();
+    for (object, soname) in requirements {
+        if selected
+            .iter()
+            .any(|p| p.exports.iter().any(|e| e.soname == soname))
+            || host(&soname)
+        {
+            continue;
+        }
+        let mut owners: Vec<&sysroot::SetProvider> = providers
+            .iter()
+            .filter(|p| p.exports.iter().any(|e| e.soname == soname))
+            .collect();
+        owners.sort_by(|a, b| a.set.cmp(&b.set));
+        let why = if owners.is_empty() {
+            "which nothing in the application, its selection, or the host line \
+             provides"
+                .to_string()
+        } else {
+            let names: Vec<&str> = owners.iter().map(|p| p.set.as_str()).collect();
+            format!(
+                "which {} exports and the entrypoint does not select",
+                names.join(" and ")
+            )
+        };
+        findings.push(format!(
+            "entrypoint '{entrypoint}': {object} needs {soname}: {why}"
+        ));
+    }
+    findings
+}
+
+/// Audit a build's declared sets before the assembly writes anything.
+///
+/// What the recipe declares is what every entrypoint launches with when
+/// its selection list is omitted, so two declared sets exporting one
+/// soname with different pins stop the build here, with both pins
+/// named, instead of writing a tree whose launch would refuse the same
+/// pair. A set whose exports cannot be verified claims nothing here and
+/// keeps its existing reporting, so a build that cannot reach a pinned
+/// build fails, when it fails, for the reason it always did. The
+/// per-object requirements of an entrypoint's own selection are audited
+/// by [`audit_entrypoint_providers`] once the resolved selection table
+/// reaches the build.
+fn audit_declared_sets(opts: &BundleOptions) -> io::Result<()> {
+    let (providers, _) = sysroot::audit_providers(&opts.sets);
+    let name = opts
+        .primary
+        .as_deref()
+        .or(opts.target.as_deref())
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("main")
+        .to_string();
+    audit_entrypoint_providers(
+        &opts.directory,
+        &opts.lib_dir,
+        &[AuditedEntrypoint {
+            name,
+            path: None,
+            selection: recipe::SetSelection::All,
+        }],
+        &providers,
+        &|_| false,
+    )
 }
 
 /// Pin a bundled file's mtime so repeated `bundle-libs` runs produce
@@ -5566,5 +5952,561 @@ mod catalog_coverage_tests {
             .expect("the carried snippet directory is anchored");
         assert!(host < carried, "{patched}");
         let _ = fs::remove_dir_all(&work);
+    }
+}
+
+#[cfg(test)]
+mod provider_audit_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onelf-audit-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Minimal ELF64 shared object carrying the `DT_NEEDED` entries
+    /// `needed` names and an optional `DT_SONAME`, so the audit walks
+    /// real objects without a toolchain.
+    fn dyn_object(needed: &[&str], soname: Option<&str>) -> Vec<u8> {
+        let mut strtab = vec![0u8];
+        let offset = |name: &str, strtab: &mut Vec<u8>| {
+            let at = strtab.len();
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+            at as u64
+        };
+        let mut dyns: Vec<(u64, u64)> = Vec::new();
+        dyns.push((5, 0));
+        dyns.push((10, 0));
+        for name in needed {
+            let at = offset(name, &mut strtab);
+            dyns.push((1, at));
+        }
+        if let Some(name) = soname {
+            let at = offset(name, &mut strtab);
+            dyns.push((14, at));
+        }
+        dyns.push((0, 0));
+        let dyn_off = 64 + 2 * 56;
+        let dyn_size = dyns.len() * 16;
+        let str_off = dyn_off + dyn_size;
+        let total = str_off + strtab.len();
+        dyns[0].1 = str_off as u64;
+        dyns[1].1 = strtab.len() as u64;
+
+        let mut elf = Vec::new();
+        elf.extend_from_slice(b"\x7fELF");
+        elf.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        elf.extend_from_slice(&3u16.to_le_bytes());
+        elf.extend_from_slice(&62u16.to_le_bytes());
+        elf.extend_from_slice(&1u32.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&64u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u32.to_le_bytes());
+        elf.extend_from_slice(&64u16.to_le_bytes());
+        elf.extend_from_slice(&56u16.to_le_bytes());
+        elf.extend_from_slice(&(2u16.to_le_bytes()));
+        elf.extend_from_slice(&[0u8; 6]);
+        elf.extend_from_slice(&1u32.to_le_bytes());
+        elf.extend_from_slice(&6u32.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&0u64.to_le_bytes());
+        elf.extend_from_slice(&(total as u64).to_le_bytes());
+        elf.extend_from_slice(&(total as u64).to_le_bytes());
+        elf.extend_from_slice(&0x1000u64.to_le_bytes());
+        elf.extend_from_slice(&2u32.to_le_bytes());
+        elf.extend_from_slice(&6u32.to_le_bytes());
+        for _ in 0..3 {
+            elf.extend_from_slice(&(dyn_off as u64).to_le_bytes());
+        }
+        elf.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+        elf.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+        elf.extend_from_slice(&8u64.to_le_bytes());
+        for (tag, value) in &dyns {
+            elf.extend_from_slice(&tag.to_le_bytes());
+            elf.extend_from_slice(&value.to_le_bytes());
+        }
+        elf.extend_from_slice(&strtab);
+        assert_eq!(elf.len(), total);
+        assert_eq!(parse_needed_bytes(&elf).unwrap(), needed);
+        let parsed = goblin::elf::Elf::parse(&elf).unwrap();
+        assert_eq!(parsed.soname, soname);
+        elf
+    }
+
+    /// The content hash a test export carries: the id in the first
+    /// byte, so two exports with the same id are "the same bytes" and
+    /// two with different ids are not.
+    fn content(id: u8) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[0] = id;
+        hash
+    }
+
+    fn provider(set: &str, pin: u64, exports: &[(&str, u8)]) -> sysroot::SetProvider {
+        sysroot::SetProvider {
+            set: set.to_string(),
+            pin: format!("{pin:064x}"),
+            exports: exports
+                .iter()
+                .map(|(soname, id)| sysroot::SetExport {
+                    soname: soname.to_string(),
+                    blake3: content(*id),
+                })
+                .collect(),
+        }
+    }
+
+    fn entrypoint(
+        name: &str,
+        path: Option<&str>,
+        selection: recipe::SetSelection,
+    ) -> AuditedEntrypoint {
+        AuditedEntrypoint {
+            name: name.to_string(),
+            path: path.map(PathBuf::from),
+            selection,
+        }
+    }
+
+    fn names(list: &[&str]) -> recipe::SetSelection {
+        recipe::SetSelection::Names(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn no_host(_soname: &str) -> bool {
+        false
+    }
+
+    /// The sonames the ELF objects under `root` export, each with the
+    /// content hash of the object exporting it: the same derivation the
+    /// set artifact's provider index and the audit's hashes follow,
+    /// against a plain tree.
+    fn tree_exports(root: &Path) -> Vec<sysroot::SetExport> {
+        let mut found: Vec<sysroot::SetExport> = jwalk::WalkDir::new(root)
+            .skip_hidden(false)
+            .sort(true)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| {
+                let data = fs::read(e.path()).ok()?;
+                let elf = goblin::elf::Elf::parse(&data).ok()?;
+                let soname = elf.soname?;
+                Some(sysroot::SetExport {
+                    soname: soname.to_string(),
+                    blake3: *blake3::hash(&data).as_bytes(),
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| (&a.soname, &a.blake3).cmp(&(&b.soname, &b.blake3)));
+        found.dedup();
+        found
+    }
+
+    /// `bin/cli` needs a soname only the `gui` set exports, and gets its
+    /// own selection only: the audit fails for the CLI naming the GUI
+    /// set, and never for the GUI, whose own selection supplies its own
+    /// need. Naming both sets supplies the CLI.
+    #[test]
+    fn a_gui_only_set_cannot_satisfy_the_cli_needs() {
+        let d = tmp("gui-cli");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/cli"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        fs::write(d.join("bin/gui"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![
+            provider("cli", 1, &[("libcli.so.1", 1)]),
+            provider("gui", 2, &[("libshared.so.1", 1)]),
+        ];
+        let entrypoints = vec![
+            entrypoint("cli", Some("bin/cli"), names(&["cli"])),
+            entrypoint("gui", Some("bin/gui"), names(&["gui"])),
+        ];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("entrypoint 'cli'"), "{text}");
+        assert!(text.contains("libshared.so.1"), "{text}");
+        assert!(text.contains("which gui exports"), "{text}");
+        assert!(!text.contains("entrypoint 'gui'"), "{text}");
+
+        // The same two entrypoints with the CLI naming both sets: its
+        // need is satisfied by its own selection, and nothing else
+        // stands in the way.
+        let entrypoints = vec![
+            entrypoint("cli", Some("bin/cli"), names(&["cli", "gui"])),
+            entrypoint("gui", Some("bin/gui"), names(&["gui"])),
+        ];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Two selected declarations pinning the same build are one
+    /// provider however they are named: no conflict, and the need they
+    /// both export is satisfied.
+    #[test]
+    fn identical_exports_deduplicate() {
+        let d = tmp("dedup");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![
+            provider("alpha", 1, &[("libshared.so.1", 1)]),
+            provider("beta", 1, &[("libshared.so.1", 1)]),
+        ];
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Two selected declarations pinning different builds but exporting
+    /// one soname is refused, naming both sets, whatever order the
+    /// selection read.
+    #[test]
+    fn differing_simultaneous_exports_fail_naming_both_sets() {
+        let d = tmp("diff");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![
+            provider("beta", 2, &[("libshared.so.1", 2)]),
+            provider("alpha", 1, &[("libshared.so.1", 1)]),
+        ];
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("entrypoint 'app'"), "{text}");
+        assert!(text.contains("libshared.so.1"), "{text}");
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("beta"), "{text}");
+        assert!(text.contains("exported with different bytes"), "{text}");
+        assert!(text.contains("cannot be selected together"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Two entrypoints whose selections never name the same set use
+    /// different providers of one soname without a conflict: each is
+    /// audited against its own selection alone.
+    #[test]
+    fn disjoint_selections_use_different_providers() {
+        let d = tmp("disjoint");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/cli"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        fs::write(d.join("bin/gui"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![
+            provider("alpha", 1, &[("libshared.so.1", 1)]),
+            provider("beta", 2, &[("libshared.so.1", 2)]),
+        ];
+        let entrypoints = vec![
+            entrypoint("cli", Some("bin/cli"), names(&["alpha"])),
+            entrypoint("gui", Some("bin/gui"), names(&["beta"])),
+        ];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Two set trees whose private plugins share a basename export only
+    /// their own sonames, so the basename adds nothing to the exports
+    /// and the two builds, pinning different bytes, still never
+    /// collide on it.
+    #[test]
+    fn private_plugin_basenames_are_not_collisions() {
+        let d = tmp("plugins");
+        let alpha = d.join("set-alpha");
+        let beta = d.join("set-beta");
+        for (set, soname) in [(&alpha, "liba.so.1"), (&beta, "libb.so.1")] {
+            fs::create_dir_all(set.join("lib/plugins")).unwrap();
+            fs::write(
+                set.join("lib/libcarried.so.1"),
+                dyn_object(&[], Some(soname)),
+            )
+            .unwrap();
+            fs::write(set.join("lib/plugins/helper.so"), dyn_object(&[], None)).unwrap();
+        }
+        let alpha_exports = tree_exports(&alpha);
+        let beta_exports = tree_exports(&beta);
+        assert_eq!(
+            alpha_exports
+                .iter()
+                .map(|e| e.soname.as_str())
+                .collect::<Vec<_>>(),
+            ["liba.so.1"]
+        );
+        assert_eq!(
+            beta_exports
+                .iter()
+                .map(|e| e.soname.as_str())
+                .collect::<Vec<_>>(),
+            ["libb.so.1"]
+        );
+
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(
+            d.join("bin/app"),
+            dyn_object(&["liba.so.1", "libb.so.1"], None),
+        )
+        .unwrap();
+        let providers = vec![
+            sysroot::SetProvider {
+                set: "alpha".to_string(),
+                pin: format!("{:064x}", 1u64),
+                exports: alpha_exports,
+            },
+            sysroot::SetProvider {
+                set: "beta".to_string(),
+                pin: format!("{:064x}", 2u64),
+                exports: beta_exports,
+            },
+        ];
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A library the tree itself carries satisfies the need, whether or
+    /// not a selected set also exports the soname: the application
+    /// outranks its sets. Take the copy away and the same need fails,
+    /// so the audit's answer came from the tree and nothing else.
+    #[test]
+    fn an_app_owned_provider_satisfies_the_requirement() {
+        let d = tmp("app-owned");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        fs::write(
+            d.join("lib/libshared.so.1"),
+            dyn_object(&[], Some("libshared.so.1")),
+        )
+        .unwrap();
+        let providers = vec![provider("alpha", 1, &[("libshared.so.1", 1)])];
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+
+        // The audit's answer came from the tree: take the app's copy
+        // away and a set that exports nothing cannot answer the need.
+        let providers = vec![provider("alpha", 1, &[])];
+        fs::remove_file(d.join("lib/libshared.so.1")).unwrap();
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        assert!(err.to_string().contains("libshared.so.1"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A selected set exporting `libshared.so.1` does not satisfy a
+    /// need for `libshared.so.2`: the version a need names is the one
+    /// that counts, and the failure names the entrypoint, the need, and
+    /// the set that holds the version the selection left out.
+    #[test]
+    fn an_insufficient_provider_version_fails_naming_what_was_found() {
+        let d = tmp("version");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/cli"), dyn_object(&["libshared.so.2"], None)).unwrap();
+        let providers = vec![
+            provider("cli", 1, &[("libshared.so.1", 1)]),
+            provider("gui", 2, &[("libshared.so.2", 2)]),
+        ];
+        let entrypoints = vec![entrypoint("cli", Some("bin/cli"), names(&["cli"]))];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("entrypoint 'cli'"), "{text}");
+        assert!(text.contains("libshared.so.2"), "{text}");
+        assert!(text.contains("which gui exports"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A need nothing declared exports fails naming the entrypoint, the
+    /// requesting object, and the soname, without inventing a provider.
+    #[test]
+    fn an_absent_provider_names_the_need_and_the_object() {
+        let d = tmp("absent");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libgone.so.1"], None)).unwrap();
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        let err = audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &[], &no_host)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("entrypoint 'app'"), "{text}");
+        assert!(text.contains("bin/app needs libgone.so.1"), "{text}");
+        assert!(text.contains("nothing in the application"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A resolved need is followed into the object it named, so the
+    /// closure is the entrypoint's own: the failure names the carried
+    /// library that asked, not the executable, and a need another
+    /// entrypoint's objects alone reach never shows up here.
+    #[test]
+    fn the_requirements_walk_follows_the_entrypoints_own_closure() {
+        let d = tmp("closure");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libcarried.so.1"], None)).unwrap();
+        fs::write(
+            d.join("lib/libcarried.so.1"),
+            dyn_object(&["libgone.so.1"], Some("libcarried.so.1")),
+        )
+        .unwrap();
+        // Another entrypoint's objects need something else; its
+        // selection must not answer for this one's audit.
+        fs::write(d.join("bin/other"), dyn_object(&["libgui.so.1"], None)).unwrap();
+        let providers = vec![provider("gui", 1, &[("libgui.so.1", 1)])];
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("lib/libcarried.so.1 needs libgone.so.1"),
+            "{text}"
+        );
+        assert!(!text.contains("libgui.so.1"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// An entrypoint audited for its selection alone contributes no
+    /// rooted needs, so a tree the audit cannot root, even one that does
+    /// not exist, cannot fail it; the collision rule still applies to
+    /// the providers the selection names.
+    #[test]
+    fn a_selection_only_entrypoint_needs_no_tree() {
+        let providers = vec![
+            provider("alpha", 1, &[("liba.so.1", 1)]),
+            provider("beta", 2, &[("libb.so.1", 2)]),
+        ];
+        let entrypoints = vec![entrypoint("app", None, recipe::SetSelection::All)];
+        audit_entrypoint_providers(
+            Path::new("/onelf-audit-no-such-tree"),
+            Path::new("lib"),
+            &entrypoints,
+            &providers,
+            &no_host,
+        )
+        .unwrap();
+        let colliding = vec![
+            provider("alpha", 1, &[("liba.so.1", 1)]),
+            provider("beta", 2, &[("liba.so.1", 2)]),
+        ];
+        let err = audit_entrypoint_providers(
+            Path::new("/onelf-audit-no-such-tree"),
+            Path::new("lib"),
+            &entrypoints,
+            &colliding,
+            &no_host,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("liba.so.1"), "{err}");
+    }
+
+    /// A selection naming a set the recipe never declares is refused,
+    /// naming the entrypoint and the name.
+    #[test]
+    fn an_unknown_selection_name_is_refused() {
+        let d = tmp("ghost");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&[], None)).unwrap();
+        let entrypoints = vec![entrypoint("app", Some("bin/app"), names(&["ghost"]))];
+        let err = audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &[], &no_host)
+            .unwrap_err();
+        assert!(err.to_string().contains("set ghost"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// An entrypoint whose executable is missing from the tree is a
+    /// finding, since nothing roots its requirements.
+    #[test]
+    fn a_missing_entrypoint_executable_is_a_finding() {
+        let d = tmp("missing");
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        let err = audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &[], &no_host)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bin/app is not in the tree"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A failing audit leaves the tree byte for byte as it found it:
+    /// the caller may run it before the assembly writes and trust that
+    /// a failure wrote nothing.
+    #[test]
+    fn a_failing_audit_writes_nothing() {
+        let d = tmp("readonly");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libgone.so.1"], None)).unwrap();
+        fs::write(
+            d.join("lib/libcarried.so.1"),
+            dyn_object(&[], Some("libcarried.so.1")),
+        )
+        .unwrap();
+        let before = snapshot(&d);
+        let entrypoints = vec![entrypoint(
+            "app",
+            Some("bin/app"),
+            recipe::SetSelection::All,
+        )];
+        assert!(
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &[], &no_host).is_err()
+        );
+        assert_eq!(before, snapshot(&d), "the audit must not write");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Every file under `root`, by relative path and bytes.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = jwalk::WalkDir::new(root)
+            .skip_hidden(false)
+            .sort(true)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e.path().strip_prefix(root).unwrap().to_path_buf();
+                (rel, fs::read(e.path()).unwrap())
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
     }
 }

@@ -1148,6 +1148,173 @@ pub(crate) fn report_set_provides(provides: &[SetProvides], unchecked: &[(String
     }
 }
 
+/// One declared set as a provider of loader-namespace names: the set's
+/// canonical declaration name, the full pin of the build the exports
+/// were read from, and the sonames that build verifiably exports, each
+/// with the content hash of the object exporting it. The pin and the
+/// per-export hashes are what the collision rule compares: two builds
+/// whose shared export hashes the same are one provider of it, and two
+/// whose hashes differ cannot be selected together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetProvider {
+    /// The set declaration name.
+    pub set: String,
+    /// The BLAKE3 pin of the build the exports belong to.
+    pub pin: String,
+    /// The sonames the pinned build exports with their content hashes,
+    /// sorted by soname and unique.
+    pub exports: Vec<SetExport>,
+}
+
+/// One exported soname and the BLAKE3 content hash of the object that
+/// exports it, as verified out of a set's pinned build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetExport {
+    /// The soname the object exports.
+    pub soname: String,
+    /// BLAKE3 of the object's bytes.
+    pub blake3: [u8; 32],
+}
+
+/// The sonames a set's pinned build exports with their content hashes,
+/// read out of the pinned artifact itself.
+///
+/// The build must carry a provider index: it is the authority for what
+/// the build exports, it is bound to the set and pin the recipe pins,
+/// and a listing alone does not establish what an export's bytes are,
+/// so a build without one is refused here rather than taken on its
+/// recorded word. Every payload object the artifact carries is then
+/// decompressed and verified against its recorded content hash, and the
+/// sonames its objects export must be exactly the ones the index
+/// records, so the hashes always describe the exports the index names.
+pub(crate) fn verified_export_hashes(set: &SharedSet) -> Result<Vec<SetExport>, String> {
+    let build = set_build(set)?;
+    let pin = set
+        .blake3
+        .parse::<blake3::Hash>()
+        .map_err(|_| format!("set {}: pin is not a blake3 digest", set.name))?;
+    let bytes = crate::metadata::read_packed_file(&build, PROVIDER_INDEX_FILE)
+        .map_err(|e| format!("{}: {e}", build.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} records no provider index, so its exports cannot be checked",
+                build.display()
+            )
+        })?;
+    let index = onelf_format::provider_index::ProviderIndex::decode(&bytes)
+        .map_err(|e| format!("{}: {e}", build.display()))?;
+    index
+        .verify(&onelf_format::provider_index::ArtifactIdentity {
+            set: set.name.clone(),
+            blake3: *pin.as_bytes(),
+        })
+        .map_err(|e| format!("{}: {e}", build.display()))?;
+
+    let (footer, manifest) = crate::info::read_footer_and_manifest(&build)
+        .map_err(|e| format!("{}: {e}", build.display()))?;
+    let mut file = fs::File::open(&build).map_err(|e| format!("{}: {e}", build.display()))?;
+    let codec = onelf_format::payload::Codec::open(&file, &footer)
+        .map_err(|e| format!("{}: {e}", build.display()))?;
+    let mut found: Vec<SetExport> = Vec::new();
+    for (at, entry) in manifest.entries.iter().enumerate() {
+        if entry.kind != onelf_format::EntryKind::File {
+            continue;
+        }
+        if !manifest.entry_path(at).contains(".so") {
+            continue;
+        }
+        let data = crate::extract::decompress_verified(&mut file, &footer, entry, &codec)
+            .map_err(|e| format!("{}: {}: {e}", build.display(), manifest.entry_path(at)))?;
+        let Ok(elf) = goblin::elf::Elf::parse(&data) else {
+            continue;
+        };
+        let Some(soname) = elf.soname else {
+            continue;
+        };
+        if soname.is_empty() || soname.contains('/') {
+            continue;
+        }
+        found.push(SetExport {
+            soname: soname.to_string(),
+            blake3: entry.content_hash,
+        });
+    }
+    found.sort_by(|a, b| (&a.soname, &a.blake3).cmp(&(&b.soname, &b.blake3)));
+    found.dedup();
+    for pair in found.windows(2) {
+        if pair[0].soname == pair[1].soname {
+            return Err(format!(
+                "{} exports {} from objects with different bytes",
+                build.display(),
+                pair[0].soname
+            ));
+        }
+    }
+    let scanned: Vec<String> = found.iter().map(|e| e.soname.clone()).collect();
+    if scanned != index.exports {
+        return Err(format!(
+            "{}: the provider index records {:?}, and its objects export {:?}",
+            build.display(),
+            index.exports,
+            scanned
+        ));
+    }
+    Ok(found)
+}
+
+/// The providers a provider audit over `sets` starts from, with the
+/// sets whose exports could not be verified and the reason.
+///
+/// Names always come from the builds themselves. Content hashes are
+/// resolved only for the sets whose exports overlap another set's,
+/// because those are the only comparisons a collision rule makes, so a
+/// selection whose sets export disjoint sonames never decompresses a
+/// byte of their payloads. A set involved in an overlap whose exports
+/// cannot be verified claims nothing, the way a build that cannot be
+/// had does, and keeps its existing reporting.
+pub(crate) fn audit_providers(sets: &[SharedSet]) -> (Vec<SetProvider>, Vec<(String, String)>) {
+    let mut named: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut unchecked: Vec<(String, String)> = Vec::new();
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for set in sets {
+        match shipped_sonames(set) {
+            Ok(mut exports) => {
+                exports.sort();
+                exports.dedup();
+                for name in &exports {
+                    *counts.entry(name.clone()).or_default() += 1;
+                }
+                named.push((set.name.clone(), set.blake3.clone(), exports));
+            }
+            Err(why) => unchecked.push((set.name.clone(), why)),
+        }
+    }
+    let mut providers: Vec<SetProvider> = Vec::new();
+    for (name, pin, exports) in named {
+        let shared = exports.iter().any(|soname| counts[soname] > 1);
+        if !shared {
+            providers.push(SetProvider {
+                set: name,
+                pin,
+                exports: Vec::new(),
+            });
+            continue;
+        }
+        let set = sets.iter().find(|s| s.name == name);
+        match set.map(verified_export_hashes) {
+            Some(Ok(hashes)) => providers.push(SetProvider {
+                set: name,
+                pin,
+                exports: hashes,
+            }),
+            Some(Err(why)) => unchecked.push((name, why)),
+            None => unreachable!("the names came from this list"),
+        }
+    }
+    providers.sort_by(|a, b| a.set.cmp(&b.set));
+    (providers, unchecked)
+}
+
 /// Rewrite the absolute module paths in a copied cache to paths relative
 /// to the cache itself, and drop the entries for modules the tree does
 /// not carry.
