@@ -7,6 +7,10 @@
 //! for the processes the app spawns; acquisition never takes a
 //! destination from it.
 //!
+//! Both launch forms apply this machinery: the packed launch drives it on
+//! every mode, and the CLI's development run calls the same functions for
+//! its AppDir, so the two forms configure one environment the same way.
+//!
 //! `LD_LIBRARY_PATH` is intentionally NOT set. It would be inherited by
 //! every child process the packed app spawns, including host binaries
 //! (`/bin/sh`, `ssh`, etc.), which corrupts them by mixing the bundled
@@ -31,6 +35,79 @@ pub(crate) fn set_var_checked(key: &str, value: &str) {
     }
     // SAFETY: the runtime is single-threaded at this point (before exec)
     unsafe { env::set_var(key, value) };
+}
+
+/// Why `name` cannot be a configured environment setting, when it names a
+/// dynamic-loader search path.
+///
+/// `LD_LIBRARY_PATH` and its per-ABI variants are how a process pulls
+/// libraries from outside its own tree into its loading, and the search
+/// path is the one thing a launch resolves itself: the application loads
+/// from its package's own directories and the resolver's decision, and a
+/// host program the app spawns loads from the caller's environment. A
+/// recipe `[env]` entry naming one of these cannot be honoured without
+/// leaking one side into the other, so the setting is refused instead of
+/// applied. Framework plugin paths are ordinary variables and stay
+/// configurable.
+pub fn library_search_override(name: &str) -> Option<&'static str> {
+    matches!(
+        name,
+        "LD_LIBRARY_PATH" | "LD_LIBRARY_PATH_32" | "LD_LIBRARY_PATH_64" | "LD_AOUT_LIBRARY_PATH"
+    )
+    .then_some("the loader search path is what onelf resolves, not a configurable one")
+}
+
+/// The library search path for the application's own libraries: the
+/// resolver's link farm first, then the package's library directories,
+/// then the selected sets'.
+///
+/// This one construction serves both launch forms. The packed launch
+/// hands it to the dynamic linker as `--library-path`, and a development
+/// run uses the same value for that flag and for the loader fallback of a
+/// binary the kernel starts without a run path. A caller's inherited
+/// `LD_LIBRARY_PATH` never joins it: a host directory on the path would
+/// hand the application a dependency its package does not carry, and the
+/// application's directories on the caller's value would corrupt a host
+/// program the caller starts beside this one. The caller's value stays in
+/// the environment exactly as it was, and the restoration record
+/// ([`crate::hostenv`]) keeps it for the host programs the app spawns.
+///
+/// A fetched GL build's directories are never placed here either: the
+/// path reaches every process the app spawns, and a foreign build's
+/// libstdc++ or zlib next to the host's libc would break a host binary.
+/// What the app needs from the build comes through the farm, by name,
+/// one library at a time.
+///
+/// An empty `lib_subpath` names no package libraries and yields an empty
+/// path.
+pub fn library_search_path(
+    pkg_root: &Path,
+    lib_subpath: &str,
+    farm: Option<&Path>,
+    set_lib_dirs: &[PathBuf],
+) -> String {
+    let bundled = lib_subpath
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(|p| pkg_root.join(p).to_string_lossy().into_owned());
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(farm) = farm {
+        // The farm holds the host libraries the resolver chose over their
+        // bundled copies, so it has to come first to shadow them. No host
+        // directory is ever placed here: a soname the bundle lacks and
+        // the resolver did not choose must fail by name rather than be
+        // satisfied by whatever the host has.
+        parts.push(farm.to_string_lossy().into_owned());
+    }
+    parts.extend(bundled);
+    // After the bundle's own directories: a set supplies what the bundle
+    // left out, and a name the bundle kept stays its own.
+    parts.extend(
+        set_lib_dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned()),
+    );
+    parts.join(":")
 }
 
 /// Set up environment variables and return a colon-joined lib path
@@ -114,13 +191,10 @@ pub fn setup_env(
         set_var_checked(crate::platform::STORE_HINT_VAR, &store.to_string_lossy());
     }
 
-    // Build the library search path for ELF entrypoints. Order:
-    //   <link farm> : <bundled lib dirs> : <existing LD_LIBRARY_PATH>
-    // The farm holds the host libraries the resolver chose over their
-    // bundled copies, so it has to come first to shadow them. No host
-    // directory is ever placed here: a soname the bundle lacks and the
-    // resolver did not choose must fail by name rather than be satisfied
-    // by whatever the host has.
+    // Build the library search path for ELF entrypoints through the one
+    // construction both launch forms share. A caller's inherited
+    // `LD_LIBRARY_PATH` is never appended: the application resolves from
+    // the farm, its own directories and the sets alone.
     if !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
             .split(':')
@@ -128,36 +202,15 @@ pub fn setup_env(
             .collect();
         let lib_str = lib_paths.join(":");
         if !lib_str.is_empty() {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(farm) = farm {
-                parts.push(farm.to_string_lossy().into_owned());
-            }
-            parts.push(lib_str.clone());
-            // After the bundle's own directories: a set supplies what the
-            // bundle left out, and a name the bundle kept stays its own.
-            parts.extend(
-                set_lib_dirs
-                    .iter()
-                    .map(|d| d.to_string_lossy().into_owned()),
-            );
-            // A fetched GL build's directories are never placed here: the
-            // path reaches every process the app spawns, and a foreign
-            // build's libstdc++ or zlib next to the host's libc would break
-            // a host binary. What the app needs from the build comes
-            // through the farm, by name, one library at a time.
-            // Preserve the user's pre-existing LD_LIBRARY_PATH as a middle
-            // layer, but don't propagate it to the child env.
-            let existing = env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            if !existing.is_empty() {
-                parts.push(existing);
-            }
-            lib_path = parts.join(":");
+            lib_path = library_search_path(pkg, lib_subpath, farm, set_lib_dirs);
 
             // LD_LIBRARY_PATH is deliberately not set here. The paths go to
             // the linker as --library-path, on the one invocation that needs
             // them, so nothing the app spawns inherits them. The farm's and
             // the sets' libraries also show in the bundle's own library
             // directory (see crate::links), where the run path finds them.
+            // The caller's own value stays in the environment as it was,
+            // and the restoration record keeps it for host programs.
 
             // Kept for scripts written when they had to export it as
             // LD_LIBRARY_PATH. The bundle's own directories hold everything
@@ -1537,6 +1590,98 @@ mod setup_env_tests {
 
         let returned = call(elf.to_str().unwrap());
         assert!(returned.starts_with("/pkg/lib"));
+    }
+}
+
+#[cfg(test)]
+mod library_search_tests {
+    use super::test_env_lock::ENV_LOCK;
+    use super::*;
+
+    #[test]
+    fn the_search_path_orders_farm_package_and_sets() {
+        let path = library_search_path(
+            Path::new("/pkg"),
+            "lib:lib/x86_64-linux-gnu",
+            Some(Path::new("/farm")),
+            &[PathBuf::from("/set/lib")],
+        );
+        assert_eq!(path, "/farm:/pkg/lib:/pkg/lib/x86_64-linux-gnu:/set/lib");
+    }
+
+    #[test]
+    fn no_package_libraries_name_no_search_path() {
+        assert_eq!(library_search_path(Path::new("/pkg"), "", None, &[]), "");
+    }
+
+    /// A caller's inherited `LD_LIBRARY_PATH` never joins the search
+    /// path, and the variable itself is left exactly as the caller had
+    /// it, for the restoration record and the host programs it covers.
+    #[test]
+    fn a_callers_library_path_never_joins_the_search() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { env::set_var("LD_LIBRARY_PATH", "/caller/priv:/usr/lib") };
+
+        let path = library_search_path(Path::new("/pkg"), "lib", None, &[]);
+
+        assert_eq!(path, "/pkg/lib");
+        assert_eq!(
+            env::var("LD_LIBRARY_PATH").as_deref(),
+            Ok("/caller/priv:/usr/lib")
+        );
+        unsafe { env::remove_var("LD_LIBRARY_PATH") };
+    }
+
+    /// The launch returns the shared search path for an ELF target, with
+    /// the caller's inherited value absent from it.
+    #[test]
+    fn the_launch_returns_the_shared_path_without_the_callers_value() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = env::temp_dir().join(format!("onelf-libpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let elf = dir.join("binary");
+        std::fs::write(&elf, b"\x7fELF").unwrap();
+        unsafe { env::set_var("LD_LIBRARY_PATH", "/caller/priv") };
+
+        let path = setup_env(
+            "/pkg",
+            "app",
+            elf.to_str().unwrap(),
+            "ep",
+            "test",
+            "lib",
+            elf.to_str().unwrap(),
+            Some(Path::new("/farm")),
+            None,
+            &[PathBuf::from("/set/lib")],
+            &[],
+        );
+
+        assert_eq!(path, "/farm:/pkg/lib:/set/lib");
+        assert_eq!(env::var("LD_LIBRARY_PATH").as_deref(), Ok("/caller/priv"));
+        unsafe { env::remove_var("LD_LIBRARY_PATH") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loader search variables are refused configuration names, and
+    /// the rule codec refuses exactly the same names, so a recipe entry
+    /// and a rule cannot slip past one gate what the other refuses.
+    #[test]
+    fn loader_search_variables_are_refused_configuration_names() {
+        for name in [
+            "LD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH_32",
+            "LD_LIBRARY_PATH_64",
+            "LD_AOUT_LIBRARY_PATH",
+        ] {
+            assert!(library_search_override(name).is_some(), "{name}");
+            assert!(EnvironmentName::new(name).is_err(), "{name}");
+        }
+        for name in ["PATH", "HOME", "QT_PLUGIN_PATH", "FONTCONFIG_FILE"] {
+            assert!(library_search_override(name).is_none(), "{name}");
+            assert!(EnvironmentName::new(name).is_ok(), "{name}");
+        }
     }
 }
 

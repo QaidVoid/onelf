@@ -516,7 +516,7 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ViewEnvError> {
 
 /// `LD_LIBRARY_PATH` for an ELF without a `$ORIGIN` run path that the
 /// kernel starts: the package's library directories, which hold the
-/// library links as well, ahead of the caller's own path.
+/// library links as well.
 ///
 /// Such a binary is one the packer gave no run path: a self-extracting
 /// one, which needs the kernel to make `/proc/self/exe` itself, one
@@ -526,15 +526,17 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ViewEnvError> {
 /// be handed `--library-path` for it, and a host loader may predate the
 /// `--argv0` the command line would need. This is the one place the
 /// variable is still set, and what the app spawns inherits it.
+///
+/// The caller's inherited value is not appended: the application resolves
+/// only from its package's own directories, and the caller's value
+/// reaches the host programs the app spawns through the restoration
+/// record, which lists this variable as set at exec.
 fn fallback_library_path(pkg_root: &Path, lib_dirs: &[&str]) -> String {
-    let mut parts: Vec<String> = lib_dirs
+    lib_dirs
         .iter()
         .map(|d| pkg_root.join(d).to_string_lossy().into_owned())
-        .collect();
-    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH").filter(|v| !v.is_empty()) {
-        parts.push(existing.to_string_lossy().into_owned());
-    }
-    parts.join(":")
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Put each host winner in place of the bundled copy it beat.

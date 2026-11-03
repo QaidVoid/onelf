@@ -134,7 +134,13 @@ fn in_onelf_package(path: &Path) -> bool {
 ///
 /// A hook restores a variable only while it holds what was applied, so
 /// a value the application changes on purpose survives.
-pub(crate) fn record_host_env(pkg_root: &Path, set_roots: &[PathBuf]) {
+///
+/// A caller driving the library surface captures its starting
+/// environment with [`capture_starting_env`] first, applies the launch
+/// environment through [`crate::env`], then records here, so the
+/// application it starts carries the same restoration record a packed
+/// launch leaves.
+pub fn record_host_env(pkg_root: &Path, set_roots: &[PathBuf]) {
     let Some(start) = STARTING_ENV.get() else {
         return;
     };

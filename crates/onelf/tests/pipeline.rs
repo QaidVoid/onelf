@@ -18411,3 +18411,222 @@ fn run_bundle_honors_the_host_libs_decision() {
     );
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A library directory the caller puts on `LD_LIBRARY_PATH` never
+/// supplies a development launch's missing dependency: the launch
+/// resolves from the tree's own directories alone, and neither the app
+/// nor a host child it spawns sees the caller's directory.
+#[test]
+fn an_inherited_library_path_does_not_satisfy_a_dev_run() {
+    let td = workdir("runinherited");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    let caller = td.join("caller-lib");
+    std::fs::create_dir_all(&caller).unwrap();
+
+    // The dependency exists only where the caller points the loader.
+    write(&td.join("hole.c"), "int hole_value(void){return 3;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libhole.so.1",
+            td.join("hole.c").to_str().unwrap(),
+        ],
+        &caller.join("libhole.so.1")
+    ));
+    // The tree carries a library directory of its own, so the launch has
+    // a search path to resolve from.
+    write(&td.join("plain.c"), "int plain_value(void){return 1;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libplain.so.1",
+            td.join("plain.c").to_str().unwrap(),
+        ],
+        &app.join("lib/libplain.so.1")
+    ));
+    write(
+        &td.join("app.c"),
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    printf("app_lp=%s\n", lp ? lp : "(unset)");
+    void *h = dlopen("libhole.so.1", RTLD_NOW);
+    printf("hole=%s\n", h ? "loaded" : "absent");
+    if (h) dlclose(h);
+    fflush(stdout);
+    if (system("echo child_lp=$LD_LIBRARY_PATH") != 0) return 1;
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("app.c").to_str().unwrap(), "-ldl"],
+        &app.join("bin/app")
+    ));
+
+    let mut run = Command::new(onelf());
+    run.args(["run", app.to_str().unwrap(), "--command", "bin/app"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("LD_LIBRARY_PATH", &caller);
+    isolate(&mut run, &td);
+    let out = run.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = format!("{}{}", String::from_utf8_lossy(&out.stderr), stdout);
+    assert!(out.status.success(), "{report}");
+    assert!(
+        stdout.contains("hole=absent"),
+        "the caller's copy loaded: {report}"
+    );
+    let line = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {report}"))
+            .to_string()
+    };
+    let app_lp = line("app_lp=");
+    assert!(
+        app_lp.contains(app.join("lib").to_str().unwrap()) && !app_lp.contains("caller-lib"),
+        "the app's path is not the tree's own: {app_lp}"
+    );
+    let child_lp = line("child_lp=");
+    assert!(
+        !child_lp.contains("caller-lib"),
+        "the caller's directory reached a child: {child_lp}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A recipe environment naming a loader search path is refused in both
+/// development forms before anything launches, with the supported
+/// alternatives named, while every other recipe setting still applies.
+#[test]
+fn a_recipe_library_path_is_refused_in_development() {
+    let td = workdir("runrefuse");
+    let dir = td.join("app");
+    write(
+        &dir.join("bin/run.sh"),
+        "#!/bin/sh\necho var=$ONELF_T_DEVVAR\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join("bin/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run.sh\"\n\n[env]\nLD_LIBRARY_PATH = \"/caller/lib\"\n",
+    );
+
+    for bundle in [false, true] {
+        let args: &[&str] = if bundle { &["--bundle"] } else { &[] };
+        let mut cmd = dev_run(&td, args);
+        cmd.arg(&dir);
+        let out = cmd.output().expect("spawn onelf run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "bundle={bundle}: the launch ran despite the refusal"
+        );
+        assert!(
+            stderr.contains("LD_LIBRARY_PATH"),
+            "bundle={bundle}: {stderr}"
+        );
+        assert!(stderr.contains("resolver"), "bundle={bundle}: {stderr}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("var="),
+            "bundle={bundle}: the app launched"
+        );
+    }
+
+    // A recipe setting that is not a loader search path applies, so the
+    // refusal is about the protected names and nothing else.
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run.sh\"\n\n[env]\nONELF_T_DEVVAR = \"from-recipe\"\n",
+    );
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("var=from-recipe"),
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A development launch leaves the caller's original values in the
+/// restoration record the host programs the app starts read, whatever
+/// the launch resolved for the app itself, and the shared launch
+/// variables reach the app exactly as a packed launch sets them.
+#[test]
+fn a_dev_run_records_the_callers_environment_for_host_children() {
+    let td = workdir("runrecord");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let caller = td.join("caller-lib");
+    std::fs::create_dir_all(&caller).unwrap();
+    write(
+        &td.join("app.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    printf("mode=%s\n", getenv("ONELF_ACTIVE_MODE") ? getenv("ONELF_ACTIVE_MODE") : "(unset)");
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    printf("record=%s\n", getenv("ONELF_HOST_ENV") ? getenv("ONELF_HOST_ENV") : "(unset)");
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("app.c").to_str().unwrap()],
+        &app.join("bin/app")
+    ));
+
+    let mut run = Command::new(onelf());
+    run.args(["run", app.to_str().unwrap(), "--command", "bin/app"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("LD_LIBRARY_PATH", &caller);
+    isolate(&mut run, &td);
+    let out = run.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = format!("{}{}", String::from_utf8_lossy(&out.stderr), stdout);
+    assert!(out.status.success(), "{report}");
+    let line = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {report}"))
+            .to_string()
+    };
+    assert_eq!(line("mode="), "dev", "{report}");
+    assert_eq!(
+        line("dir="),
+        app.canonicalize().unwrap().to_string_lossy(),
+        "{report}"
+    );
+    let caller_s = caller.to_string_lossy().into_owned();
+    let entry = format!("LD_LIBRARY_PATH=*{}:{};", caller_s.len(), caller_s);
+    assert!(
+        line("record=").contains(&entry),
+        "the record lacks the caller's own value: {report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}

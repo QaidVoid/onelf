@@ -284,6 +284,15 @@ impl AssemblyRequest {
             input,
         } = recipe;
 
+        for name in env.keys() {
+            if let Some(why) = onelf_rt::env::library_search_override(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: [env] {}: refused: {why}", recipe_path.display(), name),
+                ));
+            }
+        }
+
         // An imported binary is a second authoritative source of the
         // AppDir's contents, so it is judged before anything is
         // materialized or mutated: a conflict must fail naming both
@@ -1097,6 +1106,32 @@ mod tests {
     /// Whether a sysroot build pins the epoch mtime in this environment.
     fn expected_sysroot_mtime() -> Option<u64> {
         (pack::source_date_epoch().is_none()).then_some(0)
+    }
+
+    #[test]
+    fn a_recipe_library_search_setting_is_refused_at_planning() {
+        let dir = temp_dir("libpath");
+        let err = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[env]\nLD_LIBRARY_PATH = \"lib\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("LD_LIBRARY_PATH"), "{err}");
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn an_ordinary_recipe_env_variable_plans() {
+        let dir = temp_dir("ordinary-env");
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[env]\nQT_PLUGIN_PATH = \"plugins\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            request.env,
+            vec![("QT_PLUGIN_PATH".to_string(), "plugins".to_string())]
+        );
     }
 
     #[test]

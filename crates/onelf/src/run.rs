@@ -2,8 +2,9 @@
 //!
 //! If the AppDir has an `onelf.toml`, use it for entrypoint/args/working-dir.
 //! Otherwise auto-discover a single binary under `bin/` and run with defaults.
-//! Sets environment variables matching the packed runtime and execs directly.
-//! No packing and no release executable involved.
+//! The shared runtime machinery applies the same environment a packed launch
+//! applies, and the entrypoint is exec'd directly. No packing and no release
+//! executable involved.
 //!
 //! `--bundle` assembles through the same machinery a build uses and
 //! prepares its launch through the shared runtime support: the recipe's
@@ -72,7 +73,7 @@ fn https_fetch(url: &str, into: &Path) -> Result<(), String> {
 
 /// Run an AppDir in place: assemble a bundle launch through the shared
 /// machinery when `run_bundle` is set, then exec the chosen entrypoint
-/// with the environment the packed runtime would set.
+/// with the environment the packed runtime's own machinery applies.
 pub fn run(
     app_spec: &Path,
     command_override: Option<&str>,
@@ -80,9 +81,21 @@ pub fn run(
     run_bundle: bool,
     passthrough_args: &[String],
 ) -> io::Result<()> {
+    // The caller's environment, captured before anything applies package
+    // settings, is what the restoration record offers the host programs
+    // the app spawns later.
+    onelf_rt::hostenv::capture_starting_env();
+
     // Figure out the AppDir: user's spec is either the directory or a recipe file.
     let (dir, mut found) = resolve_app(app_spec)?;
     let dir = dir.canonicalize()?;
+
+    // A recipe environment naming a loader search path is refused in
+    // every development form, before anything stages or launches.
+    if let Some(loaded) = &found {
+        reject_library_search_env(&loaded.recipe.env)?;
+    }
+    let recipe_env = found.as_ref().map(|l| l.recipe.env.clone());
 
     let mut assembled: Option<Assembled> = None;
     if run_bundle {
@@ -116,11 +129,11 @@ pub fn run(
     // Detect lib dirs in the AppDir (same rule as pack: any dir containing .so files,
     // excluding .onelf/, share/, bin/, etc).
     let lib_dirs = detect_lib_dirs(&dir);
-    let lib_paths: Vec<String> = lib_dirs
+    let lib_subpath = lib_dirs
         .iter()
-        .map(|p| dir.join(p).to_string_lossy().into_owned())
-        .collect();
-    let lib_paths_str = lib_paths.join(":");
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":");
     let target_is_elf = is_elf_file_at(&target);
 
     // The same decision the packed runtime makes: what the host supplies is
@@ -154,12 +167,13 @@ pub fn run(
     // cannot have ends the launch naming the entrypoint and the pin, as
     // a packed launch does; the pinned build is warn-and-continue.
     let mut set_roots: Vec<PathBuf> = Vec::new();
+    let mut set_lib_dirs: Vec<PathBuf> = Vec::new();
     let mut pinned_gl: Option<(PathBuf, std::fs::File)> = None;
     if let Some(a) = &assembled {
         let selection = selected_sets(&a.request, &a.selections, &ep_name)?;
         acquire_sets(&dir, selection, &ep_name)?;
         set_roots = onelf_rt::sets::roots();
-        let set_lib_dirs: Vec<PathBuf> = set_roots
+        set_lib_dirs = set_roots
             .iter()
             .flat_map(|root| onelf_rt::sets::lib_dirs(root))
             .collect();
@@ -187,14 +201,6 @@ pub fn run(
     for name in &resolution.incomparable {
         eprintln!("onelf run: resolver: cannot order {name}; keeping the bundled copy");
     }
-    let mut search: Vec<String> = Vec::new();
-    if let Some(farm) = &resolution.farm {
-        search.push(farm.to_string_lossy().into_owned());
-    }
-    if !lib_paths_str.is_empty() {
-        search.push(lib_paths_str.clone());
-    }
-    let search_str = search.join(":");
 
     let requested_cwd = match working_dir {
         WorkingDir::PackageRoot => Some(dir.clone()),
@@ -209,10 +215,53 @@ pub fn run(
         Some(path) if target.file_name() == Some(ep_name.as_ref()) => path,
         _ => ep_name.as_str(),
     };
+
+    // The launch environment, applied by the same functions a packed
+    // launch runs: the launch variables and the framework mappings and
+    // hooks, then the recipe's own settings, then the restoration record
+    // that keeps the caller's original values for the host programs the
+    // app spawns. The returned search path names the farm, the AppDir's
+    // own directories and the sets, never the caller's inherited value.
+    let dir_str = dir.to_string_lossy().into_owned();
+    let target_str = target.to_string_lossy().into_owned();
+    let lib_path = onelf_rt::env::setup_env(
+        &dir_str,
+        &ep_name,
+        &target_str,
+        &ep_name,
+        "dev",
+        &lib_subpath,
+        &target_str,
+        resolution.farm.as_deref(),
+        pinned_gl.as_ref().map(|(root, _)| root.as_path()),
+        &set_lib_dirs,
+        &set_roots,
+    );
+    if let Some(env) = &recipe_env {
+        let mut data = Vec::new();
+        for (key, value) in env {
+            data.extend_from_slice(format!("{key}={value}\n").as_bytes());
+        }
+        onelf_rt::env::apply_custom_env(&data, &dir_str);
+    }
+    onelf_rt::hostenv::record_host_env(&dir, &set_roots);
+
+    // A bare kernel exec is given the search path only when the target's
+    // own metadata cannot reach what it names: without a `$ORIGIN` run
+    // path there is nothing to walk, and the development view's farm and
+    // set libraries live outside the tree in any case. A packed launch
+    // reaches them through its links instead, which is why its fallback
+    // gate is the run path alone.
+    let outside_runpath = resolution.farm.is_some() || !set_lib_dirs.is_empty();
+    let kernel_lib_path = (!lib_path.is_empty()
+        && (outside_runpath || !has_origin_runpath(&target)))
+    .then(|| lib_path.clone());
+
     let mut cmd = build_exec_command(
         &target,
         &dir,
-        &search_str,
+        &lib_path,
+        kernel_lib_path.as_deref(),
         argv0,
         resolution.host_interp.as_deref(),
     )?;
@@ -227,68 +276,32 @@ pub fn run(
         cmd.current_dir(c);
     }
 
-    cmd.env("ONELF_DIR", &dir);
-    cmd.env("ONELF_ACTIVE_MODE", "dev");
-    cmd.env("ONELF_ARGV0", &ep_name);
-    cmd.env("ONELF_EXEC", &target);
-    cmd.env("ONELF_ENTRYPOINT", &ep_name);
-    cmd.env("ONELF_ENTRYPOINT_EXPORTED", &ep_name);
-
-    if !lib_paths_str.is_empty() {
-        // Only set LD_LIBRARY_PATH for ELF targets. When the entrypoint
-        // is a script the kernel hands it to a host interpreter
-        // (/bin/sh, /usr/bin/python3, ...) linked against the host
-        // glibc. If our bundled lib dir comes first on LD_LIBRARY_PATH,
-        // the host ld would load our bundled libc, mixing two glibc
-        // versions in one process and crashing before main. Let the
-        // script export LD_LIBRARY_PATH itself before exec'ing bundled
-        // ELFs.
-        if target_is_elf {
-            let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            let mut parts: Vec<String> = vec![search_str.clone()];
-            if !existing.is_empty() {
-                parts.push(existing);
-            }
-            cmd.env("LD_LIBRARY_PATH", parts.join(":"));
-        }
-
-        // Auto-set GPU/driver paths if the usual subdirs exist.
-        let dri_paths: Vec<String> = lib_paths
-            .iter()
-            .map(|p| Path::new(p).join("dri").to_string_lossy().into_owned())
-            .filter(|p| Path::new(p).is_dir())
-            .collect();
-        if !dri_paths.is_empty() {
-            let joined = dri_paths.join(":");
-            cmd.env("LIBGL_DRIVERS_PATH", &joined);
-            cmd.env("LIBVA_DRIVERS_PATH", &joined);
-        }
-
-        let gbm_paths: Vec<String> = lib_paths
-            .iter()
-            .map(|p| Path::new(p).join("gbm").to_string_lossy().into_owned())
-            .filter(|p| Path::new(p).is_dir())
-            .collect();
-        if !gbm_paths.is_empty() {
-            cmd.env("GBM_BACKENDS_PATH", gbm_paths.join(":"));
-        }
-    }
-
-    let share = dir.join("share");
-    if share.is_dir() {
-        let existing = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
-        let base = share.to_string_lossy();
-        let new_val = if existing.is_empty() {
-            format!("{base}:/usr/local/share:/usr/share")
-        } else {
-            format!("{base}:{existing}")
-        };
-        cmd.env("XDG_DATA_DIRS", new_val);
-    }
-
     // exec never returns on success.
     let err = cmd.exec();
     Err(io::Error::other(format!("exec failed: {err}")))
+}
+
+/// Refuse a recipe `[env]` table that names a dynamic-loader search
+/// path, with the supported alternatives named.
+///
+/// The launch resolves the application's libraries from the tree's own
+/// directories and the resolver's decision, and a host program the app
+/// spawns loads with the caller's environment: an entry naming the
+/// loader search path could only leak one side into the other, so the
+/// setting is an error rather than a value that is quietly applied.
+fn reject_library_search_env(env: &std::collections::BTreeMap<String, String>) -> io::Result<()> {
+    for name in env.keys() {
+        if let Some(reason) = onelf_rt::env::library_search_override(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "[env] {name} cannot be set: {reason}; bundle the library with the \
+                     AppDir or let the resolver choose it"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Pick the entrypoint an assembled launch runs: the `--command`
@@ -613,10 +626,17 @@ fn resolve_entrypoint(
 /// Falls back to invoking the bundled loader explicitly when we have
 /// one but PT_INTERP wasn't patched, or to a bare exec if nothing is
 /// bundled (the host must have the right loader).
+///
+/// A bare kernel exec is given `kernel_lib_path` as `LD_LIBRARY_PATH` on
+/// the command, the same fallback a packed launch applies: the caller
+/// decides when the target's own metadata cannot reach what the launch
+/// resolved, and the caller's inherited value is never part of what is
+/// set.
 fn build_exec_command(
     target: &Path,
     app_dir: &Path,
     lib_path: &str,
+    kernel_lib_path: Option<&str>,
     argv0: &str,
     host_interp: Option<&Path>,
 ) -> io::Result<Command> {
@@ -630,6 +650,9 @@ fn build_exec_command(
         if interp.is_none() {
             let mut cmd = Command::new(target);
             cmd.arg0(argv0).env("ONELF_INTERP", host_interp);
+            if let Some(path) = &kernel_lib_path {
+                cmd.env("LD_LIBRARY_PATH", path);
+            }
             return Ok(cmd);
         }
         let mut cmd = Command::new(host_interp);
@@ -671,7 +694,28 @@ fn build_exec_command(
 
     let mut cmd = Command::new(target);
     cmd.arg0(argv0);
+    if let Some(path) = &kernel_lib_path {
+        cmd.env("LD_LIBRARY_PATH", path);
+    }
     Ok(cmd)
+}
+
+/// Whether the target's own metadata walks to its libraries from the
+/// binary's location: a `$ORIGIN` entry on DT_RPATH or DT_RUNPATH. Such
+/// a binary needs no search path from the launch, and nothing is
+/// exported for it.
+fn has_origin_runpath(target: &Path) -> bool {
+    let Ok(data) = std::fs::read(target) else {
+        return false;
+    };
+    let Ok(elf) = goblin::elf::Elf::parse(&data) else {
+        return false;
+    };
+    elf.rpaths
+        .iter()
+        .chain(elf.runpaths.iter())
+        .flat_map(|p| p.split(':'))
+        .any(|entry| entry.starts_with("$ORIGIN") || entry.starts_with("${ORIGIN}"))
 }
 
 /// Read PT_INTERP from an ELF file. Returns None for non-ELF or missing interp.
@@ -698,11 +742,10 @@ fn find_bundled_interp(interp: &str, app_dir: &Path) -> Option<PathBuf> {
 }
 
 /// True if `path` is an ELF file (first four bytes `\x7fELF`). Scripts
-/// (shebang `#!`) and missing files return false. Used to decide
-/// whether it's safe to set `LD_LIBRARY_PATH` in the child's env:
-/// scripts get handed to a host interpreter linked against the host's
-/// glibc, and pointing it at our bundled libc mixes versions and
-/// crashes before main.
+/// (shebang `#!`) and missing files return false. Used to decide which
+/// launch machinery applies: the resolver and the search path serve ELF
+/// targets, while a script is handed to a host interpreter linked
+/// against the host's glibc, which must never see the bundled libc.
 fn is_elf_file_at(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
