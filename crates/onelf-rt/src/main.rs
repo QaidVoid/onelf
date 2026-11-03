@@ -34,7 +34,6 @@ use std::path::Path;
 
 use onelf_format::EntryKind;
 use onelf_format::HostLibsPolicy;
-use onelf_format::resolve::ActivePin;
 
 /// The directory of the cache's execution-view store, under the cache
 /// root. The cache's collection reclaims exactly this layout when the
@@ -271,7 +270,24 @@ fn main() {
     // before any mode is chosen: a set is served from the host mount
     // namespace so every package naming it shares one mount, and a mode
     // that unshares first would make that mount private to this launch.
-    sets::init(read_package_file(&mut pkg, sets::SETS_FILE).as_deref());
+    // The carried selection record scopes acquisition to the invoked
+    // entrypoint's selection, and a record the set table cannot back
+    // ends the launch here, before any namespace or artifact exists.
+    let sets_table = read_package_file(&mut pkg, sets::SETS_FILE);
+    let set_selections = read_package_file(&mut pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
+    let selected = match sets::selection(
+        sets_table.as_deref(),
+        set_selections.as_deref(),
+        &pkg.manifest,
+        &ep_name,
+    ) {
+        Ok(pins) => pins,
+        Err(why) => {
+            eprintln!("onelf-rt: {why}");
+            std::process::exit(1);
+        }
+    };
+    sets::init(&selected, &ep_name);
 
     // The app runs setuid binaries, so it has to stay in the namespace it
     // was started in. That rules out the two modes that make one of their
@@ -479,7 +495,7 @@ fn exec_cache(
         .manifest
         .get_string(pkg.manifest.entrypoints[ep_idx].name)
         .to_string();
-    let pins = active_pins(read_package_file(pkg, sets::SETS_FILE).as_deref());
+    let pins = sets::pins();
     let metadata = metadata_digest(
         read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE),
         read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE),
@@ -665,22 +681,6 @@ fn stage_view_from_base(
     Ok(())
 }
 
-/// The dependency-set pins a launch obtained from the set table `record`,
-/// in table order. They are the selection the launch materializes set
-/// roots for, so they are what its view's selection identity covers.
-fn active_pins(record: Option<&[u8]>) -> Vec<ActivePin> {
-    let Some(bytes) = record else {
-        return Vec::new();
-    };
-    sets::parse(&String::from_utf8_lossy(bytes))
-        .into_iter()
-        .map(|pin| ActivePin {
-            label: pin.label,
-            hash: pin.blake3.to_ascii_lowercase(),
-        })
-        .collect()
-}
-
 /// The content digest of the validated runtime metadata a launch applies,
 /// or `None` for a package on the built-in defaults. The digest covers
 /// the records' whole bytes, length-prefixed, so any change to validated
@@ -714,7 +714,7 @@ pub(crate) fn read_package_file(pkg: &mut loader::PackageData, path: &str) -> Op
 
 #[cfg(test)]
 mod cache_view_tests {
-    use super::{active_pins, metadata_digest, stage_view_from_base};
+    use super::{metadata_digest, stage_view_from_base};
     use crate::links;
     use onelf_format::entry::{Entry, EntryKind};
     use onelf_format::payload::Codec;
@@ -978,20 +978,6 @@ mod cache_view_tests {
             Some(base)
         );
         assert_ne!(metadata_digest(None, table), Some(base));
-    }
-
-    /// The pins a launch obtained, in table order, with the digests
-    /// lowercase; a package with no set table obtained none.
-    #[test]
-    fn active_pins_come_from_the_record() {
-        assert!(active_pins(None).is_empty());
-        assert!(active_pins(Some(b"garbage")).is_empty());
-        let hash = "ab".repeat(32);
-        let record = format!("[gtk]\nurl=\"https://example/gtk\"\nblake3=\"{hash}\"\n");
-        let pins = active_pins(Some(record.as_bytes()));
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].label, "gtk");
-        assert_eq!(pins[0].hash, hash);
     }
 }
 
