@@ -41,6 +41,18 @@ Metadata:
 Provenance:
   none recorded (built from a host scan)
 
+Sets:
+  Declared pins:
+    qt: pinned 3f1c...a9e2, from https://mirror.example.org/qt-6.7.onelf
+  Selections:
+    myapp (default): qt
+
+Runtime metadata:
+  Records:     entrypoint-sets
+  Requires:    payload metadata version 1, selection-view
+  Runtime:     advertises payload metadata version 1, selection-view
+  Agreement:   satisfied
+
 Entrypoints:
   myapp (default) [memfd]: bin/myapp
 
@@ -56,6 +68,19 @@ Useful for:
 - Seeing the package ID (useful for debugging cache entries).
 - Listing entrypoints and their memfd eligibility.
 - Reading embedded metadata and provenance.
+- Reading the declared dependency sets and, when the recipe wrote any
+  explicit `sets` list, the selection of every entrypoint. A package
+  without one prints `every declared set`, which is what its launches
+  do.
+- Checking the package's runtime metadata records against the runtime
+  embedded in it: which records it carries, what support they require
+  (`selection-view` for a package with a selection table), what the
+  embedded runtime's capability note advertises, and whether the two
+  agree. A package with neither record prints no `Runtime metadata`
+  section and runs on the legacy defaults. The other named capability,
+  `store-import`, is the updater runtime's HTTPS client; packing
+  already chose that runtime for a package whose pins are fetched over
+  HTTPS.
 - Checking the update URL, revision and signing key, which an `Update:`
   section shows for a package that has an update URL.
 

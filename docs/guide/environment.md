@@ -38,8 +38,11 @@ The rules this page encodes:
 
 ## Library paths
 
-The runtime does not set `LD_LIBRARY_PATH` for the app. A value the
-caller set reaches the app unchanged, and so does its absence, and a
+The runtime does not set `LD_LIBRARY_PATH` for the app, and a recipe
+cannot either: an `[env]` assignment of it, or of
+`LD_LIBRARY_PATH_32`, `LD_LIBRARY_PATH_64` or `LD_AOUT_LIBRARY_PATH`,
+is refused when the recipe loads. A value the caller set reaches the
+app unchanged, and so does its absence, and a
 host program the app runs (a shell, `git`, `xdg-open`) sees the same
 thing. The variable would otherwise carry the bundle's libraries into
 every one of those programs.
@@ -64,16 +67,19 @@ exist depends on the [mode](./execution-modes):
 |------|---------------|
 | `fuse` | entries the mount serves, decided by the launch before the app starts |
 | `tmpfs`, `rundir` | symlinks in the launch's own tree |
-| `cache` | symlinks in the shared cache tree, made to match what each launch resolved |
+| `cache` | entries of the launch's execution view, a per-identity tree under the cache |
 
 A FUSE mount another instance is serving (see
 [Instances share a mount](./execution-modes#instances-share-a-mount)) is
 reused only when it shows the links this launch resolved. A launch that
 resolved differently, because the host changed or `ONELF_NO_RESOLVER` was
 set, says so and mounts the package for itself. In the
-cache mode a launch under a different host state rewrites the links,
-and an instance still running from that tree loads the new targets for
-anything it opens afterwards.
+cache mode a launch whose resolution differs from the view it would
+otherwise reuse runs from its own view instead: views are private to
+their identity, so one launch never rewrites the links another is
+using, and a running instance keeps loading the libraries its own view
+shows for anything it opens afterwards. See
+[Execution views](./sysroot#execution-views).
 
 The library directories recorded at pack time (`--lib-dir`, by default
 every directory that holds a `.so`) still form a search path, used
@@ -107,11 +113,21 @@ whose host copy is newer than the bundled one. See
 [Bundling](./bundling#libraries-that-come-from-the-host) for how the
 choice is made.
 
-❌ Do not count on a host library directory being searched. No host
-directory ever is: what the host supplies is chosen per library by the
-resolver and linked by name, and a library the bundle lacks and the
-resolver did not choose fails by name instead of being satisfied from
-the host.
+❌ Do not count on the runtime to keep host directories off the
+application's search. What onelf generates never goes on
+`LD_LIBRARY_PATH`: the libraries it resolves are linked by name into
+the bundle's own directory and handed to the linker as
+`--library-path` on the one command line that needs them, so nothing
+the app starts sees a generated search path. But a caller's
+`LD_LIBRARY_PATH` is a different thing: it reaches the application
+unchanged, and the application's loader still searches it when the
+bundle's run path has no such name. The run path is an RPATH, which
+the loader searches first, so the caller's path supplies exactly the
+names the package omits. A caller who points it at a directory
+holding such a dependency can satisfy that omission with a host
+library beside the bundled libc. The recipe cannot set the variable,
+and this is exactly the mixing the resolver exists to avoid, so keep
+the caller's value empty when it matters.
 
 Each variable below is set only when the directory it names exists.
 "A lib dir" means one of the bundle's library directories or, on a host

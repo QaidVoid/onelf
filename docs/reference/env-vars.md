@@ -25,7 +25,7 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 
 | Variable | Set when | Points to |
 |----------|----------|-----------|
-| `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs, then the previous value |
+| `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs, then the previous value. The runtime never adds or extends this variable otherwise, and a recipe that assigns it as `[env]` is refused |
 | `ONELF_LIB_PATH` | `lib/` contains `.so` files | the bundled lib dirs, kept for scripts that export it as `LD_LIBRARY_PATH` |
 | `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters. Replaces a value the caller set. |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
@@ -124,7 +124,7 @@ by anything else.
 | `ONELF_PROFILE` | Path of a file to record every block a run reads, as `path<TAB>offset` in the order first read, for `onelf pack --prefetch`. Recording starts with the mount, so the runtime's own reads before the launch are included. Appended, so runs accumulate. Records in `fuse` mode only. A profiled launch never shares a running instance's mount. See [Prefetching a startup](../guide/execution-modes#prefetching-a-startup). |
 | `ONELF_NO_PLATFORM_FETCH` | `1` stops the runtime from fetching the pinned GL build or dependency set on a host without one. A build already in the store is still used. The launch warns and continues. |
 | `ONELF_PLATFORM_URL` | Fetch the pinned GL build from this URL instead of the package's. The pinned hash still has to match, so a mirror cannot substitute content. |
-| `ONELF_PLATFORM_STORE` | Directory holding fetched GL builds and dependency sets instead of `platform/` under the cache root. `bundle-libs` also looks there for a set's build. |
+| `ONELF_PLATFORM_STORE` | Directory holding fetched GL builds and dependency sets instead of `platform/` under the cache root. `bundle-libs` also looks there for a set's build. An ordinary launch exports the store it resolved to the app and its children under this name, so a bundled helper looks where the launch did. The value is a lookup hint only: no library directory, no execution view, and no authority over another uid's state. Acquisition under a different uid verifies any artifact it finds there against the package's pin and imports into its own store, never trusting the hinted store's files outright. |
 | `ONELF_SET_MODE` | `mount` serves a dependency set from its stored build, the default; `extract` copies it out through the package cache. A host that cannot mount falls back to `extract`. |
 | `XDG_RUNTIME_DIR` | The private per-user directory for mountpoints and rundir trees. Without a usable one the runtime creates `/tmp/onelf-<uid>` with mode `0700` |
 | `XDG_CACHE_HOME` | The onelf cache lives in its `onelf/` subdirectory: the cache mode's packages and the fetched GL builds and dependency sets. Falls back to `$HOME/.cache`. A relative value is ignored |

@@ -101,9 +101,17 @@ taken from your machine. See [Bundling from a Sysroot](./sysroot).
 
 Both sources end in the same verifier. Every `DT_NEEDED` of every bundled
 ELF must resolve inside the bundle or name something the host provides.
-From a sysroot an unresolved soname is an error, since the universe was
-complete. From a host scan it is the warning described below, since the
-universe was a guess.
+How a finding is treated depends on where the tree came from:
+
+- ✅ From a sysroot an unresolved soname is an **error**, since the
+  universe was complete and the omission is a policy or platform-line
+  mistake you can fix.
+- ⚠️ From a host scan it stays a **warning**, since the universe was a
+  guess. This is true of the low-level command and of
+  `onelf build` on an AppDir without a sysroot alike.
+- ⚠️ A recipe with `[bundle] skip` runs no walk and no audit at all:
+  the tree is packed **unchecked**, exactly as it stands. See
+  [Unchecked trees](./recipe#unchecked-trees).
 
 ## Libraries that come from the host
 
@@ -395,6 +403,51 @@ onelf bundle-libs ./amdgpu_top --no-gl --no-wayland
 The `--no-*` opt-out always wins over both auto-detection and the matching
 `--*` flag. Auto-enabled and suppressed frameworks are both printed so you
 know what was decided.
+
+## Framework rules
+
+Behind the detection sits a built-in rule catalog. Each supported
+component (ALSA, GStreamer, PipeWire, GTK, Qt, xkb, fontconfig, gdk-pixbuf,
+Tcl/Tk and the rest) has a rule naming the sonames that activate it and
+the plugin directories, helper executables and data directories the
+component needs. When the walk sees an activating soname, the rule's
+groups are collected from the selected source, so a component's plugins
+and data arrive with it instead of being chased one `--include` and one
+hand-placed `share/` at a time. Each activated rule is reported, with
+the soname that triggered it and how many groups it queued:
+
+```
+  Rules: 1 activated by soname prefix: xkb (libxkbcommon.so.0); 1 group(s) queued
+```
+
+- ✅ A required group the selected source cannot supply stops the build
+  naming the rule, the group and the locations it looked in:
+
+```
+error: rule alsa group configuration requires directory data at share/alsa, but none of its declared locations exist in the selected source; ./myapp: absent
+```
+
+  The trailing list is the audit's evidence: each examined location and
+  why it held nothing (`absent`, `left to the host package`, `pruned
+  from the package`), a few at most, so the fix is visible without
+  rerunning. A required helper executable is treated the same way and
+  names the rule and the helper it missed. The host's copy is never
+  pulled in to fill the gap.
+- ⚠️ An optional group the source happens not to have is a warning, not
+  a failure:
+
+```
+warning: alsa/plugins: no usable plugin group (1 location(s) unavailable, 0 candidate(s) skipped)
+    ./myapp/lib: absent
+```
+
+  The component keeps working through the runtime mappings the rule
+  also declares, and the report says what was skipped.
+- ⚠️ Activation reads sonames, not behavior. A plugin loaded under a
+  name the binary computes at run time still needs `--trace-run` (host
+  scan) or a sysroot trace, like every other `dlopen` by computed name.
+- ⚠️ The catalog is built in. There is no recipe or CLI surface for
+  project-local rules or for disabling a built-in one yet.
 
 ## Extra library search paths
 

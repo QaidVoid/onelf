@@ -13,12 +13,19 @@ onelf init [-o FILE] [--binary PATH] [--force]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-o`, `--output` | `onelf.toml` | Where to write the recipe |
-| `--binary` | none | Seed name/command from this binary's basename |
+| `--binary` | none | Seed name/command from this binary's basename, and write `[input] binary` naming it, so the scaffold builds as it stands |
 | `--force` | `false` | Overwrite existing file |
 
 ## `onelf build`
 
-Run bundle-libs + pack from a recipe.
+Assemble an AppDir from its recipe and pack it. One command resolves
+the whole recipe: `[input]` imports a bare binary to the command's
+path, a `[sysroot]` applies its package database or records its sets,
+the framework rules run over the chosen source, and the packer writes
+the resolved set selections. Unresolved dependencies are treated
+according to their source: a `[sysroot]` with a `path` fails the
+build, a host scan warns, and `[bundle] skip` runs no audit at all and
+packs the tree unchecked.
 
 ```
 onelf build [PATH] [-o FILE]
@@ -46,8 +53,8 @@ onelf run [PATH] [--command PATH] [--entrypoint NAME] [--bundle] [-- ARGS...]
 | `PATH` | AppDir or `.toml` file (default `.`) |
 | `--command` | Binary to exec, relative to AppDir |
 | `--entrypoint` | Select a recipe-defined entrypoint |
-| `--bundle` | Run `bundle-libs` from the recipe first |
-| `-- ARGS` | Passed to the entrypoint |
+| `--bundle` | Assemble from the recipe the way a build does (sysroot, sets, rules), acquire the selected entrypoint's sets, then run from the prepared development view |
+| `-- ARGS` | Passed to the entrypoint after its own args. Name the PATH explicitly when passing args, so the first one is not read as the path: `onelf run . -- ARGS` |
 
 ## `onelf pack`
 
@@ -301,9 +308,12 @@ when the package embeds no key. See
 
 ## `onelf cache`
 
-Manage the persistent cache: packages extracted by the cache mode, and
-the GL builds fetched for hosts without one. `list` shows both; `gc`
-removes packages and builds unused past the age threshold.
+Manage the persistent cache: packages extracted by the cache mode, the
+GL builds and dependency sets fetched for hosts without them, and the
+execution views under `views/`, both the packed launches' and the
+development runs'. `list` shows the builds and packages; `gc` removes
+packages, builds and views unused past the age threshold, a view only
+once no launch holds its lease.
 
 ```
 onelf cache list

@@ -9,6 +9,9 @@ user-facing guide.
 [package]
 # required fields, plus optional metadata
 
+[input]
+# optional, imports a bare binary to the command's path
+
 [[entrypoint]]
 # zero or more extra entrypoints
 
@@ -19,7 +22,7 @@ user-facing guide.
 # optional, enables self-update
 
 [sysroot]
-# optional, take the bundle from a package database
+# optional, take the bundle from a package database, or record sets only
 
 [bundle]
 # optional, passes to bundle-libs
@@ -48,6 +51,7 @@ host-libs = "auto"                # "auto" | "always" | "never": what the resolv
 cache = false                     # bool, allow the persistent cache as the last execution mode
 prefer-cache = false              # bool, run from the persistent cache before any other mode; implies cache
 needs-setuid = false              # bool, the app runs setuid binaries (sudo, pkexec); keeps it out of user namespaces
+sets = ["gtk"]                    # Option<Vec<String>>, declared sets the command selects; see below
 mtime = 1735689600                # Option<u64>, pin every entry's mtime to this Unix timestamp (overrides SOURCE_DATE_EPOCH)
 exclude = ["*.a", "__pycache__"]  # Vec<String>, path globs
 version = "1.2.3"                 # Option<String>
@@ -62,6 +66,28 @@ homepage = "https://..."          # Option<String>
 - `package`: cwd is the AppDir root at runtime
 - `command`: cwd is the directory containing the entrypoint binary
 
+## `[input]`
+
+```toml
+[input]
+binary = "../upstream/myapp"      # PathBuf, relative to the recipe's directory
+```
+
+Imports a bare executable to the package command's path before
+assembly, so a build can start from the upstream binary alone. The
+import reads the source and never writes it; a source outside the
+recipe's directory is never modified by the build at all, while one
+inside it is AppDir content the bundling walk rewrites in place. The
+staged copy is tracked by content hash, a rebuild refreshes it, and an
+edited copy stops the build instead of being overwritten. `binary`
+must be relative to the recipe's directory, must name a regular file,
+and may not travel through a symlink or escape the AppDir. It
+conflicts with `[sysroot] path` (one authoritative source) and with
+`[bundle] skip` (nothing to import into), and is accepted beside a
+`[sysroot]` that only declares sets. Archives, package-manager
+identifiers and source trees are refused. See [Recipe
+File](../guide/recipe#starting-from-a-bare-binary).
+
 ## `[[entrypoint]]`
 
 ```toml
@@ -70,6 +96,7 @@ name = "myapp-daemon"   # String, required; selected via argv[0]
 path = "bin/myapp"      # String, required; relative to AppDir
 args = ["--daemon"]     # Vec<String>, prepended to invocation
 default = false         # bool, mark as default entrypoint
+sets = ["gtk"]          # Option<Vec<String>>, declared sets this entrypoint selects
 ```
 
 `[package].command` does not add an entrypoint of its own. It supplies
@@ -253,6 +280,27 @@ which pins a set with no `path` at all. `packages` is required either
 way; without a sysroot it is a note on what the set was made from, since
 no database is consulted.
 
+Which sets an entrypoint uses is decided by the optional `sets` lists
+in `[package]` and in each `[[entrypoint]]`. The semantics are exact:
+
+- An **omitted list selects every declared set**, for the package
+  command and for each named entrypoint independently. A named
+  entrypoint's omission does not inherit the command's explicit list.
+- **`sets = []` selects none**: the launch fetches, mounts and
+  extracts nothing, and does not depend on any declared set.
+- **A written list selects exactly its names**, read in canonical
+  (sorted) declaration order whatever order they were written in.
+- A repeated name, and a name the recipe does not declare, fail when
+  the recipe loads, naming the list they were written in.
+
+A recipe with any explicit list, empty or not, is nonlegacy: it packs
+the selections as `.onelf/entrypoint-sets` and refuses a runtime
+substitution that does not advertise payload metadata and
+selection-view support. With every list omitted no record is written,
+which the runtime reads as every declared set, and the package stays
+byte-identical to what the recipe always packed. See
+[Selecting dependency sets](../guide/recipe#selecting-dependency-sets).
+
 ## `[paths]`
 
 ```toml
@@ -298,6 +346,14 @@ when the inherited PATH is empty, since onelf setting `PATH` suppresses
 glibc's `_CS_PATH` fallback) unless `[env]` sets `PATH` explicitly, in
 which case that value is used verbatim (`PATH = "$${PATH}"` opts out of
 the prefix).
+
+❌ `LD_LIBRARY_PATH`, `LD_LIBRARY_PATH_32`, `LD_LIBRARY_PATH_64` and
+`LD_AOUT_LIBRARY_PATH` are refused as `[env]` keys at load, with
+guidance: the loader search path is what onelf resolves, not a
+configurable one. Reach libraries with `[bundle] search-paths`, sets,
+or the resolver's host policy instead. A build names the key and the
+reason: `error: ./onelf.toml: [env] LD_LIBRARY_PATH: refused: the
+loader search path is what onelf resolves, not a configurable one`.
 
 `.onelf/env` is also re-applied by the bundled `onelf-env` constructor
 (`DT_NEEDED` on the entrypoint), so these survive a sandboxed

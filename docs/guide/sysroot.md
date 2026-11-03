@@ -219,7 +219,17 @@ error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure, on 
 - ✅ A sysroot build stops, and that is the point. The universe was
   complete, so the omission is a policy or platform-line mistake you can
   fix. From a host scan the same finding stays a warning, because there
-  the universe was a guess.
+  the universe was a guess. When the file the build needs is not
+  missing but pruned, the error names the conflict:
+
+```
+error: bin/app needs libdep.so.1, which libdep holds but the policy or a trace removed; the conflict stops the build rather than dropping the object or restoring the file
+```
+
+  An object the build would have to drop for this goes through the
+  ordinary "Dropped" report instead, so the failure is the one the
+  build cannot resolve on its own: the entrypoint, a file you placed by
+  hand, and an explicit include are never dropped silently.
 - ☑️ A dependency the database names but the sysroot does not hold is
   reported, not fatal. A debloated rootfs drops metapackages on purpose.
 - ☑️ A file the build copied whose need no package in the sysroot holds
@@ -284,11 +294,28 @@ and accepts what the set provides when it verifies the bundle. The
 package records each set's URL and hash in `.onelf/sets`, which `onelf
 info` prints. ✅ The hash is the trust story, as for the GL build.
 
+Before anything is written, the build audits the sets it declares
+against each other. Two sets that export one loader name with different
+bytes cannot be selected together, because the entrypoint that names
+both would have to load one of them twice, so such a pair stops the
+build naming the entrypoint, the name and both pins:
+
+```
+error: provider audit failed:
+  entrypoint 'app': libcollide.so.1 is exported with different bytes by sets alpha (blake3 f7400782b86f..(64 chars)) and beta (blake3 0ac0d405c79e..(64 chars)), so they cannot be selected together
+```
+
+Sets that export the same bytes under one name are one provider and
+pass silently, and a set that exports no loader name contributes
+nothing to the audit.
+
 ### At launch
 
-Every set the package names is fetched into the shared store under the
-cache root and verified against its hash before it is placed there, so
-two packages naming the same set share one download.
+Every set the invoked entrypoint selects is fetched into the shared
+store under the cache root and verified against its hash before it is
+placed there, so two packages naming the same set share one download.
+An entrypoint that selects none fetches, mounts and extracts nothing,
+whatever else the recipe declares.
 
 By default the set is then served from that stored file: a detached FUSE
 server mounts it at a mountpoint named after the build's hash, so nothing
@@ -335,6 +362,64 @@ it, so a set that cannot be obtained ends the launch naming the set and
 the reason, rather than failing later at the first missing symbol.
 `ONELF_NO_PLATFORM_FETCH` and `ONELF_PLATFORM_STORE` apply to sets as
 they do to the GL build.
+
+### Store trust
+
+✅ The pin is checked against the bytes, not the name. Before a stored
+build is extracted, mounted, served or executed, the runtime hashes the
+bytes it is about to consume against the package's full BLAKE3 pin. A
+store file that carries the pinned name but holds different or
+truncated bytes is not used: the launch fetches a permitted replacement
+and verifies it the same way, or fails naming the set, the mismatch and
+the pin:
+
+```
+onelf-rt: dependency set fix required by entrypoint app: <store>/fix/<pin>.onelf: hash mismatch (got 1fe1..., pinned bdbd...); fetching is disabled by ONELF_NO_PLATFORM_FETCH (fix would be fetched from file:///tmp/fix-set.onelf)
+```
+
+A valid hash says the bytes equal the pin and nothing more: it is not a
+claim about who built them, which is why a package you do not trust
+stays untrusted however well its pins verify.
+
+✅ The store location travels as a hint, not a search path. An ordinary
+launch exports its resolved store to the application and every process
+it starts as `ONELF_PLATFORM_STORE`, so a bundled helper that fetches a
+set looks where the launch did. The value is only ever an artifact
+lookup location: no library directory is placed on it, and acquisition
+under another uid verifies against the pin and imports into that uid's
+own store rather than trusting another user's files.
+
+✅ Old artifacts keep working. What a set provides and whether its
+objects fit the package's libc are read out of the pinned build's
+verified manifest and ELF objects at check time, so a set packed by an
+older onelf needs no republishing when the checks grow stricter. A
+wrong-architecture object or an unsatisfied symbol version in any
+pinned build, old or new, fails before the application runs.
+
+### Execution views
+
+The libraries a launch shows, host choices and selected sets included,
+reach it through an execution view: a private tree identified by
+everything that changes what it shows or restores, the package, the
+active set pins, the host-library decision, the entrypoint, the
+consuming uid and the per-launch environment record among them. Views
+live under the cache root, `views/view-<key>/`, built in private
+staging and published in one atomic step, and a launch holds a lease on
+its view for as long as it or any descendant runs.
+
+Two launches of one package whose entrypoints select different sets
+resolve different identities, so each gets its own view: the CLI sees
+no toolkit links and cannot remove the links a running GUI is using,
+and the GUI keeps loading its plugins while the CLI runs. Selections
+that differ only in the order their lists were written share one view.
+A change to any identity input, the host's resolver state included,
+prevents reuse; `onelf cache gc` and `onelf cache clear` reclaim views
+once no launch holds a lease. How a lease survives a daemonizing
+application, and what becomes of a launch that is killed, is the
+lifetime guardian's story; see [The Lifetime Guardian](./guardian).
+See also
+[Developing Packages](./developing#prepared-development-views) for the
+development form of the same layout.
 
 ## Sets without a sysroot
 
@@ -390,9 +475,14 @@ user's launch. A soname a set's build ships is reported as that set's:
   supplied is listed with the missing libraries.
 
 The package records the sets in `.onelf/sets`, the same file a sysroot
-build writes, and `onelf info` prints them. A build made this way pins
-every entry's mtime to 0 unless `[package].mtime` or
-`SOURCE_DATE_EPOCH` names a time, as any `[sysroot]` build does.
+build writes, and `onelf info` prints them. A recipe that writes any
+explicit `sets` list also carries the exact per-entrypoint selections
+(see
+[Selecting dependency sets](./recipe#selecting-dependency-sets)); one
+that omits every list packs no selection record, which the runtime
+reads as every declared set. A build made this way pins every entry's
+mtime to 0 unless `[package].mtime` or `SOURCE_DATE_EPOCH` names a
+time, as any `[sysroot]` build does.
 
 ## Pinning a GL build for hosts without one
 

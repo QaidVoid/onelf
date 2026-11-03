@@ -27,27 +27,40 @@ The full guide lives in [docs/](./docs).
   Ed25519 signature before anything is replaced. Or leave the updater
   out and let a package manager do it.
 - **Recipes.** One `onelf.toml` captures the whole build, and the same
-  inputs give the same bytes.
+  inputs give the same bytes. Entrypoints pick the shared dependency
+  sets they use; an omitted list keeps every declared set, an empty
+  one keeps none.
 
 ## Quick example
 
+Write an `onelf.toml` that names the command and, when there is no
+AppDir yet, the bare binary to import:
+
+```toml
+[package]
+command = "bin/myapp"
+
+[input]
+binary = "../upstream/myapp"
+```
+
+One recipe, one command:
+
 ```sh
-# Copy the binary into an AppDir and collect its shared libraries.
-onelf bundle-libs ./myapp --from-binary /path/to/myapp --scan-dlopen
-
-# Pack into a single file.
-onelf pack ./myapp -o myapp.onelf --command bin/myapp
-
-# Run it.
+onelf build
 ./myapp.onelf
 ```
 
-GUI apps need no extra flags. Wayland and GTK data are bundled when the
-binary uses them, and the GPU stack comes from the host. Pass `--gl`,
-`--dri` or `--vulkan` only to ship Mesa for hosts that have no GL.
+The build imports the binary to `bin/myapp`, collects the shared
+libraries it needs, and packs the single file. A source outside the
+recipe's directory is never modified. GUI apps need no extra flags.
+Wayland and GTK data are bundled when the binary uses them, and the
+GPU stack comes from the host. Pass `--gl`, `--dri` or `--vulkan` only
+to ship Mesa for hosts that have no GL.
 
-Or declare everything in `onelf.toml` and use `onelf build`. See
-[docs/guide/recipe.md](./docs/guide/recipe.md).
+Without a recipe, `onelf bundle-libs` and `onelf pack` do the same two
+steps by hand. See [docs/guide/quick-start.md](./docs/guide/quick-start.md)
+and [docs/guide/recipe.md](./docs/guide/recipe.md).
 
 ## Install
 
@@ -83,6 +96,7 @@ crates/
 - [Quick start](./docs/guide/quick-start.md)
 - [Bundling libraries](./docs/guide/bundling.md)
 - [Execution modes](./docs/guide/execution-modes.md)
+- [The lifetime guardian](./docs/guide/guardian.md)
 - [Self-update](./docs/guide/self-update.md)
 - [CLI reference](./docs/reference/cli.md)
 - [Recipe schema](./docs/reference/recipe-schema.md)

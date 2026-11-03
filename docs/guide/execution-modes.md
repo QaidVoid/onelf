@@ -146,6 +146,11 @@ How it works:
 - Launches that start together take turns on the record. The first one
   holds it until its app runs, so the others find a finished mount and
   never start a second server.
+- A launch that joins the mount runs under a lifetime guardian of its
+  own, which holds that launch's lease. Its descendants keep the mount
+  claimed even when they daemonize and close everything they inherited;
+  the first launch needs no guardian, because its server holds the
+  mount. See [The Lifetime Guardian](./guardian).
 - On the `fusermount3` rung the mount is in the host's namespace, and a
   later launch runs from it as it is. On the namespace rung a later launch
   enters the server's user and mount namespace, and then a copy of that
@@ -214,8 +219,10 @@ Without one it is `/tmp/onelf-<uid>`, created with mode `0700`.
   or edit each other's files.
 - The tree is removed when the last process using it exits. An app
   that leaves processes running after it exits keeps its tree until
-  the last of them is gone. A launch killed before it could clean up
-  leaves a tree that the next launch of any package removes.
+  the last of them is gone; the launch's lifetime guardian is what
+  holds the tree's claim across a daemonizing app (see
+  [The Lifetime Guardian](./guardian)). A launch killed before it could
+  clean up leaves a tree that the next launch of any package removes.
 - Every block is verified against its recorded hash before the
   entrypoint runs, as in every other mode.
 - Uses space in the runtime directory equal to the uncompressed package
@@ -292,6 +299,17 @@ In a recipe, set `prefetch = "profile.txt"` under `[compression]`.
   lists files for pruning a sysroot build and starts when the app is
   launched. A profile lists blocks and starts with the mount, because
   what the runtime reads before the launch is part of every startup.
+
+## The lifetime guardian
+
+The modes that leave a tree or a mount on disk (`fuse`, `tmpfs`,
+`rundir`, `cache`) keep their on-disk claims for exactly as long as
+something of the launch runs: a lifetime guardian, a process the runtime
+forks before the application, holds the mount's lease, the tree's claim
+or the view's lease, adopts the descendants a daemonizing application
+leaves behind, and lets go only when its subtree has drained. Which
+launches fork one and what each one holds is
+[The Lifetime Guardian](./guardian).
 
 ## Comparison
 

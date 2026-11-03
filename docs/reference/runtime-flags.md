@@ -28,6 +28,11 @@ The report covers:
 
 - **Host**: whether user namespaces are usable and which mount helper
   would be used, if any.
+- **Metadata**: the payload records the package carries, the runtime
+  support they require (`payload metadata version 1, selection-view`
+  for a package with a selection table), what this runtime itself
+  advertises, and whether the requirement is satisfied. A package with
+  neither record prints `records: none carried (legacy defaults)`.
 - **Execution mode**: each mode in the order a launch tries them, with
   the reason a mode would be skipped, down to the one that would run.
   `ONELF_MODE`, `ONELF_CACHE` and `ONELF_FUSE_NO_NAMESPACE` are taken
@@ -38,7 +43,14 @@ The report covers:
   bundled copy, the host's newer one, or incomparable. Libraries only
   the host has are listed together. The host loader and the link farm
   are named when the host's glibc or any host library would be used.
-- **Dependency sets**: each pinned set and whether it is stored.
+- **Dependency sets**: each pinned set and whether it is stored. The
+  entrypoint's selection is named, including the legacy default when
+  the package carries no selection record: every declared set.
+- **Execution view**: the identity a launch would publish under the
+  cache: the package id, the entrypoint, the selected pins, the digest
+  of the metadata records it applies, and the consuming uid. The report
+  publishes nothing; the host-libs policy, the resolver's links and the
+  loader choice complete the identity at launch.
 - **Self-update**: the update URL, the number of signing keys, the
   revision, and whether this runtime includes the updater.
 

@@ -239,6 +239,54 @@ keyed, so anyone who rewrites the file can recompute all of them and
 produce a consistent package. Only a detached signature over the file
 shows who produced it.
 
+## Runtime metadata records
+
+Two package files carry validated records the runtime reads before it
+launches anything. Both ride in the payload as ordinary entries, so the
+container, the manifest, and the 14-byte entrypoint records are
+unchanged, and an older inspection tool can still read and extract a
+package carrying them; it just does not interpret them.
+
+- `.onelf/entrypoint-sets`, magic `OSET`: the canonical pin table of
+  the recipe's declared dependency sets, each name with its full 32-byte
+  BLAKE3, followed by one selection record per manifest entrypoint
+  naming the sets that entrypoint selects. Absence is the legacy
+  default: every declared set. Presence is exact: the launch fetches,
+  mounts and extracts only what its entrypoint's record names, and a
+  record that is truncated, of an unsupported version, inconsistent
+  with the manifest's entrypoints or the carried pin table, or
+  otherwise damaged, fails the launch before any acquisition or
+  application execution instead of degrading to a default.
+- `.onelf/runtime-rules`, magic `ORUL`: the normalized framework rules
+  a launch applies, as path groups and hook selections.
+
+Both formats share a bounded binary grammar: a 16-byte header (magic,
+little-endian u16 version 1, u16 reserved flags, u32 payload length,
+u32 aggregate record count), then length-prefixed strings and typed
+records with fixed-order fields, all little-endian. A file may be at
+most 1 MiB and may hold at most 4096 aggregate records; identifiers are
+at most 128 bytes and encoded paths at most 4096. Readers enforce every
+bound before allocating from an encoded length, and fail cleanly on a
+violation. Encodings are canonical: tables and references are sorted by
+name, and every accepted byte string re-encodes byte-for-byte.
+
+Which records a runtime understands is advertised by a capability note
+in the runtime ELF's own prefix, in the `ONELF` note vendor namespace:
+a metadata schema version plus capability bits. Two bits are named.
+`selection-view` is the per-entrypoint selection table: a runtime
+without it cannot scope a launch's set acquisition to the invoked
+entrypoint. `store-import` is the HTTPS fetch of pinned GL builds and
+sets, which only the update-capable runtime carries; a package that
+pins builds over `https://` needs it, while a `file://` pin runs on the
+slim runtime. Packaging checks the note of the runtime it is about to
+embed and refuses the pack when the recipe's records or pins need
+support the runtime does not advertise, rather than emitting a package
+whose selections could be ignored. `onelf info` and `--onelf-doctor`
+print the carried records, the requirement, the advertisement and
+whether the two agree; see
+[Inspecting Packages](../guide/inspecting) and
+[Runtime Flags](./runtime-flags#diagnosis).
+
 ## Format compatibility
 
 The footer's `format_version` accepts `1` and `2`; writers emit `2`.

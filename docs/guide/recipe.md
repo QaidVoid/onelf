@@ -7,6 +7,10 @@ The rules this page encodes:
 
 - ✅ Write the pack as a recipe and run `onelf build`. One file
   reproduces it, with no long CLI invocation to retype.
+- ✅ `[input] binary` to start from a bare binary. The build copies it
+  to the command's path. A source outside the recipe's directory is
+  never modified; one inside it is AppDir content, and the bundling
+  walk rewrites it like every binary in the tree.
 - ✅ `${ONELF_DIR}` for values that must follow the package. Any other
   `${VAR}` the packer's environment sets is expanded at pack time.
 - ✅ `$ONELF_DIR/bin` is prepended to `PATH` by default. Set
@@ -22,15 +26,58 @@ The rules this page encodes:
 
 ```toml
 [package]
-name = "myapp"
 command = "bin/myapp"
 ```
 
-Drop this next to the AppDir and run:
+`command` is the only required field in the file. Drop this next to an
+AppDir that already holds the binary and run:
 
 ```bash
 onelf build
 ```
+
+## Starting from a bare binary
+
+An AppDir you have not assembled yet can start from the upstream
+binary alone. `[input]` imports it to the command's path before
+anything else runs:
+
+```toml
+[package]
+command = "bin/myapp"
+
+[input]
+binary = "../upstream/myapp"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `binary` | path | none | A bare executable copied to the package command's path before assembly, relative to the recipe's directory |
+
+- ✅ The import never writes the source: it reads, hashes and copies to
+  the command's path, and a symlink in the destination's way is
+  refused rather than followed. The rest of the build keeps its hands
+  off a source outside the recipe's directory too. A source inside it
+  is AppDir content: the bundling walk rewrites it in place, like
+  every binary in the tree, and the rewrite is idempotent across
+  rebuilds.
+- ✅ The staged copy is tracked by content hash: a rebuild refreshes it
+  from its source, and a copy someone edited in the AppDir stops the
+  build instead of being overwritten or packed stale.
+- ❌ `[input] binary` and `[sysroot] path` together. A build takes its
+  contents from one authoritative source, so naming both fails before
+  either is read.
+- ❌ `[input] binary` with `[bundle] skip`. Skip expects an already
+  prepared tree, so there is nothing to import into.
+- ✅ `[input] binary` with a `[sysroot]` that only declares sets (no
+  `path`). The tree has no package database to consult, so the import
+  and your own additions are the whole bundle.
+- ❌ An archive, a package-manager identifier or a source tree. A bare
+  executable file is the only supported input, and anything else is
+  refused with what the supported forms are.
+- ❌ A symlink in the way of the destination, or a command path that
+  escapes the AppDir. The build fails before copying or modifying any
+  file outside it.
 
 ## Full example
 
@@ -87,6 +134,7 @@ runtime behavior, and metadata.
 | `prefer-cache` | bool | `false` | Run from the persistent cache before any other execution mode. Implies `cache`. See [Execution Modes](./execution-modes#an-app-that-records-its-own-path) |
 | `memfd` | bool | auto | Force memfd-eligible (auto-detected otherwise) |
 | `needs-setuid` | bool | `false` | The app runs setuid binaries such as `sudo` or `pkexec`, so keep it out of a user namespace |
+| `sets` | array | all declared | Which declared shared sets the package command uses. See [Selecting dependency sets](#selecting-dependency-sets) |
 | `mtime` | int | none | Pin every entry's mtime to this Unix timestamp. See [Reproducible Builds](./reproducible) |
 | `exclude` | array | `[]` | Glob patterns to exclude from the pack |
 | `version` | string | none | Shown by `onelf info` |
@@ -106,6 +154,56 @@ entrypoint automatically.
 | `path` | string | required | Path to binary within AppDir |
 | `args` | array | `[]` | Args always prepended to the invocation |
 | `default` | bool | `false` | Run this one by default |
+| `sets` | array | all declared | Which declared shared sets this entrypoint uses. See [Selecting dependency sets](#selecting-dependency-sets) |
+
+### Selecting dependency sets
+
+A recipe that declares shared sets under `[sysroot.sets.<name>]` can
+name, per entrypoint, which of them the entrypoint uses. `sets` is a
+list of declared set names in `[package]` for the package command and
+in each `[[entrypoint]]` for that entrypoint. The defaults are exact:
+
+- ✅ A list that is **omitted selects every declared set**. This is
+  what every recipe without the key has always done, and the package
+  stays byte-identical to what the same recipe always packed.
+- ✅ **`sets = []` selects none.** The launch fetches, mounts and
+  extracts no set at all, and does not fail because an unselected set
+  is unavailable. Use it for a CLI entrypoint beside a GUI one.
+- ✅ **A written list selects exactly the names it lists**, whatever
+  order they are written in: the launch reads them in canonical (sorted)
+  declaration order.
+- ✅ A named entrypoint's omitted list does **not** inherit the package
+  command's explicit list. Every entrypoint's list is its own answer.
+
+```toml
+[package]
+command = "bin/app"
+sets = ["gtk"]                  # the GUI keeps its toolkit
+
+[[entrypoint]]
+name = "app-cli"
+path = "bin/app"
+args = ["--cli"]
+sets = []                       # the CLI fetches no set
+```
+
+❌ A name the recipe does not declare, or one written twice in the same
+list, fails when the recipe loads, naming the list it was written in.
+✅ The package records the exact selections, and `onelf info` prints
+them under `Sets:`; `--onelf-doctor` reports, per entrypoint, which
+sets a launch would fetch and whether the store already holds each.
+⚠️ A recipe that writes any explicit list, empty or not, needs a
+runtime that advertises payload metadata and selection-view support;
+packing refuses a substituted runtime that could not enforce the
+selections. A recipe with every list omitted stays packable anywhere.
+
+At launch, only the sets the invoked entrypoint selects are obtained. A
+required selected set that cannot be acquired ends the launch naming
+the set and the reason; the optional pinned GL build keeps its
+separate, warning-only behavior. At build time the declared sets are
+audited against each other, so two sets no entrypoint could select
+together stop the build before anything is written (see
+[Sharing a dependency set](./sysroot#sharing-a-dependency-set)).
 
 ### `[compression]`
 
@@ -160,7 +258,7 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `trace-run` | bool | `false` | Run the command and bundle every library it loaded. See [Bundling](./bundling#detecting-dlopen-d-libs) |
 | `trace-seconds` | int | `5` | How long the traced run may go |
 | `trace-args` | array | `[]` | Arguments for the traced run |
-| `skip` | bool | `false` | Don't run bundle-libs at all |
+| `skip` | bool | `false` | Don't run bundle-libs at all: the tree stands as authored, unchecked. See [Unchecked trees](#unchecked-trees) |
 
 ### `[sysroot]`
 
@@ -170,7 +268,7 @@ packer's machine. Paths are relative to the recipe. See
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `path` | path | required | The materialized rootfs, outside the AppDir |
+| `path` | path | none | The materialized rootfs, outside the AppDir. Omit it to record sets only, with no package database |
 | `archive` | path | none | `.tar` or `.tar.zst` materialized into `path` when it does not exist, a path or an `https://` URL |
 | `hash` | string | none | BLAKE3 the archive must have before it is unpacked |
 | `platform` | string | archive or directory name | Label recorded as the package's platform in its provenance |
@@ -182,11 +280,36 @@ packer's machine. Paths are relative to the recipe. See
 | `platform-url` / `platform-hash` | string | none | Override the GL build the sysroot pins |
 
 Shared dependency sets go in `[sysroot.sets.<name>]` tables. See the
-[Recipe Schema](../reference/recipe-schema#sysroot-sets-name).
+[Recipe Schema](../reference/recipe-schema#sysroot-sets-name) and
+[Selecting dependency sets](#selecting-dependency-sets).
 
-When this section is present, `bundle-libs` runs even if `[bundle] skip`
-is set, since it is what applies the sysroot. The build also pins every
-mtime to 0 unless `[package] mtime` or `SOURCE_DATE_EPOCH` is set.
+A `[sysroot]` that names a `path` needs no other input, and every
+database key above belongs to that path: naming one without `path`
+stops the recipe from loading, as does a `[sysroot]` with neither
+`path` nor sets nor a GL build pin. When a path is present,
+`bundle-libs` runs even if `[bundle] skip` is set, since it is what
+applies the sysroot. The build also pins every mtime to 0 unless
+`[package] mtime` or `SOURCE_DATE_EPOCH` is set.
+
+### Unchecked trees
+
+`[bundle] skip = true` packs the AppDir exactly as it stands: no scan,
+no dependency audit, no completeness claim. It is the escape hatch for
+a tree that was assembled and verified some other way, such as a
+set-only recipe whose tree is an upstream release unpacked into place.
+
+- ❌ Expecting skip to mean checked. Nothing about the tree is
+  verified: the build validates the recipe's declared pins and the
+  runtime's capabilities, and nothing more. What the tree lacks shows
+  up at launch, as a missing library named at load time.
+- ✅ A sysroot with a `path` is the checked route: a build from a
+  package database stops on an unresolved `DT_NEEDED`, because the
+  universe was complete and the omission is a policy mistake. See
+  [Bundling from a Sysroot](./sysroot).
+- ✅ A host scan sits between the two: unresolved dependencies are
+  warnings there, since the scan's universe was a guess. The same is
+  true of `onelf build` on an AppDir without a sysroot and without
+  skip.
 
 ### `[paths]`
 
@@ -214,6 +337,28 @@ GST_PLUGIN_PATH_1_0 = "${ONELF_DIR}/lib/gstreamer-1.0"
 The problem: the package root exists only once the app runs, and a
 plain `${VAR}` is expanded while the recipe loads, against the
 **packer's** environment.
+
+- ❌ `LD_LIBRARY_PATH` and the other loader search-path variables
+  (`LD_LIBRARY_PATH_32`, `LD_LIBRARY_PATH_64`, `LD_AOUT_LIBRARY_PATH`).
+  The recipe is refused when it assigns one: the loader search path is
+  what onelf resolves, not a configurable one. Bundled binaries reach
+  their libraries through the `$ORIGIN` run path the bundler writes,
+  host and set libraries are linked by name into that same directory,
+  and nothing the app spawns sees a generated search path. Point the
+  build at a library with `[bundle] search-paths`, or let the
+  resolver's host policy supply it, instead of wiring a path by hand.
+
+  The refusal reads the same for all four names. A build prints:
+
+```
+error: ./onelf.toml: [env] LD_LIBRARY_PATH: refused: the loader search path is what onelf resolves, not a configurable one
+```
+
+  and `onelf run` prints, before it stages or launches anything:
+
+```
+error: [env] LD_LIBRARY_PATH cannot be set: the loader search path is what onelf resolves, not a configurable one; bundle the library with the AppDir or let the resolver choose it
+```
 
 - ✅ `${ONELF_DIR}` for anything under the package root. It expands at
   runtime to the FUSE mount, tmpfs, or cache dir the app runs from
@@ -257,7 +402,7 @@ so `.onelf/env` is re-applied on every exec, including after an app
 re-execs itself in a sandbox that calls `clearenv()` (Chromium/Electron
 zygotes, Steam, bwrap, etc.). ⚠️ This requires `patchelf` at pack time;
 without it the values are only set for the first launch. See
-[Environment › Surviving a sandboxed re-exec](./environment#surviving-a-sandboxed-re-exec).
+[Surviving a sandboxed re-exec](./environment#surviving-a-sandboxed-re-exec).
 
 ### `preload`
 
