@@ -698,7 +698,7 @@ fn stage_view_from_base(
 /// or `None` for a package on the built-in defaults. The digest covers
 /// the records' whole bytes, length-prefixed, so any change to validated
 /// metadata yields another execution-view identity.
-fn metadata_digest(rules: Option<Vec<u8>>, table: Option<Vec<u8>>) -> Option<[u8; 32]> {
+pub(crate) fn metadata_digest(rules: Option<Vec<u8>>, table: Option<Vec<u8>>) -> Option<[u8; 32]> {
     if rules.is_none() && table.is_none() {
         return None;
     }

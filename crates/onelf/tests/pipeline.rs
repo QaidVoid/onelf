@@ -17806,6 +17806,200 @@ fn the_doctor_reports_without_running_or_leaving_anything() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The doctor explains the invoked entrypoint's selected sets: an empty
+/// selection names none of the declared sets and consults nothing about
+/// them, so an unreachable or corrupt unselected artifact cannot change
+/// the report, while the selecting entrypoint still explains its own
+/// pin. Nothing is fetched for either entrypoint.
+#[test]
+fn the_doctor_explains_the_selection_and_ignores_unselected_sets() {
+    let td = workdir("doctor-selection");
+    let app = td.join("app");
+    write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
+    let pkg = td.join("sel.onelf");
+    write(
+        &app.join("onelf.toml"),
+        &sets_recipe(
+            "sets = [\"gtk\"]",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/run.sh\"\nargs = [\"--cli\"]\nsets = []\n",
+        ),
+    );
+    let o = Command::new(onelf())
+        .args([
+            "build",
+            app.to_str().unwrap(),
+            "--output",
+            pkg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert!(
+        o.status.success(),
+        "build: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-doctor")
+        .env("ONELF_ENTRYPOINT", "cli")
+        .env("ONELF_NO_PLATFORM_FETCH", "1");
+    isolate(&mut cmd, &td);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("selected for cli: none; no set is fetched, mounted, or extracted"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("gtk"),
+        "an unselected set must not be named, stat'd, or warned about:\n{stdout}"
+    );
+    assert!(stdout.contains("selected pins: none"), "{stdout}");
+    assert!(stdout.contains("this report publishes nothing"), "{stdout}");
+    assert!(
+        stdout.contains("records: entrypoint-sets")
+            && stdout.contains("requires: payload metadata version 1, selection-view")
+            && stdout.contains("agreement: satisfied"),
+        "{stdout}"
+    );
+
+    // A corrupt store entry under an unselected pin's name cannot change
+    // the report: the empty selection never reads, stats, or names it.
+    let stored = td.join("xdg-cache/onelf/platform/gtk");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(
+        stored.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.onelf"),
+        b"corrupt bytes",
+    )
+    .unwrap();
+    let corrupt = {
+        let mut cmd = Command::new(&pkg);
+        cmd.arg("--onelf-doctor")
+            .env("ONELF_ENTRYPOINT", "cli")
+            .env("ONELF_NO_PLATFORM_FETCH", "1");
+        isolate(&mut cmd, &td);
+        String::from_utf8_lossy(&run_package(&mut cmd).stdout).into_owned()
+    };
+    let _ = std::fs::remove_dir_all(td.join("xdg-cache/onelf/platform"));
+    let clean = {
+        let mut cmd = Command::new(&pkg);
+        cmd.arg("--onelf-doctor")
+            .env("ONELF_ENTRYPOINT", "cli")
+            .env("ONELF_NO_PLATFORM_FETCH", "1");
+        isolate(&mut cmd, &td);
+        String::from_utf8_lossy(&run_package(&mut cmd).stdout).into_owned()
+    };
+    assert_eq!(
+        corrupt, clean,
+        "an unselected pin's store entry must not change the report"
+    );
+
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-doctor").env_remove("ONELF_ENTRYPOINT");
+    isolate(&mut cmd, &td);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("selected for run.sh: gtk"),
+        "the selecting entrypoint explains its own pin:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("gtk: not stored, a launch fetches"),
+        "a fetch is described, never performed:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The doctor names environment variables and states presence, but never
+/// repeats their values: distinctive values in the launch environment
+/// must leave no trace in the report, in the forced-mode skip reasons,
+/// in the private-directory and link-farm descriptions, or anywhere
+/// else.
+#[test]
+fn the_doctor_never_prints_an_environment_value() {
+    let td = workdir("doctor-env");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let src = td.join("hello.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"RAN\");return 0;}\n",
+    );
+    if !cc(&src, &app.join("bin/hello")) {
+        return;
+    }
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let pkg = td.join("hello.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/hello", "--name", "hello"])
+        .args(["--host-libs", "always"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let markers: &[(&str, &str)] = &[
+        ("LD_LIBRARY_PATH", "/onelf-marker-libs"),
+        ("HOME", "/onelf-marker-home"),
+        ("XDG_DATA_DIRS", "/onelf-marker-data"),
+        ("XDG_CONFIG_DIRS", "/onelf-marker-config"),
+        ("XDG_CACHE_HOME", "/onelf-marker-cache"),
+        ("XDG_RUNTIME_DIR", "/onelf-marker-run"),
+    ];
+
+    // A forced mode the runtime does not know skips every mode; the skip
+    // reason names the variable, and the value must not surface. The
+    // environment is cleared so no real host value can pass for a
+    // reported one.
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONELF_MODE", "onelf-marker-mode")
+        .env("ONELF_CACHE", "onelf-marker-cache");
+    for (name, value) in markers {
+        cmd.env(name, value);
+    }
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("no mode can run this package here"),
+        "{stdout}"
+    );
+    for (_, value) in markers {
+        assert!(!stdout.contains(value), "{value} leaked:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("onelf-marker-mode") && !stdout.contains("onelf-marker-cache"),
+        "{stdout}"
+    );
+
+    // With the mode left to the runtime, a mode is chosen and the
+    // resolver's section is explained; its store descriptions name
+    // facts, never the environment-derived paths.
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("ONELF_MODE");
+    for (name, value) in markers {
+        cmd.env(name, value);
+    }
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("would run"), "{stdout}");
+    assert!(stdout.contains("host-libs: always"), "{stdout}");
+    for (_, value) in markers {
+        assert!(!stdout.contains(value), "{value} leaked:\n{stdout}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Unintegrating a package that was never integrated removes nothing, and
 /// an icon theme other packages put there does not make it look otherwise.
 #[test]

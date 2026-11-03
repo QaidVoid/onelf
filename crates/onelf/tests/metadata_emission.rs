@@ -1017,3 +1017,186 @@ fn a_set_carrying_build_launches_on_the_current_runtime() {
 fn hash_from_hex(hex: &str) -> [u8; 32] {
     *blake3::Hash::from_hex(hex).unwrap().as_bytes()
 }
+
+/// `onelf info` explains a record-carrying package's pin table, each
+/// entrypoint's selection, and the metadata capabilities the package
+/// requires beside what the runtime it carries advertises. The findings
+/// stay empty while the records agree, and the whole explanation reads
+/// the package's bytes alone.
+#[test]
+fn info_explains_selections_and_capabilities_without_acquiring() {
+    let root = temp_dir("info-explains");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let recipe_path = root.join("onelf.toml");
+    let (qt_hex, gtk_hex) = ("1".repeat(64), "2".repeat(64));
+    fs::write(
+        &recipe_path,
+        format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\nsets = [\"qt\"]\n\n\
+             [bundle]\nskip = true\n\n\
+             [sysroot.sets.qt]\npackages = [\"qt5\"]\nurl = \"https://e/qt.onelf\"\nblake3 = \"{qt_hex}\"\n\n\
+             [sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"{gtk_hex}\"\n"
+        ),
+    )
+    .unwrap();
+    let recipe = recipe::load(&recipe_path).unwrap();
+    let request =
+        assembly::AssemblyRequest::plan(&recipe_path, recipe, Some(out.as_path())).unwrap();
+    request.stage().unwrap();
+    let runtime = assembly::embed_runtime(&request).unwrap();
+    let mut opts = request.pack_options(None, runtime.note, Vec::new());
+    opts.metadata = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: vec![
+                SetPin {
+                    name: RuleId::new("qt").unwrap(),
+                    hash: hash_from_hex(&qt_hex),
+                },
+                SetPin {
+                    name: RuleId::new("gtk").unwrap(),
+                    hash: hash_from_hex(&gtk_hex),
+                },
+            ],
+            entrypoints: vec![EntrypointSelection {
+                name: "app".to_string(),
+                sets: vec![RuleId::new("qt").unwrap()],
+            }],
+        }),
+    )
+    .unwrap();
+    pack::pack(&opts, runtime.bytes).unwrap();
+
+    let (footer, manifest) = info::read_footer_and_manifest(&out).unwrap();
+    let selections = info::selection_lines(&out, &footer, &manifest)
+        .unwrap()
+        .join("\n");
+    assert!(selections.contains("Declared pins:"), "{selections}");
+    assert!(
+        selections.contains(&format!("  qt: pinned {qt_hex}, from https://e/qt.onelf")),
+        "{selections}"
+    );
+    assert!(
+        selections.contains(&format!(
+            "  gtk: pinned {gtk_hex}, from https://e/gtk.onelf"
+        )),
+        "{selections}"
+    );
+    assert!(selections.contains("Selections:"), "{selections}");
+    assert!(selections.contains("  app (default): qt"), "{selections}");
+    assert!(
+        selections.contains("Declared but selected by no entrypoint: gtk"),
+        "{selections}"
+    );
+    assert!(
+        !selections.contains("Findings:"),
+        "agreeing records name no conflict:\n{selections}"
+    );
+
+    let capabilities = info::capability_lines(&out, &footer, &manifest)
+        .unwrap()
+        .join("\n");
+    assert!(
+        capabilities.contains("Records:     entrypoint-sets"),
+        "{capabilities}"
+    );
+    assert!(
+        capabilities.contains("Requires:    payload metadata version 1, selection-view"),
+        "{capabilities}"
+    );
+    assert!(
+        capabilities.contains("advertises payload metadata version 1, selection-view"),
+        "{capabilities}"
+    );
+    assert!(
+        capabilities.contains("Agreement:   satisfied"),
+        "{capabilities}"
+    );
+}
+
+/// A package without metadata records explains nothing: no sets section
+/// and no runtime metadata section. A legacy package keeps its
+/// documented defaults.
+#[test]
+fn info_stays_silent_for_a_legacy_package() {
+    let root = temp_dir("info-legacy");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    pack::pack(
+        &test_opts(&root, &out, RuntimeNote::Absent),
+        b"stub-runtime",
+    )
+    .unwrap();
+    let (footer, manifest) = info::read_footer_and_manifest(&out).unwrap();
+    assert!(
+        info::selection_lines(&out, &footer, &manifest)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        info::capability_lines(&out, &footer, &manifest)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The conflicts `onelf info` can state from the records alone, without
+/// reading any artifact: a set declared more than once, a record whose
+/// pins do not match the pin table, and a record that does not match
+/// the manifest's entrypoints. Every line is sorted, so the report is a
+/// function of the records.
+#[test]
+fn info_reports_the_conflicts_the_records_reveal() {
+    let (one, two, three) = ("11".repeat(32), "22".repeat(32), "33".repeat(32));
+    let table = format!(
+        "[qt]\nurl = \"https://e/qt.onelf\"\nblake3 = \"{one}\"\n\
+         [qt]\nurl = \"https://e/other.onelf\"\nblake3 = \"{two}\"\n\
+         [gtk]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"{three}\"\n"
+    );
+    let declared = info::parse_declared_sets(&table);
+    assert_eq!(declared.len(), 3, "a repeated name stays visible");
+    assert_eq!(declared[1].blake3, two, "the second declaration is kept");
+
+    let stray = EntrypointSets {
+        pins: vec![SetPin {
+            name: RuleId::new("qt").unwrap(),
+            hash: hash_from_hex(&one),
+        }],
+        entrypoints: vec![EntrypointSelection {
+            name: "other".to_string(),
+            sets: vec![RuleId::new("qt").unwrap()],
+        }],
+    };
+    let findings = info::selection_findings(&declared, Some(&Ok(stray)), &["app"]);
+    let joined = findings.join("\n");
+    assert!(
+        joined.contains("the set 'qt' is declared more than once"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("the selection table does not match the package's entrypoints"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("the pin table declares 'gtk', which the selection record does not carry"),
+        "{joined}"
+    );
+
+    let mismatched = EntrypointSets {
+        pins: vec![SetPin {
+            name: RuleId::new("qt").unwrap(),
+            hash: hash_from_hex(&"44".repeat(32)),
+        }],
+        entrypoints: vec![EntrypointSelection {
+            name: "app".to_string(),
+            sets: vec![RuleId::new("qt").unwrap()],
+        }],
+    };
+    let findings = info::selection_findings(&declared, Some(&Ok(mismatched)), &["app"]);
+    assert!(
+        findings.iter().any(|f| f
+            .contains("the pin for 'qt' differs between the pin table and the selection record")),
+        "{findings:?}"
+    );
+}

@@ -12,7 +12,8 @@
 use std::arch::global_asm;
 
 use onelf_format::elf::{
-    CAPABILITY_NOTE_BYTES, RUNTIME_METADATA_VERSION, RuntimeCapabilities, encode_capability_note,
+    CAPABILITY_NOTE_BYTES, RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote,
+    encode_capability_note,
 };
 
 #[cfg(feature = "update")]
@@ -23,6 +24,17 @@ const ADVERTISED: RuntimeCapabilities = RuntimeCapabilities::SELECTION_VIEW;
 
 const NOTE: [u8; CAPABILITY_NOTE_BYTES] =
     encode_capability_note(RUNTIME_METADATA_VERSION, ADVERTISED);
+
+/// What this build's note advertises, as a decoder would read it back:
+/// the payload metadata schema version and the named features the note
+/// carries. The report surfaces state this instead of re-deriving it
+/// from the build's features.
+pub(crate) fn advertised() -> RuntimeNote {
+    RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: ADVERTISED,
+    }
+}
 
 const fn note_word(offset: usize) -> u32 {
     u32::from_le_bytes([

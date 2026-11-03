@@ -3,11 +3,20 @@
 //! Reads the footer and manifest from a packed ONELF binary and displays
 //! format version, layout offsets, entrypoints, and compression statistics.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, HostLibsPolicy, Manifest};
+use onelf_format::runtime_metadata::{EntrypointSets, MetadataError};
+use onelf_format::{EntryKind, FOOTER_SIZE, Flags, Footer, HostLibsPolicy, Manifest, elf};
+
+/// Where a package carries its validated runtime rule record.
+const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
+
+/// Where a package carries its canonical pin table and entrypoint
+/// selections.
+const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
 
 pub fn info(path: &Path) -> io::Result<()> {
     let (footer, manifest) = read_footer_and_manifest(path)?;
@@ -133,6 +142,24 @@ pub fn info(path: &Path) -> io::Result<()> {
     }
     println!();
 
+    let selections = selection_lines(path, &footer, &manifest)?;
+    if !selections.is_empty() {
+        println!("Sets:");
+        for line in selections {
+            println!("{line}");
+        }
+        println!();
+    }
+
+    let capabilities = capability_lines(path, &footer, &manifest)?;
+    if !capabilities.is_empty() {
+        println!("Runtime metadata:");
+        for line in capabilities {
+            println!("{line}");
+        }
+        println!();
+    }
+
     if let Some(url) = read_metadata_string(path, &footer, &manifest, ".onelf/update-url")? {
         let unsigned =
             read_metadata_bytes(path, &footer, &manifest, ".onelf/update-unsigned")?.is_some();
@@ -213,6 +240,323 @@ pub fn info(path: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// One declaration of the `.onelf/sets` pin table: the set's name, the
+/// source its build is fetched from, and the digest the build must hash
+/// to.
+pub(crate) struct DeclaredSet {
+    pub(crate) name: String,
+    pub(crate) url: String,
+    pub(crate) blake3: String,
+}
+
+/// Parse the `.onelf/sets` pin table, keeping every declaration in file
+/// order so a repeated name stays visible to the conflict report. A
+/// section whose values do not parse yields no declaration; the pin
+/// table the carried selection record must match is checked separately.
+pub(crate) fn parse_declared_sets(text: &str) -> Vec<DeclaredSet> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let (mut url, mut blake3) = (None, None);
+    let flush = |name: &mut Option<String>,
+                 url: &mut Option<String>,
+                 blake3: &mut Option<String>,
+                 out: &mut Vec<DeclaredSet>| {
+        if let (Some(name), Some(url), Some(blake3)) = (name.take(), url.take(), blake3.take()) {
+            out.push(DeclaredSet {
+                name,
+                url,
+                blake3: blake3.to_ascii_lowercase(),
+            });
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            flush(&mut name, &mut url, &mut blake3, &mut out);
+            name = rest.strip_suffix(']').map(|n| n.trim().to_string());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let Some(value) = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .map(|v| v.replace("\\\"", "\"").replace("\\\\", "\\"))
+        else {
+            continue;
+        };
+        match key.trim() {
+            "url" => url = Some(value),
+            "blake3" => blake3 = Some(value),
+            _ => {}
+        }
+    }
+    flush(&mut name, &mut url, &mut blake3, &mut out);
+    out
+}
+
+/// The lines `onelf info` prints under `Sets:`: the declared pin table,
+/// each entrypoint's selected sets from the carried selection record,
+/// and the provider conflicts the records reveal. Only package records
+/// are read; no set artifact is obtained, inspected, or weighed.
+pub(crate) fn selection_lines(
+    path: &Path,
+    footer: &Footer,
+    manifest: &Manifest,
+) -> io::Result<Vec<String>> {
+    let table = read_metadata_string(path, footer, manifest, crate::bundle::sysroot::SETS_FILE)?;
+    let record = read_metadata_bytes(path, footer, manifest, ENTRYPOINT_SETS_FILE)?;
+    if table.is_none() && record.is_none() {
+        return Ok(Vec::new());
+    }
+    let declared = table
+        .as_deref()
+        .map(parse_declared_sets)
+        .unwrap_or_default();
+    let record = record.as_deref().map(EntrypointSets::decode);
+    let mut lines = Vec::new();
+
+    if !declared.is_empty() {
+        lines.push("  Declared pins:".to_string());
+        for set in &declared {
+            lines.push(format!(
+                "    {}: pinned {}, from {}",
+                set.name, set.blake3, set.url
+            ));
+        }
+    }
+
+    match &record {
+        Some(Ok(record)) if !record.entrypoints.is_empty() => {
+            lines.push("  Selections:".to_string());
+            let default = manifest
+                .entrypoints
+                .get(manifest.header.default_entrypoint as usize)
+                .map(|entry| manifest.get_string(entry.name));
+            for entry in &record.entrypoints {
+                let marker = if default == Some(entry.name.as_str()) {
+                    " (default)"
+                } else {
+                    ""
+                };
+                let selected = if entry.sets.is_empty() {
+                    "none".to_string()
+                } else {
+                    entry
+                        .sets
+                        .iter()
+                        .map(|set| set.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                lines.push(format!("    {}{marker}: {selected}", entry.name));
+            }
+            let selected: BTreeSet<&str> = record
+                .entrypoints
+                .iter()
+                .flat_map(|entry| entry.sets.iter().map(|set| set.as_str()))
+                .collect();
+            let unselected: Vec<&str> = record
+                .pins
+                .iter()
+                .map(|pin| pin.name.as_str())
+                .filter(|name| !selected.contains(name))
+                .collect();
+            if !unselected.is_empty() {
+                lines.push(format!(
+                    "  Declared but selected by no entrypoint: {}",
+                    unselected.join(", ")
+                ));
+            }
+        }
+        Some(Ok(_)) => lines.push("  Selections: the record names no entrypoint".to_string()),
+        Some(Err(why)) => lines.push(format!(
+            "  Selections: the carried record is unreadable: {why}"
+        )),
+        None if !declared.is_empty() => {
+            lines.push(
+                "  Selections: every declared set (the package carries no selection record)"
+                    .to_string(),
+            );
+        }
+        None => {}
+    }
+
+    let names: Vec<&str> = manifest
+        .entrypoints
+        .iter()
+        .map(|entry| manifest.get_string(entry.name))
+        .collect();
+    let findings = selection_findings(&declared, record.as_ref(), &names);
+    if !findings.is_empty() {
+        lines.push("  Findings:".to_string());
+        for finding in findings {
+            lines.push(crate::bundle::ui::finding_line(&finding));
+        }
+    }
+    Ok(lines)
+}
+
+/// The provider conflicts the pin table and the selection record reveal
+/// without reading any artifact: a name declared more than once, a
+/// selection naming a set the pin table does not declare, and a record
+/// that does not match the manifest's entrypoints or the declared pins.
+/// Every line is sorted, so the report is a function of the records.
+pub(crate) fn selection_findings(
+    declared: &[DeclaredSet],
+    record: Option<&Result<EntrypointSets, MetadataError>>,
+    entrypoint_names: &[&str],
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    for set in declared {
+        if !seen.insert(set.name.as_str()) {
+            findings.push(format!("the set '{}' is declared more than once", set.name));
+        }
+    }
+    let Some(Ok(record)) = record else {
+        findings.sort();
+        return findings;
+    };
+    let declared: BTreeMap<&str, &str> = declared
+        .iter()
+        .map(|set| (set.name.as_str(), set.blake3.as_str()))
+        .collect();
+    for entry in &record.entrypoints {
+        for name in &entry.sets {
+            if !declared.contains_key(name.as_str()) {
+                findings.push(format!(
+                    "entrypoint '{}' selects '{}', which the pin table does not declare",
+                    entry.name,
+                    name.as_str()
+                ));
+            }
+        }
+    }
+    let mut manifest_names: Vec<&str> = entrypoint_names.to_vec();
+    manifest_names.sort_unstable();
+    let mut record_names: Vec<&str> = record
+        .entrypoints
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    record_names.sort_unstable();
+    if manifest_names != record_names {
+        findings.push("the selection table does not match the package's entrypoints".to_string());
+    }
+    let mut record_pins: BTreeMap<&str, String> = BTreeMap::new();
+    for pin in &record.pins {
+        record_pins.insert(pin.name.as_str(), hex(&pin.hash));
+    }
+    for (name, hash) in &record_pins {
+        match declared.get(name) {
+            None => findings.push(format!(
+                "the selection record pins '{name}', which the pin table does not declare"
+            )),
+            Some(pinned) if pinned != hash => {
+                findings.push(format!(
+                    "the pin for '{name}' differs between the pin table and the selection record"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for name in declared.keys() {
+        if !record_pins.contains_key(name) {
+            findings.push(format!(
+                "the pin table declares '{name}', which the selection record does not carry"
+            ));
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+/// The lines `onelf info` prints under `Runtime metadata:` for a package
+/// that carries payload metadata records: what they require of a
+/// runtime, what the runtime embedded in the package advertises, and
+/// whether the two agree. The note is probed in the package's own bytes;
+/// nothing outside the package is read or run.
+pub(crate) fn capability_lines(
+    path: &Path,
+    footer: &Footer,
+    manifest: &Manifest,
+) -> io::Result<Vec<String>> {
+    let rules = read_metadata_bytes(path, footer, manifest, RUNTIME_RULES_FILE)?;
+    let sets = read_metadata_bytes(path, footer, manifest, ENTRYPOINT_SETS_FILE)?;
+    if rules.is_none() && sets.is_none() {
+        return Ok(Vec::new());
+    }
+    let sets_record = sets.as_deref().map(EntrypointSets::decode);
+    let mut required = elf::RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION);
+    if let Some(Ok(record)) = &sets_record
+        && !record.entrypoints.is_empty()
+    {
+        required.capabilities = required
+            .capabilities
+            .union(elf::RuntimeCapabilities::SELECTION_VIEW);
+    }
+
+    let mut carried: Vec<&str> = Vec::new();
+    if rules.is_some() {
+        carried.push("runtime-rules");
+    }
+    if sets.is_some() {
+        carried.push("entrypoint-sets");
+    }
+    let mut lines = vec![
+        format!("  Records:     {}", carried.join(", ")),
+        format!("  Requires:    {}", requirements_text(&required)),
+    ];
+    if let Some(Err(why)) = &sets_record {
+        lines.push(format!("  Selection table: unreadable: {why}"));
+    }
+    let mut file = File::open(path)?;
+    let mut prefix = vec![0u8; footer.manifest_offset as usize];
+    file.read_exact(&mut prefix)?;
+    match elf::probe_capability_note(&prefix) {
+        Ok(note) => {
+            lines.push(format!("  Runtime:     {}", advertisement_text(&note)));
+            match elf::check_runtime_support(&note, required) {
+                Ok(()) => lines.push("  Agreement:   satisfied".to_string()),
+                Err(why) => lines.push(format!("  Agreement:   unsatisfied: {why}")),
+            }
+        }
+        Err(why) => lines.push(format!("  Runtime:     could not be probed: {why}")),
+    }
+    Ok(lines)
+}
+
+/// The support `required` names, as one report line: the metadata
+/// schema version, then any named capability.
+fn requirements_text(required: &elf::RuntimeRequirements) -> String {
+    let mut text = format!("payload metadata version {}", required.metadata_version);
+    if !required.capabilities.is_empty() {
+        text.push_str(", ");
+        text.push_str(&required.capabilities.to_string());
+    }
+    text
+}
+
+/// What a probed note advertises, as one report line.
+fn advertisement_text(note: &elf::RuntimeNote) -> String {
+    match note {
+        elf::RuntimeNote::Present {
+            metadata_version,
+            capabilities,
+        } => format!("advertises payload metadata version {metadata_version}, {capabilities}"),
+        elf::RuntimeNote::Absent => {
+            "carries no capability note (a runtime from before payload metadata)".to_string()
+        }
+        elf::RuntimeNote::Incompatible(why) => {
+            format!("carries an unreadable capability note: {why}")
+        }
+    }
 }
 
 /// Read and verify the manifest `footer` describes, from an already
