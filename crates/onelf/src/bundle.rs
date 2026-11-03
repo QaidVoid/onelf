@@ -966,10 +966,10 @@ const PREPARED_ENTRY_LIMIT: usize = 4096;
 /// destinations, and a selection naming a set the recipe never declares
 /// is the error a launch refuses it for.
 ///
-/// The records that carry these bindings to a launch are not emitted by
-/// a build path yet, so nothing outside the tests consults the scoping
-/// until that emission lands; the function is the surface the emission
-/// and the audits will resolve selections through.
+/// The records that carry these bindings to a launch are emitted by
+/// the build path, while the launch itself does not resolve through
+/// this function yet; the function is the surface that wiring will
+/// resolve selections through.
 #[allow(dead_code)]
 pub fn activate_prepared<'a>(
     selection: &recipe::SetSelection,

@@ -23,8 +23,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use rayon::prelude::*;
 
+use onelf_format::rules::RuleId;
 use onelf_format::runtime_metadata::{
-    EntrypointSets, MetadataError, RuntimeRuleMetadata, RuntimeRuleRecord,
+    EntrypointSets, MetadataError, RuntimeRuleMetadata, RuntimeRuleRecord, SetPin,
 };
 use onelf_format::{
     Entry, EntryKind, EntryPoint, EntryPointFlags, Flags, Footer, Manifest, ManifestHeader,
@@ -91,11 +92,9 @@ pub struct MetadataPayload {
 /// same way a scanned one does, and mappings no built-in rule backs lower
 /// identically. An empty rule set with no selection table emits nothing,
 /// while an explicit empty selection table is carried as the statement it
-/// is.
-///
-/// No build path calls this yet: production emission stays unwired while
-/// the runtime consumers that read the records are.
-#[allow(dead_code)]
+/// is. The recipe build path calls this once its selections have resolved
+/// against the final entrypoint table; every other caller lowers its own
+/// already-validated records.
 pub fn lower_runtime_metadata(
     rules: Vec<RuntimeRuleRecord>,
     sets: Option<EntrypointSets>,
@@ -155,6 +154,106 @@ fn record_error(why: MetadataError) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("runtime metadata: {why}"),
     )
+}
+
+/// The names of the final manifest entrypoint table, in its order: the
+/// default under its manifest name, then every named entrypoint the
+/// default does not already cover. The selection record a package
+/// carries must answer to exactly these names, so this derivation and
+/// the one that builds the table below must stay the same.
+fn final_entrypoint_names(opts: &PackOptions) -> Vec<String> {
+    let command_path = package_relative(&opts.command);
+    let default_name = opts
+        .default_entrypoint
+        .as_deref()
+        .or_else(|| command_path.file_name().and_then(|n| n.to_str()))
+        .unwrap_or("main");
+    let mut names = vec![default_name.to_string()];
+    for (name, _, _) in &opts.entrypoints {
+        if opts.default_entrypoint.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        names.push(name.clone());
+    }
+    names
+}
+
+/// The pins the AppDir records in `.onelf/sets`, as `SetPin`s sorted by
+/// name. A tree that declares no sets has an empty table. A record the
+/// tree holds that cannot be parsed is an error: carried selection
+/// metadata is checked against it, and present-but-unreadable is not
+/// absence.
+fn declared_pins(directory: &Path) -> io::Result<Vec<SetPin>> {
+    const SETS_FILE: &str = crate::bundle::sysroot::SETS_FILE;
+    let text = match fs::read_to_string(directory.join(SETS_FILE)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{SETS_FILE}: {e}"))),
+    };
+    let value: toml::Value = toml::from_str(&text).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{SETS_FILE}: not a parsable set record: {e}"),
+        )
+    })?;
+    let mut pins = Vec::new();
+    let Some(table) = value.as_table() else {
+        return Ok(pins);
+    };
+    for (name, set) in table {
+        let id = RuleId::new(name).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{SETS_FILE}: set name {name:?}: {e}"),
+            )
+        })?;
+        let hex = set
+            .get("blake3")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{SETS_FILE}: set {name} records no blake3 pin"),
+                )
+            })?;
+        let hash = blake3::Hash::from_hex(hex).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{SETS_FILE}: set {name}: pin is not a blake3 digest"),
+            )
+        })?;
+        pins.push(SetPin {
+            name: id,
+            hash: *hash.as_bytes(),
+        });
+    }
+    Ok(pins)
+}
+
+/// Check the selection metadata a package carries against the final
+/// entrypoint table and the pins the AppDir records, before anything is
+/// written. The runtime runs the same comparison against the packed
+/// package and executes nothing on a mismatch, so a record that names
+/// an entrypoint or pin the package does not carry fails here, naming
+/// what disagrees, rather than shipping as a package that can only be
+/// refused at launch.
+fn validate_carried_selections(opts: &PackOptions) -> io::Result<()> {
+    let Some(bytes) = &opts.metadata.entrypoint_sets else {
+        return Ok(());
+    };
+    let sets = EntrypointSets::decode(bytes).map_err(record_error)?;
+    let pins = declared_pins(&opts.directory)?;
+    let names = final_entrypoint_names(opts);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    sets.validate_against(&names, &pins).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the carried entrypoint selection metadata does not match the \
+                 package: {e}"
+            ),
+        )
+    })
 }
 
 impl Payload {
@@ -257,8 +356,10 @@ pub struct PackOptions {
     /// `.onelf/entrypoint-sets`. The default carries neither. Carrying
     /// either requires the embedded runtime to advertise the metadata
     /// support the records need, so `pack` refuses a runtime that falls
-    /// short. No build path populates this yet: production emission stays
-    /// unwired while the runtime consumers that read the records are.
+    /// short, and a carried selection table is validated against the
+    /// final entrypoint table and the pins the tree records before
+    /// anything is written. The recipe build path lowers the table its
+    /// resolved selections write; every other build carries none.
     pub metadata: MetadataPayload,
     /// What the embedded runtime advertises, probed from its actual bytes
     /// including any `ONELF_RT_PATH` substitution. Assembly refuses a
@@ -828,6 +929,11 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             ),
         )
     })?;
+    // A carried selection record answers to the final entrypoint table
+    // and the pins this tree declares, checked here so a mismatched
+    // record fails the build instead of shipping as a package the
+    // runtime must refuse.
+    validate_carried_selections(opts)?;
     if opts.payload == Payload::Stipple {
         if !opts.block_size.is_power_of_two() {
             return Err(io::Error::new(
@@ -1186,8 +1292,8 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     }
 
     // Inject the validated runtime mappings and the entrypoint selection
-    // table when a build lowers them. No build populates them yet, so
-    // ordinary packages carry neither record.
+    // table when a build lowers them. Builds that write no explicit
+    // selection lower neither record, so ordinary packages carry none.
     if let Some(ref bytes) = opts.metadata.runtime_rules {
         inject_onelf_file(
             &mut dirs,

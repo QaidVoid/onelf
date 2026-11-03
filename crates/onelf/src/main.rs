@@ -1108,10 +1108,9 @@ fn run_build(
         Some(p) => pack::read_profile(p)?,
         None => Vec::new(),
     };
-    pack::pack(
-        &request.pack_options(update_key, runtime.note, profile),
-        runtime.bytes,
-    )
+    let mut options = request.pack_options(update_key, runtime.note, profile);
+    options.metadata = entrypoint_sets_metadata(&request, &selected)?;
+    pack::pack(&options, runtime.bytes)
 }
 
 /// One final manifest entrypoint and the sets its recipe selects.
@@ -1236,6 +1235,130 @@ fn require_selection_runtime(
     })
 }
 
+/// The metadata a build carries for its set selections: the declared
+/// pin table paired with one exact selection per final manifest
+/// entrypoint, in the canonical form the shared codec encodes.
+///
+/// A build whose every list was omitted carries none of it. The
+/// runtime's documented default for absent selection metadata is
+/// already every declared set, so the record would say what absence
+/// already says, and the package stays byte-identical to what the same
+/// recipe always packed. A build that wrote any explicit list carries
+/// the complete table, because a launch reads it as the exact selection
+/// and absence would read as every set.
+///
+/// An omitted selection expands to every declared name and a written
+/// list keeps its names, so the table is complete over the final
+/// entrypoint names whatever mixture of the two the recipe wrote. The
+/// packer re-checks the lowered table against the final entrypoint
+/// table and the recorded pins before anything is written.
+fn entrypoint_sets_metadata(
+    request: &assembly::AssemblyRequest,
+    table: &[ResolvedSelection],
+) -> std::io::Result<pack::MetadataPayload> {
+    if !table.iter().any(ResolvedSelection::is_explicit) {
+        return Ok(pack::MetadataPayload::default());
+    }
+    let declared = declared_set_pins(request)?;
+    let names: std::collections::BTreeMap<&str, onelf_format::rules::RuleId> = declared
+        .iter()
+        .map(|pin| (pin.name.as_str(), pin.name.clone()))
+        .collect();
+    let mut entrypoints = Vec::new();
+    for resolved in table {
+        let sets: Vec<_> = match &resolved.sets {
+            recipe::SetSelection::All => names.values().cloned().collect(),
+            recipe::SetSelection::Names(list) => {
+                let mut selected = Vec::with_capacity(list.len());
+                for name in list {
+                    let Some(id) = names.get(name.as_str()) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "entrypoint '{}': set '{name}' is not declared by this recipe",
+                                resolved.name
+                            ),
+                        ));
+                    };
+                    selected.push(id.clone());
+                }
+                selected
+            }
+        };
+        entrypoints.push(onelf_format::runtime_metadata::EntrypointSelection {
+            name: resolved.name.clone(),
+            sets,
+        });
+    }
+    pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(onelf_format::runtime_metadata::EntrypointSets {
+            pins: declared,
+            entrypoints,
+        }),
+    )
+    .map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the entrypoint selection record cannot be written: {e}"),
+        )
+    })
+}
+
+/// The canonical pin table of a build's declared sets: every
+/// declaration's name and full artifact hash, sorted by name. A
+/// declaration whose pin is not a BLAKE3 digest is refused here, so the
+/// table carries only pins the published build can be checked against.
+fn declared_set_pins(
+    request: &assembly::AssemblyRequest,
+) -> std::io::Result<Vec<onelf_format::runtime_metadata::SetPin>> {
+    let own = request.bundle.sets.iter();
+    let shared = request
+        .bundle
+        .sysroot
+        .as_ref()
+        .map(|sysroot| sysroot.sets.iter())
+        .into_iter()
+        .flatten();
+    let mut declared: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for set in own.chain(shared) {
+        match declared.entry(set.name.as_str()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(set.blake3.as_str());
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                if slot.get() != &set.blake3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("set '{}' is declared twice with different pins", set.name),
+                    ));
+                }
+            }
+        }
+    }
+    declared
+        .into_iter()
+        .map(|(name, hash)| {
+            let name = onelf_format::rules::RuleId::new(name).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("set '{name}': the selection record needs an identifier: {e}"),
+                )
+            })?;
+            let parsed = blake3::Hash::from_hex(hash).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("set '{}': pin is not a blake3 digest", name.as_str()),
+                )
+            })?;
+            Ok(onelf_format::runtime_metadata::SetPin {
+                name,
+                hash: *parsed.as_bytes(),
+            })
+        })
+        .collect()
+}
+
 /// If `src` is given, copy it into `dir/bin/<basename>`, creating `dir/bin`
 /// first. No-op when `src` is None.
 fn scaffold_from_binary(
@@ -1300,17 +1423,22 @@ mod block_size_tests {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::{ResolvedSelection, require_selection_runtime, resolve_set_selections};
+    use super::{
+        ResolvedSelection, entrypoint_sets_metadata, require_selection_runtime,
+        resolve_set_selections,
+    };
     use crate::assembly;
+    use crate::metadata;
     use crate::recipe;
     use onelf_format::elf::{RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote};
+    use onelf_format::runtime_metadata::EntrypointSets;
 
-    const SETS: &str = "[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n";
+    const SETS: &str = "[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\n[sysroot.sets.audio]\npackages = [\"pipewire\"]\nurl = \"https://e/audio.onelf\"\nblake3 = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n";
 
     /// A recipe body: package-level keys beyond the command, then the
     /// declared sets, then any named entrypoints.
     fn recipe(package: &str, entrypoints: &str) -> String {
-        format!("[package]\ncommand = \"bin/app\"\n{package}\n{SETS}\n{entrypoints}")
+        format!("[package]\ncommand = \"bin/app\"\nmtime = 0\n{package}\n{SETS}\n{entrypoints}")
     }
 
     /// Load, normalize and plan a recipe written into a scratch
@@ -1466,5 +1594,273 @@ mod selection_tests {
             },
         ];
         require_selection_runtime(&RuntimeNote::Absent, &table).unwrap();
+    }
+
+    const GTK_PIN: [u8; 32] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+        0xcd, 0xef,
+    ];
+    const AUDIO_PIN: [u8; 32] = [
+        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+        0x32, 0x10,
+    ];
+
+    /// Plan and resolve a recipe written into a scratch directory,
+    /// keeping the scratch: the record builder needs only the request,
+    /// and the packing tests need the tree.
+    fn planned(
+        body: &str,
+    ) -> (
+        std::path::PathBuf,
+        assembly::AssemblyRequest,
+        Vec<ResolvedSelection>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-selection-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("onelf.toml"), body).unwrap();
+        let path = recipe::resolve(&dir).unwrap();
+        let recipe = recipe::load(&path).unwrap();
+        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
+        let request = assembly::AssemblyRequest::plan(&path, recipe, None).unwrap();
+        let table = resolve_set_selections(&selections, &request).unwrap();
+        (dir, request, table)
+    }
+
+    /// The sets one entrypoint selects, by name, from a decoded record.
+    fn selection<'a>(record: &'a EntrypointSets, name: &str) -> Vec<&'a str> {
+        record
+            .entrypoints
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.sets.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_else(|| panic!("no record for {name}"))
+    }
+
+    /// An explicit selection lowers the complete record: the declared
+    /// pin table in canonical order, and one exact selection per final
+    /// manifest entrypoint name.
+    #[test]
+    fn an_explicit_selection_lowers_the_complete_record() {
+        let (dir, request, table) = planned(&recipe(
+            "sets = [\"gtk\"]",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
+        ));
+        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        assert!(
+            payload.runtime_rules.is_none(),
+            "selections carry no rule records"
+        );
+        let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            record
+                .pins
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["audio", "gtk"],
+            "every declared set is pinned, canonically ordered"
+        );
+        assert_eq!(record.pins[0].hash, AUDIO_PIN);
+        assert_eq!(record.pins[1].hash, GTK_PIN);
+        assert_eq!(selection(&record, "app"), ["gtk"]);
+        assert_eq!(selection(&record, "cli"), [] as [&str; 0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A legacy build, every list omitted, carries no records: absence
+    /// already means every declared set, so the package stays
+    /// byte-identical to what the recipe always packed.
+    #[test]
+    fn a_legacy_selection_lowers_no_record() {
+        let (dir, request, table) = planned(&recipe("", ""));
+        assert_eq!(
+            entrypoint_sets_metadata(&request, &table).unwrap(),
+            crate::pack::MetadataPayload::default()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// In one complete table an omitted list expands to every declared
+    /// name while a written list keeps exactly its names.
+    #[test]
+    fn an_omitted_list_expands_beside_a_written_one() {
+        let (dir, request, table) = planned(&recipe(
+            "sets = [\"audio\"]",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        ));
+        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
+        assert_eq!(selection(&record, "app"), ["audio"]);
+        assert_eq!(selection(&record, "cli"), ["audio", "gtk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The entrypoint the default names keeps its recipe name in the
+    /// record: renamed and default entrypoints address one record, not
+    /// a second one under the command's name.
+    #[test]
+    fn the_default_named_entrypoint_keeps_one_record_under_its_recipe_name() {
+        let (dir, request, table) = planned(&recipe(
+            "",
+            "[[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\ndefault = true\nsets = [\"gtk\"]\n",
+        ));
+        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            record
+                .entrypoints
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["gui"],
+            "the default names the record, once"
+        );
+        assert_eq!(selection(&record, "gui"), ["gtk"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A selection table naming a set nothing declares is refused
+    /// rather than lowered.
+    #[test]
+    fn a_record_names_only_declared_sets() {
+        let (dir, request, _table) = planned(&recipe("", ""));
+        let hostile = vec![ResolvedSelection {
+            name: "app".to_string(),
+            sets: recipe::SetSelection::Names(vec!["ghost".to_string()]),
+        }];
+        let err = entrypoint_sets_metadata(&request, &hostile).unwrap_err();
+        assert!(
+            err.to_string().contains("entrypoint 'app': set 'ghost'"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A skipped tree with explicit selections packs the record through
+    /// the real build onto the embedded runtime, and the packer refuses
+    /// the same record on a runtime short on the selection view: the
+    /// pack-level gate agrees with the selection gate.
+    #[test]
+    fn the_pack_gate_agrees_on_an_incapable_runtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-selection-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/app"), "#!/bin/sh\necho hi\n").unwrap();
+        let body = recipe(
+            "sets = [\"gtk\"]\n\n[bundle]\nskip = true",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
+        );
+        std::fs::write(dir.join("onelf.toml"), body).unwrap();
+        let path = recipe::resolve(&dir).unwrap();
+        let loaded = recipe::load(&path).unwrap();
+        let selections = recipe::SetSelections::normalize(&loaded).unwrap();
+        let request = assembly::AssemblyRequest::plan(&path, loaded, None).unwrap();
+        let table = resolve_set_selections(&selections, &request).unwrap();
+        let _report = request.stage().unwrap();
+        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+
+        let out = dir.join("pkg.onelf");
+        let mut opts = request.pack_options(None, RuntimeNote::Absent, Vec::new());
+        opts.output = out.clone();
+        opts.metadata = payload;
+        let err = crate::pack::pack(&opts, b"stub-runtime").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("refusing to embed a runtime"), "{text}");
+        assert!(text.contains("selection-view"), "{text}");
+        assert!(!out.exists(), "the refusal must come before any writing");
+
+        let runtime = assembly::embed_runtime(&request).unwrap();
+        let mut opts = request.pack_options(None, runtime.note, Vec::new());
+        opts.output = out.clone();
+        opts.metadata = entrypoint_sets_metadata(&request, &table).unwrap();
+        crate::pack::pack(&opts, runtime.bytes).unwrap();
+        let carried = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .expect("the capable runtime carries the record");
+        assert!(EntrypointSets::decode(&carried).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// End to end through the real build: a recipe with explicit
+    /// selections packs a package whose selection record answers to the
+    /// final entrypoint table, while the legacy recipe beside it packs
+    /// no record at all.
+    #[test]
+    fn a_run_build_emits_the_record_its_selections_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-selection-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/app"), "#!/bin/sh\necho hi\n").unwrap();
+        let explicit = recipe(
+            "sets = [\"gtk\"]\n\n[bundle]\nskip = true",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
+        );
+        std::fs::write(dir.join("onelf.toml"), explicit).unwrap();
+        let out = dir.join("pkg.onelf");
+        super::run_build(&dir.join("onelf.toml"), Some(out.as_path())).unwrap();
+
+        let (_, manifest) = crate::info::read_footer_and_manifest(&out).unwrap();
+        assert_eq!(manifest.entrypoints.len(), 2);
+        let names: Vec<&str> = manifest
+            .entrypoints
+            .iter()
+            .map(|e| manifest.get_string(e.name))
+            .collect();
+        assert_eq!(
+            names,
+            ["app", "cli"],
+            "the final table the record answers to"
+        );
+        let carried = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .expect("the explicit build carries the record");
+        let record = EntrypointSets::decode(&carried).unwrap();
+        assert_eq!(selection(&record, "app"), ["gtk"]);
+        assert_eq!(selection(&record, "cli"), [] as [&str; 0]);
+        assert!(
+            metadata::read_packed_file(&out, ".onelf/runtime-rules")
+                .unwrap()
+                .is_none(),
+            "a skipped tree lowers no rule records"
+        );
+
+        let legacy = recipe(
+            "\n[bundle]\nskip = true",
+            "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
+        );
+        std::fs::write(dir.join("onelf.toml"), legacy).unwrap();
+        let plain = dir.join("plain.onelf");
+        super::run_build(&dir.join("onelf.toml"), Some(plain.as_path())).unwrap();
+        assert!(
+            metadata::read_packed_file(&plain, ".onelf/entrypoint-sets")
+                .unwrap()
+                .is_none(),
+            "the legacy build emits nothing"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

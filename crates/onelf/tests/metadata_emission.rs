@@ -1,22 +1,20 @@
-//! Metadata lowering, capability gating and emission wiring tests.
+//! Metadata lowering, capability gating, emission and packing-gate tests.
 //!
 //! The packer is a binary crate, so these tests compile the modules they
-//! exercise straight from source: the lowering and gating APIs are library
-//! shapes no build path wires up yet, and only these tests drive them
-//! ahead of that wiring. Including a module also runs its own unit tests
-//! in this target; the tests at the end of this file are the ones it adds.
+//! exercise straight from source. Lowering turns validated runtime
+//! mappings into the two encoded records a package can carry, the recipe
+//! build path lowers the selection table its resolved selections write
+//! through it, the capability note gates what a package may carry, and
+//! the packer validates a carried selection table against the final
+//! entrypoint table and the pins the tree records before anything is
+//! written. A build whose recipe writes no explicit selection lowers
+//! nothing, so it packs byte-identically to before.
 //!
 //! `bundle` is a file module with a child directory in the packer's own
 //! tree, and a module loaded through a path attribute resolves its
 //! children beside the named file. `tests/bundle/` therefore mirrors the
 //! packer's `bundle.rs` and `bundle/` pair with links, so the bundle
 //! include below resolves exactly the files the build compiles.
-//!
-//! Lowering turns validated runtime mappings into the two encoded records
-//! a package can carry, gates them on the embedded runtime's capability
-//! note, and injects them as `.onelf/runtime-rules` and
-//! `.onelf/entrypoint-sets`. Ordinary builds populate none of it, so they
-//! must pack byte-identically to before.
 
 #![allow(dead_code)]
 
@@ -141,6 +139,22 @@ fn capable_note() -> RuntimeNote {
         metadata_version: RUNTIME_METADATA_VERSION,
         capabilities: RuntimeCapabilities::SELECTION_VIEW,
     }
+}
+
+/// Record declared sets into `root`'s `.onelf/sets`, the record the
+/// packer checks a carried pin table against. Each entry is a set name
+/// and the pin its build is published under.
+fn record_declared_sets(root: &Path, sets: &[(&str, [u8; 32])]) {
+    let declared: Vec<bundle::sysroot::SharedSet> = sets
+        .iter()
+        .map(|(name, hash)| bundle::sysroot::SharedSet {
+            name: (*name).to_string(),
+            packages: Vec::new(),
+            url: format!("https://e/{name}.onelf"),
+            blake3: blake3::Hash::from(*hash).to_hex().to_string(),
+        })
+        .collect();
+    bundle::sysroot::record_sets(root, &declared, None).unwrap();
 }
 
 /// A runtime that parses payload metadata but resolves no selections: the
@@ -353,6 +367,7 @@ fn a_capable_runtime_carries_the_lowered_records() {
 fn selections_need_the_selection_view_and_are_carried_when_advertised() {
     let root = temp_dir("view");
     seed_app(&root);
+    record_declared_sets(&root, &[("gtk", [9; 32])]);
     let payload =
         pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [9; 32]))).unwrap();
     let out = root.join("pkg.onelf");
@@ -451,9 +466,15 @@ fn a_skipped_tree_carries_records_without_discovery() {
     seed_app(&root);
     let out = root.join("pkg.onelf");
     let recipe_path = root.join("onelf.toml");
+    let hash = [0xab; 32];
     fs::write(
         &recipe_path,
-        "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n",
+        format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\n\
+             blake3 = \"{}\"\n",
+            blake3::Hash::from(hash).to_hex()
+        ),
     )
     .unwrap();
     let recipe = recipe::load(&recipe_path).unwrap();
@@ -467,11 +488,10 @@ fn a_skipped_tree_carries_records_without_discovery() {
             .pack_options(None, RuntimeNote::Absent, Vec::new())
             .metadata,
         pack::MetadataPayload::default(),
-        "the wired build path still carries no records"
+        "an omitted selection lowers no records"
     );
 
     let runtime = assembly::embed_runtime(&request).unwrap();
-    let hash = [0xab; 32];
     let payload = pack::lower_runtime_metadata(
         vec![record(
             "gtk",
@@ -518,4 +538,338 @@ fn a_minimal_recipe_emits_no_metadata_records() {
     let (_, manifest) = info::read_footer_and_manifest(&out).unwrap();
     assert!(metadata::find_entry_by_path(&manifest, ".onelf/runtime-rules").is_none());
     assert!(metadata::find_entry_by_path(&manifest, ".onelf/entrypoint-sets").is_none());
+}
+
+/// The packer checks a carried pin table against the pins the tree
+/// records: a pin that does not match the actual published set fails
+/// the pack before anything is written, and the matching table passes.
+#[test]
+fn a_mismatched_pin_table_is_refused_before_writing() {
+    let root = temp_dir("pin-mismatch");
+    seed_app(&root);
+    record_declared_sets(&root, &[("gtk", [9; 32])]);
+    let wrong = pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [7; 32]))).unwrap();
+    let out = root.join("pkg.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, capable_note());
+            opts.metadata = wrong;
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("does not match the package"), "{text}");
+    assert!(text.contains("pin table"), "{text}");
+    assert!(!out.exists(), "a refused pin table writes nothing");
+
+    let matching =
+        pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [9; 32]))).unwrap();
+    let mut opts = test_opts(&root, &out, capable_note());
+    opts.metadata = matching;
+    pack::pack(&opts, b"stub-runtime").unwrap();
+    assert!(
+        metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A carried selection table must be complete over the final manifest
+/// entrypoint names: a record naming an entrypoint the package does not
+/// carry is refused before anything is written.
+#[test]
+fn a_record_off_the_final_entrypoint_table_is_refused() {
+    let root = temp_dir("name-mismatch");
+    seed_app(&root);
+    record_declared_sets(&root, &[("gtk", [9; 32])]);
+    let stray = EntrypointSets {
+        pins: vec![SetPin {
+            name: RuleId::new("gtk").unwrap(),
+            hash: [9; 32],
+        }],
+        entrypoints: vec![EntrypointSelection {
+            name: "other".to_string(),
+            sets: vec![RuleId::new("gtk").unwrap()],
+        }],
+    };
+    let payload = pack::lower_runtime_metadata(Vec::new(), Some(stray)).unwrap();
+    let out = root.join("pkg.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, capable_note());
+            opts.metadata = payload;
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("does not match the package"), "{text}");
+    assert!(text.contains("entrypoint names"), "{text}");
+    assert!(!out.exists());
+}
+
+/// Tampered or truncated carried bytes are refused at pack level: the
+/// packer decodes what it is about to write, so a payload that fails the
+/// shared codec fails the build instead of shipping as a package the
+/// runtime must reject at launch.
+#[test]
+fn truncated_carried_metadata_is_refused_before_writing() {
+    let root = temp_dir("truncated");
+    seed_app(&root);
+    record_declared_sets(&root, &[("gtk", [9; 32])]);
+    let mut bytes = pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [9; 32])))
+        .unwrap()
+        .entrypoint_sets
+        .unwrap();
+    bytes.truncate(bytes.len() - 1);
+    let out = root.join("pkg.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, capable_note());
+            opts.metadata.entrypoint_sets = Some(bytes);
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    let text = refused.to_string();
+    assert!(text.contains("runtime metadata"), "{text}");
+    assert!(!out.exists());
+}
+
+/// A selection naming a set outside the pin table cannot be lowered, a
+/// carried table over a tree that declares no pins has nothing to
+/// validate against, and an empty carried table matches no manifest.
+#[test]
+fn selections_without_declared_pins_are_refused() {
+    let ghost = EntrypointSets {
+        pins: vec![SetPin {
+            name: RuleId::new("gtk").unwrap(),
+            hash: [9; 32],
+        }],
+        entrypoints: vec![EntrypointSelection {
+            name: "app".to_string(),
+            sets: vec![RuleId::new("ghost").unwrap()],
+        }],
+    };
+    let err = pack::lower_runtime_metadata(Vec::new(), Some(ghost)).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown declared set name"),
+        "{err}"
+    );
+
+    let root = temp_dir("no-pins");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let payload =
+        pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", [9; 32]))).unwrap();
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, capable_note());
+            opts.metadata = payload;
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("does not match the package"),
+        "{refused}"
+    );
+    assert!(
+        !out.exists(),
+        "a tree declaring no pins carries no pin table"
+    );
+
+    let empty = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: Vec::new(),
+            entrypoints: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let out = root.join("empty.onelf");
+    let refused = pack::pack(
+        &{
+            let mut opts = test_opts(&root, &out, capable_note());
+            opts.metadata = empty;
+            opts
+        },
+        b"stub-runtime",
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("does not match the package"),
+        "{refused}"
+    );
+    assert!(!out.exists());
+}
+
+/// A skipped unchecked tree carries its declarations and nothing more:
+/// the pin table is exactly what `.onelf/sets` records, the selections
+/// answer to the final entrypoint names, and no rule record is lowered
+/// for a tree nothing audited.
+#[test]
+fn an_unchecked_tree_carries_declarations_and_no_satisfied_providers() {
+    let root = temp_dir("unchecked");
+    seed_app(&root);
+    let out = root.join("pkg.onelf");
+    let hash = [0x5a; 32];
+    let recipe_path = root.join("onelf.toml");
+    fs::write(
+        &recipe_path,
+        format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\nsets = [\"gtk\"]\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\n\
+             blake3 = \"{}\"\n",
+            blake3::Hash::from(hash).to_hex()
+        ),
+    )
+    .unwrap();
+    let recipe = recipe::load(&recipe_path).unwrap();
+    let request =
+        assembly::AssemblyRequest::plan(&recipe_path, recipe, Some(out.as_path())).unwrap();
+    let report = request.stage().unwrap();
+    assert_eq!(report.source, assembly::Source::Unchecked);
+
+    let payload = pack::lower_runtime_metadata(Vec::new(), Some(sets_table("gtk", hash))).unwrap();
+    let runtime = assembly::embed_runtime(&request).unwrap();
+    let mut opts = request.pack_options(None, runtime.note, Vec::new());
+    opts.metadata = payload;
+    pack::pack(&opts, runtime.bytes).unwrap();
+
+    let carried = EntrypointSets::decode(
+        &metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .expect("the unchecked tree carries its declarations"),
+    )
+    .unwrap();
+    let text = fs::read_to_string(root.join(".onelf/sets")).unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    let recorded: Vec<SetPin> = value
+        .as_table()
+        .unwrap()
+        .into_iter()
+        .map(|(name, set)| SetPin {
+            name: RuleId::new(name).unwrap(),
+            hash: *blake3::Hash::from_hex(set.get("blake3").unwrap().as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+        })
+        .collect();
+    carried
+        .validate_against(&["app"], &recorded)
+        .expect("the record is the declared table, nothing more");
+    assert!(
+        metadata::read_packed_file(&out, ".onelf/runtime-rules")
+            .unwrap()
+            .is_none(),
+        "nothing audited lowers no rule record"
+    );
+}
+
+/// Primary and named selections encode canonically and round-trip: the
+/// primary under its manifest name, named entrypoints under theirs, a
+/// renamed entrypoint keeping its recipe name.
+#[test]
+fn primary_and_named_selections_round_trip() {
+    let gtk = RuleId::new("gtk").unwrap();
+    let record = EntrypointSets {
+        pins: vec![SetPin {
+            name: gtk.clone(),
+            hash: [3; 32],
+        }],
+        entrypoints: vec![
+            EntrypointSelection {
+                name: "app".to_string(),
+                sets: vec![gtk.clone()],
+            },
+            EntrypointSelection {
+                name: "cli".to_string(),
+                sets: Vec::new(),
+            },
+        ],
+    };
+    let bytes = record.encode().unwrap();
+    let decoded = EntrypointSets::decode(&bytes).unwrap();
+    assert_eq!(decoded, record, "the record round-trips whole");
+    assert_eq!(decoded.encode().unwrap(), bytes, "decoding re-encodes 1:1");
+    // The canonical order holds regardless of the order the table was
+    // written in.
+    let reordered = EntrypointSets {
+        pins: record.pins.clone(),
+        entrypoints: record.entrypoints.iter().rev().cloned().collect(),
+    };
+    assert_eq!(reordered.encode().unwrap(), bytes);
+}
+
+/// The legacy entrypoint record size is kept: a package carrying
+/// selection metadata still serializes every entrypoint in 14 bytes,
+/// the record's own name bound applies to the metadata alone, and a
+/// legacy build over a name past that bound packs as it always did.
+#[test]
+fn legacy_entrypoint_size_is_kept() {
+    let long = "l".repeat(129);
+    let root = temp_dir("ep-size");
+    seed_app(&root);
+    record_declared_sets(&root, &[("gtk", [9; 32])]);
+
+    let payload = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: vec![SetPin {
+                name: RuleId::new("gtk").unwrap(),
+                hash: [9; 32],
+            }],
+            entrypoints: vec![EntrypointSelection {
+                name: long.clone(),
+                sets: vec![RuleId::new("gtk").unwrap()],
+            }],
+        }),
+    );
+    let err = payload.unwrap_err();
+    assert!(err.to_string().contains("1..=128"), "{err}");
+
+    let legacy_out = root.join("legacy.onelf");
+    let mut legacy = test_opts(&root, &legacy_out, RuntimeNote::Absent);
+    legacy.entrypoints = vec![(long.clone(), "bin/app".to_string(), Vec::new())];
+    pack::pack(&legacy, b"stub-runtime").unwrap();
+    assert!(
+        metadata::read_packed_file(&legacy_out, ".onelf/entrypoint-sets")
+            .unwrap()
+            .is_none(),
+        "a legacy build over the same name carries no record"
+    );
+
+    let out = root.join("carrying.onelf");
+    let mut opts = test_opts(&root, &out, capable_note());
+    opts.metadata = pack::lower_runtime_metadata(
+        Vec::new(),
+        Some(EntrypointSets {
+            pins: vec![SetPin {
+                name: RuleId::new("gtk").unwrap(),
+                hash: [9; 32],
+            }],
+            entrypoints: vec![EntrypointSelection {
+                name: "app".to_string(),
+                sets: vec![RuleId::new("gtk").unwrap()],
+            }],
+        }),
+    )
+    .unwrap();
+    pack::pack(&opts, b"stub-runtime").unwrap();
+    let (_, manifest) = info::read_footer_and_manifest(&out).unwrap();
+    for entrypoint in &manifest.entrypoints {
+        let mut written = Vec::new();
+        entrypoint.write_to(&mut written).unwrap();
+        assert_eq!(
+            written.len(),
+            onelf_format::entry::ENTRYPOINT_SIZE,
+            "the entrypoint record stays 14 bytes beside the metadata"
+        );
+    }
 }

@@ -7412,14 +7412,14 @@ fn a_duplicate_set_name_fails_before_the_tree_is_written() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// Explicit selections are validated and gated, but their records are
-/// not emitted yet: the package structure and every generated record
-/// stay exactly what the same recipe without the lists produces, so a
-/// legacy build's output is unchanged. The packed recipe text itself
-/// differs between the two builds, so its own entry is set aside
-/// before the comparison.
+/// An explicit selection is emitted as `.onelf/entrypoint-sets`: the
+/// declared pin table paired with one exact selection per final
+/// entrypoint. The legacy recipe beside it, every list omitted, emits
+/// no record, and every other generated record the two packages carry
+/// stays identical. The packed recipe text itself differs between the
+/// two builds, so its own entry is set aside before the comparison.
 #[test]
-fn an_explicit_selection_changes_nothing_the_package_carries() {
+fn an_explicit_selection_emits_its_record_and_leaves_the_rest_unchanged() {
     let td = workdir("sets-legacy");
     let app = td.join("app");
     write(&app.join("bin/run.sh"), "#!/bin/sh\necho hi\n");
@@ -7466,21 +7466,59 @@ fn an_explicit_selection_changes_nothing_the_package_carries() {
         String::from_utf8_lossy(&o.stderr)
     );
 
-    // The packed recipe text differs by the lists themselves, so its row
-    // is set aside; everything else the package carries must match.
+    // The packed recipe text differs by the lists themselves, and only
+    // the explicit build carries the selection record, so both rows are
+    // set aside; everything else the package carries must match.
     let listing = |pkg: &Path| {
         let out = run_onelf(&["list", pkg.to_str().unwrap()], None);
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|l| !l.ends_with(" onelf.toml"))
+            .filter(|l| !l.ends_with(".onelf/entrypoint-sets"))
             .collect::<Vec<_>>()
             .join("\n")
     };
     assert_eq!(
         listing(&with),
         listing(&without),
-        "selection lists must not change the package structure"
+        "selection lists must not change the rest of the package structure"
     );
+    let record_of = |pkg: &Path| {
+        run_onelf(
+            &[
+                "extract",
+                pkg.to_str().unwrap(),
+                "-o",
+                "-",
+                "--file",
+                ".onelf/entrypoint-sets",
+            ],
+            None,
+        )
+    };
+    let carried = record_of(&with);
+    assert!(
+        carried.status.success(),
+        "the explicit build emits the record"
+    );
+    let record = onelf_format::runtime_metadata::EntrypointSets::decode(&carried.stdout)
+        .expect("the emitted record decodes");
+    assert_eq!(
+        record
+            .entrypoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.sets.len()))
+            .collect::<Vec<_>>(),
+        [("cli", 0), ("run.sh", 1),],
+        "the primary selects its written list and the named entrypoint selects none"
+    );
+    let absent = record_of(&without);
+    assert!(
+        !absent.status.success(),
+        "the legacy build carries no selection record"
+    );
+    assert!(absent.stdout.is_empty());
+
     let recorded = |pkg: &Path| {
         let out = run_onelf(
             &[
