@@ -12614,6 +12614,335 @@ fn identical_set_exports_deduplicate() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The ALSA configuration a hand-made set tree ships, with the hooks
+/// block the carried snippet anchor belongs in and a version marker a
+/// test can tell apart across pins.
+fn set_alsa_configuration(tree: &Path, version: &str) {
+    std::fs::create_dir_all(tree.join("share/alsa/alsa.conf.d")).unwrap();
+    write(
+        &tree.join("share/alsa/alsa.conf"),
+        &format!(
+            "@hooks [\n\
+        \t{{\n\
+        \t\tfunc load\n\
+        \t\tfiles [\n\
+        \t\t\t\"/etc/alsa/conf.d\"\n\
+        \t\t]\n\
+        \t}}\n\
+        ]\n\
+        \n\
+        pcm.default cards.pcm.default\n# version {version}\n"
+        ),
+    );
+    write(
+        &tree.join("share/alsa/alsa.conf.d/99-fixture.conf"),
+        &format!("pcm.fixer type plug\n# version {version}\n"),
+    );
+}
+
+/// An application whose command needs `soname`, linked as a shared
+/// object with no interpreter against the set trees that supply it, so
+/// the build admits nothing from the packer's machine and the set
+/// alone can answer for the name. False when the compile could not run.
+fn soname_needing_app(td: &Path, dir: &Path, trees: &[&Path], soname: &str) -> bool {
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &td.join("app.c"),
+        "int set_value(void);\nint app_entry(void){return set_value() - 1;}\n",
+    );
+    let mut args = vec![
+        "-shared".to_string(),
+        "-fPIC".to_string(),
+        "-nostdlib".to_string(),
+        td.join("app.c").to_str().unwrap().to_string(),
+        "-Wl,--no-as-needed".to_string(),
+    ];
+    for tree in trees {
+        args.push(format!("-L{}", tree.join("lib").display()));
+    }
+    args.push(format!("-l:{soname}"));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    cc_with(&refs, &dir.join("bin/app"))
+}
+
+/// A selected set's configuration resource that needs a build
+/// transformation is prepared into the supplying pin's own subtree
+/// through the registered hook, never carried raw to the live
+/// destination, and recorded in the build's ledger.
+#[test]
+fn a_sets_configuration_prepares_into_its_pins_subtree() {
+    let td = workdir("setprepare");
+    // A soname no host carries, so the set build alone can answer for
+    // the rule the application activates.
+    let Some(tree) = set_library(
+        &td,
+        "alsav1",
+        "libasound.so.99fixture",
+        "int set_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_alsa_configuration(&tree, "v1");
+    let (hash, set_pkg) = pack_set(&td, "alsav1", "audio");
+
+    let dir = td.join("app");
+    assert!(soname_needing_app(
+        &td,
+        &dir,
+        &[&tree],
+        "libasound.so.99fixture"
+    ));
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.audio]\npackages = [\"libasound\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Prepared 2 prepared file(s) for set audio"),
+        "{stderr}"
+    );
+
+    let pin_root = dir.join(".onelf-prepared/audio").join(&hash);
+    let conf = std::fs::read_to_string(pin_root.join("share/alsa/alsa.conf")).unwrap();
+    assert!(conf.contains("# version v1"), "{conf}");
+    assert!(
+        conf.contains("{ @func datadir } \"/alsa.conf.d\""),
+        "the registered hook anchored the subtree's own snippets: {conf}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(pin_root.join("share/alsa/alsa.conf.d/99-fixture.conf")).unwrap(),
+        "pcm.fixer type plug\n# version v1\n"
+    );
+    let mut got: Vec<String> = jwalk::WalkDir::new(&pin_root)
+        .skip_hidden(false)
+        .sort(true)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .map(|e| {
+            e.path()
+                .strip_prefix(&pin_root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "share/alsa/alsa.conf",
+            "share/alsa/alsa.conf.d/99-fixture.conf"
+        ],
+        "the subtree holds exactly the declared files"
+    );
+    assert!(
+        !dir.join("share/alsa").exists(),
+        "the set's configuration is prepared, not carried"
+    );
+    let ledger = std::fs::read_to_string(dir.join(".onelf/generated")).unwrap();
+    assert!(
+        ledger.contains(&format!(
+            ".onelf-prepared/audio/{hash}/share/alsa/alsa.conf"
+        )),
+        "{ledger}"
+    );
+    assert!(ledger.contains("99-fixture.conf"), "{ledger}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A second build of the same set name prepares beside the first:
+/// each pin's subtree keeps its own version, the ledger lists both,
+/// and the set record names the pin the recipe now pins.
+#[test]
+fn a_second_pin_prepares_beside_the_first_without_overwriting() {
+    let td = workdir("settwopins");
+    let Some(tree1) = set_library(
+        &td,
+        "alsav1",
+        "libasound.so.99fixture",
+        "int set_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_alsa_configuration(&tree1, "v1");
+    let (hash1, set_pkg1) = pack_set(&td, "alsav1", "audio");
+    let tree2 = set_library(
+        &td,
+        "alsav2",
+        "libasound.so.99fixture",
+        "int set_value(void){return 2;}\n",
+    )
+    .expect("compile the second build");
+    set_alsa_configuration(&tree2, "v2");
+    let (hash2, set_pkg2) = pack_set(&td, "alsav2", "audio");
+    assert_ne!(hash1, hash2);
+
+    let dir = td.join("app");
+    assert!(soname_needing_app(
+        &td,
+        &dir,
+        &[&tree1],
+        "libasound.so.99fixture"
+    ));
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.audio]\npackages = [\"libasound\"]\nurl = \"file://{}\"\nblake3 = \"{hash1}\"\n",
+            set_pkg1.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+
+    set_only_recipe(
+        &dir,
+        &format!(
+            "\n[sysroot.sets.audio]\npackages = [\"libasound\"]\nurl = \"file://{}\"\nblake3 = \"{hash2}\"\n",
+            set_pkg2.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Prepared 2 prepared file(s) for set audio"),
+        "{stderr}"
+    );
+
+    let first = std::fs::read_to_string(
+        dir.join(".onelf-prepared/audio")
+            .join(&hash1)
+            .join("share/alsa/alsa.conf"),
+    )
+    .unwrap();
+    let second = std::fs::read_to_string(
+        dir.join(".onelf-prepared/audio")
+            .join(&hash2)
+            .join("share/alsa/alsa.conf"),
+    )
+    .unwrap();
+    assert!(first.contains("# version v1"), "{first}");
+    assert!(second.contains("# version v2"), "{second}");
+    assert!(
+        std::fs::read_to_string(
+            dir.join(".onelf-prepared/audio")
+                .join(&hash1)
+                .join("share/alsa/alsa.conf.d/99-fixture.conf")
+        )
+        .unwrap()
+        .contains("# version v1"),
+        "the first pin's snippet keeps its version"
+    );
+    let ledger = std::fs::read_to_string(dir.join(".onelf/generated")).unwrap();
+    assert!(ledger.contains(&hash1), "{ledger}");
+    assert!(ledger.contains(&hash2), "{ledger}");
+    let sets = std::fs::read_to_string(dir.join(".onelf/sets")).unwrap();
+    assert!(sets.contains(&hash2), "{sets}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A set build that is not the pin supplies nothing and a required
+/// group fails the assembly; a build re-pinned to tampered bytes passes
+/// the pin check and is then refused by the verified read, naming the
+/// set and the path. Either way the earlier pin's subtree is untouched.
+#[test]
+fn a_tampered_set_build_never_prepares() {
+    let td = workdir("settamper");
+    let Some(tree) = set_library(
+        &td,
+        "alsav1",
+        "libasound.so.99fixture",
+        "int set_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_alsa_configuration(&tree, "v1");
+    let (hash, set_pkg) = pack_set(&td, "alsav1", "audio");
+
+    let dir = td.join("app");
+    assert!(soname_needing_app(
+        &td,
+        &dir,
+        &[&tree],
+        "libasound.so.99fixture"
+    ));
+    let audio = |blake3: &str| {
+        format!(
+            "\n[sysroot.sets.audio]\npackages = [\"libasound\"]\nurl = \"file://{}\"\nblake3 = \"{blake3}\"\n",
+            set_pkg.display()
+        )
+    };
+    set_only_recipe(&dir, &audio(&hash));
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let pin_root = dir.join(".onelf-prepared/audio").join(&hash);
+    assert!(pin_root.join("share/alsa/alsa.conf").is_file());
+
+    // One payload byte flipped inside the snippet's own compressed
+    // block, found through the container's recorded layout: the file is
+    // no longer the pin, and the same flip re-pinned to itself is a
+    // corrupted entry the verified read must refuse.
+    let bytes = std::fs::read(&set_pkg).unwrap();
+    let flen = bytes.len();
+    let mut footer_buf = [0u8; onelf_format::FOOTER_SIZE];
+    footer_buf.copy_from_slice(&bytes[flen - onelf_format::FOOTER_SIZE..]);
+    let footer = onelf_format::Footer::from_bytes(&footer_buf).expect("valid footer");
+    let compressed = &bytes[footer.manifest_offset as usize
+        ..footer.manifest_offset as usize + footer.manifest_compressed as usize];
+    let raw = zstd::bulk::decompress(compressed, footer.manifest_original as usize)
+        .expect("the manifest decompresses");
+    let manifest = onelf_format::Manifest::deserialize(&raw).expect("the manifest parses");
+    let at = manifest
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(i, _)| manifest.entry_path(*i) == "share/alsa/alsa.conf.d/99-fixture.conf")
+        .and_then(|(_, e)| e.blocks.first())
+        .map(|b| {
+            footer.payload_offset as usize + b.payload_offset as usize + b.compressed_size as usize
+                - 1
+        })
+        .expect("the snippet is a payload entry");
+    let mut flipped = bytes.clone();
+    flipped[at] ^= 0xff;
+    std::fs::write(&set_pkg, &flipped).unwrap();
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("not the pinned build"), "{stderr}");
+    assert!(stderr.contains("requires directory data"), "{stderr}");
+    assert!(
+        std::fs::read_to_string(pin_root.join("share/alsa/alsa.conf"))
+            .unwrap()
+            .contains("# version v1"),
+        "the refused build left the first pin's subtree alone"
+    );
+
+    // Re-pinning the tampered bytes: the pin matches, the verified read
+    // refuses the corrupted entry, and the failure names set and path.
+    let corrupt = blake3::hash(&flipped).to_hex().to_string();
+    set_only_recipe(&dir, &audio(&corrupt));
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("99-fixture.conf"), "{stderr}");
+    assert!(stderr.contains("audio"), "{stderr}");
+    assert!(
+        !dir.join(".onelf-prepared/audio").join(&corrupt).exists(),
+        "a refused read prepares nothing"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Two sets whose private plugins share a basename, and whose pins
 /// differ, export only their own sonames: the basename match alone
 /// never rejects the selection.

@@ -20,7 +20,7 @@
 //! used as fallbacks (`/sbin/ldconfig`, `/usr/sbin/ldconfig`) are fixed
 //! constants, not derived from any input.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::PermissionsExt;
@@ -48,7 +48,8 @@ use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
 use onelf_format::rules::{
-    BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind,
+    BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, SourceBase,
+    SourceCandidate,
 };
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
@@ -579,6 +580,10 @@ fn hooks_block(lines: &[&str]) -> Option<(usize, usize)> {
 /// plan here that the plan has not judged, and what no admitted root
 /// holds is never taken from elsewhere: in a sysroot build the
 /// alternatives are the admitted files of the selected closure alone.
+/// What a declared set holds instead is not carried raw: it is prepared
+/// into each supplying pin's own subtree, where the runtime mapping
+/// bound to that pin resolves it, and only when that pin is selected.
+#[allow(clippy::too_many_arguments)]
 fn carry_data_group(
     directory: &Path,
     descriptor: &Descriptor,
@@ -587,6 +592,7 @@ fn carry_data_group(
     sysroot: Option<&sysroot::SysrootUniverse>,
     plan: &mut DestinationPlan,
     actions: &mut Vec<WalkAction>,
+    preparation: &mut SetPreparation,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
     let hooks: Vec<BuildHookId> = descriptor.build.hooks.clone();
@@ -642,6 +648,21 @@ fn carry_data_group(
         if !hooks.is_empty() {
             actions.push(WalkAction::RunStagedHooks { hooks });
         }
+        return Ok(());
+    }
+    let supplied = preparation.supply_group(
+        plan,
+        &SupplyQuery {
+            rule,
+            group: declared.id.as_str(),
+            kind: declared.kind,
+            destination: declared.destination.as_str(),
+            candidates: &declared.candidates,
+            executable: false,
+            hooks: &hooks,
+        },
+    )?;
+    if supplied {
         return Ok(());
     }
     match declared.requirement {
@@ -743,10 +764,12 @@ fn miss_text(reason: &MissReason) -> String {
 /// runtime mapping resolves the helper there, so the alias keeps working
 /// wherever the tree is moved.
 ///
-/// A destination the tree already holds satisfies the group. A required
-/// helper no admitted source holds fails the assembly naming the rule,
-/// the helper and the examined locations; an optional one is reported
-/// and the build continues.
+/// A destination the tree already holds satisfies the group. What a
+/// declared set holds is prepared into each supplying pin's subtree
+/// instead, so the helper never executes from a raw set root. A
+/// required helper neither the tree nor a declared set supplies fails
+/// the assembly naming the rule, the helper and the examined locations;
+/// an optional one is reported and the build continues.
 #[allow(clippy::too_many_arguments)]
 fn collect_helper_group(
     directory: &Path,
@@ -760,6 +783,8 @@ fn collect_helper_group(
     needed_by: &mut HashMap<String, String>,
     processed: &mut HashSet<String>,
     discovery: &mut Discovery,
+    preparation: &mut SetPreparation,
+    plan: &mut DestinationPlan,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
     let outcome = discover_group(
@@ -778,6 +803,21 @@ fn collect_helper_group(
     )?;
     let Some(hit) = outcome.found.first() else {
         if directory.join(declared.destination.as_str()).exists() {
+            return Ok(());
+        }
+        let supplied = preparation.supply_group(
+            plan,
+            &SupplyQuery {
+                rule,
+                group: declared.id.as_str(),
+                kind: declared.kind,
+                destination: declared.destination.as_str(),
+                candidates: &declared.candidates,
+                executable: true,
+                hooks: &descriptor.build.hooks,
+            },
+        )?;
+        if supplied {
             return Ok(());
         }
         return match declared.requirement {
@@ -850,6 +890,517 @@ fn report_helper_omission(rule: &str, declared: &HelperGroup, outcome: &GroupOut
     eprintln!("{text}");
 }
 
+/// Where an application keeps the resources a selected set pin's
+/// preparation writes, relative to the AppDir root.
+///
+/// The packer reserves `.onelf/` for the metadata it injects itself, so
+/// the prepared subtrees live beside it at the top level and are packed
+/// as the application's own content: a launch resolves a selected
+/// pin's mapping against the subtree the package carries.
+pub const PREPARED_DIR: &str = ".onelf-prepared";
+
+/// The subtree one selected pin's prepared resources live in,
+/// relative to the AppDir: `PREPARED_DIR/<set>/<pin>`, the pin spelled
+/// as the lowercase hex of its BLAKE3 digest.
+///
+/// The pin is the destination key, so different builds of one set name
+/// never write one destination: two versions of a helper coexist at
+/// their own paths, and a launch consumes the subtree of whichever pin
+/// its selection named.
+pub fn prepared_subtree(set: &str, pin: &str) -> io::Result<PathBuf> {
+    sysroot::check_set_name(set)?;
+    let digest = pin.parse::<blake3::Hash>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "set pin is not a blake3 digest",
+        )
+    })?;
+    Ok(Path::new(PREPARED_DIR)
+        .join(set)
+        .join(digest.to_hex().as_ref()))
+}
+
+/// One selected pin whose set-supplied helper and configuration
+/// resources the assembly prepared.
+///
+/// Every file was decompressed out of the pinned build through the
+/// container's verified path and written once into the pin's own
+/// subtree, so the pin's bytes are the only thing the subtree can hold.
+/// The preparation binds the subtree to that one pin: a launch whose
+/// selection does not name the pin never activates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPin {
+    /// The set declaration name.
+    pub set: String,
+    /// The pinned build the bytes were read from.
+    pub pin: String,
+    /// The pin's subtree, relative to the AppDir.
+    pub root: PathBuf,
+    /// The files this build prepared, relative to the AppDir, sorted.
+    pub files: Vec<String>,
+}
+
+/// The largest single resource preparation reads out of a set build.
+/// A set's bulk libraries and plugin trees are not prepared at all, so
+/// anything past this bound is a layout the preparation does not
+/// expect, and the build says so instead of copying unbounded bytes.
+const PREPARED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// The largest total bytes one pin's subtree may hold. Small
+/// configuration resources and helpers are the declared scope; a set
+/// whose activated groups would prepare more than this belongs in the
+/// set itself.
+const PREPARED_TOTAL_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The most entries one prepared directory may expand to, matching the
+/// metadata record bound.
+const PREPARED_ENTRY_LIMIT: usize = 4096;
+
+/// The prepared pins whose mappings and configurations a launch with
+/// `selection` activates, in canonical order by set name and pin.
+///
+/// A subtree is bound to the one pin whose bytes it holds, so a
+/// selection scopes activation exactly the way it scopes providers: a
+/// pin its selection does not name stays dormant whatever its subtree
+/// carries, two pins of one set name activate side by side at their own
+/// destinations, and a selection naming a set the recipe never declares
+/// is the error a launch refuses it for.
+///
+/// The records that carry these bindings to a launch are not emitted by
+/// a build path yet, so nothing outside the tests consults the scoping
+/// until that emission lands; the function is the surface the emission
+/// and the audits will resolve selections through.
+#[allow(dead_code)]
+pub fn activate_prepared<'a>(
+    selection: &recipe::SetSelection,
+    prepared: &'a [PreparedPin],
+) -> io::Result<Vec<&'a PreparedPin>> {
+    let mut ordered: Vec<&PreparedPin> = prepared.iter().collect();
+    ordered.sort_by(|a, b| (&a.set, &a.pin).cmp(&(&b.set, &b.pin)));
+    match selection {
+        recipe::SetSelection::All => Ok(ordered),
+        recipe::SetSelection::Names(names) => {
+            let mut active = Vec::with_capacity(names.len());
+            for name in names {
+                let mut found = false;
+                for pin in &ordered {
+                    if &pin.set == name {
+                        active.push(*pin);
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "the selection names set {name}, which the recipe does not declare"
+                        ),
+                    ));
+                }
+            }
+            Ok(active)
+        }
+    }
+}
+
+/// The paths one declared candidate may sit at inside a set build. A
+/// set's `usr/` is flattened into the build root, so an installation
+/// prefix is the artifact root and a library directory is its `lib`;
+/// the unflattened spellings stay in the search for builds that kept
+/// their prefix. The order is fixed, so the same build answers the same
+/// way every time.
+fn artifact_candidate_paths(candidate: &SourceCandidate) -> Vec<String> {
+    let path = candidate.path.as_str();
+    let mut paths = Vec::with_capacity(4);
+    let mut push = |p: String| {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    };
+    match candidate.base {
+        SourceBase::InstallationPrefix => {
+            push(path.to_string());
+            push(format!("usr/{path}"));
+        }
+        SourceBase::LibraryDir => {
+            push(format!("lib/{path}"));
+            push(format!("usr/lib/{path}"));
+            push(path.to_string());
+            push(format!("usr/{path}"));
+        }
+    }
+    paths
+}
+
+/// Whether a set-supplied helper can execute without an interpreter the
+/// set's host chose.
+///
+/// An ELF helper needs no interpreter. A script names one on its first
+/// line, and the launch would then run whatever that path finds on the
+/// machine it lands on: an interpreter from the packer's tree or the
+/// set's build host, never one the application shipped. `/bin/sh` is
+/// the one name every launch environment provides, so it is the only
+/// one accepted; anything else is a declared helper that cannot run
+/// safely, and the failure says what to ship instead.
+fn check_prepared_helper(rel: &Path, bytes: &[u8]) -> io::Result<()> {
+    if !bytes.starts_with(b"#!") {
+        return Ok(());
+    }
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
+    let line = String::from_utf8_lossy(&bytes[2..line_end]);
+    let interpreter = line.split_whitespace().next().unwrap_or("");
+    if interpreter == "/bin/sh" {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: the set supplies this helper as a script naming the interpreter \
+             `{interpreter}`, which a launch must never run from a set host. Ship the \
+             helper as an ELF executable, or as a /bin/sh script that execs the \
+             application's own interpreter through the package launcher",
+            rel.display()
+        ),
+    ))
+}
+
+/// The resources one pin's subtree accumulates while group collection
+/// consults the declared sets: verified bytes keyed by their
+/// subtree-relative destination, whether each is an executable, the
+/// owning rules' declared hooks, the running total the size bound
+/// checks, and the AppDir-relative paths the build wrote.
+struct PinPreparation {
+    root: PathBuf,
+    entries: Vec<(PathBuf, Vec<u8>, bool)>,
+    hooks: Vec<BuildHookId>,
+    bytes: u64,
+    files: Vec<String>,
+}
+
+/// One activated group a declared set may supply: what the declaration
+/// asks for, where it lands inside a pin's subtree, whether it is an
+/// executable, and which build hooks the rule binds to it.
+struct SupplyQuery<'a> {
+    rule: &'a str,
+    group: &'a str,
+    kind: ResourceKind,
+    destination: &'a str,
+    candidates: &'a [SourceCandidate],
+    executable: bool,
+    hooks: &'a [BuildHookId],
+}
+
+/// The set-supplied resources a checked assembly prepares while its
+/// group collection runs: every declared set whose verified payload
+/// holds a resource an activated group declared, keyed by the pin the
+/// bytes were read from.
+///
+/// Nothing here executes a helper, an interpreter, or an editing tool.
+/// Resources are read verified out of the pinned build, staged into the
+/// pin's subtree, and transformed only through the registered staged
+/// hooks, whose procedures are fixed functions over the staged bytes.
+struct SetPreparation<'a> {
+    sets: &'a [sysroot::SharedSet],
+    dry_run: bool,
+    reads: HashMap<String, sysroot::VerifiedSet>,
+    pins: BTreeMap<(String, String), PinPreparation>,
+    warned: HashSet<String>,
+}
+
+impl<'a> SetPreparation<'a> {
+    /// The preparation over `sets`. A dry run consults no build: a dry
+    /// run fetches nothing, and a set whose build is not already in the
+    /// store has nothing to read on those terms.
+    fn new(sets: &'a [sysroot::SharedSet], dry_run: bool) -> Self {
+        Self {
+            sets,
+            dry_run,
+            reads: HashMap::new(),
+            pins: BTreeMap::new(),
+            warned: HashSet::new(),
+        }
+    }
+
+    /// Whether the assembly consults the sets at all: a set-less build
+    /// prepares nothing, and a dry run fetches nothing, so its report
+    /// never rests on bytes it did not read.
+    fn active(&self) -> bool {
+        !self.sets.is_empty() && !self.dry_run
+    }
+
+    /// Prepare one activated group's resource out of every declared set
+    /// whose verified payload holds it, into each supplying pin's own
+    /// subtree. The first declared alternative the build holds wins,
+    /// the way the tree carry takes the first alternative the selected
+    /// source holds. Returns whether any pin ended up supplying the
+    /// group, which satisfies a required declaration whose tree carry
+    /// missed.
+    fn supply_group(
+        &mut self,
+        plan: &mut DestinationPlan,
+        query: &SupplyQuery,
+    ) -> io::Result<bool> {
+        if !self.active() {
+            return Ok(false);
+        }
+        let mut supplied = false;
+        let sets = self.sets;
+        for set in sets {
+            let read = match open_set_read(&mut self.reads, &mut self.warned, set) {
+                Ok(read) => read,
+                Err(_) => continue,
+            };
+            let Some(found) = take_candidate(read, set, query)? else {
+                continue;
+            };
+            let root = prepared_subtree(&set.name, &set.blake3)?;
+            let key = (set.name.clone(), set.blake3.to_ascii_lowercase());
+            let bytes_in_pin: u64 = self.pins.get(&key).map(|p| p.bytes).unwrap_or(0);
+            let origin = format!(
+                "set {} (blake3 {}) rule {} group {} prepared",
+                set.name,
+                short_pin(&key.1),
+                query.rule,
+                query.group
+            );
+            let mut staged: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
+            let mut staged_files: Vec<String> = Vec::new();
+            let mut staged_bytes = 0u64;
+            for (rel, bytes) in found {
+                if bytes.len() as u64 > PREPARED_FILE_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: larger than the {PREPARED_FILE_LIMIT} byte preparation \
+                             limit; keep this resource in the set instead of preparing it",
+                            root.join(&rel).display()
+                        ),
+                    ));
+                }
+                if bytes_in_pin + staged_bytes + bytes.len() as u64 > PREPARED_TOTAL_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "set {} (blake3 {}): prepared resources would pass the \
+                             {PREPARED_TOTAL_LIMIT} byte per-pin limit; keep the bulk in \
+                             the set",
+                            set.name,
+                            short_pin(&key.1)
+                        ),
+                    ));
+                }
+                let app_rel = root.join(&rel);
+                match plan.admit_file(
+                    &app_rel,
+                    plan::file_hash(&bytes),
+                    &origin,
+                    Existing::SkipOnAny,
+                )? {
+                    Admission::Write => {
+                        staged_bytes += bytes.len() as u64;
+                        staged_files.push(app_rel.to_string_lossy().into_owned());
+                        staged.push((rel, bytes, query.executable));
+                    }
+                    Admission::Skip | Admission::Rejected => {}
+                }
+            }
+            supplied = true;
+            let pin = self
+                .pins
+                .entry(key.clone())
+                .or_insert_with(|| PinPreparation {
+                    root,
+                    entries: Vec::new(),
+                    hooks: Vec::new(),
+                    bytes: bytes_in_pin,
+                    files: Vec::new(),
+                });
+            pin.bytes += staged_bytes;
+            pin.entries.extend(staged);
+            pin.files.extend(staged_files);
+            pin.files.sort();
+            pin.files.dedup();
+            for hook in query.hooks {
+                if !pin.hooks.contains(hook) {
+                    pin.hooks.push(*hook);
+                }
+            }
+        }
+        Ok(supplied)
+    }
+
+    /// Queue one write per pin that accumulated entries, each carrying
+    /// the verified bytes and the rules' declared hooks. Deterministic:
+    /// the pin map is ordered by set and pin, and each pin's entries are
+    /// sorted by destination.
+    fn queue_actions(&mut self, actions: &mut Vec<WalkAction>) -> Vec<PreparedPin> {
+        let mut prepared = Vec::new();
+        for ((set, pin), done) in self.pins.iter_mut() {
+            if done.entries.is_empty() {
+                continue;
+            }
+            let mut entries = std::mem::take(&mut done.entries);
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let files = std::mem::take(&mut done.files);
+            actions.push(WalkAction::PreparePin {
+                set: set.clone(),
+                pin: pin.clone(),
+                root: done.root.clone(),
+                entries,
+                hooks: done.hooks.clone(),
+            });
+            prepared.push(PreparedPin {
+                set: set.clone(),
+                pin: pin.clone(),
+                root: done.root.clone(),
+                files,
+            });
+        }
+        prepared
+    }
+}
+
+/// The verified reader of one set's pinned build, opened once and reused
+/// across groups. A build that cannot be had on pinned terms is reported
+/// once and claims nothing, the way the provider audit treats a build it
+/// cannot check.
+fn open_set_read<'r>(
+    reads: &'r mut HashMap<String, sysroot::VerifiedSet>,
+    warned: &mut HashSet<String>,
+    set: &sysroot::SharedSet,
+) -> Result<&'r mut sysroot::VerifiedSet, String> {
+    if reads.contains_key(&set.name) {
+        return Ok(reads.get_mut(&set.name).unwrap());
+    }
+    match sysroot::VerifiedSet::open(set) {
+        Ok(read) => {
+            reads.insert(set.name.clone(), read);
+            Ok(reads.get_mut(&set.name).unwrap())
+        }
+        Err(why) => {
+            if warned.insert(set.name.clone()) {
+                eprintln!(
+                    "  {} set {} could not be prepared from ({why}); its resources stay \
+                     in the set",
+                    color::bold_red("warning:"),
+                    color::cyan(&set.name)
+                );
+            }
+            Err(why)
+        }
+    }
+}
+
+/// The verified bytes of one build path, as an integrity failure naming
+/// the set and the path when the pinned build does not reproduce them.
+fn read_verified(read: &mut sysroot::VerifiedSet, path: &str) -> io::Result<Option<Vec<u8>>> {
+    read.read(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("set {}: {e}", read.set()),
+        )
+    })
+}
+
+/// One prepared entry: its destination inside the pin's subtree and the
+/// verified bytes it holds.
+type PreparedEntry = (PathBuf, Vec<u8>);
+
+/// The first declared alternative one set's verified payload holds: an
+/// exact file for a file declaration, and every file under the prefix,
+/// layout preserved, for a directory declaration. The destination inside
+/// the pin's subtree is the declared one, so the runtime mapping that
+/// names the declared path resolves it there.
+fn take_candidate(
+    read: &mut sysroot::VerifiedSet,
+    set: &sysroot::SharedSet,
+    query: &SupplyQuery,
+) -> io::Result<Option<Vec<PreparedEntry>>> {
+    for candidate in query.candidates {
+        for base in artifact_candidate_paths(candidate) {
+            match query.kind {
+                ResourceKind::File => {
+                    if let Some(bytes) = read_verified(read, &base)? {
+                        let rel = prepared_rel(query, Path::new(""))?;
+                        if query.executable {
+                            check_prepared_helper(&rel, &bytes)?;
+                        }
+                        return Ok(Some(vec![(rel, bytes)]));
+                    }
+                }
+                ResourceKind::Directory => {
+                    let prefix = format!("{base}/");
+                    let mut under: Vec<String> = read
+                        .file_paths()
+                        .into_iter()
+                        .filter(|path| path.starts_with(&prefix))
+                        .collect();
+                    if under.is_empty() {
+                        continue;
+                    }
+                    under.sort();
+                    if under.len() > PREPARED_ENTRY_LIMIT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "set {} rule {} group {}: more than \
+                                 {PREPARED_ENTRY_LIMIT} entries under {}; keep the \
+                                 tree in the set",
+                                set.name,
+                                query.rule,
+                                query.group,
+                                read.build().display()
+                            ),
+                        ));
+                    }
+                    let mut found = Vec::with_capacity(under.len());
+                    for path in under {
+                        let bytes = read_verified(read, &path)?.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("{}: vanished from the verified listing", path),
+                            )
+                        })?;
+                        let rel = prepared_rel(query, Path::new(&path[prefix.len()..]))?;
+                        found.push((rel, bytes));
+                    }
+                    return Ok(Some(found));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The destination one prepared entry takes inside the pin's subtree:
+/// the declared destination, with a directory's layout preserved under
+/// it. A path that would leave the subtree is the traversal the
+/// preparation refuses.
+fn prepared_rel(query: &SupplyQuery, under: &Path) -> io::Result<PathBuf> {
+    let mut rel = PathBuf::from(query.destination);
+    if !under.as_os_str().is_empty() {
+        rel.push(under);
+    }
+    if !rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "rule {} group {}: {} would leave the prepared subtree",
+                query.rule,
+                query.group,
+                rel.display()
+            ),
+        ));
+    }
+    Ok(rel)
+}
+
 /// One write the planned walk performs once the whole plan has resolved
 /// without findings. The executor replays these in planning order, so
 /// the output and the mutations match the single-pass walk this
@@ -889,6 +1440,17 @@ enum WalkAction {
     /// Run a rule's declared hooks over a destination the tree already
     /// holds.
     RunStagedHooks { hooks: Vec<BuildHookId> },
+    /// Write one pin's prepared resources from verified set bytes into
+    /// the pin's own subtree, then run the owning rules' declared hooks
+    /// over the subtree. Each entry is the subtree-relative destination,
+    /// the verified bytes, and whether the file is an executable.
+    PreparePin {
+        set: String,
+        pin: String,
+        root: PathBuf,
+        entries: Vec<(PathBuf, Vec<u8>, bool)>,
+        hooks: Vec<BuildHookId>,
+    },
     /// Retarget a plugin's alias links and drop the flat copy the
     /// subdirectory copy replaces.
     MigrateFlat { flat: PathBuf, new_rel: PathBuf },
@@ -1111,6 +1673,56 @@ fn execute_walk(
             }
             WalkAction::RunStagedHooks { hooks } => {
                 run_staged_hooks(hooks, directory, dry_run);
+            }
+            WalkAction::PreparePin {
+                set,
+                pin,
+                root,
+                entries,
+                hooks,
+            } => {
+                if dry_run {
+                    eprintln!(
+                        "  {} {} prepared file(s) for set {} (blake3 {})",
+                        color::bold("Would write"),
+                        entries.len(),
+                        color::cyan(set),
+                        short_pin(pin)
+                    );
+                    continue;
+                }
+                let base = directory.join(root);
+                for (rel, bytes, executable) in entries {
+                    let dest = base.join(rel);
+                    if let Some(dir) = dest.parent() {
+                        fs::create_dir_all(dir)?;
+                    }
+                    // Writing through an existing symlink would land in
+                    // whatever it names; drop it first, the way the
+                    // library copy does.
+                    if dest.is_symlink() {
+                        let _ = fs::remove_file(&dest);
+                    }
+                    ensure_writable(&dest);
+                    fs::write(&dest, bytes)?;
+                    let mode = if *executable { 0o755 } else { 0o644 };
+                    let _ = fs::set_permissions(
+                        &dest,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    );
+                    normalize_mtime(&dest);
+                }
+                // The declared transformations run over the staged
+                // subtree through the registered hooks, before the
+                // prepared bytes are hashed for the ledger.
+                run_staged_hooks(hooks, &base, dry_run);
+                eprintln!(
+                    "  {} {} prepared file(s) for set {} (blake3 {})",
+                    color::bold_green("Prepared"),
+                    entries.len(),
+                    color::cyan(set),
+                    short_pin(pin)
+                );
             }
             WalkAction::MigrateFlat { flat, new_rel } => {
                 migrate_flat_plugin(flat, new_rel, &lib_dir, lib_dest, dry_run);
@@ -2506,6 +3118,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // writes themselves queued for the executor.
     let mut plan = DestinationPlan::load(&opts.directory)?;
     let mut actions: Vec<WalkAction> = Vec::new();
+    // What the declared sets supply when an activated group's tree carry
+    // misses: read verified out of each pin's build into the pin's own
+    // subtree. A set-less build consults nothing here, and neither does
+    // a dry run, which fetches nothing.
+    let mut preparation = SetPreparation::new(&opts.sets, opts.dry_run);
     // The walk's initial objects enter the shared discovery queue, and
     // their sonames activate rules. Seeds are sorted, so the drain order
     // is a function of the input set, not of enumeration order.
@@ -2636,6 +3253,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         sysroot_universe.as_ref(),
                         &mut plan,
                         &mut actions,
+                        &mut preparation,
                     )?;
                 }
                 if let Some(declared) = descriptor
@@ -2656,6 +3274,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &mut needed_by,
                         &mut already_processed,
                         &mut discovery,
+                        &mut preparation,
+                        &mut plan,
                     )?;
                 }
                 continue;
@@ -2992,6 +3612,10 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let activations = discovery.activations();
     report_activations(&activations);
     publish_activations(activations);
+    // The pins whose resources the sets supplied: each write is already
+    // admitted to the plan, so a finding anywhere stops the build here,
+    // before any tree write and any pin write.
+    let prepared = preparation.queue_actions(&mut actions);
 
     // The interpreter alias links the loader needs, planned here so a
     // finding anywhere in the plan stops the build before the first
@@ -3076,8 +3700,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     .iter()
                     .map(|f| opts.lib_dir.join(f).to_string_lossy().into_owned()),
             )
+            .chain(prepared.iter().flat_map(|p| p.files.iter().cloned()))
             .collect();
         sysroot::record_generated(&opts.directory, generated)?;
+    } else if !opts.dry_run && !prepared.is_empty() {
+        // A set-only build records what it prepared, so the next build
+        // can tell its own output from a publisher's edit at the same
+        // paths.
+        sysroot::record_generated(
+            &opts.directory,
+            prepared
+                .iter()
+                .flat_map(|p| p.files.iter().cloned())
+                .collect(),
+        )?;
     }
 
     // The outcome lists carry the classification with them, so the
@@ -4410,6 +5046,7 @@ mod plugin_dir_tests {
         let admitted = [AdmittedLibrary::new(soname, resolved)];
         let mut plan = DestinationPlan::load(directory).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
+        let mut preparation = SetPreparation::new(&[], false);
         for declared in &descriptor.resources.data {
             carry_data_group(
                 directory,
@@ -4419,6 +5056,7 @@ mod plugin_dir_tests {
                 None,
                 &mut plan,
                 &mut actions,
+                &mut preparation,
             )
             .unwrap();
         }
@@ -4583,6 +5221,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
+        let mut preparation = SetPreparation::new(&[], false);
         let err = carry_data_group(
             &tree,
             descriptor,
@@ -4591,6 +5230,7 @@ pcm.default cards.pcm.default
             None,
             &mut plan,
             &mut actions,
+            &mut preparation,
         )
         .expect_err("a required data miss must fail the assembly");
         let text = err.to_string();
@@ -4627,6 +5267,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
+        let mut preparation = SetPreparation::new(&[], false);
         carry_data_group(
             &tree,
             descriptor,
@@ -4635,6 +5276,7 @@ pcm.default cards.pcm.default
             None,
             &mut plan,
             &mut actions,
+            &mut preparation,
         )
         .unwrap();
         assert!(actions.is_empty(), "{actions:?}");
@@ -4873,6 +5515,8 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
+        let mut preparation = SetPreparation::new(&[], false);
+        let mut plan = DestinationPlan::load(tree)?;
         let descriptor = catalog::builtins()
             .iter()
             .find(|d| d.id.as_str() == "gstreamer")
@@ -4889,6 +5533,8 @@ mod helper_tests {
             &mut needed_by,
             &mut processed,
             &mut discovery,
+            &mut preparation,
+            &mut plan,
         )?;
         let _ = tag;
         Ok(Collected {
@@ -4932,6 +5578,8 @@ mod helper_tests {
         let mut needed_by = HashMap::new();
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
+        let mut preparation = SetPreparation::new(&[], false);
+        let mut plan = DestinationPlan::load(&root).unwrap();
         let descriptor = catalog::builtins()
             .iter()
             .find(|d| d.id.as_str() == "gstreamer")
@@ -4948,6 +5596,8 @@ mod helper_tests {
             &mut needed_by,
             &mut processed,
             &mut discovery,
+            &mut preparation,
+            &mut plan,
         )
         .unwrap();
         assert!(
@@ -6508,5 +7158,554 @@ mod provider_audit_tests {
             .collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files
+    }
+}
+
+/// Set preparation into per-pin subtrees: the verified reads out of a
+/// pinned build, the pin keyed destinations, the helper execution
+/// rules, and the selection scoping over what was prepared.
+#[cfg(test)]
+mod set_preparation_tests {
+    use super::*;
+    use onelf_format::rules::RelativePath;
+    use onelf_format::{Block, Entry, EntryKind, Flags, Footer, Manifest, ManifestHeader};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onelf-prep-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A STORED-mode package carrying `files` at their literal paths.
+    /// STORED blocks keep the bytes verbatim, so a test can tamper with
+    /// one payload byte and the container's verified read must refuse
+    /// what the pin no longer names.
+    fn stored_package(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut string_table: Vec<u8> = vec![0];
+        let mut entries = Vec::new();
+        let mut payload = Vec::new();
+        for (name, content) in files {
+            let name_offset = string_table.len() as u32;
+            string_table.extend_from_slice(name.as_bytes());
+            string_table.push(0);
+            let hash = *blake3::hash(content).as_bytes();
+            entries.push(Entry {
+                kind: EntryKind::File,
+                parent: u32::MAX,
+                name: name_offset,
+                mode: 0o644,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+                content_hash: hash,
+                blocks: vec![Block {
+                    payload_offset: payload.len() as u64,
+                    compressed_size: content.len() as u64,
+                    original_size: content.len() as u64,
+                    content_hash: hash,
+                }],
+                symlink_target: 0,
+            });
+            payload.extend_from_slice(content);
+        }
+        let manifest = Manifest {
+            header: ManifestHeader {
+                version: 3,
+                entry_count: entries.len() as u32,
+                string_table_size: string_table.len() as u32,
+                entrypoint_count: 0,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [0; 32],
+                prefix_hash: *blake3::hash(&[]).as_bytes(),
+                footer_hash: [0; 32],
+            },
+            entrypoints: Vec::new(),
+            entries,
+            lib_dir_offsets: Vec::new(),
+            string_table,
+        };
+        let raw = manifest.serialize().unwrap();
+        let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+        let footer = Footer {
+            format_version: onelf_format::footer::FORMAT_VERSION,
+            flags: Flags::STORED,
+            manifest_offset: 0,
+            manifest_compressed: compressed.len() as u64,
+            manifest_original: raw.len() as u64,
+            payload_offset: compressed.len() as u64,
+            payload_size: payload.len() as u64,
+            dict_offset: 0,
+            dict_size: 0,
+            manifest_checksum: onelf_format::manifest::manifest_checksum(&raw).unwrap(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&compressed);
+        bytes.extend_from_slice(&payload);
+        footer.write_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Write one pinned build under a fresh directory and the set
+    /// declaration pinning it by its whole-file digest.
+    fn write_build(tag: &str, files: &[(&str, &[u8])]) -> (PathBuf, sysroot::SharedSet) {
+        let dir = tmp(tag);
+        let bytes = stored_package(files);
+        let path = dir.join("set.onelf");
+        fs::write(&path, &bytes).unwrap();
+        let set = sysroot::SharedSet {
+            name: "audio".to_string(),
+            packages: vec!["alsa-lib".to_string()],
+            url: format!("file://{}", path.display()),
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+        };
+        (dir, set)
+    }
+
+    fn at(base: SourceBase, path: &str) -> SourceCandidate {
+        SourceCandidate {
+            base,
+            path: RelativePath::new(path).unwrap(),
+        }
+    }
+
+    fn data_query<'a>(candidates: &'a [SourceCandidate]) -> SupplyQuery<'a> {
+        SupplyQuery {
+            rule: "alsa",
+            group: "configuration",
+            kind: ResourceKind::Directory,
+            destination: "share/alsa",
+            candidates,
+            executable: false,
+            hooks: &[BuildHookId::AlsaConfPatch],
+        }
+    }
+
+    fn helper_query<'a>(candidates: &'a [SourceCandidate]) -> SupplyQuery<'a> {
+        SupplyQuery {
+            rule: "gstreamer",
+            group: "scanner",
+            kind: ResourceKind::File,
+            destination: "libexec/gstreamer-1.0/gst-plugin-scanner",
+            candidates,
+            executable: true,
+            hooks: &[],
+        }
+    }
+
+    /// Supply one group from `sets` into an empty plan and walk the
+    /// queued writes into `appdir`, the way a checked build does.
+    fn prepare_and_walk(
+        appdir: &Path,
+        sets: &[sysroot::SharedSet],
+        query: &SupplyQuery,
+    ) -> io::Result<Vec<PreparedPin>> {
+        let mut plan = DestinationPlan::load(appdir)?;
+        let mut preparation = SetPreparation::new(sets, false);
+        assert!(
+            preparation.supply_group(&mut plan, query)?,
+            "the declared set was expected to hold the resource"
+        );
+        assert!(!plan.has_findings());
+        let mut actions = Vec::new();
+        let prepared = preparation.queue_actions(&mut actions);
+        execute_walk(appdir, false, false, &appdir.join("lib"), &actions, &plan)?;
+        Ok(prepared)
+    }
+
+    /// The files under `root`, relative and sorted.
+    fn relative_files(root: &Path) -> Vec<String> {
+        let mut got: Vec<String> = jwalk::WalkDir::new(root)
+            .skip_hidden(false)
+            .sort(true)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        got.sort();
+        got
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A set-supplied configuration directory is staged into the
+    /// supplying pin's own subtree, layout preserved, and the
+    /// registered hook transforms it there. Nothing outside the
+    /// declared files is created, and no helper ran to do it.
+    #[test]
+    fn a_set_supplied_configuration_prepares_into_its_pins_subtree() {
+        let appdir = tmp("alsa-subtree");
+        let (builddir, set) = write_build(
+            "alsa-set",
+            &[
+                (
+                    "share/alsa/alsa.conf",
+                    b"@hooks [\n\t{\n\t\tfunc load\n\t\tfiles [\n\t\t\t\"/etc/alsa/conf.d\"\n\t\t]\n\t}\n]\n",
+                ),
+                (
+                    "share/alsa/alsa.conf.d/99-fixture.conf",
+                    b"pcm.fixer type plug\n",
+                ),
+            ],
+        );
+        let candidates = [at(SourceBase::InstallationPrefix, "share/alsa")];
+        let prepared = prepare_and_walk(
+            &appdir,
+            std::slice::from_ref(&set),
+            &data_query(&candidates),
+        )
+        .expect("the supply");
+        assert_eq!(prepared.len(), 1);
+        let pin = &prepared[0];
+        assert_eq!(pin.set, "audio");
+        assert_eq!(pin.pin, set.blake3);
+        assert_eq!(
+            pin.root,
+            Path::new(".onelf-prepared/audio").join(set.blake3.as_str())
+        );
+
+        let root = appdir.join(&pin.root);
+        assert_eq!(
+            relative_files(&root),
+            [
+                "share/alsa/alsa.conf",
+                "share/alsa/alsa.conf.d/99-fixture.conf"
+            ],
+            "the subtree holds exactly the declared files"
+        );
+        let conf = fs::read_to_string(root.join("share/alsa/alsa.conf")).unwrap();
+        assert!(
+            conf.contains("{ @func datadir } \"/alsa.conf.d\""),
+            "the registered hook anchored the subtree's own snippets: {conf}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("share/alsa/alsa.conf.d/99-fixture.conf")).unwrap(),
+            "pcm.fixer type plug\n"
+        );
+        assert_eq!(mode_of(&root.join("share/alsa/alsa.conf")), 0o644);
+        assert_eq!(pin.files.len(), 2);
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&builddir);
+    }
+
+    /// A set-supplied helper that would need an interpreter from the
+    /// packer's tree or the set's host is refused with guidance, a
+    /// /bin/sh script and an ELF binary prepare with the executable
+    /// mode, and the refused build left nothing behind.
+    #[test]
+    fn helpers_prepare_only_without_a_foreign_interpreter() {
+        let appdir = tmp("helper-safety");
+        let candidates = [
+            at(SourceBase::LibraryDir, "gstreamer-1.0/gst-plugin-scanner"),
+            at(
+                SourceBase::InstallationPrefix,
+                "libexec/gstreamer-1.0/gst-plugin-scanner",
+            ),
+        ];
+
+        let (envdir, env_set) = write_build(
+            "helper-env",
+            &[(
+                "lib/gstreamer-1.0/gst-plugin-scanner",
+                b"#!/usr/bin/env python3\nimport sys\n",
+            )],
+        );
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&env_set), false);
+        let err = preparation
+            .supply_group(&mut plan, &helper_query(&candidates))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("/usr/bin/env"), "{text}");
+        assert!(text.contains("/bin/sh"), "{text}");
+        assert!(
+            text.contains("libexec/gstreamer-1.0/gst-plugin-scanner"),
+            "{text}"
+        );
+        drop(preparation);
+        drop(plan);
+        assert!(
+            !appdir.join(PREPARED_DIR).exists(),
+            "a refused helper prepared nothing"
+        );
+
+        let (shdir, sh_set) = write_build(
+            "helper-sh",
+            &[(
+                "lib/gstreamer-1.0/gst-plugin-scanner",
+                b"#!/bin/sh\nexec \"$@\"\n",
+            )],
+        );
+        let prepared = prepare_and_walk(
+            &appdir,
+            std::slice::from_ref(&sh_set),
+            &helper_query(&candidates),
+        )
+        .expect("the /bin/sh helper");
+        let dest = appdir
+            .join(&prepared[0].root)
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"#!/bin/sh\nexec \"$@\"\n",
+            "the helper's bytes are the pinned build's bytes"
+        );
+        assert_eq!(mode_of(&dest), 0o755);
+
+        let (elfdir, elf_set) = write_build(
+            "helper-elf",
+            &[(
+                "lib/gstreamer-1.0/gst-plugin-scanner",
+                b"\x7fELFfixture-scanner",
+            )],
+        );
+        let prepared = prepare_and_walk(
+            &appdir,
+            std::slice::from_ref(&elf_set),
+            &helper_query(&candidates),
+        )
+        .expect("the ELF helper");
+        let dest = appdir
+            .join(&prepared[0].root)
+            .join("libexec/gstreamer-1.0/gst-plugin-scanner");
+        assert_eq!(fs::read(&dest).unwrap(), b"\x7fELFfixture-scanner");
+        assert_eq!(mode_of(&dest), 0o755);
+        for dir in [&envdir, &shdir, &elfdir] {
+            let _ = fs::remove_dir_all(dir);
+        }
+        let _ = fs::remove_dir_all(&appdir);
+    }
+
+    /// Bytes that are not the pin supply nothing, and a build re-pinned
+    /// to tampered bytes passes the pin check but fails the verified
+    /// read, naming the set and the path.
+    #[test]
+    fn tampered_set_bytes_are_refused_at_the_pin_or_the_read() {
+        let appdir = tmp("tamper");
+        let candidates = [at(SourceBase::InstallationPrefix, "share/alsa")];
+        let (builddir, set) = write_build("tamper-set", &[("share/alsa/alsa.conf", b"conf\n")]);
+        let build = builddir.join("set.onelf");
+        let original = fs::read(&build).unwrap();
+
+        let mut flipped = original.clone();
+        let at = flipped.len() - onelf_format::FOOTER_SIZE - 1;
+        flipped[at] ^= 0xff;
+        fs::write(&build, &flipped).unwrap();
+
+        let err = sysroot::VerifiedSet::open(&set)
+            .err()
+            .expect("a build that is not the pin must be refused");
+        assert!(err.contains("not the pinned build"), "{err}");
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), false);
+        assert!(
+            !preparation
+                .supply_group(&mut plan, &data_query(&candidates))
+                .unwrap(),
+            "an unpinned build supplies nothing"
+        );
+        drop(preparation);
+        drop(plan);
+        assert!(!appdir.join(PREPARED_DIR).exists());
+
+        let corrupt = sysroot::SharedSet {
+            blake3: blake3::hash(&flipped).to_hex().to_string(),
+            ..set
+        };
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&corrupt), false);
+        let err = preparation
+            .supply_group(&mut plan, &data_query(&candidates))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("tampered or corrupt package"), "{text}");
+        assert!(text.contains("audio"), "{text}");
+        assert!(text.contains("alsa.conf"), "{text}");
+        drop(preparation);
+        drop(plan);
+        assert!(!appdir.join(PREPARED_DIR).exists());
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&builddir);
+    }
+
+    /// Two builds of one set name prepare side by side: each pin's
+    /// subtree keeps its own version, neither overwrites the other,
+    /// and the build's ledger lists both pins' files.
+    #[test]
+    fn two_versions_of_one_set_prepare_side_by_side() {
+        let appdir = tmp("versions");
+        let candidates = [at(SourceBase::InstallationPrefix, "share/alsa")];
+        let (dir1, set1) = write_build("v1", &[("share/alsa/alsa.conf", b"conf v1\n")]);
+        let (dir2, set2) = write_build("v2", &[("share/alsa/alsa.conf", b"conf v2\n")]);
+        assert_ne!(set1.blake3, set2.blake3);
+
+        let first = prepare_and_walk(&appdir, &[set1], &data_query(&candidates))
+            .expect("the first version");
+        sysroot::record_generated(
+            &appdir,
+            first.iter().flat_map(|p| p.files.iter().cloned()).collect(),
+        )
+        .unwrap();
+        let second = prepare_and_walk(&appdir, &[set2], &data_query(&candidates))
+            .expect("the second version");
+        sysroot::record_generated(
+            &appdir,
+            second
+                .iter()
+                .flat_map(|p| p.files.iter().cloned())
+                .collect(),
+        )
+        .unwrap();
+
+        assert_ne!(first[0].root, second[0].root);
+        assert_eq!(
+            fs::read_to_string(appdir.join(&first[0].root).join("share/alsa/alsa.conf")).unwrap(),
+            "conf v1\n",
+            "the first pin's subtree keeps its version"
+        );
+        assert_eq!(
+            fs::read_to_string(appdir.join(&second[0].root).join("share/alsa/alsa.conf")).unwrap(),
+            "conf v2\n"
+        );
+        let ledger: Vec<String> = sysroot::read_generated(&appdir)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        for file in first[0].files.iter().chain(second[0].files.iter()) {
+            assert!(ledger.contains(file), "{file} missing from {ledger:?}");
+        }
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    /// Activation follows the selection: all pins under an omitted
+    /// list, only the named sets' pins under a written one, none under
+    /// an empty one, and a name the recipe never declares is refused.
+    #[test]
+    fn prepared_activation_scopes_to_the_selection() {
+        let pin = |byte: u8| {
+            let mut hex = String::with_capacity(64);
+            for _ in 0..32 {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        };
+        let prepared = vec![
+            PreparedPin {
+                set: "video".to_string(),
+                pin: pin(0xbb),
+                root: PathBuf::from(".onelf-prepared/video/bb"),
+                files: Vec::new(),
+            },
+            PreparedPin {
+                set: "audio".to_string(),
+                pin: pin(0x22),
+                root: PathBuf::from(".onelf-prepared/audio/22"),
+                files: Vec::new(),
+            },
+            PreparedPin {
+                set: "audio".to_string(),
+                pin: pin(0x11),
+                root: PathBuf::from(".onelf-prepared/audio/11"),
+                files: Vec::new(),
+            },
+        ];
+        let names = |list: &[&str]| {
+            recipe::SetSelection::Names(list.iter().map(|s| s.to_string()).collect())
+        };
+
+        let all = activate_prepared(&recipe::SetSelection::All, &prepared).unwrap();
+        let got: Vec<(&str, &str)> = all
+            .iter()
+            .map(|p| (p.set.as_str(), p.pin.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("audio", pin(0x11).as_str()),
+                ("audio", pin(0x22).as_str()),
+                ("video", pin(0xbb).as_str())
+            ],
+            "canonical order by set and pin"
+        );
+
+        let audio = activate_prepared(&names(&["audio"]), &prepared).unwrap();
+        assert_eq!(audio.len(), 2, "both pins of the named set activate");
+        assert!(audio.iter().all(|p| p.set == "audio"));
+
+        assert!(
+            activate_prepared(&names(&[]), &prepared)
+                .unwrap()
+                .is_empty()
+        );
+
+        let err = activate_prepared(&names(&["ghost"]), &prepared).unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    /// A pin's subtree is keyed by the set name and the lowercase hex
+    /// of the pin, and a bad set name or a pin that is no digest is
+    /// refused.
+    #[test]
+    fn the_prepared_subtree_is_keyed_by_set_and_pin() {
+        let pin = "AB12CD34".to_string() + &"0".repeat(56);
+        let root = prepared_subtree("audio", &pin).unwrap();
+        assert_eq!(
+            root,
+            Path::new(".onelf-prepared/audio").join(pin.to_ascii_lowercase())
+        );
+        assert!(prepared_subtree("bad name", &pin).is_err());
+        assert!(prepared_subtree("audio", "not-a-digest").is_err());
+    }
+
+    /// A dry run consults no build even when one sits at the pin, and a
+    /// build that cannot be had on pinned terms is a soft miss: the
+    /// group stays unsupplied and nothing is written.
+    #[test]
+    fn a_dry_run_and_an_unreachable_build_prepare_nothing() {
+        let appdir = tmp("no-fetch");
+        let candidates = [at(SourceBase::InstallationPrefix, "share/alsa")];
+        let (builddir, set) = write_build("dry", &[("share/alsa/alsa.conf", b"conf\n")]);
+
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), true);
+        assert!(!preparation.active());
+        assert!(
+            !preparation
+                .supply_group(&mut plan, &data_query(&candidates))
+                .unwrap()
+        );
+        drop(preparation);
+        drop(plan);
+        assert!(!appdir.join(PREPARED_DIR).exists());
+
+        let ghost = sysroot::SharedSet {
+            url: format!("file://{}", builddir.join("absent.onelf").display()),
+            ..set
+        };
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation = SetPreparation::new(std::slice::from_ref(&ghost), false);
+        assert!(
+            !preparation
+                .supply_group(&mut plan, &data_query(&candidates))
+                .unwrap()
+        );
+        drop(preparation);
+        drop(plan);
+        assert!(!appdir.join(PREPARED_DIR).exists());
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&builddir);
     }
 }

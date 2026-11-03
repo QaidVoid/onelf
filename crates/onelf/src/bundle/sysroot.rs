@@ -1262,6 +1262,89 @@ pub(crate) fn verified_export_hashes(set: &SharedSet) -> Result<Vec<SetExport>, 
     Ok(found)
 }
 
+/// Verified reads over one declared set's pinned build.
+///
+/// The build is resolved through the same pinned path a launch uses,
+/// matched against its pin before anything is read, and every entry is
+/// decompressed through the container's verified path, so what a caller
+/// prepares from this is exactly the bytes the pin names and nothing
+/// else. A build that cannot be had on those terms is an error naming
+/// the build, never a reason to read a path on its recorded word.
+pub(crate) struct VerifiedSet {
+    set: String,
+    build: PathBuf,
+    file: fs::File,
+    footer: onelf_format::Footer,
+    manifest: onelf_format::Manifest,
+    codec: onelf_format::payload::Codec,
+}
+
+impl VerifiedSet {
+    /// Open one set's pinned build for verified reads.
+    pub(crate) fn open(set: &SharedSet) -> Result<Self, String> {
+        let build = set_build(set)?;
+        let (footer, manifest) = crate::info::read_footer_and_manifest(&build)
+            .map_err(|e| format!("{}: {e}", build.display()))?;
+        let file = fs::File::open(&build).map_err(|e| format!("{}: {e}", build.display()))?;
+        let codec = onelf_format::payload::Codec::open(&file, &footer)
+            .map_err(|e| format!("{}: {e}", build.display()))?;
+        Ok(Self {
+            set: set.name.clone(),
+            build,
+            file,
+            footer,
+            manifest,
+            codec,
+        })
+    }
+
+    /// The set declaration name the build belongs to.
+    pub(crate) fn set(&self) -> &str {
+        &self.set
+    }
+
+    /// The build the reads come from, for diagnostics.
+    pub(crate) fn build(&self) -> &Path {
+        &self.build
+    }
+
+    /// The paths of the regular files the build carries, in manifest
+    /// order. Directories and links are not listed, so a caller walking
+    /// a declared prefix sees only what it can read back verified.
+    pub(crate) fn file_paths(&self) -> Vec<String> {
+        self.manifest
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == onelf_format::EntryKind::File)
+            .map(|(at, _)| self.manifest.entry_path(at))
+            .collect()
+    }
+
+    /// The verified bytes of one regular file the build carries, or
+    /// `None` when it carries no such path. The bytes are decompressed
+    /// and matched against the manifest's recorded content hash before
+    /// they are returned, so a corrupted payload is an error naming the
+    /// build and the path, never a partial answer.
+    pub(crate) fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let at = self
+            .manifest
+            .entries
+            .iter()
+            .enumerate()
+            .position(|(at, e)| {
+                e.kind == onelf_format::EntryKind::File && self.manifest.entry_path(at) == path
+            });
+        let Some(at) = at else {
+            return Ok(None);
+        };
+        let entry = &self.manifest.entries[at];
+        crate::extract::decompress_verified(&mut self.file, &self.footer, entry, &self.codec)
+            .map(Some)
+            .map_err(|e| format!("{}: {path}: {e}", self.build.display()))
+    }
+}
+
 /// The providers a provider audit over `sets` starts from, with the
 /// sets whose exports could not be verified and the reason.
 ///
@@ -3152,6 +3235,165 @@ mod tests {
         assert!(err.contains("not the pinned build"), "{err}");
         let err = set_build(&set("http://example.com/set.onelf".to_string())).unwrap_err();
         assert!(err.contains("neither https:// nor file://"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A STORED-mode package carrying `files` at their literal paths,
+    /// laid out the way a pinned build is, so verified reads run against
+    /// a real container a test can tamper with byte by byte.
+    fn stored_package(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use onelf_format::{Block, Entry, EntryKind, Flags, Footer, Manifest, ManifestHeader};
+        let mut string_table: Vec<u8> = vec![0];
+        let mut entries = Vec::new();
+        let mut payload = Vec::new();
+        for (name, content) in files {
+            let name_offset = string_table.len() as u32;
+            string_table.extend_from_slice(name.as_bytes());
+            string_table.push(0);
+            let hash = *blake3::hash(content).as_bytes();
+            entries.push(Entry {
+                kind: EntryKind::File,
+                parent: u32::MAX,
+                name: name_offset,
+                mode: 0o644,
+                mtime_secs: 0,
+                mtime_nsec: 0,
+                content_hash: hash,
+                blocks: vec![Block {
+                    payload_offset: payload.len() as u64,
+                    compressed_size: content.len() as u64,
+                    original_size: content.len() as u64,
+                    content_hash: hash,
+                }],
+                symlink_target: 0,
+            });
+            payload.extend_from_slice(content);
+        }
+        let manifest = Manifest {
+            header: ManifestHeader {
+                version: 3,
+                entry_count: entries.len() as u32,
+                string_table_size: string_table.len() as u32,
+                entrypoint_count: 0,
+                default_entrypoint: 0,
+                lib_dir_count: 0,
+                name_offset: 0,
+                package_id: [0; 32],
+                prefix_hash: *blake3::hash(&[]).as_bytes(),
+                footer_hash: [0; 32],
+            },
+            entrypoints: Vec::new(),
+            entries,
+            lib_dir_offsets: Vec::new(),
+            string_table,
+        };
+        let raw = manifest.serialize().unwrap();
+        let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+        let footer = Footer {
+            format_version: onelf_format::footer::FORMAT_VERSION,
+            flags: Flags::STORED,
+            manifest_offset: 0,
+            manifest_compressed: compressed.len() as u64,
+            manifest_original: raw.len() as u64,
+            payload_offset: compressed.len() as u64,
+            payload_size: payload.len() as u64,
+            dict_offset: 0,
+            dict_size: 0,
+            manifest_checksum: onelf_format::manifest::manifest_checksum(&raw).unwrap(),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&compressed);
+        bytes.extend_from_slice(&payload);
+        footer.write_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Write one pinned build and the set declaration pinning it by its
+    /// whole-file digest.
+    fn pinned_build(tag: &str, files: &[(&str, &[u8])]) -> (PathBuf, SharedSet) {
+        let dir = std::env::temp_dir().join(format!("onelf-vset-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bytes = stored_package(files);
+        let path = dir.join("set.onelf");
+        fs::write(&path, &bytes).unwrap();
+        let set = SharedSet {
+            name: "audio".to_string(),
+            packages: vec!["alsa-lib".to_string()],
+            url: format!("file://{}", path.display()),
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+        };
+        (dir, set)
+    }
+
+    /// A pinned build reads back exactly the bytes it carries, lists
+    /// them in manifest order, and answers None for a path it does not
+    /// carry.
+    #[test]
+    fn verified_reads_answer_a_pinned_build() {
+        let (dir, set) = pinned_build(
+            "read",
+            &[
+                ("share/alsa/alsa.conf", b"conf\n"),
+                ("lib/gstreamer-1.0/gst-plugin-scanner", b"#!/bin/sh\n"),
+            ],
+        );
+        let mut read = VerifiedSet::open(&set).unwrap();
+        assert_eq!(read.set(), "audio");
+        assert_eq!(read.build(), set.url.strip_prefix("file://").unwrap());
+        assert_eq!(
+            read.file_paths(),
+            [
+                "share/alsa/alsa.conf",
+                "lib/gstreamer-1.0/gst-plugin-scanner"
+            ]
+        );
+        assert_eq!(
+            read.read("share/alsa/alsa.conf").unwrap(),
+            Some(b"conf\n".to_vec())
+        );
+        assert_eq!(read.read("share/alsa/absent.conf").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file on disk that is not the pin is refused before any entry
+    /// is read.
+    #[test]
+    fn a_verified_reader_refuses_a_build_that_is_not_the_pin() {
+        let (dir, set) = pinned_build("unpinned", &[("share/alsa/alsa.conf", b"conf\n")]);
+        let path = PathBuf::from(set.url.strip_prefix("file://").unwrap());
+        let original = fs::read(&path).unwrap();
+        let mut flipped = original.clone();
+        let at = flipped.len() - onelf_format::FOOTER_SIZE - 1;
+        flipped[at] ^= 0xff;
+        fs::write(&path, &flipped).unwrap();
+
+        let err = VerifiedSet::open(&set).err().unwrap();
+        assert!(err.contains("not the pinned build"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A build re-pinned to tampered bytes passes the pin check and
+    /// then fails the verified read: the error names the build and the
+    /// path, and never returns partial bytes.
+    #[test]
+    fn a_verified_read_refuses_tampered_content() {
+        let (dir, set) = pinned_build("tampered", &[("share/alsa/alsa.conf", b"conf\n")]);
+        let path = PathBuf::from(set.url.strip_prefix("file://").unwrap());
+        let original = fs::read(&path).unwrap();
+        let mut flipped = original.clone();
+        let at = flipped.len() - onelf_format::FOOTER_SIZE - 1;
+        flipped[at] ^= 0xff;
+        fs::write(&path, &flipped).unwrap();
+        let corrupt = SharedSet {
+            blake3: blake3::hash(&flipped).to_hex().to_string(),
+            ..set
+        };
+
+        let mut read = VerifiedSet::open(&corrupt).unwrap();
+        let err = read.read("share/alsa/alsa.conf").err().unwrap();
+        assert!(err.contains("tampered or corrupt package"), "{err}");
+        assert!(err.contains("alsa.conf"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
