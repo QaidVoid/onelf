@@ -3021,6 +3021,12 @@ fn optional_data_the_source_lacks_warns_and_the_build_continues() {
         err.contains("gi/typelibs") && err.contains("optional data unavailable"),
         "the omission names the rule and group:\n{err}"
     );
+    let omission =
+        stderr_line_starting(&err, "  warning: gi/typelibs: optional data unavailable (");
+    assert!(
+        omission.ends_with("); the build continues without it"),
+        "the omission names the examined locations and the continuation:\n{err}"
+    );
     assert!(
         !app.join("lib/girepository-1.0").exists(),
         "no group directory is invented:\n{err}"
@@ -5232,6 +5238,33 @@ fn bundling_reports_libraries_it_did_not_bundle() {
     assert!(
         err.contains("not in the bundle") && err.contains("libc.so.6"),
         "an excluded dependency must be named as host-resolved: {err}"
+    );
+    // The copy carried the binary the first run edited: with patchelf
+    // present it also names the onelf-env constructor, whose blob stays
+    // behind in the first tree. Without one, only libc is named. The
+    // block itself is byte-stable either way.
+    let with_env = patchelf().is_some();
+    let mut expected = vec![format!(
+        "warning: {} librar(ies) are not in the bundle:",
+        if with_env { 2 } else { 1 }
+    )];
+    expected.push("  - libc.so.6 (needed by main)".to_string());
+    if with_env {
+        expected.push("  - libonelf-env.so (needed by main)".to_string());
+    }
+    expected.push(
+        "  These resolve to the host's copies, and load next to the \
+         bundled libc, only for a package that keeps the host's library \
+         directories. Otherwise loading them fails where they are first \
+         used. Add them with --search-path, or leave them if they are \
+         meant to come from the host (GL, DRI, Vulkan, NSS); \
+         `pack --host-libs` decides which of the two happens."
+            .to_string(),
+    );
+    assert_eq!(
+        report_block(&err, &expected[0], is_warning_body),
+        expected,
+        "{err}"
     );
 
     let _ = std::fs::remove_dir_all(&td);
@@ -12452,6 +12485,19 @@ fn omitted_backends_name_an_absent_need_and_an_unselected_provider_apart() {
         stderr.contains("Dropped 3 file(s)"),
         "the plugins and the carried library are omitted:\n{stderr}"
     );
+    assert_eq!(
+        report_block(&stderr, DROPPED_HEADER, is_drop_line),
+        vec![
+            "Dropped 3 file(s) needing libraries the sysroot does not hold:",
+            "  lib/core/plugins/libcore-backend.so omitted, needs libopt.so.1 \
+             (provided only by the unselected optional package optprov)",
+            "  lib/core/plugins/libcore-broken.so omitted, needs libabsent.so.7 \
+             (no selected source provides it)",
+            "  lib/libcarry.so.1 omitted, needs libabsent.so.7 (no selected \
+             source provides it)",
+        ],
+        "the omission block renders the same bytes every build:\n{stderr}"
+    );
     assert!(
         stderr.contains("libcore-broken.so") && stderr.contains("no selected source provides it"),
         "the absent dependency is named as absent:\n{stderr}"
@@ -12514,6 +12560,17 @@ fn an_explicitly_included_library_is_not_omitted_for_an_absent_need() {
             && stderr.contains("an explicit include cannot be dropped"),
         "the failure names the include, its need and the rule:\n{stderr}"
     );
+    let error = stderr
+        .lines()
+        .find(|l| l.starts_with("error: "))
+        .expect("the attributed error line");
+    assert_eq!(
+        error,
+        "error: lib/libcarry.so.1 is explicitly included and needs \
+         libabsent.so.7: no selected source provides it; an explicit include \
+         cannot be dropped",
+        "{stderr}"
+    );
     assert!(
         td.join("asked/lib/libcarry.so.1").is_file(),
         "the included library is not deleted to make the finding go away:\n{stderr}"
@@ -12571,6 +12628,27 @@ fn a_policy_removed_need_of_a_retained_object_names_the_removal() {
         stderr.contains("bin/app needs libpinned.so.1")
             && stderr.contains("core holds but the policy or a trace removed"),
         "the failure attributes the dependency to the removal:\n{stderr}"
+    );
+    let error = stderr
+        .lines()
+        .find(|l| l.starts_with("error: "))
+        .expect("the attributed error line");
+    assert_eq!(
+        error,
+        "error: bin/app needs libpinned.so.1, which core holds but the policy \
+         or a trace removed; the conflict stops the build rather than dropping \
+         the object or restoring the file",
+        "{stderr}"
+    );
+    assert_eq!(
+        report_block(&stderr, "Left out by policy (1)", |l| l.starts_with("  ")
+            && l.contains(" : ")),
+        vec![
+            "Left out by policy (1)",
+            "  libpinned.so.1 (needed by bin/app) : core holds it, but the \
+             policy or a trace removed it",
+        ],
+        "{stderr}"
     );
     assert!(
         !td.join("app/lib/libpinned.so.1").exists(),
@@ -12655,9 +12733,192 @@ fn an_explicit_include_the_source_lacks_fails_rather_than_selecting() {
             && stderr.contains("unselected optional package optprov"),
         "the failure distinguishes the provider from an absent library:\n{stderr}"
     );
+    let error = stderr
+        .lines()
+        .find(|l| l.starts_with("error: "))
+        .expect("the attributed error line");
+    assert_eq!(
+        error,
+        "error: explicitly included libopt.so.1 does not enter the bundle: \
+         provided only by the unselected optional package optprov; an \
+         explicit include cannot be dropped, and the build neither selects a \
+         package nor restores a file to carry it",
+        "{stderr}"
+    );
     assert!(
         !td.join("app/lib/libopt.so.1").exists() && !td.join("app/lib/optprov").exists(),
         "the unselected package was not pulled in to satisfy the include"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The one line of `stderr` that starts with `prefix`, or a panic
+/// naming the output.
+fn stderr_line_starting<'a>(stderr: &'a str, prefix: &str) -> &'a str {
+    stderr
+        .lines()
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{stderr}"))
+}
+
+/// The contiguous render of one report: from its exact header line
+/// through the last following line `body` accepts, so a snapshot pins
+/// the block's bytes and nothing else.
+fn report_block(stderr: &str, header: &str, body: impl Fn(&str) -> bool) -> Vec<String> {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == header)
+        .unwrap_or_else(|| panic!("no {header:?} line in:\n{stderr}"));
+    let mut block = vec![lines[start].to_string()];
+    for line in lines.iter().skip(start + 1) {
+        if body(line) {
+            block.push((*line).to_string());
+        } else {
+            break;
+        }
+    }
+    block
+}
+
+/// A line of the omitted-objects block: the tree-relative object, the
+/// soname that condemned it, and the verdict that took it out.
+fn is_drop_line(line: &str) -> bool {
+    line.starts_with("  ") && line.contains(" omitted, needs ")
+}
+
+/// A line of the host-resolved warning block: the soname and its
+/// needing objects, then the closing note.
+fn is_warning_body(line: &str) -> bool {
+    line.starts_with("  - ") || line.starts_with("  These ")
+}
+
+/// The header the omitted-objects block renders under, pinned so every
+/// snapshot below reads the same block.
+const DROPPED_HEADER: &str = "Dropped 3 file(s) needing libraries the sysroot does not hold:";
+
+/// The omission block is a function of the assembly, not of the run:
+/// two builds of the same fixture into fresh trees render the same
+/// bytes, in the same sorted order.
+#[test]
+fn the_omission_report_is_byte_identical_across_runs() {
+    let td = workdir("report-bytes");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let block = |recipe_dir: &str| {
+        let out = classification_build(&td, recipe_dir, None, None, "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the omissions are not failures:\n{stderr}"
+        );
+        report_block(&stderr, DROPPED_HEADER, is_drop_line)
+    };
+    let first = block("run-a");
+    let second = block("run-b");
+    assert!(!first.is_empty(), "the omission block is missing");
+    assert_eq!(
+        first, second,
+        "the same assembly must render the same bytes"
+    );
+    assert_eq!(
+        first,
+        vec![
+            "Dropped 3 file(s) needing libraries the sysroot does not hold:",
+            "  lib/core/plugins/libcore-backend.so omitted, needs libopt.so.1 \
+             (provided only by the unselected optional package optprov)",
+            "  lib/core/plugins/libcore-broken.so omitted, needs libabsent.so.7 \
+             (no selected source provides it)",
+            "  lib/libcarry.so.1 omitted, needs libabsent.so.7 (no selected \
+             source provides it)",
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The same unresolved need changes severity with the level: the
+/// high-level sysroot build blocks publication with one attributed error
+/// line, while the low-level host scan reports the same class of fact as
+/// a warning and succeeds, which is that path's contract. Both
+/// renderings are pinned byte for byte.
+#[test]
+fn a_required_failure_is_fatal_high_level_and_warning_only_low_level() {
+    let td = workdir("strict-vs-warn");
+    if classification_sysroot(&td).is_none() {
+        return;
+    }
+    let out = classification_build(
+        &td,
+        "asked",
+        None,
+        None,
+        "[bundle]\ninclude = [\"libabsent.so.7\"]\n",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the required failure must block the build:\n{stderr}"
+    );
+    let error = stderr
+        .lines()
+        .find(|l| l.starts_with("error: "))
+        .expect("an attributed error line");
+    assert_eq!(
+        error,
+        "error: explicitly included libabsent.so.7 does not enter the \
+         bundle: no selected source provides it; an explicit include cannot \
+         be dropped, and the build neither selects a package nor restores a \
+         file to carry it",
+        "{stderr}"
+    );
+
+    // The low-level scan sees the same shape of fact: an object whose
+    // need nothing on this machine provides. It warns and succeeds.
+    let dir = td.join("host-scan");
+    for (src, dest) in [
+        ("rootfs/usr/bin/app", "bin/app"),
+        ("rootfs/usr/lib/libcore.so.2", "lib/libcore.so.2"),
+        ("rootfs/usr/lib/libc.so.6", "lib/libc.so.6"),
+        (
+            "rootfs/usr/lib/ld-linux-x86-64.so.2",
+            "lib/ld-linux-x86-64.so.2",
+        ),
+    ] {
+        std::fs::create_dir_all(dir.join(dest).parent().unwrap()).unwrap();
+        std::fs::copy(td.join(src), dir.join(dest)).unwrap();
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&dir)
+        .arg("--target")
+        .arg("bin/app");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        o.status.success(),
+        "a host scan warns instead of failing:\n{err}"
+    );
+    assert_eq!(
+        report_block(
+            &err,
+            "warning: 1 librar(ies) are not in the bundle:",
+            is_warning_body,
+        ),
+        vec![
+            "warning: 1 librar(ies) are not in the bundle:",
+            "  - libpinned.so.1 (needed by app)",
+            "  These resolve to the host's copies, and load next to the \
+             bundled libc, only for a package that keeps the host's library \
+             directories. Otherwise loading them fails where they are first \
+             used. Add them with --search-path, or leave them if they are \
+             meant to come from the host (GL, DRI, Vulkan, NSS); \
+             `pack --host-libs` decides which of the two happens.",
+        ],
+        "{err}"
     );
     let _ = std::fs::remove_dir_all(&td);
 }

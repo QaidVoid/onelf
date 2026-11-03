@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use onelf_format::knowledge::{self, Place, Subject};
 use onelf_format::rules::RuntimeHookId;
 
-use super::color;
+use super::ui;
 
 /// The watched subjects derived once from the built-in catalog.
 fn components() -> &'static [Subject<'static>] {
@@ -40,7 +40,9 @@ pub(crate) struct Finding {
 }
 
 /// Every known compiled-in path in `elf_files` that the tree under `root`
-/// carries no copy of.
+/// carries no copy of. The findings are sorted by file, path and variable,
+/// so the report is a function of the inputs alone and not of the order
+/// the files were scanned in.
 pub(crate) fn unanswered(root: &Path, elf_files: &[PathBuf]) -> Vec<Finding> {
     let lib_dirs = library_dirs(root, elf_files);
     let carried = |place: &Place| match place {
@@ -89,6 +91,7 @@ pub(crate) fn unanswered(root: &Path, elf_files: &[PathBuf]) -> Vec<Finding> {
             var: subject.variable,
         });
     }
+    findings.sort_by(|a, b| (&a.file, &a.path, a.var).cmp(&(&b.file, &b.path, b.var)));
     findings
 }
 
@@ -155,28 +158,37 @@ fn describe(places: &[Place]) -> String {
         .join(" or ")
 }
 
-/// Print `findings` as a warning.
+/// Print `findings` as one stable warning, rendered through the shared
+/// report shape: the count header, one attributed line per finding in
+/// sorted order, and the closing note, so the block's bytes are a
+/// function of the findings alone.
 pub(crate) fn report(findings: &[Finding]) {
     if findings.is_empty() {
         return;
     }
+    let lines: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            ui::finding_line(&format!(
+                "{} reads {} (carry {} and the runtime sets {})",
+                f.file.display(),
+                f.path,
+                f.carry,
+                f.var
+            ))
+        })
+        .collect();
     eprintln!(
-        "{} {} compiled-in plugin or data path(s) have no copy in the bundle:",
-        color::bold_red("warning:"),
-        findings.len()
-    );
-    for f in findings {
-        eprintln!(
-            "  - {} reads {} (carry {} and the runtime sets {})",
-            f.file.display(),
-            f.path,
-            f.carry,
-            f.var
-        );
-    }
-    eprintln!(
-        "  Without a copy these come from the host, built against the \
-         host's libraries, or are missing there."
+        "{}",
+        ui::warning_report(
+            findings.len(),
+            "compiled-in plugin or data path(s) have no copy in the bundle",
+            &lines,
+            Some(
+                "Without a copy these come from the host, built against the \
+                 host's libraries, or are missing there.",
+            ),
+        )
     );
 }
 
@@ -328,6 +340,46 @@ mod tests {
         place_node(&root.join("share/file/misc/magic.mgc"), ResourceKind::File);
         assert!(unanswered(&root, &files).is_empty());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The findings' order is a function of their content, not of the
+    /// scan: the same two probes handed over in either order come back
+    /// sorted by file, so the report's bytes are stable.
+    #[test]
+    fn the_findings_are_sorted_regardless_of_scan_order() {
+        let root = std::env::temp_dir().join(format!(
+            "onelf-sort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let lib = root.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let first = lib.join("libaaa.so");
+        fs::write(
+            &first,
+            elf_with(&["/usr/lib/x86_64-linux-gnu/gstreamer-1.0"]),
+        )
+        .unwrap();
+        let second = lib.join("libzzz.so");
+        fs::write(&second, elf_with(&["/usr/share/misc/magic"])).unwrap();
+        let files = vec![first.clone(), second.clone()];
+
+        let forward = unanswered(&root, &files);
+        assert_eq!(forward.len(), 2, "{forward:?}");
+        assert_eq!(forward[0].file, PathBuf::from("lib/libaaa.so"));
+        assert_eq!(forward[1].file, PathBuf::from("lib/libzzz.so"));
+        assert_ne!(forward[0].var, forward[1].var);
+
+        let reversed = unanswered(&root, &files.into_iter().rev().collect::<Vec<_>>());
+        assert_eq!(
+            reversed, forward,
+            "scan order must not reorder the findings"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

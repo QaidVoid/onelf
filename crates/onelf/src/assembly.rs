@@ -219,6 +219,68 @@ pub struct AssemblyReport {
     pub pinned_gl: bool,
 }
 
+impl AssemblyReport {
+    /// The report as stable plain-text lines, in a fixed order: the
+    /// source with what completeness means for it, the frameworks the
+    /// host scan carried, one attributed line per activated rule, the
+    /// shared sets, the GL pin, and the bounded-inference limit. No
+    /// paths, timestamps or color, so the same assembly renders the same
+    /// bytes everywhere, and a snapshot can pin them.
+    #[allow(dead_code)]
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match self.source {
+            Source::SysrootDatabase => lines.push(
+                "Source: sysroot package database; the dependency closure was \
+                 audited against the selected source"
+                    .to_string(),
+            ),
+            Source::HostScan => lines.push(
+                "Source: host scan; unresolved dependencies are warnings, not \
+                 failures"
+                    .to_string(),
+            ),
+            Source::Unchecked => lines.push(
+                "Source: unchecked; the tree stands as authored, no scan or \
+                 dependency audit ran, and nothing here claims it complete"
+                    .to_string(),
+            ),
+        }
+        if !self.frameworks.is_empty() {
+            lines.push(format!(
+                "Frameworks requested: {}",
+                self.frameworks.join(", ")
+            ));
+        }
+        let mut rules: Vec<&bundle::RuleActivation> = self.active_rules.iter().collect();
+        rules.sort_by(|a, b| (&a.rule, &a.reason).cmp(&(&b.rule, &b.reason)));
+        for rule in rules {
+            let groups = if rule.groups.is_empty() {
+                String::new()
+            } else {
+                format!("; groups: {}", rule.groups.join(", "))
+            };
+            lines.push(format!(
+                "Rule {} activated by {}{groups}",
+                rule.rule, rule.reason
+            ));
+        }
+        if !self.sets.is_empty() {
+            lines.push(format!("Shared sets: {}", self.sets.join(", ")));
+        }
+        if self.pinned_gl {
+            lines.push("Pinned GL build: recorded for the launch to fetch".to_string());
+        }
+        lines.push(
+            "Not inferred: computed plugin paths, script subprocesses, \
+             application assets, kernel features and external services are \
+             not audited"
+                .to_string(),
+        );
+        lines
+    }
+}
+
 /// The normalized inputs for one recipe-driven assembly: everything the
 /// build path derives from a loaded recipe and its output flag, resolved
 /// against the recipe's directory, before the AppDir is touched.
@@ -1321,6 +1383,104 @@ mod tests {
         assert!(report.pinned_gl);
         assert!(dir.join(".onelf/platform").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A skipped tree is reported as unchecked, with no
+    /// dependency-completeness claim, and its sets named.
+    #[test]
+    fn a_skipped_appdir_reports_unchecked_with_no_completeness_claim() {
+        let report = AssemblyReport {
+            source: Source::Unchecked,
+            frameworks: Vec::new(),
+            sets: vec!["gtk".to_string()],
+            pinned_gl: false,
+            active_rules: Vec::new(),
+        };
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "Source: unchecked; the tree stands as authored, no scan or \
+                 dependency audit ran, and nothing here claims it complete"
+                    .to_string(),
+                "Shared sets: gtk".to_string(),
+                "Not inferred: computed plugin paths, script subprocesses, \
+                 application assets, kernel features and external services \
+                 are not audited"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// The summary's rule lines are sorted by rule and reason and carry
+    /// the activation attribution, so the same assembly renders the same
+    /// lines whatever order the activations were collected in.
+    #[test]
+    fn the_summary_lines_do_not_depend_on_activation_order() {
+        let activation = |rule: &str, reason: &str, groups: &[&str]| bundle::RuleActivation {
+            rule: rule.to_string(),
+            reason: reason.to_string(),
+            groups: groups.iter().map(|g| (*g).to_string()).collect(),
+        };
+        let report = |rules: Vec<bundle::RuleActivation>| AssemblyReport {
+            source: Source::SysrootDatabase,
+            frameworks: Vec::new(),
+            sets: Vec::new(),
+            pinned_gl: true,
+            active_rules: rules,
+        };
+        let forward = report(vec![
+            activation("alsa", "libasound.so.2", &["plugins", "configuration"]),
+            activation(
+                "gstreamer",
+                "libgstreamer-1.0.so.0",
+                &["plugins", "scanner"],
+            ),
+        ]);
+        let reversed = report(forward.active_rules.clone().into_iter().rev().collect());
+        let expected = vec![
+            "Source: sysroot package database; the dependency closure was \
+             audited against the selected source"
+                .to_string(),
+            "Rule alsa activated by libasound.so.2; groups: plugins, \
+             configuration"
+                .to_string(),
+            "Rule gstreamer activated by libgstreamer-1.0.so.0; groups: \
+             plugins, scanner"
+                .to_string(),
+            "Pinned GL build: recorded for the launch to fetch".to_string(),
+            "Not inferred: computed plugin paths, script subprocesses, \
+             application assets, kernel features and external services are \
+             not audited"
+                .to_string(),
+        ];
+        assert_eq!(forward.summary_lines(), expected, "{:?}", forward);
+        assert_eq!(reversed.summary_lines(), expected);
+    }
+
+    /// A host scan names its frameworks and says its unresolved
+    /// dependencies stay warnings, the way the low-level contract keeps.
+    #[test]
+    fn a_host_scan_report_names_its_frameworks_and_keeps_warnings_as_warnings() {
+        let report = AssemblyReport {
+            source: Source::HostScan,
+            frameworks: vec!["wayland", "gtk"],
+            sets: Vec::new(),
+            pinned_gl: false,
+            active_rules: Vec::new(),
+        };
+        assert_eq!(
+            report.summary_lines(),
+            vec![
+                "Source: host scan; unresolved dependencies are warnings, \
+                 not failures"
+                    .to_string(),
+                "Frameworks requested: wayland, gtk".to_string(),
+                "Not inferred: computed plugin paths, script subprocesses, \
+                 application assets, kernel features and external services \
+                 are not audited"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
