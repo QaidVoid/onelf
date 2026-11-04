@@ -211,11 +211,7 @@ fn run(launch: &Launch) {
         launch.argv0
     };
 
-    // The only environment a launch ever adds to the library search, and
-    // only for an ELF that has no `$ORIGIN` run path and that the kernel
-    // has to start: nothing else would lead it to its own libraries.
-    let kernel_lib_path = (!lib_path.is_empty() && runpath.is_empty())
-        .then(|| fallback_library_path(launch.pkg_root, &lib_dirs));
+    let kernel_lib_path = kernel_library_path(launch.pkg_root, &lib_dirs, &lib_path, &runpath);
 
     if let Some(host_interp) = &resolution.host_interp {
         exec_under_host_loader(
@@ -495,6 +491,24 @@ fn publish_view_env(
     {
         eprintln!("onelf-rt: cannot write {}: {e}", crate::env::VIEW_ENV_FILE);
     }
+}
+
+/// The `LD_LIBRARY_PATH` a launch hands an entrypoint the kernel starts,
+/// or `None` when it sets none.
+///
+/// This is the only environment a launch ever adds to the library
+/// search, and only for an ELF with no `$ORIGIN` run path (`runpath`
+/// empty) while the launch resolved a search path (`lib_path`): nothing
+/// else would lead it to its own libraries. The packed launch and the
+/// CLI's development run share this gate, so neither exports a
+/// generated search path the other would not.
+pub fn kernel_library_path(
+    pkg_root: &Path,
+    lib_dirs: &[&str],
+    lib_path: &str,
+    runpath: &[std::path::PathBuf],
+) -> Option<String> {
+    (!lib_path.is_empty() && runpath.is_empty()).then(|| fallback_library_path(pkg_root, lib_dirs))
 }
 
 /// `LD_LIBRARY_PATH` for an ELF without a `$ORIGIN` run path that the
