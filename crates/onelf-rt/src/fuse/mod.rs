@@ -294,7 +294,7 @@ fn mount_with_helper(
         // outside one, so extraction takes over. Not a failure.
         if !needs_setuid {
             eprintln!("onelf-rt: fuse: namespace mount failed: {ns_err}");
-            eprintln!("onelf-rt: fuse: fusermount3 not available either; cannot continue");
+            eprintln!("onelf-rt: fuse: fusermount3 not available either; FUSE is unavailable");
         }
         return None;
     }
