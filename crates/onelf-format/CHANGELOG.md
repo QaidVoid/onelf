@@ -1,4 +1,41 @@
 
+## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.5.1...onelf-format-v0.6.0) - 2026-11-04
+
+### ⛰️  Features
+
+- *(format)* Add canonical selection identity and storage - ([d8c2e2e](https://github.com/QaidVoid/onelf/commit/d8c2e2e7e6e6712847c0abeb33ba73aa1508e1dc))
+- *(format)* Derive lint and runtime env knowledge - ([1dd4525](https://github.com/QaidVoid/onelf/commit/1dd4525693465a92fd59142ec142fd853abc9afd))
+- *(format)* Add runtime capability note and gate - ([aff116c](https://github.com/QaidVoid/onelf/commit/aff116c2b76a8a9917b69e2ec356295e5537c05d))
+- *(format)* Add bounded ELF fact inspection - ([2355f11](https://github.com/QaidVoid/onelf/commit/2355f11d495ecf326fea3ed6b99c5056db6e134b))
+- *(format)* Add built-in rule catalog and metadata codecs - ([e0e0625](https://github.com/QaidVoid/onelf/commit/e0e06255115f14ede6f66231a099bb30fa94e3a7))
+- *(format)* Add validated framework descriptor schemas - ([5b43504](https://github.com/QaidVoid/onelf/commit/5b4350481ad3f9fc674e3d216e3c1e479c10fed4))
+- *(rt)* Evaluate carried runtime rules and prepared pins - ([23f0af9](https://github.com/QaidVoid/onelf/commit/23f0af93b64fa02460921070d6c2d99e9b6b8e53))
+- *(rt)* Export the resolved store through launch env - ([d65b2ee](https://github.com/QaidVoid/onelf/commit/d65b2eef5070ce08a8d013f6da0981253b5ea399))
+- *(rules)* Collect only client-side PipeWire and SPA members - ([589925d](https://github.com/QaidVoid/onelf/commit/589925dd99119741a9c140b7003085ac52fdb56d))
+- *(rules)* Let plugin groups list the members they collect - ([443ca55](https://github.com/QaidVoid/onelf/commit/443ca5582da0132769a369d6a6e36f34bf40aaee))
+- *(sysroot)* Verify provider index for set pins - ([bc0c474](https://github.com/QaidVoid/onelf/commit/bc0c47477087f0398b539e529fd8c614a5798cf8))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Find data for tree-copied rule libraries on the host - ([9360155](https://github.com/QaidVoid/onelf/commit/93601555e520d9a0c422cbfd29c98b7b7c5cfffe))
+- *(cli)* Publish verified sets only and persist root's cache - ([7d08f6e](https://github.com/QaidVoid/onelf/commit/7d08f6e246f9d656fb5074aed15123e71a75d055))
+- *(format)* Bind provider indexes to the pin, not the name - ([2dfabd4](https://github.com/QaidVoid/onelf/commit/2dfabd473959c55219d21e2a8d0847436d251901))
+- *(format)* Treat malformed onelf notes as incompatible - ([aaf49a3](https://github.com/QaidVoid/onelf/commit/aaf49a3debc31953237299ab117c13b7289aa1a6))
+- *(format)* Accept lld version chains and read dynstr once - ([35eec27](https://github.com/QaidVoid/onelf/commit/35eec27274d6c12738e4f1c67894ad7d9e7d494d))
+- *(rt)* Scope resolver decisions and provider checks to selections - ([faebd83](https://github.com/QaidVoid/onelf/commit/faebd83a5753c356fd7c7dad2c04ddff7bff9fd3))
+- *(rt)* Keep root's cache and base off env-chosen paths - ([5c9227b](https://github.com/QaidVoid/onelf/commit/5c9227b64962ec594c7f0a1fee4abd39093a5425))
+- *(rules)* Map translations at runtime without copying locales - ([a947b40](https://github.com/QaidVoid/onelf/commit/a947b40d4d19a38d7922257dae12e674361038a3))
+- *(rules)* Refuse loader, runtime-owned and shared env names - ([b656df1](https://github.com/QaidVoid/onelf/commit/b656df16fb2005725ce7ec274fe1b53bffe8a34f))
+- *(runtime)* Warn about missing GL only when the package links it - ([2f9904c](https://github.com/QaidVoid/onelf/commit/2f9904c9a97e6042619aa8ce2623d23f8963beca))
+
+### 🚜 Refactor
+
+- Drop stale dead-code allows and unused FUSE structs - ([a11dab9](https://github.com/QaidVoid/onelf/commit/a11dab984bcb31c9618f61aa4efbb816fc062c8b))
+
+### 🧪 Testing
+
+- *(format)* Run rules-toml tests and use canonical rule files - ([c17659a](https://github.com/QaidVoid/onelf/commit/c17659a7796d45eddbc471fdd3fda109cd1e5208))
+
 
 ## [0.5.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.4.2...onelf-format-v0.5.0) - 2026-10-29
 

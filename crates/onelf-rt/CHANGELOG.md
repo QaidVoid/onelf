@@ -1,4 +1,60 @@
 
+## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.5.1...onelf-rt-v0.6.0) - 2026-11-04
+
+### ⛰️  Features
+
+- *(bundle)* Register staged build hooks with catalog coverage - ([95f10f1](https://github.com/QaidVoid/onelf/commit/95f10f1db6af0eff71b08babb2641953702506d0))
+- *(cli)* Explain sets and views in info and doctor - ([077408c](https://github.com/QaidVoid/onelf/commit/077408c473264b6fd99f4f8542095fcf143afe51))
+- *(format)* Add canonical selection identity and storage - ([d8c2e2e](https://github.com/QaidVoid/onelf/commit/d8c2e2e7e6e6712847c0abeb33ba73aa1508e1dc))
+- *(format)* Derive lint and runtime env knowledge - ([1dd4525](https://github.com/QaidVoid/onelf/commit/1dd4525693465a92fd59142ec142fd853abc9afd))
+- *(format)* Add runtime capability note and gate - ([aff116c](https://github.com/QaidVoid/onelf/commit/aff116c2b76a8a9917b69e2ec356295e5537c05d))
+- *(rt)* Evaluate carried runtime rules and prepared pins - ([23f0af9](https://github.com/QaidVoid/onelf/commit/23f0af93b64fa02460921070d6c2d99e9b6b8e53))
+- *(rt)* Expose launch support through a library target - ([26b8872](https://github.com/QaidVoid/onelf/commit/26b88721ece309d1dca96adb0bbdc04be6627f87))
+- *(rt)* Validate selected providers and advertise store import - ([223229d](https://github.com/QaidVoid/onelf/commit/223229dd4183db6c765cf777e53b511ad48dbf84))
+- *(rt)* Scope set acquisition to entrypoint selections - ([7630b2b](https://github.com/QaidVoid/onelf/commit/7630b2b33600105f0f4af0d1b06206fbe4e3c044))
+- *(rt)* Integrate immutable views into all launch modes - ([d5e53bd](https://github.com/QaidVoid/onelf/commit/d5e53bdc777902beca318b760b631904fa513e9e))
+- *(rt)* Collect views under lease-aware sweeps - ([85b52fc](https://github.com/QaidVoid/onelf/commit/85b52fc524866261b6104422d5ed8e9a4fa23565))
+- *(rt)* Stage views with atomic verified publication - ([5b42cdb](https://github.com/QaidVoid/onelf/commit/5b42cdbfbe3fa94c4b718cb577d67bf75f2dc2df))
+- *(rt)* Add pre-fork subreaper lifetime guardian - ([9e08c5c](https://github.com/QaidVoid/onelf/commit/9e08c5c9b3451b51b2474e0c9bbd3523b1bfd829))
+- *(rt)* Add normalized view identity and records - ([7d0c312](https://github.com/QaidVoid/onelf/commit/7d0c312a6ebd5f2923afc4253da8978d83d6aade))
+- *(rt)* Export the resolved store through launch env - ([d65b2ee](https://github.com/QaidVoid/onelf/commit/d65b2eef5070ce08a8d013f6da0981253b5ea399))
+- *(rt)* Stage cached builds under locked verified publication - ([939d462](https://github.com/QaidVoid/onelf/commit/939d46295ec82ce69385757b72a79f2d9f5e36d0))
+- *(rt)* Publish bounded per-view environment input - ([5c83c15](https://github.com/QaidVoid/onelf/commit/5c83c156656ddede34783a5f3ab8d103116f156c))
+- *(rt)* Pin stored candidates and split store ownership - ([2995d46](https://github.com/QaidVoid/onelf/commit/2995d466dd7e74ce0cfcc0d64b9a13d513deeead))
+- *(rt)* Evaluate path mappings and register hooks - ([5de8072](https://github.com/QaidVoid/onelf/commit/5de8072fc5359c8e7090a4008babba984d1bea6b))
+- *(rt)* Verify cached artifacts through owned handles - ([eca4290](https://github.com/QaidVoid/onelf/commit/eca429031ea94a4e61ea557f0d1854a4da85921b))
+- *(rt)* Validate payload metadata before launch dispatch - ([eba3c4d](https://github.com/QaidVoid/onelf/commit/eba3c4dfeaaf91c432742f5a672acaf1d6881366))
+- *(rules)* Collect only client-side PipeWire and SPA members - ([589925d](https://github.com/QaidVoid/onelf/commit/589925dd99119741a9c140b7003085ac52fdb56d))
+- *(run)* Launch development runs from prepared views - ([49d416f](https://github.com/QaidVoid/onelf/commit/49d416fca97172b6a3bd5085cd60887c57615939))
+- *(run)* Launch bundles through shared runtime support - ([0a1e0ad](https://github.com/QaidVoid/onelf/commit/0a1e0add60b88a3a9a4e13e36ed08f07ca765c3f))
+
+### 🐛 Bug Fixes
+
+- *(env)* Keep the caller's LD_LIBRARY_PATH from the app - ([4d5822e](https://github.com/QaidVoid/onelf/commit/4d5822e31fededd1ca028ec57bafdb8aebeb0101))
+- *(fuse)* Say FUSE is unavailable when extraction takes over - ([2cf43d8](https://github.com/QaidVoid/onelf/commit/2cf43d874a5d87b027aee942985a7f23aa94a9eb))
+- *(payloads)* Bound env reads and align the runtime-env codec - ([8f5de0b](https://github.com/QaidVoid/onelf/commit/8f5de0b1111cee5e8d98f937f7bcca2c2e776647))
+- *(rt)* Judge a missing hinted store by its nearest ancestor - ([255869a](https://github.com/QaidVoid/onelf/commit/255869a52150f053b2a4643d081f41c1e9db15a5))
+- *(rt)* Classify carried rule variables like built-in ones - ([44814ac](https://github.com/QaidVoid/onelf/commit/44814ac536198cdddf3ef0e308428e5a6d1a371f))
+- *(rt)* Scope resolver decisions and provider checks to selections - ([faebd83](https://github.com/QaidVoid/onelf/commit/faebd83a5753c356fd7c7dad2c04ddff7bff9fd3))
+- *(rt)* Keep views, guardians and signals faithful per launch - ([f8a66ca](https://github.com/QaidVoid/onelf/commit/f8a66cacfa907893664747f7d7e4ad5028e17fa1))
+- *(rt)* Import pinned builds from the hinted store safely - ([fa3db19](https://github.com/QaidVoid/onelf/commit/fa3db192252a43f16a66b36556bbf4acb29c89d2))
+- *(rt)* Keep root's cache and base off env-chosen paths - ([5c9227b](https://github.com/QaidVoid/onelf/commit/5c9227b64962ec594c7f0a1fee4abd39093a5425))
+- *(rules)* Refuse loader, runtime-owned and shared env names - ([b656df1](https://github.com/QaidVoid/onelf/commit/b656df16fb2005725ce7ec274fe1b53bffe8a34f))
+- *(run)* Hold the view lease and use the packed library gate - ([1dddfe2](https://github.com/QaidVoid/onelf/commit/1dddfe2feb0db6501411aad45ea787bc9152bfd3))
+- *(runtime)* Warn about missing GL only when the package links it - ([2f9904c](https://github.com/QaidVoid/onelf/commit/2f9904c9a97e6042619aa8ce2623d23f8963beca))
+- Make the capability CI jobs pass on Ubuntu 26.04 runners ([#62](https://github.com/QaidVoid/onelf/pull/62)) - ([ba10af3](https://github.com/QaidVoid/onelf/commit/ba10af3ea41060f4b42c5f720e227c8ad72dedcd))
+- Make source stamps and FUSE mount reclaim race-free - ([aa56aad](https://github.com/QaidVoid/onelf/commit/aa56aad5dc1a4c33df62cd46d48991d39dc6ec49))
+- Preserve plugin subdirs and carry library data ([#59](https://github.com/QaidVoid/onelf/pull/59)) ([#60](https://github.com/QaidVoid/onelf/pull/60)) - ([16e1936](https://github.com/QaidVoid/onelf/commit/16e19369f37124235b60fa6b236c5a463ad7f92d))
+
+### 🚜 Refactor
+
+- *(env)* Share one library search path between launches - ([a62597e](https://github.com/QaidVoid/onelf/commit/a62597e00fa04146f714eda3e59cde937afc8268))
+- Drop stale dead-code allows and unused FUSE structs - ([a11dab9](https://github.com/QaidVoid/onelf/commit/a11dab984bcb31c9618f61aa4efbb816fc062c8b))
+
+### 🎨 Styling
+
+- *(rt)* Use ascii in fuse module docs - ([1610a5b](https://github.com/QaidVoid/onelf/commit/1610a5bdb9aff42c7eb44570f7af40e2e28eaa3c))
+
 
 ## [0.5.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.4.2...onelf-rt-v0.5.0) - 2026-10-29
 
