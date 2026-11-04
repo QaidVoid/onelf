@@ -2217,7 +2217,7 @@ mod store_hint_tests {
         };
         let artifact = crate::platform::store_build(&pin).expect("the cached import is allowed");
 
-        assert_eq!(&*artifact, stored.as_path());
+        assert_eq!(artifact.path(), stored.as_path());
         assert_eq!(extracted_content(&artifact), FILE_CONTENT);
 
         unsafe {

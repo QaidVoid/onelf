@@ -632,7 +632,7 @@ fn fetch_verified(
     let mut staged = staged;
     let downloaded = src.size().map_err(|e| e.to_string()).and_then(|size| {
         let reader = src.fetch_whole().map_err(|e| e.to_string())?;
-        copy_into(reader, &mut staged, Some(size))
+        copy_into(reader, &mut staged, size)
     });
     if let Err(e) = downloaded {
         eprintln!("onelf-rt: download update: {e}");
@@ -923,29 +923,37 @@ fn streaming_agent(redirects: u32) -> ureq::Agent {
         .new_agent()
 }
 
-/// Download `url` through the hardened client. Used for a pinned GL
-/// build, which its hash verifies afterwards.
-pub fn download(url: &str, into: &Path) -> Result<(), String> {
-    let mut file = std::fs::File::create(into).map_err(|e| format!("{}: {e}", into.display()))?;
+/// Download `url` through the hardened client into the already open
+/// `into`, refusing the transfer as soon as the body exceeds `max`
+/// bytes. Used for a pinned GL build or dependency set, which its hash
+/// verifies afterwards.
+pub fn download(url: &str, into: &mut std::fs::File, max: u64) -> Result<(), String> {
     let response = streaming_agent(10)
         .get(url)
         .call()
         .map_err(|e| format!("{url}: {e}"))?;
-    copy_into(response.into_body().into_reader(), &mut file, None)
-        .map_err(|e| format!("{url}: {e}"))
+    let copied = io::copy(
+        &mut response
+            .into_body()
+            .into_reader()
+            .take(max.saturating_add(1)),
+        into,
+    )
+    .map_err(|e| format!("{url}: {e}"))?;
+    if copied > max {
+        return Err(format!(
+            "{url}: the body is larger than the {max}-byte bound a staged build may take"
+        ));
+    }
+    Ok(())
 }
 
 /// Stream `reader` into `file` from its start, refusing a body longer
 /// than `limit` bytes.
-fn copy_into(
-    reader: impl Read,
-    file: &mut std::fs::File,
-    limit: Option<u64>,
-) -> Result<(), String> {
+fn copy_into(reader: impl Read, file: &mut std::fs::File, limit: u64) -> Result<(), String> {
     file.set_len(0).map_err(|e| e.to_string())?;
     file.seek(io::SeekFrom::Start(0))
         .map_err(|e| e.to_string())?;
-    let limit = limit.unwrap_or(u64::MAX);
     let copied =
         io::copy(&mut reader.take(limit.saturating_add(1)), file).map_err(|e| e.to_string())?;
     if copied > limit {

@@ -222,11 +222,22 @@ fn root_available() -> bool {
     }
 }
 
-/// The fixed per-uid base the runtime itself resolves for uid 0. It is
-/// not a per-test path, so the guard below isolates it for one root test
-/// at a time and never touches what another root left there.
+/// The fixed base the runtime itself resolves for uid 0: `/run/onelf`
+/// when the suite is real root and `/run` is root's alone, otherwise
+/// `/tmp/onelf-0`, which is also what a user-namespace root sees, since
+/// the host's `/run` belongs to an unmapped owner there. It is not a
+/// per-test path, so the guard below isolates it for one root test at a
+/// time and never touches what another root left there.
 fn root_base_path() -> PathBuf {
-    PathBuf::from("/tmp/onelf-0")
+    use std::os::unix::fs::MetadataExt;
+
+    let run_is_roots = std::fs::symlink_metadata("/run")
+        .is_ok_and(|md| md.is_dir() && md.uid() == 0 && md.mode() & 0o022 == 0);
+    if root_flavor() == Some(RootFlavor::AlreadyRoot) && run_is_roots {
+        PathBuf::from("/run/onelf")
+    } else {
+        PathBuf::from("/tmp/onelf-0")
+    }
 }
 
 /// One root test at a time: every root launch shares the fixed base
@@ -11557,13 +11568,15 @@ fn root_neither_widens_private_state_nor_leaves_acquisition_scratch() {
 
     // The failed acquisition is tried first, while root's own store is
     // still empty and the launch has to stage the pinned build itself.
-    // The bytes the pin names are what gets replaced: the fetch copies
-    // whatever the pin's URL serves.
+    // Both copies root may take are replaced: the import copies what the
+    // hinted store holds, the fetch whatever the pin's URL serves.
     let original = std::fs::read(&build).unwrap();
     let mut bytes = original.clone();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 1;
+    let user_copy = store.join("fixture").join(format!("{hash}.onelf"));
     std::fs::write(&build, &bytes).unwrap();
+    std::fs::write(&user_copy, &bytes).unwrap();
     let out = root_run(&[
         ("ONELF_MODE", "cache"),
         ("ONELF_SET_MODE", "extract"),
@@ -11576,6 +11589,7 @@ fn root_neither_widens_private_state_nor_leaves_acquisition_scratch() {
         "the failure names the set and the reason:\n{stderr}"
     );
     std::fs::write(&build, &original).unwrap();
+    std::fs::write(&user_copy, &original).unwrap();
     let view = base.view.clone();
     assert_eq!(
         mode_of(&view),
@@ -11771,11 +11785,13 @@ sleep 12
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// With a user store under the hint and root's own store still empty, a
-/// failed and a successful privileged acquisition both leave the hinted
-/// store byte-for-byte identical: contents, modes, owners, sizes, and
+/// With fetching disabled and the pin's source gone, root imports the
+/// pinned build from the hinted user store into its own store and runs
+/// from that private copy. A tampered user copy is refused on its digest
+/// with nothing published. Both outcomes leave the hinted store
+/// byte-for-byte identical: contents, modes, owners, sizes, and
 /// modification times, verified against a snapshot of the whole tree.
-/// Root acquires into its own store instead.
+/// Once imported, root's own copy serves even with the user store gone.
 ///
 /// Skips when the suite can reach neither real root nor a
 /// user-namespace root. When the suite already runs as root the planted
@@ -11792,65 +11808,146 @@ fn root_leaves_a_hinted_user_store_byte_identical() {
     };
     let (build, hash, pkg) = pack_pinned_set(&td);
     let store = plant_user_store(&td, &build, &hash);
-    let before = state_of(&store);
+    let user_copy = store.join("fixture").join(format!("{hash}.onelf"));
+    // The pin's own source is taken away, so whatever root runs can only
+    // have come from the hinted store.
+    std::fs::rename(&build, td.join("set.onelf.away")).unwrap();
 
-    let root_run = |envs: &[(&str, &str)]| {
+    let root_run = || {
         let mut run = root_command(&base, &pkg);
-        run.env_clear().env("PATH", "/usr/bin:/bin");
-        for (name, value) in envs {
-            run.env(name, value);
-        }
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("ONELF_MODE", "cache")
+            .env("ONELF_SET_MODE", "extract")
+            .env("ONELF_NO_PLATFORM_FETCH", "1")
+            .env("ONELF_PLATFORM_STORE", &store);
         run_package(&mut run)
     };
 
-    // The failed acquisition is tried first, while root's own store is
-    // still empty and the launch has to stage the pinned build itself.
-    // The bytes the pin names are what gets replaced: the fetch copies
-    // whatever the pin's URL serves.
-    let original = std::fs::read(&build).unwrap();
+    let original = std::fs::read(&user_copy).unwrap();
     let mut bytes = original.clone();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 1;
-    std::fs::write(&build, &bytes).unwrap();
-    let out = root_run(&[
-        ("ONELF_MODE", "cache"),
-        ("ONELF_SET_MODE", "extract"),
-        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
-    ]);
+    std::fs::write(&user_copy, &bytes).unwrap();
+    let tampered = state_of(&store);
+    let out = root_run();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "a tampered source ran:\n{stderr}");
+    assert!(!out.status.success(), "a tampered import ran:\n{stderr}");
     assert!(
-        stderr.contains("hash mismatch"),
-        "the failure names the reason:\n{stderr}"
+        stderr.contains("hash mismatch") && stderr.contains("fetching is disabled"),
+        "the failure names the refusal and the prohibition:\n{stderr}"
     );
     assert_eq!(
         state_of(&store),
-        before,
-        "a failed privileged acquisition changed the user's store"
+        tampered,
+        "a failed privileged import changed the user's store"
     );
-    std::fs::write(&build, &original).unwrap();
+    assert_eq!(
+        files_under(&base.view.join("platform")),
+        Vec::<String>::new(),
+        "the refused import published something"
+    );
 
-    let out = root_run(&[
-        ("ONELF_MODE", "cache"),
-        ("ONELF_SET_MODE", "extract"),
-        ("ONELF_PLATFORM_STORE", store.to_str().unwrap()),
-    ]);
+    std::fs::write(&user_copy, &original).unwrap();
+    let before = state_of(&store);
+    let out = root_run();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success() && stdout.contains("uid=0"),
-        "the successful root launch failed:\n{stdout}{stderr}"
+        "root did not import the hinted artifact:\n{stdout}{stderr}"
     );
     assert_eq!(
         state_of(&store),
         before,
-        "a successful privileged acquisition changed the user's store"
+        "a successful privileged import changed the user's store"
     );
+    let published = base
+        .view
+        .join("platform")
+        .join("fixture")
+        .join(format!("{hash}.onelf"));
     assert_eq!(
         files_under(&base.view.join("platform")),
         [format!("fixture/{hash}.onelf")],
-        "root did not acquire into its own store:\n{stdout}{stderr}"
+        "root did not import into its own store:\n{stdout}{stderr}"
     );
+    assert_eq!(mode_of(&published), Some(0o600));
+    assert_eq!(std::fs::read(&published).unwrap(), original);
+
+    std::fs::remove_dir_all(&store).unwrap();
+    let out = root_run();
+    assert!(
+        out.status.success(),
+        "root's imported copy did not serve on its own:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    drop(base);
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Root's cache and execution views never derive from an inherited
+/// `HOME` or `XDG_CACHE_HOME`, the way `sudo -E` keeps them: a cache
+/// launch extracts under root's own private base, and the user's cache
+/// directory and home stay empty.
+///
+/// Skips when the suite can reach neither real root nor a
+/// user-namespace root.
+#[test]
+fn root_leaves_inherited_home_and_xdg_cache_alone() {
+    if !root_available() {
+        return;
+    }
+    let td = workdir("rootxdg");
+    let Some(base) = root_base(&td) else {
+        return;
+    };
+    let pkg = pack_script(&td, "app", "#!/bin/sh\necho uid=$(id -u)\n");
+    let home = td.join("home");
+    let xdg = td.join("xdg-cache");
+    for dir in [&home, &xdg] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(
+            dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+    }
+
+    for preserved in [
+        vec![("HOME", &home), ("XDG_CACHE_HOME", &xdg)],
+        vec![("HOME", &home)],
+    ] {
+        let mut run = root_command(&base, &pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("ONELF_MODE", "cache");
+        for (name, value) in &preserved {
+            run.env(name, value);
+        }
+        let out = run_package(&mut run);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("uid=0"),
+            "the root cache launch failed:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            entries_of(&xdg),
+            Vec::<String>::new(),
+            "root wrote the user's cache"
+        );
+        assert_eq!(
+            entries_of(&home),
+            Vec::<String>::new(),
+            "root wrote the user's home"
+        );
+        assert!(
+            !files_under(&base.view.join("onelf").join("pkg")).is_empty(),
+            "root's cache is not under its own private base"
+        );
+    }
 
     drop(base);
     let _ = std::fs::remove_dir_all(&td);

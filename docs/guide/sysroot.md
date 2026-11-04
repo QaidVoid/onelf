@@ -374,7 +374,7 @@ and verifies it the same way, or fails naming the set, the mismatch and
 the pin:
 
 ```
-onelf-rt: dependency set fix required by entrypoint app: <store>/fix/<pin>.onelf: hash mismatch (got 1fe1..., pinned bdbd...); fetching is disabled by ONELF_NO_PLATFORM_FETCH (fix would be fetched from file:///tmp/fix-set.onelf)
+onelf-rt: dependency set fix required by entrypoint app: <store>/fix/<pin>.onelf: hash mismatch (pinned bdbd...); fetching is disabled by ONELF_NO_PLATFORM_FETCH (fix would be fetched from file:///tmp/fix-set.onelf)
 ```
 
 A valid hash says the bytes equal the pin and nothing more: it is not a
@@ -385,9 +385,23 @@ stays untrusted however well its pins verify.
 launch exports its resolved store to the application and every process
 it starts as `ONELF_PLATFORM_STORE`, so a bundled helper that fetches a
 set looks where the launch did. The value is only ever an artifact
-lookup location: no library directory is placed on it, and acquisition
-under another uid verifies against the pin and imports into that uid's
-own store rather than trusting another user's files.
+lookup location: no library directory is placed on it. A uid uses the
+hinted store as its own only when that store's root directory belongs
+to it. Root never does, and keeps its store under its own private base
+(`/run/onelf` when `/run` is root's alone, otherwise a validated
+`/tmp/onelf-0`), whatever `HOME` or `XDG_CACHE_HOME` say.
+
+✅ Another user's store is import input. When the uid's own store lacks
+the pinned build, acquisition looks in the hinted store before it
+fetches. The candidate is reached through the store without following
+any symlink, must be a regular file, and is copied through a handle to
+that same file into an exclusive scratch file in the uid's own store.
+The copy's own bytes are verified against the pin and loaded as a
+container before one rename publishes it, so a source changed or
+replaced during the import yields either the pinned bytes or a refusal.
+Nothing in the hinted store is written, renamed, chmod'd or touched.
+`ONELF_NO_PLATFORM_FETCH` still permits this import, and any refusal
+just moves on to the next permitted source.
 
 ✅ Old artifacts keep working. What a set provides and whether its
 objects fit the package's libc are read out of the pinned build's

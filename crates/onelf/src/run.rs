@@ -32,7 +32,6 @@ use onelf_format::{HostLibsPolicy, WorkingDir, drivers};
 use crate::assembly;
 use crate::pack::HostLibs;
 use crate::recipe;
-use crate::sysroot_cmd;
 
 /// The AppDir a run targets, with the recipe found beside it.
 struct Loaded {
@@ -69,8 +68,19 @@ fn assemble_for_launch(loaded: Loaded) -> io::Result<Assembled> {
 
 /// The CLI's HTTPS client, supplied as acquisition's `https://`
 /// operation.
-fn https_fetch(url: &str, into: &Path) -> Result<(), String> {
-    sysroot_cmd::download(url, into).map_err(|e| e.to_string())
+fn https_fetch(url: &str, into: &mut std::fs::File, max: u64) -> Result<(), String> {
+    let response = ureq::get(url).call().map_err(|e| format!("{url}: {e}"))?;
+    let copied = io::copy(
+        &mut io::Read::take(response.into_body().into_reader(), max.saturating_add(1)),
+        into,
+    )
+    .map_err(|e| format!("{url}: {e}"))?;
+    if copied > max {
+        return Err(format!(
+            "{url}: the body is larger than the {max}-byte bound a staged build may take"
+        ));
+    }
+    Ok(())
 }
 
 /// Run an AppDir in place: assemble a bundle launch through the shared

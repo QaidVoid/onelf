@@ -310,10 +310,16 @@ fn obtain(pin: &Pin, earlier: &[Obtained]) -> Result<Obtained, String> {
     })
 }
 
-/// Serve the build at `file` from a mountpoint named after the pin's
-/// hash, or join the mount another instance already serves there.
-/// `earlier` are the sets this launch already holds.
-fn mount(file: &Path, pin: &Pin, earlier: &[Obtained]) -> Result<Obtained, String> {
+/// Serve the verified build `artifact` from a mountpoint named after the
+/// pin's hash, or join the mount another instance already serves there.
+/// The server loads the container through a duplicate of the verified
+/// handle, never by reopening the stored name. `earlier` are the sets
+/// this launch already holds.
+fn mount(
+    artifact: &crate::platform::VerifiedArtifact,
+    pin: &Pin,
+    earlier: &[Obtained],
+) -> Result<Obtained, String> {
     use rustix::runtime::{Fork, kernel_fork};
 
     let (mountpoint, lock) =
@@ -357,6 +363,7 @@ fn mount(file: &Path, pin: &Pin, earlier: &[Obtained]) -> Result<Obtained, Strin
     if served(&mountpoint) {
         return Ok(joined(lock));
     }
+    let file = artifact.handle()?;
 
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
@@ -402,9 +409,10 @@ fn served(mountpoint: &Path) -> bool {
     crate::paths::is_mountpoint(mountpoint) && mountpoint.read_dir().is_ok()
 }
 
-/// The detached server: mount, serve until nothing claims the mountpoint
-/// any more, then take it down. Never returns.
-fn serve(file: &Path, mountpoint: &Path) -> ! {
+/// The detached server: mount the verified build `file` holds, serve
+/// until nothing claims the mountpoint any more, then take it down.
+/// Never returns.
+fn serve(file: fs::File, mountpoint: &Path) -> ! {
     // Out of the launcher's session and off its standard streams, so a
     // Ctrl-C aimed at the application does not take the set down and
     // `app | head` does not wait on this process.
@@ -424,7 +432,7 @@ fn serve(file: &Path, mountpoint: &Path) -> ! {
 
     let served = (|| -> Result<(), String> {
         let fuse_fd = crate::fuse::mount::fuse_mount(mountpoint).map_err(|e| e.to_string())?;
-        let mut pkg = crate::loader::load_from(file).map_err(|e| e.to_string())?;
+        let mut pkg = crate::loader::load_file(file).map_err(|e| e.to_string())?;
         let lock_path = crate::paths::set_lock_path(
             mountpoint
                 .file_name()
