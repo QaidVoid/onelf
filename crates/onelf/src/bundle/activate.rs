@@ -482,4 +482,111 @@ mod tests {
             "{err}"
         );
     }
+
+    /// A hundred unrelated rules injected through the activator's local
+    /// descriptor list, over exactly the soname sequence the ten-thousand
+    /// object scale fixture tree holds: they activate in identity order, each
+    /// group queues once however many sonames reach it, the shared queue
+    /// drains exactly objects plus groups rather than objects times rules,
+    /// and a run whose duplicate spellings arrive first leaves the
+    /// activations, the groups and the queue order identical, with only the
+    /// reasons swapped the way the rule text decides them. Elapsed time is
+    /// recorded.
+    #[test]
+    fn a_hundred_injected_rules_activate_over_the_tree_sonames_without_rewalking_it() {
+        let names: Vec<String> = (0..10_000)
+            .map(|i| format!("libscale{i:04}.so.1"))
+            .collect();
+        let aliases: Vec<String> = (0..100).map(|i| format!("libscale{i:04}.so.2")).collect();
+
+        // Observe the batches in order, seed the objects, and drain the
+        // queue: the activations, the object and group pops, the group
+        // queue order as the activator renders it, and the elapsed time.
+        let drain = |rule_count: usize,
+                     batches: &[Vec<String>]|
+         -> (Vec<RuleActivation>, usize, Vec<String>, u128) {
+            let rules: Vec<Descriptor> = (0..rule_count)
+                .map(|i| {
+                    descriptor(
+                        &format!("scale-{i:04}"),
+                        &format!("libscale{i:04}.so"),
+                        &["plugins"],
+                    )
+                })
+                .collect();
+            let mut discovery = Discovery::new(&[], &rules, &[]).unwrap();
+            let started = std::time::Instant::now();
+            for batch in batches {
+                for name in batch {
+                    discovery.observe(name).unwrap();
+                }
+            }
+            discovery.seed(&names);
+            let mut objects = 0usize;
+            let mut groups = Vec::new();
+            while let Some(item) = discovery.pop() {
+                match item {
+                    WorkItem::Object(_) => objects += 1,
+                    WorkItem::Group(group) => groups.push(format!("{group:?}")),
+                }
+            }
+            (
+                discovery.activations(),
+                objects,
+                groups,
+                started.elapsed().as_micros(),
+            )
+        };
+
+        let (first, objects, first_groups, elapsed) = drain(100, &[names.clone(), aliases.clone()]);
+        assert_eq!(first.len(), 100, "each unrelated rule activates once");
+        assert_eq!(objects, 10_000, "the objects pop once each");
+        assert_eq!(first_groups.len(), 100, "each group queues once");
+        for (i, activation) in first.iter().enumerate() {
+            assert_eq!(activation.rule, format!("scale-{i:04}"), "identity order");
+            assert_eq!(activation.reason, names[i], "the seed spelling");
+            assert_eq!(activation.groups, vec!["plugins"]);
+        }
+        for (i, group) in first_groups.iter().enumerate() {
+            assert!(
+                group.contains(&format!("scale-{i:04}")),
+                "the queue drains in identity order: {group}"
+            );
+        }
+
+        let (second, objects, second_groups, elapsed_reordered) =
+            drain(100, &[aliases.clone(), names.clone()]);
+        assert_eq!(objects, 10_000);
+        let strip_reason = |a: &[RuleActivation]| -> Vec<(String, Vec<String>)> {
+            a.iter()
+                .map(|x| (x.rule.clone(), x.groups.clone()))
+                .collect()
+        };
+        assert_eq!(
+            strip_reason(&first),
+            strip_reason(&second),
+            "the reordering must not move a rule or a group"
+        );
+        for (i, activation) in second.iter().enumerate() {
+            assert_eq!(
+                activation.reason, aliases[i],
+                "the reason follows whichever spelling arrived first"
+            );
+        }
+        assert_eq!(first_groups, second_groups, "the queue order must hold");
+
+        let (few, few_objects, few_groups, _) = drain(10, &[names.clone(), vec![]]);
+        assert_eq!(few.len(), 10);
+        assert_eq!(few_objects, 10_000, "the objects never depend on the rules");
+        assert_eq!(few_groups.len(), 10);
+        assert_eq!(
+            objects + first_groups.len() - (few_objects + few_groups.len()),
+            90,
+            "ten times the rules cost exactly ninety more pops, not a rewalk"
+        );
+        eprintln!(
+            "scale activation: 100 rules over 10000 sonames drained in {elapsed} us \
+             ({elapsed_reordered} us with the spellings reordered)"
+        );
+    }
 }

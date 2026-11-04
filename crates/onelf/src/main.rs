@@ -8,6 +8,8 @@ mod init;
 mod integrate;
 mod list;
 mod metadata;
+#[cfg(test)]
+mod metadata_emission;
 mod pack;
 mod payload;
 mod recipe;

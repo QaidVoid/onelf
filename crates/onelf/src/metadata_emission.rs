@@ -1,56 +1,14 @@
 //! Metadata lowering, capability gating, emission and packing-gate tests.
 //!
-//! The packer is a binary crate, so these tests compile the modules they
-//! exercise straight from source. Lowering turns validated runtime
-//! mappings into the two encoded records a package can carry, the recipe
-//! build path lowers the selection table its resolved selections write
-//! through it, the capability note gates what a package may carry, and
-//! the packer validates a carried selection table against the final
-//! entrypoint table and the pins the tree records before anything is
-//! written. A build whose recipe writes no explicit selection lowers
-//! nothing, so it packs byte-identically to before.
-//!
-//! `bundle` is a file module with a child directory in the packer's own
-//! tree, and a module loaded through a path attribute resolves its
-//! children beside the named file. `tests/bundle/` therefore mirrors the
-//! packer's `bundle.rs` and `bundle/` pair with links, so the bundle
-//! include below resolves exactly the files the build compiles.
+//! Lowering turns validated runtime mappings into the two encoded records
+//! a package can carry, the recipe build path lowers the selection table
+//! its resolved selections write through it, the capability note gates
+//! what a package may carry, and the packer validates a carried selection
+//! table against the final entrypoint table and the pins the tree records
+//! before anything is written. A build whose recipe writes no explicit
+//! selection lowers nothing, so it packs byte-identically to before.
 
-#![allow(dead_code)]
-
-#[rustfmt::skip]
-#[path = "../src/assembly.rs"]
-mod assembly;
-#[rustfmt::skip]
-#[path = "bundle/bundle.rs"]
-mod bundle;
-#[rustfmt::skip]
-#[path = "../src/compress.rs"]
-mod compress;
-#[rustfmt::skip]
-#[path = "../src/extract.rs"]
-mod extract;
-#[rustfmt::skip]
-#[path = "../src/info.rs"]
-mod info;
-#[rustfmt::skip]
-#[path = "../src/metadata.rs"]
-mod metadata;
-#[rustfmt::skip]
-#[path = "../src/pack.rs"]
-mod pack;
-#[rustfmt::skip]
-#[path = "../src/payload.rs"]
-mod payload;
-#[rustfmt::skip]
-#[path = "../src/recipe.rs"]
-mod recipe;
-#[rustfmt::skip]
-#[path = "../src/rules.rs"]
-mod rules;
-#[rustfmt::skip]
-#[path = "../src/sysroot_cmd.rs"]
-mod sysroot_cmd;
+use crate::{assembly, bundle, compress, info, metadata, pack, recipe};
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
