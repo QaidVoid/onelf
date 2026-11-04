@@ -468,7 +468,15 @@ fn serve_private(
         let inbox = &mut inbox;
         let pkg: &PackageData = pkg;
         let mountpoint = mountpoint.clone();
+        let connection = std::os::fd::AsRawFd::as_raw_fd(&fuse_fd);
         crate::guardian::fork_foreground(move || {
+            // The connection is the server's alone. A copy held here until
+            // the exec would keep a killed server's mount alive, and a read
+            // of the mount this child was in would then wait forever,
+            // unkillably, for an answer only the dead server could give.
+            // SAFETY: this forked child never touches the server's handle
+            // again; it execs or exits.
+            unsafe { rustix::io::close(connection) };
             // The server's ends of the hand-off are not the app's: an ack
             // pipe the app held would never hang up on a dead server.
             drop(inbox.take());

@@ -10318,7 +10318,7 @@ fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
     };
     // The runtime and the app it launched share the mountpoint lock, so
     // the whole group has to die for the mount to count as abandoned.
-    kill_group(&child);
+    kill_group(&mut child);
     child.wait().unwrap();
     assert!(
         helper_mount_under(&td.join("xdg-run")).is_some(),
@@ -10381,7 +10381,7 @@ fn a_live_helper_mount_survives_another_launch() {
 
     // Once the instance is gone its mount is abandoned, and the next launch
     // reclaims it, which also leaves nothing behind on this machine.
-    kill_group(&child);
+    kill_group(&mut child);
     child.wait().unwrap();
     assert!(
         reclaimed_by(&mut run, &td),
@@ -10410,18 +10410,20 @@ fn reclaimed_by(run: &mut Command, td: &Path) -> bool {
     false
 }
 
-/// SIGKILL `child` and every process in its group.
-/// Kill everything in the child's process group and wait for all of it
-/// to be gone. `wait` on the child alone reaps the runtime; the app it
+/// SIGKILL `child` and every process in its group, and wait for all of
+/// it to be gone. `wait` on the child alone reaps the runtime; the app it
 /// forked and that app's children are still being torn down for a few
-/// milliseconds, and until then they hold the locks they inherited.
-fn kill_group(child: &std::process::Child) {
+/// milliseconds, and until then they hold the locks they inherited. The
+/// child is reaped first, since an unreaped zombie still counts as a
+/// member of the group and would hold the poll below to its deadline.
+fn kill_group(child: &mut std::process::Child) {
     let group = format!("-{}", child.id());
     let st = Command::new("kill")
         .args(["-9", "--", &group])
         .status()
         .expect("spawn kill");
     assert!(st.success());
+    child.wait().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let alive = Command::new("kill")
@@ -11455,7 +11457,7 @@ fn an_abandoned_rundir_tree_is_reclaimed_by_the_next_launch() {
     }
     let tree = tree.expect("the tree appears");
 
-    kill_group(&child);
+    kill_group(&mut child);
     child.wait().unwrap();
     assert!(tree.is_dir(), "the tree outlives its killed processes");
 
@@ -11917,7 +11919,7 @@ sleep 12
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let Some(tree) = tree else {
-        kill_group(&held);
+        kill_group(&mut held);
         let out = held.wait_with_output().unwrap();
         panic!(
             "the root rundir tree never appeared:\n{}",
@@ -11969,7 +11971,7 @@ sleep 12
         Some(0o700),
         "root's private base was widened while the launch held it"
     );
-    kill_group(&held);
+    kill_group(&mut held);
     held.wait().unwrap();
 
     // The next root launch's sweep takes the abandoned tree away.
@@ -11984,8 +11986,10 @@ sleep 12
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The sweeper's own tree may still be on its way out when its launch
+    // returns, so the check names the abandoned tree itself.
     assert!(
-        held_tree(&view).is_none(),
+        std::fs::symlink_metadata(&tree).is_err(),
         "the abandoned tree was not reclaimed"
     );
     assert_eq!(mode_of(&view), Some(0o700));

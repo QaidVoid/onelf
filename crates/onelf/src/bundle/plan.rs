@@ -321,12 +321,23 @@ struct PlannedDest {
 
 /// The stamp planning took of one source file, re-checked before the
 /// executor writes anything derived from it.
+///
+/// `modified` is kept only when it already lay [`SETTLED`] in the past
+/// when the stamp was taken. A later write then always moves it, while
+/// a write landing in the same timestamp tick as a recent one could
+/// leave it unchanged, so a recently modified source is always checked
+/// by content.
 #[derive(Debug, Clone)]
 struct SourceStamp {
     size: u64,
     modified: Option<std::time::SystemTime>,
     hash: blake3::Hash,
 }
+
+/// How far in the past a source's modification time must lie for the
+/// time and size to stand for its content: comfortably more than the
+/// coarsest timestamp granularity a source filesystem keeps.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Every destination the walk intends to write, resolved against each
 /// other and against the tree, with the findings that stop the build.
@@ -467,11 +478,15 @@ impl DestinationPlan {
     /// can tell when it changed before the copy runs.
     pub(crate) fn note_source(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let meta = fs::metadata(path)?;
+        let settled = std::time::SystemTime::now().checked_sub(SETTLED);
         self.sources.insert(
             path.to_path_buf(),
             SourceStamp {
                 size: meta.len(),
-                modified: meta.modified().ok(),
+                modified: meta
+                    .modified()
+                    .ok()
+                    .filter(|m| settled.is_some_and(|settled| *m < settled)),
                 hash: file_hash(bytes),
             },
         );
@@ -489,7 +504,10 @@ impl DestinationPlan {
             Ok(meta) => meta,
             Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
         };
-        if meta.len() == stamp.size && meta.modified().ok() == stamp.modified {
+        if stamp.modified.is_some()
+            && meta.len() == stamp.size
+            && meta.modified().ok() == stamp.modified
+        {
             return Ok(());
         }
         let mut hasher = blake3::Hasher::new();
@@ -1168,22 +1186,58 @@ mod tests {
         );
     }
 
-    /// A source stamped at planning time reads back verified while its
-    /// content stands, and the read the copy writes from fails with a
-    /// finding once its bytes change, whatever its timestamps say.
+    /// A source stamped at planning time verifies while its content
+    /// stands, and both the check and the read the copy writes from fail
+    /// with a finding once its bytes change. A same-size rewrite within
+    /// one timestamp tick of planning leaves the time and size as they
+    /// were, so a freshly written source is checked by content.
     #[test]
     fn a_changed_source_fails_verification_by_content() {
         let (dir, mut plan) = seeded("source");
         let src = dir.join("src.so");
         fs::write(&src, b"planned").unwrap();
         plan.note_source(&src, b"planned").unwrap();
+        plan.verify_source(&src).unwrap();
         assert_eq!(plan.read_verified(&src).unwrap(), b"planned");
 
+        let modified = fs::metadata(&src).unwrap().modified().unwrap();
         fs::write(&src, b"changed").unwrap();
-        let err = plan.read_verified(&src).unwrap_err();
-        let text = err.to_string();
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        for err in [
+            plan.verify_source(&src).unwrap_err(),
+            plan.read_verified(&src).unwrap_err(),
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("changed while the bundle"), "{text}");
+            assert!(text.contains("src.so"), "{text}");
+        }
+    }
+
+    /// A source whose modification time settled before planning keeps
+    /// the cheap time and size check, and a later rewrite moves the
+    /// time, so it is still caught.
+    #[test]
+    fn a_settled_source_is_checked_by_time_and_size() {
+        let (dir, mut plan) = seeded("settled");
+        let src = dir.join("src.so");
+        fs::write(&src, b"planned").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        plan.note_source(&src, b"planned").unwrap();
+        plan.verify_source(&src).unwrap();
+        fs::write(&src, b"changed").unwrap();
+        let text = plan.verify_source(&src).unwrap_err().to_string();
         assert!(text.contains("changed while the bundle"), "{text}");
-        assert!(text.contains("src.so"), "{text}");
     }
 
     /// A destination that would reach outside the tree is an escape,

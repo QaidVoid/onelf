@@ -428,10 +428,15 @@ pub(crate) fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Whether the filesystem at `path` reports a disconnected transport, which
-/// is what a FUSE mount answers once its daemon has exited. The kernel
-/// fails the query immediately in that state, so this never blocks.
+/// is what a FUSE mount answers once its daemon has exited. A daemon that
+/// died before it answered the kernel's `INIT` leaves a connection marked
+/// failed instead, which answers `ECONNREFUSED`. The kernel fails the query
+/// immediately in both states, so this never blocks.
 fn is_dead_mount(path: &Path) -> bool {
-    matches!(rustix::fs::statfs(path), Err(rustix::io::Errno::NOTCONN))
+    matches!(
+        rustix::fs::statfs(path),
+        Err(rustix::io::Errno::NOTCONN | rustix::io::Errno::CONNREFUSED)
+    )
 }
 
 /// Remove the lock file for `dir_name` once its directory is gone and nobody
