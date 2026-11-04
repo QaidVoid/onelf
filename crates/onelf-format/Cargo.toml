@@ -16,5 +16,9 @@ xxhash-rust = { workspace = true }
 stipplefs = { workspace = true, features = ["read", "zstd"] }
 toml = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Enables the feature-gated TOML tests in every workspace test run.
+onelf-format = { path = ".", features = ["rules-toml"] }
+
 [build-dependencies]
 toml = { workspace = true }

@@ -631,6 +631,7 @@ name = "onelf-format"
 version = "0.5.1"
 dependencies = [
  "blake3",
+ "onelf-format",
  "stipplefs",
  "toml",
  "xxhash-rust",
