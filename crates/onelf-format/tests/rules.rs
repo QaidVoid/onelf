@@ -29,6 +29,7 @@ fn plugin(name: &str) -> ResourceGroup {
         }],
         destination: path("lib/example/plugins"),
         requirement: Requirement::Optional,
+        members: Vec::new(),
     }
 }
 
@@ -730,6 +731,60 @@ mod toml_schema {
             "path = '../escape'",
             "path:",
         );
+    }
+
+    #[test]
+    fn plugin_members_are_validated_paths_and_data_groups_take_none() {
+        let listed = "destination = \"lib/gstreamer-1.0\"\nmembers = [\"core/libcore.so\", \"./libother.so\"]";
+        let rule =
+            parse_descriptor(&GST.replacen("destination = \"lib/gstreamer-1.0\"", listed, 1))
+                .unwrap();
+        let members: Vec<&str> = rule.resources.plugins[0]
+            .members
+            .iter()
+            .map(RelativePath::as_str)
+            .collect();
+        assert_eq!(members, ["core/libcore.so", "libother.so"]);
+        assert!(
+            parse_descriptor(GST).unwrap().resources.plugins[0]
+                .members
+                .is_empty()
+        );
+        let destination = "destination = \"lib/gstreamer-1.0\"";
+        for value in [
+            "\"../escape.so\"",
+            "\"/usr/lib/escape.so\"",
+            "\"a\\u0000b.so\"",
+            "\"\"",
+        ] {
+            rejects_replacement(
+                GST,
+                destination,
+                &format!("{destination}\nmembers = [{value}]"),
+                "path",
+            );
+        }
+        rejects_replacement(
+            GST,
+            destination,
+            &format!("{destination}\nmembers = []"),
+            "at least one member",
+        );
+        rejects_replacement(
+            GST,
+            destination,
+            &format!("{destination}\nmembers = [\"a.so\", \"./a.so\"]"),
+            "duplicate",
+        );
+        rejects_replacement(
+            MAGIC,
+            "[[resources.data]]",
+            "[[resources.data]]\nmembers = [\"magic.mgc\"]",
+            "unknown field",
+        );
+        let mut direct = parse_descriptor(MAGIC).unwrap();
+        direct.resources.data[0].members = vec![path("magic.mgc")];
+        error_contains(direct.validate(), "only plugin groups list members");
     }
 
     #[test]

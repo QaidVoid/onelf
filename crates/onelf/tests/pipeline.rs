@@ -3249,6 +3249,7 @@ fn scale_rule(i: usize) -> onelf_format::rules::Descriptor {
         }],
         destination: RelativePath::new(&format!("lib/scale-{i:04}")).unwrap(),
         requirement: Requirement::Optional,
+        members: Vec::new(),
     });
     d
 }

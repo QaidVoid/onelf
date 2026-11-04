@@ -7,6 +7,10 @@
 //! to the walk as an object, written at the group's declared
 //! destination with the source layout preserved.
 //!
+//! A group that lists its members collects only those, matched by their
+//! path relative to the found directory. The rest of the directory is
+//! passed over before any compatibility check.
+//!
 //! A member that is not an ELF object of the bundle's own class and
 //! machine is refused with a reason and never shadows a compatible one,
 //! so a multiarch plugin directory contributes only its matching half.
@@ -117,6 +121,10 @@ pub(crate) fn collect_group(
                 continue;
             }
             let shown = rel.to_string_lossy().into_owned();
+            if !declared.members.is_empty() && !declared.members.iter().any(|m| m.as_str() == shown)
+            {
+                continue;
+            }
             if let Err(reason) = compatible_object(&path, target_class, target_machine) {
                 collection.skipped.push((shown, reason));
                 continue;
@@ -689,21 +697,73 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A group listing its members collects those alone, a nested one by
+    /// its relative path, and a non-member is neither collected nor
+    /// recorded as refused.
+    #[test]
+    fn a_member_allowlist_collects_only_the_listed_members() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let lib = dir.join("usr/lib");
+        write(&lib.join("libspa-0.2.so.0"), &fake_elf(2, 62));
+        write(
+            &lib.join("spa-0.2/support/libspa-support.so"),
+            &fake_elf(2, 62),
+        );
+        write(
+            &lib.join("spa-0.2/bluez5/libspa-bluez5.so"),
+            &fake_elf(2, 62),
+        );
+        write(&lib.join("spa-0.2/libspa-support.so"), &fake_elf(2, 62));
+        write(
+            &lib.join("spa-0.2/audioconvert/libspa-arm.so"),
+            &fake_elf(2, 183),
+        );
+        let libs = [admitted_lib(&lib.join("libspa-0.2.so.0"))];
+        let mut listed = builtin_group("spa");
+        listed.members = ["support/libspa-support.so", "audioconvert/libspa-arm.so"]
+            .into_iter()
+            .map(|m| onelf_format::rules::RelativePath::new(m).unwrap())
+            .collect();
+
+        let collection = collect_group("spa", &listed, &libs, None, Some(2), Some(62)).unwrap();
+        let found: Vec<&Path> = collection
+            .plugins
+            .iter()
+            .map(|p| p.destination.as_path())
+            .collect();
+        assert_eq!(found, [Path::new("lib/spa-0.2/support/libspa-support.so")]);
+        assert_eq!(
+            collection
+                .skipped
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["audioconvert/libspa-arm.so"],
+            "a listed incompatible member is still refused with its reason"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn collection_is_bounded() {
         let dir =
             std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib");
-        write(&lib.join("libpipewire-0.3.so.0"), &fake_elf(2, 62));
+        write(&lib.join("libgstreamer-1.0.so.0"), &fake_elf(2, 62));
         for i in 0..MAX_GROUP_MEMBERS + 1 {
-            write(&lib.join(format!("pipewire-0.3/m{i}.so")), &fake_elf(2, 62));
+            write(
+                &lib.join(format!("gstreamer-1.0/m{i}.so")),
+                &fake_elf(2, 62),
+            );
         }
-        let libs = [admitted_lib(&lib.join("libpipewire-0.3.so.0"))];
+        let libs = [admitted_lib(&lib.join("libgstreamer-1.0.so.0"))];
 
         let err = collect_group(
-            "pipewire",
-            &builtin_group("pipewire"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),

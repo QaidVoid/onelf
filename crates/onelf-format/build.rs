@@ -117,12 +117,13 @@ fn source_code(candidate: &SourceCandidate) -> String {
 
 fn resource_code(resource: &ResourceGroup) -> String {
     format!(
-        "ResourceGroup {{ id: {}, kind: ResourceKind::{:?}, candidates: {}, destination: {}, requirement: Requirement::{:?} }}",
+        "ResourceGroup {{ id: {}, kind: ResourceKind::{:?}, candidates: {}, destination: {}, requirement: Requirement::{:?}, members: {} }}",
         id_code(&resource.id),
         resource.kind,
         vector_code(&resource.candidates, source_code),
         path_code(&resource.destination),
-        resource.requirement
+        resource.requirement,
+        vector_code(&resource.members, path_code)
     )
 }
 

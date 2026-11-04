@@ -3,8 +3,10 @@
 //! A descriptor has an explicit schema and identity. Trigger predicates are ORed
 //! over parsed ELF sonames. Resource and runtime candidate order is significant.
 //! Resource destinations are package-relative and directory copies preserve the
-//! complete candidate-relative layout. Helpers name an associated plugin or data
-//! group in the same descriptor. Resource IDs share one namespace, while runtime
+//! complete candidate-relative layout. A plugin group may list `members`, paths
+//! relative to the found directory, to collect only those members instead of
+//! every compatible one. Helpers name an associated plugin or data group in the
+//! same descriptor. Resource IDs share one namespace, while runtime
 //! path IDs have their own namespace, both scoped to the descriptor.
 //!
 //! TOML parsing is available only with the `rules-toml` feature through
@@ -58,8 +60,9 @@ pub const SCHEMA_VERSION: u16 = 1;
 pub const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 /// Maximum aggregate records in a descriptor or validated catalog.
 ///
-/// Each descriptor, trigger, resource group, candidate, helper group reference,
-/// runtime path group, variable alias, hook and disabled ID counts as one record.
+/// Each descriptor, trigger, resource group, candidate, plugin member, helper
+/// group reference, runtime path group, variable alias, hook and disabled ID
+/// counts as one record.
 /// Container tables do not count as records.
 pub const MAX_RECORDS: usize = 4096;
 /// Maximum bytes in a rule/group ID or environment variable name.
@@ -451,8 +454,9 @@ pub struct SourceCandidate {
 /// A plugin tree or data resource with ordered source alternatives.
 ///
 /// Plugin groups require directory kind and select the complete compatible ELF
-/// tree. Data groups may require a file or a directory. Source alternatives are
-/// tried in order, without broadening the admitted source or package universe.
+/// tree, or only the listed members of it. Data groups may require a file or a
+/// directory and list no members. Source alternatives are tried in order,
+/// without broadening the admitted source or package universe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceGroup {
     /// Descriptor-local resource identity.
@@ -465,6 +469,10 @@ pub struct ResourceGroup {
     pub destination: RelativePath,
     /// Treatment of unavailable resources after source policy is applied.
     pub requirement: Requirement,
+    /// Plugin group member allowlist, as paths relative to the found
+    /// directory. Empty selects every compatible member. A listed member the
+    /// source lacks is not an error. The requirement applies to what remains.
+    pub members: Vec<RelativePath>,
 }
 
 /// A framework helper executable associated with a plugin or data group.
@@ -637,6 +645,7 @@ impl Descriptor {
         budget.add(self.runtime.hooks.len())?;
         for resource in self.resources.plugins.iter().chain(&self.resources.data) {
             budget.add(resource.candidates.len())?;
+            budget.add(resource.members.len())?;
         }
         for helper in &self.resources.helpers {
             budget.add(1)?;
@@ -688,6 +697,17 @@ impl Descriptor {
                     plugin.id.as_str(),
                 ));
             }
+            let mut members = BTreeSet::new();
+            for member in &plugin.members {
+                unique(&mut members, member, "plugins.members")?;
+            }
+        }
+        if let Some(data) = self.resources.data.iter().find(|d| !d.members.is_empty()) {
+            return Err(RuleError::value(
+                "data.members",
+                "only plugin groups list members",
+                data.id.as_str(),
+            ));
         }
         for helper in &self.resources.helpers {
             if !groups.contains(&helper.group) {

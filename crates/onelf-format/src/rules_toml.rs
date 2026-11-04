@@ -141,25 +141,57 @@ fn parse_trigger(value: Value) -> Result<Trigger, RuleError> {
 fn parse_resources(value: Value) -> Result<Resources, RuleError> {
     let mut fields = Fields::new(value, "resources", &["plugins", "data", "helpers"])?;
     Ok(Resources {
-        plugins: fields.list("plugins", parse_resource_group)?,
-        data: fields.list("data", parse_resource_group)?,
+        plugins: fields.list("plugins", parse_plugin_group)?,
+        data: fields.list("data", parse_data_group)?,
         helpers: fields.list("helpers", parse_helper)?,
     })
 }
 
-fn parse_resource_group(value: Value) -> Result<ResourceGroup, RuleError> {
-    let mut fields = Fields::new(
-        value,
-        "resource group",
-        &["id", "kind", "candidates", "destination", "requirement"],
-    )?;
-    Ok(ResourceGroup {
+fn parse_plugin_group(value: Value) -> Result<ResourceGroup, RuleError> {
+    parse_resource_group(value, true)
+}
+
+fn parse_data_group(value: Value) -> Result<ResourceGroup, RuleError> {
+    parse_resource_group(value, false)
+}
+
+/// A resource group. Only a plugin group accepts `members`, and a present
+/// list must name at least one member, since an absent list already means
+/// every compatible member.
+fn parse_resource_group(value: Value, plugin: bool) -> Result<ResourceGroup, RuleError> {
+    const DATA: &[&str] = &["id", "kind", "candidates", "destination", "requirement"];
+    const PLUGIN: &[&str] = &[
+        "id",
+        "kind",
+        "candidates",
+        "destination",
+        "requirement",
+        "members",
+    ];
+    let mut fields = Fields::new(value, "resource group", if plugin { PLUGIN } else { DATA })?;
+    let listed = fields.values.contains_key("members");
+    let group = ResourceGroup {
         id: RuleId::new(&fields.string("id")?)?,
         kind: parse_kind(&fields.string("kind")?)?,
         candidates: fields.list("candidates", parse_source_candidate)?,
         destination: RelativePath::new(&fields.string("destination")?)?,
         requirement: parse_requirement(&fields.string("requirement")?)?,
-    })
+        members: fields.list("members", parse_member)?,
+    };
+    if listed && group.members.is_empty() {
+        return Err(RuleError::new(
+            "members",
+            &format!(
+                "must name at least one member when present: {}",
+                group.id.as_str()
+            ),
+        ));
+    }
+    Ok(group)
+}
+
+fn parse_member(value: Value) -> Result<RelativePath, RuleError> {
+    RelativePath::new(&string(value, "members")?)
 }
 
 fn parse_helper(value: Value) -> Result<HelperGroup, RuleError> {

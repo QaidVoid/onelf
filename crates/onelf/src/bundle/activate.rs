@@ -292,6 +292,7 @@ mod tests {
                 }],
                 destination: RelativePath::new(group).unwrap(),
                 requirement: Requirement::Optional,
+                members: Vec::new(),
             });
         }
         d
