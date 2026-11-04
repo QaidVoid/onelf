@@ -231,16 +231,24 @@ fn import_hint() -> Option<PathBuf> {
 
 /// Whether the store root `dir` belongs to `uid`: the directory it opens
 /// to, following a symlink at the root as the store root always does, is
-/// owned by `uid`. A store that does not exist yet belongs to whoever
-/// creates it, which is the acquisition of this uid.
+/// owned by `uid`. A store that does not exist yet is judged by its
+/// nearest existing ancestor, so a fresh path under this uid's own tree
+/// is accepted while one under another uid's home stays import input.
 fn store_owned_by(dir: &Path, uid: u32) -> bool {
-    match rustix::fs::open(
-        dir,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fstat(&fd).is_ok_and(|st| st.st_uid == uid),
-        Err(e) => e == Errno::NOENT,
+    let mut probe = dir;
+    loop {
+        match rustix::fs::open(
+            probe,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => return fstat(&fd).is_ok_and(|st| st.st_uid == uid),
+            Err(Errno::NOENT) => match probe.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                _ => return false,
+            },
+            Err(_) => return false,
+        }
     }
 }
 
@@ -1771,6 +1779,32 @@ mod tests {
         let store = owned_store(
             me(),
             Some(Path::new("/")),
+            || Some(base.clone()),
+            || unreachable!("the private base is not consulted"),
+        )
+        .unwrap();
+        assert_eq!(store, base.join("platform"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A hinted store that does not exist yet is the uid's own only when
+    /// its nearest existing ancestor is.
+    #[test]
+    fn a_missing_hint_is_judged_by_its_nearest_existing_ancestor() {
+        if me() == 0 {
+            return;
+        }
+        let base = temp_dir("missing-hint");
+        fs::create_dir_all(&base).unwrap();
+        let fresh = base.join("not/yet/created");
+        assert!(store_owned_by(&fresh, me()));
+        assert!(!store_owned_by(
+            Path::new("/onelf-missing-hint/store"),
+            me()
+        ));
+        let store = owned_store(
+            me(),
+            Some(Path::new("/onelf-missing-hint/store")),
             || Some(base.clone()),
             || unreachable!("the private base is not consulted"),
         )
