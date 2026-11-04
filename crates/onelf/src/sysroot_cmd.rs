@@ -133,10 +133,10 @@ pub fn pack_gl(
 /// be inside it.
 ///
 /// The packed build carries a provider index derived from the objects it
-/// verified during assembly, and it is only published once the packed
-/// artifact has been read back and found to carry exactly that index:
-/// the pin printed below is for a build whose exported names were
-/// checked, not for one whose word was taken.
+/// verified during assembly. It is packed beside `output` and only
+/// renamed onto it once the packed artifact has been read back and found
+/// to carry exactly that index: the pin printed below is for a build
+/// whose exported names were checked, not for one whose word was taken.
 pub fn pack_set(
     dir: &Path,
     output: &Path,
@@ -145,19 +145,44 @@ pub fn pack_set(
     runtime: &[u8],
 ) -> io::Result<()> {
     crate::bundle::sysroot::check_set_name(name)?;
-    pack_tree(
+    let staged = crate::pack::sibling_tmp(output, "unverified");
+    let packed = pack_tree(
         dir,
-        output,
+        &staged,
         sysroot,
         runtime,
         SET_ENTRYPOINT,
         &format!("onelf-set-{name}"),
         Some(name),
-    )?;
-    let exports = crate::bundle::sysroot::verified_exports(dir)?;
-    let hash = crate::bundle::sysroot::verify_set_artifact(output, name, &exports)?;
+    );
+    let hash = publish_checked(&staged, output, |staged| {
+        packed?;
+        let exports = crate::bundle::sysroot::verified_exports(dir)?;
+        crate::bundle::sysroot::verify_set_artifact(staged, name, &exports)
+    })?;
     println!("blake3 = \"{hash}\"");
     Ok(())
+}
+
+/// Rename `staged` onto `output` once `check` accepts it and return what
+/// the check answered. A rejected artifact is removed instead, so the
+/// output path never holds bytes the check refused and a previous output
+/// there stays as it was.
+fn publish_checked(
+    staged: &Path,
+    output: &Path,
+    check: impl FnOnce(&Path) -> io::Result<String>,
+) -> io::Result<String> {
+    match check(staged) {
+        Ok(answer) => {
+            std::fs::rename(staged, output)?;
+            Ok(answer)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(staged);
+            Err(e)
+        }
+    }
 }
 
 /// Record the name every shared object in `dir` answers to.
@@ -373,4 +398,52 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(std::fs::File::open(path)?)?;
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::publish_checked;
+
+    /// A scratch directory unique to this test run.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "onelf-publish-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A staged artifact the check refuses never reaches the output
+    /// path: the previous output keeps its bytes and the staged file is
+    /// gone. One the check accepts replaces the output.
+    #[test]
+    fn a_refused_artifact_is_never_published() {
+        let dir = scratch("refused");
+        let (staged, output) = (dir.join("set.staged"), dir.join("set.onelf"));
+        std::fs::write(&output, b"previous").unwrap();
+        std::fs::write(&staged, b"unverified").unwrap();
+        let err = publish_checked(&staged, &output, |_| {
+            Err(std::io::Error::other("index mismatch"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("index mismatch"), "{err}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous");
+        assert!(!staged.exists(), "the refused artifact stays behind");
+
+        std::fs::write(&staged, b"verified").unwrap();
+        let answer = publish_checked(&staged, &output, |p| {
+            assert_eq!(std::fs::read(p).unwrap(), b"verified");
+            Ok("hash".to_string())
+        })
+        .unwrap();
+        assert_eq!(answer, "hash");
+        assert_eq!(std::fs::read(&output).unwrap(), b"verified");
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

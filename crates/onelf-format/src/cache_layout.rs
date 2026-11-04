@@ -88,6 +88,26 @@ pub fn privileged_base_in(uid: u32, run: &Path, tmp: &Path) -> Option<PathBuf> {
     create_private_dir(&dir, uid).then_some(dir)
 }
 
+/// The persistent root-owned base a privileged caller with no private
+/// base of its own keeps its cache under: `/var/cache`, when it is a
+/// real directory root owns that group and other cannot write. Unlike
+/// [`privileged_base`], it survives a reboot, which is what the packer
+/// CLI's fetched builds and resolver state need. See
+/// [`persistent_base_in`] for the acceptance rule.
+fn persistent_privileged_base() -> Option<PathBuf> {
+    persistent_base_in(0, Path::new("/var/cache"))
+}
+
+/// [`persistent_privileged_base`]'s rule for `uid` over an explicit
+/// candidate: `var_cache` is accepted only as a real directory `uid` owns
+/// that group and other cannot write, so nobody else can have planted
+/// the `onelf` name the cache root takes under it.
+fn persistent_base_in(uid: u32, var_cache: &Path) -> Option<PathBuf> {
+    std::fs::symlink_metadata(var_cache)
+        .is_ok_and(|md| md.is_dir() && md.uid() == uid && md.mode() & 0o022 == 0)
+        .then(|| var_cache.to_path_buf())
+}
+
 /// Create `dir` at `0700` with one `mkdir`, so it is never group or
 /// other accessible, and report whether it is now a real directory `uid`
 /// owns with no group or other access. A pre-existing path is checked,
@@ -129,9 +149,11 @@ fn env_base(uid: u32, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Optio
 /// which are already user-private, and only an absolute value is
 /// trusted. `fallback` supplies the last resort (the runtime passes its
 /// `0700` per-uid directory; a caller with none passes `None`). Uid 0
-/// ignores the environment entirely and uses `fallback`, or the
-/// [`privileged_base`] when the caller has none, so root never creates
-/// or trusts state under a path the invoking user chose.
+/// ignores the environment entirely and uses `fallback`. A caller with
+/// none, the packer CLI, gets the persistent `/var/cache/onelf`, or the
+/// tmpfs-backed [`privileged_base`] when `/var/cache` is unusable, so
+/// root never creates or trusts state under a path the invoking user
+/// chose.
 pub fn resolve_root(uid: u32, fallback: Option<PathBuf>) -> Option<PathBuf> {
     resolve_root_with(uid, |name| std::env::var_os(name), fallback)
 }
@@ -142,9 +164,11 @@ fn resolve_root_with(
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
     fallback: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let base = env_base(uid, var)
-        .or(fallback)
-        .or_else(|| (uid == 0).then(privileged_base).flatten())?;
+    let base = env_base(uid, var).or(fallback).or_else(|| {
+        (uid == 0)
+            .then(|| persistent_privileged_base().or_else(privileged_base))
+            .flatten()
+    })?;
     let onelf = base.join("onelf");
     ensure_safe_dir(&onelf, uid).then_some(onelf)
 }
@@ -408,6 +432,31 @@ mod tests {
             None,
             "a planted fallback name is refused"
         );
+
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// The persistent base is taken only when the candidate is a real
+    /// directory the uid owns that nobody else may write: a writable or
+    /// foreign directory, a symlink and a missing path are all refused.
+    #[test]
+    fn the_persistent_base_requires_a_private_owned_directory() {
+        let me = uid();
+        let top = unique("vbase");
+        let cache = top.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(persistent_base_in(me, &cache), Some(cache.clone()));
+        assert_eq!(persistent_base_in(me.wrapping_add(1), &cache), None);
+
+        std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o777)).unwrap();
+        assert_eq!(persistent_base_in(me, &cache), None, "others may write it");
+
+        let link = top.join("link");
+        std::os::unix::fs::symlink(&cache, &link).unwrap();
+        std::fs::set_permissions(&cache, PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(persistent_base_in(me, &link), None, "a symlink is refused");
+        assert_eq!(persistent_base_in(me, &top.join("absent")), None);
 
         let _ = std::fs::remove_dir_all(&top);
     }

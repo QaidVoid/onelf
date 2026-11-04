@@ -145,7 +145,7 @@ onelf sysroot pack-set DIR -o FILE --name NAME [--sysroot SYSROOT --package NAME
 | `fetch SOURCE DIR` | Materialize a `.tar` or `.tar.zst` rootfs from a local path or an `https://` URL into `DIR`. With `--hash`, an archive whose BLAKE3 does not match is not unpacked |
 | `info DIR` | Print the package count, file count and glibc version of a materialized sysroot |
 | `pack-gl DIR -o FILE` | Pack a GL build for hosts without one and print the BLAKE3 hash to pin in `platform.toml`. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure: shared objects and driver description directories, glibc left out. Otherwise `DIR` is a tree you built. Either way it is verified to be self-contained |
-| `pack-set DIR -o FILE --name NAME` | Pack a shared dependency set and print the BLAKE3 hash to pin in a recipe's `[sysroot.sets.<name>]`. `NAME` is letters, digits, `-` and `_` only, as the recipe requires. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure, everything but glibc and the development and documentation directories; otherwise `DIR` is a tree you built. `--platform-line` names the soname prefixes the host provides; without it the GPU driver families are the line. Verified to be self-contained like a GL build |
+| `pack-set DIR -o FILE --name NAME` | Pack a shared dependency set and print the BLAKE3 hash to pin in a recipe's `[sysroot.sets.<name>]`. `NAME` is letters, digits, `-` and `_` only, as the recipe requires. With `--sysroot` and `--package`, `DIR` is built first from the named packages' closure, everything but glibc and the development and documentation directories; otherwise `DIR` is a tree you built. `--platform-line` names the soname prefixes the host provides; without it the GPU driver families are the line. Verified to be self-contained like a GL build, and packed beside `FILE` and only renamed onto it once its provider index reads back as verified, so a failed check leaves `FILE` as it was |
 
 ## `onelf info`
 
@@ -314,6 +314,13 @@ execution views under `views/`, both the packed launches' and the
 development runs'. `list` shows the builds and packages; `gc` removes
 packages, builds and views unused past the age threshold, a view only
 once no launch holds its lease.
+
+The cache lives under `$XDG_CACHE_HOME/onelf`, else `~/.cache/onelf`.
+Run as root, the CLI ignores both variables and keeps a persistent,
+root-owned `0700` cache at `/var/cache/onelf`. Only when `/var/cache`
+is not a directory root alone may write does it fall back to the
+runtime's private base (`/run/onelf`, else `/tmp/onelf-0`), which does
+not survive a reboot.
 
 ```
 onelf cache list
