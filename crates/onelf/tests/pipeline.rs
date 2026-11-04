@@ -24009,12 +24009,14 @@ fn host_library(soname: &str) -> Option<PathBuf> {
 }
 
 /// The host gst-plugin-scanner at one of the locations the gstreamer
-/// rule's own candidates name for an installation prefix.
+/// rule's own candidates name for an installation prefix, or at the
+/// Debian and Ubuntu multiarch location.
 fn host_gst_scanner() -> Option<PathBuf> {
     [
         "/usr/libexec/gstreamer-1.0/gst-plugin-scanner",
         "/usr/lib/gstreamer-1.0/gst-plugin-scanner",
         "/usr/lib64/gstreamer-1.0/gst-plugin-scanner",
+        "/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner",
     ]
     .iter()
     .map(PathBuf::from)
