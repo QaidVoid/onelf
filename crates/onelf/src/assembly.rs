@@ -645,6 +645,7 @@ impl AssemblyRequest {
                 active_rules: Vec::new(),
             });
         }
+        let _source_out_of_walk = self.exclude_declared_source()?;
         bundle::bundle_libs(&self.bundle_options())?;
         if self.input.is_some() {
             // The bundler may rewrite the imported command (its ELF
@@ -712,6 +713,28 @@ impl AssemblyRequest {
             sets: self.bundle.sets.clone(),
             platform_pin: self.bundle.platform_pin.clone(),
         }
+    }
+
+    /// The exclusion that keeps the declared input source out of the
+    /// bundling walk: a source inside the recipe's directory is the
+    /// author's file, and the walk processes the imported copy at the
+    /// command's path instead, so the source keeps its exact bytes. A
+    /// source that is the command's own file is the staged app itself,
+    /// so nothing is excluded and the walk processes that one file as
+    /// it does every bundled binary.
+    fn exclude_declared_source(&self) -> io::Result<bundle::WalkExclusion> {
+        let Some(source) = self.input.as_ref().map(|i| &i.source) else {
+            return Ok(bundle::exclude_from_walk(Vec::new()));
+        };
+        let command_path = self
+            .directory
+            .join(import_destination(&self.package.command)?);
+        let paths = if same_file(source, &command_path) {
+            Vec::new()
+        } else {
+            vec![source.clone()]
+        };
+        Ok(bundle::exclude_from_walk(paths))
     }
 
     /// The entrypoints the assembly audits: each resolved selection row
@@ -923,6 +946,17 @@ fn refuse_destination_links(appdir: &Path, rel: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether two paths reach one file: equal device and inode numbers. A
+/// source hardlinked to the command path, or named through a symlink,
+/// is one file too.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => (x.dev(), x.ino()) == (y.dev(), y.ino()),
+        _ => false,
+    }
 }
 
 /// The BLAKE3 of a regular file's bytes, tagged the way

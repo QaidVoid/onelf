@@ -16,9 +16,9 @@ runs on your machine.
    whose `[input]` section names the binary you gave it. On the next
    step the build copies it to `bin/mybinary` and packs the AppDir it
    assembles around the recipe: the recipe's directory is that AppDir,
-   and nothing outside it is touched. An AppDir that already holds the
-   binary needs no `[input]` section: a recipe whose only field is
-   `command` builds the same way.
+   and nothing outside it is touched, the binary you named included.
+   An AppDir that already holds the binary needs no `[input]` section:
+   a recipe whose only field is `command` builds the same way.
 
 2. **Build** the package:
 

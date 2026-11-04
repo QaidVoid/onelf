@@ -18860,6 +18860,190 @@ fn a_bare_binary_import_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The `DT_NEEDED` sonames `readelf -d` reports for one ELF.
+fn needed_sonames(path: &Path) -> Vec<String> {
+    let out = Command::new("readelf")
+        .args(["-d", path.to_str().unwrap()])
+        .output()
+        .expect("spawn readelf");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            l.split("Shared library: [")
+                .nth(1)
+                .map(|rest| rest.trim_end_matches(']').to_string())
+        })
+        .collect()
+}
+
+/// A source inside the recipe's directory is the author's file, not
+/// AppDir content: the build leaves it byte for byte as it stands,
+/// carrying no onelf-env NEED of its own, while the copy at the
+/// command's path takes the bundling walk's rewriting. The packed
+/// package runs, every rebuild leaves the source pristine again, and
+/// once the tree has converged the rebuilds are byte-identical.
+#[test]
+fn an_in_tree_import_source_keeps_its_bytes() {
+    let td = workdir("import-intree");
+    let src = elf_source(&td, "ELF_IMPORT_INTREE_OK");
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(pkg.join("upstream")).unwrap();
+    let source = pkg.join("upstream/app");
+    if !cc(&src, &source) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    let before = std::fs::read(&source).unwrap();
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+         [input]\nbinary = \"upstream/app\"\n",
+    );
+    // A fixed epoch pins the fresh ledger's mtime, so two builds of the
+    // same tree compare byte for byte.
+    let build = || {
+        let mut c = Command::new(onelf());
+        c.arg("build")
+            .current_dir(&pkg)
+            .env("SOURCE_DATE_EPOCH", "1700000000");
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        c.output().expect("spawn onelf build")
+    };
+    let out = build();
+    assert!(
+        out.status.success(),
+        "in-tree import build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        before,
+        "the build must leave an in-tree source byte-identical"
+    );
+    let staged = std::fs::read(pkg.join("bin/app")).unwrap();
+    assert_ne!(
+        staged, before,
+        "the command's copy is the walk's to rewrite, the source is not"
+    );
+    let package = pkg.join("imported.onelf");
+    let run = run_import_package(&package, &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_INTREE_OK"), "{stdout}");
+
+    if !have("readelf") || !have("patchelf") {
+        skip("readelf or patchelf is not available to check the added NEED");
+    }
+    assert!(
+        !needed_sonames(&source).contains(&"libonelf-env.so".to_string()),
+        "the source must carry no added onelf-env NEED"
+    );
+    assert!(
+        needed_sonames(&pkg.join("bin/app")).contains(&"libonelf-env.so".to_string()),
+        "the command's copy must carry the onelf-env NEED"
+    );
+
+    let rebuild = || {
+        let out = build();
+        assert!(
+            out.status.success(),
+            "a rebuild over an untouched source must refresh: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            before,
+            "every rebuild must leave the source byte-identical"
+        );
+    };
+    // The first rebuild converges the tree (the bundler resolves needs it
+    // could not see on the first pass), so idempotence is the second
+    // rebuild producing the same package bytes as the first.
+    rebuild();
+    let rebuilt = blake3::hash(&std::fs::read(&package).unwrap()).to_hex();
+    rebuild();
+    assert_eq!(
+        blake3::hash(&std::fs::read(&package).unwrap()).to_hex(),
+        rebuilt,
+        "an idempotent rebuild must produce the same package bytes"
+    );
+    let run = run_import_package(&package, &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_INTREE_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A source that is also the package command path is the app itself:
+/// the import stages the one file onto itself, the bundling walk
+/// processes it like any bundled binary, and the package runs, from
+/// the first build and from a rebuild.
+#[test]
+fn a_source_that_is_also_the_command_builds_and_runs() {
+    let td = workdir("import-self");
+    let src = elf_source(&td, "ELF_IMPORT_SELF_OK");
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(pkg.join("bin")).unwrap();
+    let app = pkg.join("bin/app");
+    if !cc(&src, &app) {
+        let _ = std::fs::remove_dir_all(&td);
+        return;
+    }
+    write(
+        &pkg.join("onelf.toml"),
+        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+         [input]\nbinary = \"bin/app\"\n",
+    );
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "self-command import build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = run_import_package(&pkg.join("imported.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_SELF_OK"), "{stdout}");
+
+    if !have("readelf") || !have("patchelf") {
+        skip("readelf or patchelf is not available to check the added NEED");
+    }
+    assert!(
+        needed_sonames(&app).contains(&"libonelf-env.so".to_string()),
+        "the app file the walk processed must carry the onelf-env NEED"
+    );
+
+    let out = onelf_build(&pkg);
+    assert!(
+        out.status.success(),
+        "a rebuild whose source is the rewritten command must refresh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = run_import_package(&pkg.join("imported.onelf"), &td);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(stdout.contains("ELF_IMPORT_SELF_OK"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A rebuild refreshes the staged copy: a vanished one is restored, and
 /// an untouched one is rewritten in place from the same source.
 #[test]

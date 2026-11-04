@@ -20,6 +20,7 @@
 //! used as fallbacks (`/sbin/ldconfig`, `/usr/sbin/ldconfig`) are fixed
 //! constants, not derived from any input.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead};
@@ -4850,12 +4851,59 @@ fn resolve_primary(opts: &BundleOptions) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Keeps the paths [`exclude_from_walk`] installed out of the bundling
+/// walk until it drops.
+pub struct WalkExclusion {
+    installed: usize,
+}
+
+impl Drop for WalkExclusion {
+    fn drop(&mut self) {
+        WALK_EXCLUSIONS.with(|list| {
+            let mut list = list.borrow_mut();
+            let keep = list.len().saturating_sub(self.installed);
+            list.truncate(keep);
+        });
+    }
+}
+
+thread_local! {
+    /// Canonical files the bundling walk leaves untouched for the
+    /// lifetime of one [`WalkExclusion`]. [`find_elf_files`] filters
+    /// them out of its discovery, so every pass that walks the tree,
+    /// dependency resolution included, skips them.
+    static WALK_EXCLUSIONS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keep `paths` out of the bundling walk's ELF discovery and rewriting
+/// until the returned guard drops. A build names the declared
+/// `[input] binary` source, which is the author's file rather than
+/// AppDir content, while the imported copy at the command's path is
+/// processed like any bundled binary.
+pub fn exclude_from_walk(paths: Vec<PathBuf>) -> WalkExclusion {
+    let resolved: Vec<PathBuf> = paths
+        .into_iter()
+        .filter_map(|path| fs::canonicalize(&path).ok())
+        .collect();
+    let installed = resolved.len();
+    WALK_EXCLUSIONS.with(|list| list.borrow_mut().extend(resolved));
+    WalkExclusion { installed }
+}
+
 /// Every regular file under `dir` that starts with the ELF magic.
 ///
 /// Symlinks are not followed: the tree is rewritten in place, and a link
 /// pointing outside it would have the host's library patched. A link to a
-/// file inside the tree is reached through the file itself.
+/// file inside the tree is reached through the file itself. Paths
+/// [`exclude_from_walk`] installed are not discovered, so no pass that
+/// walks the tree rewrites them.
 fn find_elf_files(dir: &Path) -> Vec<PathBuf> {
+    let excluded = WALK_EXCLUSIONS.with(|list| list.borrow().clone());
+    let root = if excluded.is_empty() {
+        None
+    } else {
+        Some(fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+    };
     let mut result = Vec::new();
     for entry in jwalk::WalkDir::new(dir).skip_hidden(false).sort(true) {
         let Ok(entry) = entry else { continue };
@@ -4863,6 +4911,15 @@ fn find_elf_files(dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         let path = entry.path();
+        if let Some(root) = &root {
+            let resolved = path
+                .strip_prefix(dir)
+                .map(|rel| root.join(rel))
+                .unwrap_or_else(|_| path.to_path_buf());
+            if excluded.contains(&resolved) {
+                continue;
+            }
+        }
         if is_elf(&path) {
             result.push(path);
         }

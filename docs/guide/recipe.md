@@ -8,9 +8,9 @@ The rules this page encodes:
 - ✅ Write the pack as a recipe and run `onelf build`. One file
   reproduces it, with no long CLI invocation to retype.
 - ✅ `[input] binary` to start from a bare binary. The build copies it
-  to the command's path. A source outside the recipe's directory is
-  never modified; one inside it is AppDir content, and the bundling
-  walk rewrites it like every binary in the tree.
+  to the command's path. The source is never modified, whether it
+  lives outside the recipe's directory or inside it: the bundling walk
+  rewrites only the copy at the command's path.
 - ✅ `${ONELF_DIR}` for values that must follow the package. Any other
   `${VAR}` the packer's environment sets is expanded at pack time.
 - ✅ `$ONELF_DIR/bin` is prepended to `PATH` by default. Set
@@ -54,13 +54,13 @@ binary = "../upstream/myapp"
 |-------|------|---------|-------------|
 | `binary` | path | none | A bare executable copied to the package command's path before assembly, relative to the recipe's directory |
 
-- ✅ The import never writes the source: it reads, hashes and copies to
-  the command's path, and a symlink in the destination's way is
-  refused rather than followed. The rest of the build keeps its hands
-  off a source outside the recipe's directory too. A source inside it
-  is AppDir content: the bundling walk rewrites it in place, like
-  every binary in the tree, and the rewrite is idempotent across
-  rebuilds.
+- ✅ The import never writes the source, and neither does the rest of
+  the build: it reads, hashes and copies to the command's path, and a
+  symlink in the destination's way is refused rather than followed.
+  The bundling walk keeps an in-tree source out of its rewriting too,
+  so the file you gave stays byte for byte what it was. A source that
+  is the command's own path is the app itself and is processed like
+  any bundled binary.
 - ✅ The staged copy is tracked by content hash: a rebuild refreshes it
   from its source, and a copy someone edited in the AppDir stops the
   build instead of being overwritten or packed stale.
