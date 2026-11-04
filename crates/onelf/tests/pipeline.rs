@@ -23592,6 +23592,71 @@ fn a_host_scan_build_fails_on_a_missing_required_dependency() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A recipe exclusion is policy, not a promise that the host supplies
+/// the library: the runtime takes only drivers and the libc family from
+/// the host, so a high-level build whose entrypoint needs an excluded
+/// library stops with the exclusion named instead of shipping an object
+/// that cannot load. The low-level `bundle-libs` keeps its warning.
+#[test]
+fn an_excluded_library_the_app_needs_stops_the_high_level_build() {
+    let td = workdir("hostexcluded");
+    let libs = td.join("libs");
+    std::fs::create_dir_all(&libs).unwrap();
+    write(&td.join("dep.c"), "int excluded_value(void){return 3;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libexcludeddep.so.1",
+            td.join("dep.c").to_str().unwrap(),
+        ],
+        &libs.join("libexcludeddep.so.1"),
+    ) {
+        let _ = std::fs::remove_dir_all(&td);
+        return; // no compiler: documented soft-skip
+    }
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &td.join("app.c"),
+        "int excluded_value(void);\nint main(void){return excluded_value() == 3 ? 0 : 1;}\n",
+    );
+    assert!(cc_with(
+        &[
+            td.join("app.c").to_str().unwrap(),
+            &format!("-L{}", libs.display()),
+            "-l:libexcludeddep.so.1",
+        ],
+        &dir.join("bin/app"),
+    ));
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"hostexcluded\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\nexclude = [\"libexcludeddep\"]\n",
+            libs.display()
+        ),
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("bin/app needs libexcludeddep.so.1, which [bundle] exclude leaves out"),
+        "{stderr}"
+    );
+    assert!(
+        !dir.join("hostexcluded.onelf").exists(),
+        "a refused build writes no output"
+    );
+
+    let out = run_onelf(&["bundle-libs", dir.to_str().unwrap()], None);
+    let low = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{low}");
+    assert!(low.contains("libexcludeddep.so.1"), "{low}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A sysroot build attributes its selected source: the summary says the
 /// contents came from the package database and the closure was audited
 /// against it, with the bounded-inference limit under it.
@@ -25184,6 +25249,45 @@ fn a_project_local_rule_collects_its_group_and_maps_it_without_its_file() {
         probe_line(&stdout, "ALSA_PLUGIN_DIR") == "(unset)",
         "the carried record keeps the built-ins presence based: {stdout}"
     );
+}
+
+/// `[bundle] exclude` also leaves out a collected plugin group member
+/// whose file name it matches, and records why, while the group's other
+/// members still arrive.
+#[test]
+fn an_excluded_plugin_member_is_left_out_of_its_group() {
+    let td = workdir("local-rule-exclude");
+    let Some(lib) = plugin_tree_sources(
+        &td,
+        &["libvendor.so.1"],
+        &[("vendor-plugins", &["probe.so", "libunwanted.so"])],
+    ) else {
+        return;
+    };
+    let Some(app) = mapping_probe_app(&td, &lib, &["libvendor.so.1"]) else {
+        return;
+    };
+    write(&td.join("rules/vendor.toml"), VENDOR_RULE);
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"vendor\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\nrules = [\"../rules/vendor.toml\"]\n\
+             exclude = [\"libunwanted\"]\n",
+            lib.display()
+        ),
+    );
+
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(app.join("lib/vendor-plugins/probe.so").is_file(), "{err}");
+    assert!(
+        !app.join("lib/vendor-plugins/libunwanted.so").exists(),
+        "{err}"
+    );
+    assert!(err.contains("left out by [bundle] exclude"), "{err}");
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// `disable-rules` keeps a built-in rule from activating: its plugin

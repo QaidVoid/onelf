@@ -112,9 +112,11 @@ How a finding is treated depends on where the tree came from:
   mistake you can fix.
 - ✅ From a host scan, `onelf build` and `onelf run --bundle` fail on
   an unresolved required dependency too, before anything is published
-  or run. A need the host platform supplies (the libc family, the GPU
-  driver stacks, and what `[bundle] exclude` leaves to the host) is
-  reported and never fails the build. An auto-collected plugin whose
+  or run. A need the host platform supplies (the libc family and the
+  GPU driver stacks) is reported and never fails the build. A need that
+  `[bundle] exclude` removes fails it: the runtime takes nothing but
+  those host-platform libraries from the host, so an excluded library
+  something retained needs would be missing at launch. An auto-collected plugin whose
   dependency the scan cannot find is omitted and reported instead, and
   what the build requires (an entrypoint, an explicit include, a file
   you placed, a required helper or data group) is never omitted.
@@ -618,8 +620,11 @@ onelf bundle-libs ./myapp --exclude libpthread,libdl
 onelf bundle-libs ./myapp --include libsomething.so.1
 ```
 
-`--exclude` skips libraries by prefix. `--include` forces a soname into
-the resolution queue.
+`--exclude` skips libraries by prefix, collected plugin group members
+included, so excluding a plugin by name keeps it and its dependencies
+out. Excluding a library that a retained object needs is a conflict
+that stops `onelf build`, since nothing at launch supplies it from the
+host. `--include` forces a soname into the resolution queue.
 
 ☑️ Some prefixes are always excluded: `libnss_` (apart from the name
 service modules a bundled glibc needs), the vendor GPU and compute

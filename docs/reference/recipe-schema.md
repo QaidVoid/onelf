@@ -192,7 +192,7 @@ search-paths = [
   "${MUSL_LIBDRM}/lib",
   "/opt/custom/lib",
 ]                                # Vec<String>, supports ${VAR}, relative to the recipe's directory
-exclude = ["libpthread"]         # Vec<String>, soname prefixes to skip
+exclude = ["libpthread"]         # Vec<String>, soname prefixes to skip, plugin members included
 include = ["libfoo.so.1"]        # Vec<String>, force-include sonames
 gl = false                       # opt-in, never enabled by detection
 dri = false                      # opt-in

@@ -3883,7 +3883,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                         })
                         .map(AdmittedLibrary::without_provenance)
                         .collect();
-                    let collection = collect::collect_group(
+                    let mut collection = collect::collect_group(
                         &rule,
                         declared,
                         &owners,
@@ -3891,6 +3891,17 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                         target_class,
                         target_machine,
                     )?;
+                    let (plugins, excluded): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut collection.plugins)
+                            .into_iter()
+                            .partition(|p| !recipe_excludes(&p.soname, &opts.exclude));
+                    collection.plugins = plugins;
+                    collection.skipped.extend(excluded.into_iter().map(|p| {
+                        (
+                            p.destination.display().to_string(),
+                            "left out by [bundle] exclude".to_string(),
+                        )
+                    }));
                     for dir in &collection.search_dirs {
                         if !search_paths.contains(dir) {
                             search_paths.push(dir.clone());
@@ -4722,7 +4733,10 @@ fn drop_unloadable(
             // One deliberate removal among the unmet needs keeps the
             // object, so the conflict surfaces instead of hiding behind
             // an omission of the object that names it.
-            let condemned = |s: &str| gone.contains(s) || classifier.classify(s).omittable();
+            let condemned = |s: &str| {
+                gone.contains(s)
+                    || (!recipe_excludes(s, &opts.exclude) && classifier.classify(s).omittable())
+            };
             if !libs.iter().all(|s| condemned(s)) {
                 continue;
             }
@@ -4802,14 +4816,21 @@ pub(crate) fn remove_dangling_links_beside(object: &Path) {
 /// must match the running kernel, and the names the build leaves to the
 /// host by its default or recipe exclusions. A strict host-scan build
 /// reports such a need and does not fail on it.
-fn host_platform_provider(soname: &str, exclude: &[String]) -> bool {
+fn host_platform_provider(soname: &str) -> bool {
     onelf_format::resolve::is_libc_family(soname)
         || libc_family_of_soname(soname).is_some()
         || onelf_format::drivers::DRIVER_FAMILIES
             .iter()
             .any(|prefix| soname.starts_with(prefix))
         || DEFAULT_EXCLUDES.iter().any(|p| soname.starts_with(p))
-        || exclude.iter().any(|p| soname.starts_with(p.as_str()))
+}
+
+/// Whether the recipe's `[bundle] exclude` leaves `soname` out. That is
+/// policy: the runtime takes only host-platform providers from the host,
+/// so an excluded library a retained object needs is a conflict, never a
+/// need the host is trusted to meet.
+fn recipe_excludes(soname: &str, exclude: &[String]) -> bool {
+    !host_platform_provider(soname) && exclude.iter().any(|p| soname.starts_with(p.as_str()))
 }
 
 /// Audit the assembled tree for objects whose needs nothing in the
@@ -4852,7 +4873,7 @@ fn verify_needs(
             && !set_sonames.contains(s)
             && !set_provided.contains(s)
     };
-    let host_allowed = |s: &str| opts.sysroot.is_none() && host_platform_provider(s, &opts.exclude);
+    let host_allowed = |s: &str| opts.sysroot.is_none() && host_platform_provider(s);
     let condemnable = |findings: &mut Vec<(PathBuf, Vec<String>)>| {
         for (_, libs) in findings.iter_mut() {
             libs.retain(|s| open(s) && !host_allowed(s));
@@ -4919,11 +4940,17 @@ fn verify_needs(
              removed; the conflict stops the build rather than dropping the object or \
              restoring the file"
         )
+    } else if recipe_excludes(soname, &opts.exclude) {
+        format!(
+            "{shown} needs {soname}, which [bundle] exclude leaves out; the runtime takes \
+             only drivers and the libc family from the host, so the object could not load. \
+             Remove the exclusion, or exclude the object that needs it"
+        )
     } else if opts.sysroot.is_none() {
         format!(
             "{shown} needs {soname}, which neither the tree, the host libraries the scan \
              searched, a host-platform provider, nor a selected set supplies; add it with \
-             --search-path or [bundle] search-paths, or exclude it to leave it to the host"
+             --search-path or [bundle] search-paths"
         )
     } else if matches!(verdict, SourceVerdict::Absent) {
         format!(
