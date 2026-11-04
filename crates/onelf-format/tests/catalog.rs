@@ -7,6 +7,7 @@ use onelf_format::rules::{self, *};
 use std::collections::BTreeSet;
 
 #[cfg(feature = "rules-toml")]
+// The catalog generation is exercised here; the script's `main` is not.
 #[allow(dead_code)]
 #[path = "../build.rs"]
 mod catalog_build;

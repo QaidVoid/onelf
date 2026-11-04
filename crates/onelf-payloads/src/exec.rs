@@ -669,53 +669,49 @@ struct DlPhdrInfo {
 
 #[cfg(target_pointer_width = "64")]
 #[repr(C)]
-#[allow(dead_code)]
 struct Phdr {
     p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
+    _p_flags: u32,
+    _p_offset: u64,
     p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
+    _p_paddr: u64,
+    _p_filesz: u64,
     p_memsz: u64,
-    p_align: u64,
+    _p_align: u64,
 }
 
 #[cfg(target_pointer_width = "32")]
 #[repr(C)]
-#[allow(dead_code)]
 struct Phdr {
     p_type: u32,
-    p_offset: u32,
+    _p_offset: u32,
     p_vaddr: u32,
-    p_paddr: u32,
-    p_filesz: u32,
+    _p_paddr: u32,
+    _p_filesz: u32,
     p_memsz: u32,
-    p_flags: u32,
-    p_align: u32,
+    _p_flags: u32,
+    _p_align: u32,
 }
 
 #[cfg(target_pointer_width = "64")]
 #[repr(C)]
-#[allow(dead_code)]
 struct Sym {
     st_name: u32,
     st_info: u8,
-    st_other: u8,
+    _st_other: u8,
     st_shndx: u16,
     st_value: u64,
-    st_size: u64,
+    _st_size: u64,
 }
 
 #[cfg(target_pointer_width = "32")]
 #[repr(C)]
-#[allow(dead_code)]
 struct Sym {
     st_name: u32,
     st_value: u32,
-    st_size: u32,
+    _st_size: u32,
     st_info: u8,
-    st_other: u8,
+    _st_other: u8,
     st_shndx: u16,
 }
 

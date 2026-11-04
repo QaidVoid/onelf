@@ -74,7 +74,6 @@ const RTLD_GLOBAL: i32 = 0x0100;
 // ---- raw syscalls ---------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
-#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -101,6 +100,7 @@ mod sys {
     pub unsafe fn close(fd: i32) -> i64 {
         sys3(3, fd as i64, 0, 0)
     }
+    #[cfg(not(test))]
     pub unsafe fn exit_group(code: i32) -> ! {
         sys3(231, code as i64, 0, 0);
         loop {
@@ -136,7 +136,6 @@ mod sys {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -155,6 +154,7 @@ mod sys {
     pub unsafe fn close(fd: i32) -> i64 {
         svc4(57, fd as i64, 0, 0, 0)
     }
+    #[cfg(not(test))]
     pub unsafe fn exit_group(code: i32) -> ! {
         svc4(94, code as i64, 0, 0, 0);
         loop {
@@ -189,7 +189,6 @@ mod sys {
 }
 
 #[cfg(target_arch = "x86")]
-#[cfg_attr(test, allow(dead_code))]
 mod sys {
     use core::arch::asm;
 
@@ -219,6 +218,7 @@ mod sys {
     pub unsafe fn close(fd: i32) -> i64 {
         sys3(6, fd, 0, 0) as i64
     }
+    #[cfg(not(test))]
     pub unsafe fn exit_group(code: i32) -> ! {
         sys3(252, code, 0, 0);
         loop {

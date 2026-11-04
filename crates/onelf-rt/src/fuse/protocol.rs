@@ -107,17 +107,6 @@ pub struct FuseAttr {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-// Answered from the header alone; kept so this module mirrors the
-// kernel's wire layout completely.
-#[allow(dead_code)]
-pub struct FuseGetAttrIn {
-    pub getattr_flags: u32,
-    pub dummy: u32,
-    pub fh: u64,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct FuseAttrOut {
     pub attr_valid: u64,
     pub attr_valid_nsec: u32,
@@ -139,16 +128,6 @@ pub struct FuseEntryOut {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-// Answered from the header alone; kept so this module mirrors the
-// kernel's wire layout completely.
-#[allow(dead_code)]
-pub struct FuseOpenIn {
-    pub flags: u32,
-    pub open_flags: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct FuseOpenOut {
     pub fh: u64,
     pub open_flags: u32,
@@ -164,16 +143,6 @@ pub struct FuseReadIn {
     pub read_flags: u32,
     pub lock_owner: u64,
     pub flags: u32,
-    pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-// Answered from the header alone; kept so this module mirrors the
-// kernel's wire layout completely.
-#[allow(dead_code)]
-pub struct FuseAccessIn {
-    pub mask: u32,
     pub padding: u32,
 }
 

@@ -1,5 +1,7 @@
 //! Validate canonical framework sources and emit parser-free typed defaults.
 
+// The build script compiles the library's rule model from source and
+// uses only part of it.
 #[allow(dead_code)]
 #[path = "src/rules.rs"]
 mod rules;

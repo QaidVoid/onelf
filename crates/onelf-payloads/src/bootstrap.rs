@@ -11,7 +11,6 @@
 //! metadata-pointer patch offsets in `onelf`'s `payload.rs`.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
-#![cfg_attr(test, allow(dead_code))]
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(test))]
