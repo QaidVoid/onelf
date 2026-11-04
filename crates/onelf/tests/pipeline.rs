@@ -13,6 +13,7 @@
 //! (first-launch env still works), so it always verifies *something*
 //! meaningful rather than silently passing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -2380,6 +2381,776 @@ fn the_scanner_alias_survives_moving_the_bundle() {
         stdout.lines().find_map(|l| l.strip_prefix("scanner10:")),
         Some(value),
         "both aliases name the same helper:\n{stdout}"
+    );
+}
+
+/// The activator compiled straight from source, the way
+/// `metadata_emission.rs` compiles the packer's modules. The built-in
+/// catalog holds a couple of dozen rules, so a hundred unrelated ones
+/// can only enter discovery through the local-descriptor list the
+/// activator itself takes, which is the injection surface this include
+/// puts behind an ordinary function call. The activator's publication
+/// seam serves the whole walk, which this include does not compile, so
+/// the dead-code allowance stays scoped to the module.
+#[allow(dead_code)]
+#[rustfmt::skip]
+#[path = "../src/bundle/activate.rs"]
+mod activation;
+
+/// Dynamic tags and program header types the synthetic objects carry.
+const DT_NEEDED: u64 = 1;
+const DT_STRTAB: u64 = 5;
+const DT_STRSZ: u64 = 10;
+const DT_SONAME: u64 = 14;
+const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+
+/// The catalog sonames the scale fixture's entrypoint names, with the
+/// rule identity each activates, the number of resource groups that
+/// rule queues, and the number of group reports a build of the fixture
+/// prints for it (the gstreamer scanner is a hit, so its rule warns
+/// once for the plugin group it lacks). Every group these rules declare
+/// is optional or absent from the synthetic tree, so activation costs
+/// report lines and never a failure. `libpipewire-0.3.so.0` matches two
+/// rules at once and `libspa-0.2.so.0` reaches the already-activated
+/// `spa` group again, which is the deduplication the fixture exists to
+/// show.
+const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
+    ("libbabl-0.1.so.0", "babl", 1, 1),
+    ("libfontconfig.so.1", "fontconfig", 0, 0),
+    ("libgdk_pixbuf-2.0.so.0", "gdk-pixbuf", 1, 1),
+    ("libgegl-0.4.so.0", "gegl", 1, 1),
+    ("libgio-2.0.so.0", "gio", 1, 1),
+    ("libgirepository-1.0.so.1", "gi", 1, 1),
+    ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
+    ("libheif.so.1", "heif", 1, 1),
+    ("libintl.so.8", "translations", 1, 1),
+    ("libpipewire-0.3.so.0", "pipewire", 1, 1),
+    ("libQt5Core.so.5", "qt5", 1, 1),
+    ("libQt6Core.so.6", "qt6", 1, 1),
+    ("libspa-0.2.so.0", "spa", 1, 1),
+];
+
+/// The soname of the `i`th synthetic object of a scale fixture tree.
+/// Zero-padded, so the sequence is already sorted.
+fn scale_soname(i: usize) -> String {
+    format!("libscale{i:04}.so.1")
+}
+
+/// A synthetic ELF64 shared object: one PT_LOAD and one PT_DYNAMIC
+/// program header over a string table holding DT_SONAME and DT_NEEDED,
+/// with `pad` appended so every object's bytes differ. Nothing here
+/// reads the clock, the host or a compiler, so the same index builds
+/// the same bytes on every machine and every run.
+fn synthetic_object(machine: u16, needed: &[&str], soname: Option<&str>, pad: &[u8]) -> Vec<u8> {
+    let mut strtab: Vec<u8> = vec![0];
+    let mut dyns: Vec<(u64, u64)> = vec![(DT_STRTAB, 0), (DT_STRSZ, 0)];
+    for name in needed {
+        let at = strtab.len();
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+        dyns.push((DT_NEEDED, at as u64));
+    }
+    if let Some(name) = soname {
+        let at = strtab.len();
+        strtab.extend_from_slice(name.as_bytes());
+        strtab.push(0);
+        dyns.push((DT_SONAME, at as u64));
+    }
+    dyns.push((0, 0));
+    let dyn_off = 64 + 2 * 56;
+    let dyn_size = dyns.len() * 16;
+    let str_off = dyn_off + dyn_size;
+    let total = str_off + strtab.len();
+    dyns[0].1 = str_off as u64;
+    dyns[1].1 = strtab.len() as u64;
+
+    let mut e = Vec::with_capacity(total);
+    e.extend_from_slice(b"\x7fELF");
+    e.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    e.extend_from_slice(&3u16.to_le_bytes());
+    e.extend_from_slice(&machine.to_le_bytes());
+    e.extend_from_slice(&1u32.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&64u64.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&0u32.to_le_bytes());
+    e.extend_from_slice(&64u16.to_le_bytes());
+    e.extend_from_slice(&56u16.to_le_bytes());
+    e.extend_from_slice(&2u16.to_le_bytes());
+    e.extend_from_slice(&[0u8; 6]);
+    e.extend_from_slice(&PT_LOAD.to_le_bytes());
+    e.extend_from_slice(&6u32.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&0u64.to_le_bytes());
+    e.extend_from_slice(&(total as u64).to_le_bytes());
+    e.extend_from_slice(&(total as u64).to_le_bytes());
+    e.extend_from_slice(&0x1000u64.to_le_bytes());
+    e.extend_from_slice(&PT_DYNAMIC.to_le_bytes());
+    e.extend_from_slice(&6u32.to_le_bytes());
+    e.extend_from_slice(&(dyn_off as u64).to_le_bytes());
+    e.extend_from_slice(&(dyn_off as u64).to_le_bytes());
+    e.extend_from_slice(&(dyn_off as u64).to_le_bytes());
+    e.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+    e.extend_from_slice(&(dyn_size as u64).to_le_bytes());
+    e.extend_from_slice(&8u64.to_le_bytes());
+    for (tag, value) in &dyns {
+        e.extend_from_slice(&tag.to_le_bytes());
+        e.extend_from_slice(&value.to_le_bytes());
+    }
+    e.extend_from_slice(&strtab);
+    e.extend_from_slice(pad);
+    e
+}
+
+/// The machine type of the `onelf` binary itself, the architecture
+/// every synthetic object must carry for the walk's class and machine
+/// checks to admit it.
+fn host_machine() -> Option<u16> {
+    use std::io::Read;
+    let mut head = [0u8; 20];
+    std::fs::File::open(onelf())
+        .ok()?
+        .read_exact(&mut head)
+        .ok()?;
+    if head[4] != 2 {
+        return None;
+    }
+    Some(u16::from_le_bytes([head[18], head[19]]))
+}
+
+/// A scale fixture tree: `count` chained synthetic objects under a
+/// distribution library directory, each needing the next, and an
+/// entrypoint naming the first link of the chain. With `rules` the tree
+/// also holds one object per catalog soname above and the gstreamer
+/// scanner at the libexec alternative its rule declares, and the
+/// entrypoint names those sonames too, so the catalog rules activate
+/// over a tree that answers them entirely from its own files. Returns
+/// the AppDir and the distribution library directory. Generation is a
+/// pure function of `count`: no compiler, no clock, no host state.
+fn scale_tree_sources(td: &Path, count: usize, rules: bool) -> (PathBuf, PathBuf) {
+    let machine = host_machine().expect("the onelf binary to be a 64-bit ELF");
+    let dist = td.join("dist/usr/lib");
+    std::fs::create_dir_all(&dist).unwrap();
+    let sonames: Vec<String> = (0..count).map(scale_soname).collect();
+    for (i, soname) in sonames.iter().enumerate() {
+        let next: Vec<&str> = sonames.get(i + 1).map(String::as_str).into_iter().collect();
+        let object = synthetic_object(
+            machine,
+            &next,
+            Some(soname),
+            format!("payload {i}").as_bytes(),
+        );
+        write_bytes(&dist.join(soname), &object);
+    }
+    let mut needs: Vec<String> = vec![sonames[0].clone()];
+    if rules {
+        for (soname, ..) in SCALE_RULE_SONAMES {
+            let object = synthetic_object(machine, &[], Some(soname), b"catalog");
+            write_bytes(&dist.join(soname), &object);
+        }
+        let scanner_dir = td.join("dist/usr/libexec/gstreamer-1.0");
+        std::fs::create_dir_all(&scanner_dir).unwrap();
+        let scanner = synthetic_object(machine, &[], Some("gst-plugin-scanner"), b"scanner");
+        write_bytes(&scanner_dir.join("gst-plugin-scanner"), &scanner);
+        needs.extend(SCALE_RULE_SONAMES.iter().map(|(s, ..)| s.to_string()));
+    }
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let entry = app.join("bin/app");
+    let needed: Vec<&str> = needs.iter().map(String::as_str).collect();
+    write_bytes(&entry, &synthetic_object(machine, &needed, None, b"entry"));
+    std::fs::set_permissions(
+        &entry,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    (app, dist)
+}
+
+/// One bundle or pack run with its wall time and the child's peak RSS,
+/// the recorded numbers the scale fixtures report.
+struct MeasuredRun {
+    status: std::process::ExitStatus,
+    stderr: String,
+    wall_ms: u128,
+    peak_kb: u64,
+}
+
+/// Run `cmd` to completion, collecting its stderr while polling `/proc`
+/// for the child's high-water resident set, the way [`peak_rss_kb`]
+/// does but with the report kept.
+fn run_measured(cmd: &mut Command) -> MeasuredRun {
+    use std::io::Read;
+    let started = std::time::Instant::now();
+    let mut child = cmd
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn onelf");
+    let pid = child.id();
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let mut peak = 0u64;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            for line in s.lines() {
+                if let Some(v) = line.strip_prefix("VmHWM:")
+                    && let Ok(kb) = v.split_whitespace().next().unwrap_or("").parse::<u64>()
+                {
+                    peak = peak.max(kb);
+                }
+            }
+        }
+        match child.try_wait().expect("wait for onelf") {
+            Some(status) => {
+                let out = reader.join().expect("stderr reader");
+                return MeasuredRun {
+                    status,
+                    stderr: String::from_utf8_lossy(&out).into_owned(),
+                    wall_ms: started.elapsed().as_millis(),
+                    peak_kb: peak,
+                };
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+}
+
+/// Successful opens per path, the paths opened as directories, and the
+/// total number of directory reads in one traced run, counted from an
+/// strace log.
+struct SyscallCounts {
+    opens: HashMap<String, usize>,
+    dir_paths: Vec<String>,
+    scans: usize,
+}
+
+/// Run `cmd` under `strace -f`, tracing opens and directory reads, and
+/// count what the log holds: every successful open by path, the opens
+/// that name directories, and every successful read of a directory.
+/// Fails the test when strace cannot run, so a silent absence of the
+/// counter can never look like a pass.
+fn traced_counts(cmd: &mut Command, log: &Path) -> SyscallCounts {
+    let mut wrapper = Command::new("strace");
+    wrapper
+        .args([
+            "-f",
+            "-qq",
+            "-e",
+            "trace=openat,open,getdents64,getdents",
+            "-o",
+        ])
+        .arg(log)
+        .arg("--");
+    wrapper.arg(cmd.get_program());
+    wrapper.args(cmd.get_args());
+    let out = wrapper.output().expect("spawn strace");
+    assert!(
+        out.status.success(),
+        "strace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(log).expect("read strace log");
+    let mut counts = SyscallCounts {
+        opens: HashMap::new(),
+        dir_paths: Vec::new(),
+        scans: 0,
+    };
+    for line in text.lines() {
+        let Some((_, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let call = rest
+            .strip_prefix("openat(")
+            .or_else(|| rest.strip_prefix("open("));
+        if let Some(args) = call {
+            let args = args.strip_prefix("AT_FDCWD, ").unwrap_or(args);
+            let Some((path, _)) = args.strip_prefix('"').and_then(|r| r.split_once('"')) else {
+                continue;
+            };
+            let Some(rc) = line
+                .rsplit_once(" = ")
+                .and_then(|(_, v)| v.split_whitespace().next())
+                .and_then(|v| v.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if rc < 0 {
+                continue;
+            }
+            *counts.opens.entry(path.to_string()).or_insert(0) += 1;
+            if args.contains("O_DIRECTORY") {
+                counts.dir_paths.push(path.to_string());
+            }
+        } else if rest.starts_with("getdents")
+            && line
+                .rsplit_once(" = ")
+                .and_then(|(_, v)| v.split_whitespace().next())
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_some_and(|v| v >= 0)
+        {
+            counts.scans += 1;
+        }
+    }
+    counts
+}
+
+/// A hundred-object scale fixture with the catalog sonames in play
+/// activates all thirteen rules and queues their thirteen groups, and
+/// deduplicates what two sonames reach: the `spa` group is processed
+/// once though both pipewire spellings match its rule and reach it, and
+/// the library both rules name is copied once. Two independent builds
+/// of the same fixture render byte-identical reports and pack
+/// byte-identical packages, and every object enters the report exactly
+/// once.
+#[test]
+fn a_hundred_object_fixture_activates_rules_deduplicates_groups_and_reproduces_itself() {
+    let td = workdir("scale100");
+    let mut reports = Vec::new();
+    let mut artifacts = Vec::new();
+    for tag in ["run-a", "run-b"] {
+        let root = td.join(tag);
+        let (app, dist) = scale_tree_sources(&root, 100, true);
+        let started = std::time::Instant::now();
+        let mut c = Command::new(onelf());
+        c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+            .arg("--search-path")
+            .arg(&dist);
+        let o = c.output().expect("spawn onelf bundle-libs");
+        let wall = started.elapsed();
+        assert!(
+            o.status.success(),
+            "bundle-libs failed:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        reports.push(String::from_utf8_lossy(&o.stderr).replace(root.to_str().unwrap(), "<SCALE>"));
+        let pkg = root.join("scale.onelf");
+        let mut p = Command::new(onelf());
+        p.args([
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+        ]);
+        let po = p.output().expect("spawn onelf pack");
+        assert!(
+            po.status.success(),
+            "pack failed:\n{}",
+            String::from_utf8_lossy(&po.stderr)
+        );
+        artifacts.push((std::fs::read(&pkg).unwrap(), wall));
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "two builds of one fixture must render the same report bytes"
+    );
+    assert_eq!(
+        artifacts[0].0, artifacts[1].0,
+        "two builds of one fixture must pack the same bytes"
+    );
+    let report = &reports[0];
+    let rules_line = report
+        .lines()
+        .find(|l| l.contains("activated by soname prefix"))
+        .expect("an activation report");
+    let expected_groups: usize = SCALE_RULE_SONAMES.iter().map(|(_, _, g, _)| *g).sum();
+    assert!(
+        rules_line.contains(&format!("{} activated", SCALE_RULE_SONAMES.len())),
+        "{rules_line}"
+    );
+    assert!(
+        rules_line.contains(&format!("{expected_groups} group(s) queued")),
+        "{rules_line}"
+    );
+    for (soname, rule, _, warnings) in SCALE_RULE_SONAMES {
+        assert_eq!(
+            report.matches(&format!("lib/{soname} <-")).count(),
+            1,
+            "{soname} must be copied once"
+        );
+        assert_eq!(
+            report.matches(&format!("warning: {rule}/")).count(),
+            *warnings,
+            "{rule} must report each missing group once, whatever reached it"
+        );
+    }
+    for i in 0..100 {
+        assert_eq!(
+            report
+                .matches(&format!("lib/{} <-", scale_soname(i)))
+                .count(),
+            1,
+            "{} must be copied once",
+            scale_soname(i)
+        );
+    }
+    assert_eq!(
+        report.matches(" <- ").count(),
+        100 + SCALE_RULE_SONAMES.len() + 1,
+        "the helper is the only copy beyond the objects"
+    );
+    eprintln!(
+        "scale 100: bundle {} ms, artifact {} bytes",
+        artifacts[0].1.as_millis(),
+        artifacts[0].0.len()
+    );
+}
+
+/// Under a syscall trace the walk reads every synthetic object the same
+/// small number of times whatever the rules in play and whatever the
+/// tree holds, opens no directory of the distribution tree at all (rule
+/// activation and group collection answer from metadata about the
+/// objects the walk already resolved, never by scanning), and reads the
+/// AppDir's directories a bounded handful of times rather than once per
+/// object or once per rule. The exact counts are printed for the
+/// record; the assertions are the invariants, not the machine's speed.
+#[test]
+fn traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size() {
+    if !have("strace") {
+        skip("strace is not available");
+        return;
+    }
+    let td = workdir("scaletrace");
+    let mut reads_per_object = None;
+    for (tag, count, rules) in [
+        ("plain100", 100, false),
+        ("ruled100", 100, true),
+        ("ruled1000", 1000, true),
+        ("ruled10000", 10000, true),
+    ] {
+        let root = td.join(tag);
+        let (app, dist) = scale_tree_sources(&root, count, rules);
+        let mut c = Command::new(onelf());
+        c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+            .arg("--search-path")
+            .arg(&dist);
+        let counts = traced_counts(&mut c, &root.join("trace.log"));
+        let prefix = format!("{}/dist/usr/", root.to_str().unwrap());
+        let touched = counts
+            .opens
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
+            .count();
+        let per_object: Vec<usize> = {
+            let mut values: Vec<usize> = counts
+                .opens
+                .iter()
+                .filter(|(p, _)| p.starts_with(&prefix))
+                .map(|(_, n)| *n)
+                .collect();
+            values.sort();
+            values.dedup();
+            values
+        };
+        let expected_files = count
+            + if rules {
+                SCALE_RULE_SONAMES.len() + 1
+            } else {
+                0
+            };
+        assert_eq!(
+            touched, expected_files,
+            "{tag}: every object must be opened, and nothing of the tree besides them"
+        );
+        let constant = per_object[0];
+        assert_eq!(
+            per_object,
+            vec![constant],
+            "{tag}: reads per object must not depend on the object or the rule"
+        );
+        assert!(
+            constant <= 12,
+            "{tag}: {constant} opens per unchanged object is no longer one read per phase"
+        );
+        match reads_per_object {
+            None => reads_per_object = Some(constant),
+            Some(first) => assert_eq!(
+                constant, first,
+                "{tag}: reads per object must not grow with the rules in play or the tree"
+            ),
+        }
+        let dist_scanned = counts
+            .dir_paths
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .count();
+        assert_eq!(
+            dist_scanned, 0,
+            "{tag}: no directory of the distribution tree may be scanned"
+        );
+        assert!(
+            counts.scans <= usize::max(96, count / 8),
+            "{tag}: {} directory reads means the tree is walked per object or per rule",
+            counts.scans
+        );
+        eprintln!(
+            "scale {tag}: objects {count}, rules {}, reads per object {constant}, \
+             tree-wide directory reads {}, distribution directories opened {dist_scanned}",
+            if rules { SCALE_RULE_SONAMES.len() } else { 0 },
+            counts.scans,
+        );
+    }
+}
+
+/// From a hundred to ten thousand objects: every build and pack
+/// completes, peak memory stays far under any plausible tree-holding
+/// bound, and the packed artifact grows by a bounded budget per object
+/// rather than scaling with the count. Wall time, peak RSS and artifact
+/// size are recorded in the output. At ten thousand objects two sibling
+/// builds of the same fixture still render byte-identical reports and
+/// pack byte-identical packages.
+#[test]
+fn scale_from_100_to_10000_objects_completes_with_bounded_memory_and_plausible_artifacts() {
+    let td = workdir("scalegrowth");
+    let mut artifact_100 = 0u64;
+    let mut report_10000 = String::new();
+    let mut bytes_10000 = Vec::new();
+    for count in [100usize, 1000, 10000] {
+        let root = td.join(format!("n{count}"));
+        let (app, dist) = scale_tree_sources(&root, count, true);
+        let mut c = Command::new(onelf());
+        c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+            .arg("--search-path")
+            .arg(&dist);
+        let bundle = run_measured(&mut c);
+        assert!(
+            bundle.status.success(),
+            "bundling {count} objects failed:\n{}",
+            bundle.stderr
+        );
+        let copies = bundle.stderr.lines().filter(|l| l.contains(" <- ")).count();
+        assert_eq!(
+            copies,
+            count + SCALE_RULE_SONAMES.len() + 1,
+            "every object must be copied exactly once at {count}"
+        );
+        let pkg = root.join("scale.onelf");
+        let mut p = Command::new(onelf());
+        p.args([
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            pkg.to_str().unwrap(),
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+        ]);
+        let pack = run_measured(&mut p);
+        assert!(
+            pack.status.success(),
+            "packing {count} objects failed:\n{}",
+            pack.stderr
+        );
+        let artifact = std::fs::metadata(&pkg).unwrap().len();
+        assert!(
+            bundle.peak_kb < 512 * 1024,
+            "bundling {count} objects peaked at {} MB",
+            bundle.peak_kb / 1024
+        );
+        assert!(
+            pack.peak_kb < 512 * 1024,
+            "packing {count} objects peaked at {} MB",
+            pack.peak_kb / 1024
+        );
+        if count == 100 {
+            artifact_100 = artifact;
+        }
+        assert!(
+            artifact <= artifact_100 + 4096 * (count as u64 - 100),
+            "packing {count} objects produced {artifact} bytes, over the per-object budget"
+        );
+        if count == 10000 {
+            report_10000 = bundle.stderr.replace(root.to_str().unwrap(), "<SCALE>");
+            bytes_10000 = std::fs::read(&pkg).unwrap();
+        }
+        eprintln!(
+            "scale {count}: bundle {} ms (peak {} KB), pack {} ms (peak {} KB), \
+             artifact {artifact} bytes",
+            bundle.wall_ms, bundle.peak_kb, pack.wall_ms, pack.peak_kb,
+        );
+    }
+    let sibling = td.join("n10000-b");
+    let (app, dist) = scale_tree_sources(&sibling, 10000, true);
+    let mut c = Command::new(onelf());
+    c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+        .arg("--search-path")
+        .arg(&dist);
+    let bundle = run_measured(&mut c);
+    assert!(
+        bundle.status.success(),
+        "the sibling ten-thousand-object build failed:\n{}",
+        bundle.stderr
+    );
+    assert_eq!(
+        bundle.stderr.replace(sibling.to_str().unwrap(), "<SCALE>"),
+        report_10000,
+        "the ten-thousand-object report must be identical build to build"
+    );
+    let pkg = sibling.join("scale.onelf");
+    let mut p = Command::new(onelf());
+    p.args([
+        "pack",
+        app.to_str().unwrap(),
+        "-o",
+        pkg.to_str().unwrap(),
+        "--command",
+        "bin/app",
+        "--mtime",
+        "0",
+    ]);
+    let pack = run_measured(&mut p);
+    assert!(
+        pack.status.success(),
+        "the sibling ten-thousand-object pack failed:\n{}",
+        pack.stderr
+    );
+    assert_eq!(
+        std::fs::read(&pkg).unwrap(),
+        bytes_10000,
+        "the ten-thousand-object package must be identical build to build"
+    );
+}
+
+/// One synthetic descriptor the way a project-local rule file produces
+/// it: a soname-prefix trigger over the scale tree's own naming and one
+/// optional directory group of its own, so every rule is unrelated to
+/// every other.
+fn scale_rule(i: usize) -> onelf_format::rules::Descriptor {
+    use onelf_format::rules::{
+        Descriptor, RelativePath, Requirement, ResourceGroup, ResourceKind, RuleId, SCHEMA_VERSION,
+        SourceBase, SourceCandidate, Trigger,
+    };
+    let id = format!("scale-{i:04}");
+    let mut d = Descriptor {
+        schema: SCHEMA_VERSION,
+        id: RuleId::new(&id).unwrap(),
+        triggers: vec![Trigger {
+            soname_prefix: format!("libscale{i:04}.so"),
+        }],
+        resources: Default::default(),
+        build: Default::default(),
+        runtime: Default::default(),
+    };
+    d.resources.plugins.push(ResourceGroup {
+        id: RuleId::new("plugins").unwrap(),
+        kind: ResourceKind::Directory,
+        candidates: vec![SourceCandidate {
+            base: SourceBase::LibraryDir,
+            path: RelativePath::new("plugins").unwrap(),
+        }],
+        destination: RelativePath::new(&format!("lib/scale-{i:04}")).unwrap(),
+        requirement: Requirement::Optional,
+    });
+    d
+}
+
+/// A hundred unrelated rules injected through the activator's local
+/// descriptor list, over exactly the soname sequence the ten-thousand
+/// object fixture tree holds: they activate in identity order, each
+/// group queues once however many sonames reach it, the shared queue
+/// drains exactly objects plus groups rather than objects times rules,
+/// and a run whose duplicate spellings arrive first leaves the
+/// activations, the groups and the queue order identical, with only the
+/// reasons swapped the way the rule text decides them. Elapsed time is
+/// recorded.
+#[test]
+fn a_hundred_injected_rules_activate_over_the_tree_sonames_without_rewalking_it() {
+    use activation::{Discovery, RuleActivation, WorkItem};
+
+    let names: Vec<String> = (0..10_000).map(scale_soname).collect();
+    let aliases: Vec<String> = (0..100).map(|i| format!("libscale{i:04}.so.2")).collect();
+
+    // Observe the batches in order, seed the objects, and drain the
+    // queue: the activations, the object and group pops, the group
+    // queue order as the activator renders it, and the elapsed time.
+    let drain = |rule_count: usize,
+                 batches: &[Vec<String>]|
+     -> (Vec<RuleActivation>, usize, Vec<String>, u128) {
+        let rules: Vec<onelf_format::rules::Descriptor> = (0..rule_count).map(scale_rule).collect();
+        let mut discovery = Discovery::new(&[], &rules, &[]).unwrap();
+        let started = std::time::Instant::now();
+        for batch in batches {
+            for name in batch {
+                discovery.observe_present(name).unwrap();
+            }
+        }
+        discovery.seed(&names);
+        let mut objects = 0usize;
+        let mut groups = Vec::new();
+        while let Some(item) = discovery.pop() {
+            match item {
+                WorkItem::Object(_) => objects += 1,
+                WorkItem::Group(group) => groups.push(format!("{group:?}")),
+            }
+        }
+        (
+            discovery.activations(),
+            objects,
+            groups,
+            started.elapsed().as_micros(),
+        )
+    };
+
+    let (first, objects, first_groups, elapsed) = drain(100, &[names.clone(), aliases.clone()]);
+    assert_eq!(first.len(), 100, "each unrelated rule activates once");
+    assert_eq!(objects, 10_000, "the objects pop once each");
+    assert_eq!(first_groups.len(), 100, "each group queues once");
+    for (i, activation) in first.iter().enumerate() {
+        assert_eq!(activation.rule, format!("scale-{i:04}"), "identity order");
+        assert_eq!(activation.reason, scale_soname(i), "the seed spelling");
+        assert_eq!(activation.groups, vec!["plugins"]);
+    }
+    for (i, group) in first_groups.iter().enumerate() {
+        assert!(
+            group.contains(&format!("scale-{i:04}")),
+            "the queue drains in identity order: {group}"
+        );
+    }
+
+    let (second, objects, second_groups, elapsed_reordered) =
+        drain(100, &[aliases.clone(), names.clone()]);
+    assert_eq!(objects, 10_000);
+    let strip_reason = |a: &[RuleActivation]| -> Vec<(String, Vec<String>)> {
+        a.iter()
+            .map(|x| (x.rule.clone(), x.groups.clone()))
+            .collect()
+    };
+    assert_eq!(
+        strip_reason(&first),
+        strip_reason(&second),
+        "the reordering must not move a rule or a group"
+    );
+    for (i, activation) in second.iter().enumerate() {
+        assert_eq!(
+            activation.reason, aliases[i],
+            "the reason follows whichever spelling arrived first"
+        );
+    }
+    assert_eq!(first_groups, second_groups, "the queue order must hold");
+
+    let (few, few_objects, few_groups, _) = drain(10, &[names.clone(), vec![]]);
+    assert_eq!(few.len(), 10);
+    assert_eq!(few_objects, 10_000, "the objects never depend on the rules");
+    assert_eq!(few_groups.len(), 10);
+    assert_eq!(
+        objects + first_groups.len() - (few_objects + few_groups.len()),
+        90,
+        "ten times the rules cost exactly ninety more pops, not a rewalk"
+    );
+    eprintln!(
+        "scale activation: 100 rules over 10000 sonames drained in {elapsed} us \
+         ({elapsed_reordered} us with the spellings reordered)"
     );
 }
 
