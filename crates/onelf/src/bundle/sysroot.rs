@@ -863,6 +863,32 @@ fn populate_closure(
     })
 }
 
+thread_local! {
+    /// Set while a dry run holds a [`FetchGuard`]: a set build is then
+    /// read only where it already sits, never downloaded.
+    static FETCH_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Forbids set build downloads on this thread while it lives.
+pub(crate) struct FetchGuard(bool);
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        FETCH_FORBIDDEN.with(|f| f.set(self.0));
+    }
+}
+
+/// Whether a [`FetchGuard`] forbids downloads on this thread.
+pub(crate) fn fetch_forbidden() -> bool {
+    FETCH_FORBIDDEN.with(|f| f.get())
+}
+
+/// Forbid set build downloads on this thread until the guard drops. A
+/// build already in place is still read and verified against its pin.
+pub(crate) fn forbid_fetch() -> FetchGuard {
+    FetchGuard(FETCH_FORBIDDEN.with(|f| f.replace(true)))
+}
+
 /// The store the runtime fetches set and GL builds into: the same root,
 /// so a build the packer fetched is already there for a launch on this
 /// machine.
@@ -928,6 +954,12 @@ fn set_build(set: &SharedSet) -> Result<PathBuf, String> {
     let stored = store.join(&set.name).join(format!("{}.onelf", set.blake3));
     if pinned(&stored) {
         return Ok(stored);
+    }
+    if fetch_forbidden() {
+        return Err(format!(
+            "pinned build {} is not cached on this machine, and a dry run does not fetch it",
+            &set.blake3[..set.blake3.len().min(16)]
+        ));
     }
     eprintln!(
         "  {} set {} from {}",

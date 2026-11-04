@@ -40,6 +40,7 @@ pub(crate) mod gpu;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod activate;
 mod collect;
+mod completeness;
 mod plan;
 mod resolve;
 pub(crate) use resolve::*;
@@ -47,6 +48,8 @@ pub(crate) mod elf;
 pub mod sysroot;
 use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
+pub(crate) use completeness::record as record_finding;
+pub use completeness::{Finding, Outcome, take_reported as take_findings};
 pub(crate) use elf::*;
 use onelf_format::rules::{
     BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, RuntimeBase,
@@ -925,12 +928,14 @@ fn carry_data_group(
     if supplied {
         return Ok(());
     }
+    let miss = data_miss(rule, declared, &outcome);
+    completeness::record(miss.clone());
     match declared.requirement {
-        Requirement::Required => Err(required_data_miss(rule, declared, &outcome)),
-        Requirement::Optional => {
-            report_data_omission(rule, declared, &outcome);
-            Ok(())
-        }
+        Requirement::Required if !preparation.dry_run => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("rule {rule} {}", miss.reason),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1010,40 +1015,48 @@ fn admitted_members(
 /// The required-data failure: which rule's data is missing, at what
 /// destination, and what was examined where, bounded like every
 /// finding.
-fn required_data_miss(rule: &str, declared: &ResourceGroup, outcome: &GroupOutcome) -> io::Error {
-    let mut text = format!(
-        "rule {rule} group {} requires {} data at {}, but none of its declared \
-         locations exist in the selected source",
-        declared.id.as_str(),
-        match declared.kind {
-            ResourceKind::File => "file",
-            ResourceKind::Directory => "directory",
-        },
-        declared.destination.as_str()
-    );
-    for location in examined_locations(outcome) {
-        text.push_str("; ");
-        text.push_str(&location);
-    }
-    io::Error::new(io::ErrorKind::NotFound, text)
-}
-
-/// The report an optional data group the selected source lacks gets, so
-/// the omission is a decision the packager can see.
-fn report_data_omission(rule: &str, declared: &ResourceGroup, outcome: &GroupOutcome) {
-    let mut text = format!(
-        "  {} {rule}/{}: optional data unavailable",
-        color::bold_red("warning:"),
-        declared.id.as_str()
-    );
+/// The finding for a data group the selected source lacks: a required
+/// failure naming what the group requires and where it looked, or an
+/// optional omission the build continues without.
+fn data_miss(rule: &str, declared: &ResourceGroup, outcome: &GroupOutcome) -> Finding {
     let examined = examined_locations(outcome);
-    if examined.is_empty() {
-        text.push_str(" (no declared location)");
-    } else {
-        text.push_str(&format!(" ({})", examined.join(", ")));
-    }
-    text.push_str("; the build continues without it");
-    eprintln!("{text}");
+    let reason = match declared.requirement {
+        Requirement::Required => {
+            let mut text = format!(
+                "group {} requires {} data at {}, but none of its declared locations \
+                 exist in the selected source",
+                declared.id.as_str(),
+                match declared.kind {
+                    ResourceKind::File => "file",
+                    ResourceKind::Directory => "directory",
+                },
+                declared.destination.as_str()
+            );
+            for location in examined {
+                text.push_str("; ");
+                text.push_str(&location);
+            }
+            text
+        }
+        Requirement::Optional => format!(
+            "group {}: optional data unavailable ({}); the build continues without it",
+            declared.id.as_str(),
+            if examined.is_empty() {
+                "no declared location".to_string()
+            } else {
+                examined.join(", ")
+            }
+        ),
+    };
+    Finding::new(
+        declared.destination.as_str(),
+        match declared.requirement {
+            Requirement::Required => Outcome::RequiredFailure,
+            Requirement::Optional => Outcome::OptionalOmission,
+        },
+        reason,
+    )
+    .of_rule(rule)
 }
 
 /// Where the group looked and why each location held nothing, with the
@@ -1169,12 +1182,14 @@ fn collect_helper_group(
         if supplied {
             return Ok(());
         }
+        let miss = helper_miss(rule, declared, &outcome);
+        completeness::record(miss.clone());
         return match declared.requirement {
-            Requirement::Required => Err(required_helper_miss(rule, declared, &outcome)),
-            Requirement::Optional => {
-                report_helper_omission(rule, declared, &outcome);
-                Ok(())
-            }
+            Requirement::Required if !preparation.dry_run => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("rule {rule} {}", miss.reason),
+            )),
+            _ => Ok(()),
         };
     };
     let Some(source_name) = hit.resolved.file_name().and_then(|n| n.to_str()) else {
@@ -1209,36 +1224,44 @@ fn collect_helper_group(
 
 /// The required-helper failure: which rule's helper is missing, at what
 /// destination, and what was examined where, bounded like every finding.
-fn required_helper_miss(rule: &str, declared: &HelperGroup, outcome: &GroupOutcome) -> io::Error {
-    let mut text = format!(
-        "rule {rule} helper {} requires the executable at {}, but none of its declared \
-         locations exist in the selected source",
-        declared.id.as_str(),
-        declared.destination.as_str()
-    );
-    for location in examined_locations(outcome) {
-        text.push_str("; ");
-        text.push_str(&location);
-    }
-    io::Error::new(io::ErrorKind::NotFound, text)
-}
-
-/// The report an optional helper the selected source lacks gets, so the
-/// omission is a decision the packager can see.
-fn report_helper_omission(rule: &str, declared: &HelperGroup, outcome: &GroupOutcome) {
-    let mut text = format!(
-        "  {} {rule}/helper {}: optional executable unavailable",
-        color::bold_red("warning:"),
-        declared.id.as_str()
-    );
+/// The finding for a helper the selected source lacks: a required
+/// failure naming the executable and where it looked, or an optional
+/// omission the build continues without.
+fn helper_miss(rule: &str, declared: &HelperGroup, outcome: &GroupOutcome) -> Finding {
     let examined = examined_locations(outcome);
-    if examined.is_empty() {
-        text.push_str(" (no declared location)");
-    } else {
-        text.push_str(&format!(" ({})", examined.join(", ")));
-    }
-    text.push_str("; the build continues without it");
-    eprintln!("{text}");
+    let reason = match declared.requirement {
+        Requirement::Required => {
+            let mut text = format!(
+                "helper {} requires the executable at {}, but none of its declared \
+                 locations exist in the selected source",
+                declared.id.as_str(),
+                declared.destination.as_str()
+            );
+            for location in examined {
+                text.push_str("; ");
+                text.push_str(&location);
+            }
+            text
+        }
+        Requirement::Optional => format!(
+            "helper {}: optional executable unavailable ({}); the build continues without it",
+            declared.id.as_str(),
+            if examined.is_empty() {
+                "no declared location".to_string()
+            } else {
+                examined.join(", ")
+            }
+        ),
+    };
+    Finding::new(
+        declared.destination.as_str(),
+        match declared.requirement {
+            Requirement::Required => Outcome::RequiredFailure,
+            Requirement::Optional => Outcome::OptionalOmission,
+        },
+        reason,
+    )
+    .of_rule(rule)
 }
 
 /// Where an application keeps the resources a selected set pin's
@@ -2303,7 +2326,7 @@ fn alias_links_to(root: &Path, target: &Path) -> Vec<PathBuf> {
 
 /// One bundling invocation: the tree, what is scanned, where the
 /// contents come from, and how strictly the outcome is audited.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BundleOptions {
     pub directory: PathBuf,
     /// Restricts *which* binaries are scanned for dependencies.
@@ -2472,19 +2495,47 @@ fn mirror_new_groups(
     }
 }
 
-/// Report one plugin group's collection: what was collected, where
-/// from, and every member refused with its reason, bounded so a hostile
-/// directory cannot flood the build log.
-fn report_collection(collection: &collect::GroupCollection) {
+/// Report one plugin group's collection, placed at `destination`: the
+/// group's finding, which names its source directories or why nothing
+/// was usable, and as progress what was collected and every member
+/// refused with its reason, bounded so a hostile directory cannot flood
+/// the build log.
+fn report_collection(collection: &collect::GroupCollection, destination: &str) {
     let label = format!("{}/{}", collection.rule, collection.group);
     if collection.plugins.is_empty() {
-        eprintln!(
-            "  {} {label}: no usable plugin group ({} location(s) unavailable, {} candidate(s) skipped)",
-            color::bold_red("warning:"),
+        let mut reason = format!(
+            "group {}: no usable plugin group ({} location(s) unavailable, {} candidate(s) \
+             skipped)",
+            collection.group,
             collection.misses.len(),
             collection.skipped.len()
         );
+        for miss in collection.misses.iter().take(3) {
+            reason.push_str("; ");
+            reason.push_str(miss);
+        }
+        completeness::record(
+            Finding::new(destination, Outcome::OptionalOmission, reason).of_rule(&collection.rule),
+        );
     } else {
+        let dirs: Vec<String> = collection
+            .search_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
+        completeness::record(
+            Finding::new(
+                destination,
+                Outcome::Selected,
+                format!(
+                    "group {}: {} plugin(s) from {}",
+                    collection.group,
+                    collection.plugins.len(),
+                    dirs.join(", ")
+                ),
+            )
+            .of_rule(&collection.rule),
+        );
         eprintln!(
             "  {} {} plugin(s) for {} from {} director{}",
             color::bold_green("Collected"),
@@ -2497,9 +2548,9 @@ fn report_collection(collection: &collect::GroupCollection) {
                 "ies"
             },
         );
-    }
-    for reason in collection.misses.iter().take(3) {
-        eprintln!("    {reason}");
+        for reason in collection.misses.iter().take(3) {
+            eprintln!("    {reason}");
+        }
     }
     const SHOWN_SKIPS: usize = 4;
     for (name, reason) in collection.skipped.iter().take(SHOWN_SKIPS) {
@@ -2902,7 +2953,93 @@ mod source_verdict_tests {
 /// given: the output package is written later, by packing, and only
 /// after assembly succeeds, so a failed build never replaces an
 /// existing output.
+///
+/// The completeness findings the run reached are printed as one sorted
+/// block when it ends, whether it succeeded or not, and kept for
+/// [`take_findings`]. A dry run writes nothing into the AppDir, fetches
+/// nothing and runs nothing: a set build not already verified on this
+/// machine is reported as unverified, a traced run is reported as not
+/// exercised, and a sysroot build populates a private scratch copy of
+/// the AppDir, which is removed afterwards, since its scan needs the
+/// populated tree.
 pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
+    publish_activations(Vec::new());
+    let _no_fetch = opts.dry_run.then(sysroot::forbid_fetch);
+    let result = if opts.dry_run && opts.sysroot.is_some() && opts.directory.is_dir() {
+        ScratchTree::copy_of(&opts.directory).and_then(|scratch| {
+            bundle_tree(&BundleOptions {
+                directory: scratch.path().to_path_buf(),
+                ..opts.clone()
+            })
+        })
+    } else {
+        bundle_tree(opts)
+    };
+    completeness::report(&activate::published_activations());
+    result
+}
+
+/// A private copy of a tree, removed when dropped.
+pub(crate) struct ScratchTree(PathBuf);
+
+impl ScratchTree {
+    /// Copy `root` into a fresh private directory: directories made,
+    /// regular files cloned as their own inodes, symlinks remade as
+    /// they are.
+    pub(crate) fn copy_of(root: &Path) -> io::Result<Self> {
+        let scratch = ScratchTree(private_temp_dir("dry-run")?);
+        for entry in jwalk::WalkDir::new(root).skip_hidden(false).sort(true) {
+            let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let dest = scratch.0.join(rel);
+            let kind = entry.file_type();
+            if kind.is_dir() {
+                fs::create_dir_all(&dest)?;
+            } else if kind.is_symlink() {
+                std::os::unix::fs::symlink(fs::read_link(&path)?, &dest)?;
+            } else if kind.is_file() {
+                clone_file(&path, &dest)?;
+            }
+        }
+        Ok(scratch)
+    }
+
+    /// Where the copy lives.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Give `dest` the bytes and permission bits of the regular file at
+/// `source` as a new inode: a reflink where the filesystem shares
+/// extents, a plain copy otherwise. Never a hardlink, so an edit to one
+/// side cannot reach the other through a shared inode.
+pub(crate) fn clone_file(source: &Path, dest: &Path) -> io::Result<()> {
+    let from = fs::File::open(source)?;
+    let mut to = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    if rustix::fs::ioctl_ficlone(&to, &from).is_err() {
+        io::copy(&mut &from, &mut to)?;
+    }
+    to.set_permissions(from.metadata()?.permissions())
+}
+
+/// The bundling run [`bundle_libs`] reports on.
+fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     publish_prepared(Vec::new());
     if !opts.directory.is_dir() {
         return Err(io::Error::new(
@@ -2926,8 +3063,26 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         .chain(opts.sysroot.iter().flat_map(|sr| sr.sets.iter()))
         .cloned()
         .collect();
-    let set_audit = if !declared_sets.is_empty() && !opts.dry_run {
+    let set_audit = if !declared_sets.is_empty() {
         let (providers, unchecked) = sysroot::audit_providers(&declared_sets);
+        for provider in &providers {
+            completeness::record(Finding::new(
+                format!("set {}", provider.set),
+                Outcome::Selected,
+                format!(
+                    "verified pinned build {}, providing {} soname(s)",
+                    short_pin(&provider.pin),
+                    provider.provides.len()
+                ),
+            ));
+        }
+        for (set, why) in &unchecked {
+            completeness::record(Finding::new(
+                format!("set {set}"),
+                Outcome::Unverified,
+                format!("{why}; it satisfies no dependency here"),
+            ));
+        }
         audit_declared_sets(opts, &providers)?;
         Some((providers, unchecked))
     } else {
@@ -3197,7 +3352,17 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // nothing in DT_NEEDED for the scan above to find. The run is against
     // this machine, so it has no meaning for a sysroot build, whose trace
     // tier covers that ground.
-    if opts.trace_run {
+    if opts.trace_run && opts.dry_run {
+        completeness::record(Finding::new(
+            opts.target
+                .as_deref()
+                .map(|t| t.display().to_string())
+                .unwrap_or_default(),
+            Outcome::Unchecked,
+            "a dry run does not run the target, so the libraries a traced run \
+             would load are not listed",
+        ));
+    } else if opts.trace_run {
         if opts.sysroot.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3741,7 +3906,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                             repair_extra.insert(dir);
                         }
                     }
-                    report_collection(&collection);
+                    report_collection(&collection, declared.destination.as_str());
                     if declared.requirement == Requirement::Required {
                         required_dests
                             .extend(collection.plugins.iter().map(|p| p.destination.clone()));
@@ -4344,61 +4509,40 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         );
     }
 
-    // The outcome lists carry the classification with them, so the
-    // report says whether a library is absent, left to an unselected
-    // optional package, or deliberately removed, and names the
-    // package involved. Deterministic: the lists are sorted and the
-    // classifier answers from the same source every time.
-    if !left_with_host.is_empty() {
-        eprintln!(
-            "\n{} ({})",
-            color::bold("Left out with a host package"),
-            left_with_host.len()
-        );
-        for (lib, requirer) in &left_with_host {
-            eprintln!(
-                "  {} {} {}",
-                lib,
-                color::dim(&format!("(needed by {})", color::cyan(requirer))),
-                color::dim(&format!(": {}", classifier.classify(lib).reason()))
-            );
-        }
+    // The outcome lists carry the classification with them, so each
+    // finding says whether a library is absent, left to an unselected
+    // optional package, or deliberately removed, and names the package
+    // involved.
+    for (lib, requirer) in &left_with_host {
+        completeness::record(Finding::new(
+            lib,
+            Outcome::Selected,
+            format!(
+                "{} (needed by {requirer})",
+                classifier.classify(lib).reason()
+            ),
+        ));
     }
-
-    if !left_out.is_empty() {
-        eprintln!(
-            "\n{} ({})",
-            color::bold("Left out by policy"),
-            left_out.len()
-        );
-        for (lib, requirer) in &left_out {
-            eprintln!(
-                "  {} {} {}",
-                lib,
-                color::dim(&format!("(needed by {})", color::cyan(requirer))),
-                color::dim(&format!(": {}", classifier.classify(lib).reason()))
-            );
-        }
+    for (lib, requirer) in &left_out {
+        completeness::record(Finding::new(
+            lib,
+            Outcome::Removed,
+            format!(
+                "{} (needed by {requirer})",
+                classifier.classify(lib).reason()
+            ),
+        ));
     }
-
-    if !not_found.is_empty() {
-        eprintln!("\n{} ({})", color::bold_red("Not found"), not_found.len());
-        for (lib, requirer) in &not_found {
-            if opts.sysroot.is_some() {
-                eprintln!(
-                    "  {} {} {}",
-                    color::red(lib),
-                    color::dim(&format!("(needed by {})", color::cyan(requirer))),
-                    color::dim(&format!(": {}", classifier.classify(lib).reason()))
-                );
-            } else {
-                eprintln!(
-                    "  {} {}",
-                    color::red(lib),
-                    color::dim(&format!("(needed by {})", color::cyan(requirer)))
-                );
-            }
-        }
+    for (lib, requirer) in &not_found {
+        let reason = if opts.sysroot.is_some() {
+            format!(
+                "{} (needed by {requirer})",
+                classifier.classify(lib).reason()
+            )
+        } else {
+            format!("the host scan did not find it (needed by {requirer})")
+        };
+        completeness::record(Finding::new(lib, Outcome::Unresolved, reason));
     }
 
     // Ensure each ELF's PT_INTERP basename exists in lib_dest as a file or
@@ -4485,7 +4629,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             ),
         }
         attest_staged_outputs(opts)?;
-        datadirs::report(&datadirs::unanswered(
+        datadirs::record(&datadirs::unanswered(
             &opts.directory,
             &find_elf_files(&opts.directory),
         ));
@@ -4735,7 +4879,7 @@ fn verify_needs(
                 libs.retain(|s| open(s));
             }
             findings.retain(|(_, libs)| !libs.is_empty());
-            report_dropped(opts, &dropped);
+            report_dropped(&dropped);
         }
     }
     if let Some((provides, unchecked)) = &set_report {
@@ -4805,30 +4949,14 @@ fn verify_needs(
     ))
 }
 
-/// Report what the drop pass omitted, bounded like every summary.
-fn report_dropped(opts: &BundleOptions, dropped: &[Dropped]) {
-    let source = if opts.sysroot.is_some() {
-        "the sysroot does not hold"
-    } else {
-        "the host scan did not find"
-    };
-    eprintln!(
-        "\n{} {} file(s) needing libraries {source}:",
-        color::bold("Dropped"),
-        dropped.len()
-    );
-    const SHOWN_DROPS: usize = 8;
-    for d in dropped.iter().take(SHOWN_DROPS) {
-        eprintln!(
-            "  {} omitted, needs {} ({})",
-            d.object.display(),
-            d.need,
-            color::dim(&d.verdict.reason())
-        );
-    }
-    let hidden = dropped.len().saturating_sub(SHOWN_DROPS);
-    if hidden > 0 {
-        eprintln!("  and {hidden} more omitted");
+/// Record what the drop pass omitted, one optional omission per object.
+fn report_dropped(dropped: &[Dropped]) {
+    for d in dropped {
+        completeness::record(Finding::new(
+            d.object.display().to_string(),
+            Outcome::OptionalOmission,
+            format!("omitted, needs {} ({})", d.need, d.verdict.reason()),
+        ));
     }
 }
 

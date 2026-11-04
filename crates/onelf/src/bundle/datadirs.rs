@@ -20,8 +20,6 @@ use std::sync::OnceLock;
 use onelf_format::knowledge::{self, Place, Subject};
 use onelf_format::rules::RuntimeHookId;
 
-use super::ui;
-
 /// The watched subjects derived once from the built-in catalog.
 fn components() -> &'static [Subject<'static>] {
     static COMPONENTS: OnceLock<Vec<Subject<'static>>> = OnceLock::new();
@@ -158,38 +156,22 @@ fn describe(places: &[Place]) -> String {
         .join(" or ")
 }
 
-/// Print `findings` as one stable warning, rendered through the shared
-/// report shape: the count header, one attributed line per finding in
-/// sorted order, and the closing note, so the block's bytes are a
-/// function of the findings alone.
-pub(crate) fn report(findings: &[Finding]) {
-    if findings.is_empty() {
-        return;
-    }
-    let lines: Vec<String> = findings
-        .iter()
-        .map(|f| {
-            ui::finding_line(&format!(
-                "{} reads {} (carry {} and the runtime sets {})",
-                f.file.display(),
-                f.path,
-                f.carry,
-                f.var
-            ))
-        })
-        .collect();
-    eprintln!(
-        "{}",
-        ui::warning_report(
-            findings.len(),
-            "compiled-in plugin or data path(s) have no copy in the bundle",
-            &lines,
-            Some(
-                "Without a copy these come from the host, built against the \
-                 host's libraries, or are missing there.",
+/// Record `findings` as unchecked completeness findings: each names
+/// the file holding the compiled-in path, and what the bundle would have
+/// to carry, and the runtime set, for the path to stop reaching the
+/// host. Without a copy these come from the host, built against the
+/// host's libraries, or are missing there.
+pub(crate) fn record(findings: &[Finding]) {
+    for f in findings {
+        super::completeness::record(super::Finding::new(
+            f.file.display().to_string(),
+            super::Outcome::Unchecked,
+            format!(
+                "reads {} from the host unless the bundle carries {} and the runtime sets {}",
+                f.path, f.carry, f.var
             ),
-        )
-    );
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -199,6 +199,12 @@ enum Commands {
         /// Override the output path from the recipe
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Report what the build would collect, import and emit, with its
+        /// completeness findings, without writing to the AppDir, fetching
+        /// anything or running the application
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Run an AppDir in place, without packing, for fast dev iteration
@@ -814,7 +820,16 @@ fn main() {
             binary,
             force,
         } => init::init(&output, binary.as_deref(), force),
-        Commands::Build { path, output } => run_build(&path, output.as_deref()),
+        Commands::Build {
+            path,
+            output,
+            dry_run: false,
+        } => run_build(&path, output.as_deref()),
+        Commands::Build {
+            path,
+            output,
+            dry_run: true,
+        } => dry_run_build(&path, output.as_deref()),
         Commands::Run {
             path,
             command,
@@ -1125,6 +1140,55 @@ fn run_build(
     let mut options = request.pack_options(update_key, runtime.note, profile);
     options.metadata = build_metadata(&request, &request.selections, &report.prepared)?;
     pack::pack(&options, runtime.bytes)
+}
+
+/// Report the build a recipe describes without performing it: the
+/// assembly's dry run, its summary, and the output and metadata records
+/// the build would write. Nothing is written, fetched or run. A required
+/// failure among the findings fails the dry run the way it would fail
+/// the build.
+fn dry_run_build(
+    path: &std::path::Path,
+    output_override: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let _no_fetch = bundle::sysroot::forbid_fetch();
+    let recipe_path = recipe::resolve(path)?;
+    let recipe = recipe::load(&recipe_path)?;
+    let request = assembly::AssemblyRequest::plan(&recipe_path, recipe, output_override)?;
+    let report = request.dry_run()?;
+    for line in report.summary_lines() {
+        eprintln!("{line}");
+    }
+    let metadata = build_metadata(&request, &request.selections, &report.prepared)?;
+    let records: Vec<&str> = [
+        (metadata.runtime_rules.is_some(), "runtime rules"),
+        (metadata.entrypoint_sets.is_some(), "entrypoint selections"),
+    ]
+    .into_iter()
+    .filter_map(|(carried, name)| carried.then_some(name))
+    .collect();
+    eprintln!(
+        "Would emit: {} ({})",
+        request.output.display(),
+        if records.is_empty() {
+            "no runtime metadata records".to_string()
+        } else {
+            format!("carrying {}", records.join(" and "))
+        }
+    );
+    let failures = report
+        .findings
+        .iter()
+        .filter(|f| f.outcome == bundle::Outcome::RequiredFailure)
+        .count();
+    if failures > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("dry run: the build would fail on {failures} required failure(s)"),
+        ));
+    }
+    eprintln!("Dry run: nothing was written, fetched or run");
+    Ok(())
 }
 
 /// Whether this build's pins are fetched over HTTPS at launch, which only

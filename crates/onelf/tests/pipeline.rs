@@ -1815,7 +1815,9 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
         "the required data group is still carried from the sysroot:\n{err}"
     );
     assert!(
-        err.contains("no usable plugin group") && err.contains("alsa/"),
+        err.lines().any(|l| l.starts_with("  - alsa: ")
+            && l.contains(": optional omission: group ")
+            && l.contains("no usable plugin group")),
         "the omission names the rule and group:\n{err}"
     );
     let _ = std::fs::remove_dir_all(&td);
@@ -3004,7 +3006,11 @@ fn a_hundred_object_fixture_activates_rules_deduplicates_groups_and_reproduces_i
             "{soname} must be copied once"
         );
         assert_eq!(
-            report.matches(&format!("warning: {rule}/")).count(),
+            report
+                .lines()
+                .filter(|l| l.starts_with(&format!("  - {rule}: "))
+                    && l.contains(": optional omission: "))
+                .count(),
             *warnings,
             "{rule} must report each missing group once, whatever reached it"
         );
@@ -4027,14 +4033,15 @@ fn optional_data_the_source_lacks_warns_and_the_build_continues() {
         out.status.success(),
         "an optional data miss is not a failure:\n{err}"
     );
+    let omission = err
+        .lines()
+        .find(|l| {
+            l.starts_with("  - gi: ") && l.contains("group typelibs: optional data unavailable (")
+        })
+        .unwrap_or_else(|| panic!("the omission names the rule and group:\n{err}"));
     assert!(
-        err.contains("gi/typelibs") && err.contains("optional data unavailable"),
-        "the omission names the rule and group:\n{err}"
-    );
-    let omission =
-        stderr_line_starting(&err, "  warning: gi/typelibs: optional data unavailable (");
-    assert!(
-        omission.ends_with("); the build continues without it"),
+        omission.contains(": optional omission: ")
+            && omission.contains("); the build continues without it"),
         "the omission names the examined locations and the continuation:\n{err}"
     );
     assert!(
@@ -13354,7 +13361,7 @@ fn objects_the_sysroot_cannot_satisfy_are_dropped_not_fatal() {
     let out = onelf_build(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("Dropped 3 file(s)"), "{stderr}");
+    assert!(drop_lines(&stderr).len() == 3, "{stderr}");
     for gone in [
         "lib/fixture/plugins/c.so",
         "lib/libchainlib.so.1.0.0",
@@ -13656,19 +13663,18 @@ fn omitted_backends_name_an_absent_need_and_an_unselected_provider_apart() {
     );
     let dir = td.join("app");
     assert!(
-        stderr.contains("Dropped 3 file(s)"),
+        drop_lines(&stderr).len() == 3,
         "the plugins and the carried library are omitted:\n{stderr}"
     );
     assert_eq!(
-        report_block(&stderr, DROPPED_HEADER, is_drop_line),
+        drop_lines(&stderr),
         vec![
-            "Dropped 3 file(s) needing libraries the sysroot does not hold:",
-            "  lib/core/plugins/libcore-backend.so omitted, needs libopt.so.1 \
-             (provided only by the unselected optional package optprov)",
-            "  lib/core/plugins/libcore-broken.so omitted, needs libabsent.so.7 \
-             (no selected source provides it)",
-            "  lib/libcarry.so.1 omitted, needs libabsent.so.7 (no selected \
-             source provides it)",
+            "  - lib/core/plugins/libcore-backend.so: optional omission: omitted, needs \
+             libopt.so.1 (provided only by the unselected optional package optprov)",
+            "  - lib/core/plugins/libcore-broken.so: optional omission: omitted, needs \
+             libabsent.so.7 (no selected source provides it)",
+            "  - lib/libcarry.so.1: optional omission: omitted, needs libabsent.so.7 (no \
+             selected source provides it)",
         ],
         "the omission block renders the same bytes every build:\n{stderr}"
     );
@@ -13715,7 +13721,7 @@ fn an_explicitly_included_library_is_not_omitted_for_an_absent_need() {
         "the omission is not a failure:\n{plain_err}"
     );
     assert!(
-        plain_err.contains("Dropped 3 file(s)") && !td.join("plain/lib/libcarry.so.1").exists(),
+        drop_lines(&plain_err).len() == 3 && !td.join("plain/lib/libcarry.so.1").exists(),
         "without the include the library is omitted like the rest:\n{plain_err}"
     );
 
@@ -13815,12 +13821,13 @@ fn a_policy_removed_need_of_a_retained_object_names_the_removal() {
         "{stderr}"
     );
     assert_eq!(
-        report_block(&stderr, "Left out by policy (1)", |l| l.starts_with("  ")
-            && l.contains(" : ")),
+        stderr
+            .lines()
+            .filter(|l| l.starts_with("  - ") && l.contains(": removed: "))
+            .collect::<Vec<_>>(),
         vec![
-            "Left out by policy (1)",
-            "  libpinned.so.1 (needed by bin/app) : core holds it, but the \
-             policy or a trace removed it",
+            "  - libpinned.so.1: removed: core holds it, but the policy or a trace \
+             removed it (needed by bin/app)",
         ],
         "{stderr}"
     );
@@ -13926,15 +13933,6 @@ fn an_explicit_include_the_source_lacks_fails_rather_than_selecting() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// The one line of `stderr` that starts with `prefix`, or a panic
-/// naming the output.
-fn stderr_line_starting<'a>(stderr: &'a str, prefix: &str) -> &'a str {
-    stderr
-        .lines()
-        .find(|l| l.starts_with(prefix))
-        .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{stderr}"))
-}
-
 /// The contiguous render of one report: from its exact header line
 /// through the last following line `body` accepts, so a snapshot pins
 /// the block's bytes and nothing else.
@@ -13955,10 +13953,15 @@ fn report_block(stderr: &str, header: &str, body: impl Fn(&str) -> bool) -> Vec<
     block
 }
 
-/// A line of the omitted-objects block: the tree-relative object, the
-/// soname that condemned it, and the verdict that took it out.
-fn is_drop_line(line: &str) -> bool {
-    line.starts_with("  ") && line.contains(" omitted, needs ")
+/// The omitted-object lines of the completeness findings, in the order
+/// the block renders them: the tree-relative object, the soname that
+/// condemned it, and the verdict that took it out.
+fn drop_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("  - ") && l.contains(": optional omission: omitted, needs "))
+        .map(String::from)
+        .collect()
 }
 
 /// A line of the host-resolved warning block: the soname and its
@@ -13966,10 +13969,6 @@ fn is_drop_line(line: &str) -> bool {
 fn is_warning_body(line: &str) -> bool {
     line.starts_with("  - ") || line.starts_with("  These ")
 }
-
-/// The header the omitted-objects block renders under, pinned so every
-/// snapshot below reads the same block.
-const DROPPED_HEADER: &str = "Dropped 3 file(s) needing libraries the sysroot does not hold:";
 
 /// The omission block is a function of the assembly, not of the run:
 /// two builds of the same fixture into fresh trees render the same
@@ -13987,7 +13986,7 @@ fn the_omission_report_is_byte_identical_across_runs() {
             out.status.success(),
             "the omissions are not failures:\n{stderr}"
         );
-        report_block(&stderr, DROPPED_HEADER, is_drop_line)
+        drop_lines(&stderr)
     };
     let first = block("run-a");
     let second = block("run-b");
@@ -13999,16 +13998,204 @@ fn the_omission_report_is_byte_identical_across_runs() {
     assert_eq!(
         first,
         vec![
-            "Dropped 3 file(s) needing libraries the sysroot does not hold:",
-            "  lib/core/plugins/libcore-backend.so omitted, needs libopt.so.1 \
-             (provided only by the unselected optional package optprov)",
-            "  lib/core/plugins/libcore-broken.so omitted, needs libabsent.so.7 \
-             (no selected source provides it)",
-            "  lib/libcarry.so.1 omitted, needs libabsent.so.7 (no selected \
-             source provides it)",
+            "  - lib/core/plugins/libcore-backend.so: optional omission: omitted, needs \
+             libopt.so.1 (provided only by the unselected optional package optprov)",
+            "  - lib/core/plugins/libcore-broken.so: optional omission: omitted, needs \
+             libabsent.so.7 (no selected source provides it)",
+            "  - lib/libcarry.so.1: optional omission: omitted, needs libabsent.so.7 (no \
+             selected source provides it)",
         ],
     );
     let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Every entry under `dir` with its kind, and each file's bytes, so a
+/// comparison catches a created directory or link as well as a write.
+fn tree_entries(dir: &Path) -> Vec<(String, char, Vec<u8>)> {
+    let mut out: Vec<(String, char, Vec<u8>)> = jwalk::WalkDir::new(dir)
+        .skip_hidden(false)
+        .sort(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let rel = e
+                .path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let kind = e.file_type();
+            if kind.is_symlink() {
+                let target = std::fs::read_link(e.path()).unwrap();
+                (rel, 'l', target.into_os_string().into_encoded_bytes())
+            } else if kind.is_dir() {
+                (rel, 'd', Vec::new())
+            } else {
+                (rel, 'f', std::fs::read(e.path()).unwrap())
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A dry run of a build that imports a bare binary and declares an
+/// uncached set pinned behind an unreachable https URL leaves the AppDir
+/// byte for byte as it was: no import, no ledger, no set record and no
+/// copied library. Nothing is fetched: the set is reported as an
+/// unverified provider, never as satisfying a dependency. The report
+/// lists the import and the findings in the same sorted order on every
+/// run, and names the package the build would emit.
+#[test]
+fn a_build_dry_run_changes_nothing_and_reports_an_uncached_pin_unverified() {
+    let td = workdir("build-dry-run");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(td.join("upstream")).unwrap();
+    if !cc(&td.join("main.c"), &td.join("upstream/app")) {
+        return;
+    }
+    let dir = td.join("app");
+    let hash = "ab".repeat(32);
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"../upstream/app\"\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"t\"]\n\
+             url = \"https://127.0.0.1:9/toolkit.onelf\"\nblake3 = \"{hash}\"\n"
+        ),
+    );
+    write(&dir.join("share/readme.txt"), "authored\n");
+    let store = td.join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let before = tree_entries(&dir);
+    let upstream = std::fs::read(td.join("upstream/app")).unwrap();
+
+    let dry_run = || {
+        let mut c = Command::new(onelf());
+        c.args(["build", "--dry-run"])
+            .arg(&dir)
+            .env("HOME", &td)
+            .env("XDG_CACHE_HOME", td.join("cache"))
+            .env("ONELF_PLATFORM_STORE", &store);
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        c.output().expect("spawn onelf build --dry-run")
+    };
+    let out = dry_run();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "the dry run failed:\n{stderr}");
+    assert_eq!(
+        tree_entries(&dir),
+        before,
+        "the dry run changed the AppDir:\n{stderr}"
+    );
+    assert_eq!(std::fs::read(td.join("upstream/app")).unwrap(), upstream);
+    assert!(
+        std::fs::read_dir(&store).unwrap().next().is_none()
+            && !td.join("cache/onelf/platform").exists(),
+        "the dry run fetched into a store:\n{stderr}"
+    );
+    assert!(
+        !dir.join("app.onelf").exists(),
+        "the dry run wrote the package:\n{stderr}"
+    );
+
+    let findings: Vec<&str> = stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("Completeness findings ("))
+        .take_while(|l| l.starts_with("Completeness findings (") || l.starts_with("  - "))
+        .collect();
+    assert!(
+        findings.len() >= 3,
+        "the findings block is missing:\n{stderr}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.starts_with("  - bin/app: selected: imported from ")),
+        "the import is reported:\n{stderr}"
+    );
+    let unverified = findings
+        .iter()
+        .find(|l| l.starts_with("  - set toolkit: "))
+        .unwrap_or_else(|| panic!("the uncached set is reported:\n{stderr}"));
+    assert!(
+        unverified.contains(": unverified: ")
+            && unverified.contains("a dry run does not fetch it")
+            && unverified.ends_with("it satisfies no dependency here"),
+        "the uncached pin is unverified, not a provider: {unverified}"
+    );
+    let mut sorted = findings[1..].to_vec();
+    sorted.sort();
+    assert_eq!(&findings[1..], &sorted[..], "the findings are sorted");
+    assert!(
+        stderr.contains(&format!("Would emit: {}", dir.join("app.onelf").display())),
+        "the output the build would emit is named:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Dry run: nothing was written, fetched or run"),
+        "{stderr}"
+    );
+
+    let again = dry_run();
+    let again_err = String::from_utf8_lossy(&again.stderr);
+    let again_findings: Vec<&str> = again_err
+        .lines()
+        .skip_while(|l| !l.starts_with("Completeness findings ("))
+        .take_while(|l| l.starts_with("Completeness findings (") || l.starts_with("  - "))
+        .collect();
+    assert_eq!(
+        findings, again_findings,
+        "the findings render the same bytes twice"
+    );
+    assert_eq!(tree_entries(&dir), before);
+}
+
+/// A sysroot build's dry run populates a private copy, so the AppDir
+/// stays exactly as it was while the report still names the need the
+/// sysroot cannot satisfy. The drop pass audits the finished tree, so
+/// the dry run reports the need itself rather than the omissions the
+/// build derives from it.
+#[test]
+fn a_sysroot_build_dry_run_reports_the_build_findings_and_changes_nothing() {
+    let td = workdir("sysroot-dry-run");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+    let first = onelf_build(&dir);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let materialized = tree_entries(&dir);
+    let out = Command::new(onelf())
+        .args(["build", "--dry-run"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn onelf build --dry-run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        tree_entries(&dir),
+        materialized,
+        "the dry run changed the AppDir:\n{stderr}"
+    );
+    assert!(
+        !drop_lines(&String::from_utf8_lossy(&first.stderr)).is_empty(),
+        "the build omits the objects that need libmissing.so.9"
+    );
+    assert!(
+        stderr.contains(
+            "  - libmissing.so.9: unresolved: no selected source provides it \
+             (needed by lib/fixture/plugins/c.so)"
+        ),
+        "the dry run names the need the build's omissions follow from:\n{stderr}"
+    );
 }
 
 /// The same unresolved need changes severity with the level: the
@@ -17377,7 +17564,7 @@ fn a_policy_naming_a_linked_library_holds_for_dependencies() {
     );
     let out = onelf_build(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Left out by policy"), "{stderr}");
+    assert!(stderr.contains("  - libvendor.so.1: removed: "), "{stderr}");
     assert!(
         !dir.join("lib/libvendor.so.1").exists(),
         "the pruned library is not copied back:\n{stderr}"
@@ -17441,7 +17628,8 @@ fn a_sysroot_vendor_library_is_found_through_ld_so_conf() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("Left out by policy") && stderr.contains("bin/vtool needs libvendor.so.1"),
+        stderr.contains("  - libvendor.so.1: removed: ")
+            && stderr.contains("bin/vtool needs libvendor.so.1"),
         "{stderr}"
     );
     assert!(!dir.join("lib/libvendor.so.1").exists());

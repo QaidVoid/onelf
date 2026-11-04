@@ -244,6 +244,8 @@ pub struct AssemblyReport {
     /// The selected pins whose resources the assembly prepared into their
     /// own subtrees, each with the rules that prepared into it.
     pub prepared: Vec<bundle::PreparedPin>,
+    /// The completeness findings the bundler reported, sorted.
+    pub findings: Vec<bundle::Finding>,
 }
 
 impl AssemblyReport {
@@ -663,6 +665,7 @@ impl AssemblyRequest {
                 pinned_gl: self.bundle.platform_pin.is_some(),
                 active_rules: Vec::new(),
                 prepared: Vec::new(),
+                findings: Vec::new(),
             });
         }
         let bundled = {
@@ -712,6 +715,80 @@ impl AssemblyRequest {
             pinned_gl: self.bundle.platform_pin.is_some(),
             active_rules: bundle::take_activations(),
             prepared: bundle::take_prepared(),
+            findings: bundle::take_findings(),
+        })
+    }
+
+    /// Plan the assembly [`stage`](Self::stage) would perform and report
+    /// it, changing nothing.
+    ///
+    /// The bundler runs in its dry-run form, so the AppDir is neither
+    /// written nor recorded into, nothing is downloaded, and the target
+    /// is never run. A binary import is placed into a private scratch
+    /// copy of the AppDir that the scan reads instead, and which is
+    /// removed afterwards. The report carries the same completeness
+    /// findings a build reports; a pinned set that is not already
+    /// verified on this machine appears as unverified rather than as a
+    /// provider.
+    pub fn dry_run(&self) -> io::Result<AssemblyReport> {
+        let _no_fetch = bundle::sysroot::forbid_fetch();
+        let sets = set_names(&self.bundle.sets);
+        if self.bundle.skip {
+            return Ok(AssemblyReport {
+                source: Source::Unchecked,
+                frameworks: Vec::new(),
+                sets,
+                pinned_gl: self.bundle.platform_pin.is_some(),
+                active_rules: Vec::new(),
+                prepared: Vec::new(),
+                findings: Vec::new(),
+            });
+        }
+        let mut options = self.bundle_options();
+        options.dry_run = true;
+        let _scratch = match &self.input {
+            Some(import) => {
+                let scratch = bundle::ScratchTree::copy_of(&self.directory)?;
+                if let Ok(rel) = import.source.strip_prefix(&self.directory) {
+                    let _ = std::fs::remove_file(scratch.path().join(rel));
+                }
+                import_binary(scratch.path(), import, &self.package.command)?;
+                bundle::record_finding(bundle::Finding::new(
+                    self.package.command.clone(),
+                    bundle::Outcome::Selected,
+                    format!(
+                        "imported from {}; the scan reads the import in a scratch copy",
+                        import.source.display()
+                    ),
+                ));
+                options.directory = scratch.path().to_path_buf();
+                Some(scratch)
+            }
+            None => None,
+        };
+        bundle::bundle_libs(&options)?;
+        Ok(AssemblyReport {
+            source: if self.bundle.sysroot.is_some() {
+                Source::SysrootDatabase
+            } else {
+                Source::HostScan
+            },
+            frameworks: if self.bundle.sysroot.is_none() {
+                framework_names(
+                    self.bundle.gl,
+                    self.bundle.dri,
+                    self.bundle.vulkan,
+                    self.bundle.wayland,
+                    self.bundle.gtk,
+                )
+            } else {
+                Vec::new()
+            },
+            sets,
+            pinned_gl: self.bundle.platform_pin.is_some(),
+            active_rules: bundle::take_activations(),
+            prepared: bundle::take_prepared(),
+            findings: bundle::take_findings(),
         })
     }
 
@@ -1241,6 +1318,16 @@ fn sysroot_from_recipe(
     let root = resolve(path);
     bundle::sysroot::refuse_inside(&root, dir)?;
     if !root.is_dir() {
+        if bundle::sysroot::fetch_forbidden() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "{}: the sysroot is not materialized, and a dry run neither fetches \
+                     nor unpacks its archive; run `onelf sysroot fetch` or a build first",
+                    root.display()
+                ),
+            ));
+        }
         let Some(archive) = &sr.archive else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1583,6 +1670,7 @@ mod tests {
                 pinned_gl: false,
                 active_rules: Vec::new(),
                 prepared: Vec::new(),
+                findings: Vec::new(),
             }
         );
         assert!(!dir.join(".onelf").exists());
@@ -1662,6 +1750,7 @@ mod tests {
             pinned_gl: false,
             active_rules: Vec::new(),
             prepared: Vec::new(),
+            findings: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),
@@ -1695,6 +1784,7 @@ mod tests {
             pinned_gl: true,
             active_rules: rules,
             prepared: Vec::new(),
+            findings: Vec::new(),
         };
         let forward = report(vec![
             activation("alsa", "libasound.so.2", &["plugins", "configuration"]),
@@ -1736,6 +1826,7 @@ mod tests {
             pinned_gl: false,
             active_rules: Vec::new(),
             prepared: Vec::new(),
+            findings: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),

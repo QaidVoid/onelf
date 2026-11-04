@@ -263,6 +263,12 @@ pub(crate) fn publish_activations(activations: Vec<RuleActivation>) {
     LAST_ACTIVATIONS.with(|cell| *cell.borrow_mut() = activations);
 }
 
+/// The activations of the last completed bundle run on this thread,
+/// left in place for [`take_activations`].
+pub(crate) fn published_activations() -> Vec<RuleActivation> {
+    LAST_ACTIVATIONS.with(|cell| cell.borrow().clone())
+}
+
 /// Take the activations of the last completed bundle run on this
 /// thread. A run that failed activation leaves nothing behind.
 pub fn take_activations() -> Vec<RuleActivation> {
