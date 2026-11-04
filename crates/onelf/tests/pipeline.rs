@@ -21737,11 +21737,12 @@ fn the_prepared_view(store: &Path) -> PathBuf {
     std::fs::read_dir(store)
         .expect("the view store")
         .find_map(|e| {
-            let p = e.unwrap().path();
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("view-"))
-                .then_some(p)
+            let e = e.unwrap();
+            let is_view = e.file_type().is_ok_and(|t| t.is_dir())
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("view-"));
+            is_view.then(|| e.path())
         })
         .expect("the prepared view")
 }
