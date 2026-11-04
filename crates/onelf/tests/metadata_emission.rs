@@ -46,6 +46,9 @@ mod payload;
 #[path = "../src/recipe.rs"]
 mod recipe;
 #[rustfmt::skip]
+#[path = "../src/rules.rs"]
+mod rules;
+#[rustfmt::skip]
 #[path = "../src/sysroot_cmd.rs"]
 mod sysroot_cmd;
 

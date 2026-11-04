@@ -27,6 +27,8 @@
 //! search-paths = ["${MUSL_LIBDRM}/lib"]
 //! strict-libc = true
 //! gl = true
+//! rules = ["vendor-framework.toml"]
+//! disable-rules = ["translations"]
 //! ```
 
 use std::collections::BTreeMap;
@@ -565,6 +567,15 @@ pub struct Bundle {
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).
     #[serde(default)]
     pub skip: bool,
+    /// Project-local framework descriptor files, relative to the recipe
+    /// directory. Their identities extend the built-in catalog and may
+    /// not repeat a built-in identity.
+    #[serde(default)]
+    pub rules: Vec<PathBuf>,
+    /// Built-in or local rule identities that never activate and whose
+    /// runtime mappings are not carried.
+    #[serde(default)]
+    pub disable_rules: Vec<String>,
 }
 
 /// Load a recipe from a file path. `${VAR}` references in string

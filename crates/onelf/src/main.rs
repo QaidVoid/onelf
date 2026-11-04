@@ -11,6 +11,7 @@ mod metadata;
 mod pack;
 mod payload;
 mod recipe;
+mod rules;
 mod run;
 mod sign;
 mod sysroot_cmd;
@@ -991,6 +992,7 @@ fn main() {
                 sets: Vec::new(),
                 entrypoint_selections: Vec::new(),
                 platform_pin: None,
+                rules: Default::default(),
                 strict: false,
             })
         }),
@@ -1119,7 +1121,7 @@ fn run_build(
         None => Vec::new(),
     };
     let mut options = request.pack_options(update_key, runtime.note, profile);
-    options.metadata = entrypoint_sets_metadata(&request, &request.selections)?;
+    options.metadata = build_metadata(&request, &request.selections, &report.prepared)?;
     pack::pack(&options, runtime.bytes)
 }
 
@@ -1151,9 +1153,37 @@ fn fetches_over_https(request: &assembly::AssemblyRequest) -> bool {
     sets.chain(pinned).any(|url| url.starts_with("https://"))
 }
 
-/// The metadata a build carries for its set selections: the declared
-/// pin table paired with one exact selection per final manifest
-/// entrypoint, in the canonical form the shared codec encodes.
+/// The metadata records a build carries: the runtime rule record its rule
+/// catalog and prepared pins need, and the selection table its resolved
+/// selections write, lowered and validated together.
+///
+/// The rule record is carried only when the runtime's built-in fallback
+/// would not reproduce it (see [`rules::RuleCatalog::runtime_records`]),
+/// and the selection table only when some list is explicit, so a recipe
+/// using neither project-local rules, disables, prepared pins nor
+/// explicit selections packs byte-identically to before.
+fn build_metadata(
+    request: &assembly::AssemblyRequest,
+    table: &[assembly::ResolvedSelection],
+    prepared: &[bundle::PreparedPin],
+) -> std::io::Result<pack::MetadataPayload> {
+    let rules = request
+        .bundle
+        .rules
+        .runtime_records(prepared)?
+        .unwrap_or_default();
+    let sets = selection_table(request, table)?;
+    pack::lower_runtime_metadata(rules, sets).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the runtime metadata records cannot be written: {e}"),
+        )
+    })
+}
+
+/// The selection table a build carries: the declared pin table paired
+/// with one exact selection per final manifest entrypoint, in the
+/// canonical form the shared codec encodes.
 ///
 /// A build whose every list was omitted carries none of it. The
 /// runtime's documented default for absent selection metadata is
@@ -1168,12 +1198,12 @@ fn fetches_over_https(request: &assembly::AssemblyRequest) -> bool {
 /// entrypoint names whatever mixture of the two the recipe wrote. The
 /// packer re-checks the lowered table against the final entrypoint
 /// table and the recorded pins before anything is written.
-fn entrypoint_sets_metadata(
+fn selection_table(
     request: &assembly::AssemblyRequest,
     table: &[assembly::ResolvedSelection],
-) -> std::io::Result<pack::MetadataPayload> {
+) -> std::io::Result<Option<onelf_format::runtime_metadata::EntrypointSets>> {
     if !table.iter().any(assembly::ResolvedSelection::is_explicit) {
-        return Ok(pack::MetadataPayload::default());
+        return Ok(None);
     }
     let declared = declared_set_pins(request)?;
     let names: std::collections::BTreeMap<&str, onelf_format::rules::RuleId> = declared
@@ -1206,19 +1236,10 @@ fn entrypoint_sets_metadata(
             sets,
         });
     }
-    pack::lower_runtime_metadata(
-        Vec::new(),
-        Some(onelf_format::runtime_metadata::EntrypointSets {
-            pins: declared,
-            entrypoints,
-        }),
-    )
-    .map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("the entrypoint selection record cannot be written: {e}"),
-        )
-    })
+    Ok(Some(onelf_format::runtime_metadata::EntrypointSets {
+        pins: declared,
+        entrypoints,
+    }))
 }
 
 /// The canonical pin table of a build's declared sets: every
@@ -1329,7 +1350,7 @@ mod block_size_tests {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::entrypoint_sets_metadata;
+    use super::build_metadata;
     use crate::assembly::{self, ResolvedSelection};
     use crate::metadata;
     use crate::recipe;
@@ -1508,7 +1529,7 @@ mod selection_tests {
             "sets = [\"gtk\"]",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
+        let payload = build_metadata(&request, &request.selections, &[]).unwrap();
         assert!(
             payload.runtime_rules.is_none(),
             "selections carry no rule records"
@@ -1537,7 +1558,7 @@ mod selection_tests {
     fn a_legacy_selection_lowers_no_record() {
         let (dir, request) = planned(&recipe("", ""));
         assert_eq!(
-            entrypoint_sets_metadata(&request, &request.selections).unwrap(),
+            build_metadata(&request, &request.selections, &[]).unwrap(),
             crate::pack::MetadataPayload::default()
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1551,7 +1572,7 @@ mod selection_tests {
             "sets = [\"audio\"]",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
+        let payload = build_metadata(&request, &request.selections, &[]).unwrap();
         let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
         assert_eq!(selection(&record, "app"), ["audio"]);
         assert_eq!(selection(&record, "cli"), ["audio", "gtk"]);
@@ -1567,7 +1588,7 @@ mod selection_tests {
             "",
             "[[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\ndefault = true\nsets = [\"gtk\"]\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
+        let payload = build_metadata(&request, &request.selections, &[]).unwrap();
         let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
         assert_eq!(
             record
@@ -1591,7 +1612,7 @@ mod selection_tests {
             name: "app".to_string(),
             sets: recipe::SetSelection::Names(vec!["ghost".to_string()]),
         }];
-        let err = entrypoint_sets_metadata(&request, &hostile).unwrap_err();
+        let err = build_metadata(&request, &hostile, &[]).unwrap_err();
         assert!(
             err.to_string().contains("entrypoint 'app': set 'ghost'"),
             "{err}"
@@ -1625,7 +1646,7 @@ mod selection_tests {
         let loaded = recipe::load(&path).unwrap();
         let request = assembly::AssemblyRequest::plan(&path, loaded, None).unwrap();
         let _report = request.stage().unwrap();
-        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
+        let payload = build_metadata(&request, &request.selections, &[]).unwrap();
 
         let out = dir.join("pkg.onelf");
         let mut opts = request.pack_options(None, RuntimeNote::Absent, Vec::new());
@@ -1640,7 +1661,7 @@ mod selection_tests {
         let runtime = assembly::embed_runtime(&request).unwrap();
         let mut opts = request.pack_options(None, runtime.note, Vec::new());
         opts.output = out.clone();
-        opts.metadata = entrypoint_sets_metadata(&request, &request.selections).unwrap();
+        opts.metadata = build_metadata(&request, &request.selections, &[]).unwrap();
         crate::pack::pack(&opts, runtime.bytes).unwrap();
         let carried = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
             .unwrap()

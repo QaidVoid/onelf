@@ -17,7 +17,9 @@ ed25519-compact = { version = "2", default-features = false, features = [
 ] }
 goblin = { workspace = true }
 indicatif = { workspace = true }
-onelf-format = { workspace = true }
+# The TOML adapter parses a recipe's project-local rule files. The
+# runtime never enables it.
+onelf-format = { workspace = true, features = ["rules-toml"] }
 onelf-sysroot = { workspace = true }
 # Shared launch support for the development run: acquisition, set
 # selection, and the pinned-artifact store. Default features only, so

@@ -251,9 +251,18 @@ fn declared_pins(directory: &Path) -> io::Result<Vec<SetPin>> {
 /// package and executes nothing on a mismatch, so a record that names
 /// an entrypoint or pin the package does not carry fails here, naming
 /// what disagrees, rather than shipping as a package that can only be
-/// refused at launch.
+/// refused at launch. Without a selection record, a runtime rule bound
+/// to a pin must name one the AppDir records, as the launch gate checks.
 fn validate_carried_selections(opts: &PackOptions) -> io::Result<()> {
     let Some(bytes) = &opts.metadata.entrypoint_sets else {
+        if let Some(rules) = &opts.metadata.runtime_rules {
+            let rules = RuntimeRuleMetadata::decode(rules).map_err(record_error)?;
+            let declared = EntrypointSets {
+                pins: declared_pins(&opts.directory)?,
+                entrypoints: Vec::new(),
+            };
+            rules.validate_bindings(&declared).map_err(record_error)?;
+        }
         return Ok(());
     };
     let sets = EntrypointSets::decode(bytes).map_err(record_error)?;
@@ -1311,8 +1320,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     }
 
     // Inject the validated runtime mappings and the entrypoint selection
-    // table when a build lowers them. Builds that write no explicit
-    // selection lower neither record, so ordinary packages carry none.
+    // table when a build lowers them. A build without explicit
+    // selections, local rules, disables or prepared pins lowers neither
+    // record, so ordinary packages carry none.
     if let Some(ref bytes) = opts.metadata.runtime_rules {
         inject_onelf_file(
             &mut dirs,

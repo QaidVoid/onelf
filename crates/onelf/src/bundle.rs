@@ -21,7 +21,7 @@
 //! constants, not derived from any input.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::PermissionsExt;
@@ -49,8 +49,8 @@ use activate::{Discovery, WorkItem, publish_activations};
 pub use activate::{RuleActivation, take_activations};
 pub(crate) use elf::*;
 use onelf_format::rules::{
-    BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, SourceBase,
-    SourceCandidate,
+    BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, RuntimeBase,
+    RuntimePathGroup, SourceBase, SourceCandidate,
 };
 use plan::{Admission, DestinationPlan, Existing};
 pub use sysroot::SysrootOptions;
@@ -786,6 +786,7 @@ fn carry_data_group(
             candidates: &declared.candidates,
             executable: false,
             hooks: &hooks,
+            runtime: &descriptor.runtime.paths,
         },
     )?;
     if supplied {
@@ -1029,6 +1030,7 @@ fn collect_helper_group(
                 candidates: &declared.candidates,
                 executable: true,
                 hooks: &descriptor.build.hooks,
+                runtime: &descriptor.runtime.paths,
             },
         )?;
         if supplied {
@@ -1107,13 +1109,13 @@ fn report_helper_omission(rule: &str, declared: &HelperGroup, outcome: &GroupOut
 }
 
 /// Where an application keeps the resources a selected set pin's
-/// preparation writes, relative to the AppDir root.
+/// preparation writes, relative to the AppDir root: the shared contract
+/// a launch resolves a selected pin's bound mapping against.
 ///
 /// The packer reserves `.onelf/` for the metadata it injects itself, so
 /// the prepared subtrees live beside it at the top level and are packed
-/// as the application's own content: a launch resolves a selected
-/// pin's mapping against the subtree the package carries.
-pub const PREPARED_DIR: &str = ".onelf-prepared";
+/// as the application's own content.
+pub use onelf_format::runtime_metadata::PREPARED_DIR;
 
 /// The subtree one selected pin's prepared resources live in,
 /// relative to the AppDir: `PREPARED_DIR/<set>/<pin>`, the pin spelled
@@ -1154,6 +1156,9 @@ pub struct PreparedPin {
     pub root: PathBuf,
     /// The files this build prepared, relative to the AppDir, sorted.
     pub files: Vec<String>,
+    /// The rules whose resources the pin's subtree holds, sorted. Each
+    /// lowers a runtime record bound to this pin.
+    pub rules: Vec<String>,
 }
 
 /// The largest single resource preparation reads out of a set build.
@@ -1171,53 +1176,6 @@ const PREPARED_TOTAL_LIMIT: u64 = 64 * 1024 * 1024;
 /// The most entries one prepared directory may expand to, matching the
 /// metadata record bound.
 const PREPARED_ENTRY_LIMIT: usize = 4096;
-
-/// The prepared pins whose mappings and configurations a launch with
-/// `selection` activates, in canonical order by set name and pin.
-///
-/// A subtree is bound to the one pin whose bytes it holds, so a
-/// selection scopes activation exactly the way it scopes providers: a
-/// pin its selection does not name stays dormant whatever its subtree
-/// carries, two pins of one set name activate side by side at their own
-/// destinations, and a selection naming a set the recipe never declares
-/// is the error a launch refuses it for.
-///
-/// The records that carry these bindings to a launch are emitted by
-/// the build path, while the launch itself does not resolve through
-/// this function yet; the function is the surface that wiring will
-/// resolve selections through.
-#[allow(dead_code)]
-pub fn activate_prepared<'a>(
-    selection: &recipe::SetSelection,
-    prepared: &'a [PreparedPin],
-) -> io::Result<Vec<&'a PreparedPin>> {
-    let mut ordered: Vec<&PreparedPin> = prepared.iter().collect();
-    ordered.sort_by(|a, b| (&a.set, &a.pin).cmp(&(&b.set, &b.pin)));
-    match selection {
-        recipe::SetSelection::All => Ok(ordered),
-        recipe::SetSelection::Names(names) => {
-            let mut active = Vec::with_capacity(names.len());
-            for name in names {
-                let mut found = false;
-                for pin in &ordered {
-                    if &pin.set == name {
-                        active.push(*pin);
-                        found = true;
-                    }
-                }
-                if !found {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "the selection names set {name}, which the recipe does not declare"
-                        ),
-                    ));
-                }
-            }
-            Ok(active)
-        }
-    }
-}
 
 /// The paths one declared candidate may sit at inside a set build. A
 /// set's `usr/` is flattened into the build root, so an installation
@@ -1294,6 +1252,7 @@ struct PinPreparation {
     hooks: Vec<BuildHookId>,
     bytes: u64,
     files: Vec<String>,
+    rules: BTreeSet<String>,
 }
 
 /// One activated group a declared set may supply: what the declaration
@@ -1307,6 +1266,28 @@ struct SupplyQuery<'a> {
     candidates: &'a [SourceCandidate],
     executable: bool,
     hooks: &'a [BuildHookId],
+    /// The rule's runtime path groups, which decide whether a launch
+    /// would find the prepared destination at all.
+    runtime: &'a [RuntimePathGroup],
+}
+
+/// Whether a runtime path group of the rule names `destination` inside a
+/// prepared subtree: a package-root candidate at the destination itself,
+/// or a library-root candidate below `lib_dir`. A launch evaluates a
+/// selected pin's bound record against the subtree with exactly those
+/// bases, so a resource no candidate names would be prepared and never
+/// mapped.
+fn runtime_maps(runtime: &[RuntimePathGroup], destination: &str, lib_dir: &Path) -> bool {
+    let below_lib = Path::new(destination).strip_prefix(lib_dir).ok();
+    runtime
+        .iter()
+        .flat_map(|group| &group.candidates)
+        .any(|candidate| match candidate.base {
+            RuntimeBase::PackageRoot => candidate.path.as_str() == destination,
+            RuntimeBase::LibraryRoot => {
+                below_lib.is_some_and(|rest| rest == Path::new(candidate.path.as_str()))
+            }
+        })
 }
 
 /// The set-supplied resources a checked assembly prepares while its
@@ -1322,6 +1303,7 @@ struct SupplyQuery<'a> {
 struct SetPreparation<'a> {
     sets: &'a [sysroot::SharedSet],
     sysroot_sets: &'a [sysroot::SharedSet],
+    lib_dir: &'a Path,
     dry_run: bool,
     reads: HashMap<String, sysroot::VerifiedSet>,
     pins: BTreeMap<(String, String), PinPreparation>,
@@ -1336,11 +1318,13 @@ impl<'a> SetPreparation<'a> {
     fn new(
         sets: &'a [sysroot::SharedSet],
         sysroot_sets: &'a [sysroot::SharedSet],
+        lib_dir: &'a Path,
         dry_run: bool,
     ) -> Self {
         Self {
             sets,
             sysroot_sets,
+            lib_dir,
             dry_run,
             reads: HashMap::new(),
             pins: BTreeMap::new(),
@@ -1363,20 +1347,21 @@ impl<'a> SetPreparation<'a> {
     /// group, which satisfies a required declaration whose tree carry
     /// missed.
     ///
-    /// What satisfies the requirement at launch today is the selected
-    /// set's own root: the rule's runtime path mapping searches every
-    /// selected set root after the package root, and finds the resource
-    /// there. The prepared copy under [`PREPARED_DIR`] is not mapped by
-    /// any launch yet, since no runtime rule binds a subtree to its pin.
-    /// Wiring that activation is what makes the prepared copy, not the
-    /// raw set root, the one a launch resolves, as the design requires
-    /// for a helper that needs application-relative relocation.
+    /// The build lowers one runtime record per rule and pin bound to the
+    /// pin's subtree, and a launch selecting that pin evaluates the
+    /// rule's runtime paths against the subtree before the raw set root.
+    /// A resource is therefore prepared, and counts as supplied, only
+    /// when one of the rule's runtime candidates names its destination;
+    /// a resource no mapping would reach is left in the set, and a
+    /// required one fails as a miss. The requirement holds for the
+    /// entrypoints selecting the supplying pin, which are the only ones
+    /// preparation reads sets for.
     fn supply_group(
         &mut self,
         plan: &mut DestinationPlan,
         query: &SupplyQuery,
     ) -> io::Result<bool> {
-        if !self.active() {
+        if !self.active() || !runtime_maps(query.runtime, query.destination, self.lib_dir) {
             return Ok(false);
         }
         let mut supplied = false;
@@ -1450,7 +1435,9 @@ impl<'a> SetPreparation<'a> {
                     hooks: Vec::new(),
                     bytes: bytes_in_pin,
                     files: Vec::new(),
+                    rules: BTreeSet::new(),
                 });
+            pin.rules.insert(query.rule.to_string());
             pin.bytes += staged_bytes;
             pin.entries.extend(staged);
             pin.files.extend(staged_files);
@@ -1466,34 +1453,51 @@ impl<'a> SetPreparation<'a> {
     }
 
     /// Queue one write per pin that accumulated entries, each carrying
-    /// the verified bytes and the rules' declared hooks. Deterministic:
-    /// the pin map is ordered by set and pin, and each pin's entries are
-    /// sorted by destination.
+    /// the verified bytes and the rules' declared hooks, and return every
+    /// pin that supplied a group, including one whose subtree already
+    /// held identical bytes and needs no write. Deterministic: the pin map
+    /// is ordered by set and pin, and each pin's entries are sorted by
+    /// destination.
     fn queue_actions(&mut self, actions: &mut Vec<WalkAction>) -> Vec<PreparedPin> {
         let mut prepared = Vec::new();
         for ((set, pin), done) in self.pins.iter_mut() {
-            if done.entries.is_empty() {
-                continue;
+            if !done.entries.is_empty() {
+                let mut entries = std::mem::take(&mut done.entries);
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                actions.push(WalkAction::PreparePin {
+                    set: set.clone(),
+                    pin: pin.clone(),
+                    root: done.root.clone(),
+                    entries,
+                    hooks: done.hooks.clone(),
+                });
             }
-            let mut entries = std::mem::take(&mut done.entries);
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let files = std::mem::take(&mut done.files);
-            actions.push(WalkAction::PreparePin {
-                set: set.clone(),
-                pin: pin.clone(),
-                root: done.root.clone(),
-                entries,
-                hooks: done.hooks.clone(),
-            });
             prepared.push(PreparedPin {
                 set: set.clone(),
                 pin: pin.clone(),
                 root: done.root.clone(),
-                files,
+                files: std::mem::take(&mut done.files),
+                rules: done.rules.iter().cloned().collect(),
             });
         }
         prepared
     }
+}
+
+thread_local! {
+    static LAST_PREPARED: RefCell<Vec<PreparedPin>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Publish the pins one bundle run prepared resources into.
+fn publish_prepared(prepared: Vec<PreparedPin>) {
+    LAST_PREPARED.with(|cell| *cell.borrow_mut() = prepared);
+}
+
+/// Take the prepared pins of the last bundle run on this thread, in
+/// canonical order by set and pin. A run that prepared nothing, or
+/// failed before preparation, leaves none.
+pub fn take_prepared() -> Vec<PreparedPin> {
+    LAST_PREPARED.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// The verified reader of one set's pinned build, opened once and reused
@@ -2226,6 +2230,9 @@ pub struct BundleOptions {
     pub entrypoint_selections: Vec<AuditedEntrypoint>,
     /// A GL build pinned without a sysroot, named whole by the recipe.
     pub platform_pin: Option<onelf_sysroot::platform::Pin>,
+    /// The rule catalog discovery activates: the built-ins alone by
+    /// default, or the built-ins with a recipe's local rules and disables.
+    pub rules: crate::rules::RuleCatalog,
     /// Fail on an unresolved required dependency whatever the source,
     /// the contract of high-level `onelf build` and `onelf run --bundle`.
     /// A sysroot build is always strict. Without this a host scan keeps
@@ -2763,6 +2770,7 @@ mod source_verdict_tests {
 /// after assembly succeeds, so a failed build never replaces an
 /// existing output.
 pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
+    publish_prepared(Vec::new());
     if !opts.directory.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
@@ -3226,10 +3234,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 
     // Descriptor activation seeds from every soname already in play: the
     // libraries the tree already bundles and the sonames the packaged
-    // sets supply. No recipe surface for project-local descriptors or
-    // rule disabling exists yet, so both lists are empty until that
-    // lands; the activator already takes them.
-    let mut discovery = Discovery::new(onelf_format::catalog::builtins(), &[], &[])?;
+    // sets supply, over the built-ins and the recipe's local rules less
+    // the disabled ones.
+    let mut discovery = Discovery::new(
+        onelf_format::catalog::builtins(),
+        opts.rules.local(),
+        opts.rules.disabled(),
+    )?;
     let mut present: Vec<String> = reachable.iter().cloned().collect();
     present.extend(set_sonames.iter().cloned());
     present.sort();
@@ -3477,7 +3488,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             .map(|sr| sr.sets.as_slice())
             .unwrap_or(&[]),
     );
-    let mut preparation = SetPreparation::new(&tree_sets, &sysroot_sets, opts.dry_run);
+    let mut preparation =
+        SetPreparation::new(&tree_sets, &sysroot_sets, &opts.lib_dir, opts.dry_run);
     // The destinations a required descriptor group placed, which the
     // drop pass never omits to make the assembly succeed.
     let mut required_dests: HashSet<PathBuf> = HashSet::new();
@@ -3544,10 +3556,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 let Some((rule, group)) = group_queue.pop_front() else {
                     continue;
                 };
-                let descriptor = onelf_format::catalog::builtins()
-                    .iter()
-                    .find(|d| d.id.as_str() == rule);
-                let Some(descriptor) = descriptor else {
+                let Some(descriptor) = opts.rules.find(&rule) else {
                     continue;
                 };
                 // Plugin groups collect here, into the object queue.
@@ -4076,7 +4085,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // The pins whose resources the sets supplied: each write is already
     // admitted to the plan, so a finding anywhere stops the build here,
     // before any tree write and any pin write.
-    preparation.queue_actions(&mut actions);
+    publish_prepared(preparation.queue_actions(&mut actions));
 
     // The interpreter alias links the loader needs, planned here so a
     // finding anywhere in the plan stops the build before the first
@@ -5749,7 +5758,7 @@ mod plugin_dir_tests {
         )];
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         for declared in &descriptor.resources.data {
             carry_data_group(
                 &tree,
@@ -5832,7 +5841,7 @@ mod plugin_dir_tests {
         let admitted = [AdmittedLibrary::new(soname, resolved)];
         let mut plan = DestinationPlan::load(directory).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         for declared in &descriptor.resources.data {
             carry_data_group(
                 directory,
@@ -6009,7 +6018,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         let err = carry_data_group(
             &tree,
             descriptor,
@@ -6056,7 +6065,7 @@ pcm.default cards.pcm.default
         let mut plan = DestinationPlan::load(&tree).unwrap();
         let mut actions: Vec<WalkAction> = Vec::new();
         let declared = descriptor.resources.data.first().unwrap();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         carry_data_group(
             &tree,
             descriptor,
@@ -6306,7 +6315,7 @@ mod helper_tests {
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
         let mut repair_extra = HashSet::new();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         let mut plan = DestinationPlan::load(tree)?;
         let descriptor = catalog::builtins()
             .iter()
@@ -6372,7 +6381,7 @@ mod helper_tests {
         let mut processed = HashSet::new();
         let mut search_paths = Vec::new();
         let mut repair_extra = HashSet::new();
-        let mut preparation = SetPreparation::new(&[], &[], false);
+        let mut preparation = SetPreparation::new(&[], &[], Path::new("lib"), false);
         let mut plan = DestinationPlan::load(&root).unwrap();
         let descriptor = catalog::builtins()
             .iter()
@@ -8221,7 +8230,18 @@ mod set_preparation_tests {
             candidates,
             executable: false,
             hooks: &[BuildHookId::AlsaConfPatch],
+            runtime: builtin_runtime("alsa"),
         }
+    }
+
+    /// The runtime path groups of the built-in rule `id`.
+    fn builtin_runtime(id: &str) -> &'static [RuntimePathGroup] {
+        &onelf_format::catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == id)
+            .unwrap()
+            .runtime
+            .paths
     }
 
     fn helper_query<'a>(candidates: &'a [SourceCandidate]) -> SupplyQuery<'a> {
@@ -8233,6 +8253,7 @@ mod set_preparation_tests {
             candidates,
             executable: true,
             hooks: &[],
+            runtime: builtin_runtime("gstreamer"),
         }
     }
 
@@ -8244,7 +8265,7 @@ mod set_preparation_tests {
         query: &SupplyQuery,
     ) -> io::Result<Vec<PreparedPin>> {
         let mut plan = DestinationPlan::load(appdir)?;
-        let mut preparation = SetPreparation::new(sets, &[], false);
+        let mut preparation = SetPreparation::new(sets, &[], Path::new("lib"), false);
         assert!(
             preparation.supply_group(&mut plan, query)?,
             "the declared set was expected to hold the resource"
@@ -8292,6 +8313,44 @@ mod set_preparation_tests {
     /// supplying pin's own subtree, layout preserved, and the
     /// registered hook transforms it there. Nothing outside the
     /// declared files is created, and no helper ran to do it.
+    /// A resource is prepared only where the rule's runtime mapping
+    /// would find it in the pin's subtree: a destination no runtime
+    /// candidate names is left in the set, so a required group it would
+    /// satisfy stays a miss. The prepared pin names the rule it binds.
+    #[test]
+    fn only_a_resource_a_runtime_mapping_reaches_is_prepared() {
+        let appdir = tmp("unmapped-subtree");
+        let (builddir, set) = write_build(
+            "unmapped-set",
+            &[("share/alsa/alsa.conf", b"# conf\n".as_slice())],
+        );
+        let candidates = [at(SourceBase::InstallationPrefix, "share/alsa")];
+        let unmapped = SupplyQuery {
+            runtime: &[],
+            ..data_query(&candidates)
+        };
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&set), &[], Path::new("lib"), false);
+        assert!(!preparation.supply_group(&mut plan, &unmapped).unwrap());
+        assert!(preparation.queue_actions(&mut Vec::new()).is_empty());
+
+        let prepared = prepare_and_walk(
+            &appdir,
+            std::slice::from_ref(&set),
+            &data_query(&candidates),
+        )
+        .unwrap();
+        assert_eq!(prepared[0].rules, ["alsa"]);
+        assert!(runtime_maps(
+            builtin_runtime("gstreamer"),
+            "lib/gstreamer-1.0/gst-plugin-scanner",
+            Path::new("lib")
+        ));
+        let _ = fs::remove_dir_all(&appdir);
+        let _ = fs::remove_dir_all(&builddir);
+    }
+
     #[test]
     fn a_set_supplied_configuration_prepares_into_its_pins_subtree() {
         let appdir = tmp("alsa-subtree");
@@ -8371,7 +8430,8 @@ mod set_preparation_tests {
             )],
         );
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&env_set), &[], false);
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&env_set), &[], Path::new("lib"), false);
         let err = preparation
             .supply_group(&mut plan, &helper_query(&candidates))
             .unwrap_err();
@@ -8457,7 +8517,8 @@ mod set_preparation_tests {
             .expect("a build that is not the pin must be refused");
         assert!(err.contains("not the pinned build"), "{err}");
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), &[], false);
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&set), &[], Path::new("lib"), false);
         assert!(
             !preparation
                 .supply_group(&mut plan, &data_query(&candidates))
@@ -8473,7 +8534,8 @@ mod set_preparation_tests {
             ..set
         };
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&corrupt), &[], false);
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&corrupt), &[], Path::new("lib"), false);
         let err = preparation
             .supply_group(&mut plan, &data_query(&candidates))
             .unwrap_err();
@@ -8540,71 +8602,6 @@ mod set_preparation_tests {
         let _ = fs::remove_dir_all(&dir2);
     }
 
-    /// Activation follows the selection: all pins under an omitted
-    /// list, only the named sets' pins under a written one, none under
-    /// an empty one, and a name the recipe never declares is refused.
-    #[test]
-    fn prepared_activation_scopes_to_the_selection() {
-        let pin = |byte: u8| {
-            let mut hex = String::with_capacity(64);
-            for _ in 0..32 {
-                hex.push_str(&format!("{byte:02x}"));
-            }
-            hex
-        };
-        let prepared = vec![
-            PreparedPin {
-                set: "video".to_string(),
-                pin: pin(0xbb),
-                root: PathBuf::from(".onelf-prepared/video/bb"),
-                files: Vec::new(),
-            },
-            PreparedPin {
-                set: "audio".to_string(),
-                pin: pin(0x22),
-                root: PathBuf::from(".onelf-prepared/audio/22"),
-                files: Vec::new(),
-            },
-            PreparedPin {
-                set: "audio".to_string(),
-                pin: pin(0x11),
-                root: PathBuf::from(".onelf-prepared/audio/11"),
-                files: Vec::new(),
-            },
-        ];
-        let names = |list: &[&str]| {
-            recipe::SetSelection::Names(list.iter().map(|s| s.to_string()).collect())
-        };
-
-        let all = activate_prepared(&recipe::SetSelection::All, &prepared).unwrap();
-        let got: Vec<(&str, &str)> = all
-            .iter()
-            .map(|p| (p.set.as_str(), p.pin.as_str()))
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("audio", pin(0x11).as_str()),
-                ("audio", pin(0x22).as_str()),
-                ("video", pin(0xbb).as_str())
-            ],
-            "canonical order by set and pin"
-        );
-
-        let audio = activate_prepared(&names(&["audio"]), &prepared).unwrap();
-        assert_eq!(audio.len(), 2, "both pins of the named set activate");
-        assert!(audio.iter().all(|p| p.set == "audio"));
-
-        assert!(
-            activate_prepared(&names(&[]), &prepared)
-                .unwrap()
-                .is_empty()
-        );
-
-        let err = activate_prepared(&names(&["ghost"]), &prepared).unwrap_err();
-        assert!(err.to_string().contains("ghost"), "{err}");
-    }
-
     /// A pin's subtree is keyed by the set name and the lowercase hex
     /// of the pin, and a bad set name or a pin that is no digest is
     /// refused.
@@ -8630,7 +8627,8 @@ mod set_preparation_tests {
         let (builddir, set) = write_build("dry", &[("share/alsa/alsa.conf", b"conf\n")]);
 
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&set), &[], true);
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&set), &[], Path::new("lib"), true);
         assert!(!preparation.active());
         assert!(
             !preparation
@@ -8646,7 +8644,8 @@ mod set_preparation_tests {
             ..set
         };
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(std::slice::from_ref(&ghost), &[], false);
+        let mut preparation =
+            SetPreparation::new(std::slice::from_ref(&ghost), &[], Path::new("lib"), false);
         assert!(
             !preparation
                 .supply_group(&mut plan, &data_query(&candidates))
@@ -8679,7 +8678,8 @@ mod set_preparation_tests {
         );
 
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(&[], std::slice::from_ref(&set), true);
+        let mut preparation =
+            SetPreparation::new(&[], std::slice::from_ref(&set), Path::new("lib"), true);
         assert!(!preparation.active());
         assert!(
             !preparation
@@ -8691,7 +8691,8 @@ mod set_preparation_tests {
         assert!(!appdir.join(PREPARED_DIR).exists());
 
         let mut plan = DestinationPlan::load(&appdir).unwrap();
-        let mut preparation = SetPreparation::new(&[], std::slice::from_ref(&set), false);
+        let mut preparation =
+            SetPreparation::new(&[], std::slice::from_ref(&set), Path::new("lib"), false);
         assert!(
             preparation
                 .supply_group(&mut plan, &helper_query(&candidates))

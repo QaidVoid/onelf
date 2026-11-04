@@ -172,8 +172,8 @@ pub(crate) struct Discovery {
 impl Discovery {
     /// Build the activator from the builtin and local descriptors,
     /// keeping the enabled ones sorted by identity and refusing unknown
-    /// or repeated disabled identities. No project-local descriptor
-    /// loading exists yet, so the local list is empty until that lands.
+    /// or repeated disabled identities. The local descriptors are the
+    /// ones a recipe's `[bundle] rules` loaded.
     pub(crate) fn new(
         builtins: &[Descriptor],
         local: &[Descriptor],

@@ -206,6 +206,9 @@ pub struct BundleRequest {
     pub sets: Vec<bundle::sysroot::SharedSet>,
     /// A GL build pinned whole by the recipe.
     pub platform_pin: Option<onelf_sysroot::platform::Pin>,
+    /// The validated rule catalog: built-ins, the recipe's local rules
+    /// and its disables.
+    pub rules: crate::rules::RuleCatalog,
 }
 
 /// Where an assembled AppDir's contents came from.
@@ -238,6 +241,9 @@ pub struct AssemblyReport {
     pub active_rules: Vec<bundle::RuleActivation>,
     /// Whether a whole GL build was pinned.
     pub pinned_gl: bool,
+    /// The selected pins whose resources the assembly prepared into their
+    /// own subtrees, each with the rules that prepared into it.
+    pub prepared: Vec<bundle::PreparedPin>,
 }
 
 impl AssemblyReport {
@@ -377,6 +383,8 @@ impl AssemblyRequest {
         } = recipe;
 
         refuse_library_search_env(recipe_path, &env)?;
+        let rules =
+            crate::rules::RuleCatalog::load(recipe_path, &dir, &rb.rules, &rb.disable_rules)?;
 
         // An imported binary is a second authoritative source of the
         // AppDir's contents, so it is judged before anything is
@@ -620,6 +628,7 @@ impl AssemblyRequest {
                 sysroot,
                 sets,
                 platform_pin,
+                rules,
             },
         })
     }
@@ -653,6 +662,7 @@ impl AssemblyRequest {
                 sets,
                 pinned_gl: self.bundle.platform_pin.is_some(),
                 active_rules: Vec::new(),
+                prepared: Vec::new(),
             });
         }
         let bundled = {
@@ -701,6 +711,7 @@ impl AssemblyRequest {
             sets,
             pinned_gl: self.bundle.platform_pin.is_some(),
             active_rules: bundle::take_activations(),
+            prepared: bundle::take_prepared(),
         })
     }
 
@@ -739,6 +750,7 @@ impl AssemblyRequest {
             sysroot: self.bundle.sysroot.clone(),
             sets: self.bundle.sets.clone(),
             platform_pin: self.bundle.platform_pin.clone(),
+            rules: self.bundle.rules.clone(),
             strict: true,
         }
     }
@@ -819,9 +831,9 @@ impl AssemblyRequest {
             profile,
             provider_index: None,
             // Carrying no records is the right default here: the recipe
-            // build lowers the selection table its resolved selections
-            // write at the call site, and every other build carries
-            // neither record.
+            // build lowers its rule and selection records at the call
+            // site, once assembly has prepared its pins, and every other
+            // build carries neither record.
             metadata: pack::MetadataPayload::default(),
             runtime_note,
         }
@@ -1570,6 +1582,7 @@ mod tests {
                 sets: Vec::new(),
                 pinned_gl: false,
                 active_rules: Vec::new(),
+                prepared: Vec::new(),
             }
         );
         assert!(!dir.join(".onelf").exists());
@@ -1648,6 +1661,7 @@ mod tests {
             sets: vec!["gtk".to_string()],
             pinned_gl: false,
             active_rules: Vec::new(),
+            prepared: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),
@@ -1680,6 +1694,7 @@ mod tests {
             sets: Vec::new(),
             pinned_gl: true,
             active_rules: rules,
+            prepared: Vec::new(),
         };
         let forward = report(vec![
             activation("alsa", "libasound.so.2", &["plugins", "configuration"]),
@@ -1720,6 +1735,7 @@ mod tests {
             sets: Vec::new(),
             pinned_gl: false,
             active_rules: Vec::new(),
+            prepared: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),

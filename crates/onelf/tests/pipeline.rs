@@ -16169,9 +16169,9 @@ fn a_dev_run_with_sets_exports_the_packed_library_path() {
 /// it needs is one no build machine's installation provides, so the
 /// bundle rests on no host installation content and the scanner the
 /// rule requires is prepared from the pinned set alone. The launch
-/// names the set's copy for the app under development and packed
-/// execution alike, the scanner the app invokes directly reads its
-/// registry data from beside itself, and it exits clean both ways.
+/// names the pin's prepared copy, ahead of the raw set's, for the app
+/// under development and packed execution alike, and the scanner the
+/// app invokes directly exits clean both ways.
 #[test]
 fn a_set_scanner_serves_both_launch_forms() {
     let td = workdir("parity-scanner");
@@ -16346,24 +16346,21 @@ int main(void) {
         };
         let scanner = line("scanner=");
         assert!(
-            scanner.ends_with("/lib/gstreamer-1.0/gst-plugin-scanner"),
-            "{stdout}"
-        );
-        assert!(
-            !scanner.starts_with("/usr"),
-            "the host installation's own scanner answers: {stdout}"
+            scanner.contains("/.onelf-prepared/toolkit/")
+                && scanner.ends_with("/libexec/gstreamer-1.0/gst-plugin-scanner"),
+            "the pin's prepared copy answers ahead of the raw set: {stdout}"
         );
         assert!(scanner.starts_with(td.to_str().unwrap()), "{stdout}");
         assert!(
             !scanner.contains(&app.to_string_lossy().to_string()),
-            "the set's copy answers, not the AppDir: {stdout}"
+            "the launched tree's copy answers, not the AppDir: {stdout}"
         );
         assert_eq!(line("helper="), "0", "{stdout}");
-        assert_eq!(line("registry="), "registry-v1", "{stdout}");
+        assert_eq!(line("registry="), "(absent)", "{stdout}");
     };
 
     // Packed: the build prepares the scanner from the set, and the
-    // launch names the set's extraction for the app.
+    // launch names the prepared copy for the app.
     let Some(dir) = build_app_dir("scanner") else {
         return;
     };
@@ -16396,8 +16393,7 @@ int main(void) {
     assert_scan(&String::from_utf8_lossy(&out.stdout), &dir);
 
     // Development: the same recipe stages the same preparation, and the
-    // launch resolves the scanner from the set's extraction the same
-    // way.
+    // launch resolves the prepared scanner the same way.
     let Some(dev_dir) = build_app_dir("dev-scanner") else {
         return;
     };
@@ -16639,10 +16635,11 @@ fn helper_sysroot_recipe(dir: &Path, archive: &Path, extra: &str) {
     );
 }
 
-/// The helper a fixture launch named ran, and read the registry data
-/// beside itself: the answer is the set's own copy under the test's
-/// tree, never the packer's machine's installation and never the
-/// AppDir the build wrote.
+/// The helper a fixture launch named ran, and it is the copy the build
+/// prepared into the pin's subtree of the launched tree, never the raw
+/// set root's, the packer's machine's installation or the AppDir the
+/// build wrote. The registry data sits only beside the raw set's copy and
+/// no rule declares it, so the prepared copy finds none beside itself.
 fn assert_set_helper_ran(stdout: &str, td: &Path, dir: &Path) {
     let line = |key: &str| {
         stdout
@@ -16652,18 +16649,18 @@ fn assert_set_helper_ran(stdout: &str, td: &Path, dir: &Path) {
             .to_string()
     };
     let scanner = line("scanner=");
-    assert!(scanner.ends_with("gst-plugin-scanner"), "{stdout}");
+    assert!(
+        scanner.contains("/.onelf-prepared/toolkit/")
+            && scanner.ends_with("/libexec/gstreamer-1.0/gst-plugin-scanner"),
+        "the pin's prepared copy must answer: {stdout}"
+    );
     assert!(scanner.starts_with(td.to_str().unwrap()), "{stdout}");
     assert!(
-        !scanner.starts_with("/usr"),
-        "the host installation's own helper answered: {stdout}"
-    );
-    assert!(
         !scanner.contains(&dir.to_string_lossy().to_string()),
-        "the AppDir answered instead of the set's copy: {stdout}"
+        "the AppDir answered instead of the launched tree: {stdout}"
     );
     assert_eq!(line("helper="), "0", "{stdout}");
-    assert_eq!(line("registry="), "registry-v1", "{stdout}");
+    assert_eq!(line("registry="), "(absent)", "{stdout}");
 }
 
 /// A database-backed sysroot build prepares a required helper that

@@ -46,6 +46,9 @@ struct Assembled {
     /// The shared assembly request a build would pack from, carrying
     /// the resolved selection table a build lowers into its record.
     request: assembly::AssemblyRequest,
+    /// The pins the assembly prepared resources into, which bind runtime
+    /// records exactly as a build's would.
+    prepared: Vec<crate::bundle::PreparedPin>,
 }
 
 /// Assemble the AppDir for a bundle launch the way a build assembles it:
@@ -62,8 +65,27 @@ struct Assembled {
 fn assemble_for_launch(loaded: Loaded) -> io::Result<Assembled> {
     onelf_rt::platform::supply_https_fetch(https_fetch);
     let request = assembly::AssemblyRequest::plan(&loaded.path, loaded.recipe, None)?;
-    request.stage()?;
-    Ok(Assembled { request })
+    let report = request.stage()?;
+    Ok(Assembled {
+        request,
+        prepared: report.prepared,
+    })
+}
+
+/// Install `records` as the launch's runtime rule record, through the
+/// same lowering and codec a build packs them with, so a development
+/// launch evaluates exactly the canonical record a packed one reads.
+fn carry_rules(records: Vec<onelf_format::runtime_metadata::RuntimeRuleRecord>) -> io::Result<()> {
+    let invalid = |e: onelf_format::runtime_metadata::MetadataError| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("runtime rules: {e}"))
+    };
+    let lowered = crate::pack::lower_runtime_metadata(records, None).map_err(invalid)?;
+    if let Some(bytes) = lowered.runtime_rules {
+        let decoded =
+            onelf_format::runtime_metadata::RuntimeRuleMetadata::decode(&bytes).map_err(invalid)?;
+        onelf_rt::env::carry_rules(decoded);
+    }
+    Ok(())
 }
 
 /// The CLI's HTTPS client, supplied as acquisition's `https://`
@@ -267,6 +289,27 @@ pub fn run(
         },
     };
     let env_data = env_bytes(&recipe_env);
+
+    // The runtime rule record a build of this recipe would carry, put in
+    // place before any mapping is evaluated: the recipe's local rules and
+    // disables, and in bundle mode the pins the assembly prepared.
+    let carried = match (&assembled, &found) {
+        (Some(a), _) => a.request.bundle.rules.runtime_records(&a.prepared)?,
+        (None, Some(l)) => {
+            let recipe_dir = l.path.parent().unwrap_or(Path::new("."));
+            crate::rules::RuleCatalog::load(
+                &l.path,
+                recipe_dir,
+                &l.recipe.bundle.rules,
+                &l.recipe.bundle.disable_rules,
+            )?
+            .runtime_records(&[])?
+        }
+        (None, None) => None,
+    };
+    if let Some(records) = carried {
+        carry_rules(records)?;
+    }
 
     // The argv0 decision, taken once for the record pass and the launch
     // pass alike: the tree the view stages is a copy, so every path the
