@@ -270,7 +270,7 @@ pub(crate) fn resolved_store() -> Option<PathBuf> {
         if let Some(dir) = hint {
             return Some(dir);
         }
-        return onelf_format::cache_layout::proposed_root(None)
+        return onelf_format::cache_layout::proposed_root(uid, None)
             .filter(|root| {
                 !root.exists() || onelf_format::cache_layout::is_safe_owned_dir(root, uid)
             })

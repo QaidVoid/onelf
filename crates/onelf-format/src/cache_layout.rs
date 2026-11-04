@@ -58,53 +58,115 @@ pub fn ensure_safe_dir(dir: &Path, uid: u32) -> bool {
     is_safe_owned_dir(dir, uid)
 }
 
+/// The root-owned private base a privileged process keeps its state
+/// under, chosen without consulting the environment: `/run/onelf` when
+/// `/run` is a real root-owned directory nobody else may write, else
+/// `/tmp/onelf-0`. See [`privileged_base_in`] for the acceptance rules.
+pub fn privileged_base() -> Option<PathBuf> {
+    privileged_base_in(0, Path::new("/run"), Path::new("/tmp"))
+}
+
+/// [`privileged_base`]'s rules for `uid` over explicit candidate parents.
+///
+/// `<run>/onelf` is preferred when `run` is a real directory `uid` owns
+/// that group and other cannot write, so nobody else can have planted
+/// the name. Otherwise `<tmp>/onelf-<uid>` serves, which any user may
+/// pre-create in a sticky `/tmp`. Either candidate is created `0700` when
+/// absent and accepted only as a real directory owned by `uid` with no
+/// group or other access; a pre-existing one that fails is refused, never
+/// chmod'd through.
+pub fn privileged_base_in(uid: u32, run: &Path, tmp: &Path) -> Option<PathBuf> {
+    let run_is_private = std::fs::symlink_metadata(run)
+        .is_ok_and(|md| md.is_dir() && md.uid() == uid && md.mode() & 0o022 == 0);
+    if run_is_private {
+        let dir = run.join("onelf");
+        if create_private_dir(&dir, uid) {
+            return Some(dir);
+        }
+    }
+    let dir = tmp.join(format!("onelf-{uid}"));
+    create_private_dir(&dir, uid).then_some(dir)
+}
+
+/// Create `dir` at `0700` with one `mkdir`, so it is never group or
+/// other accessible, and report whether it is now a real directory `uid`
+/// owns with no group or other access. A pre-existing path is checked,
+/// never chmod'd, since it may be a symlink or another user's.
+pub fn create_private_dir(dir: &Path, uid: u32) -> bool {
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    is_safe_owned_dir(dir, uid)
+}
+
+/// The cache base the environment names for `uid`: `$XDG_CACHE_HOME`,
+/// then `$HOME/.cache`, each only when absolute, because an empty or
+/// relative value would resolve against the current directory. A
+/// privileged uid takes none: both variables were chosen by the
+/// unprivileged caller that started the launch, and `sudo -E` keeps them
+/// pointing into that caller's home.
+fn env_base(uid: u32, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if uid == 0 {
+        return None;
+    }
+    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
+        let p = PathBuf::from(v);
+        p.is_absolute().then_some(p)
+    };
+    var("XDG_CACHE_HOME")
+        .and_then(abs)
+        .or_else(|| var("HOME").and_then(abs).map(|h| h.join(".cache")))
+}
+
 /// Resolve the cache root, or `None` when no safe location can be
 /// established. Callers MUST treat `None` as a refusal rather than
 /// substituting a guess: a shared world-writable fallback is what this
 /// function exists to prevent.
 ///
-/// Prefers `$XDG_CACHE_HOME`, then `~/.cache`, both of which are already
-/// user-private. Only an *absolute* env-derived path is trusted, because an
-/// empty or relative one would resolve against the current directory, which
-/// the caller does not control. `fallback` supplies the last resort (the
-/// runtime passes its `0700` per-uid directory; a caller with none passes
-/// `None`).
+/// An ordinary uid prefers `$XDG_CACHE_HOME`, then `~/.cache`, both of
+/// which are already user-private, and only an absolute value is
+/// trusted. `fallback` supplies the last resort (the runtime passes its
+/// `0700` per-uid directory; a caller with none passes `None`). Uid 0
+/// ignores the environment entirely and uses `fallback`, or the
+/// [`privileged_base`] when the caller has none, so root never creates
+/// or trusts state under a path the invoking user chose.
 pub fn resolve_root(uid: u32, fallback: Option<PathBuf>) -> Option<PathBuf> {
-    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
-        let p = PathBuf::from(v);
-        p.is_absolute().then_some(p)
-    };
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .and_then(abs)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(abs)
-                .map(|h| h.join(".cache"))
-        })
-        .or(fallback)?;
+    resolve_root_with(uid, |name| std::env::var_os(name), fallback)
+}
+
+/// [`resolve_root`] over an injected environment lookup.
+fn resolve_root_with(
+    uid: u32,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base = env_base(uid, var)
+        .or(fallback)
+        .or_else(|| (uid == 0).then(privileged_base).flatten())?;
     let onelf = base.join("onelf");
     ensure_safe_dir(&onelf, uid).then_some(onelf)
 }
 
-/// Where [`resolve_root`] would place the cache root, computed from the
-/// environment alone: nothing is created and nothing on disk is probed.
-/// The launch export answers this so merely starting a launch never
-/// establishes the persistent cache; acquisition keeps using
+/// Where [`resolve_root`] would place the cache root for `uid`, computed
+/// from the environment alone: nothing is created and nothing on disk is
+/// probed. The launch export answers this so merely starting a launch
+/// never establishes the persistent cache; acquisition keeps using
 /// [`resolve_root`], which creates the root under its safe-creation
 /// rules on demand. The `fallback` applies only when the environment
-/// names no absolute cache location, mirroring [`resolve_root`].
-pub fn proposed_root(fallback: Option<PathBuf>) -> Option<PathBuf> {
-    let abs = |v: std::ffi::OsString| -> Option<PathBuf> {
-        let p = PathBuf::from(v);
-        p.is_absolute().then_some(p)
-    };
-    std::env::var_os("XDG_CACHE_HOME")
-        .and_then(abs)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .and_then(abs)
-                .map(|h| h.join(".cache"))
-        })
+/// names no absolute cache location, and is the only base uid 0 takes.
+pub fn proposed_root(uid: u32, fallback: Option<PathBuf>) -> Option<PathBuf> {
+    proposed_root_with(uid, |name| std::env::var_os(name), fallback)
+}
+
+/// [`proposed_root`] over an injected environment lookup.
+fn proposed_root_with(
+    uid: u32,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    env_base(uid, var)
         .or(fallback)
         .map(|base| base.join("onelf"))
 }
@@ -254,6 +316,100 @@ mod tests {
 
         assert_eq!(root, Some(fallback.join("onelf")));
         let _ = std::fs::remove_dir_all(&fallback);
+    }
+
+    /// An environment lookup over fixed values, so the root decision is
+    /// tested without touching the process environment.
+    fn env_of(pairs: &[(&str, &Path)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+        let pairs: Vec<(String, PathBuf)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_path_buf()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone().into_os_string())
+        }
+    }
+
+    /// Uid 0 takes neither `XDG_CACHE_HOME` nor `HOME`: the proposal is
+    /// the private base the caller supplies, and resolving creates nothing
+    /// under the directories the environment names. An ordinary uid keeps
+    /// the environment's choice.
+    #[test]
+    fn root_ignores_the_environment_cache_base() {
+        let xdg = unique("root-xdg");
+        let home = unique("root-home");
+        let fallback = unique("root-fb");
+        for dir in [&xdg, &home, &fallback] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let both = env_of(&[("XDG_CACHE_HOME", &xdg), ("HOME", &home)]);
+        let home_only = env_of(&[("HOME", &home)]);
+
+        assert_eq!(
+            proposed_root_with(0, &both, Some(fallback.clone())),
+            Some(fallback.join("onelf"))
+        );
+        assert_eq!(proposed_root_with(0, &both, None), None);
+        assert_eq!(
+            proposed_root_with(1000, &both, Some(fallback.clone())),
+            Some(xdg.join("onelf"))
+        );
+        assert_eq!(
+            proposed_root_with(1000, &home_only, None),
+            Some(home.join(".cache").join("onelf"))
+        );
+
+        let _ = resolve_root_with(0, &both, Some(fallback.clone()));
+        assert_eq!(std::fs::read_dir(&xdg).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+
+        for dir in [&xdg, &home, &fallback] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The privileged base prefers the run directory only when its owner
+    /// is the uid and nobody else may write it, and falls back to the
+    /// per-uid temporary name, which is refused when another object
+    /// already holds it.
+    #[test]
+    fn the_privileged_base_prefers_a_private_run_directory() {
+        let me = uid();
+        let top = unique("pbase");
+        let run = top.join("run");
+        let tmp = top.join("tmp");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let got = privileged_base_in(me, &run, &tmp).unwrap();
+        assert_eq!(got, run.join("onelf"));
+        assert_eq!(
+            std::fs::symlink_metadata(&got).unwrap().mode() & 0o777,
+            0o700
+        );
+
+        std::fs::remove_dir(&got).unwrap();
+        std::fs::set_permissions(&run, PermissionsExt::from_mode(0o777)).unwrap();
+        assert_eq!(
+            privileged_base_in(me, &run, &tmp),
+            Some(tmp.join(format!("onelf-{me}"))),
+            "a run directory others may write is never used"
+        );
+        assert!(!run.join("onelf").exists());
+
+        std::fs::remove_dir(tmp.join(format!("onelf-{me}"))).unwrap();
+        std::os::unix::fs::symlink(&top, tmp.join(format!("onelf-{me}"))).unwrap();
+        assert_eq!(
+            privileged_base_in(me, &top.join("absent"), &tmp),
+            None,
+            "a planted fallback name is refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]

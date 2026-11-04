@@ -48,7 +48,8 @@ fn file_hashes_to(path: &Path, expected: &[u8; 32]) -> bool {
 /// Resolve the persistent cache root, or `None` when no safe location can
 /// be established, in which case the caller refuses rather than extracting
 /// into an untrusted path. The rules live in `onelf_format::cache_layout` so
-/// the packer CLI applies exactly the same ones.
+/// the packer CLI applies exactly the same ones: root takes its private
+/// base and never an inherited `HOME` or `XDG_CACHE_HOME`.
 fn cache_dir() -> Option<PathBuf> {
     onelf_format::cache_layout::resolve_root(
         rustix::process::getuid().as_raw(),
