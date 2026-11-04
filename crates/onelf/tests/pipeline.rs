@@ -16119,8 +16119,8 @@ fn host_and_set_libraries_load_without_a_library_path() {
 
 /// A development run with an active set and a resolver farm applies the
 /// packed launch's library-path gate: the app's run path reaches the
-/// view's links, so neither form exports a generated `LD_LIBRARY_PATH`
-/// and both hand the app the same value the caller started with.
+/// view's links, so neither form exports a generated `LD_LIBRARY_PATH`,
+/// and both withhold the caller's value from the app.
 #[test]
 fn a_dev_run_with_sets_exports_the_packed_library_path() {
     let td = workdir("lpparity");
@@ -16159,10 +16159,7 @@ fn a_dev_run_with_sets_exports_the_packed_library_path() {
         dev_lp, packed_lp,
         "the launch forms disagree on LD_LIBRARY_PATH"
     );
-    assert_eq!(
-        dev_lp, caller,
-        "a generated search path leaked into the app"
-    );
+    assert_eq!(dev_lp, "(unset)", "a search path reached the app");
     let _ = std::fs::remove_dir_all(&td);
 }
 
