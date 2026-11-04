@@ -1,5 +1,5 @@
 //! Pinned distro fixtures: pack and run the documented application kinds
-//! inside Ubuntu 24.04, Alpine 3.20 and Fedora 40 container images, and
+//! inside Ubuntu 24.04, Alpine 3.20 and Fedora 44 container images, and
 //! prove what the static musl runtime guarantees there.
 //!
 //! The images build from `ci/fixtures/Dockerfile.*`: base tags pinned by
@@ -16,6 +16,11 @@
 //! * each distro builds, packs and runs the CLI, GTK, Qt, script plus
 //!   helper, and environment-clearing re-exec fixtures, asserting the
 //!   documented output of each,
+//! * the GTK and Qt packages also run on a bare base image of a foreign
+//!   libc that has no GTK or Qt installed, once cleanly and once under
+//!   hostile inherited GStreamer, Qt, GTK and GIO search paths plus a
+//!   conflicting `/etc/asound.conf`, so their output proves the bundle
+//!   answered,
 //! * a package built on one distro runs on the other two, with the
 //!   compiled-in marker naming the distro that produced it,
 //! * the slim and update-feature runtimes are static musl (no
@@ -26,6 +31,10 @@
 //!   host-libs-never package prints its bundled glibc version on Ubuntu,
 //!   on Fedora and on Alpine, so Alpine's musl never answers, and a musl
 //!   application packed the same way prints musl on a glibc host.
+//!
+//! Every container runs with `--network none` and as the invoking user,
+//! and each test prints the image ID of every image it runs, so a log
+//! names exactly what was exercised.
 //!
 //! Capability skips are accounted, not silent: without a container
 //! engine (docker, or podman) or without `ONELF_DISTRO_FIXTURES=1` the
@@ -39,7 +48,7 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 
 /// The distros the fixtures pin, in the order tests report them.
-const DISTROS: [&str; 3] = ["ubuntu-24.04", "alpine-3.20", "fedora-40"];
+const DISTROS: [&str; 3] = ["ubuntu-24.04", "alpine-3.20", "fedora-44"];
 
 /// The workspace's own `onelf` CLI, built for the host.
 fn onelf() -> &'static str {
@@ -302,18 +311,72 @@ fn image(engine: &Engine, distro: &str) -> String {
             "fixture image {distro} failed to build:\n{}",
             String::from_utf8_lossy(&o.stderr)
         );
+        record_image_id(engine, &tag);
     }
     tag
+}
+
+/// The bare base image a distro's fixture Dockerfile starts `FROM`,
+/// pulled once per process. It carries none of the fixture packages, so
+/// a package that runs there brought its own libraries.
+fn bare_image(engine: &Engine, distro: &str) -> String {
+    static PULLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let pulled = PULLED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut pulled = pulled.lock().unwrap();
+    let dockerfile = workspace_root().join(format!("ci/fixtures/Dockerfile.{distro}"));
+    let text = std::fs::read_to_string(&dockerfile)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile.display()));
+    let base = text
+        .lines()
+        .find_map(|l| l.strip_prefix("FROM "))
+        .unwrap_or_else(|| panic!("{} has no FROM line", dockerfile.display()))
+        .trim()
+        .to_string();
+    if pulled.insert(base.clone()) {
+        let o = engine.run(&["pull".to_string(), base.clone()]);
+        assert!(
+            o.status.success(),
+            "pulling the bare image {base} failed:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        record_image_id(engine, &base);
+    }
+    base
+}
+
+/// Print the engine's image ID for `reference`, so the test output names
+/// the exact image the fixtures ran.
+fn record_image_id(engine: &Engine, reference: &str) {
+    let o = engine.run(&[
+        "image".to_string(),
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.Id}}".to_string(),
+        reference.to_string(),
+    ]);
+    assert!(
+        o.status.success(),
+        "inspecting image {reference} failed:\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    eprintln!(
+        "fixture image {reference}: {}",
+        String::from_utf8_lossy(&o.stdout).trim()
+    );
 }
 
 /// One `run` in a fixture container: the repository at `/repo` and the
 /// cargo target directory at `/onelf-target`, both read-only, the
 /// scratch tree at `/work`, and the static musl onelf at `$ONELF_BIN`.
+/// The container has no network and runs as the owner of the scratch
+/// tree with `HOME=/work`, so everything it writes stays removable by
+/// the test. `extra_args` go to the engine before the image.
 fn container(
     engine: &Engine,
     tag: &str,
     scratch: &Workdir,
     extra_env: &[(&str, String)],
+    extra_args: &[String],
     script: &str,
 ) -> Output {
     let onelf_bin = format!(
@@ -324,7 +387,8 @@ fn container(
             .to_string_lossy()
     );
     let mut cmd = Command::new(&engine.0);
-    cmd.args(["run", "--rm"]);
+    cmd.args(["run", "--rm", "--network", "none"]);
+    cmd.args(user_args(engine, scratch));
     cmd.arg("-v")
         .arg(format!("{}:/repo:ro", workspace_root().to_string_lossy()));
     cmd.arg("-v").arg(format!(
@@ -334,15 +398,36 @@ fn container(
     cmd.arg("-v")
         .arg(format!("{}:/work", scratch.to_string_lossy()));
     cmd.arg("-e").arg(format!("ONELF_BIN={onelf_bin}"));
+    cmd.arg("-e").arg("HOME=/work");
     for (key, value) in extra_env {
         cmd.arg("-e").arg(format!("{key}={value}"));
     }
+    cmd.args(extra_args);
     cmd.arg(tag).arg("sh").arg("-c").arg(script);
     cmd.output().expect("spawn container run")
 }
 
+/// Run the container as the owner of the scratch tree. Rootless podman
+/// maps that user through `keep-id`; docker takes the numeric ids.
+fn user_args(engine: &Engine, scratch: &Workdir) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let podman = Path::new(&engine.0)
+        .file_name()
+        .is_some_and(|name| name == "podman");
+    if podman {
+        return vec!["--userns=keep-id".to_string()];
+    }
+    let meta = std::fs::metadata(&scratch.0)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", scratch.0.display()));
+    vec![
+        "--user".to_string(),
+        format!("{}:{}", meta.uid(), meta.gid()),
+    ]
+}
+
 fn container_simple(engine: &Engine, tag: &str, scratch: &Workdir, script: &str) -> Output {
-    container(engine, tag, scratch, &[], script)
+    container(engine, tag, scratch, &[], &[], script)
 }
 
 /// Run a container command and fail with the transcript when it exits
@@ -403,7 +488,7 @@ fn pack(engine: &Engine, tag: &str, scratch: &Workdir, app: &str, with_patchelf:
     } else {
         Vec::new()
     };
-    container(engine, tag, scratch, &env, &script)
+    container(engine, tag, scratch, &env, &[], &script)
 }
 
 /// Run a packed package in an image, with only the environment the image
@@ -411,6 +496,100 @@ fn pack(engine: &Engine, tag: &str, scratch: &Workdir, app: &str, with_patchelf:
 fn run_pkg(engine: &Engine, tag: &str, scratch: &Workdir, pkg_rel: &str, args: &[&str]) -> Output {
     let script = format!("HOME=/work {} {}", in_work(pkg_rel), args.join(" "));
     container_simple(engine, tag, scratch, script.trim_end())
+}
+
+/// Run a packed package with hostile inherited framework search paths
+/// that all point at junk under `/work/hostile`, and with that tree's
+/// conflicting ALSA snippet mounted over `/etc/asound.conf`. A package
+/// that bundles its frameworks must not let any of them answer.
+fn run_pkg_hostile(engine: &Engine, tag: &str, scratch: &Workdir, pkg_rel: &str) -> Output {
+    let hostile = write_hostile_tree(scratch);
+    let dir = |rel: &str| format!("/work/hostile/{rel}");
+    let env = [
+        ("GST_PLUGIN_PATH", dir("gstreamer-1.0")),
+        ("GST_PLUGIN_PATH_1_0", dir("gstreamer-1.0")),
+        ("GST_PLUGIN_SYSTEM_PATH", dir("gstreamer-1.0")),
+        ("GST_PLUGIN_SYSTEM_PATH_1_0", dir("gstreamer-1.0")),
+        ("GST_PLUGIN_SCANNER", dir("gst-plugin-scanner")),
+        ("GST_PLUGIN_SCANNER_1_0", dir("gst-plugin-scanner")),
+        ("QT_PLUGIN_PATH", dir("qt/plugins")),
+        ("QT_QPA_PLATFORM_PLUGIN_PATH", dir("qt/plugins/platforms")),
+        ("GTK_PATH", dir("gtk-3.0")),
+        ("GTK_IM_MODULE_FILE", dir("immodules.cache")),
+        ("GDK_PIXBUF_MODULE_FILE", dir("loaders.cache")),
+        ("GIO_MODULE_DIR", dir("gio/modules")),
+    ];
+    let mount = vec![
+        "-v".to_string(),
+        format!(
+            "{}:/etc/asound.conf:ro",
+            hostile.join("asound.conf").display()
+        ),
+    ];
+    container(engine, tag, scratch, &env, &mount, &in_work(pkg_rel))
+}
+
+/// The junk tree the hostile variables name: plugin files that are not
+/// ELF objects, a scanner that reports itself if anything runs it,
+/// unparsable module caches, and an ALSA default naming a PipeWire
+/// backend no fixture image has.
+fn write_hostile_tree(scratch: &Workdir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch.join("hostile");
+    let junk = b"not an ELF object\n";
+    for rel in [
+        "gstreamer-1.0/libgstcoreelements.so",
+        "qt/plugins/platforms/libqxcb.so",
+        "qt/plugins/platforms/libqoffscreen.so",
+        "gtk-3.0/3.0.0/immodules/im-hostile.so",
+        "gio/modules/libgiohostile.so",
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, junk).unwrap();
+    }
+    std::fs::write(root.join("immodules.cache"), "}{ hostile\n").unwrap();
+    std::fs::write(root.join("loaders.cache"), "}{ hostile\n").unwrap();
+    let scanner = root.join("gst-plugin-scanner");
+    std::fs::write(
+        &scanner,
+        "#!/bin/sh\necho HOSTILE_SCANNER_RAN >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&scanner, PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(
+        root.join("asound.conf"),
+        "pcm.!default {\n    type pipewire\n}\nctl.!default {\n    type pipewire\n}\n",
+    )
+    .unwrap();
+    root
+}
+
+/// Assert a hostile-path run behaved like a clean one: the expected
+/// marker, and no sign that the junk scanner ran.
+fn assert_hostile_run(out: &Output, prefix: &str, what: &str) {
+    must(out, what);
+    assert!(
+        stdout_of(out).starts_with(prefix),
+        "{what}: wrong output under hostile inherited paths:\n{}",
+        transcript(out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("HOSTILE_SCANNER_RAN"),
+        "{what}: the inherited scanner ran:\n{}",
+        transcript(out)
+    );
+}
+
+/// The libc family a distro is not: the foreign bare image a package
+/// built there runs on to prove it carries its own libraries.
+fn foreign_distro(distro: &str) -> &'static str {
+    if distro.starts_with("alpine") {
+        "ubuntu-24.04"
+    } else {
+        "alpine-3.20"
+    }
 }
 
 /// The package file an `onelf build` of recipe `name` produced.
@@ -425,11 +604,14 @@ fn in_work(rel: &str) -> String {
 
 /// `file`, `readelf` and `ldd` transcripts of a packed package, taken
 /// inside the image so the answers come from the pinned distro's own
-/// binutils.
+/// binutils. `file` and `readelf` must succeed. `ldd` exits nonzero on
+/// a static object, so its exit status is recorded rather than checked,
+/// and [`assert_static_musl`] requires its static verdict instead.
 fn static_report(engine: &Engine, tag: &str, scratch: &Workdir, pkg_rel: &str) -> String {
     let pkg = in_work(pkg_rel);
     let script = format!(
-        "file {pkg}; echo ---; readelf -lW {pkg}; echo ---; readelf -dW {pkg}; echo ---; ldd {pkg} 2>&1 || true"
+        "set -e; file {pkg}; echo ---; readelf -lW {pkg}; echo ---; readelf -dW {pkg}; echo ---; \
+         status=0; ldd {pkg} 2>&1 || status=$?; echo \"ldd exit $status\""
     );
     let out = container_simple(engine, tag, scratch, &script);
     must(&out, &format!("inspecting {pkg_rel}"));
@@ -439,6 +621,14 @@ fn static_report(engine: &Engine, tag: &str, scratch: &Workdir, pkg_rel: &str) -
 /// Assert the report shows a static musl runtime: a static link line, no
 /// interpreter segment, no dynamic entries naming a library.
 fn assert_static_musl(report: &str, what: &str) {
+    assert!(
+        report.contains("Program Headers:"),
+        "{what}: readelf printed no program headers, so the absence checks prove nothing:\n{report}"
+    );
+    assert!(
+        report.contains("not a dynamic executable") || report.contains("statically linked"),
+        "{what}: ldd did not report a static object:\n{report}"
+    );
     assert!(
         report.contains("static-pie linked") || report.contains("statically linked"),
         "{what}: `file` does not report a static link:\n{report}"
@@ -568,6 +758,30 @@ fn app_kinds_run_on(distro: &'static str) {
         transcript(&out)
     );
 
+    // GTK and Qt again on a bare image of the other libc family, which
+    // has neither toolkit nor this libc installed, first cleanly and then
+    // under hostile inherited framework paths.
+    let foreign = foreign_distro(distro);
+    let bare = bare_image(&engine, foreign);
+    for (rel, prefix) in [
+        ("apps/gtk/onelf-distro-gtk.onelf", "GTK_OK 3."),
+        ("apps/qt/onelf-distro-qt.onelf", "QT_OK 6."),
+    ] {
+        let out = run_pkg(&engine, &bare, &td, rel, &[]);
+        must(&out, &format!("{distro}: {rel} on bare {foreign}"));
+        assert!(
+            stdout_of(&out).starts_with(prefix),
+            "{distro}: {rel} did not answer from its bundle on bare {foreign}:\n{}",
+            transcript(&out)
+        );
+        let out = run_pkg_hostile(&engine, &bare, &td, rel);
+        assert_hostile_run(
+            &out,
+            prefix,
+            &format!("{distro}: {rel} on bare {foreign} with hostile paths"),
+        );
+    }
+
     // Script and helper: a shell entrypoint execs a bundled companion.
     write_recipe(
         &td,
@@ -641,8 +855,8 @@ fn fixture_app_kinds_build_pack_and_run_on_alpine_3_20() {
 }
 
 #[test]
-fn fixture_app_kinds_build_pack_and_run_on_fedora_40() {
-    app_kinds_run_on("fedora-40");
+fn fixture_app_kinds_build_pack_and_run_on_fedora_44() {
+    app_kinds_run_on("fedora-44");
 }
 
 /// Build on one distro, run on another: the compiled-in marker names the
@@ -661,7 +875,7 @@ fn packages_run_across_distro_lines() {
         &pack(&engine, &ubuntu, &td, "cli", false),
         "cross: packing on Ubuntu",
     );
-    for host in ["alpine-3.20", "fedora-40"] {
+    for host in ["alpine-3.20", "fedora-44"] {
         let host_tag = image(&engine, host);
         let out = run_pkg(
             &engine,
@@ -687,7 +901,7 @@ fn packages_run_across_distro_lines() {
         &pack(&engine, &alpine, &td, "cli", false),
         "cross: packing on Alpine",
     );
-    let fedora = image(&engine, "fedora-40");
+    let fedora = image(&engine, "fedora-44");
     let out = run_pkg(
         &engine,
         &fedora,
