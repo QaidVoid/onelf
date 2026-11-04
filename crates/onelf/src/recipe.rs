@@ -248,7 +248,23 @@ impl SetSelections {
     ///
     /// A named entrypoint's omitted list stays omitted: it selects all
     /// declared sets and does not inherit the package command's list.
+    /// A `[package]` list beside a default named entrypoint is refused:
+    /// that entrypoint replaces the package command in the package's
+    /// entrypoint table, so the list would select for nothing.
     pub fn normalize(recipe: &Recipe) -> std::io::Result<Self> {
+        if recipe.package.sets.is_some()
+            && let Some(default) = recipe.entrypoint.iter().find(|e| e.default)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "[package] sets has no entrypoint to apply to: entrypoint '{}' is the \
+                     default and takes the package command's place. Write the list as \
+                     that entrypoint's sets instead",
+                    default.name
+                ),
+            ));
+        }
         let declared: std::collections::BTreeSet<&str> = recipe
             .sysroot
             .as_ref()
@@ -1053,6 +1069,28 @@ mod selection_tests {
         ));
         assert_eq!(s.primary, SetSelection::Names(vec!["gtk".to_string()]));
         assert_eq!(s.named["cli"], SetSelection::All);
+    }
+
+    /// A default named entrypoint replaces the package command in the
+    /// entrypoint table, so a `[package]` list beside it would apply to
+    /// nothing: the recipe is refused at load, naming the entrypoint,
+    /// whether or not the default writes a list of its own.
+    #[test]
+    fn a_package_list_beside_a_default_entrypoint_is_refused() {
+        for own in ["", "sets = [\"audio\"]\n"] {
+            let err = load_result(&recipe(&format!(
+                "sets = [\"gtk\"]\n\n[[entrypoint]]\nname = \"gui\"\npath = \"bin/app\"\n\
+                 default = true\n{own}"
+            )))
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("[package] sets"), "{text}");
+            assert!(text.contains("entrypoint 'gui' is the default"), "{text}");
+        }
+        let s = selections(&recipe(
+            "\n[[entrypoint]]\nname = \"gui\"\npath = \"bin/app\"\ndefault = true\nsets = [\"gtk\"]\n",
+        ));
+        assert_eq!(s.named["gui"], SetSelection::Names(vec!["gtk".to_string()]));
     }
 
     /// With nothing declared, an omitted list still selects all (of

@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 /// Write a default onelf.toml at `output`. If `binary` is provided, its
 /// basename is used for the package name and it becomes `bin/<name>`,
 /// with an `[input]` section naming the binary relative to the recipe,
-/// so the scaffolded recipe actually builds. Refuses to overwrite an
+/// so the scaffolded recipe actually builds. A binary that already sits
+/// at `bin/<name>` beside the recipe gets no `[input]`. Refuses to
+/// overwrite an
 /// existing file unless `force` is set.
 pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()> {
     if output.exists() && !force {
@@ -25,13 +27,15 @@ pub fn init(output: &Path, binary: Option<&Path>, force: bool) -> io::Result<()>
         }
         None => ("myapp".to_string(), "bin/myapp".to_string()),
     };
-    let input = match binary {
-        Some(b) => format!(
+    // A binary already at the command path is the AppDir's own, which an
+    // import would rewrite in place, so it gets no `[input]`.
+    let input = match binary.map(|b| recipe_relative(output, b)) {
+        Some(rel) if rel != Path::new(&command) => format!(
             "\n[input]\n# The bare binary imported to `command` before assembly. A path\n\
              # relative to this file.\nbinary = \"{}\"\n",
-            toml_escape(&recipe_relative(output, b).to_string_lossy())
+            toml_escape(&rel.to_string_lossy())
         ),
-        None => String::new(),
+        _ => String::new(),
     };
 
     let body = format!(
@@ -265,6 +269,23 @@ mod tests {
             std::fs::canonicalize(request.input.expect("planned import").source).unwrap(),
             std::fs::canonicalize(&binary).unwrap()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A binary already at the command path beside the recipe is the
+    /// AppDir's own: the seed names it as the command and imports
+    /// nothing, so the recipe builds instead of rewriting its source.
+    #[test]
+    fn a_binary_at_the_command_path_gets_no_import() {
+        let dir = temp_dir("in-place");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/app"), b"#!/bin/sh\n").unwrap();
+        let recipe_path = dir.join("onelf.toml");
+        init(&recipe_path, Some(&dir.join("bin/app")), false).unwrap();
+        let recipe = crate::recipe::load(&recipe_path).unwrap();
+        assert_eq!(recipe.package.command, "bin/app");
+        assert!(recipe.input.is_none());
+        crate::assembly::AssemblyRequest::plan(&recipe_path, recipe, None).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

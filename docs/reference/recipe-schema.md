@@ -75,9 +75,9 @@ binary = "../upstream/myapp"      # PathBuf, relative to the recipe's directory
 
 Imports a bare executable to the package command's path before
 assembly, so a build can start from the upstream binary alone. The
-import reads the source and never writes it; a source outside the
-recipe's directory is never modified by the build at all, while one
-inside it is AppDir content the bundling walk rewrites in place. The
+import reads the source and never writes it, and the bundling walk
+keeps an in-tree source out of its rewriting. A source that is the
+command itself, by path, symlink or hardlink, is refused. The
 staged copy is tracked by content hash, a rebuild refreshes it, and an
 edited copy stops the build instead of being overwritten. `binary`
 must be relative to the recipe's directory, must name a regular file,
@@ -191,7 +191,7 @@ lib-dirs = ["auto"]              # default ["auto"]; the bundle's library dirs
 search-paths = [
   "${MUSL_LIBDRM}/lib",
   "/opt/custom/lib",
-]                                # Vec<String>, supports ${VAR}
+]                                # Vec<String>, supports ${VAR}, relative to the recipe's directory
 exclude = ["libpthread"]         # Vec<String>, soname prefixes to skip
 include = ["libfoo.so.1"]        # Vec<String>, force-include sonames
 gl = false                       # opt-in, never enabled by detection
@@ -292,6 +292,9 @@ in `[package]` and in each `[[entrypoint]]`. The semantics are exact:
   (sorted) declaration order whatever order they were written in.
 - A repeated name, and a name the recipe does not declare, fail when
   the recipe loads, naming the list they were written in.
+- A `[package]` list beside a `default = true` entrypoint fails when the
+  recipe loads: that entrypoint replaces the package command in the
+  package, so write the list as its own `sets`.
 
 A recipe with any explicit list, empty or not, is nonlegacy: it packs
 the selections as `.onelf/entrypoint-sets` and refuses a runtime

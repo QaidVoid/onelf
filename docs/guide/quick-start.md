@@ -18,7 +18,8 @@ runs on your machine.
    assembles around the recipe: the recipe's directory is that AppDir,
    and nothing outside it is touched, the binary you named included.
    An AppDir that already holds the binary needs no `[input]` section:
-   a recipe whose only field is `command` builds the same way.
+   a recipe whose only field is `command` builds the same way, and
+   `init --binary` pointed at the AppDir's own `bin/` copy writes none.
 
 2. **Build** the package:
 

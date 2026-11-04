@@ -58,9 +58,7 @@ binary = "../upstream/myapp"
   the build: it reads, hashes and copies to the command's path, and a
   symlink in the destination's way is refused rather than followed.
   The bundling walk keeps an in-tree source out of its rewriting too,
-  so the file you gave stays byte for byte what it was. A source that
-  is the command's own path is the app itself and is processed like
-  any bundled binary.
+  so the file you gave stays byte for byte what it was.
 - ✅ The staged copy is tracked by content hash: a rebuild refreshes it
   from its source, and a copy someone edited in the AppDir stops the
   build instead of being overwritten or packed stale.
@@ -78,6 +76,10 @@ binary = "../upstream/myapp"
 - ❌ A symlink in the way of the destination, or a command path that
   escapes the AppDir. The build fails before copying or modifying any
   file outside it.
+- ❌ A source that is the command itself: the same path, a symlink to
+  it, or a hardlink of it. Importing would rewrite the source, so the
+  recipe is refused before anything is written. Drop `[input]` when the
+  AppDir already carries the command.
 
 ## Full example
 
@@ -174,6 +176,10 @@ in each `[[entrypoint]]` for that entrypoint. The defaults are exact:
   declaration order.
 - ✅ A named entrypoint's omitted list does **not** inherit the package
   command's explicit list. Every entrypoint's list is its own answer.
+- ❌ A `[package] sets` list beside an entrypoint marked `default = true`.
+  That entrypoint takes the package command's place in the package, so
+  the list would select for nothing. Write it as the default
+  entrypoint's own `sets`.
 
 ```toml
 [package]
@@ -245,7 +251,7 @@ Everything `bundle-libs` accepts, as recipe keys.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `lib-dirs` | array | `["auto"]` | Bundled directories the runtime adds to its lib search (pass `["auto"]` to detect) |
-| `search-paths` | array | `[]` | Extra lib search paths (highest priority) |
+| `search-paths` | array | `[]` | Extra lib search paths (highest priority), relative to the recipe's directory |
 | `exclude` | array | `[]` | Excluded soname prefixes |
 | `include` | array | `[]` | Force-included sonames |
 | `gl` / `dri` / `vulkan` | bool | `false` | Bundle the GPU driver stack. Off by default, so the host's is used. An error with `[sysroot]` |

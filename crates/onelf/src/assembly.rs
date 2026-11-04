@@ -376,14 +376,7 @@ impl AssemblyRequest {
             input,
         } = recipe;
 
-        for name in env.keys() {
-            if let Some(why) = onelf_rt::env::library_search_override(name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{}: [env] {}: refused: {why}", recipe_path.display(), name),
-                ));
-            }
-        }
+        refuse_library_search_env(recipe_path, &env)?;
 
         // An imported binary is a second authoritative source of the
         // AppDir's contents, so it is judged before anything is
@@ -418,7 +411,7 @@ impl AssemblyRequest {
                         ),
                     ));
                 }
-                import_destination(&package.command)?;
+                let destination = dir.join(import_destination(&package.command)?);
                 let source = dir.join(binary);
                 let why = "[input] binary names a bare executable file to import; \
                            archives, package-manager identifiers and source trees \
@@ -440,6 +433,23 @@ impl AssemblyRequest {
                             "{}: [input] binary {}: not a file. {why}",
                             recipe_path.display(),
                             source.display()
+                        ),
+                    ));
+                }
+                // The import rewrites its destination, so a source that is
+                // the destination, by name, symlink or hardlink, would be
+                // rewritten in place.
+                if same_file(&source, &destination) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{}: [input] binary {} is the same file as the package \
+                             command {}, so importing it would rewrite the source. \
+                             Point [input] binary at a file outside the command path, \
+                             or drop [input] when the AppDir already carries the command",
+                            recipe_path.display(),
+                            source.display(),
+                            package.command
                         ),
                     ));
                 }
@@ -535,6 +545,8 @@ impl AssemblyRequest {
         let update_unsigned = update.as_ref().map(|u| u.unsigned).unwrap_or(false);
         let embed_updater = update.as_ref().and_then(|u| u.embed).unwrap_or(true);
 
+        // An absolute entry joins to itself.
+        let search_paths: Vec<PathBuf> = rb.search_paths.iter().map(|p| dir.join(p)).collect();
         let package_info = build_package_info(&package);
         let profile = compression.prefetch.map(|p| dir.join(p));
         let payload: pack::Payload = compression.payload.into();
@@ -602,7 +614,7 @@ impl AssemblyRequest {
                 trace_run: rb.trace_run,
                 trace_seconds: rb.trace_seconds.unwrap_or(5),
                 trace_args: rb.trace_args,
-                search_paths: rb.search_paths.into_iter().map(PathBuf::from).collect(),
+                search_paths,
                 exclude: rb.exclude,
                 include: rb.include,
                 sysroot,
@@ -628,13 +640,13 @@ impl AssemblyRequest {
         }
         let sets = set_names(&self.bundle.sets);
         if self.bundle.skip {
-            if !self.bundle.sets.is_empty() || self.bundle.platform_pin.is_some() {
-                bundle::sysroot::record_sets(
-                    &self.directory,
-                    &self.bundle.sets,
-                    self.bundle.platform_pin.as_ref(),
-                )?;
-            }
+            // Rewritten every time, so a record from an earlier recipe
+            // that pinned sets is removed once the recipe pins none.
+            bundle::sysroot::record_sets(
+                &self.directory,
+                &self.bundle.sets,
+                self.bundle.platform_pin.as_ref(),
+            )?;
             return Ok(AssemblyReport {
                 source: Source::Unchecked,
                 frameworks: Vec::new(),
@@ -643,8 +655,25 @@ impl AssemblyRequest {
                 active_rules: Vec::new(),
             });
         }
-        let _source_out_of_walk = self.exclude_declared_source()?;
-        bundle::bundle_libs(&self.bundle_options())?;
+        let bundled = {
+            let _source_out_of_walk = self.exclude_declared_source();
+            bundle::bundle_libs(&self.bundle_options())
+        };
+        if let Err(e) = bundled {
+            // The bundler may have rewritten the import before it failed,
+            // which its pending record cannot tell from an author's edit.
+            // Putting the plain copy back keeps the record attesting the
+            // bytes on disk, so the next build refreshes it.
+            if let Some(import) = &self.input
+                && let Err(why) = import_destination(&self.package.command).and_then(|dest| {
+                    let snapshot = hash_file(&import.source)?;
+                    place_import(&self.directory, &import.source, &dest, snapshot)
+                })
+            {
+                eprintln!("warning: the import could not be restored after the failure: {why}");
+            }
+            return Err(e);
+        }
         if self.input.is_some() {
             // The bundler may rewrite the imported command (its ELF
             // constructor injection among other things), so the import's
@@ -717,23 +746,9 @@ impl AssemblyRequest {
     /// The exclusion that keeps the declared input source out of the
     /// bundling walk: a source inside the recipe's directory is the
     /// author's file, and the walk processes the imported copy at the
-    /// command's path instead, so the source keeps its exact bytes. A
-    /// source that is the command's own file is the staged app itself,
-    /// so nothing is excluded and the walk processes that one file as
-    /// it does every bundled binary.
-    fn exclude_declared_source(&self) -> io::Result<bundle::WalkExclusion> {
-        let Some(source) = self.input.as_ref().map(|i| &i.source) else {
-            return Ok(bundle::exclude_from_walk(Vec::new()));
-        };
-        let command_path = self
-            .directory
-            .join(import_destination(&self.package.command)?);
-        let paths = if same_file(source, &command_path) {
-            Vec::new()
-        } else {
-            vec![source.clone()]
-        };
-        Ok(bundle::exclude_from_walk(paths))
+    /// command's path instead, so the source keeps its exact bytes.
+    fn exclude_declared_source(&self) -> bundle::WalkExclusion {
+        bundle::exclude_from_walk(self.input.iter().map(|i| i.source.clone()).collect())
     }
 
     /// The entrypoints the assembly audits: each resolved selection row
@@ -813,11 +828,38 @@ impl AssemblyRequest {
     }
 }
 
+/// Refuse a recipe `[env]` table that names a dynamic-loader search
+/// path, with the supported alternatives named.
+///
+/// A launch resolves the application's libraries from the tree's own
+/// directories and the resolver's decision, and a host program the app
+/// spawns loads with the caller's environment. An entry naming the
+/// loader search path could only leak one side into the other, so a
+/// build and every development launch refuse it rather than apply it.
+pub fn refuse_library_search_env(
+    recipe_path: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+) -> io::Result<()> {
+    for name in env.keys() {
+        if let Some(why) = onelf_rt::env::library_search_override(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: [env] {name}: refused: {why}. Bundle the library with the \
+                     AppDir or let the resolver choose it",
+                    recipe_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Pair the recipe's normalized selections with the final entrypoint
-/// table the packer emits: the package command under its manifest name,
-/// then every named entrypoint the default does not already cover. The
-/// entrypoint the default names carries its own selection into the
-/// primary record rather than a second record under the same name.
+/// table the packer emits, as [`pack::final_entrypoint_names`] derives
+/// it. The first row is the default: the package command's selection,
+/// or the default named entrypoint's own when one takes the command's
+/// place.
 ///
 /// Two records answering to one name would leave which selection a
 /// launch reads up to table order, so the ambiguity is refused here,
@@ -828,34 +870,19 @@ fn resolve_selections(
     default_entrypoint: &Option<String>,
     entrypoints: &[Entrypoint],
 ) -> io::Result<Vec<ResolvedSelection>> {
-    let default_name = default_entrypoint
-        .clone()
-        .or_else(|| {
-            std::path::Path::new(command)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "main".to_string());
-    let named_by_default = default_entrypoint
-        .as_deref()
-        .and_then(|name| entrypoints.iter().find(|e| e.name == name));
-    let primary = match named_by_default {
-        Some(entrypoint) => set_selection_named(&selections.named, &entrypoint.name)?,
-        None => selections.primary.clone(),
-    };
-    let mut table = vec![ResolvedSelection {
-        name: default_name,
-        sets: primary,
-    }];
-    for entrypoint in entrypoints {
-        if default_entrypoint.as_deref() == Some(entrypoint.name.as_str()) {
-            continue;
-        }
-        table.push(ResolvedSelection {
-            name: entrypoint.name.clone(),
-            sets: set_selection_named(&selections.named, &entrypoint.name)?,
-        });
+    let names = pack::final_entrypoint_names(
+        command,
+        default_entrypoint.as_deref(),
+        entrypoints.iter().map(|e| e.name.as_str()),
+    );
+    let mut table = Vec::with_capacity(names.len());
+    for (index, name) in names.into_iter().enumerate() {
+        let sets = if index == 0 && default_entrypoint.is_none() {
+            selections.primary.clone()
+        } else {
+            set_selection_named(&selections.named, &name)?
+        };
+        table.push(ResolvedSelection { name, sets });
     }
     if let Some(dup) = table
         .iter()
@@ -969,12 +996,13 @@ fn hash_file(path: &Path) -> io::Result<blake3::Hash> {
 }
 
 /// Whether an existing destination may be overwritten by this import.
-/// Bytes that already match the source are an idempotent re-import.
-/// Bytes the record still attests as the previous build's own output
-/// are a refresh, and so is a record whose hash predates the build's
-/// own ELF rewriting, since the rewriting may have changed the bytes
-/// through no publisher's hand. Anything else is publisher content,
-/// which stays and stops the build instead of being replaced or packed.
+/// Bytes that already match the source are an idempotent re-import, and
+/// bytes the record attests as the previous build's own output are a
+/// refresh. A record still pending the build's own ELF rewriting attests
+/// the plain copy it was taken from: a failed build puts that copy back,
+/// so different bytes there are an edit made since. Anything else is
+/// publisher content, which stays and stops the build instead of being
+/// replaced or packed.
 fn judge_existing_import(
     appdir: &Path,
     dest_rel: &Path,
@@ -989,7 +1017,6 @@ fn judge_existing_import(
         .into_iter()
         .find(|e| e.path == dest_rel);
     match recorded {
-        Some(entry) if entry.pending => Ok(()),
         Some(entry) if entry.hash == Some(actual) => Ok(()),
         _ => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1047,11 +1074,10 @@ fn staged_copy(source: &Path, dest: &Path) -> io::Result<PathBuf> {
 /// The copy is recorded in the generated ledger with its content hash.
 /// The record starts pending: the build may still rewrite the command
 /// after the import, and only the bytes the build finishes with are
-/// attested. A staged copy the record still attests is refreshed from
-/// the source, including a source that changed upstream since the last
-/// build; a record whose hash predates the build's own rewriting is
-/// also refreshed; staged bytes that attest to nothing are publisher
-/// content and stop the build with a conflict before anything is packed.
+/// attested. A staged copy the record attests is refreshed from the
+/// source, including a source that changed upstream since the last
+/// build. Staged bytes that attest to nothing are publisher content and
+/// stop the build with a conflict before anything is packed.
 fn import_binary(appdir: &Path, import: &BinaryImport, command: &str) -> io::Result<()> {
     let dest_rel = import_destination(command)?;
     let dest = appdir.join(&dest_rel);
@@ -1081,24 +1107,34 @@ fn import_binary(appdir: &Path, import: &BinaryImport, command: &str) -> io::Res
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", dest.display()))),
     }
+    place_import(appdir, &import.source, &dest_rel, snapshot)
+}
+
+/// Copy `source`, whose bytes hash to `snapshot`, to `dest_rel` in the
+/// AppDir through a staged file renamed into place, and record the copy
+/// in the generated ledger. A source that changes while it is copied
+/// fails rather than publishing bytes the snapshot does not describe.
+fn place_import(
+    appdir: &Path,
+    source: &Path,
+    dest_rel: &Path,
+    snapshot: blake3::Hash,
+) -> io::Result<()> {
+    let dest = appdir.join(dest_rel);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let staged = staged_copy(&import.source, &dest)?;
+    let staged = staged_copy(source, &dest)?;
     if hash_file(&staged)? != snapshot {
         let _ = std::fs::remove_file(&staged);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "{}: changed while the import copied it",
-                import.source.display()
-            ),
+            format!("{}: changed while the import copied it", source.display()),
         ));
     }
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     std::fs::rename(&staged, &dest)?;
-    bundle::sysroot::record_generated(appdir, vec![dest_rel.to_string_lossy().into_owned()])?;
-    Ok(())
+    bundle::sysroot::record_generated(appdir, vec![dest_rel.to_string_lossy().into_owned()])
 }
 
 /// The runtime selected for a build, with the capability note probed
@@ -1540,6 +1576,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A skipped tree rewrites its set record on every build, so a
+    /// recipe that stops pinning sets leaves no stale record behind.
+    #[test]
+    fn a_skip_rebuild_without_sets_removes_the_stale_record() {
+        let dir = temp_dir("skip-stale");
+        let pinned = format!(
+            "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"t\"]\nurl = \"https://e/t.onelf\"\n\
+             blake3 = \"{HASH}\"\n"
+        );
+        plan_in(&dir, &pinned).unwrap().stage().unwrap();
+        assert!(dir.join(".onelf/sets").exists());
+        plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[bundle]\nskip = true\n",
+        )
+        .unwrap()
+        .stage()
+        .unwrap();
+        assert!(
+            !dir.join(".onelf/sets").exists(),
+            "the record of the removed set survived"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Search paths resolve against the recipe's directory, like every
+    /// other recipe path, whatever the caller's working directory, and
+    /// an absolute entry stays as written.
+    #[test]
+    fn search_paths_resolve_against_the_recipe_directory() {
+        let dir = temp_dir("search-paths");
+        let request = plan_in(
+            &dir,
+            "[package]\ncommand = \"bin/app\"\n\n[bundle]\n\
+             search-paths = [\"deps/lib\", \"/opt/custom/lib\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            request.bundle.search_paths,
+            [dir.join("deps/lib"), PathBuf::from("/opt/custom/lib")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_gl_pin_records_into_a_skipped_appdir() {
         let dir = temp_dir("skip-pin");
@@ -1882,6 +1963,57 @@ mod tests {
             std::fs::read(dir.join("bin/app")).unwrap(),
             b"#!/bin/sh\necho EDITED\n",
             "the edit must be preserved, not overwritten"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A source that is the destination itself, by the same name, a
+    /// symlink inside the AppDir or a hardlink, would be rewritten in
+    /// place, so planning refuses it with the way out named.
+    #[test]
+    fn an_import_whose_source_is_its_destination_is_refused() {
+        let dir = temp_dir("import-alias");
+        let dest = seed_binary(&dir, "bin/app", UPSTREAM);
+        std::os::unix::fs::symlink("app", dir.join("bin/alias")).unwrap();
+        std::fs::hard_link(&dest, dir.join("hard")).unwrap();
+        for source in ["bin/app", "bin/alias", "hard"] {
+            let body =
+                format!("[package]\ncommand = \"bin/app\"\n\n[input]\nbinary = \"{source}\"\n");
+            let err = plan_in(&dir, &body).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("same file as the package command"),
+                "{source}: {text}"
+            );
+            assert!(text.contains("drop [input]"), "{source}: {text}");
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), UPSTREAM);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pending record attests the plain copy it was taken from, not
+    /// whatever the path holds later: an edit made after a build that
+    /// stopped before attesting is publisher content and stops the next
+    /// import, while the untouched copy refreshes.
+    #[test]
+    fn a_pending_import_does_not_excuse_a_later_edit() {
+        let dir = temp_dir("import-pending");
+        let elf = b"\x7fELF pending import";
+        seed_binary(&dir, "upstream/app", elf);
+        let import = BinaryImport {
+            source: dir.join("upstream/app"),
+        };
+        import_binary(&dir, &import, "bin/app").unwrap();
+        let entries = bundle::sysroot::read_generated(&dir).unwrap();
+        assert!(entries.iter().any(|e| e.path == "bin/app" && e.pending));
+
+        import_binary(&dir, &import, "bin/app").unwrap();
+        std::fs::write(dir.join("bin/app"), b"\x7fELF edited by hand").unwrap();
+        let err = import_binary(&dir, &import, "bin/app").unwrap_err();
+        assert!(err.to_string().contains("did not import"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("bin/app")).unwrap(),
+            b"\x7fELF edited by hand"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
