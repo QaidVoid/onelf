@@ -1154,7 +1154,7 @@ fn info_reports_the_conflicts_the_records_reveal() {
          [qt]\nurl = \"https://e/other.onelf\"\nblake3 = \"{two}\"\n\
          [gtk]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"{three}\"\n"
     );
-    let declared = info::parse_declared_sets(&table);
+    let declared = onelf_rt::sets::parse(&table);
     assert_eq!(declared.len(), 3, "a repeated name stays visible");
     assert_eq!(declared[1].blake3, two, "the second declaration is kept");
 

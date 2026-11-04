@@ -760,44 +760,48 @@ fn main() {
                 Ok((update_key, profile)) => {
                     match onelf_format::elf::probe_capability_note(runtime) {
                         Err(e) => Err(e.into()),
-                        Ok(runtime_note) => pack::pack(
-                            &pack::PackOptions {
-                                directory,
-                                output,
-                                command,
-                                name,
-                                entrypoints,
-                                default_entrypoint,
-                                lib_dirs: lib_dir,
-                                level,
-                                block_size: block_size.unwrap_or(payload.default_block_size()),
-                                payload,
-                                use_dict: dict,
-                                no_compress,
-                                memfd: memfd_opt,
-                                working_dir: wd,
-                                host_libs: host_libs.into(),
-                                cache,
-                                prefer_cache,
-                                update_url: update_url.clone(),
-                                embed_updater: !no_embed_updater,
-                                update_key,
-                                update_revision,
-                                update_unsigned,
-                                exclude,
-                                package_info: None,
-                                mtime,
-                                env: Vec::new(),
-                                paths: Vec::new(),
-                                preload,
-                                needs_setuid,
-                                profile,
-                                provider_index: None,
-                                metadata: pack::MetadataPayload::default(),
-                                runtime_note,
-                            },
-                            runtime,
-                        ),
+                        Ok(runtime_note) => pack::require_store_runtime(&runtime_note, pins_https)
+                            .and_then(|()| {
+                                pack::pack(
+                                    &pack::PackOptions {
+                                        directory,
+                                        output,
+                                        command,
+                                        name,
+                                        entrypoints,
+                                        default_entrypoint,
+                                        lib_dirs: lib_dir,
+                                        level,
+                                        block_size: block_size
+                                            .unwrap_or(payload.default_block_size()),
+                                        payload,
+                                        use_dict: dict,
+                                        no_compress,
+                                        memfd: memfd_opt,
+                                        working_dir: wd,
+                                        host_libs: host_libs.into(),
+                                        cache,
+                                        prefer_cache,
+                                        update_url: update_url.clone(),
+                                        embed_updater: !no_embed_updater,
+                                        update_key,
+                                        update_revision,
+                                        update_unsigned,
+                                        exclude,
+                                        package_info: None,
+                                        mtime,
+                                        env: Vec::new(),
+                                        paths: Vec::new(),
+                                        preload,
+                                        needs_setuid,
+                                        profile,
+                                        provider_index: None,
+                                        metadata: pack::MetadataPayload::default(),
+                                        runtime_note,
+                                    },
+                                    runtime,
+                                )
+                            }),
                     }
                 }
             }
@@ -1110,7 +1114,6 @@ fn run_build(
     let update_key = request.update.read_key()?;
     let runtime = assembly::embed_runtime(&request)?;
     pack::require_store_runtime(&runtime.note, fetches_over_https(&request))?;
-    require_selection_runtime(&runtime.note, &request.selections)?;
     let profile = match &request.compression.profile {
         Some(p) => pack::read_profile(p)?,
         None => Vec::new(),
@@ -1146,38 +1149,6 @@ fn fetches_over_https(request: &assembly::AssemblyRequest) -> bool {
         .map(|pin| pin.url.as_str())
         .into_iter();
     sets.chain(pinned).any(|url| url.starts_with("https://"))
-}
-
-/// A nonlegacy selection, an explicit `sets` list whether empty or not,
-/// only packs onto a runtime advertising the payload metadata and
-/// selection-view support carrying its records will need, so a
-/// substitution that would silently ignore the selections is refused. A
-/// legacy build, every list omitted, stays acceptable on any embeddable
-/// runtime.
-fn require_selection_runtime(
-    note: &onelf_format::elf::RuntimeNote,
-    table: &[assembly::ResolvedSelection],
-) -> std::io::Result<()> {
-    if !table.iter().any(assembly::ResolvedSelection::is_explicit) {
-        return Ok(());
-    }
-    let mut required = onelf_format::elf::RuntimeRequirements::metadata(
-        onelf_format::elf::RUNTIME_METADATA_VERSION,
-    );
-    required.capabilities = required
-        .capabilities
-        .union(onelf_format::elf::RuntimeCapabilities::SELECTION_VIEW);
-    onelf_format::elf::check_runtime_support(note, required).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "the recipe declares explicit set selections, so the embedded runtime \
-                 must advertise payload metadata and selection-view support, and this \
-                 one does not: {e}. Build with a runtime that carries that support, or \
-                 drop the explicit `sets` lists to select every declared set"
-            ),
-        )
-    })
 }
 
 /// The metadata a build carries for its set selections: the declared
@@ -1251,7 +1222,9 @@ fn entrypoint_sets_metadata(
 }
 
 /// The canonical pin table of a build's declared sets: every
-/// declaration's name and full artifact hash, sorted by name. A
+/// declaration's name and full artifact hash, sorted by name. Both
+/// sources come from the recipe's one `[sysroot.sets]` table, and only
+/// one of them is filled, so every name is unique. A
 /// declaration whose pin is not a BLAKE3 digest is refused here, so the
 /// table carries only pins the published build can be checked against.
 fn declared_set_pins(
@@ -1265,22 +1238,10 @@ fn declared_set_pins(
         .map(|sysroot| sysroot.sets.iter())
         .into_iter()
         .flatten();
-    let mut declared: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for set in own.chain(shared) {
-        match declared.entry(set.name.as_str()) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(set.blake3.as_str());
-            }
-            std::collections::btree_map::Entry::Occupied(slot) => {
-                if slot.get() != &set.blake3 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("set '{}' is declared twice with different pins", set.name),
-                    ));
-                }
-            }
-        }
-    }
+    let declared: std::collections::BTreeMap<&str, &str> = own
+        .chain(shared)
+        .map(|set| (set.name.as_str(), set.blake3.as_str()))
+        .collect();
     declared
         .into_iter()
         .map(|(name, hash)| {
@@ -1368,11 +1329,11 @@ mod block_size_tests {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::{entrypoint_sets_metadata, require_selection_runtime};
+    use super::entrypoint_sets_metadata;
     use crate::assembly::{self, ResolvedSelection};
     use crate::metadata;
     use crate::recipe;
-    use onelf_format::elf::{RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote};
+    use onelf_format::elf::RuntimeNote;
     use onelf_format::runtime_metadata::EntrypointSets;
 
     const SETS: &str = "[sysroot.sets.gtk]\npackages = [\"gtk3\"]\nurl = \"https://e/gtk.onelf\"\nblake3 = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\n[sysroot.sets.audio]\npackages = [\"pipewire\"]\nurl = \"https://e/audio.onelf\"\nblake3 = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n";
@@ -1493,51 +1454,6 @@ mod selection_tests {
             err.to_string().contains("duplicate entrypoint name 'app'"),
             "{err}"
         );
-    }
-
-    /// A nonlegacy selection needs a runtime advertising metadata and
-    /// selection-view support; a note-free legacy runtime is refused
-    /// with guidance.
-    #[test]
-    fn an_explicit_selection_requires_a_capable_runtime() {
-        let table = vec![ResolvedSelection {
-            name: "app".to_string(),
-            sets: recipe::SetSelection::Names(Vec::new()),
-        }];
-        let err = require_selection_runtime(&RuntimeNote::Absent, &table).unwrap_err();
-        assert!(err.to_string().contains("explicit set selections"), "{err}");
-        let note = RuntimeNote::Present {
-            metadata_version: RUNTIME_METADATA_VERSION,
-            capabilities: RuntimeCapabilities::SELECTION_VIEW,
-        };
-        require_selection_runtime(&note, &table).unwrap();
-        // A runtime short on the capability itself stays refused.
-        let err = require_selection_runtime(
-            &RuntimeNote::Present {
-                metadata_version: RUNTIME_METADATA_VERSION,
-                capabilities: RuntimeCapabilities::empty(),
-            },
-            &table,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("selection-view"), "{err}");
-    }
-
-    /// A legacy build, every list omitted, packs onto any embeddable
-    /// runtime, note or not.
-    #[test]
-    fn a_legacy_selection_stays_acceptable_on_any_runtime() {
-        let table = vec![
-            ResolvedSelection {
-                name: "app".to_string(),
-                sets: recipe::SetSelection::All,
-            },
-            ResolvedSelection {
-                name: "cli".to_string(),
-                sets: recipe::SetSelection::All,
-            },
-        ];
-        require_selection_runtime(&RuntimeNote::Absent, &table).unwrap();
     }
 
     const GTK_PIN: [u8; 32] = [

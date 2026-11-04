@@ -242,63 +242,6 @@ pub fn info(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// One declaration of the `.onelf/sets` pin table: the set's name, the
-/// source its build is fetched from, and the digest the build must hash
-/// to.
-pub(crate) struct DeclaredSet {
-    pub(crate) name: String,
-    pub(crate) url: String,
-    pub(crate) blake3: String,
-}
-
-/// Parse the `.onelf/sets` pin table, keeping every declaration in file
-/// order so a repeated name stays visible to the conflict report. A
-/// section whose values do not parse yields no declaration; the pin
-/// table the carried selection record must match is checked separately.
-pub(crate) fn parse_declared_sets(text: &str) -> Vec<DeclaredSet> {
-    let mut out = Vec::new();
-    let mut name: Option<String> = None;
-    let (mut url, mut blake3) = (None, None);
-    let flush = |name: &mut Option<String>,
-                 url: &mut Option<String>,
-                 blake3: &mut Option<String>,
-                 out: &mut Vec<DeclaredSet>| {
-        if let (Some(name), Some(url), Some(blake3)) = (name.take(), url.take(), blake3.take()) {
-            out.push(DeclaredSet {
-                name,
-                url,
-                blake3: blake3.to_ascii_lowercase(),
-            });
-        }
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix('[') {
-            flush(&mut name, &mut url, &mut blake3, &mut out);
-            name = rest.strip_suffix(']').map(|n| n.trim().to_string());
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        let Some(value) = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .map(|v| v.replace("\\\"", "\"").replace("\\\\", "\\"))
-        else {
-            continue;
-        };
-        match key.trim() {
-            "url" => url = Some(value),
-            "blake3" => blake3 = Some(value),
-            _ => {}
-        }
-    }
-    flush(&mut name, &mut url, &mut blake3, &mut out);
-    out
-}
-
 /// The lines `onelf info` prints under `Sets:`: the declared pin table,
 /// each entrypoint's selected sets from the carried selection record,
 /// and the provider conflicts the records reveal. Only package records
@@ -315,7 +258,7 @@ pub(crate) fn selection_lines(
     }
     let declared = table
         .as_deref()
-        .map(parse_declared_sets)
+        .map(onelf_rt::sets::parse)
         .unwrap_or_default();
     let record = record.as_deref().map(EntrypointSets::decode);
     let mut lines = Vec::new();
@@ -325,7 +268,7 @@ pub(crate) fn selection_lines(
         for set in &declared {
             lines.push(format!(
                 "    {}: pinned {}, from {}",
-                set.name, set.blake3, set.url
+                set.label, set.blake3, set.url
             ));
         }
     }
@@ -407,15 +350,18 @@ pub(crate) fn selection_lines(
 /// that does not match the manifest's entrypoints or the declared pins.
 /// Every line is sorted, so the report is a function of the records.
 pub(crate) fn selection_findings(
-    declared: &[DeclaredSet],
+    declared: &[onelf_rt::platform::Pin],
     record: Option<&Result<EntrypointSets, MetadataError>>,
     entrypoint_names: &[&str],
 ) -> Vec<String> {
     let mut findings = Vec::new();
     let mut seen = BTreeSet::new();
     for set in declared {
-        if !seen.insert(set.name.as_str()) {
-            findings.push(format!("the set '{}' is declared more than once", set.name));
+        if !seen.insert(set.label.as_str()) {
+            findings.push(format!(
+                "the set '{}' is declared more than once",
+                set.label
+            ));
         }
     }
     let Some(Ok(record)) = record else {
@@ -424,7 +370,7 @@ pub(crate) fn selection_findings(
     };
     let declared: BTreeMap<&str, &str> = declared
         .iter()
-        .map(|set| (set.name.as_str(), set.blake3.as_str()))
+        .map(|set| (set.label.as_str(), set.blake3.as_str()))
         .collect();
     for entry in &record.entrypoints {
         for name in &entry.sets {

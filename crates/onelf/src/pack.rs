@@ -185,31 +185,34 @@ fn record_error(why: MetadataError) -> io::Error {
 
 /// The names of the final manifest entrypoint table, in its order: the
 /// default under its manifest name, then every named entrypoint the
-/// default does not already cover. The selection record a package
-/// carries must answer to exactly these names, so this derivation and
-/// the one that builds the table below must stay the same.
-fn final_entrypoint_names(opts: &PackOptions) -> Vec<String> {
-    let command_path = package_relative(&opts.command);
-    let default_name = opts
-        .default_entrypoint
-        .as_deref()
+/// default does not already cover. The manifest the packer writes, the
+/// selection record a package carries, and the selection table a recipe
+/// resolves all answer to exactly these names.
+pub(crate) fn final_entrypoint_names<'a>(
+    command: &str,
+    default_entrypoint: Option<&str>,
+    entrypoints: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let command_path = package_relative(command);
+    let default_name = default_entrypoint
         .or_else(|| command_path.file_name().and_then(|n| n.to_str()))
         .unwrap_or("main");
     let mut names = vec![default_name.to_string()];
-    for (name, _, _) in &opts.entrypoints {
-        if opts.default_entrypoint.as_deref() == Some(name.as_str()) {
-            continue;
-        }
-        names.push(name.clone());
-    }
+    names.extend(
+        entrypoints
+            .into_iter()
+            .filter(|name| default_entrypoint != Some(*name))
+            .map(str::to_string),
+    );
     names
 }
 
 /// The pins the AppDir records in `.onelf/sets`, as `SetPin`s sorted by
-/// name. A tree that declares no sets has an empty table. A record the
-/// tree holds that cannot be parsed is an error: carried selection
-/// metadata is checked against it, and present-but-unreadable is not
-/// absence.
+/// name, read with the runtime's own parser so the packer checks a
+/// carried selection record against exactly the table a launch reads. A
+/// tree that declares no sets has an empty table, and a declaration the
+/// runtime would not accept is absent from it, so a record naming that
+/// set fails the check rather than shipping.
 fn declared_pins(directory: &Path) -> io::Result<Vec<SetPin>> {
     const SETS_FILE: &str = crate::bundle::sysroot::SETS_FILE;
     let text = match fs::read_to_string(directory.join(SETS_FILE)) {
@@ -217,43 +220,28 @@ fn declared_pins(directory: &Path) -> io::Result<Vec<SetPin>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(io::Error::new(e.kind(), format!("{SETS_FILE}: {e}"))),
     };
-    let value: toml::Value = toml::from_str(&text).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{SETS_FILE}: not a parsable set record: {e}"),
-        )
-    })?;
-    let mut pins = Vec::new();
-    let Some(table) = value.as_table() else {
-        return Ok(pins);
-    };
-    for (name, set) in table {
-        let id = RuleId::new(name).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{SETS_FILE}: set name {name:?}: {e}"),
-            )
-        })?;
-        let hex = set
-            .get("blake3")
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| {
+    let mut pins = onelf_rt::sets::parse(&text)
+        .into_iter()
+        .map(|pin| {
+            let name = RuleId::new(&pin.label).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{SETS_FILE}: set {name} records no blake3 pin"),
+                    format!("{SETS_FILE}: set name {:?}: {e}", pin.label),
                 )
             })?;
-        let hash = blake3::Hash::from_hex(hex).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{SETS_FILE}: set {name}: pin is not a blake3 digest"),
-            )
-        })?;
-        pins.push(SetPin {
-            name: id,
-            hash: *hash.as_bytes(),
-        });
-    }
+            let hash = blake3::Hash::from_hex(&pin.blake3).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{SETS_FILE}: set {}: pin is not a blake3 digest", pin.label),
+                )
+            })?;
+            Ok(SetPin {
+                name,
+                hash: *hash.as_bytes(),
+            })
+        })
+        .collect::<io::Result<Vec<SetPin>>>()?;
+    pins.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
     Ok(pins)
 }
 
@@ -270,7 +258,11 @@ fn validate_carried_selections(opts: &PackOptions) -> io::Result<()> {
     };
     let sets = EntrypointSets::decode(bytes).map_err(record_error)?;
     let pins = declared_pins(&opts.directory)?;
-    let names = final_entrypoint_names(opts);
+    let names = final_entrypoint_names(
+        &opts.command,
+        opts.default_entrypoint.as_deref(),
+        opts.entrypoints.iter().map(|(name, _, _)| name.as_str()),
+    );
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     sets.validate_against(&names, &pins).map_err(|e| {
         io::Error::new(
@@ -880,7 +872,7 @@ fn package_relative(path: &str) -> PathBuf {
 /// name is kept, so `app.x86_64` and `app.aarch64` packing at once in one
 /// directory do not share it, and the pid is added, so two packs of one
 /// output do not either.
-fn sibling_tmp(output: &Path, tag: &str) -> PathBuf {
+pub(crate) fn sibling_tmp(output: &Path, tag: &str) -> PathBuf {
     let mut name = output.as_os_str().to_os_string();
     name.push(format!(".onelf-{tag}-{}.tmp", std::process::id()));
     PathBuf::from(name)
@@ -1796,11 +1788,12 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         )
     })?;
 
-    let default_name = opts
-        .default_entrypoint
-        .as_deref()
-        .or_else(|| command_path.file_name().and_then(|n| n.to_str()))
-        .unwrap_or("main");
+    let names = final_entrypoint_names(
+        &opts.command,
+        opts.default_entrypoint.as_deref(),
+        opts.entrypoints.iter().map(|(name, _, _)| name.as_str()),
+    );
+    let default_name = names[0].as_str();
 
     // When `default_entrypoint` names a declared `[[entrypoint]]`, the
     // default launch must use that entrypoint's path and args, not the
