@@ -717,6 +717,11 @@ impl DestinationPlan {
         sorted
     }
 
+    /// Whether an earlier admission already planned a write to `rel`.
+    pub(crate) fn is_planned(&self, rel: &Path) -> bool {
+        self.entries.contains_key(rel)
+    }
+
     /// Whether any finding stands.
     pub(crate) fn has_findings(&self) -> bool {
         !self.findings.is_empty()

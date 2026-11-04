@@ -4459,7 +4459,12 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         interp_names.dedup();
         for interp_name in interp_names {
             let target = lib_dest.join(&interp_name);
-            if target.exists() || target.is_symlink() {
+            // The walk copies the interpreter itself when a program names
+            // it, so only a destination nothing else writes takes the alias.
+            if target.exists()
+                || target.is_symlink()
+                || plan.is_planned(&opts.lib_dir.join(&interp_name))
+            {
                 continue;
             }
             let Some(libc_name) = libc_alias_for(&interp_name) else {
