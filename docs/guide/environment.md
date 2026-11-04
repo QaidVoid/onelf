@@ -41,11 +41,14 @@ The rules this page encodes:
 The runtime does not set `LD_LIBRARY_PATH` for the app, and a recipe
 cannot either: an `[env]` assignment of it, or of
 `LD_LIBRARY_PATH_32`, `LD_LIBRARY_PATH_64` or `LD_AOUT_LIBRARY_PATH`,
-is refused when the recipe loads. A value the caller set reaches the
-app unchanged, and so does its absence, and a
-host program the app runs (a shell, `git`, `xdg-open`) sees the same
-thing. The variable would otherwise carry the bundle's libraries into
-every one of those programs.
+is refused when the recipe loads. A value the caller set is removed
+from the app's environment, so neither the app nor a bundled program it
+starts searches the caller's directories. A host program the app runs
+(a shell, `git`, `xdg-open`) gets the caller's value back from the exec
+hooks, except through the calls the hooks cannot reach (see
+[Programs the app starts](#programs-the-app-starts)), which start it
+without one. A generated value would otherwise carry the bundle's
+libraries into every one of those programs.
 
 Bundled binaries find their libraries through the `$ORIGIN` run path
 `bundle-libs` wrote into them, which names the bundle's library
@@ -86,7 +89,7 @@ every directory that holds a `.so`) still form a search path, used
 only when the runtime invokes the dynamic linker itself:
 
 ```
-<resolver link farm>:<bundle lib dirs>:<shared set lib dirs>:<previous LD_LIBRARY_PATH>
+<resolver link farm>:<bundle lib dirs>:<shared set lib dirs>
 ```
 
 It is passed as `--library-path` on that one command line, so nothing
@@ -97,8 +100,8 @@ without an `$ORIGIN` run path that the kernel has to start. That is a
 self-extracting binary, an executable `bundle-libs` could not give a
 run path (no slot and no `patchelf`), or a binary packed without
 `bundle-libs` that runs under the host's loader. Nothing else leads it
-to its libraries, so it gets the bundle's library directories ahead of
-the previous value, and the programs it runs inherit them.
+to its libraries, so it gets the bundle's library directories, and the
+programs it runs inherit them.
 `bundle-libs` reports such executables at pack time.
 
 `ONELF_LIB_PATH` names the bundle's library directories. Scripts used
@@ -113,21 +116,13 @@ whose host copy is newer than the bundled one. See
 [Bundling](./bundling#libraries-that-come-from-the-host) for how the
 choice is made.
 
-❌ Do not count on the runtime to keep host directories off the
-application's search. What onelf generates never goes on
-`LD_LIBRARY_PATH`: the libraries it resolves are linked by name into
-the bundle's own directory and handed to the linker as
-`--library-path` on the one command line that needs them, so nothing
-the app starts sees a generated search path. But a caller's
-`LD_LIBRARY_PATH` is a different thing: it reaches the application
-unchanged, and the application's loader still searches it when the
-bundle's run path has no such name. The run path is an RPATH, which
-the loader searches first, so the caller's path supplies exactly the
-names the package omits. A caller who points it at a directory
-holding such a dependency can satisfy that omission with a host
-library beside the bundled libc. The recipe cannot set the variable,
-and this is exactly the mixing the resolver exists to avoid, so keep
-the caller's value empty when it matters.
+✅ Host directories stay off the application's search. What onelf
+generates never goes on `LD_LIBRARY_PATH`: the libraries it resolves
+are linked by name into the bundle's own directory and handed to the
+linker as `--library-path` on the one command line that needs them.
+The caller's `LD_LIBRARY_PATH` does not reach the application either,
+so a name the package omits fails by name instead of being satisfied
+by a host library beside the bundled libc.
 
 Each variable below is set only when the directory it names exists.
 "A lib dir" means one of the bundle's library directories or, on a host

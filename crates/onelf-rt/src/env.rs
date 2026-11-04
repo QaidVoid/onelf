@@ -16,7 +16,11 @@
 //! (`/bin/sh`, `ssh`, etc.), which corrupts them by mixing the bundled
 //! libc/libcrypto with the host loader. Bundled binaries find their
 //! libraries through their `$ORIGIN` run path, and the lib path is
-//! passed via `--library-path` on a single linker invocation.
+//! passed via `--library-path` on a single linker invocation. The
+//! caller's own value is removed from the application's environment, so
+//! no host directory is searched ahead of a bundled helper's run path,
+//! and the restoration record hands it back to the host programs the app
+//! starts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -64,16 +68,15 @@ pub fn library_search_override(name: &str) -> Option<&'static str> {
 /// resolver's link farm first, then the package's library directories,
 /// then the selected sets'.
 ///
-/// This one construction serves both launch forms. The packed launch
-/// hands it to the dynamic linker as `--library-path`, and a development
-/// run uses the same value for that flag and for the loader fallback of a
-/// binary the kernel starts without a run path. A caller's inherited
+/// This one construction serves both launch forms, which hand it to the
+/// dynamic linker as `--library-path`. A caller's inherited
 /// `LD_LIBRARY_PATH` never joins it: a host directory on the path would
 /// hand the application a dependency its package does not carry, and the
 /// application's directories on the caller's value would corrupt a host
-/// program the caller starts beside this one. The caller's value stays in
-/// the environment exactly as it was, and the restoration record
-/// ([`crate::hostenv`]) keeps it for the host programs the app spawns.
+/// program the caller starts beside this one. [`setup_env`] removes the
+/// caller's value from the application's environment, and the
+/// restoration record ([`crate::hostenv`]) keeps it for the host programs
+/// the app spawns.
 ///
 /// A fetched GL build's directories are never placed here either: the
 /// path reaches every process the app spawns, and a foreign build's
@@ -170,6 +173,15 @@ pub fn setup_env(
         return String::new();
     }
 
+    // The caller's search path would put host directories ahead of every
+    // bundled helper's run path and of a kernel-started entrypoint's own
+    // directories. The restoration record lists this variable as set at
+    // exec, so a host program the app starts gets the caller's value
+    // back, and a launch that needs a generated value sets it on the one
+    // command that needs it.
+    // SAFETY: the runtime is single-threaded at this point (before exec)
+    unsafe { env::remove_var("LD_LIBRARY_PATH") };
+
     let pkg = Path::new(onelf_dir);
     let app_lib_dirs: Vec<PathBuf> = lib_subpath
         .split(':')
@@ -195,8 +207,7 @@ pub fn setup_env(
     }
 
     // Build the library search path for ELF entrypoints through the one
-    // construction both launch forms share. A caller's inherited
-    // `LD_LIBRARY_PATH` is never appended: the application resolves from
+    // construction both launch forms share: the application resolves from
     // the farm, its own directories and the sets alone.
     if !lib_subpath.is_empty() {
         let lib_paths: Vec<String> = lib_subpath
@@ -212,8 +223,6 @@ pub fn setup_env(
             // them, so nothing the app spawns inherits them. The farm's and
             // the sets' libraries also show in the bundle's own library
             // directory (see crate::links), where the run path finds them.
-            // The caller's own value stays in the environment as it was,
-            // and the restoration record keeps it for host programs.
 
             // Kept for scripts written when they had to export it as
             // LD_LIBRARY_PATH. The bundle's own directories hold everything
@@ -1807,8 +1816,7 @@ mod library_search_tests {
     }
 
     /// A caller's inherited `LD_LIBRARY_PATH` never joins the search
-    /// path, and the variable itself is left exactly as the caller had
-    /// it, for the restoration record and the host programs it covers.
+    /// path.
     #[test]
     fn a_callers_library_path_never_joins_the_search() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1817,15 +1825,12 @@ mod library_search_tests {
         let path = library_search_path(Path::new("/pkg"), "lib", None, &[]);
 
         assert_eq!(path, "/pkg/lib");
-        assert_eq!(
-            env::var("LD_LIBRARY_PATH").as_deref(),
-            Ok("/caller/priv:/usr/lib")
-        );
         unsafe { env::remove_var("LD_LIBRARY_PATH") };
     }
 
     /// The launch returns the shared search path for an ELF target, with
-    /// the caller's inherited value absent from it.
+    /// the caller's inherited value absent from it and from the
+    /// application's environment.
     #[test]
     fn the_launch_returns_the_shared_path_without_the_callers_value() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1851,8 +1856,7 @@ mod library_search_tests {
         );
 
         assert_eq!(path, "/farm:/pkg/lib:/set/lib");
-        assert_eq!(env::var("LD_LIBRARY_PATH").as_deref(), Ok("/caller/priv"));
-        unsafe { env::remove_var("LD_LIBRARY_PATH") };
+        assert!(env::var_os("LD_LIBRARY_PATH").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

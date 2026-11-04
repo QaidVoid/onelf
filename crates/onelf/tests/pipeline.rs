@@ -12452,7 +12452,7 @@ fn synthetic_sysroot(td: &Path) -> Option<SysrootFixture> {
     ));
     write(
         &src.join("app.c"),
-        "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}if (getenv(\"SHOW_LP\")) {const char *l = getenv(\"LD_LIBRARY_PATH\");printf(\"app_lp=%s\\n\", l ? l : \"(unset)\");}if (getenv(\"SHOW_CHILD\")) {fflush(stdout);if (system(\"echo \\\"child_lp=${LD_LIBRARY_PATH-(unset)}\\\"\") != 0) return 1;}if (getenv(\"AGAIN\")) printf(\"again\\n\");if (getenv(\"REEXEC\")) {char *argv[] = {\"app\", 0};char *envp[] = {\"AGAIN=1\", 0};fflush(stdout);execve(\"/proc/self/exe\", argv, envp);return 1;}if (getenv(\"HOLD\")) sleep(atoi(getenv(\"HOLD\")));return 0;}\n",
+        "#include <spawn.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <sys/wait.h>\n#include <unistd.h>\nextern char **environ;\nint fix_value(void);\nint gl_probe(void);\nint helper(void);\nint main(void){printf(\"value=%d\\n\", fix_value() + gl_probe() + helper());const char *q = getenv(\"QT_PLUGIN_PATH\");if (q && getenv(\"SHOW_QT\")) printf(\"qt=%s\\n\", q);if (getenv(\"SHOW_DATA\")) {FILE *f = fopen(\"/usr/share/fixture/data.txt\", \"r\");char buf[64] = {0};if (f && fgets(buf, sizeof buf, f)) printf(\"data=%s\", buf);else printf(\"data=missing\\n\");if (f) fclose(f);}if (getenv(\"SHOW_LP\")) {const char *l = getenv(\"LD_LIBRARY_PATH\");printf(\"app_lp=%s\\n\", l ? l : \"(unset)\");}if (getenv(\"SHOW_CHILD\")) {fflush(stdout);if (system(\"echo \\\"child_lp=${LD_LIBRARY_PATH-(unset)}\\\"\") != 0) return 1;}if (getenv(\"SPAWN_CHILD\")) {fflush(stdout);pid_t pid;int st;char *sh[] = {\"sh\", \"-c\", \"echo \\\"spawn_lp=${LD_LIBRARY_PATH-(unset)}\\\"\", 0};if (posix_spawnp(&pid, \"sh\", 0, 0, sh, environ) != 0 || waitpid(pid, &st, 0) < 0) return 1;}if (getenv(\"AGAIN\")) printf(\"again\\n\");if (getenv(\"REEXEC\")) {char *argv[] = {\"app\", 0};char *envp[] = {\"AGAIN=1\", 0};fflush(stdout);execve(\"/proc/self/exe\", argv, envp);return 1;}if (getenv(\"HOLD\")) sleep(atoi(getenv(\"HOLD\")));return 0;}\n",
     );
     assert!(cc_with(
         &[
@@ -16065,9 +16065,11 @@ fn set_app_launch(pkg: &Path, td: &Path, fixture: &SysrootFixture) -> Command {
 
 /// The host library the resolver chose and the set's library are found
 /// through the bundle's own run path, so no library path is exported:
-/// the app sees the caller's `LD_LIBRARY_PATH` as it was, a host shell it
-/// runs sees the same, and a re-exec with an empty environment still
-/// loads both.
+/// the app sees no `LD_LIBRARY_PATH` at all, a host shell it spawns
+/// through a hooked call gets the caller's value back, one `system`
+/// starts keeps the application's environment, as the documented hook
+/// limitation says, and a re-exec with an empty environment still loads
+/// both.
 #[test]
 fn host_and_set_libraries_load_without_a_library_path() {
     let td = workdir("liblinks");
@@ -16087,6 +16089,7 @@ fn host_and_set_libraries_load_without_a_library_path() {
             .env("LD_LIBRARY_PATH", &caller)
             .env("SHOW_LP", "1")
             .env("SHOW_CHILD", "1")
+            .env("SPAWN_CHILD", "1")
             .env("REEXEC", "1");
         let out = run_package(&mut cmd);
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -16103,8 +16106,13 @@ fn host_and_set_libraries_load_without_a_library_path() {
                 .unwrap_or_else(|| panic!("no {key} in {report}"))
                 .to_string()
         };
-        assert_eq!(line("app_lp="), caller, "the app's path: {report}");
-        assert_eq!(line("child_lp="), caller, "a host shell's path: {report}");
+        assert_eq!(line("app_lp="), "(unset)", "the app's path: {report}");
+        assert_eq!(line("spawn_lp="), caller, "a host shell's path: {report}");
+        assert_eq!(
+            line("child_lp="),
+            "(unset)",
+            "a system() shell's path: {report}"
+        );
     }
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -22942,6 +22950,86 @@ fn run_bundle_honors_the_host_libs_decision() {
         !stdout.contains("value=6"),
         "the refused host copy satisfied the launch: {stdout}"
     );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A library directory the caller puts on `LD_LIBRARY_PATH` never
+/// supplies a dependency to a bundled helper a packed launch starts: the
+/// caller's value is gone from the application's environment, so the
+/// helper's lookup cannot reach the decoy there.
+#[test]
+fn an_inherited_library_path_does_not_reach_a_bundled_helper() {
+    let td = workdir("packinherited");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let caller = td.join("caller-lib");
+    std::fs::create_dir_all(&caller).unwrap();
+    write(&td.join("hole.c"), "int hole_value(void){return 3;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libhole.so.1",
+            td.join("hole.c").to_str().unwrap(),
+        ],
+        &caller.join("libhole.so.1")
+    ));
+    write(
+        &td.join("helper.c"),
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    void *h = dlopen("libhole.so.1", RTLD_NOW);
+    printf("hole=%s\n", h ? "loaded" : "absent");
+    return 0;
+}
+"#,
+    );
+    assert!(cc_with(
+        &[td.join("helper.c").to_str().unwrap(), "-ldl"],
+        &app.join("bin/helper")
+    ));
+    write(
+        &app.join("bin/run.sh"),
+        "#!/bin/sh\necho \"lp=${LD_LIBRARY_PATH-(unset)}\"\nexec \"$ONELF_DIR/bin/helper\"\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        app.join("bin/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let pkg = td.join("app.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run.sh", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let mut modes = vec!["rundir"];
+    if fuse_available() {
+        modes.push("fuse");
+    }
+    for mode in modes {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", mode)
+            .env("LD_LIBRARY_PATH", &caller);
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{mode}: {}{stdout}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{report}");
+        assert!(
+            stdout.contains("hole=absent"),
+            "the caller's copy loaded: {report}"
+        );
+        assert!(stdout.contains("lp=(unset)"), "{report}");
+    }
     let _ = std::fs::remove_dir_all(&td);
 }
 
