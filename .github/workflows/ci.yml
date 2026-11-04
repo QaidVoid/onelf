@@ -23,6 +23,12 @@ jobs:
   check:
     name: Format, lint, test
     runs-on: ubuntu-latest
+    # What this runner reliably provides. Declaring it makes a skip of
+    # any other capability an announced skip rather than a failure, since
+    # the capability jobs below own those claims, while a skip of one of
+    # these still fails the job.
+    env:
+      ONELF_REQUIRED_CAPS: cc,patchelf,musl,glibc,hostlibs,staticlibc,fifo
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,6 +80,20 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The TOML rule loader is feature gated, so the workspace run above
+      # never compiles its tests.
+      - name: Test the TOML rule loader
+        run: cargo test -p onelf-format --features rules-toml --locked
+
+      # build.rs builds the embedded runtimes with --release only when the
+      # onelf build itself is a release build, so the debug runs above
+      # never produce the runtimes that ship.
+      - name: Build the release runtimes
+        run: cargo build --release -p onelf --locked
+
+      - name: Inspect the release runtimes
+        run: ci/check-runtimes.sh release
+
       # The self-update code builds only into the update runtime, so the
       # workspace build above never compiles its tests.
       - name: Lint and test the update runtime
@@ -95,11 +115,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # squashfuse and squashfs-tools serve the preflight's real mount.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            musl-tools patchelf fuse3
+            musl-tools patchelf fuse3 squashfuse squashfs-tools
 
       # Best effort here on purpose: the preflight, not the sysctl exit
       # code, decides whether this runner may claim namespaces.
@@ -135,11 +156,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # squashfuse and squashfs-tools serve the preflight's real mount.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            musl-tools patchelf fuse3
+            musl-tools patchelf fuse3 squashfuse squashfs-tools
 
       # Mounts must come from the setuid fusermount3 helper alone, so the
       # user-namespace knob stays at Ubuntu 24.04's denying default. The
@@ -249,7 +271,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools fuse3
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools fuse3 squashfuse squashfs-tools
 
       - name: Allow namespace FUSE mounts
         run: |
@@ -273,15 +296,85 @@ jobs:
       - name: Privileged tests as root
         run: sudo -E env "PATH=$PATH" cargo test -p onelf --locked --test pipeline -- root_serves root_neither root_leaves
 
+  # The media stack checks and the traced read counters. The job
+  # installs GStreamer with its scanner and base plugins, ALSA headers,
+  # configuration and plugins, a PipeWire server and strace, starts the
+  # server headless on the runtime directory the PipeWire fixture
+  # bridges to, and claims each of those capabilities, so none of these
+  # tests can pass as a skip.
+  media:
+    name: Media stack and traced scale checks
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: cc,musl,strace,gstreamer,gstreamer-scanner,gstreamer-plugins,alsa,alsa-devel,alsa-config,pipewire,pipewire-server,pipewire-config
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools patchelf strace pkg-config \
+            gstreamer1.0-tools gstreamer1.0-plugins-base libgstreamer1.0-0 \
+            libasound2-dev libasound2-data libasound2-plugins alsa-utils \
+            pipewire pipewire-bin
+
+      # The PipeWire fixture links its runtime directory to
+      # /run/user/<uid>/pipewire-0, so the server listens there. A runner
+      # has no login session, so the directory is made by hand.
+      - name: Start a headless PipeWire server
+        run: |
+          run_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$run_dir"
+          echo "XDG_RUNTIME_DIR=$run_dir" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$run_dir" nohup pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            if XDG_RUNTIME_DIR="$run_dir" pw-cli info 0 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/pipewire.log"
+          exit 1
+
+      - name: Preflight capabilities
+        run: ci/preflight.sh media
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Media and traced scale tests
+        run: >-
+          cargo test -p onelf --locked --test pipeline --
+          a_packed_pipeline_plays_through_the_pack_scanner
+          hostile_user_alsa_snippets_leave_the_private_stack_working
+          hostile_pipewire_config_leaves_the_private_spa_stack_connected
+          traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size
+          a_musl_target_without_its_interpreter_is_still_traced
+
+      - name: PipeWire server log
+        if: always()
+        run: cat "$RUNNER_TEMP/pipewire.log" || true
+
   # The pinned distro fixtures drive docker directly: three images from
   # ci/fixtures/Dockerfile.* (base tags pinned by digest, packages
   # installed only at image-prep time) run the application fixtures and
   # the static musl runtime checks inside Ubuntu 24.04, Alpine 3.20 and
-  # Fedora 40. The job claims docker in ONELF_REQUIRED_CAPS, so a runner
+  # Fedora 44, and the GTK and Qt packages also run on the bare base of
+  # the other libc family. Containers run without network and print
+  # their image IDs. The job claims docker in ONELF_REQUIRED_CAPS, so a runner
   # without docker fails the preflight, and a fixture test that skips
   # for any reason fails the job instead of passing as a skip.
   distro-fixtures:
-    name: Distro fixtures, Ubuntu 24.04 Alpine 3.20 Fedora 40
+    name: Distro fixtures, Ubuntu 24.04 Alpine 3.20 Fedora 44
     runs-on: ubuntu-latest
     env:
       ONELF_REQUIRED_CAPS: docker
@@ -313,10 +406,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # The offline builds below, and the one the test itself falls back
+      # to, need every crate already downloaded.
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
       # Built before the tests so the in-test build of the same binary
       # is a cache hit and stays offline.
       - name: Build the static musl onelf
         run: cargo build -p onelf --locked --offline --target x86_64-unknown-linux-musl
 
+      # --nocapture keeps the recorded image IDs in the log.
       - name: Distro fixture tests
-        run: cargo test -p onelf --locked --test distro_fixtures
+        run: cargo test -p onelf --locked --test distro_fixtures -- --nocapture
