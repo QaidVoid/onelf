@@ -12,6 +12,28 @@ requirement = "optional"
 candidates = [
   { base = "library-dir", path = "pipewire-0.3" },
 ]
+# The modules client.conf loads into an application's context. The rest
+# serve the PipeWire daemon and the session manager.
+members = [
+  "libpipewire-module-rt.so",
+  "libpipewire-module-protocol-native.so",
+  "libpipewire-module-client-node.so",
+  "libpipewire-module-client-device.so",
+  "libpipewire-module-adapter.so",
+  "libpipewire-module-metadata.so",
+  "libpipewire-module-session-manager.so",
+]
+
+# A client context fails without client.conf, and the bundled library
+# looks for it only under its own build prefix.
+[[resources.data]]
+id = "configuration"
+kind = "file"
+destination = "share/pipewire/client.conf"
+requirement = "optional"
+candidates = [
+  { base = "installation-prefix", path = "share/pipewire/client.conf" },
+]
 
 [[runtime.paths]]
 id = "plugins"
@@ -21,4 +43,14 @@ selection = "all"
 inheritance = "replace"
 candidates = [
   { base = "library-root", path = "pipewire-0.3" },
+]
+
+[[runtime.paths]]
+id = "configuration"
+kind = "directory"
+variables = ["PIPEWIRE_CONFIG_DIR"]
+selection = "first"
+inheritance = "preserve"
+candidates = [
+  { base = "package-root", path = "share/pipewire" },
 ]

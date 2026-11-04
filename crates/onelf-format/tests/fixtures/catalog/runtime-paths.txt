@@ -24,6 +24,8 @@ magic/database File First Preserve MAGIC
   PackageRoot:share/misc/magic.mgc
 pipewire/plugins Directory All Replace PIPEWIRE_MODULE_DIR
   LibraryRoot:pipewire-0.3
+pipewire/configuration Directory First Preserve PIPEWIRE_CONFIG_DIR
+  PackageRoot:share/pipewire
 qt/plugins Directory All Replace QT_PLUGIN_PATH
   LibraryRoot:qt6/plugins
   LibraryRoot:qt5/plugins

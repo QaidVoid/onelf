@@ -466,6 +466,7 @@ mod classification_tests {
             "GST_PLUGIN_SCANNER_1_0",
             "GST_PLUGIN_SCANNER",
             "PIPEWIRE_MODULE_DIR",
+            "PIPEWIRE_CONFIG_DIR",
             "SPA_PLUGIN_DIR",
             "GI_TYPELIB_PATH",
             "LIBHEIF_PLUGIN_PATH",

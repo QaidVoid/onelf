@@ -15,6 +15,14 @@ requirement = "optional"
 candidates = [
   { base = "library-dir", path = "spa-0.2" },
 ]
+# The support plugins every client context loads and the audio
+# converter its streams adapt through. Device, codec and filter plugins
+# serve the PipeWire daemon.
+members = [
+  "support/libspa-support.so",
+  "support/libspa-dbus.so",
+  "audioconvert/libspa-audioconvert.so",
+]
 
 [[runtime.paths]]
 id = "plugins"

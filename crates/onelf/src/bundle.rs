@@ -7191,13 +7191,23 @@ mod catalog_coverage_tests {
                 ),
                 ("spa", "plugins", "lib/spa-0.2", Requirement::Optional),
             ],
-            data: &[],
+            data: &[(
+                "pipewire",
+                "configuration",
+                "share/pipewire/client.conf",
+                Requirement::Optional,
+            )],
             helpers: &[],
             paths: &[
                 (
                     "PIPEWIRE_MODULE_DIR",
                     PathSelection::All,
                     Inheritance::Replace,
+                ),
+                (
+                    "PIPEWIRE_CONFIG_DIR",
+                    PathSelection::First,
+                    Inheritance::Preserve,
                 ),
                 ("SPA_PLUGIN_DIR", PathSelection::All, Inheritance::Replace),
             ],

@@ -1300,7 +1300,13 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
         &["libpipewire-0.3.so.0"],
         &[
             ("pipewire-0.3", &["libpipewire-module-adapter.so"]),
-            ("spa-0.2", &["libspa-support.so", "libspa-journal.so"]),
+            (
+                "spa-0.2",
+                &[
+                    "support/libspa-support.so",
+                    "audioconvert/libspa-audioconvert.so",
+                ],
+            ),
         ],
         &["pipewire", "spa"],
     ),
@@ -1540,6 +1546,98 @@ fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
             );
         }
     }
+}
+
+/// The PipeWire and SPA rules list their client members: the modules
+/// and plugins an application's context loads arrive at their layout,
+/// while the daemon's protocol servers, device plugins and codecs stay
+/// behind, and the client configuration the context needs comes along.
+#[test]
+fn member_allowlists_collect_only_the_client_side_of_a_plugin_tree() {
+    let td = workdir("plugin-allowlist");
+    let members: &[(&str, &[&str])] = &[
+        (
+            "pipewire-0.3",
+            &[
+                "libpipewire-module-protocol-native.so",
+                "libpipewire-module-client-node.so",
+                "libpipewire-module-adapter.so",
+            ],
+        ),
+        (
+            "spa-0.2",
+            &[
+                "support/libspa-support.so",
+                "audioconvert/libspa-audioconvert.so",
+            ],
+        ),
+    ];
+    let daemon: &[(&str, &[&str])] = &[
+        (
+            "pipewire-0.3",
+            &[
+                "libpipewire-module-protocol-pulse.so",
+                "libpipewire-module-raop-sink.so",
+                "v4l2/libpw-v4l2.so",
+            ],
+        ),
+        (
+            "spa-0.2",
+            &[
+                "bluez5/libspa-codec-bluez5-ldac.so",
+                "libcamera/libspa-libcamera.so",
+                "libspa-support.so",
+            ],
+        ),
+    ];
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (group, plugins) in members.iter().chain(daemon) {
+        match groups.iter_mut().find(|(g, _)| g == group) {
+            Some((_, all)) => all.extend_from_slice(plugins),
+            None => groups.push((group, plugins.to_vec())),
+        }
+    }
+    let groups: Vec<(&str, &[&str])> = groups.iter().map(|(g, p)| (*g, p.as_slice())).collect();
+    let Some(libdir) = plugin_tree_sources(&td, &["libpipewire-0.3.so.0"], &groups) else {
+        return;
+    };
+    write(
+        &td.join("dist/usr/share/pipewire/client.conf"),
+        "context.modules = []\n",
+    );
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libpipewire-0.3.so.0"], &libdir) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    for (group, plugins) in members {
+        for plugin in *plugins {
+            assert!(
+                app.join("lib").join(group).join(plugin).is_file(),
+                "the client member {group}/{plugin} is collected:\n{err}"
+            );
+        }
+    }
+    for (group, plugins) in daemon {
+        for plugin in *plugins {
+            let name = Path::new(plugin).file_name().unwrap();
+            assert!(
+                !app.join("lib").join(group).join(plugin).exists()
+                    && !app.join("lib").join(name).exists(),
+                "the daemon-side {group}/{plugin} stays behind:\n{err}"
+            );
+        }
+    }
+    assert!(
+        err.contains("Collected 3 plugin(s) for pipewire/plugins")
+            && err.contains("Collected 2 plugin(s) for spa/plugins"),
+        "the report counts members only:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/pipewire/client.conf")).unwrap(),
+        "context.modules = []\n",
+        "the client configuration is carried:\n{err}"
+    );
 }
 
 /// Minimal ELF-shaped bytes: magic + EI_CLASS + e_machine, enough for
@@ -2563,7 +2661,7 @@ const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
     ("libgirepository-1.0.so.1", "gi", 1, 1),
     ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
     ("libheif.so.1", "heif", 1, 1),
-    ("libpipewire-0.3.so.0", "pipewire", 1, 1),
+    ("libpipewire-0.3.so.0", "pipewire", 2, 2),
     ("libQt5Core.so.5", "qt5", 1, 1),
     ("libQt6Core.so.6", "qt6", 1, 1),
     ("libspa-0.2.so.0", "spa", 1, 1),
@@ -3524,7 +3622,7 @@ fn all_families_dist(td: &Path) -> Option<(PathBuf, PathBuf)> {
         ("alsa-lib", "libasound_module_pcm_pulse.so"),
         ("gstreamer-1.0", "libgstcoreelements.so"),
         ("pipewire-0.3", "libpipewire-module-adapter.so"),
-        ("spa-0.2", "libspa-support.so"),
+        ("spa-0.2/support", "libspa-support.so"),
         ("gio/modules", "libgiognutls.so"),
         ("libheif", "libheif-x264.so"),
         ("libheif/plugins", "libheif-avif.so"),
@@ -3645,7 +3743,7 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
         ("alsa-lib", "libasound_module_pcm_pulse.so", "alsa"),
         ("gstreamer-1.0", "libgstcoreelements.so", "gstreamer"),
         ("pipewire-0.3", "libpipewire-module-adapter.so", "pipewire"),
-        ("spa-0.2", "libspa-support.so", "spa"),
+        ("spa-0.2/support", "libspa-support.so", "spa"),
         ("gio/modules", "libgiognutls.so", "gio"),
         ("libheif", "libheif-x264.so", "heif"),
         ("libheif/plugins", "libheif-avif.so", "heif"),
