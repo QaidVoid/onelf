@@ -12,9 +12,10 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use onelf_format::knowledge::{self, ValueShape};
+use onelf_format::runtime_metadata::RuntimeRuleMetadata;
 
 /// The record of what the runtime changed, read by the `onelf-env` exec
 /// hooks. See [`record_host_env`] for the format.
@@ -25,7 +26,15 @@ const ROOTS_VAR: &str = "ONELF_ROOTS";
 
 /// The environment this runtime was started with, after
 /// [`capture_starting_env`] cleaned it.
-static STARTING_ENV: OnceLock<BTreeMap<OsString, OsString>> = OnceLock::new();
+static STARTING_ENV: Mutex<Option<BTreeMap<OsString, OsString>>> = Mutex::new(None);
+
+/// The captured starting environment, or `None` before
+/// [`capture_starting_env`] ran.
+fn starting_env() -> std::sync::MutexGuard<'static, Option<BTreeMap<OsString, OsString>>> {
+    STARTING_ENV
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Clean the environment this runtime was started with and remember it,
 /// before anything else here changes it.
@@ -56,7 +65,33 @@ pub fn capture_starting_env() {
         unsafe { env::remove_var(HOST_ENV_VAR) };
     }
     purge_foreign_modules();
-    let _ = STARTING_ENV.set(env::vars_os().collect());
+    let mut start = starting_env();
+    if start.is_none() {
+        *start = Some(env::vars_os().collect());
+    }
+}
+
+/// Drop every variable a carried runtime-rules record maps that still
+/// points into another package, the way [`capture_starting_env`] drops
+/// the built-in names, and forget it in the captured starting
+/// environment, so a host program is not handed the foreign value back.
+///
+/// A local rule's variable names reach the runtime only through the
+/// record, which is read after the starting environment is captured,
+/// so the launch calls this once the record is installed and before it
+/// applies anything.
+pub fn purge_carried(rules: &RuntimeRuleMetadata) {
+    let mut start = starting_env();
+    for group in rules.rules.iter().flat_map(|record| &record.runtime.paths) {
+        let class = knowledge::group_class(group);
+        for name in &group.variables {
+            if drop_foreign(name.as_str(), class)
+                && let Some(start) = start.as_mut()
+            {
+                start.remove(OsStr::new(name.as_str()));
+            }
+        }
+    }
 }
 
 /// Drop every mapped module variable still pointing into another
@@ -162,7 +197,8 @@ pub(crate) fn host_records(
     pkg_root: &Path,
     set_roots: &[PathBuf],
 ) -> bool {
-    let Some(start) = STARTING_ENV.get() else {
+    let start = starting_env();
+    let Some(start) = start.as_ref() else {
         return false;
     };
     let roots: Vec<PathBuf> = std::iter::once(pkg_root)
@@ -628,6 +664,63 @@ mod classification_tests {
             }
         }
         assert!(checked > 0, "no catalog candidates evaluated");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A local rule's variable reaches the runtime only through the
+    /// carried record, and is classified like a built-in name once the
+    /// record is installed: a value inside another package is dropped,
+    /// and a host value stays.
+    #[test]
+    fn a_carried_rule_variable_is_classified_like_a_built_in_one() {
+        use onelf_format::rules::{
+            EnvironmentName, Inheritance, PathSelection, RelativePath, ResourceKind, RuleId,
+            RuntimeBase, RuntimeCandidate, RuntimePathGroup, RuntimeRules,
+        };
+        use onelf_format::runtime_metadata::{RuntimeRuleMetadata, RuntimeRuleRecord};
+
+        let _guard = env_lock();
+        let name = "LOCALRULE_TEST_PLUGIN_PATH";
+        assert!(knowledge::classify(name).is_none(), "not a built-in name");
+        let rules = RuntimeRuleMetadata {
+            rules: vec![RuntimeRuleRecord {
+                id: RuleId::new("local-plugins").unwrap(),
+                binding: None,
+                runtime: RuntimeRules {
+                    paths: vec![RuntimePathGroup {
+                        id: RuleId::new("plugins").unwrap(),
+                        kind: ResourceKind::Directory,
+                        candidates: vec![RuntimeCandidate {
+                            base: RuntimeBase::PackageRoot,
+                            path: RelativePath::new("lib/plugins").unwrap(),
+                        }],
+                        variables: vec![EnvironmentName::new(name).unwrap()],
+                        selection: PathSelection::All,
+                        inheritance: Inheritance::Preserve,
+                    }],
+                    ..Default::default()
+                },
+            }],
+        };
+        let work = std::env::temp_dir().join(format!("onelf-carried-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let other = work.join("other-package");
+        std::fs::create_dir_all(other.join(".onelf")).unwrap();
+
+        let foreign = format!("/usr/lib/plugins:{}", other.join("lib/plugins").display());
+        set(name, Path::new(&foreign));
+        super::purge_carried(&rules);
+        assert!(
+            std::env::var_os(name).is_none(),
+            "the foreign list is dropped"
+        );
+
+        set(name, Path::new("/usr/lib/plugins"));
+        super::purge_carried(&rules);
+        assert_eq!(std::env::var(name).as_deref(), Ok("/usr/lib/plugins"));
+
+        // SAFETY: the test holds the environment lock
+        unsafe { std::env::remove_var(name) };
         let _ = std::fs::remove_dir_all(&work);
     }
 }

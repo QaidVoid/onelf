@@ -1056,7 +1056,12 @@ static CARRIED_RULES: OnceLock<RuntimeRuleMetadata> = OnceLock::new();
 /// Install the decoded runtime rule record the package carries, so every
 /// later environment evaluation in this process uses its groups and hooks
 /// in place of the built-in fallback. Only the first installation counts.
+///
+/// The record's variable names are classified like the built-in ones:
+/// a value still pointing into another package is dropped before the
+/// launch applies anything.
 pub fn carry_rules(rules: RuntimeRuleMetadata) {
+    crate::hostenv::purge_carried(&rules);
     let _ = CARRIED_RULES.set(rules);
 }
 
