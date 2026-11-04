@@ -33,6 +33,25 @@ fn have(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this machine lets an ordinary user make a user namespace and
+/// mount inside it, which the path overlays need.
+///
+/// No knob answers that: Ubuntu's AppArmor policy lets the namespace be
+/// created and then strips its capabilities, so only a mount inside one
+/// tells. This runs the probe `ci/preflight.sh` runs, once.
+fn user_namespaces_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .args(["sh", "-c", "mount -t tmpfs onelf-probe /mnt"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 /// Whether this machine can actually mount a FUSE filesystem.
 ///
 /// `fusermount3` being installed says nothing about whether mounting is
@@ -42,16 +61,6 @@ fn have(cmd: &str) -> bool {
 /// own terms. Both have to be tried to know, so this packs a package and
 /// runs it, once, forcing FUSE so a fallback to another mode cannot make
 /// an unavailable mount look available.
-/// Whether this machine lets an ordinary user make a user namespace.
-/// Some distributions turn that off, and the path overlays need one.
-fn user_namespaces_available() -> bool {
-    match std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-        Ok(v) => v.trim() == "1",
-        // The knob is Debian's; its absence means the kernel allows it.
-        Err(_) => std::path::Path::new("/proc/self/ns/user").exists(),
-    }
-}
-
 fn fuse_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
