@@ -145,8 +145,10 @@ variable; see [Which values the caller can override](#which-values-the-caller-ca
 - `LIBDECOR_PLUGIN_DIR` for `share/libdecor/plugins-1/`
 - `XKB_CONFIG_ROOT` for `share/X11/xkb/`
 - `PIPEWIRE_CONFIG_DIR` for `share/pipewire/`, where the PipeWire rule
-  carries `client.conf`. PipeWire reads only that directory then, so a
-  caller who wants their own client configuration sets this variable
+  carries `client.conf`. PipeWire then reads only that directory, so
+  the user's drop-ins under `~/.config/pipewire` are not read by the
+  packaged app. A caller who wants their own client configuration sets
+  `PIPEWIRE_CONFIG_DIR` themselves
 - `GDK_PIXBUF_MODULE_FILE` and `GTK_IM_MODULE_FILE` for the
   `loaders.cache` under `lib/gdk-pixbuf-2.0/*/` and the
   `immodules.cache` under `lib/gtk-3.0/*/`, rewritten with absolute

@@ -25,7 +25,7 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 
 | Variable | Set when | Points to |
 |----------|----------|-----------|
-| `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs, then the previous value. The runtime never adds or extends this variable otherwise, and a recipe that assigns it as `[env]` is refused |
+| `LD_LIBRARY_PATH` | only for an ELF entrypoint without an `$ORIGIN` run path that the kernel starts | the bundled lib dirs only. The runtime never adds or extends this variable otherwise, and a recipe that assigns it as `[env]` is refused |
 | `ONELF_LIB_PATH` | `lib/` contains `.so` files | the bundled lib dirs, kept for scripts that export it as `LD_LIBRARY_PATH` |
 | `GCONV_PATH` | `lib/gconv/` exists | `<pkg>/lib/gconv`, the bundled glibc's charset converters. Replaces a value the caller set. |
 | `LIBGL_DRIVERS_PATH` | `lib/dri/` exists | `<pkg>/lib/dri` |
@@ -68,7 +68,7 @@ set; the module variables replace it. Any of them that arrives pointing
 into another onelf package is dropped first. See
 [Which values the caller can override](../guide/environment#which-values-the-caller-can-override).
 
-The runtime leaves `LD_LIBRARY_PATH` as the caller set it. Bundled
+The runtime removes the caller's `LD_LIBRARY_PATH` from the app's environment and restores it only for the host programs the app runs. Bundled
 binaries find their libraries through their `$ORIGIN` run path, and the
 host libraries the resolver chose and the libraries of the package's
 shared sets are shown as symlinks in the bundle's library directory,

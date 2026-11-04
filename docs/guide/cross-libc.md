@@ -106,11 +106,12 @@ After `bundle-libs`, watch for warnings:
 warning: libfoo.so.1 links against Glibc libc but target is Musl; this bundle may not work at runtime
 ```
 
-With `--strict-libc` those are skipped and listed under "Not found":
+With `--strict-libc` those are skipped and reported as `unresolved` in
+the completeness findings:
 
 ```
-Not found (1)
-  libfoo.so.1 (needed by bin/app (libfoo.so.1 links against Glibc libc but target is Musl))
+Completeness findings (1):
+  - libfoo.so.1: unresolved: the host scan did not find it (needed by bin/app (libfoo.so.1 links against Glibc libc but target is Musl))
 ```
 
 ⚠️ Either way, the warning means the bundle may not work at runtime. It

@@ -253,26 +253,25 @@ libraries, or finds nothing on a host without the package.
 
 `bundle-libs` looks through every bundled file for the paths of a fixed
 list of such components and reports each one the bundle has no copy
-for:
+for as an `unchecked` completeness finding:
 
 ```
-warning: 2 compiled-in plugin or data path(s) have no copy in the bundle:
-  - lib/libasound.so.2 reads /usr/lib/alsa-lib (carry alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR)
-  - lib/libasound.so.2 reads /usr/share/alsa (carry share/alsa and the runtime sets ALSA_CONFIG_DIR)
+  - lib/libasound.so.2: unchecked: reads /usr/lib/alsa-lib from the host unless the bundle carries alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR
+  - lib/libasound.so.2: unchecked: reads /usr/share/alsa from the host unless the bundle carries share/alsa and the runtime sets ALSA_CONFIG_DIR
 ```
 
 - ✅ Copy the directory into the bundle where the line says, and the
-  warning goes away.
+  finding goes away.
 - ✅ Or force-include the plugins by soname
   (`include = ["libasound_module_pcm_pulse.so"]`): a resolved plugin
   keeps the directory it was found in (`lib/alsa-lib/`), which is the
-  copy the line asks for, and the warning clears on the next run. The
+  copy the line asks for, and the finding clears on the next run. The
   soname alone is not enough to find the file: give the walk a
   `search-paths` entry pointing at the host's plugin directory, such as
   `/usr/lib/alsa-lib`.
 - ✅ For the data directories (`share/alsa` and the rest), nothing to
   do: a bundled library brings its own data from beside it, and the
-  warning clears without a hand-placed copy. It stays when the build
+  finding clears without a hand-placed copy. It stays when the build
   host has none to bring.
 - ☑️ Leave it when the app never uses that part of the library, such as
   an app that links libasound but plays no sound.
@@ -445,12 +444,11 @@ error: rule alsa group configuration requires directory data at share/alsa, but 
   rerunning. A required helper executable is treated the same way and
   names the rule and the helper it missed. The host's copy is never
   pulled in to fill the gap.
-- ⚠️ An optional group the source happens not to have is a warning, not
-  a failure:
+- ⚠️ An optional group the source happens not to have is an optional
+  omission in the completeness findings, not a failure:
 
 ```
-warning: alsa/plugins: no usable plugin group (1 location(s) unavailable, 0 candidate(s) skipped)
-    ./myapp/lib: absent
+  - alsa: lib/alsa-lib: optional omission: group plugins: no usable plugin group (1 location(s) unavailable, 0 candidate(s) skipped); ./myapp/lib: absent (activated by libasound.so.2)
 ```
 
   The component keeps working through the runtime mappings the rule
@@ -511,6 +509,14 @@ with the libraries they pull in. The PipeWire rule also carries
 `share/pipewire/client.conf`, without which a client context does not
 start, and points `PIPEWIRE_CONFIG_DIR` at it.
 
+⚠️ This is a limitation of packaged PipeWire clients. With
+`PIPEWIRE_CONFIG_DIR` set, PipeWire reads its client configuration from
+that directory alone, so the user's drop-ins under
+`~/.config/pipewire/client.conf.d/` and `~/.config/pipewire/client.conf`
+are not read by a packaged application. A user who needs their own
+client configuration sets `PIPEWIRE_CONFIG_DIR` before the launch,
+since a value the caller set wins.
+
 ```toml
 [[resources.plugins]]
 id = "plugins"
@@ -523,7 +529,8 @@ members = ["libvendor-core.so", "codecs/libvendor-pcm.so"]
 
 - ✅ The rules are parsed and checked with the built-ins before the
   AppDir is touched. A parse error, an unsupported schema, an unknown
-  field or hook, a refused variable such as `LD_LIBRARY_PATH`, a local
+  field or hook, a refused variable (any `LD_*` name, `GCONV_PATH`,
+  `GLIBC_TUNABLES` or an `ONELF_*` name), a local
   identity that repeats another file's, and an unknown or repeated
   `disable-rules` entry all fail the build naming the file and the rule.
 - ❌ A local rule cannot take a built-in identity, not even one the
@@ -594,7 +601,8 @@ libraries built against the wrong libc. Those fail at runtime with
 confusing "symbol not found" errors.
 
 ✅ `--strict-libc` refuses to bundle libraries whose `DT_NEEDED` points
-at the wrong libc family, and instead lists them under "Not found":
+at the wrong libc family, and instead reports them as `unresolved` in
+the completeness findings:
 
 ```bash
 onelf bundle-libs ./myapp --strict-libc
@@ -635,7 +643,11 @@ Runs `strip --strip-unneeded` on each copied library. Saves disk space
 onelf bundle-libs ./myapp --dry-run
 ```
 
-Shows what would be bundled without copying anything.
+Shows what would be bundled without copying, fetching or running
+anything. For a recipe, `onelf build --dry-run` does the same for the
+whole build: it reports the import, the libraries and framework groups
+it would collect, the package it would emit, and the completeness
+findings, and it leaves the AppDir untouched.
 
 ## GPU / graphics helpers
 

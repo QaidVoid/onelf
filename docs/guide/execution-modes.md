@@ -241,8 +241,8 @@ keeps the extraction between runs. A content-addressable store (`cas/`)
 deduplicates files across packages, and auto-GC removes packages unused
 for 30 days (tunable via `ONELF_GC_MAX_AGE`).
 
-Each launch runs from an execution view published beside the
-extraction and keyed by its full identity, generated environment input
+Each launch runs from an execution view published under the cache
+root's `views/view-<key>/` and keyed by its full identity, generated environment input
 included, which the view carries as `.onelf/runtime-env`. A later launch
 of the same identity reuses the view as it is. An idle view is
 collected once it has gone unused for the same 30 days, and never

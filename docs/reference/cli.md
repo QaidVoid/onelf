@@ -22,19 +22,43 @@ Assemble an AppDir from its recipe and pack it. One command resolves
 the whole recipe: `[input]` imports a bare binary to the command's
 path, a `[sysroot]` applies its package database or records its sets,
 the framework rules run over the chosen source, and the packer writes
-the resolved set selections. Unresolved dependencies are treated
-according to their source: a `[sysroot]` with a `path` fails the
-build, a host scan warns, and `[bundle] skip` runs no audit at all and
-packs the tree unchecked.
+the resolved set selections. An unresolved required dependency fails
+the build whether the contents come from a `[sysroot]` or from a scan of
+this machine. `[bundle] skip` runs no audit at all and packs the tree
+as unchecked, with no completeness claim.
 
 ```
-onelf build [PATH] [-o FILE]
+onelf build [PATH] [-o FILE] [--dry-run]
 ```
 
 | Arg / Flag | Default | Description |
 |------------|---------|-------------|
 | `PATH` | `.` | Directory or `.toml` file |
 | `-o`, `--output` | `[package] output`, else `<name>.onelf` next to the recipe | Override recipe's output path |
+| `--dry-run` | `false` | Report what the build would collect, import and emit, with its completeness findings, without writing to the AppDir, fetching anything or running the application |
+
+The build ends its bundling with one sorted block of completeness
+findings, headed `Completeness findings (N):`. Each line names the
+entrypoint when the finding is specific to one, the framework rule
+when one is involved, the object, the outcome and the reason, and the
+soname that activated the rule. The outcomes are `selected` (the
+source or provider that answers for the object), `unverified` (a
+pinned set that was not obtained), `optional omission`, `removed` (by
+the policy, a trace or a host package), `unresolved`, `required
+failure` and `unchecked` (a compiled-in path or traced run the
+assembly could not check).
+
+A dry run uses the same planning and reports the same findings. A
+binary import is placed into a private scratch copy, and a sysroot
+build populates one, so the AppDir is left exactly as it was. A pinned
+set whose build is not already verified on this machine is reported
+as `unverified` and satisfies nothing, since a dry run never fetches.
+A sysroot that is not materialized yet stops the dry run, which
+neither fetches nor unpacks its archive. A traced run is reported as
+not exercised. The dry run exits nonzero when it finds a required
+failure. Because the drop pass audits the finished tree, a dry run
+reports an unresolved need itself rather than the optional objects a
+build would omit for it.
 
 A recipe with a `[sysroot]` pins every entry's mtime to `0` unless it
 sets `[package] mtime` or `SOURCE_DATE_EPOCH` is set. See
@@ -110,7 +134,7 @@ onelf bundle-libs DIRECTORY [options]
 | `--exclude PFX` | | Soname prefixes to skip (comma/repeat) |
 | `--include SONAME` | | Force-include this soname (comma/repeat) |
 | `--search-path DIR` | | Extra lib search dir (highest priority) |
-| `--dry-run` | `false` | Report without copying |
+| `--dry-run` | `false` | Report without copying, fetching or running the target; a `--sysroot` dry run populates a private scratch copy instead of `DIRECTORY` |
 | `--no-recursive` | `false` | Don't resolve transitive deps |
 | `--gl`, `--dri`, `--vulkan` | `false` | Bundle the GPU stack (Mesa GL/EGL/GBM, DRI drivers, Vulkan ICDs). Opt-in: it is never bundled on detection alone, because the host's driver is the one that works |
 | `--wayland`, `--gtk` | auto | Framework bundlers. Auto-detect inspects both `DT_NEEDED` and versioned soname strings in the binary, so dlopen'd frameworks are picked up too |

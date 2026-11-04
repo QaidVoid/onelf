@@ -211,13 +211,18 @@ dlopen = ["libmyvendor.so.1"]    # extra sonames for scan-dlopen allow-list
 trace-run = false                # run the command and bundle what it loads at runtime
 trace-seconds = 5                # how long the traced run may go
 trace-args = ["--version"]       # arguments for the traced run
-skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
+skip = false                     # no scan or audit: the tree is packed unchecked, with no completeness claim
 rules = ["vendor-framework.toml"]  # Vec<PathBuf>, local descriptor files, relative to the recipe's directory
 disable-rules = ["translations"] # Vec<String>, built-in or local rule identities to switch off
 ```
 
 `rules` names project-local framework descriptors in the built-in
-catalog's schema. They are validated together with the built-ins before
+catalog's schema (see [Project-local rules](../guide/bundling#project-local-rules)).
+A plugin group in one may list `members`, paths relative to the found
+directory, to collect only those. A descriptor's runtime mapping may not
+name a loader-control or runtime-owned variable: any `LD_*` name,
+`GCONV_PATH`, `GLIBC_TUNABLES` or an `ONELF_*` name is refused. They are
+validated together with the built-ins before
 the AppDir changes: a local identity may not repeat a built-in one, even
 a disabled one, or another local file's, and every `disable-rules` entry
 must name a known rule exactly once. Each failure names the file and the

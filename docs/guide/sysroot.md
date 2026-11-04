@@ -152,8 +152,8 @@ usr/lib/*.a
   for optional stacks, and this is how they are cut.
 - ✅ It holds for dependencies too. A library the policy prunes is not
   copied back because something bundled needs it; the build reports it
-  under "Left out by policy" and the verifier names the file that needed
-  it, which is the next thing to prune.
+  as `removed` in its completeness findings, and the verifier names the
+  file that needed it, which is the next thing to prune.
 
 A build records what it put into the AppDir in `.onelf/generated`, with
 the hash of each file, and removes those files first the next time, so
@@ -233,22 +233,24 @@ error: bin/myapp needs libfoo.so.1, which is neither in the sysroot closure, on 
 
 - ✅ A sysroot build stops, and that is the point. The universe was
   complete, so the omission is a policy or platform-line mistake you can
-  fix. From a host scan the same finding stays a warning, because there
-  the universe was a guess. When the file the build needs is not
+  fix. A host scan through `onelf build` fails on it too. Only the
+  low-level `onelf bundle-libs` keeps it a warning when it scans this
+  machine, because there the universe was a guess. When the file the
+  build needs is not
   missing but pruned, the error names the conflict:
 
 ```
 error: bin/app needs libdep.so.1, which libdep holds but the policy or a trace removed; the conflict stops the build rather than dropping the object or restoring the file
 ```
 
-  An object the build would have to drop for this goes through the
-  ordinary "Dropped" report instead, so the failure is the one the
+  An object the build would have to drop for this is listed as an
+  optional omission in the completeness findings instead, so the failure is the one the
   build cannot resolve on its own: the entrypoint, a file you placed by
   hand, and an explicit include are never dropped silently.
 - ☑️ A dependency the database names but the sysroot does not hold is
   reported, not fatal. A debloated rootfs drops metapackages on purpose.
 - ☑️ A file the build copied whose need no package in the sysroot holds
-  is dropped and listed under "Dropped", since nothing could load it: a
+  is dropped and listed as an optional omission, since nothing could load it: a
   plugin for a stack that was never installed, say. The entrypoint and
   files you placed by hand are never dropped. They stay findings.
 
@@ -406,9 +408,9 @@ to it. Root never does, and keeps its store under its own private base
 (`/run/onelf` when `/run` is root's alone, otherwise a validated
 `/tmp/onelf-0`), whatever `HOME` or `XDG_CACHE_HOME` say.
 
-✅ Another user's store is import input. When the uid's own store lacks
-the pinned build, acquisition looks in the hinted store before it
-fetches. The candidate is reached through the store without following
+✅ Another user's store is import input, for root as for any other
+uid. When the uid's own store lacks the pinned build, acquisition looks
+in the hinted store before it fetches. The candidate is reached through the store without following
 any symlink, must be a regular file, and is copied through a handle to
 that same file into an exclusive scratch file in the uid's own store.
 The copy's own bytes are verified against the pin and loaded as a
@@ -501,8 +503,9 @@ blake3 = "3f1c...a9e2"
 
 The verifier still audits the tree, and reads each set's pinned build
 to see what it ships. A build is taken from its `file://` URL, or from
-the platform store the runtime fetches into (`ONELF_PLATFORM_STORE`,
-otherwise `platform/` under the cache root); an `https://` build not
+the platform store the runtime fetches into (`ONELF_PLATFORM_STORE`
+when the packer's uid owns it, otherwise `platform/` under the cache
+root); an `https://` build not
 there yet is fetched into that store first, and kept only when its
 BLAKE3 is the pinned one, so a wrong pin fails here rather than at a
 user's launch. A soname a set's build ships is reported as that set's:
@@ -511,7 +514,7 @@ user's launch. A soname a set's build ships is reported as that set's:
   Provided by set gtk: libgtk-3.so.0, libgdk-3.so.0
 ```
 
-- ✅ Everything no set ships stays a plain warning, so a library the
+- ✅ Everything no set ships is reported as unresolved, so a library the
   tree truly lacks is not hidden behind a set that does not carry it.
 - ⚠️ A set whose build cannot be had, offline or with a wrong pin, is
   reported with the reason, and claims nothing: what it would have

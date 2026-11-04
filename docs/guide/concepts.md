@@ -116,8 +116,10 @@ opened.
 
 Both end in the same **verifier**: every `DT_NEEDED` of every bundled
 ELF must resolve inside the bundle or sit on the platform line. From a
-sysroot an omission is an error, because the universe was complete. From
-a host scan it is a warning, because the universe was a guess.
+sysroot an omission is an error, because the universe was complete. A
+host scan through `onelf build` fails on a required omission too, while
+the low-level `onelf bundle-libs` only warns, because its universe was a
+guess.
 
 Detail: [Bundling from a Sysroot](./sysroot).
 

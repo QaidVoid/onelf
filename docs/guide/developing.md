@@ -195,6 +195,7 @@ the AppDir carries one, just like the packed runtime does.
 Once the recipe is stable:
 
 ```bash
+onelf build --dry-run        # what the build would collect and emit; changes nothing
 onelf build                  # produces myapp.onelf
 onelf verify myapp.onelf     # sanity check
 ```

@@ -315,10 +315,13 @@ set-only recipe whose tree is an upstream release unpacked into place.
   package database stops on an unresolved `DT_NEEDED`, because the
   universe was complete and the omission is a policy mistake. See
   [Bundling from a Sysroot](./sysroot).
-- ✅ A host scan sits between the two: unresolved dependencies are
-  warnings there, since the scan's universe was a guess. The same is
-  true of `onelf build` on an AppDir without a sysroot and without
-  skip.
+- ✅ A host scan through `onelf build` fails on an unresolved required
+  dependency too. A need the host platform supplies is reported, and an
+  auto-collected plugin the scan cannot satisfy is omitted and
+  reported. Only the low-level `onelf bundle-libs` keeps an unresolved
+  dependency a warning, since its scan's universe was a guess.
+- ✅ `onelf build --dry-run` reports what the build would collect,
+  import and emit, with its completeness findings, and changes nothing.
 
 ### `[paths]`
 
