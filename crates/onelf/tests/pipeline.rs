@@ -2761,11 +2761,12 @@ fn run_measured(cmd: &mut Command) -> MeasuredRun {
 
 /// Successful opens per path, the paths opened as directories, and the
 /// total number of directory reads in one traced run, counted from an
-/// strace log.
+/// strace log, with the traced command's stderr.
 struct SyscallCounts {
     opens: HashMap<String, usize>,
     dir_paths: Vec<String>,
     scans: usize,
+    stderr: String,
 }
 
 /// Run `cmd` under `strace -f`, tracing opens and directory reads, and
@@ -2798,6 +2799,7 @@ fn traced_counts(cmd: &mut Command, log: &Path) -> SyscallCounts {
         opens: HashMap::new(),
         dir_paths: Vec::new(),
         scans: 0,
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     };
     for line in text.lines() {
         let Some((_, rest)) = line.split_once(' ') else {
@@ -2944,14 +2946,43 @@ fn a_hundred_object_fixture_activates_rules_deduplicates_groups_and_reproduces_i
     );
 }
 
+/// A hundred unrelated project-local rule files for the scale fixture,
+/// one per object at the head of its chain, each with a plugin group of
+/// its own that the distribution tree does not hold. Returns their
+/// recipe-relative paths from `app`.
+fn scale_local_rules(root: &Path, app: &Path) -> Vec<String> {
+    (0..100)
+        .map(|i| {
+            let file = root.join(format!("rules/scale-{i:04}.toml"));
+            write(
+                &file,
+                &format!(
+                    "schema = 1\nid = \"local-scale-{i:04}\"\n\n[[triggers]]\n\
+                     soname-prefix = \"libscale{i:04}.so\"\n\n[[resources.plugins]]\n\
+                     id = \"plugins\"\nkind = \"directory\"\n\
+                     destination = \"lib/local-scale-{i:04}\"\nrequirement = \"optional\"\n\
+                     candidates = [{{ base = \"library-dir\", path = \"local-scale-{i:04}\" }}]\n"
+                ),
+            );
+            let rel = file.strip_prefix(root).unwrap();
+            let up = app.strip_prefix(root).unwrap().components().count();
+            format!("{}{}", "../".repeat(up), rel.display())
+        })
+        .collect()
+}
+
 /// Under a syscall trace the walk reads every synthetic object the same
 /// small number of times whatever the rules in play and whatever the
 /// tree holds, opens no directory of the distribution tree at all (rule
 /// activation and group collection answer from metadata about the
 /// objects the walk already resolved, never by scanning), and reads the
 /// AppDir's directories a bounded handful of times rather than once per
-/// object or once per rule. The exact counts are printed for the
-/// record; the assertions are the invariants, not the machine's speed.
+/// object or once per rule. The last run builds the ten-thousand-object
+/// tree through `onelf build` with a hundred unrelated local rules
+/// loaded by `[bundle] rules`, which activate and leave every per-object
+/// count where the catalog rules alone left it. The exact counts are
+/// printed for the record; the assertions are the invariants, not the
+/// machine's speed.
 #[test]
 fn traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size() {
     if !have("strace") {
@@ -2960,19 +2991,48 @@ fn traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size() {
     }
     let td = workdir("scaletrace");
     let mut reads_per_object = None;
-    for (tag, count, rules) in [
-        ("plain100", 100, false),
-        ("ruled100", 100, true),
-        ("ruled1000", 1000, true),
-        ("ruled10000", 10000, true),
+    for (tag, count, rules, local) in [
+        ("plain100", 100, false, false),
+        ("ruled100", 100, true, false),
+        ("ruled1000", 1000, true, false),
+        ("ruled10000", 10000, true, false),
+        ("local10000", 10000, true, true),
     ] {
         let root = td.join(tag);
         let (app, dist) = scale_tree_sources(&root, count, rules);
         let mut c = Command::new(onelf());
-        c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
-            .arg("--search-path")
-            .arg(&dist);
+        if local {
+            let files: Vec<String> = scale_local_rules(&root, &app)
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect();
+            write(
+                &app.join("onelf.toml"),
+                &format!(
+                    "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\n\
+                     search-paths = [\"{}\"]\nrules = [{}]\n",
+                    dist.display(),
+                    files.join(", ")
+                ),
+            );
+            c.arg("build").arg(&app);
+        } else {
+            c.args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+                .arg("--search-path")
+                .arg(&dist);
+        }
         let counts = traced_counts(&mut c, &root.join("trace.log"));
+        if local {
+            for i in [0, 99] {
+                assert!(
+                    counts.stderr.contains(&format!(
+                        "Rule local-scale-{i:04} activated by libscale{i:04}.so.1"
+                    )),
+                    "{tag}: the local rules must load and activate:\n{}",
+                    counts.stderr
+                );
+            }
+        }
         let prefix = format!("{}/dist/usr/", root.to_str().unwrap());
         let touched = counts
             .opens
@@ -3034,7 +3094,7 @@ fn traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size() {
         eprintln!(
             "scale {tag}: objects {count}, rules {}, reads per object {constant}, \
              tree-wide directory reads {}, distribution directories opened {dist_scanned}",
-            if rules { SCALE_RULE_SONAMES.len() } else { 0 },
+            if rules { SCALE_RULE_SONAMES.len() } else { 0 } + if local { 100 } else { 0 },
             counts.scans,
         );
     }
@@ -24731,4 +24791,543 @@ fn hostile_pipewire_config_leaves_the_private_spa_stack_connected() {
     );
 
     let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A project-local descriptor the local-rule fixtures select: the
+/// `libvendor.so` soname activates a plugin group collected from the
+/// library directory's `vendor-plugins`, mapped at launch as
+/// `VENDOR_PLUGIN_DIR`.
+const VENDOR_RULE: &str = r#"schema = 1
+id = "vendor-framework"
+
+[[triggers]]
+soname-prefix = "libvendor.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/vendor-plugins"
+requirement = "optional"
+candidates = [{ base = "library-dir", path = "vendor-plugins" }]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["VENDOR_PLUGIN_DIR"]
+selection = "first"
+inheritance = "replace"
+candidates = [{ base = "library-root", path = "vendor-plugins" }]
+"#;
+
+/// An AppDir whose `bin/app` links `sonames` from the fixture library
+/// directory `lib` and prints the framework mappings the local-rule
+/// tests observe, and whether the vendor plugin is present in the
+/// directory its mapping names. Returns None without a compiler.
+fn mapping_probe_app(td: &Path, lib: &Path, sonames: &[&str]) -> Option<PathBuf> {
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &td.join("probe-main.c"),
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int framework(void);
+
+static void show(const char *name) {
+    const char *value = getenv(name);
+    printf("%s=%s\n", name, value ? value : "(unset)");
+}
+
+int main(void) {
+    show("VENDOR_PLUGIN_DIR");
+    show("ALSA_PLUGIN_DIR");
+    show("ALSA_CONFIG_DIR");
+    const char *dir = getenv("VENDOR_PLUGIN_DIR");
+    if (dir) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/probe.so", dir);
+        printf("member=%s\n", access(path, R_OK) == 0 ? "present" : "absent");
+    }
+    return framework() - 1;
+}
+"#,
+    );
+    let mut args: Vec<String> = vec![
+        td.join("probe-main.c").to_string_lossy().into_owned(),
+        format!("-L{}", lib.display()),
+    ];
+    args.extend(sonames.iter().map(|s| format!("-l:{s}")));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    cc_with(&refs, &app.join("bin/app")).then_some(app)
+}
+
+/// The value one `NAME=value` line of a probe's output reports.
+fn probe_line<'a>(stdout: &'a str, name: &str) -> &'a str {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} in {stdout}"))
+}
+
+/// A project-local rule named by a recipe-relative `[bundle] rules`
+/// path activates on its soname, collects its plugin group into the
+/// AppDir, and maps its variable in a development launch and in the
+/// packed launch alike. The packed launch runs after the rule file is
+/// deleted, so the mapping comes from the carried runtime record alone.
+#[test]
+fn a_project_local_rule_collects_its_group_and_maps_it_without_its_file() {
+    let td = workdir("local-rule");
+    let Some(lib) = plugin_tree_sources(
+        &td,
+        &["libvendor.so.1"],
+        &[("vendor-plugins", &["probe.so"])],
+    ) else {
+        return;
+    };
+    let Some(app) = mapping_probe_app(&td, &lib, &["libvendor.so.1"]) else {
+        return;
+    };
+    write(&td.join("rules/vendor.toml"), VENDOR_RULE);
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"vendor\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\nrules = [\"../rules/vendor.toml\"]\n",
+            lib.display()
+        ),
+    );
+
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("Rule vendor-framework activated by libvendor.so.1; groups: plugins"),
+        "{err}"
+    );
+    assert!(app.join("lib/vendor-plugins/probe.so").is_file(), "{err}");
+    let pkg = app.join("vendor.onelf");
+    let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).contains(".onelf/runtime-rules"),
+        "the local mapping is carried"
+    );
+
+    let mut dev = dev_run(&td, &["--bundle"]);
+    dev.arg(&app);
+    let out = dev.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        probe_line(&stdout, "VENDOR_PLUGIN_DIR").ends_with("/lib/vendor-plugins"),
+        "{stdout}"
+    );
+    assert_eq!(probe_line(&stdout, "member"), "present", "{stdout}");
+
+    std::fs::remove_dir_all(td.join("rules")).unwrap();
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mapped = probe_line(&stdout, "VENDOR_PLUGIN_DIR");
+    assert!(
+        mapped.ends_with("/lib/vendor-plugins") && !mapped.starts_with(app.to_str().unwrap()),
+        "the packed tree's group answers: {stdout}"
+    );
+    assert_eq!(probe_line(&stdout, "member"), "present", "{stdout}");
+    assert!(
+        probe_line(&stdout, "ALSA_PLUGIN_DIR") == "(unset)",
+        "the carried record keeps the built-ins presence based: {stdout}"
+    );
+}
+
+/// `disable-rules` keeps a built-in rule from activating: its plugin
+/// group and required data stay uncollected and its mapping is absent
+/// at launch, while the same fixture without the disable collects and
+/// maps both.
+#[test]
+fn disabling_a_builtin_rule_leaves_its_group_and_mapping_out() {
+    for disabled in [false, true] {
+        let td = workdir(if disabled { "alsa-off" } else { "alsa-on" });
+        let Some(lib) = plugin_tree_sources(
+            &td,
+            &["libasound.so.2"],
+            &[("alsa-lib", &["libasound_module_pcm_probe.so"])],
+        ) else {
+            return;
+        };
+        let Some(app) = mapping_probe_app(&td, &lib, &["libasound.so.2"]) else {
+            return;
+        };
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"audio\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+                 [bundle]\nsearch-paths = [\"{}\"]\n{}",
+                lib.display(),
+                if disabled {
+                    "disable-rules = [\"alsa\"]\n"
+                } else {
+                    ""
+                }
+            ),
+        );
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        let pkg = app.join("audio.onelf");
+        let out = run_package(&mut packed_launch(&pkg, &td));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plugin = app.join("lib/alsa-lib/libasound_module_pcm_probe.so");
+        let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
+        let carried = String::from_utf8_lossy(&listing.stdout).contains(".onelf/runtime-rules");
+        if disabled {
+            assert!(!err.contains("Rule alsa activated"), "{err}");
+            assert!(
+                !plugin.exists() && !app.join("share/alsa").exists(),
+                "{err}"
+            );
+            assert_eq!(
+                probe_line(&stdout, "ALSA_PLUGIN_DIR"),
+                "(unset)",
+                "{stdout}"
+            );
+            assert_eq!(
+                probe_line(&stdout, "ALSA_CONFIG_DIR"),
+                "(unset)",
+                "{stdout}"
+            );
+            assert!(carried, "the disable is carried to the launch");
+        } else {
+            assert!(
+                err.contains("Rule alsa activated by libasound.so.2"),
+                "{err}"
+            );
+            assert!(plugin.is_file(), "{err}");
+            assert!(
+                probe_line(&stdout, "ALSA_PLUGIN_DIR").ends_with("/lib/alsa-lib"),
+                "{stdout}"
+            );
+            assert!(!carried, "the built-ins alone carry no record");
+        }
+    }
+}
+
+/// A local rule shadowing a built-in identity, an unknown disabled
+/// identity, an unsupported schema and a truncated descriptor each fail
+/// the build naming the file or the offending identity, and leave the
+/// AppDir exactly as it stood.
+#[test]
+fn invalid_local_rules_fail_before_the_appdir_changes() {
+    let td = workdir("local-rule-invalid");
+    let Some(lib) = plugin_tree_sources(
+        &td,
+        &["libvendor.so.1"],
+        &[("vendor-plugins", &["probe.so"])],
+    ) else {
+        return;
+    };
+    let Some(app) = mapping_probe_app(&td, &lib, &["libvendor.so.1"]) else {
+        return;
+    };
+    let cases: [(&str, String, &str, &[&str]); 4] = [
+        (
+            "shadow.toml",
+            VENDOR_RULE.replace("vendor-framework", "alsa"),
+            "disable-rules = [\"alsa\"]\n",
+            &["shadow.toml", "rule alsa shadows the built-in"],
+        ),
+        (
+            "vendor.toml",
+            VENDOR_RULE.to_string(),
+            "disable-rules = [\"no-such-rule\"]\n",
+            &["disable-rules", "no-such-rule"],
+        ),
+        (
+            "schema.toml",
+            VENDOR_RULE.replace("schema = 1", "schema = 7"),
+            "",
+            &["schema.toml", "unsupported version 7"],
+        ),
+        (
+            "cut.toml",
+            VENDOR_RULE[..VENDOR_RULE.len() / 2].to_string(),
+            "",
+            &["cut.toml", "TOML line"],
+        ),
+    ];
+    for (file, text, extra, needles) in cases {
+        write(&td.join("rules").join(file), &text);
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"vendor\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+                 [bundle]\nsearch-paths = [\"{}\"]\nrules = [\"../rules/{file}\"]\n{extra}",
+                lib.display()
+            ),
+        );
+        let before = state_of(&app);
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{file} must fail:\n{err}");
+        for needle in needles {
+            assert!(err.contains(needle), "{file}: no {needle:?} in:\n{err}");
+        }
+        assert_eq!(
+            state_of(&app),
+            before,
+            "{file}: the AppDir changed before the refusal"
+        );
+    }
+}
+
+/// Resources prepared from a set pin activate only for the entrypoints
+/// selecting that pin: the default entrypoint's launch names the pin's
+/// prepared helper ahead of the raw set's copy, which sits at an
+/// earlier candidate, while an entrypoint selecting no set sees no
+/// mapping at all, packed and in development.
+#[test]
+fn prepared_resources_activate_only_for_entrypoints_selecting_their_pin() {
+    let td = workdir("prepared-selection");
+    let Some(set_tree) = set_library(
+        &td,
+        "toolkit",
+        "libgstreamer-1.0.so.9",
+        "int gstreamer_value(void){return 42;}\n",
+    ) else {
+        return;
+    };
+    std::fs::create_dir_all(set_tree.join("lib/gstreamer-1.0")).unwrap();
+    if !cc(
+        &registry_scanner_source(&td),
+        &set_tree.join("lib/gstreamer-1.0/gst-plugin-scanner"),
+    ) {
+        return;
+    }
+    let (hash, set_pkg) = pack_set(&td, "toolkit", "toolkit");
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            helper_spawning_app_source(&td).to_str().unwrap(),
+            &format!("-L{}", set_tree.join("lib").display()),
+            "-l:libgstreamer-1.0.so.9",
+            "-Wl,-rpath,$ORIGIN/../lib",
+        ],
+        &dir.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("plain.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(void){const char *s=getenv(\"GST_PLUGIN_SCANNER\");\
+         printf(\"scanner=%s\\n\", s ? s : \"(unset)\");return 0;}\n",
+    );
+    if !cc(&td.join("plain.c"), &dir.join("bin/plain")) {
+        return;
+    }
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"sel\"\ncommand = \"bin/app\"\nmtime = 0\nsets = [\"toolkit\"]\n\n\
+             [[entrypoint]]\nname = \"plain\"\npath = \"bin/plain\"\nsets = []\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"libgstreamer\"]\nurl = \"file://{}\"\nblake3 = \"{hash}\"\n",
+            set_pkg.display()
+        ),
+    );
+    let out = Command::new(onelf())
+        .arg("build")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_PLATFORM_STORE", td.join("store"))
+        .output()
+        .expect("spawn onelf build");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("Prepared 1 prepared file(s) for set toolkit"),
+        "{err}"
+    );
+    let prepared = format!(
+        "/.onelf-prepared/toolkit/{}/libexec/gstreamer-1.0/gst-plugin-scanner",
+        hash.to_ascii_lowercase()
+    );
+    let selecting = |stdout: &str| {
+        assert!(
+            probe_line(stdout, "scanner").ends_with(&prepared),
+            "the pin's prepared copy precedes the raw set's: {stdout}"
+        );
+        assert_eq!(probe_line(stdout, "helper"), "0", "{stdout}");
+        assert_eq!(probe_line(stdout, "registry"), "(absent)", "{stdout}");
+    };
+
+    let pkg = dir.join("sel.onelf");
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    selecting(&stdout);
+    let out = run_package(packed_launch(&pkg, &td).env("ONELF_ENTRYPOINT", "plain"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(probe_line(&stdout, "scanner"), "(unset)", "{stdout}");
+
+    let mut dev = dev_run(&td, &["--bundle"]);
+    dev.arg(&dir);
+    let out = dev.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    selecting(&stdout);
+    let mut dev = dev_run(&td, &["--bundle", "--entrypoint", "plain"]);
+    dev.arg(&dir);
+    let out = dev.output().expect("spawn onelf run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(probe_line(&stdout, "scanner"), "(unset)", "{stdout}");
+}
+
+/// A recipe whose rule declarations leave the runtime behavior the
+/// built-ins already give, a discovery-only local rule and a disabled
+/// built-in without runtime mappings, packs byte for byte what the
+/// minimal recipe packs, and neither carries a runtime rule or
+/// selection record. A local runtime mapping is what adds the record.
+#[test]
+fn rule_declarations_that_change_no_mapping_pack_identically() {
+    let discovery_only = &VENDOR_RULE[..VENDOR_RULE.find("[[runtime.paths]]").unwrap()];
+    let build = |tag: &str, bundle: &str, rule: Option<&str>| -> Option<(Vec<u8>, String)> {
+        let td = workdir(tag);
+        let app = td.join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        write(&td.join("main.c"), "int main(void){return 0;}\n");
+        if !cc(&td.join("main.c"), &app.join("bin/prog")) {
+            return None;
+        }
+        if let Some(rule) = rule {
+            write(&td.join("rules/local.toml"), rule);
+        }
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"same\"\ncommand = \"bin/prog\"\nmtime = 0\n\
+                 exclude = [\"onelf.toml\"]\n\n[bundle]\n{bundle}"
+            ),
+        );
+        let out = onelf_build(&app);
+        assert!(
+            out.status.success(),
+            "{tag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let pkg = app.join("same.onelf");
+        let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
+        Some((
+            std::fs::read(&pkg).unwrap(),
+            String::from_utf8_lossy(&listing.stdout).into_owned(),
+        ))
+    };
+    let Some(minimal) = build("rules-min", "", None) else {
+        return;
+    };
+    let Some(quiet) = build(
+        "rules-quiet",
+        "rules = [\"../rules/local.toml\"]\ndisable-rules = [\"qt5\"]\n",
+        Some(discovery_only),
+    ) else {
+        return;
+    };
+    for listing in [&minimal.1, &quiet.1] {
+        assert!(
+            !listing.contains(".onelf/runtime-rules")
+                && !listing.contains(".onelf/entrypoint-sets"),
+            "{listing}"
+        );
+    }
+    assert!(
+        minimal.0 == quiet.0,
+        "declarations that change no mapping must not change the package"
+    );
+    let Some(mapped) = build(
+        "rules-mapped",
+        "rules = [\"../rules/local.toml\"]\n",
+        Some(VENDOR_RULE),
+    ) else {
+        return;
+    };
+    assert!(mapped.1.contains(".onelf/runtime-rules"), "{}", mapped.1);
+    assert!(minimal.0 != mapped.0);
+}
+
+/// A `[bundle] skip` tree runs no discovery, yet its enabled local rule
+/// mappings are still validated and carried, and the report claims no
+/// audit: the packed launch maps the variable from the tree as authored.
+#[test]
+fn a_skipped_tree_carries_its_local_mappings_unchecked() {
+    let td = workdir("local-rule-skip");
+    let app = td.join("app");
+    write(
+        &app.join("bin/app"),
+        "#!/bin/sh\necho \"VENDOR_DATA_DIR=${VENDOR_DATA_DIR:-(unset)}\"\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/app"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(&app.join("share/vendor/data.txt"), "data\n");
+    write(
+        &td.join("rules/data.toml"),
+        "schema = 1\nid = \"vendor-data\"\n\n[[runtime.paths]]\nid = \"data\"\n\
+         kind = \"directory\"\nvariables = [\"VENDOR_DATA_DIR\"]\nselection = \"first\"\n\
+         inheritance = \"preserve\"\ncandidates = [{ base = \"package-root\", path = \"share/vendor\" }]\n",
+    );
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname = \"skipped\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+         [bundle]\nskip = true\nrules = [\"../rules/data.toml\"]\n",
+    );
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("Source: unchecked"), "{err}");
+    let pkg = app.join("skipped.onelf");
+    let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
+    assert!(String::from_utf8_lossy(&listing.stdout).contains(".onelf/runtime-rules"));
+    std::fs::remove_dir_all(td.join("rules")).unwrap();
+    let out = run_package(&mut packed_launch(&pkg, &td));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        probe_line(&stdout, "VENDOR_DATA_DIR").ends_with("/share/vendor"),
+        "{stdout}"
+    );
 }
