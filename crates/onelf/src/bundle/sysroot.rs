@@ -867,10 +867,36 @@ fn populate_closure(
 /// so a build the packer fetched is already there for a launch on this
 /// machine.
 fn store_root() -> Option<PathBuf> {
-    match std::env::var_os("ONELF_PLATFORM_STORE").filter(|v| !v.is_empty()) {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => onelf_format::cache_layout::resolve_root(rustix::process::getuid().as_raw(), None)
-            .map(|root| onelf_format::cache_layout::platform_dir(&root)),
+    let uid = rustix::process::getuid().as_raw();
+    store_root_with(
+        uid,
+        std::env::var_os("ONELF_PLATFORM_STORE").map(PathBuf::from),
+        || onelf_format::cache_layout::resolve_root(uid, None),
+    )
+}
+
+/// [`store_root`] over an injected uid, store hint and cache root.
+///
+/// The hint is the store's location only when `uid` owns it, the rule
+/// the runtime applies. An ordinary uid owns a store root that belongs
+/// to it or does not exist yet. Root owns a hinted store only when it
+/// exists, belongs to uid 0 and is neither group nor other writable,
+/// since the name arrived through the invoking user's environment.
+/// Otherwise the uid's own cache root holds the store, which for root
+/// is the persistent `/var/cache/onelf`.
+fn store_root_with(
+    uid: u32,
+    hint: Option<PathBuf>,
+    cache_root: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let owned = |dir: &Path| match fs::metadata(dir) {
+        Ok(md) => md.is_dir() && md.uid() == uid && (uid != 0 || md.mode() & 0o022 == 0),
+        Err(e) => uid != 0 && e.kind() == io::ErrorKind::NotFound,
+    };
+    match hint.filter(|dir| !dir.as_os_str().is_empty() && owned(dir)) {
+        Some(dir) => Some(dir),
+        None => cache_root().map(|root| onelf_format::cache_layout::platform_dir(&root)),
     }
 }
 
@@ -2493,6 +2519,54 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
     use onelf_sysroot::Package;
+
+    /// The hinted store is the packer's store only when the uid owns it:
+    /// an ordinary uid takes its own or a missing one, and root takes
+    /// only a root-owned store no one else can write. Anything else falls
+    /// back to the uid's own cache root.
+    #[test]
+    fn a_hinted_store_is_used_only_when_the_uid_owns_it() {
+        use std::os::unix::fs::MetadataExt;
+        let mine = std::env::temp_dir().join(format!("onelf-store-hint-{}", std::process::id()));
+        fs::create_dir_all(&mine).unwrap();
+        let me = fs::metadata(&mine).unwrap().uid();
+        let cache = || Some(PathBuf::from("/cache-root/onelf"));
+        let fallback = Some(PathBuf::from("/cache-root/onelf/platform"));
+
+        assert_eq!(
+            store_root_with(me, Some(mine.clone()), cache),
+            Some(mine.clone())
+        );
+        let missing = mine.join("not-yet");
+        assert_eq!(
+            store_root_with(me, Some(missing.clone()), cache),
+            Some(missing.clone())
+        );
+        assert_eq!(store_root_with(me + 1, Some(mine.clone()), cache), fallback);
+        assert_eq!(store_root_with(me, None, cache), fallback);
+        assert_eq!(store_root_with(me, Some(PathBuf::new()), cache), fallback);
+
+        if me != 0 {
+            assert_eq!(store_root_with(0, Some(mine.clone()), cache), fallback);
+            assert_eq!(store_root_with(0, Some(mine.clone()), || None), None);
+        }
+        assert_eq!(store_root_with(0, Some(missing), cache), fallback);
+        let root_owned = Path::new("/");
+        if fs::metadata(root_owned).unwrap().uid() == 0 {
+            assert_eq!(
+                store_root_with(0, Some(root_owned.to_path_buf()), cache),
+                Some(root_owned.to_path_buf())
+            );
+        }
+        let shared = Path::new("/tmp");
+        if fs::metadata(shared).is_ok_and(|md| md.uid() == 0 && md.mode() & 0o002 != 0) {
+            assert_eq!(
+                store_root_with(0, Some(shared.to_path_buf()), cache),
+                fallback
+            );
+        }
+        let _ = fs::remove_dir_all(&mine);
+    }
 
     /// A module cache names the packaging distribution's own filesystem.
     /// Left that way it sends the bundle to the host's modules, which on
