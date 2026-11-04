@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::rc::Rc;
 
 /// Versions defined by an object, excluding its base object-name version.
 pub type VersionSet = BTreeSet<String>;
@@ -262,12 +263,18 @@ fn infer_libc(needed: &[String], interpreter: Option<&str>) -> LibcFamily {
     }
 }
 
+/// A section body and the string table its link names.
+type SectionWithStrings = (Vec<u8>, Rc<[u8]>);
+
 struct Object {
     file: File,
     file_len: u64,
     layout: Layout,
     table: Vec<u8>,
     programs: Vec<u8>,
+    /// The last string table read, by section index. The dynamic, version
+    /// definition and version requirement sections usually share one.
+    strings: Option<(usize, Rc<[u8]>)>,
 }
 
 impl Object {
@@ -286,10 +293,11 @@ impl Object {
             layout,
             table,
             programs,
+            strings: None,
         })
     }
 
-    fn section_with_strings(&mut self, kind: u32) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    fn section_with_strings(&mut self, kind: u32) -> io::Result<Option<SectionWithStrings>> {
         let Some(section) = self.layout.find_section(&self.table, kind)? else {
             return Ok(None);
         };
@@ -304,7 +312,15 @@ impl Object {
             return Err(invalid("string table is implausibly large"));
         }
         let body = read_at(&mut self.file, self.file_len, section.offset, section.size)?;
-        let strings = read_at(&mut self.file, self.file_len, strtab.offset, strtab.size)?;
+        let strings = match &self.strings {
+            Some((index, strings)) if *index == section.link => strings.clone(),
+            _ => {
+                let strings: Rc<[u8]> =
+                    read_at(&mut self.file, self.file_len, strtab.offset, strtab.size)?.into();
+                self.strings = Some((section.link, strings.clone()));
+                strings
+            }
+        };
         Ok(Some((body, strings)))
     }
 
@@ -549,6 +565,29 @@ fn advance(pos: usize, delta: usize, minimum: usize) -> io::Result<usize> {
         .ok_or_else(|| invalid("ELF chain overflows"))
 }
 
+/// Refuse an auxiliary entry overlapping any header of its chain.
+///
+/// Linkers differ in where auxiliary entries go: GNU ld interleaves them
+/// after their header, lld writes every header first. Only overlap with a
+/// header is malformed. `headers` holds strictly ascending header offsets.
+fn check_aux_placement(
+    headers: &[usize],
+    header_len: usize,
+    auxes: &[usize],
+    aux_len: usize,
+) -> io::Result<()> {
+    for &aux in auxes {
+        let after = headers.partition_point(|&header| header + header_len <= aux);
+        if headers
+            .get(after)
+            .is_some_and(|&header| header < aux + aux_len)
+        {
+            return Err(invalid("ELF auxiliary entry overlaps a header"));
+        }
+    }
+    Ok(())
+}
+
 fn parse_verdef(defs: &[u8], strings: &[u8]) -> io::Result<VersionSet> {
     let mut out = VersionSet::new();
     if defs.is_empty() {
@@ -556,8 +595,11 @@ fn parse_verdef(defs: &[u8], strings: &[u8]) -> io::Result<VersionSet> {
     }
     let mut pos = 0;
     let mut total_aux = 0usize;
+    let mut headers = Vec::new();
+    let mut auxes = Vec::new();
     for _ in 0..MAX_RECORDS {
         let entry = record(defs, pos, VERDEF_ENTRY)?;
+        headers.push(pos);
         if u16_at(entry, 0) != 1 {
             return Err(invalid("unsupported version definition format"));
         }
@@ -569,6 +611,7 @@ fn parse_verdef(defs: &[u8], strings: &[u8]) -> io::Result<VersionSet> {
         let mut aux_at = advance(pos, u32_at(entry, 12) as usize, VERDEF_ENTRY)?;
         for i in 0..count {
             let aux = record(defs, aux_at, VERDAUX_ENTRY)?;
+            auxes.push(aux_at);
             let name = string_at(strings, u32_at(aux, 0) as usize)?;
             if i == 0 && u16_at(entry, 2) & VER_FLG_BASE == 0 {
                 out.insert(name);
@@ -586,9 +629,10 @@ fn parse_verdef(defs: &[u8], strings: &[u8]) -> io::Result<VersionSet> {
         }
         let next = u32_at(entry, 16) as usize;
         if next == 0 {
+            check_aux_placement(&headers, VERDEF_ENTRY, &auxes, VERDAUX_ENTRY)?;
             return Ok(out);
         }
-        pos = advance(pos, next, aux_at - pos + VERDAUX_ENTRY)?;
+        pos = advance(pos, next, VERDEF_ENTRY)?;
     }
     Err(invalid("too many version definitions"))
 }
@@ -655,8 +699,11 @@ fn parse_verneed(
     }
     let mut pos = 0;
     let mut total_aux = 0usize;
+    let mut headers = Vec::new();
+    let mut auxes = Vec::new();
     for count in 1..=MAX_RECORDS {
         let entry = record(bytes, pos, 16)?;
+        headers.push(pos);
         if u16_at(entry, 0) != 1 {
             return Err(invalid("unsupported version requirement format"));
         }
@@ -677,6 +724,7 @@ fn parse_verneed(
         let mut aux_at = advance(pos, u32_at(entry, 8) as usize, 16)?;
         for i in 0..aux_count {
             let aux = record(bytes, aux_at, 16)?;
+            auxes.push(aux_at);
             let name = string_at(strings, u32_at(aux, 8) as usize)?;
             if name.is_empty() {
                 return Err(invalid("empty required version name"));
@@ -698,9 +746,10 @@ fn parse_verneed(
         }
         let next = u32_at(entry, 12) as usize;
         if next == 0 {
+            check_aux_placement(&headers, 16, &auxes, 16)?;
             return Ok((out, count));
         }
-        pos = advance(pos, next, aux_at - pos + 16)?;
+        pos = advance(pos, next, 16)?;
     }
     Err(invalid("too many version requirements"))
 }
@@ -960,6 +1009,32 @@ mod tests {
         elf[verdef_at + 16..verdef_at + 20].copy_from_slice(&0u32.to_le_bytes());
         let path = write_temp("short.so", &elf);
         assert_eq!(read(&path).unwrap(), set(&["FOO_1.0"]));
+    }
+
+    #[test]
+    fn definitions_with_every_header_first_are_accepted() {
+        let strings = b"\0libfoo.so.1\0FOO_1.0\0";
+        let header = |flags: u16, index: u16, aux: u32, next: u32| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&1u16.to_le_bytes());
+            v.extend_from_slice(&flags.to_le_bytes());
+            v.extend_from_slice(&index.to_le_bytes());
+            v.extend_from_slice(&1u16.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v.extend_from_slice(&aux.to_le_bytes());
+            v.extend_from_slice(&next.to_le_bytes());
+            v
+        };
+        let aux = |name: u32| [name.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        let headers = 2 * VERDEF_ENTRY as u32;
+        let mut defs = header(VER_FLG_BASE, 1, headers, VERDEF_ENTRY as u32);
+        defs.extend(header(0, 2, headers - VERDEF_ENTRY as u32 + 8, 0));
+        defs.extend(aux(1));
+        defs.extend(aux(13));
+        assert_eq!(parse_verdef(&defs, strings).unwrap(), set(&["FOO_1.0"]));
+
+        defs[12..16].copy_from_slice(&(VERDEF_ENTRY as u32).to_le_bytes());
+        assert!(parse_verdef(&defs, strings).is_err(), "aux over a header");
     }
 
     #[test]
@@ -1273,6 +1348,76 @@ mod facts_tests {
         for cut in 0..fixture.bytes.len() {
             assert_invalid(&fixture.bytes[..cut]);
         }
+    }
+
+    /// Rewrite an interleaved version-need chain into lld's layout: every
+    /// header first, then every auxiliary entry in header order.
+    fn lld_layout(verneed: &[u8]) -> Vec<u8> {
+        let mut chains = Vec::new();
+        let mut pos = 0;
+        loop {
+            let count = u16_at(verneed, pos + 2) as usize;
+            let aux_at = pos + u32_at(verneed, pos + 8) as usize;
+            chains.push((pos, &verneed[aux_at..aux_at + 16 * count]));
+            match u32_at(verneed, pos + 12) {
+                0 => break,
+                next => pos += next as usize,
+            }
+        }
+        let mut out = Vec::new();
+        let mut aux_at = 16 * chains.len();
+        for (i, (header, auxes)) in chains.iter().enumerate() {
+            let mut entry = verneed[*header..header + 16].to_vec();
+            entry[8..12].copy_from_slice(&((aux_at - 16 * i) as u32).to_le_bytes());
+            let next = if i + 1 < chains.len() { 16u32 } else { 0 };
+            entry[12..16].copy_from_slice(&next.to_le_bytes());
+            out.extend_from_slice(&entry);
+            aux_at += auxes.len();
+        }
+        for (_, auxes) in &chains {
+            out.extend_from_slice(auxes);
+        }
+        assert_eq!(out.len(), verneed.len());
+        out
+    }
+
+    #[test]
+    fn lld_layout_with_every_header_first_is_accepted() {
+        for class64 in [false, true] {
+            let fixture = facts_elf(
+                class64,
+                62,
+                None,
+                &["libc.so.6", "libfoo.so"],
+                &[
+                    ("libfoo.so", &[(0, "FOO_1")]),
+                    ("libc.so.6", &[(0, "GLIBC_2.17"), (2, "GLIBC_2.34")]),
+                ],
+            );
+            let expected = inspect(&fixture.bytes).unwrap().required_versions;
+            let at = fixture.requirements_at;
+            let mut bytes = fixture.bytes.clone();
+            let relaid = lld_layout(&bytes[at..]);
+            assert_ne!(relaid, bytes[at..], "the layouts differ");
+            bytes[at..].copy_from_slice(&relaid);
+            assert_eq!(inspect(&bytes).unwrap().required_versions, expected);
+
+            let mut overlapping = bytes.clone();
+            overlapping[at + 8..at + 12].copy_from_slice(&16u32.to_le_bytes());
+            let error = inspect(&overlapping).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("overlaps a header"), "{error}");
+        }
+    }
+
+    #[test]
+    fn lld_linked_objects_on_the_host_parse_when_present() {
+        let path = Path::new("/usr/lib/LLVMgold.so");
+        if !path.is_file() {
+            return;
+        }
+        let facts = read_facts(path).unwrap();
+        assert!(!facts.required_versions.is_empty());
     }
 
     #[test]
