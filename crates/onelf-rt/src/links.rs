@@ -308,13 +308,17 @@ pub(crate) enum Received {
     Done(Option<Message>),
 }
 
-/// The links for one directory and the launch's generated environment
-/// input, as the server is sent them.
+/// The links for one directory, the host libraries shown in place of
+/// bundled copies, and the launch's generated environment input, as the
+/// server is sent them.
 pub(crate) struct Message {
     /// The directory, relative to the package root.
     pub dir: String,
     /// Each link's name and target.
     pub links: Vec<(String, Vec<u8>)>,
+    /// Each shadowed file's path, relative to the package root, and the
+    /// host file served in its place.
+    pub shadows: Vec<(String, Vec<u8>)>,
     /// The generated environment input the mount serves; empty for none.
     pub env: Vec<u8>,
 }
@@ -338,20 +342,18 @@ pub(crate) fn channel() -> io::Result<(Sender, Receiver)> {
 }
 
 impl Sender {
-    /// Send `links` for `dir` and the generated environment input `env`,
-    /// and wait until the server serves them. A server that has gone away
-    /// ends the wait as well.
-    pub(crate) fn send(&self, dir: &str, links: &Links, env: &[u8]) {
+    /// Send `links` for `dir`, the `shadows` to serve in place of bundled
+    /// files (see [`Message::shadows`]) and the generated environment
+    /// input `env`, and wait until the server serves them. A server that
+    /// has gone away ends the wait as well.
+    pub(crate) fn send(&self, dir: &str, links: &Links, shadows: &Links, env: &[u8]) {
         let mut body = (env.len() as u64).to_le_bytes().to_vec();
         body.extend_from_slice(env);
         body.extend_from_slice(dir.as_bytes());
         body.push(0);
-        for (name, target) in links {
-            body.extend_from_slice(name.as_bytes());
-            body.push(0);
-            body.extend_from_slice(target.as_os_str().as_bytes());
-            body.push(0);
-        }
+        encode_pairs(&mut body, links);
+        body.push(0);
+        encode_pairs(&mut body, shadows);
         let mut message = (body.len() as u64).to_le_bytes().to_vec();
         message.extend_from_slice(&body);
         let mut rest = message.as_slice();
@@ -397,18 +399,38 @@ impl Receiver {
     }
 }
 
+/// Append each name and target of `pairs`, every one NUL-terminated.
+fn encode_pairs(body: &mut Vec<u8>, pairs: &Links) {
+    for (name, target) in pairs {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(target.as_os_str().as_bytes());
+        body.push(0);
+    }
+}
+
 fn decode(body: &[u8]) -> Option<Message> {
     let env_len = usize::try_from(u64::from_le_bytes(body.get(..8)?.try_into().ok()?)).ok()?;
     let env = body.get(8..8usize.checked_add(env_len)?)?.to_vec();
     let body = &body[8 + env_len..];
     let mut fields = body.split(|&b| b == 0);
     let dir = std::str::from_utf8(fields.next()?).ok()?.to_string();
-    let mut links = Vec::new();
-    while let Some(name) = fields.next().filter(|f| !f.is_empty()) {
-        let target = fields.next()?;
-        links.push((std::str::from_utf8(name).ok()?.to_string(), target.to_vec()));
-    }
-    Some(Message { dir, links, env })
+    let mut pairs = || -> Option<Vec<(String, Vec<u8>)>> {
+        let mut pairs = Vec::new();
+        while let Some(name) = fields.next().filter(|f| !f.is_empty()) {
+            let target = fields.next()?;
+            pairs.push((std::str::from_utf8(name).ok()?.to_string(), target.to_vec()));
+        }
+        Some(pairs)
+    };
+    let links = pairs()?;
+    let shadows = pairs()?;
+    Some(Message {
+        dir,
+        links,
+        shadows,
+        env,
+    })
 }
 
 /// Execution-view identity and the configuration record stored beside a
@@ -3140,7 +3162,11 @@ mod tests {
             "libfixture.so.1".into(),
             PathBuf::from("/run/set/lib/libfixture.so.1"),
         );
-        let sender = std::thread::spawn(move || tx.send("lib", &links, b"ONELF-RUNTIME-ENV 1 0\n"));
+        let mut shadows = Links::new();
+        shadows.insert("lib/libc.so.6".into(), PathBuf::from("/usr/lib/libc.so.6"));
+        let sender = std::thread::spawn(move || {
+            tx.send("lib", &links, &shadows, b"ONELF-RUNTIME-ENV 1 0\n")
+        });
         let got = loop {
             if let Received::Done(got) = rx.read() {
                 break got;
@@ -3160,6 +3186,10 @@ mod tests {
                     b"/run/set/lib/libfixture.so.1".to_vec()
                 ),
             ]
+        );
+        assert_eq!(
+            got.shadows,
+            vec![("lib/libc.so.6".to_string(), b"/usr/lib/libc.so.6".to_vec())]
         );
     }
 }

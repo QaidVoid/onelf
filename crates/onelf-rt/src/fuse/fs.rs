@@ -566,12 +566,18 @@ pub(crate) const VIEW_ENV_DIR: &str = ".onelf";
 /// package's library directory (see `crate::links`), and the launch's
 /// generated environment input as a read-only file. Their inodes follow
 /// the manifest's, in the order they were added.
+///
+/// A host library that beat a bundled copy is served as a symlink in that
+/// copy's place, where a launch without a mount namespace of its own has
+/// no other way to put it.
 #[derive(Default)]
 struct Synthetic {
     /// Inode of the first entry.
     first: u64,
     links: Vec<SyntheticLink>,
     by_name: HashMap<(u64, String), u64>,
+    /// The inode served in place of each shadowed package entry's.
+    shadowed: HashMap<u64, u64>,
 }
 
 struct SyntheticLink {
@@ -581,6 +587,8 @@ struct SyntheticLink {
     target: Vec<u8>,
     /// Whether this is a regular file rather than a symlink.
     file: bool,
+    /// Whether this stands in for a package entry of the same name.
+    shadow: bool,
 }
 
 impl Synthetic {
@@ -591,10 +599,10 @@ impl Synthetic {
         }
     }
 
-    fn add(&mut self, parent: u64, name: String, target: Vec<u8>, file: bool) {
+    fn add(&mut self, parent: u64, name: String, target: Vec<u8>, file: bool) -> Option<u64> {
         let key = (parent, name);
         if self.by_name.contains_key(&key) {
-            return;
+            return None;
         }
         let inode = self.first + self.links.len() as u64;
         self.by_name.insert(key.clone(), inode);
@@ -603,7 +611,27 @@ impl Synthetic {
             name: key.1,
             target,
             file,
+            shadow: false,
         });
+        Some(inode)
+    }
+
+    /// Serve a symlink to `target` in place of the package entry `entry`,
+    /// named `name` in directory `parent`.
+    fn shadow(&mut self, entry: u64, parent: u64, name: String, target: Vec<u8>) {
+        if self.shadowed.contains_key(&entry) {
+            return;
+        }
+        if let Some(inode) = self.add(parent, name, target, false) {
+            self.links[(inode - self.first) as usize].shadow = true;
+            self.shadowed.insert(entry, inode);
+        }
+    }
+
+    /// The inode served for the package entry `entry`: its own, or the
+    /// one that shadows it.
+    fn served(&self, entry: u64) -> u64 {
+        self.shadowed.get(&entry).copied().unwrap_or(entry)
     }
 
     fn get(&self, inode: u64) -> Option<&SyntheticLink> {
@@ -615,12 +643,13 @@ impl Synthetic {
         self.by_name.get(&(parent, name.to_string())).copied()
     }
 
-    /// The links in directory `parent`, with their inodes.
+    /// The links in directory `parent` that are served beside the
+    /// package's entries, with their inodes.
     fn children(&self, parent: u64) -> Vec<(u64, &SyntheticLink)> {
         self.links
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.parent == parent)
+            .filter(|(_, l)| l.parent == parent && !l.shadow)
             .map(|(i, l)| (self.first + i as u64, l))
             .collect()
     }
@@ -708,7 +737,7 @@ impl<'a> FuseState<'a> {
         self.inbox = Some(inbox);
     }
 
-    fn take_links(&mut self) {
+    fn take_links(&mut self, fuse_fd: &impl AsFd) {
         let Some(inbox) = self.inbox.as_mut() else {
             return;
         };
@@ -722,11 +751,62 @@ impl<'a> FuseState<'a> {
                     self.synthetic.add(entry_to_inode(idx), name, target, false);
                 }
             }
+            for (path, target) in message.shadows {
+                self.shadow(fuse_fd, &path, target);
+            }
             self.serve_view_env(message.env);
             if let Some(inbox) = &inbox {
                 inbox.ack();
             }
         }
+    }
+
+    /// Serve a symlink to `target` in place of the package's file at
+    /// `path`, relative to the package root.
+    ///
+    /// The launch looked the file up before it chose the host's copy, and
+    /// the kernel keeps that answer for as long as the entry is valid, so
+    /// it is told to forget the name.
+    fn shadow(&mut self, fuse_fd: &impl AsFd, path: &str, target: Vec<u8>) {
+        let Some((dir, name)) = path.rsplit_once('/') else {
+            return;
+        };
+        let Some(idx) = crate::links::dir_index(self.manifest, dir) else {
+            return;
+        };
+        let parent = entry_to_inode(idx);
+        let found = self.children[parent as usize].iter().copied().find(|&c| {
+            let entry = &self.manifest.entries[inode_to_entry(c)];
+            entry.kind != EntryKind::Dir && self.manifest.get_string(entry.name) == name
+        });
+        let Some(entry) = found else {
+            return;
+        };
+        self.synthetic
+            .shadow(entry, parent, name.to_string(), target);
+
+        let out = FuseNotifyInvalEntryOut {
+            parent,
+            namelen: name.len() as u32,
+            flags: 0,
+        };
+        let len =
+            OUT_HEADER_SIZE + core::mem::size_of::<FuseNotifyInvalEntryOut>() + name.len() + 1;
+        let header = FuseOutHeader {
+            len: len as u32,
+            error: FUSE_NOTIFY_INVAL_ENTRY,
+            unique: 0,
+        };
+        let mut message = Vec::with_capacity(len);
+        unsafe {
+            write_struct(&mut message, &header);
+            write_struct(&mut message, &out);
+        }
+        message.extend_from_slice(name.as_bytes());
+        message.push(0);
+        // A name the kernel never looked up has nothing to forget, and
+        // answers ENOENT.
+        let _ = rustix::io::write(fuse_fd, &message);
     }
 
     /// Serve the launch's generated environment input at
@@ -843,7 +923,7 @@ impl<'a> FuseState<'a> {
                 .get(signals)
                 .is_some_and(|r| r.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
             {
-                self.take_links();
+                self.take_links(fuse_fd);
             }
 
             // An external unmount (`fusermount3 -u -z`) signals ERR/HUP on
@@ -1307,6 +1387,13 @@ fn handle_lookup(
         })
         .copied();
     let attr = match found {
+        Some(child_inode) if tree.synthetic.served(child_inode) != child_inode => {
+            let inode = tree.synthetic.served(child_inode);
+            match tree.synthetic.get(inode) {
+                Some(link) => tree.synthetic.attr(inode, link, manifest),
+                None => return reply_err(header, -libc_enoent()),
+            }
+        }
         Some(child_inode) => {
             let entry_idx = inode_to_entry(child_inode);
             if let Some(rec) = recorder {
@@ -1507,6 +1594,18 @@ fn handle_readdir(header: &FuseInHeader, body: &[u8], tree: &Tree, plus: bool) -
         let (ino, typ, name, attr): (u64, u32, &[u8], Option<FuseAttr>) = match i {
             0 => (inode, dir_type(EntryKind::Dir), b".", None),
             1 => (parent_inode, dir_type(EntryKind::Dir), b"..", None),
+            _ if i - 2 < ch.len() && tree.synthetic.served(ch[i - 2]) != ch[i - 2] => {
+                let link_inode = tree.synthetic.served(ch[i - 2]);
+                let Some(link) = tree.synthetic.get(link_inode) else {
+                    continue;
+                };
+                (
+                    link_inode,
+                    dir_type(EntryKind::Symlink),
+                    link.name.as_bytes(),
+                    plus.then(|| tree.synthetic.attr(link_inode, link, manifest)),
+                )
+            }
             _ if i - 2 < ch.len() => {
                 let child_inode = ch[i - 2];
                 let child_entry = &manifest.entries[inode_to_entry(child_inode)];
