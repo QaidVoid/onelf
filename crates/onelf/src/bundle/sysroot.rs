@@ -84,7 +84,6 @@ pub struct SysrootReport {
     /// Sonames a shared set provides, which the verifier accepts.
     pub set_sonames: HashSet<String>,
     /// What the build admitted, which descriptor discovery draws from.
-    #[allow(dead_code)]
     pub(crate) universe: SysrootUniverse,
 }
 
@@ -146,7 +145,6 @@ pub struct SysrootUniverse {
     db: Database,
 }
 
-#[allow(dead_code)]
 impl SysrootUniverse {
     /// The universe a populated build admits: `kept` are the
     /// sysroot-relative files the closure and the pruning tiers left
@@ -644,19 +642,12 @@ pub fn refuse_inside(root: &Path, appdir: &Path) -> io::Result<()> {
 }
 
 /// Refuse a shared set name a recipe could not refer to: a set is named
-/// in `[sysroot.sets.<name>]` and in the paths built from it.
+/// in `[sysroot.sets.<name>]` and in the paths built from it, so the name
+/// follows the one set-name rule every metadata table applies.
 pub fn check_set_name(name: &str) -> io::Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("set {name}: a set name is letters, digits, - and _ only"),
-        ));
-    }
-    Ok(())
+    onelf_format::rules::RuleId::set_name(name)
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("set {name}: {e}")))
 }
 
 /// `path` canonicalized through its deepest existing ancestor, with the
@@ -1957,7 +1948,6 @@ pub(crate) fn dispose_generated(
 /// which is the point from which a difference on disk is a publisher's
 /// edit rather than the build's own doing, and every later rebuild
 /// stops on one instead of excusing it.
-#[allow(dead_code)]
 pub(crate) fn attest_generated(appdir: &Path) -> io::Result<()> {
     let mut entries = read_generated(appdir)?;
     for entry in &mut entries {

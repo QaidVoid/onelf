@@ -4,10 +4,9 @@
 use super::*;
 
 mod candidates;
-#[allow(unused_imports)]
 pub(crate) use candidates::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, CandidateMiss, GroupClassification,
-    GroupOutcome, GroupQuery, MissReason, discover_group,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, MissReason,
+    discover_group,
 };
 
 /// Scan `dir` for existing shared libraries. Returns the set of sonames

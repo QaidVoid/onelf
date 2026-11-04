@@ -635,7 +635,6 @@ fn carry_data_group(
             rule,
             group: declared.id.as_str(),
             kind: declared.kind,
-            requirement: declared.requirement,
             destination: &declared.destination,
             candidates: &declared.candidates,
         },
@@ -752,7 +751,7 @@ fn examined_locations(outcome: &GroupOutcome) -> Vec<String> {
 }
 
 /// Why one examined alternative is not the carry, in the shared wording.
-fn miss_text(reason: &MissReason) -> String {
+pub(crate) fn miss_text(reason: &MissReason) -> String {
     match reason {
         MissReason::Absent => "absent".to_string(),
         MissReason::WrongKind {
@@ -827,7 +826,6 @@ fn collect_helper_group(
             rule,
             group: declared.id.as_str(),
             kind: declared.kind,
-            requirement: declared.requirement,
             destination: &declared.destination,
             candidates: &declared.candidates,
         },
@@ -2974,7 +2972,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     present.sort();
     present.dedup();
     for soname in &present {
-        discovery.observe_present(soname)?;
+        discovery.observe(soname)?;
     }
 
     if needed_by.is_empty() {
@@ -3206,7 +3204,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     let mut seeds: Vec<String> = needed_by.keys().cloned().collect();
     seeds.sort();
     for soname in &seeds {
-        discovery.observe_present(soname)?;
+        discovery.observe(soname)?;
     }
     discovery.seed(&seeds);
     // The groups the activator queued, as rule and identity pairs in
@@ -4405,7 +4403,7 @@ fn provider_collisions(entrypoint: &str, selected: &[&sysroot::SetProvider]) -> 
         exports.sort_by(|a, b| (&a.1.blake3, &a.0.set).cmp(&(&b.1.blake3, &b.0.set)));
         let mut groups: Vec<(&[u8; 32], &sysroot::SetProvider)> = Vec::new();
         for (provider, export) in &exports {
-            match groups.first() {
+            match groups.last() {
                 Some((hash, _)) if *hash == &export.blake3 => {}
                 _ => groups.push((&export.blake3, provider)),
             }
@@ -5766,7 +5764,7 @@ mod helper_tests {
     ) -> io::Result<Collected> {
         let admitted = [AdmittedLibrary::new("libgstreamer-1.0.so.0", lib)];
         let mut discovery = Discovery::new(catalog::builtins(), &[], &[]).unwrap();
-        discovery.observe_present("libgstreamer-1.0.so.0").unwrap();
+        discovery.observe("libgstreamer-1.0.so.0").unwrap();
         let mut destinations = HashMap::new();
         let mut helpers = HashSet::new();
         let mut needed_by = HashMap::new();
@@ -6767,7 +6765,7 @@ mod catalog_coverage_tests {
         for family in FAMILIES {
             let mut discovery = Discovery::new(catalog::builtins(), &[], &[]).unwrap();
             for soname in family.sonames {
-                discovery.observe_present(soname).unwrap();
+                discovery.observe(soname).unwrap();
             }
             let activated: Vec<RuleActivation> = discovery
                 .activations()
@@ -7173,6 +7171,25 @@ mod provider_audit_tests {
         assert!(text.contains("exported with different bytes"), "{text}");
         assert!(text.contains("cannot be selected together"), "{text}");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Providers that agree on the bytes form one side of a collision,
+    /// so a finding names one set per distinct content, never two sets
+    /// that ship the same export.
+    #[test]
+    fn a_collision_names_one_set_per_distinct_content() {
+        let providers = [
+            provider("alpha", 1, &[("libshared.so.1", 1)]),
+            provider("beta", 2, &[("libshared.so.1", 2)]),
+            provider("gamma", 3, &[("libshared.so.1", 2)]),
+        ];
+        let selected: Vec<&sysroot::SetProvider> = providers.iter().collect();
+        let findings = provider_collisions("app", &selected);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let text = &findings[0];
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("beta"), "{text}");
+        assert!(!text.contains("gamma"), "{text}");
     }
 
     /// Two entrypoints whose selections never name the same set use

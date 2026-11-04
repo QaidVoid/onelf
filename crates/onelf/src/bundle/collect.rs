@@ -18,13 +18,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::rules::{Requirement, ResourceGroup, ResourceKind};
+use onelf_format::rules::{Requirement, ResourceGroup};
 
 use super::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, MissReason, discover_group,
-    is_nix_stub_ld, read_elf_class, read_elf_machine,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, discover_group, is_nix_stub_ld,
+    miss_text, read_elf_class, read_elf_machine,
 };
-use crate::bundle::sysroot::{Refusal, SysrootUniverse};
+use crate::bundle::sysroot::SysrootUniverse;
 
 /// The most members one group's collection may yield. A directory past
 /// this is a hostile or pathological source, not completeness.
@@ -85,7 +85,6 @@ pub(crate) fn collect_group(
             rule,
             group: declared.id.as_str(),
             kind: declared.kind,
-            requirement: declared.requirement,
             destination: &declared.destination,
             candidates: &declared.candidates,
         },
@@ -265,31 +264,6 @@ fn compatible_object(
         )),
         (Some(_), None) => Err("not an ELF object".to_string()),
         _ => Ok(()),
-    }
-}
-
-fn miss_text(reason: &MissReason) -> String {
-    match reason {
-        MissReason::Absent => "absent".to_string(),
-        MissReason::WrongKind {
-            actual: ResourceKind::File,
-        } => "a file where a directory is declared".to_string(),
-        MissReason::WrongKind {
-            actual: ResourceKind::Directory,
-        } => "a directory where a file is declared".to_string(),
-        MissReason::OutsideRoot => "outside the admitted root".to_string(),
-        MissReason::NotAdmitted(refusal) => format!("not admitted: {}", refusal_text(refusal)),
-    }
-}
-
-fn refusal_text(refusal: &Refusal) -> String {
-    match refusal {
-        Refusal::Absent => "not in the selected source".to_string(),
-        Refusal::HostPackage { owner } => format!("left to the host package {owner}"),
-        Refusal::UnselectedPackage { owner } => {
-            format!("owned by the unselected package {owner}")
-        }
-        Refusal::Pruned { owner } => format!("pruned from the package {owner}"),
     }
 }
 

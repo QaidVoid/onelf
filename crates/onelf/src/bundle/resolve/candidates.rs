@@ -24,7 +24,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use onelf_format::rules::{RelativePath, Requirement, ResourceKind, SourceBase, SourceCandidate};
+use onelf_format::rules::{RelativePath, ResourceKind, SourceBase, SourceCandidate};
 use onelf_sysroot::path::in_root;
 
 use crate::bundle::sysroot::{Refusal, SysrootUniverse};
@@ -46,7 +46,6 @@ pub(crate) struct AdmittedLibrary {
     path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl AdmittedLibrary {
     /// Record an admitted object: the soname it answers to and the path
     /// the walk resolved it to, which in a sysroot build is the
@@ -61,11 +60,6 @@ impl AdmittedLibrary {
     /// The soname the object answers to.
     pub(crate) fn soname(&self) -> &str {
         &self.soname
-    }
-
-    /// The path the walk resolved the object to.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 
     /// The directory the object sits in, which a library-dir base
@@ -105,7 +99,6 @@ fn is_lib_dir(dir: &Path) -> bool {
 /// The roots one declared base searches: each admitted library's
 /// directory or installation prefix, in the order the libraries were
 /// admitted, without repetition.
-#[allow(dead_code)]
 pub(crate) fn roots_for(base: SourceBase, libraries: &[AdmittedLibrary]) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -131,8 +124,6 @@ pub(crate) struct GroupQuery<'a> {
     pub group: &'a str,
     /// The kind the declared source must have on disk.
     pub kind: ResourceKind,
-    /// Whether absence is a required miss or an optional omission.
-    pub requirement: Requirement,
     /// The destination relative to the bundle root, which every
     /// alternative maps onto with its layout preserved.
     pub destination: &'a RelativePath,
@@ -203,48 +194,12 @@ pub(crate) struct CandidateMiss {
 
 /// What discovery answered for one activated group.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct GroupOutcome {
-    /// The rule the group belongs to.
-    pub rule: String,
-    /// The group's identity within its rule.
-    pub group: String,
-    /// The kind the declaration requires.
-    pub kind: ResourceKind,
-    /// Whether absence is a required miss or an optional omission.
-    pub requirement: Requirement,
     /// The existing admitted alternatives, in declaration order, each
     /// against every root of its base in library-admission order.
     pub found: Vec<CandidateHit>,
     /// The examined and refused alternatives, in examination order.
     pub misses: Vec<CandidateMiss>,
-}
-
-/// What an outcome means for assembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GroupClassification {
-    /// At least one alternative exists on an admitted root.
-    Found,
-    /// A required group has no alternative on any admitted root. The
-    /// collector turns this into an assembly failure.
-    RequiredMiss,
-    /// An optional group has no alternative on any admitted root. The
-    /// collector turns this into an omission finding.
-    OptionalOmission,
-}
-
-impl GroupOutcome {
-    /// What the outcome means for assembly.
-    #[allow(dead_code)]
-    pub(crate) fn classification(&self) -> GroupClassification {
-        if !self.found.is_empty() {
-            GroupClassification::Found
-        } else if self.requirement == Requirement::Required {
-            GroupClassification::RequiredMiss
-        } else {
-            GroupClassification::OptionalOmission
-        }
-    }
 }
 
 /// Enumerate an activated group's declared alternatives over the
@@ -257,16 +212,11 @@ impl GroupOutcome {
 ///
 /// Past the hit or examination caps the answer is an error naming the
 /// group, so discovery stays bounded whatever a descriptor declares.
-#[allow(dead_code)]
 pub(crate) fn discover_group(
     query: &GroupQuery,
     admitted: &AdmittedUniverse,
 ) -> io::Result<GroupOutcome> {
     let mut outcome = GroupOutcome {
-        rule: query.rule.to_string(),
-        group: query.group.to_string(),
-        kind: query.kind,
-        requirement: query.requirement,
         found: Vec::new(),
         misses: Vec::new(),
     };
@@ -469,7 +419,6 @@ mod tests {
 
     fn discover(
         kind: ResourceKind,
-        requirement: Requirement,
         candidates: &[SourceCandidate],
         libraries: &[AdmittedLibrary],
         sysroot: Option<&SysrootUniverse>,
@@ -479,7 +428,6 @@ mod tests {
                 rule: "rule",
                 group: "group",
                 kind,
-                requirement,
                 destination: &RelativePath::new("lib/group").unwrap(),
                 candidates,
             },
@@ -569,14 +517,7 @@ mod tests {
             candidate(SourceBase::InstallationPrefix, "share/app/missing"),
             candidate(SourceBase::InstallationPrefix, "share/app/data"),
         ];
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert_eq!(
             outcome
                 .found
@@ -627,14 +568,7 @@ mod tests {
             candidate(SourceBase::InstallationPrefix, "lib/relative"),
             candidate(SourceBase::LibraryDir, "liba.so.1.2"),
         ];
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert_eq!(outcome.misses.len(), 0, "{:?}", outcome.misses);
         // All three alternatives answer for the same file, so they
         // deduplicate onto one hit, the first declared one.
@@ -668,14 +602,7 @@ mod tests {
             candidate(SourceBase::LibraryDir, "relative"),
             candidate(SourceBase::LibraryDir, "dangling"),
         ];
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert!(outcome.found.is_empty(), "{:?}", outcome.found);
         let reasons: Vec<(usize, &MissReason)> = outcome
             .misses
@@ -709,29 +636,15 @@ mod tests {
             candidate(SourceBase::LibraryDir, "tree"),
         ];
 
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert!(outcome.found.iter().any(|h| h.candidate == 0));
         assert!(outcome.misses.iter().any(|m| m.reason
             == MissReason::WrongKind {
                 actual: ResourceKind::Directory
             }));
-        assert_eq!(outcome.classification(), GroupClassification::Found);
+        assert!(!outcome.found.is_empty());
 
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::Directory, &candidates, &libs, None).unwrap();
         assert!(outcome.found.iter().any(|h| h.candidate == 1));
         assert!(outcome.misses.iter().any(|m| m.reason
             == MissReason::WrongKind {
@@ -753,30 +666,13 @@ mod tests {
         let libs = [library(root.join("usr/lib/liba.so.1").to_str().unwrap())];
         let candidates = [candidate(SourceBase::LibraryDir, "missing")];
 
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert!(outcome.found.is_empty());
-        assert_eq!(outcome.classification(), GroupClassification::RequiredMiss);
+        assert!(outcome.found.is_empty());
 
-        let outcome = discover(
-            ResourceKind::File,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::File, &candidates, &libs, None).unwrap();
         assert!(outcome.found.is_empty());
-        assert_eq!(
-            outcome.classification(),
-            GroupClassification::OptionalOmission
-        );
+        assert!(outcome.found.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -796,14 +692,7 @@ mod tests {
             candidates.push(candidate(SourceBase::LibraryDir, &name));
         }
         let libs = [library(root.join("usr/lib/liba.so.1").to_str().unwrap())];
-        let err = discover(
-            ResourceKind::File,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap_err();
+        let err = discover(ResourceKind::File, &candidates, &libs, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("rule rule group group: more than 64 source candidates"),
@@ -842,14 +731,8 @@ mod tests {
         )];
         let candidates = [candidate(SourceBase::InstallationPrefix, "share/alsa")];
 
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert_eq!(outcome.found.len(), 1, "{:?}", outcome.misses);
         assert_eq!(
             outcome.found[0].resolved,
@@ -860,14 +743,8 @@ mod tests {
         fs::remove_dir_all(root.join("usr/share/alsa")).unwrap();
         std::os::unix::fs::symlink(dir.join("host/usr/share/alsa"), root.join("usr/share/alsa"))
             .unwrap();
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert!(outcome.found.is_empty(), "{:?}", outcome.found);
         assert_eq!(
             outcome.misses[0].reason,
@@ -913,14 +790,8 @@ mod tests {
         )];
         let candidates = [candidate(SourceBase::InstallationPrefix, "share/X11/xkb")];
 
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert_eq!(outcome.misses.len(), 0, "{:?}", outcome.misses);
         assert_eq!(
             outcome.found[0].resolved,
@@ -957,14 +828,8 @@ mod tests {
         )];
         let candidates = [candidate(SourceBase::LibraryDir, "gstreamer-1.0")];
 
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert!(outcome.found.is_empty(), "{:?}", outcome.found);
         assert_eq!(
             outcome.misses[0].reason,
@@ -972,18 +837,12 @@ mod tests {
                 owner: "extra".to_string()
             })
         );
-        assert_eq!(outcome.classification(), GroupClassification::RequiredMiss);
+        assert!(outcome.found.is_empty());
 
         let named = vec!["extra".to_string()];
         let universe = fixture::populate_universe(&root, &packages, "app", &named, None, None);
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Required,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert_eq!(outcome.found.len(), 1, "{:?}", outcome.misses);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1023,14 +882,8 @@ mod tests {
         )];
         let candidates = [candidate(SourceBase::LibraryDir, "gstreamer-1.0")];
 
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            Some(&universe),
-        )
-        .unwrap();
+        let outcome =
+            discover(ResourceKind::Directory, &candidates, &libs, Some(&universe)).unwrap();
         assert_eq!(outcome.found.len(), 1, "{:?}", outcome.misses);
         assert_eq!(
             universe.admitted_under("usr/lib/gstreamer-1.0"),
@@ -1067,14 +920,7 @@ mod tests {
             candidate(SourceBase::LibraryDir, "gstreamer-1.0"),
             candidate(SourceBase::InstallationPrefix, "share/gstreamer-1.0"),
         ];
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::Directory, &candidates, &libs, None).unwrap();
         assert_eq!(outcome.found.len(), 2, "{:?}", outcome.misses);
         assert_eq!(outcome.found[0].resolved, multi.join("gstreamer-1.0"));
         assert_eq!(
@@ -1091,36 +937,10 @@ mod tests {
         let libs = [library(
             store.join("lib/libgstreamer-1.0.so.0").to_str().unwrap(),
         )];
-        let outcome = discover(
-            ResourceKind::Directory,
-            Requirement::Optional,
-            &candidates,
-            &libs,
-            None,
-        )
-        .unwrap();
+        let outcome = discover(ResourceKind::Directory, &candidates, &libs, None).unwrap();
         assert_eq!(outcome.found.len(), 2, "{:?}", outcome.misses);
         assert_eq!(outcome.found[0].resolved, store.join("lib/gstreamer-1.0"));
         assert_eq!(outcome.found[1].resolved, store.join("share/gstreamer-1.0"));
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The outcome carries its rule and group for the report.
-    #[test]
-    fn the_outcome_carries_its_rule_and_group() {
-        let outcome = GroupOutcome {
-            rule: "alsa".to_string(),
-            group: "plugins".to_string(),
-            kind: ResourceKind::Directory,
-            requirement: Requirement::Optional,
-            found: Vec::new(),
-            misses: Vec::new(),
-        };
-        assert_eq!(outcome.rule, "alsa");
-        assert_eq!(outcome.group, "plugins");
-        assert_eq!(
-            outcome.classification(),
-            GroupClassification::OptionalOmission
-        );
     }
 }

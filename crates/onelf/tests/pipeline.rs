@@ -2519,7 +2519,6 @@ const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
     ("libgirepository-1.0.so.1", "gi", 1, 1),
     ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
     ("libheif.so.1", "heif", 1, 1),
-    ("libintl.so.8", "translations", 1, 1),
     ("libpipewire-0.3.so.0", "pipewire", 1, 1),
     ("libQt5Core.so.5", "qt5", 1, 1),
     ("libQt6Core.so.6", "qt6", 1, 1),
@@ -3177,7 +3176,7 @@ fn a_hundred_injected_rules_activate_over_the_tree_sonames_without_rewalking_it(
         let started = std::time::Instant::now();
         for batch in batches {
             for name in batch {
-                discovery.observe_present(name).unwrap();
+                discovery.observe(name).unwrap();
             }
         }
         discovery.seed(&names);
@@ -3527,10 +3526,11 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
             "{soname} is bundled:\n{err}"
         );
     }
-    // Every activated rule is reported, twenty distinct rules over the
-    // twenty sonames (the pipewire soname activates spa too).
+    // Every activated rule is reported: nineteen distinct rules over the
+    // twenty sonames, since the runtime-only translations rule has no
+    // build trigger.
     assert!(
-        err.contains("Rules:") && err.contains("20 activated by soname prefix"),
+        err.contains("Rules:") && err.contains("19 activated by soname prefix"),
         "every family's rule activates:\n{err}"
     );
 
@@ -3602,7 +3602,6 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
         ("share/X11/xkb/symbols/us", "us\n"),
         ("share/X11/locale/Compose", "compose\n"),
         ("share/misc/magic.mgc", "compiled-one\n"),
-        ("share/locale/de/LC_MESSAGES/app.mo", "messages\n"),
         ("lib/tcl8.6/init.tcl", "tcl\n"),
         ("lib/tk8.6/tk.tcl", "tk\n"),
         ("lib/girepository-1.0/GLib-2.0.typelib", "typelib\n"),
@@ -3619,16 +3618,11 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
         !app.join("share/file").exists(),
         "no later MAGIC alternative:\n{err}"
     );
-    for rule in [
-        "alsa",
-        "magic",
-        "xkb",
-        "x11",
-        "tcl-8.6",
-        "tk-8.6",
-        "gi",
-        "translations",
-    ] {
+    assert!(
+        !app.join("share/locale").exists(),
+        "translations are mapped at launch, never copied:\n{err}"
+    );
+    for rule in ["alsa", "magic", "xkb", "x11", "tcl-8.6", "tk-8.6", "gi"] {
         assert!(
             err.contains(&format!("(data of {rule}")),
             "the report names {rule}'s data carry:\n{err}"
@@ -3812,11 +3806,11 @@ fn gi_typelibs_are_carried_into_the_library_directory() {
     );
 }
 
-/// Translation catalogs come from the installation prefix the
-/// declaration names and land under the tree root the runtime's
-/// `TEXTDOMAINDIR` mapping names.
+/// The translations rule maps the runtime's `TEXTDOMAINDIR` and carries
+/// nothing: a host's whole `share/locale` never enters the tree because
+/// a bundled library links `libintl`.
 #[test]
-fn translations_are_carried_from_the_installation_prefix() {
+fn translations_are_mapped_at_launch_and_never_copied() {
     let td = workdir("data-locale");
     let Some(dist) = data_tree_sources(
         &td,
@@ -3832,8 +3826,8 @@ fn translations_are_carried_from_the_installation_prefix() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "bundle-libs failed:\n{err}");
     assert!(
-        app.join("share/locale/de/LC_MESSAGES/app.mo").is_file(),
-        "the catalogs are carried:\n{err}"
+        !app.join("share/locale").exists(),
+        "the host catalogs stay on the host:\n{err}"
     );
 }
 

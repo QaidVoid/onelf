@@ -213,12 +213,6 @@ impl Discovery {
         Ok(())
     }
 
-    /// Observe a soname that needs no resolution: one the tree already
-    /// bundles or a packaged set supplies.
-    pub(crate) fn observe_present(&mut self, soname: &str) -> io::Result<()> {
-        self.observe(soname)
-    }
-
     /// Observe a soname and queue it for resolution: a seed of the walk
     /// or a dependency discovered along the way.
     pub(crate) fn enqueue(&mut self, soname: &str) -> io::Result<()> {
@@ -441,7 +435,7 @@ mod tests {
                 s
             };
             for soname in &sorted {
-                d.observe_present(soname).unwrap();
+                d.observe(soname).unwrap();
             }
             d.seed(&sorted);
             std::iter::from_fn(|| d.pop())
