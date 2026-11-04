@@ -19,6 +19,9 @@ pub const FUSE_DESTROY: u32 = 38;
 pub const FUSE_BATCH_FORGET: u32 = 42;
 pub const FUSE_READDIRPLUS: u32 = 44;
 
+/// The `error` of an unsolicited message that drops a cached name.
+pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
+
 // Init flags
 pub const FUSE_ASYNC_READ: u32 = 1 << 0;
 pub const FUSE_BIG_WRITES: u32 = 1 << 3;
@@ -56,6 +59,15 @@ pub struct FuseOutHeader {
     pub len: u32,
     pub error: i32,
     pub unique: u64,
+}
+
+/// The body of [`FUSE_NOTIFY_INVAL_ENTRY`], followed by the name and a NUL.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FuseNotifyInvalEntryOut {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
 }
 
 #[repr(C)]

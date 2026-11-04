@@ -44,7 +44,7 @@ jobs:
             musl-tools patchelf fuse3
 
       # Installing fuse3 is not the same as being allowed to mount. The
-      # runtime prefers unsharing a mount namespace, which Ubuntu 24.04
+      # runtime prefers unsharing a mount namespace, which the Ubuntu runner
       # denies to unprivileged users through AppArmor, and falls back to
       # the fusermount3 helper, which needs the fuse module present. The
       # tests probe for a real mount and skip themselves when it fails, so
@@ -164,7 +164,7 @@ jobs:
             musl-tools patchelf fuse3 squashfuse squashfs-tools
 
       # Mounts must come from the setuid fusermount3 helper alone, so the
-      # user-namespace knob stays at Ubuntu 24.04's denying default. The
+      # user-namespace knob stays at the Ubuntu runner's denying default. The
       # preflight refuses a runner where unshare still succeeds, since
       # such a runner would not be exercising the helper path at all.
       - name: Allow the helper mount, keep namespaces denied
@@ -208,8 +208,10 @@ jobs:
       # A leftover helper or device node could still mount, and then the
       # launches this job runs would not take the extraction fallback it
       # exists to cover. The preflight fails on any of the three.
+      # The runner image ships fuse3 whether or not a job asks for it.
       - name: Take FUSE off the runner
         run: |
+          sudo apt-get remove -y --purge fuse3 fuse 2>/dev/null || true
           sudo modprobe -r fuse 2>/dev/null || true
           sudo rm -f /dev/fuse
 
@@ -293,13 +295,15 @@ jobs:
 
       # The root guarantees are written against a real uid transition, so
       # the tests that hold them run as actual uid 0, not a mapped one.
+      # The runner's sudo ignores -E, so root gets the toolchain and the
+      # capability claims it needs by name.
       - name: Privileged tests as root
-        run: sudo -E env "PATH=$PATH" cargo test -p onelf --locked --test pipeline -- root_serves root_neither root_leaves
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=$CI" "ONELF_REQUIRED_CAPS=$ONELF_REQUIRED_CAPS" "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" cargo test -p onelf --locked --test pipeline -- root_serves root_neither root_leaves
 
       # The import races (a source mutated or replaced mid-copy, an unsafe
       # source, fetch prohibition) as the uid they defend.
       - name: Import race tests as root
-        run: sudo -E env "PATH=$PATH" cargo test -p onelf-rt --locked import
+        run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CI=$CI" "ONELF_REQUIRED_CAPS=$ONELF_REQUIRED_CAPS" "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" cargo test -p onelf-rt --locked import
 
   # The media stack checks and the traced read counters. The job
   # installs GStreamer with its scanner and base plugins, ALSA headers,

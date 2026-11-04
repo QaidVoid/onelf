@@ -468,8 +468,7 @@ fn exec_cache(
     // view's identity. The base shows the same package content the view
     // will, so judging it here is judging the view.
     let lib_dirs_empty = pkg.manifest.lib_dirs().is_empty();
-    let resolved =
-        (!lib_dirs_empty).then(|| launch::resolve_launch(pkg, ep_idx, &pkg_dir, false, false));
+    let resolved = (!lib_dirs_empty).then(|| launch::resolve_launch(pkg, ep_idx, &pkg_dir, false));
     let policy = resolved
         .as_ref()
         .map(|r| r.policy)

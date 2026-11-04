@@ -137,8 +137,9 @@ fn run(launch: &Launch) {
                     launch.pkg,
                     launch.ep_idx,
                     launch.pkg_root,
-                    launch.private_ns,
-                    launch.tree_writable,
+                    launch.private_ns
+                        || launch.tree_writable
+                        || matches!(launch.links, Links::Server(_)),
                 )
             };
             &resolved_owned
@@ -148,9 +149,12 @@ fn run(launch: &Launch) {
     for name in &resolution.incomparable {
         eprintln!("onelf-rt: resolver: cannot order {name}; keeping the bundled copy");
     }
-    if let Some(farm) = &resolution.farm {
-        shadow_bundled_copies(farm, launch, &lib_dirs);
-    }
+    let shadows = resolution
+        .farm
+        .as_deref()
+        .map(|farm| bundled_shadows(manifest, farm, launch.pkg_root, &lib_dirs))
+        .unwrap_or_default();
+    shadow_bundled_copies(launch, &shadows);
     let runpath = crate::links::origin_runpath(&target_path);
     let wanted = if lib_dirs.is_empty() {
         None
@@ -178,6 +182,7 @@ fn run(launch: &Launch) {
         &set_lib_dirs,
         &set_roots,
         wanted.as_ref(),
+        &shadows,
     );
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
@@ -452,6 +457,8 @@ fn publishes_view_env(links: &Links<'_>, tree_writable: bool, private_ns: bool) 
 }
 
 /// Generate and publish this launch's evaluated per-view environment input.
+/// A server this launch started is sent it with the launch's library links
+/// and the `shadows` it serves (see [`shadow_bundled_copies`]).
 ///
 /// The record holds one entry per framework mapping alias and per variable
 /// the launch changed, the active roots, and the host-restoration record.
@@ -467,6 +474,7 @@ fn publish_view_env(
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
     wanted: Option<&(String, crate::links::Links)>,
+    shadows: &crate::links::Links,
 ) {
     if !publishes_view_env(&launch.links, launch.tree_writable, launch.private_ns) {
         return;
@@ -484,8 +492,13 @@ fn publish_view_env(
     if let Links::Server(sender) = launch.links {
         let no_links = crate::links::Links::new();
         let (dir, links) = wanted.map_or(("", &no_links), |(d, l)| (d.as_str(), l));
-        if !links.is_empty() || !bytes.is_empty() {
-            sender.send(dir, links, &bytes);
+        let shadows = if serves_shadows(launch) {
+            shadows
+        } else {
+            &no_links
+        };
+        if !links.is_empty() || !shadows.is_empty() || !bytes.is_empty() {
+            sender.send(dir, links, shadows, &bytes);
         }
         return;
     }
@@ -539,7 +552,47 @@ fn fallback_library_path(pkg_root: &Path, lib_dirs: &[&str]) -> String {
         .join(":")
 }
 
-/// Put each host winner in place of the bundled copy it beat.
+/// Each bundled copy a host winner in the link farm at `farm` beat, by
+/// its path relative to `pkg_root`, with the host file that takes its
+/// place. A name the package does not carry is a library link, never a
+/// bundled copy.
+pub(crate) fn bundled_shadows(
+    manifest: &Manifest,
+    farm: &Path,
+    pkg_root: &Path,
+    lib_dirs: &[&str],
+) -> crate::links::Links {
+    let mut shadows = crate::links::Links::new();
+    let Ok(entries) = std::fs::read_dir(farm) else {
+        return shadows;
+    };
+    for entry in entries.flatten() {
+        let Ok(host) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        for dir in lib_dirs {
+            let rel = format!("{dir}/{name}");
+            if crate::links::carried(manifest, dir).contains(name.as_str())
+                && pkg_root.join(&rel).is_file()
+            {
+                shadows.insert(rel, host.clone());
+            }
+        }
+    }
+    shadows
+}
+
+/// Whether the FUSE server this launch started serves its `shadows` in
+/// place of the bundled copies, having no namespace to mount them in.
+fn serves_shadows(launch: &Launch) -> bool {
+    matches!(launch.links, Links::Server(_)) && !launch.private_ns && !launch.tree_writable
+}
+
+/// Put each host winner in place of the bundled copy it beat, as
+/// `shadows` lists them.
 ///
 /// A link beside the bundled copy is not enough for that, and neither is
 /// a library path: `bundle-libs` gives every executable a `DT_RPATH`, and
@@ -547,38 +600,27 @@ fn fallback_library_path(pkg_root: &Path, lib_dirs: &[&str]) -> String {
 /// would always be found first. Inside a private mount namespace the host
 /// file is bind-mounted over the bundled path, which every process in the
 /// tree then sees, including one that clears its environment and
-/// re-execs. A tree that is this launch's own gets a symlink instead.
-/// With neither, only libraries the bundle does not carry can come from
-/// the host.
-fn shadow_bundled_copies(farm: &Path, launch: &Launch, lib_dirs: &[&str]) {
+/// re-execs. A tree that is this launch's own gets a symlink instead, and
+/// a FUSE server this launch started serves one, from
+/// [`publish_view_env`]. With none of these, only libraries the bundle
+/// does not carry can come from the host.
+fn shadow_bundled_copies(launch: &Launch, shadows: &crate::links::Links) {
     if !launch.private_ns && !launch.tree_writable {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(farm) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(host) = std::fs::read_link(entry.path()) else {
-            continue;
+    for (rel, host) in shadows {
+        let bundled = launch.pkg_root.join(rel);
+        let outcome = if launch.private_ns {
+            rustix::mount::mount_bind(host, &bundled).map_err(std::io::Error::from)
+        } else {
+            std::fs::remove_file(&bundled).and_then(|()| std::os::unix::fs::symlink(host, &bundled))
         };
-        for dir in lib_dirs {
-            let bundled = launch.pkg_root.join(dir).join(entry.file_name());
-            if !bundled.is_file() {
-                continue;
-            }
-            let outcome = if launch.private_ns {
-                rustix::mount::mount_bind(&host, &bundled).map_err(std::io::Error::from)
-            } else {
-                std::fs::remove_file(&bundled)
-                    .and_then(|()| std::os::unix::fs::symlink(&host, &bundled))
-            };
-            if let Err(e) = outcome {
-                eprintln!(
-                    "onelf-rt: resolver: cannot place {} over {}: {e}",
-                    host.display(),
-                    bundled.display()
-                );
-            }
+        if let Err(e) = outcome {
+            eprintln!(
+                "onelf-rt: resolver: cannot place {} over {}: {e}",
+                host.display(),
+                bundled.display()
+            );
         }
     }
 }
@@ -667,9 +709,10 @@ pub struct Resolved {
 /// `pkg_root`. `ONELF_NO_RESOLVER` turns it off for one launch, which is
 /// the way to tell whether a failure is the resolver's doing.
 ///
-/// A launch that can put no host file in place of a bundled one, neither
-/// by mount nor by editing its tree, never takes the host's glibc: the
-/// bundled executables would load their own libc under the host loader.
+/// A launch that cannot put a host file in place of a bundled one
+/// (`can_shadow`), by mount, by editing its tree or through the FUSE
+/// server it started, never takes the host's glibc: the bundled
+/// executables would load their own libc under the host loader.
 ///
 /// A host with no GL stack gets the build the package pins, if it pins
 /// one and the build can be had; the resolver then indexes that build
@@ -679,8 +722,7 @@ pub fn resolve_launch(
     pkg: &PackageData,
     ep_idx: usize,
     pkg_root: &Path,
-    private_ns: bool,
-    tree_writable: bool,
+    can_shadow: bool,
 ) -> Resolved {
     let lib_dirs = pkg.manifest.lib_dirs();
     let disabled = std::env::var_os("ONELF_NO_RESOLVER").is_some_and(|v| !v.is_empty() && v != "0");
@@ -749,7 +791,7 @@ pub fn resolve_launch(
             icd_dirs: resolve::ICD_DIRS,
             extra_root: platform_root.as_deref(),
             set_roots: &set_roots,
-            host_libc: private_ns || tree_writable,
+            host_libc: can_shadow,
         },
         &crate::sets::pins(),
     );

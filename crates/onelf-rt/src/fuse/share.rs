@@ -29,7 +29,10 @@
 //!
 //! A package file replaced on disk has a new package id, so a launch of it
 //! never finds the old server's record, and a launch whose library links
-//! differ from what the mount serves mounts its own.
+//! differ from what the mount serves mounts its own. A mount made through
+//! the helper also shows every launch the host libraries its first launch
+//! put in place of bundled copies, so a launch that would put others
+//! there mounts its own as well.
 //!
 //! Lifetime: the server is a transport, never a launch's guardian. Every
 //! launch, the first one included, runs under a lifetime guardian of its
@@ -258,25 +261,8 @@ fn join(
     // The mount is visible and served by the first launch's server, so
     // this launch can read it here: what it shows decides the links, and
     // the check below needs those before anything runs.
-    let resolved =
-        crate::launch::resolve_launch(pkg, req.ep_idx, &share.mountpoint, record.namespace, false);
-    let (dir, links) = crate::launch::effective_links(
-        &pkg.manifest,
-        req.ep_idx,
-        &share.mountpoint,
-        resolved.resolution.farm.as_deref(),
-    );
-    let manifest = &pkg.manifest;
-    if let Some(dir) = &dir
-        && !crate::links::served(
-            manifest,
-            &share.mountpoint,
-            dir,
-            &links,
-            &manifest.lib_dirs(),
-        )
-    {
-        // The links that mount serves were placed for a launch that
+    let Some(resolved) = resolve_joined(pkg, req, record, &share.mountpoint) else {
+        // The host libraries that mount shows were chosen by a launch that
         // resolved the host differently, and only that launch could have
         // chosen them.
         drop(lease);
@@ -285,7 +271,7 @@ fn join(
              libraries than this launch needs; mounting its own"
         );
         return Declined::Private;
-    }
+    };
 
     let mountpoint = share.mountpoint.clone();
     let launch = req.launch(
@@ -315,6 +301,77 @@ fn join(
         }
     };
     crate::guardian::proxy(supervision, "fuse")
+}
+
+/// The resolver's decision for a launch that joins the mount at
+/// `mountpoint`, or `None` when that mount serves other host libraries
+/// than the launch needs.
+fn resolve_joined(
+    pkg: &PackageData,
+    req: &Request,
+    record: &Record,
+    mountpoint: &Path,
+) -> Option<crate::launch::Resolved> {
+    let manifest = &pkg.manifest;
+    let lib_dirs = manifest.lib_dirs();
+    let resolved = crate::launch::resolve_launch(pkg, req.ep_idx, mountpoint, true);
+    let farm = resolved.resolution.farm.as_deref();
+    // A mount made through the helper shows every launch the host files
+    // its first launch put in place of bundled copies; in a namespace each
+    // launch binds its own. This launch resolved against the mount as it
+    // is, where a shadowed name reads as the host file. A host copy that
+    // won for its versions then looks no newer and does not win again, so
+    // the sets differ, while one that wins whatever the bundle holds, as a
+    // GL driver does, wins again. Equal sets therefore show this launch
+    // what it would have put in place itself.
+    let wanted = match farm {
+        Some(farm) if !record.namespace => {
+            crate::launch::bundled_shadows(manifest, farm, mountpoint, &lib_dirs)
+        }
+        _ => crate::links::Links::new(),
+    };
+    if served_shadows(manifest, mountpoint, &lib_dirs) != wanted {
+        return None;
+    }
+    let (dir, links) = crate::launch::effective_links(manifest, req.ep_idx, mountpoint, farm);
+    if let Some(dir) = &dir
+        && !crate::links::served(manifest, mountpoint, dir, &links, &lib_dirs)
+    {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// What the mount at `mountpoint` serves in place of files the package
+/// carries in its `lib_dirs`, by path relative to the package root, as
+/// [`crate::launch::bundled_shadows`] lists them. Such an entry has a
+/// server inode, past every inode of the package's own.
+fn served_shadows(
+    manifest: &onelf_format::Manifest,
+    mountpoint: &Path,
+    lib_dirs: &[&str],
+) -> crate::links::Links {
+    use std::os::unix::fs::DirEntryExt;
+    let mut shadows = crate::links::Links::new();
+    for dir in lib_dirs {
+        let carried = crate::links::carried(manifest, dir);
+        let Ok(entries) = std::fs::read_dir(mountpoint.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|n| carried.contains(n)) else {
+                continue;
+            };
+            if entry.ino() <= manifest.entries.len() as u64 {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                shadows.insert(format!("{dir}/{name}"), target);
+            }
+        }
+    }
+    shadows
 }
 
 /// Whether the mount serves exactly the generated environment input this

@@ -33,6 +33,25 @@ fn have(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this machine lets an ordinary user make a user namespace and
+/// mount inside it, which the path overlays need.
+///
+/// No knob answers that: Ubuntu's AppArmor policy lets the namespace be
+/// created and then strips its capabilities, so only a mount inside one
+/// tells. This runs the probe `ci/preflight.sh` runs, once.
+fn user_namespaces_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--"])
+            .args(["sh", "-c", "mount -t tmpfs onelf-probe /mnt"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 /// Whether this machine can actually mount a FUSE filesystem.
 ///
 /// `fusermount3` being installed says nothing about whether mounting is
@@ -42,16 +61,6 @@ fn have(cmd: &str) -> bool {
 /// own terms. Both have to be tried to know, so this packs a package and
 /// runs it, once, forcing FUSE so a fallback to another mode cannot make
 /// an unavailable mount look available.
-/// Whether this machine lets an ordinary user make a user namespace.
-/// Some distributions turn that off, and the path overlays need one.
-fn user_namespaces_available() -> bool {
-    match std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-        Ok(v) => v.trim() == "1",
-        // The knob is Debian's; its absence means the kernel allows it.
-        Err(_) => std::path::Path::new("/proc/self/ns/user").exists(),
-    }
-}
-
 fn fuse_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -9923,12 +9932,20 @@ fn pack_script(td: &Path, tag: &str, body: &str) -> PathBuf {
 /// The mountpoint under `run_dir` that this process's mount namespace
 /// currently lists, if any.
 fn helper_mount_under(run_dir: &Path) -> Option<PathBuf> {
-    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    helper_mounts_under(run_dir).into_iter().next()
+}
+
+/// Every mountpoint under `run_dir` that this process's mount namespace
+/// currently lists, in the order they were mounted.
+fn helper_mounts_under(run_dir: &Path) -> Vec<PathBuf> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let prefix = format!("{}/onelf-", run_dir.display());
-    info.lines().find_map(|line| {
-        let mp = line.split(' ').nth(4)?.replace("\\040", " ");
-        mp.starts_with(&prefix).then(|| PathBuf::from(mp))
-    })
+    info.lines()
+        .filter_map(|line| {
+            let mp = line.split(' ').nth(4)?.replace("\\040", " ");
+            mp.starts_with(&prefix).then(|| PathBuf::from(mp))
+        })
+        .collect()
 }
 
 /// Launch `pkg` through the host's FUSE helper and wait for its mount to
@@ -10338,7 +10355,7 @@ fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
         .env("HOME", td.to_str().unwrap());
     isolate(&mut run, &td);
     assert!(
-        reclaimed_by(&mut run, &td),
+        reclaimed_by(&mut run, std::slice::from_ref(&mountpoint)),
         "the dead mount is gone from the namespace"
     );
     assert!(
@@ -10372,9 +10389,8 @@ fn a_live_helper_mount_survives_another_launch() {
     let out = run_package(&mut run);
     assert!(out.status.success());
 
-    assert_eq!(
-        helper_mount_under(&td.join("xdg-run")),
-        Some(mountpoint.clone()),
+    assert!(
+        helper_mounts_under(&td.join("xdg-run")).contains(&mountpoint),
         "the live mount is still in the namespace"
     );
     assert!(
@@ -10391,17 +10407,22 @@ fn a_live_helper_mount_survives_another_launch() {
     kill_group(&mut child);
     child.wait().unwrap();
     assert!(
-        reclaimed_by(&mut run, &td),
+        reclaimed_by(&mut run, std::slice::from_ref(&mountpoint)),
         "the abandoned mount is reclaimed"
     );
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// Launch `run` until no helper mount is left under the test's runtime
-/// directory. A killed group's processes release the mountpoint lock as
-/// they die, which is not instantaneous, and a launch that arrives before
-/// the last of them is right to leave the mount alone.
-fn reclaimed_by(run: &mut Command, td: &Path) -> bool {
+/// Launch `run` until this process's mount namespace lists none of the
+/// `abandoned` mounts. A killed group's processes release the mountpoint
+/// lock as they die, which is not instantaneous, and a launch that arrives
+/// before the last of them is right to leave the mount alone.
+///
+/// The check names the abandoned mounts rather than asking for none at
+/// all: on a host without user namespaces `run` mounts through the helper
+/// as well, and its own shared mount stays until its server notices that
+/// nothing uses it.
+fn reclaimed_by(run: &mut Command, abandoned: &[PathBuf]) -> bool {
     for _ in 0..40 {
         let out = run_package(run);
         assert!(
@@ -10409,7 +10430,11 @@ fn reclaimed_by(run: &mut Command, td: &Path) -> bool {
             "the next package runs: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        if helper_mount_under(&td.join("xdg-run")).is_none() {
+        let listed = |mp: &PathBuf| {
+            mp.parent()
+                .is_some_and(|dir| helper_mounts_under(dir).contains(mp))
+        };
+        if !abandoned.iter().any(listed) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -10839,6 +10864,7 @@ fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
             "helper={helper}: a killed server leaves its files"
         );
 
+        let abandoned = helper_mounts_under(&td.join("xdg-run"));
         let mut run = Command::new(&other);
         run.env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -10850,7 +10876,7 @@ fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
         let mut left = Vec::new();
         for _ in 0..20 {
             assert!(
-                reclaimed_by(&mut run, &td),
+                reclaimed_by(&mut run, &abandoned),
                 "helper={helper}: the mount stays"
             );
             // The reclaiming launch shares a mount of its own, gone once its
@@ -11629,6 +11655,9 @@ fn root_serves_its_own_set_view_not_a_users_mount() {
     let (build, hash, pkg) = pack_pinned_set(&td);
     let store = plant_user_store(&td, &build, &hash);
     let run_dir = td.join("xdg-run");
+    // Without a user launch to make it, the user's runtime directory is
+    // still the place root must leave alone, so it exists to compare.
+    std::fs::create_dir_all(&run_dir).unwrap();
 
     // A user launch holds a mount of the user's stored copy while root
     // runs. The first line arrives only after the set is acquired and

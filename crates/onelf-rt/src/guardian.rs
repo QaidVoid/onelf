@@ -704,6 +704,15 @@ mod tests {
         ppid_of(pid).is_some()
     }
 
+    /// Write `contents` to `path` in one step, through a rename, so a
+    /// reader polling for the file never sees it created but still empty.
+    fn publish(path: &Path, contents: &str) {
+        let staged = path.with_extension("staged");
+        if std::fs::write(&staged, contents).is_ok() {
+            let _ = std::fs::rename(&staged, path);
+        }
+    }
+
     fn read_u32_file(path: &Path) -> Option<u32> {
         std::fs::read_to_string(path).ok()?.trim().parse().ok()
     }
@@ -784,7 +793,7 @@ mod tests {
             Ok(Fork::Child(_)) => match unsafe { kernel_fork() } {
                 Ok(Fork::Child(_)) => {
                     super::detach_stdio();
-                    let _ = std::fs::write(dir.join("daemon_pid"), std::process::id().to_string());
+                    publish(&dir.join("daemon_pid"), &std::process::id().to_string());
                     std::thread::sleep(Duration::from_secs(sleep_secs));
                     std::process::exit(exit_code);
                 }
@@ -999,7 +1008,7 @@ mod tests {
         match unsafe { kernel_fork() } {
             Ok(Fork::Child(_)) => {
                 let _ = rustix::process::setsid();
-                let _ = std::fs::write(dir.join("daemon_pid"), format!("{}", std::process::id()));
+                publish(&dir.join("daemon_pid"), &std::process::id().to_string());
                 // Rustix's `close` treats an already closed descriptor as
                 // a bug, so the wholesale wipe asks `fcntl` first.
                 for fd in 0..4096 {
