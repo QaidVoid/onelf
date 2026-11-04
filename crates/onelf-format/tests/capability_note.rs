@@ -197,15 +197,20 @@ fn absent_note_is_distinct_from_malformed() {
 }
 
 #[test]
-fn truncated_notes_never_probe_present() {
+fn truncated_notes_are_incompatible_once_the_vendor_is_readable() {
     let note = encode_capability_note(RUNTIME_METADATA_VERSION, all_caps());
+    let vendor_end = 12 + NOTE_NAME.len() + 1;
     for len in 0..note.len() {
         let elf = elf64_with_segments(&[note[..len].to_vec()], 4);
         let probed = probe_capability_note(&elf).unwrap();
-        assert!(
-            !matches!(probed, RuntimeNote::Present { .. }),
-            "truncation at {len} probed present"
-        );
+        if len < vendor_end {
+            assert_eq!(probed, RuntimeNote::Absent, "truncation at {len}");
+        } else {
+            assert!(
+                matches!(probed, RuntimeNote::Incompatible(_)),
+                "truncation at {len} probed {probed:?}"
+            );
+        }
     }
 }
 
@@ -250,7 +255,7 @@ fn invalid_descriptions_are_incompatible() {
         ));
     }
     // A note of the right vendor and type but a non-canonical description
-    // width is not a readable advertisement: absence, not corruption.
+    // width is corruption, not absence.
     for desc in [vec![9u8; 11], vec![9u8; 13]] {
         assert!(matches!(
             probe_capability_note(&elf64_with_segments(
@@ -258,16 +263,16 @@ fn invalid_descriptions_are_incompatible() {
                 4
             ))
             .unwrap(),
-            RuntimeNote::Absent
+            RuntimeNote::Incompatible(_)
         ));
     }
 }
 
 #[test]
 fn oversized_declared_lengths_are_abandoned_without_panic() {
-    // A foreign note with a nonsense declared size, and a note of ours
-    // whose declared description is not the canonical width, are skipped
-    // without following their lengths.
+    // A foreign note with a nonsense declared size is skipped, and a note
+    // of ours whose declared description is not the canonical width is
+    // refused, both without following their lengths.
     let mut corrupt = gnu_entry();
     corrupt[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(matches!(
@@ -279,7 +284,7 @@ fn oversized_declared_lengths_are_abandoned_without_panic() {
     greedy[4..8].copy_from_slice(&4096u32.to_le_bytes());
     assert!(matches!(
         probe_capability_note(&elf64_with_segments(&[greedy], 4)).unwrap(),
-        RuntimeNote::Absent
+        RuntimeNote::Incompatible(_)
     ));
 }
 
@@ -305,12 +310,13 @@ fn segment_bounds_drive_the_scan() {
     elf[96..104].copy_from_slice(&u64::MAX.to_le_bytes()); // p_filesz
     assert_eq!(probe_capability_note(&elf).unwrap(), RuntimeNote::Absent);
 
-    // A table claiming far more entries than the file holds.
+    // A table claiming far more entries than the file holds is walked
+    // only as far as whole entries fit, so the real note is still found.
     let mut elf = elf64_with_segments(&[capability_entry(4)], 4);
     elf[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
     assert!(matches!(
         probe_capability_note(&elf).unwrap(),
-        RuntimeNote::Present { .. } | RuntimeNote::Absent
+        RuntimeNote::Present { .. }
     ));
 }
 

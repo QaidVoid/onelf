@@ -407,9 +407,9 @@ fn decode_note_desc(desc: &[u8]) -> Result<(u16, RuntimeCapabilities), Capabilit
 /// a sequential walk, because linkers merge note sections with differing
 /// internal alignment into one segment and a fixed-stride walk desyncs on
 /// the padding between them. The description is accepted at the 4- and
-/// 8-byte padded name offsets, whichever lies in bounds. A candidate whose
-/// declared description is not exactly the canonical width, or extends past
-/// the segment, is not a match.
+/// 8-byte padded name offsets, whichever lies in bounds. Once the vendor
+/// name and type match, a description that is not exactly the canonical
+/// width or extends past the segment makes the note incompatible.
 fn scan_note_segment(data: &[u8], ph: &Phdr, state: &mut RuntimeNote) {
     if !matches!(state, RuntimeNote::Absent) {
         return;
@@ -436,12 +436,17 @@ fn scan_note_segment(data: &[u8], ph: &Phdr, state: &mut RuntimeNote) {
         };
         if namesz as usize != NOTE_NAME.len() + 1
             || ntype != NOTE_TYPE
-            || descsz as usize != NOTE_DESC_BYTES
             || candidate + 12 + NOTE_NAME.len() + 1 > seg_end
             || data[candidate + 12..candidate + 12 + NOTE_NAME.len()] != *NOTE_NAME
             || data[candidate + 12 + NOTE_NAME.len()] != 0
         {
             continue;
+        }
+        if descsz as usize != NOTE_DESC_BYTES {
+            *state = RuntimeNote::Incompatible(CapabilityNoteError::new(&format!(
+                "capability note declares a {descsz}-byte description, expected {NOTE_DESC_BYTES}"
+            )));
+            return;
         }
         let mut rejected: Option<CapabilityNoteError> = None;
         for desc_pos in [candidate + 20, candidate + 24] {
@@ -461,9 +466,9 @@ fn scan_note_segment(data: &[u8], ph: &Phdr, state: &mut RuntimeNote) {
                 }
             }
         }
-        if let Some(e) = rejected {
-            *state = RuntimeNote::Incompatible(e);
-        }
+        *state = RuntimeNote::Incompatible(rejected.unwrap_or_else(|| {
+            CapabilityNoteError::new("capability note description is truncated")
+        }));
         return;
     }
 }
