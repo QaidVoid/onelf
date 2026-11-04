@@ -15722,6 +15722,61 @@ fn a_skipped_bundle_still_records_its_sets() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A skipped tree that stops pinning sets is rebuilt without them: the
+/// earlier set record is removed with the declaration, so the package
+/// `onelf info` describes declares none.
+#[test]
+fn a_skipped_rebuild_drops_the_sets_the_recipe_removed() {
+    let td = workdir("setskipstale");
+    let dir = td.join("app");
+    write(&dir.join("bin/app"), "#!/bin/sh\necho hi\n");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("bin/app"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plain = "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\nskip = true\n";
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "{plain}\n[sysroot.sets.fixture]\npackages = [\"libfixture\"]\n\
+             url = \"file:///nonexistent/fixture.onelf\"\nblake3 = \"{}\"\n",
+            "0".repeat(64)
+        ),
+    );
+    let info = || {
+        let o = run_onelf(&["info", dir.join("app.onelf").to_str().unwrap()], None);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        info().contains("fixture"),
+        "the first build records the set"
+    );
+
+    write(&dir.join("onelf.toml"), plain);
+    let out = onelf_build(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join(".onelf/sets").exists(),
+        "the stale record survived"
+    );
+    let shown = info();
+    assert!(
+        !shown.contains("Shared sets") && !shown.contains("fixture"),
+        "the rebuilt package still declares the removed set:\n{shown}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A set keeps the shape of the tree it was packed from. A library
 /// whose dependency sits in a subdirectory, reachable only through its
 /// own run path, keeps both the dependency and a run path that still
@@ -16051,6 +16106,55 @@ fn host_and_set_libraries_load_without_a_library_path() {
         assert_eq!(line("app_lp="), caller, "the app's path: {report}");
         assert_eq!(line("child_lp="), caller, "a host shell's path: {report}");
     }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A development run with an active set and a resolver farm applies the
+/// packed launch's library-path gate: the app's run path reaches the
+/// view's links, so neither form exports a generated `LD_LIBRARY_PATH`
+/// and both hand the app the same value the caller started with.
+#[test]
+fn a_dev_run_with_sets_exports_the_packed_library_path() {
+    let td = workdir("lpparity");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let pkg = build_set_app(&td, &fixture);
+    let caller = td.join("caller-lib").to_string_lossy().into_owned();
+    let app_lp = |out: &std::process::Output, form: &str| {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{form}:\n{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{report}");
+        assert!(stdout.contains("value=42"), "{report}");
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("app_lp="))
+            .unwrap_or_else(|| panic!("no app_lp= in {report}"))
+            .to_string()
+    };
+
+    let mut packed = set_app_launch(&pkg, &td, &fixture);
+    packed
+        .env("ONELF_MODE", "rundir")
+        .env("LD_LIBRARY_PATH", &caller)
+        .env("SHOW_LP", "1");
+    let packed_lp = app_lp(&run_package(&mut packed), "packed");
+
+    let mut dev = dev_run(&td, &["--bundle"]);
+    dev.arg(td.join("app"))
+        .env("ONELF_LD_CACHE", &fixture.ld_cache)
+        .env("LD_LIBRARY_PATH", &caller)
+        .env("SHOW_LP", "1");
+    let dev_lp = app_lp(&dev.output().expect("spawn onelf run"), "dev");
+
+    assert_eq!(
+        dev_lp, packed_lp,
+        "the launch forms disagree on LD_LIBRARY_PATH"
+    );
+    assert_eq!(
+        dev_lp, caller,
+        "a generated search path leaked into the app"
+    );
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -20196,66 +20300,135 @@ fn an_in_tree_import_source_keeps_its_bytes() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// A source that is also the package command path is the app itself:
-/// the import stages the one file onto itself, the bundling walk
-/// processes it like any bundled binary, and the package runs, from
-/// the first build and from a rebuild.
+/// A source that is the package command itself, by the same path, by a
+/// symlink inside the AppDir or by a hardlink, would be rewritten in
+/// place by the import. The build refuses it before anything is written,
+/// names the way out, and leaves the file as it was.
 #[test]
-fn a_source_that_is_also_the_command_builds_and_runs() {
+fn an_import_whose_source_is_the_command_is_refused() {
     let td = workdir("import-self");
-    let src = elf_source(&td, "ELF_IMPORT_SELF_OK");
     let pkg = td.join("pkg");
-    std::fs::create_dir_all(pkg.join("bin")).unwrap();
     let app = pkg.join("bin/app");
-    if !cc(&src, &app) {
+    write(&app, "#!/bin/sh\necho SELF\n");
+    std::os::unix::fs::symlink("app", pkg.join("bin/alias")).unwrap();
+    std::fs::hard_link(&app, pkg.join("hard")).unwrap();
+    for source in ["bin/app", "bin/alias", "hard"] {
+        write(
+            &pkg.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+                 [input]\nbinary = \"{source}\"\n"
+            ),
+        );
+        let out = onelf_build(&pkg);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{source}: the build ran");
+        assert!(
+            stderr.contains("same file as the package command"),
+            "{source}: {stderr}"
+        );
+        assert!(stderr.contains("drop [input]"), "{source}: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(&app).unwrap(),
+            "#!/bin/sh\necho SELF\n",
+            "{source}: the command was rewritten"
+        );
+        assert!(
+            !pkg.join(".onelf").exists(),
+            "{source}: the build wrote records"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A build that fails after importing leaves the plain copy its record
+/// attests, so the rebuild that follows a fix refreshes it, while an edit
+/// made to the staged command after the failure is publisher content
+/// that stops the next build instead of being silently overwritten.
+#[test]
+fn a_failed_import_build_refreshes_but_protects_later_edits() {
+    let td = workdir("import-failed");
+    let gone = td.join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    write(&td.join("gone.c"), "int gone_value(void){return 7;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgone.so.1",
+            td.join("gone.c").to_str().unwrap(),
+        ],
+        &gone.join("libgone.so.1"),
+    ) {
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
     write(
-        &pkg.join("onelf.toml"),
-        "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
-         [input]\nbinary = \"bin/app\"\n",
+        &td.join("app.c"),
+        "int gone_value(void);\nint main(void){return gone_value() == 7 ? 0 : 1;}\n",
     );
-    let out = onelf_build(&pkg);
-    assert!(
-        out.status.success(),
-        "self-command import build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let run = run_import_package(&pkg.join("imported.onelf"), &td);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(stdout.contains("ELF_IMPORT_SELF_OK"), "{stdout}");
-
-    if !have("readelf") || !have("patchelf") {
-        skip(
-            "patchelf",
-            "readelf or patchelf is not available to check the added NEED",
+    let upstream = td.join("upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    let source = upstream.join("app");
+    assert!(cc_with(
+        &[
+            td.join("app.c").to_str().unwrap(),
+            "-L",
+            gone.to_str().unwrap(),
+            "-l:libgone.so.1",
+        ],
+        &source
+    ));
+    let source_bytes = std::fs::read(&source).unwrap();
+    let pkg = td.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let recipe = |search: &str| {
+        write(
+            &pkg.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"imported\"\ncommand = \"bin/app\"\n\n\
+                 [input]\nbinary = \"../upstream/app\"\n{search}"
+            ),
         );
-    }
-    assert!(
-        needed_sonames(&app).contains(&"libonelf-env.so".to_string()),
-        "the app file the walk processed must carry the onelf-env NEED"
+    };
+
+    // Nothing supplies libgone, so the strict host scan stops the build.
+    recipe("");
+    let out = onelf_build(&pkg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the build must fail: {stderr}");
+    assert!(stderr.contains("libgone.so.1"), "{stderr}");
+    assert_eq!(
+        std::fs::read(pkg.join("bin/app")).unwrap(),
+        source_bytes,
+        "the failed build left a copy its record does not attest"
     );
 
+    // The fix: the library is reachable. The rebuild refreshes.
+    let fixed = format!("\n[bundle]\nsearch-paths = [\"{}\"]\n", gone.display());
+    recipe(&fixed);
     let out = onelf_build(&pkg);
     assert!(
         out.status.success(),
-        "a rebuild whose source is the rewritten command must refresh: {}",
+        "the rebuild after a failure must refresh the import: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let run = run_import_package(&pkg.join("imported.onelf"), &td);
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
+
+    // A failure, then an edit: the next build stops on the edit. The
+    // bundled copy goes too, so nothing in the tree supplies libgone.
+    let _ = std::fs::remove_dir_all(pkg.join("lib"));
+    recipe("");
+    assert!(!onelf_build(&pkg).status.success());
+    write(&pkg.join("bin/app"), "#!/bin/sh\necho EDITED\n");
+    recipe(&fixed);
+    let out = onelf_build(&pkg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the edit was overwritten");
+    assert!(stderr.contains("did not import"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(pkg.join("bin/app")).unwrap(),
+        "#!/bin/sh\necho EDITED\n"
     );
-    assert!(stdout.contains("ELF_IMPORT_SELF_OK"), "{stdout}");
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -22153,7 +22326,8 @@ fn dev_run(td: &Path, args: &[&str]) -> Command {
 }
 
 /// The one prepared view in a test's store, which a single-launch test
-/// can name this way.
+/// can name this way. The view's lease and creation lock share its name
+/// prefix, so only the directory answers.
 fn the_prepared_view(store: &Path) -> PathBuf {
     std::fs::read_dir(store)
         .expect("the view store")
@@ -22461,6 +22635,43 @@ fn run_without_bundle_keeps_the_development_launch() {
     assert!(
         !dir.join("bin/app").exists(),
         "the import ran without --bundle"
+    );
+
+    // Without --bundle no set is acquired, so an entrypoint that selects
+    // one is an incomplete tree: the run names the sets and the assembly
+    // instead of letting the host stand in. One that selects none runs.
+    let dir = td.join("sets");
+    write(&dir.join("bin/run.sh"), "#!/bin/sh\necho ran\n");
+    std::fs::set_permissions(
+        dir.join("bin/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/run.sh\"\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.toolkit]\npackages = [\"t\"]\nurl = \"file:///nonexistent/t.onelf\"\n\
+             blake3 = \"{}\"\n\n\
+             [[entrypoint]]\nname = \"cli\"\npath = \"bin/run.sh\"\nsets = []\n",
+            "0".repeat(64)
+        ),
+    );
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the run ignored its sets: {stderr}");
+    assert!(stderr.contains("selects the sets toolkit"), "{stderr}");
+    assert!(stderr.contains("--bundle"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("ran"));
+    let mut cmd = dev_run(&td, &["--entrypoint", "cli"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ran"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -23040,6 +23251,25 @@ int main(int argc, char **argv) {
         "the stored input names the AppDir: {text}"
     );
     assert!(!dir_root.join(".onelf/runtime-env").exists());
+
+    // Every staged file is its own inode, so an edit to the AppDir in
+    // place can never reach the published view.
+    let inode = |p: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    for rel in ["bin/app", "share/data.txt", "onelf.toml"] {
+        assert_ne!(
+            inode(&dir_root.join(rel)),
+            inode(&view.join(rel)),
+            "{rel} is shared with the view"
+        );
+        assert_eq!(
+            std::fs::read(dir_root.join(rel)).unwrap(),
+            std::fs::read(view.join(rel)).unwrap()
+        );
+    }
     let ready = view.join("ready");
     let stamp = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
 
@@ -23079,6 +23309,57 @@ int main(int argc, char **argv) {
         .count();
     assert_eq!(views, 2, "a changed tree shares the old view");
 
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The view a development run launched from stays claimed for as long
+/// as the entrypoint runs: the run's lease survives the exec, so a
+/// collection while the app is alive leaves the view in place, and the
+/// same collection reclaims it once the app has exited.
+#[test]
+fn a_running_dev_run_keeps_its_view_from_collection() {
+    let td = workdir("runlease");
+    let dir = td.join("app");
+    write(
+        &dir.join("bin/app"),
+        "#!/bin/sh\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.05; done\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("bin/app"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n",
+    );
+    let (started, gate) = (td.join("started"), td.join("gate"));
+
+    let mut cmd = dev_run(&td, &[]);
+    cmd.arg(&dir)
+        .arg("--")
+        .arg(&started)
+        .arg(&gate)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn onelf run");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            panic!("the development run never started its entrypoint");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let view = the_prepared_view(&td.join("xdg-cache/onelf/views"));
+
+    let report = cache_gc(&td.join("xdg-cache"), &td);
+    assert!(
+        view.join("ready").exists(),
+        "a live run's view was collected: {report}"
+    );
+
+    write(&gate, "");
+    assert!(child.wait().unwrap().success());
+    let report = cache_gc(&td.join("xdg-cache"), &td);
+    assert!(!view.exists(), "the idle view was not reclaimed: {report}");
     let _ = std::fs::remove_dir_all(&td);
 }
 
