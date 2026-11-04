@@ -22690,3 +22690,750 @@ int main(void) {
 
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// A host shared object by soname, from the usual library directories.
+/// The audio fixtures link a soname they cannot call through headers the
+/// machine may not ship, so the bundler's rules trigger on the closure
+/// while the fixture itself stays portable.
+fn host_library(soname: &str) -> Option<PathBuf> {
+    [
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib64",
+        "/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+    ]
+    .iter()
+    .map(|dir| Path::new(dir).join(soname))
+    .find(|path| path.is_file())
+}
+
+/// The host gst-plugin-scanner at one of the locations the gstreamer
+/// rule's own candidates name for an installation prefix.
+fn host_gst_scanner() -> Option<PathBuf> {
+    [
+        "/usr/libexec/gstreamer-1.0/gst-plugin-scanner",
+        "/usr/lib/gstreamer-1.0/gst-plugin-scanner",
+        "/usr/lib64/gstreamer-1.0/gst-plugin-scanner",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+/// The host plugin library that answers a GStreamer element, read out of
+/// `gst-inspect-1.0`'s report, so the fixture does not hardcode a plugin
+/// directory layout.
+fn gst_plugin_library(element: &str) -> Option<PathBuf> {
+    let out = Command::new("gst-inspect-1.0")
+        .arg(element)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("  Filename "))
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_file())
+}
+
+/// Whether pkg-config finds a development package. The ALSA fixture is
+/// the one that calls into its library, so it is the one that needs
+/// headers.
+fn pkg_config_available(name: &str) -> bool {
+    Command::new("pkg-config")
+        .args(["--exists", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether a live PipeWire server answers on this machine's runtime
+/// directory. The connection fixture negotiates a real stream state, so
+/// it needs the real server, not merely the libraries.
+fn pipewire_server_reachable() -> bool {
+    Command::new("pw-cli")
+        .args(["info", "0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The tree-local copies the GStreamer fixture bundles: the soname the
+/// rule triggers on must be a real gstreamer at runtime, because the
+/// helper copy the registry scanner runs resolves it beside itself.
+fn stage_gst_tree(td: &Path, gst: &Path, scanner: &Path, plugins: &[&Path]) -> PathBuf {
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("lib/gstreamer-1.0")).unwrap();
+    std::fs::copy(gst, dir.join("lib/libgstreamer-1.0.so.0")).unwrap();
+    // The plugin loader matches a plugin by its file name, so the
+    // copies keep the names the host installation gave them.
+    for plugin in plugins {
+        let name = plugin.file_name().unwrap().to_owned();
+        std::fs::copy(plugin, dir.join("lib/gstreamer-1.0").join(name)).unwrap();
+    }
+    std::fs::copy(scanner, dir.join("lib/gstreamer-1.0/gst-plugin-scanner")).unwrap();
+    dir
+}
+
+/// The application the GStreamer fixture packs: it reports the
+/// environment the launch gave it, then runs a real audiotestsrc to
+/// filesink pipeline through the host gst-launch tool under that
+/// environment and reports what came out of the sink. Linked against the
+/// framework soname so the bundle carries plugins and scanner, though
+/// the application itself never calls into gstreamer.
+const GSTPIPE_SOURCE: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    const char *scanner = getenv("GST_PLUGIN_SCANNER");
+    const char *scanner10 = getenv("GST_PLUGIN_SCANNER_1_0");
+    const char *syspath = getenv("GST_PLUGIN_SYSTEM_PATH_1_0");
+    const char *dir = getenv("ONELF_DIR");
+    printf("dir=%s\n", dir ? dir : "(unset)");
+    printf("scanner=%s\n", scanner ? scanner : "(unset)");
+    printf("scanner10=%s\n", scanner10 ? scanner10 : "(unset)");
+    printf("syspath=%s\n", syspath ? syspath : "(unset)");
+    printf("scanner_ready=%d\n", scanner && access(scanner, X_OK) == 0);
+    if (argc < 2) {
+        printf("usage=missing\n");
+        return 2;
+    }
+    char cmd[4096];
+    snprintf(cmd, sizeof cmd,
+             "gst-launch-1.0 audiotestsrc num-buffers=10 ! filesink location=%s",
+             argv[1]);
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        printf("spawn=fail\n");
+        return 1;
+    }
+    int playing = 0;
+    int eos = 0;
+    char line[512];
+    while (fgets(line, sizeof line, p)) {
+        if (strstr(line, "Setting pipeline to PLAYING")) playing = 1;
+        if (strstr(line, "EOS")) eos = 1;
+    }
+    int st = pclose(p);
+    printf("gst_exit=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    printf("playing=%d\n", playing);
+    printf("eos=%d\n", eos);
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        printf("audio_bytes=0\naudio_nonzero=0\n");
+        return 0;
+    }
+    unsigned char buf[4096];
+    long bytes = 0;
+    long nonzero = 0;
+    size_t got;
+    while ((got = fread(buf, 1, sizeof buf, f)) > 0) {
+        for (size_t i = 0; i < got; i++) {
+            bytes++;
+            if (buf[i] != 0) nonzero++;
+        }
+    }
+    fclose(f);
+    printf("audio_bytes=%ld\n", bytes);
+    printf("audio_nonzero=%ld\n", nonzero);
+    return 0;
+}
+"#;
+
+/// A packed package runs a real GStreamer pipeline with the package's
+/// own plugin copies and its own registry scanner: the launch names the
+/// private scanner for the app, the pipeline reaches PLAYING and EOS and
+/// delivers real audio bytes, and the registry the run built names the
+/// private plugin paths alone, with no host plugin or scanner path in
+/// it. No hardware is involved: the sink is a file.
+#[test]
+fn a_packed_pipeline_plays_through_the_pack_scanner() {
+    if !have("gst-launch-1.0") {
+        skip("gstreamer", "no gst-launch-1.0 on PATH");
+        return;
+    }
+    let Some(scanner) = host_gst_scanner() else {
+        skip("gstreamer-scanner", "the host ships no gst-plugin-scanner");
+        return;
+    };
+    let Some(coreelements) = gst_plugin_library("filesink") else {
+        skip(
+            "gstreamer-plugins",
+            "gst-inspect-1.0 names no library for filesink",
+        );
+        return;
+    };
+    let Some(audiotestsrc) = gst_plugin_library("audiotestsrc") else {
+        skip(
+            "gstreamer-plugins",
+            "gst-inspect-1.0 names no library for audiotestsrc",
+        );
+        return;
+    };
+    let td = workdir("gstpipe");
+    let Some(gst) = host_library("libgstreamer-1.0.so.0") else {
+        skip("gstreamer", "the host ships no libgstreamer-1.0.so.0");
+        return;
+    };
+    let dir = stage_gst_tree(&td, &gst, &scanner, &[&coreelements, &audiotestsrc]);
+    write(&td.join("gstpipe.c"), GSTPIPE_SOURCE);
+    if !cc_with(
+        &[
+            td.join("gstpipe.c").to_str().unwrap(),
+            &format!("-L{}", gst.parent().unwrap().display()),
+            "-l:libgstreamer-1.0.so.0",
+            "-Wl,-rpath,$ORIGIN/../lib",
+        ],
+        &dir.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"gstpipe\"\ncommand = \"bin/app\"\nmtime = 0\n",
+    );
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .output()
+        .expect("spawn onelf build");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{log}");
+    // The rule's helper sits staged beside the plugins it needs.
+    assert!(
+        dir.join("libexec/gstreamer-1.0/gst-plugin-scanner")
+            .is_file(),
+        "{log}"
+    );
+
+    let pkg = dir.join("gstpipe.onelf");
+    let audio = td.join("audio.raw");
+    let mut cmd = packed_launch(&pkg, &td);
+    cmd.arg(audio.to_str().unwrap());
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = format!("{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{report}");
+    let line = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {report}"))
+            .to_string()
+    };
+    let tree = line("dir=");
+    assert!(
+        tree.starts_with(td.to_str().unwrap()),
+        "the launch tree left the scratch: {report}"
+    );
+    for key in ["scanner=", "scanner10="] {
+        let named = line(key);
+        assert!(
+            !named.starts_with("/usr"),
+            "the host installation's scanner answered: {report}"
+        );
+        assert!(
+            named.starts_with(&tree) && named.ends_with("/lib/gstreamer-1.0/gst-plugin-scanner"),
+            "the launch did not name the package's own scanner: {report}"
+        );
+    }
+    let syspath = line("syspath=");
+    assert!(
+        syspath.starts_with(&tree) && !syspath.contains("/usr/"),
+        "the plugin search path is not the package's: {report}"
+    );
+    assert_eq!(line("scanner_ready="), "1", "{report}");
+    assert_eq!(line("gst_exit="), "0", "{report}");
+    assert_eq!(line("playing="), "1", "{report}");
+    assert_eq!(line("eos="), "1", "{report}");
+    let bytes: u64 = line("audio_bytes=").parse().unwrap();
+    let nonzero: u64 = line("audio_nonzero=").parse().unwrap();
+    assert!(
+        bytes >= 10_000,
+        "the pipeline delivered only {bytes} bytes: {report}"
+    );
+    assert!(nonzero > 0, "the delivered audio is silence: {report}");
+
+    // The registry this run built names the private plugins alone: no
+    // host plugin directory and no host scanner path appear in it.
+    let cache = td.join("xdg-cache/gstreamer-1.0");
+    let registry = std::fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("registry."))
+        })
+        .unwrap_or_else(|| panic!("no registry cache under {}: {report}", cache.display()));
+    let registry = String::from_utf8_lossy(&std::fs::read(&registry).unwrap()).into_owned();
+    let private = |name: &str| format!("{tree}/lib/gstreamer-1.0/{name}");
+    for plugin in ["libgstcoreelements.so", "libgstaudiotestsrc.so"] {
+        assert!(
+            registry.contains(&private(plugin)),
+            "the registry does not name the private {plugin}: {report}"
+        );
+    }
+    assert!(
+        !registry.contains("/usr/lib/gstreamer-1.0"),
+        "the registry reached the host plugin directory: {report}"
+    );
+    assert!(
+        !registry.contains("/usr/libexec/gstreamer-1.0"),
+        "the registry reached the host scanner location: {report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The application the hostile-ALSA fixture packs: it reports the
+/// configuration pointers the launch gave it, probes the devices the
+/// hostile and user snippets would define, and writes frames to the
+/// null device. Linked against libasound, so the bundler carries the
+/// configuration and plugin tree the rules require.
+const ALSAHOST_SOURCE: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <alsa/asoundlib.h>
+
+static void probe(const char *key, const char *name) {
+    snd_pcm_t *pcm = NULL;
+    int err = snd_pcm_open(&pcm, name, SND_PCM_STREAM_PLAYBACK, 0);
+    if (err == 0) {
+        printf("%s=ok\n", key);
+        snd_pcm_close(pcm);
+    } else {
+        printf("%s=failed:%s\n", key, snd_strerror(err));
+    }
+}
+
+int main(void) {
+    const char *dir = getenv("ONELF_DIR");
+    printf("dir=%s\n", dir ? dir : "(unset)");
+    printf("cfg_path=%s\n", getenv("ALSA_CONFIG_PATH") ? getenv("ALSA_CONFIG_PATH") : "(unset)");
+    printf("cfg_dir=%s\n", getenv("ALSA_CONFIG_DIR") ? getenv("ALSA_CONFIG_DIR") : "(unset)");
+    printf("plugin_dir=%s\n", getenv("ALSA_PLUGIN_DIR") ? getenv("ALSA_PLUGIN_DIR") : "(unset)");
+    probe("default_open", "default");
+    probe("user_device", "user_marker");
+    probe("hostile_device", "hostile_host_marker");
+    snd_pcm_t *pcm = NULL;
+    int err = snd_pcm_open(&pcm, "null", SND_PCM_STREAM_PLAYBACK, 0);
+    if (err == 0) {
+        printf("null_open=ok\n");
+    } else {
+        printf("null_open=failed:%s\n", snd_strerror(err));
+    }
+    if (err == 0) {
+        err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_U8, SND_PCM_ACCESS_RW_INTERLEAVED,
+                                 1, 8000, 1, 200000);
+        printf("null_params=%s\n", err == 0 ? "ok" : snd_strerror(err));
+        if (err == 0) {
+            unsigned char buf[1024];
+            memset(buf, 0x5a, sizeof buf);
+            snd_pcm_sframes_t written = snd_pcm_writei(pcm, buf, 1024);
+            printf("null_written=%ld\n", (long)written);
+            snd_pcm_drain(pcm);
+        }
+        snd_pcm_close(pcm);
+    }
+    return 0;
+}
+"#;
+
+/// Hostile snippets in the user configuration locations cannot take the
+/// packed stack down, and a caller's own configuration file outranks
+/// them: the launch keeps the caller's ALSA_CONFIG_PATH, the hostile
+/// files are never parsed, the private configuration directories are the
+/// tree's, and the null device carries real frames. The raw binary over
+/// the same hostile home fails its opens first, so the hostility is
+/// proven real rather than assumed. No hardware is involved: the null
+/// device only.
+#[test]
+fn hostile_user_alsa_snippets_leave_the_private_stack_working() {
+    if !pkg_config_available("alsa") {
+        skip(
+            "alsa-devel",
+            "no alsa headers for the probe (pkg-config alsa)",
+        );
+        return;
+    }
+    if host_library("libasound.so.2").is_none() {
+        skip("alsa", "the host ships no libasound.so.2");
+        return;
+    }
+    if !Path::new("/usr/share/alsa/alsa.conf").is_file() {
+        skip("alsa-config", "the host ships no /usr/share/alsa/alsa.conf");
+        return;
+    }
+    let td = workdir("alsahost");
+
+    // The hostile home: a valid but wrong default that a marker device
+    // accompanies, a malformed snippet at the XDG location, and garbage
+    // for a pulse client that reads the same home.
+    let home = td.join("home");
+    write(
+        &home.join(".asoundrc"),
+        "pcm.!default {\n    type hostile_dead_end\n}\npcm.hostile_host_marker {\n    type null\n}\n",
+    );
+    write(
+        &home.join(".config/alsa/asoundrc"),
+        "this is }{ not alsa config\n",
+    );
+    write(
+        &home.join(".config/pulse/client.conf"),
+        "garbage {{{ broken\n",
+    );
+    // The caller's own configuration: a full replacement that defines
+    // the working default, the null device and a marker device.
+    write(
+        &td.join("user-alsa.conf"),
+        "pcm.default {\n    type null\n}\npcm.null {\n    type null\n}\npcm.user_marker {\n    type null\n}\n",
+    );
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&td.join("alsahost.c"), ALSAHOST_SOURCE);
+    if !cc_with(
+        &[td.join("alsahost.c").to_str().unwrap(), "-lasound"],
+        &dir.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"alsahost\"\ncommand = \"bin/app\"\nmtime = 0\n",
+    );
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .output()
+        .expect("spawn onelf build");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{log}");
+    let pkg = dir.join("alsahost.onelf");
+    let line = |stdout: &str, key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {stdout}"))
+            .to_string()
+    };
+
+    // The raw binary over the hostile home: the host's own configuration
+    // parses the snippets and collapses, so the opens fail.
+    let mut base = Command::new(dir.join("bin/app"));
+    base.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    let out = base.output().expect("run the raw ALSA probe");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        line(&stdout, "default_open=").starts_with("failed"),
+        "the hostile home did not break the host configuration: {stdout}"
+    );
+    assert!(
+        line(&stdout, "null_open=").starts_with("failed"),
+        "the hostile home left the host configuration usable: {stdout}"
+    );
+
+    // Packed over the same hostile home with the caller's configuration:
+    // the launch keeps the caller's path, the hostile files are never
+    // read, and the stack works on the tree's private directories.
+    let mut cmd = packed_launch(&pkg, &td);
+    cmd.env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ALSA_CONFIG_PATH", td.join("user-alsa.conf"));
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report = format!("{stdout}\n{stderr}");
+    assert!(out.status.success(), "{report}");
+    let tree = line(&stdout, "dir=");
+    assert_eq!(
+        line(&stdout, "cfg_path="),
+        td.join("user-alsa.conf").to_str().unwrap(),
+        "the launch lost the caller's configuration: {report}"
+    );
+    let cfg_dir = line(&stdout, "cfg_dir=");
+    assert!(
+        cfg_dir.starts_with(&tree) && cfg_dir.ends_with("/share/alsa"),
+        "the configuration directory is not the package's: {report}"
+    );
+    let plugin_dir = line(&stdout, "plugin_dir=");
+    assert!(
+        plugin_dir.starts_with(&tree) && plugin_dir.ends_with("/lib/alsa-lib"),
+        "the plugin directory is not the package's: {report}"
+    );
+    assert!(
+        line(&stdout, "hostile_device=").starts_with("failed"),
+        "the hostile snippet's device answered: {report}"
+    );
+    assert_eq!(
+        line(&stdout, "user_device="),
+        "ok",
+        "the caller's configuration did not answer: {report}"
+    );
+    assert_eq!(
+        line(&stdout, "default_open="),
+        "ok",
+        "the caller's default did not open: {report}"
+    );
+    assert_eq!(line(&stdout, "null_open="), "ok", "{report}");
+    let written: i64 = line(&stdout, "null_written=").parse().unwrap();
+    assert!(written > 0, "the null device took no frames: {report}");
+    assert!(
+        !stderr.contains("asoundrc"),
+        "the hostile snippet files were parsed after all: {report}"
+    );
+
+    // Packed over a clean home with no caller configuration: the carried
+    // configuration is what the launch points at, privately.
+    let clean = td.join("cleanhome");
+    std::fs::create_dir_all(&clean).unwrap();
+    let mut cmd = packed_launch(&pkg, &td);
+    cmd.env("HOME", &clean);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report = format!("{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{report}");
+    let tree = line(&stdout, "dir=");
+    let cfg_path = line(&stdout, "cfg_path=");
+    assert!(
+        cfg_path.starts_with(&tree) && cfg_path.contains("/share/alsa/alsa.conf"),
+        "the carried configuration is not what the launch named: {report}"
+    );
+    assert_eq!(line(&stdout, "null_open="), "ok", "{report}");
+    let written: i64 = line(&stdout, "null_written=").parse().unwrap();
+    assert!(written > 0, "the null device took no frames: {report}");
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The application the hostile-PipeWire fixture packs: it reports the
+/// private SPA pointers the launch gave it, bridges the server socket
+/// into its runtime directory, and drives pw-cli to the real server.
+/// Linked against the soname so the bundle carries the module trees.
+const PWCLIENT_SOURCE: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void grab_version(char *version, size_t cap, const char *line,
+                         const char *needle) {
+    const char *q = strstr(line, needle);
+    if (!q || version[0]) {
+        return;
+    }
+    q += strlen(needle);
+    const char *e = strchr(q, '"');
+    if (e && (size_t)(e - q) < cap) {
+        memcpy(version, q, (size_t)(e - q));
+        version[e - q] = 0;
+    }
+}
+
+int main(void) {
+    printf("dir=%s\n", getenv("ONELF_DIR") ? getenv("ONELF_DIR") : "(unset)");
+    printf("spa_dir=%s\n", getenv("SPA_PLUGIN_DIR") ? getenv("SPA_PLUGIN_DIR") : "(unset)");
+    printf("module_dir=%s\n", getenv("PIPEWIRE_MODULE_DIR") ? getenv("PIPEWIRE_MODULE_DIR") : "(unset)");
+    printf("cfg_prefix=%s\n", getenv("PIPEWIRE_CONFIG_PREFIX") ? getenv("PIPEWIRE_CONFIG_PREFIX") : "(unset)");
+    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg) {
+        char target[256];
+        char link[512];
+        snprintf(target, sizeof target, "/run/user/%u/pipewire-0", (unsigned)getuid());
+        snprintf(link, sizeof link, "%s/pipewire-0", xdg);
+        (void)unlink(link);
+        (void)symlink(target, link);
+    }
+    fflush(stdout);
+    FILE *p = popen("pw-cli info 0", "r");
+    if (!p) {
+        printf("spawn=fail\n");
+        return 1;
+    }
+    int has_core = 0;
+    char version[128] = "";
+    char line[512];
+    while (fgets(line, sizeof line, p)) {
+        if (strstr(line, "Interface:Core")) has_core = 1;
+        grab_version(version, sizeof version, line, "version = \"");
+        grab_version(version, sizeof version, line, "version: \"");
+    }
+    int st = pclose(p);
+    printf("pwcli_exit=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    printf("core_seen=%d\n", has_core);
+    printf("pw_version=%s\n", version[0] ? version : "(absent)");
+    return 0;
+}
+"#;
+
+/// A malformed client configuration in the user's PipeWire directory
+/// stops an unpackaged client cold, and a caller's own configuration
+/// prefix, preserved through the packed launch, outranks it: the packed
+/// client loads its SPA plugins and modules from the tree's private
+/// copies, negotiates core information with the live server, and never
+/// parses the hostile file. The raw binary over the same hostile home
+/// fails to build a context first, so the hostility is proven real.
+#[test]
+fn hostile_pipewire_config_leaves_the_private_spa_stack_connected() {
+    if !pipewire_server_reachable() {
+        skip(
+            "pipewire-server",
+            "no reachable PipeWire server (pw-cli info 0 failed)",
+        );
+        return;
+    }
+    let Some(pwlib) = host_library("libpipewire-0.3.so.0") else {
+        skip("pipewire", "the host ships no libpipewire-0.3.so.0");
+        return;
+    };
+    let host_conf = Path::new("/usr/share/pipewire/client.conf");
+    if !host_conf.is_file() {
+        skip(
+            "pipewire-config",
+            "the host ships no /usr/share/pipewire/client.conf",
+        );
+        return;
+    }
+    let td = workdir("pwclient");
+
+    let home = td.join("home");
+    for name in ["client.conf", "client-rt.conf", "pipewire.conf"] {
+        write(
+            &home.join(".config/pipewire").join(name),
+            "garbage {{{ broken\n",
+        );
+    }
+    let clean = td.join("clean-conf");
+    std::fs::create_dir_all(&clean).unwrap();
+    std::fs::copy(host_conf, clean.join("client.conf")).unwrap();
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&td.join("pwclient.c"), PWCLIENT_SOURCE);
+    if !cc_with(
+        &[
+            td.join("pwclient.c").to_str().unwrap(),
+            &format!("-L{}", pwlib.parent().unwrap().display()),
+            "-l:libpipewire-0.3.so.0",
+        ],
+        &dir.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"pwclient\"\ncommand = \"bin/app\"\nmtime = 0\n",
+    );
+    let o = Command::new(onelf())
+        .arg("build")
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .output()
+        .expect("spawn onelf build");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "{log}");
+    let pkg = dir.join("pwclient.onelf");
+    let line = |stdout: &str, key: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} in {stdout}"))
+            .to_string()
+    };
+
+    // The raw binary over the hostile home: pw refuses to build a
+    // context from the malformed configuration.
+    let mut base = Command::new(dir.join("bin/app"));
+    base.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_RUNTIME_DIR", td.join("xdg-run"))
+        .env("XDG_CACHE_HOME", td.join("xdg-cache"));
+    let out = base.output().expect("run the raw PipeWire probe");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(
+        line(&stdout, "core_seen="),
+        "0",
+        "the hostile home did not stop the unpackaged client: {stdout}"
+    );
+
+    // Packed over the same hostile home with the caller's configuration
+    // prefix: the private SPA and module trees serve, the caller's
+    // prefix survives the launch, and the server negotiation completes.
+    let mut cmd = packed_launch(&pkg, &td);
+    cmd.env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("PIPEWIRE_CONFIG_PREFIX", &clean);
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report = format!("{stdout}\n{stderr}");
+    assert!(out.status.success(), "{report}");
+    let tree = line(&stdout, "dir=");
+    for key in ["spa_dir=", "module_dir="] {
+        let mapped = line(&stdout, key);
+        assert!(
+            mapped.starts_with(&tree) && !mapped.contains("/usr/"),
+            "{key} is not the package's private copy: {report}"
+        );
+    }
+    assert_eq!(
+        line(&stdout, "cfg_prefix="),
+        clean.to_str().unwrap(),
+        "the launch lost the caller's configuration prefix: {report}"
+    );
+    assert_eq!(line(&stdout, "pwcli_exit="), "0", "{report}");
+    assert_eq!(
+        line(&stdout, "core_seen="),
+        "1",
+        "the packed client reached no server core: {report}"
+    );
+    let version = line(&stdout, "pw_version=");
+    assert_ne!(version, "(absent)", "the server named no version: {report}");
+    assert!(
+        !stderr.contains("error in config"),
+        "the hostile configuration was parsed after all: {report}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
