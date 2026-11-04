@@ -558,13 +558,17 @@ impl Drop for Prefetch {
     }
 }
 
-/// Symlinks served beside the package's own entries: the libraries the
-/// launch takes from the host and from dependency sets, shown in the
-/// package's library directory (see `crate::links`). Their inodes follow
+/// The package directory the generated environment input is served in.
+pub(crate) const VIEW_ENV_DIR: &str = ".onelf";
+
+/// Entries served beside the package's own: the libraries the launch
+/// takes from the host and from dependency sets, as symlinks in the
+/// package's library directory (see `crate::links`), and the launch's
+/// generated environment input as a read-only file. Their inodes follow
 /// the manifest's, in the order they were added.
 #[derive(Default)]
 struct Synthetic {
-    /// Inode of the first link.
+    /// Inode of the first entry.
     first: u64,
     links: Vec<SyntheticLink>,
     by_name: HashMap<(u64, String), u64>,
@@ -573,7 +577,10 @@ struct Synthetic {
 struct SyntheticLink {
     parent: u64,
     name: String,
+    /// The link's target, or the file's content.
     target: Vec<u8>,
+    /// Whether this is a regular file rather than a symlink.
+    file: bool,
 }
 
 impl Synthetic {
@@ -584,7 +591,7 @@ impl Synthetic {
         }
     }
 
-    fn add(&mut self, parent: u64, name: String, target: Vec<u8>) {
+    fn add(&mut self, parent: u64, name: String, target: Vec<u8>, file: bool) {
         let key = (parent, name);
         if self.by_name.contains_key(&key) {
             return;
@@ -595,6 +602,7 @@ impl Synthetic {
             parent,
             name: key.1,
             target,
+            file,
         });
     }
 
@@ -617,17 +625,30 @@ impl Synthetic {
             .collect()
     }
 
-    /// Attributes of the link at `inode`, timestamped like its directory.
+    /// Attributes of the entry at `inode`, timestamped like its directory.
     fn attr(&self, inode: u64, link: &SyntheticLink, manifest: &Manifest) -> FuseAttr {
         let dir = &manifest.entries[inode_to_entry(link.parent)];
         let mut attr = make_attr(link.parent, dir, manifest);
         attr.ino = inode;
-        attr.mode = 0o120000 | 0o777;
+        attr.mode = if link.file {
+            0o100000 | 0o444
+        } else {
+            0o120000 | 0o777
+        };
         attr.nlink = 1;
         attr.size = link.target.len() as u64;
         attr.blocks = attr.size.div_ceil(512);
         attr
     }
+}
+
+/// Why [`FuseState::run_loop`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopEnd {
+    /// A signal pipe woke it.
+    Woken,
+    /// The connection ended: unmounted, destroyed, or unreadable.
+    Finished,
 }
 
 /// One FUSE server's state over a package: what it serves, how it
@@ -694,15 +715,44 @@ impl<'a> FuseState<'a> {
         let crate::links::Received::Done(message) = inbox.read() else {
             return;
         };
-        if let Some(message) = message
-            && let Some(idx) = crate::links::dir_index(self.manifest, &message.dir)
-        {
-            for (name, target) in message.links {
-                self.synthetic.add(entry_to_inode(idx), name, target);
+        let inbox = self.inbox.take();
+        if let Some(message) = message {
+            if let Some(idx) = crate::links::dir_index(self.manifest, &message.dir) {
+                for (name, target) in message.links {
+                    self.synthetic.add(entry_to_inode(idx), name, target, false);
+                }
             }
-            inbox.ack();
+            self.serve_view_env(message.env);
+            if let Some(inbox) = &inbox {
+                inbox.ack();
+            }
         }
-        self.inbox = None;
+    }
+
+    /// Serve the launch's generated environment input at
+    /// `.onelf/runtime-env`, in a package that has the directory and does
+    /// not carry the name itself.
+    fn serve_view_env(&mut self, env: Vec<u8>) {
+        if env.is_empty() {
+            return;
+        }
+        let Some(idx) = crate::links::dir_index(self.manifest, VIEW_ENV_DIR) else {
+            return;
+        };
+        let Some(name) = crate::env::VIEW_ENV_FILE.rsplit('/').next() else {
+            return;
+        };
+        let carried = self.children[entry_to_inode(idx) as usize]
+            .iter()
+            .any(|&c| {
+                self.manifest
+                    .get_string(self.manifest.entries[inode_to_entry(c)].name)
+                    == name
+            });
+        if !carried {
+            self.synthetic
+                .add(entry_to_inode(idx), name.to_string(), env, true);
+        }
     }
 
     /// Confirm the entry may be served, for manifests that predate
@@ -730,25 +780,20 @@ impl<'a> FuseState<'a> {
         ok
     }
 
-    /// Serve the mount until the launched process is done with it.
+    /// Serve the mount until a signal pipe wakes it or the connection ends.
     ///
-    /// Two things end it. `death_pipe` hangs up once every descendant has
-    /// closed the inherited descriptor, which is the cleanest signal but only
-    /// arrives when the whole tree is gone. `child_exit` fires as soon as the
-    /// process that was launched exits, which is what the caller has to return
-    /// on: a launcher that waits for a daemon its child started is a launcher
-    /// that only returns once that daemon has given up, and reports it dead.
-    /// The mount is handed to a background server in that case, so leaving
-    /// here does not take the filesystem with it. Either signal may be left
-    /// out; the caller passes no death pipe when it has already hung up and
-    /// the child turned out to be alive.
+    /// `death_pipe` wakes it when it hangs up or turns readable, and so
+    /// does `child_exit`; either may be left out. The return says which
+    /// of the two ended the loop: a wake, after which the caller decides
+    /// whether to serve on, or the connection finishing, after which
+    /// nothing is left to serve.
     pub fn run_loop(
         &mut self,
         fuse_fd: &impl AsFd,
         death_pipe: Option<&impl AsFd>,
         child_exit: Option<&impl AsFd>,
         buf: &mut [u8],
-    ) {
+    ) -> LoopEnd {
         use rustix::event::Timespec;
 
         let cache_timeout = Timespec {
@@ -781,7 +826,7 @@ impl<'a> FuseState<'a> {
                 Ok(0) => continue,
                 Ok(_) => {}
                 Err(rustix::io::Errno::INTR) => continue,
-                Err(_) => return,
+                Err(_) => return LoopEnd::Finished,
             }
             let revents: Vec<PollFlags> = poll_fds.iter().map(|p| p.revents()).collect();
             drop(poll_fds);
@@ -791,7 +836,7 @@ impl<'a> FuseState<'a> {
                 .iter()
                 .any(|r| r.intersects(PollFlags::HUP | PollFlags::IN))
             {
-                return;
+                return LoopEnd::Woken;
             }
 
             if revents
@@ -805,7 +850,7 @@ impl<'a> FuseState<'a> {
             // the FUSE fd, never IN. The connection is gone; polling on is
             // a 100%-core spin, since ERR is always ready.
             if revents[0].intersects(PollFlags::ERR | PollFlags::HUP) {
-                return;
+                return LoopEnd::Finished;
             }
 
             if !revents[0].intersects(PollFlags::IN) {
@@ -813,15 +858,9 @@ impl<'a> FuseState<'a> {
             }
 
             if self.serve_ready(fuse_fd, buf).is_break() {
-                return;
+                return LoopEnd::Finished;
             }
         }
-    }
-
-    /// End the prefetch. Its workers do not survive a fork, so a caller
-    /// that forks to keep serving calls this first.
-    pub(crate) fn stop_prefetch(&mut self) {
-        self.prefetch = None;
     }
 
     /// Drop the cached blocks once reads have stopped for a while, and with
@@ -952,6 +991,15 @@ impl<'a> FuseState<'a> {
         };
 
         let inode = read_in.fh;
+        if let Some(file) = self.synthetic.get(inode).filter(|f| f.file) {
+            let start = (read_in.offset as usize).min(file.target.len());
+            let end = start
+                .saturating_add(read_in.size as usize)
+                .min(file.target.len());
+            let r = reply_ok(header, &file.target[start..end]);
+            let _ = rustix::io::write(fuse_fd, &r);
+            return;
+        }
         let entry_idx = inode_to_entry(inode);
         if inode == 0 || entry_idx >= self.manifest.entries.len() {
             let r = reply_err(header, -libc_enoent());
@@ -1175,7 +1223,7 @@ fn dispatch(
         FUSE_INIT => handle_init(header, body),
         FUSE_LOOKUP => handle_lookup(header, body, tree, recorder),
         FUSE_GETATTR => handle_getattr(header, tree),
-        FUSE_OPEN => handle_open(header, manifest, recorder),
+        FUSE_OPEN => handle_open(header, tree, recorder),
         FUSE_RELEASE | FUSE_RELEASEDIR => reply_ok(header, &[]),
         FUSE_OPENDIR => handle_opendir(header, manifest),
         FUSE_READDIR => handle_readdir(header, body, tree, false),
@@ -1306,8 +1354,8 @@ fn handle_access(header: &FuseInHeader, body: &[u8], tree: &Tree) -> Vec<u8> {
     }
     let mask = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     let inode = header.nodeid;
-    let mode = if tree.synthetic.get(inode).is_some() {
-        0o777
+    let mode = if let Some(entry) = tree.synthetic.get(inode) {
+        if entry.file { 0o444 } else { 0o777 }
     } else if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
     } else {
@@ -1359,10 +1407,24 @@ fn handle_getattr(header: &FuseInHeader, tree: &Tree) -> Vec<u8> {
 
 fn handle_open(
     header: &FuseInHeader,
-    manifest: &Manifest,
+    tree: &Tree,
     recorder: &mut Option<TraceRecorder>,
 ) -> Vec<u8> {
+    let manifest = tree.manifest;
     let inode = header.nodeid;
+    if let Some(entry) = tree.synthetic.get(inode) {
+        if !entry.file {
+            return reply_err(header, -libc_einval());
+        }
+        let open_out = FuseOpenOut {
+            fh: inode,
+            open_flags: FOPEN_KEEP_CACHE,
+            padding: 0,
+        };
+        let mut payload = Vec::new();
+        unsafe { write_struct(&mut payload, &open_out) };
+        return reply_ok(header, &payload);
+    }
     if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {
         return reply_err(header, -libc_enoent());
     }
@@ -1457,9 +1519,14 @@ fn handle_readdir(header: &FuseInHeader, body: &[u8], tree: &Tree, plus: bool) -
             }
             _ => {
                 let (link_inode, link) = links[i - 2 - ch.len()];
+                let kind = if link.file {
+                    EntryKind::File
+                } else {
+                    EntryKind::Symlink
+                };
                 (
                     link_inode,
-                    dir_type(EntryKind::Symlink),
+                    dir_type(kind),
                     link.name.as_bytes(),
                     plus.then(|| tree.synthetic.attr(link_inode, link, manifest)),
                 )
@@ -1510,6 +1577,9 @@ fn handle_readlink(header: &FuseInHeader, tree: &Tree) -> Vec<u8> {
     let manifest = tree.manifest;
     let inode = header.nodeid;
     if let Some(link) = tree.synthetic.get(inode) {
+        if link.file {
+            return reply_err(header, -libc_einval());
+        }
         return reply_ok(header, &link.target);
     }
     if inode == 0 || inode_to_entry(inode) >= manifest.entries.len() {

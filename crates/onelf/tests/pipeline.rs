@@ -4725,6 +4725,57 @@ fn clearenv_reexec_in_both_launch_forms() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A re-exec that clears the environment from a cache view or a FUSE
+/// mount still gets the generated mappings back: the cache view carries
+/// the launch's evaluated input and the mount serves it, both under the
+/// root the app actually runs from.
+#[test]
+fn clearenv_reexec_keeps_generated_mappings_in_cache_and_fuse() {
+    let td = workdir("parity-clearenv-views");
+    let Some(dir) = build_parity_fixture(&td, "clearviews") else {
+        return;
+    };
+    let Some((pkg, _)) = build_hooked_package(&dir, "clearviews", &td.join("store")) else {
+        return;
+    };
+    let mut modes = vec![("cache", "cache", vec![])];
+    if fuse_available() {
+        modes.push(("private fuse", "fuse", vec![("ONELF_FUSE_NO_SHARE", "1")]));
+        modes.push(("shared fuse", "fuse", vec![]));
+    }
+    for (mode, run_mode, mode_env) in modes {
+        let mut packed = packed_launch(&pkg, &td);
+        packed.env("ONELF_MODE", run_mode).arg("clearenv");
+        for (name, value) in mode_env {
+            packed.env(name, value);
+        }
+        let o = run_package(&mut packed);
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            o.status.success(),
+            "{mode}: {out}{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(
+            out.contains(&format!("after_mode={run_mode}")),
+            "{mode}: {out}"
+        );
+        let tree = out
+            .lines()
+            .find_map(|l| l.strip_prefix("after_dir="))
+            .unwrap_or_else(|| panic!("{mode}: {out}"));
+        assert_ne!(tree, "(unset)", "{mode}: {out}");
+        let xdg = out
+            .lines()
+            .find_map(|l| l.strip_prefix("after_xdg="))
+            .unwrap_or_default();
+        assert!(
+            xdg.starts_with(&format!("{tree}/share:")),
+            "{mode}: the generated mapping did not survive the re-exec: {out}"
+        );
+    }
+}
+
 /// An intentional present override: an app that sets a generated
 /// variable on purpose before re-exec keeps its value under both forms,
 /// because the stored application records what the launch last applied
@@ -10366,6 +10417,22 @@ fn servers_of(pkg: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// The FUSE servers among [`servers_of`]: the processes of `pkg` that
+/// hold a FUSE connection. A launch's proxy and the guardian of a shared
+/// mount's launch run the packed file too, but serve nothing.
+fn fuse_servers_of(pkg: &Path) -> Vec<u32> {
+    servers_of(pkg)
+        .into_iter()
+        .filter(|pid| {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == Path::new("/dev/fuse")))
+        })
+        .collect()
+}
+
 /// Wait for every server of `pkg` to leave. False when one is still
 /// running after twice the time a server takes to notice it is unused.
 fn servers_gone(pkg: &Path) -> bool {
@@ -10511,7 +10578,7 @@ fn a_launch_after_the_last_has_left_starts_a_fresh_server() {
     pack_share_app(&td, "one", &pkg);
 
     let (a, _) = start_share_app(&pkg, &td, &[]);
-    let first = servers_of(&pkg);
+    let first = fuse_servers_of(&pkg);
     release_share_apps(&td, vec![a]);
     assert_eq!(first.len(), 1, "{first:?}");
     assert!(servers_gone(&pkg), "the server stays after its last launch");
@@ -10519,7 +10586,7 @@ fn a_launch_after_the_last_has_left_starts_a_fresh_server() {
 
     std::fs::remove_file(td.join("release")).unwrap();
     let (b, b_line) = start_share_app(&pkg, &td, &[]);
-    let second = servers_of(&pkg);
+    let second = fuse_servers_of(&pkg);
     let rest = release_share_apps(&td, vec![b]);
     assert!(b_line.contains("data=one"), "{b_line}");
     assert!(rest[0].contains("data=one"), "{rest:?}");
@@ -10556,7 +10623,7 @@ fn a_replaced_package_is_not_served_from_the_old_mount() {
         pack_share_app(&td, "two", &staged);
         std::fs::rename(&staged, &pkg).unwrap();
         let (new, new_line) = start_share_app(&pkg, &td, envs);
-        let servers = servers_of(&pkg);
+        let servers = fuse_servers_of(&pkg);
         let rest = release_share_apps(&td, vec![old, new]);
 
         assert!(old_line.contains("data=one"), "helper={helper}: {old_line}");
@@ -10605,7 +10672,7 @@ fn the_share_opt_out_gives_each_launch_its_own_mount() {
         let _ = std::fs::remove_file(td.join("release"));
         let (a, a_line) = start_share_app(&pkg, &td, &envs);
         let (b, b_line) = start_share_app(&pkg, &td, &envs);
-        let servers = servers_of(&pkg);
+        let servers = fuse_servers_of(&pkg);
         release_share_apps(&td, vec![a, b]);
 
         assert_ne!(a_line, b_line, "helper={helper}: the launches shared");
@@ -10817,9 +10884,10 @@ fn a_join_launch_holds_the_mount_with_its_own_guardian() {
             "helper={helper}: the daemon stayed silent"
         );
 
-        // The holder dies. Its claims go with it; the server and the mount
-        // must stay, held by the joining launch's guardian alone.
-        let _ = holding.kill();
+        // The holder dies: its launcher forwards the TERM, and its app and
+        // guardian go with their claims. The server and the mount must
+        // stay, held by the joining launch's guardian alone.
+        let _ = Command::new("kill").arg(holding.id().to_string()).status();
         let _ = holding.wait();
         let servers = share_servers(&td);
         assert_eq!(
@@ -11219,8 +11287,10 @@ fn rundir_mode_runs_and_leaves_nothing_behind() {
         Path::new(dir).starts_with(td.join("xdg-run")),
         "the tree lives in the private runtime directory: {dir}"
     );
+    // The detached guardian removes the tree once its subtree is empty,
+    // which can be just after the launcher has returned.
     assert!(
-        std::fs::symlink_metadata(dir).is_err(),
+        until(|| std::fs::symlink_metadata(dir).is_err()),
         "the tree is removed after exit"
     );
     assert_eq!(
@@ -16894,7 +16964,9 @@ fn a_launch_whose_library_links_differ_gets_its_own_mount() {
         }
         same();
 
-        let _ = child.kill();
+        // A TERM to the launcher reaches the holder's app through its
+        // guardian, so the whole launch ends and its claims with it.
+        let _ = Command::new("kill").arg(child.id().to_string()).status();
         let _ = child.wait();
         assert!(servers_gone(&pkg), "helper={helper}");
     }
@@ -20766,9 +20838,27 @@ fn a_cache_view_is_leased_by_its_guardian_and_reclaimed_when_idle() {
         );
 
         // The holder's last process goes, its guardian lets the lease go,
-        // and the next launch's collection reclaims the idle view.
+        // and once the view has gone unused past the age limit the next
+        // launch's collection reclaims it.
         std::fs::write(&gate, "").unwrap();
         assert!(until(|| done.is_file()), "the daemon never finished");
+        let lease = views.join(format!(
+            "{}.lease",
+            view.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            until(|| {
+                std::fs::File::open(&lease).is_ok_and(|f| {
+                    rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                        .is_ok()
+                })
+            }),
+            "the guardian never let the lease go"
+        );
+        std::fs::File::open(&lease)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 86400))
+            .unwrap();
         let mut third = Command::new(&other);
         third
             .env_clear()
@@ -20993,7 +21083,8 @@ fn a_fallback_launch_keeps_its_isolation() {
 /// The late-loader fixture's C source. One app covers every scenario
 /// through its environment: it reports the tree it runs from on stdout,
 /// optionally double-forks into a helper that drops every inherited
-/// descriptor (`$DAEMON`, `$READY` marks the moment), waits for `$GATE`,
+/// descriptor (`$DAEMON`; `$READY` marks the moment and names the
+/// ancestor that adopted the helper), waits for `$GATE`,
 /// loads every soname named in `$PLUGIN`, defaulting to its own bundled
 /// plugin and a host driver by name, and writes one
 /// `late=<soname>:<value>` line per load to `$RESULT`, then waits for
@@ -21038,6 +21129,7 @@ int main(void) {
     printf("dir=%s\n", dir ? dir : "unset");
     fflush(stdout);
     if (daemon && *daemon) {
+        pid_t foreground = getpid();
         if (fork() != 0) {
             _exit(0);
         }
@@ -21050,10 +21142,13 @@ int main(void) {
                 close(fd);
             }
         }
+        for (int i = 0; i < 200 && getppid() == foreground; i++) {
+            usleep(10000);
+        }
         if (ready && *ready) {
             FILE *r = fopen(ready, "w");
             if (r) {
-                fputs("closed", r);
+                fprintf(r, "closed %d", (int)getppid());
                 fclose(r);
             }
         }
@@ -21468,6 +21563,69 @@ fn a_late_plugin_load_survives_a_changed_host_view() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Two cache launches one after the other run from one published view:
+/// the second reuses it, ready record inode and all, instead of having
+/// its own sweep reclaim the view and rebuild it. A view nothing has used
+/// for longer than the age limit is still reclaimed by a launch's sweep.
+#[test]
+fn sequential_cache_launches_reuse_their_view() {
+    use std::os::unix::fs::MetadataExt;
+    let td = workdir("cachereuse");
+    let empty = td.join("empty.cache");
+    std::fs::write(&empty, ld_so_cache(&[])).unwrap();
+    let pkg = pack_late_loader(&td, "reuse");
+    if pkg.as_os_str().is_empty() {
+        return; // no compiler: documented soft-skip
+    }
+    let views = td.join("xdg-cache/onelf/views");
+    let launch = || {
+        let (mut child, view) = start_late_loader(
+            &pkg,
+            &td,
+            "cache",
+            &[
+                ("PLUGIN", "libplugin.so.1"),
+                ("ONELF_LD_CACHE", empty.to_str().unwrap()),
+            ],
+        );
+        let status = child.wait().unwrap();
+        assert!(status.success(), "the cache launch failed: {status}");
+        view
+    };
+    let ready_inode = |view: &Path| std::fs::metadata(view.join("ready")).unwrap().ino();
+
+    let first = launch();
+    assert!(first.starts_with(&views), "{}", first.display());
+    let inode = ready_inode(&first);
+    let second = launch();
+    assert_eq!(first, second, "one identity, one view");
+    assert_eq!(
+        ready_inode(&second),
+        inode,
+        "the second launch reused the view instead of rebuilding it"
+    );
+
+    // Another identity's idle view, last used long past the age limit.
+    let stale = views.join(format!("view-{}", "0".repeat(32)));
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("config"), b"onelf-view 1\n").unwrap();
+    std::fs::write(stale.join("ready"), b"onelf-view-ready 1\n").unwrap();
+    let lease =
+        std::fs::File::create(views.join(format!("view-{}.lease", "0".repeat(32)))).unwrap();
+    lease
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400))
+        .unwrap();
+    drop(lease);
+
+    let third = launch();
+    assert_eq!(third, first);
+    assert_eq!(ready_inode(&third), inode, "the live identity's view stays");
+    assert!(
+        !stale.exists(),
+        "the long idle view is reclaimed by the sweep"
+    );
+}
+
 /// A cache sweep runs while two launches share one view and both sit
 /// before their late loads, while one has drained, and while the last
 /// one has loaded but not exited: the view and its package are skipped
@@ -21600,8 +21758,9 @@ fn cache_gc_spares_a_launch_awaiting_a_late_plugin_load() {
 /// returns while the helper waits. A cache sweep still finds the view
 /// leased, the helper's late load reads the plugin out of the view with
 /// nothing inherited, and the view is reclaimed only after the helper
-/// finishes. The runtime directory mode shows the same lifetime without
-/// a cache.
+/// finishes. Every other mode that runs a guardian shows the same
+/// lifetime, and in each one the helper's adopting ancestor is a process
+/// of the launch itself, never init or a process started later.
 #[test]
 fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
     let td = workdir("latefdclose");
@@ -21619,33 +21778,54 @@ fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
     let hold = td.join("hold");
     let done = td.join("done");
 
-    for mode in ["rundir", "cache"] {
+    for (mode, run_mode, mode_env) in guarded_modes() {
         for file in [&ready, &gate, &result, &hold, &done] {
             let _ = std::fs::remove_file(file);
         }
-        let (mut child, view) = start_late_loader(
-            &pkg,
-            &td,
-            mode,
-            &[
-                ("DAEMON", "1"),
-                ("READY", ready.to_str().unwrap()),
-                ("GATE", gate.to_str().unwrap()),
-                ("PLUGIN", "libplugin.so.1"),
-                ("RESULT", result.to_str().unwrap()),
-                ("HOLD", hold.to_str().unwrap()),
-                ("DONE", done.to_str().unwrap()),
-                ("ONELF_LD_CACHE", empty.to_str().unwrap()),
-            ],
-        );
+        let mut envs = vec![
+            ("DAEMON", "1"),
+            ("READY", ready.to_str().unwrap()),
+            ("GATE", gate.to_str().unwrap()),
+            ("PLUGIN", "libplugin.so.1"),
+            ("RESULT", result.to_str().unwrap()),
+            ("HOLD", hold.to_str().unwrap()),
+            ("DONE", done.to_str().unwrap()),
+            ("ONELF_LD_CACHE", empty.to_str().unwrap()),
+        ];
+        envs.extend(mode_env);
+        let (mut child, view) = start_late_loader(&pkg, &td, run_mode, &envs);
         let status = child.wait().unwrap();
         assert!(
             status.success(),
             "{mode}: the launcher returned while the helper lives: {status}"
         );
         assert!(
-            until(|| ready.is_file()),
+            until(|| std::fs::read_to_string(&ready).is_ok_and(|s| s.starts_with("closed "))),
             "{mode}: the helper never dropped its descriptors"
+        );
+        let ancestor = std::fs::read_to_string(&ready).unwrap();
+        let ancestor = ancestor.trim_start_matches("closed ").trim();
+        // The process name, not the executable link or the command
+        // line: a guardian inside a user namespace of its own keeps those
+        // from this process.
+        let status =
+            std::fs::read_to_string(format!("/proc/{ancestor}/status")).unwrap_or_default();
+        let field = |key: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            field("Name:"),
+            "fddrain.onelf",
+            "{mode}: the helper's adopting ancestor {ancestor} is not the launch's guardian: {status}"
+        );
+        assert!(
+            !field("State:").starts_with('Z'),
+            "{mode}: the adopting guardian already exited: {status}"
         );
         if mode == "cache" {
             let while_held = cache_gc(&cache_root, &td);
@@ -21657,8 +21837,9 @@ fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
         }
         assert!(
             view.is_dir(),
-            "{mode}: the view outlives the launcher: {}",
-            view.display()
+            "{mode}: the view outlives the launcher: {}: {:?}",
+            view.display(),
+            std::fs::metadata(&view)
         );
 
         std::fs::write(&gate, "").unwrap();
@@ -21705,7 +21886,7 @@ fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
                 "{mode}: the drained helper's view is reclaimed: {when_idle}"
             );
             assert_eq!(view_count(&views), 0, "{mode}: nothing of the view is left");
-        } else {
+        } else if mode == "rundir" {
             assert!(
                 until(|| std::fs::symlink_metadata(&view).is_err()),
                 "{mode}: the view is taken down after the helper finishes"
@@ -21713,6 +21894,246 @@ fn a_double_fork_helper_that_closes_every_fd_keeps_its_late_load_alive() {
         }
     }
     let _ = std::fs::remove_dir_all(&td);
+}
+
+/// One mode [`guarded_modes`] lists: a label, the `ONELF_MODE` value,
+/// and the environment the mode needs.
+type GuardedMode = (
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// The modes that run the application under a lifetime guardian. tmpfs
+/// and both FUSE launch forms are included where this host has them.
+fn guarded_modes() -> Vec<GuardedMode> {
+    let mut modes = vec![("rundir", "rundir", vec![]), ("cache", "cache", vec![])];
+    if tmpfs_available() {
+        modes.push(("tmpfs", "tmpfs", vec![]));
+    }
+    if fuse_available() {
+        modes.push(("private fuse", "fuse", vec![("ONELF_FUSE_NO_SHARE", "1")]));
+        modes.push(("shared fuse", "fuse", vec![]));
+    }
+    modes
+}
+
+/// An app that counts the SIGINTs it receives: it marks `$ARMED` once
+/// its handler is in place, waits for `$STOP`, settles so any duplicate
+/// delivery lands, and writes the count to `$COUNT`. With `$RAISE` set
+/// it kills itself with that signal at once instead.
+const SIGNAL_COUNTER_SRC: &str = r#"#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t ints;
+
+static void on_int(int sig) {
+    (void)sig;
+    ints++;
+}
+
+int main(void) {
+    const char *raise_sig = getenv("RAISE");
+    if (raise_sig && *raise_sig) {
+        signal(atoi(raise_sig), SIG_DFL);
+        raise(atoi(raise_sig));
+        return 3;
+    }
+    const char *armed = getenv("ARMED");
+    const char *stop = getenv("STOP");
+    const char *count = getenv("COUNT");
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_int;
+    sigaction(SIGINT, &sa, NULL);
+    FILE *a = fopen(armed, "w");
+    if (a) {
+        fputs("1", a);
+        fclose(a);
+    }
+    for (int i = 0; i < 600 && access(stop, F_OK) != 0; i++) {
+        usleep(50000);
+    }
+    usleep(300000);
+    FILE *c = fopen(count, "w");
+    if (c) {
+        fprintf(c, "%d", (int)ints);
+        fclose(c);
+    }
+    return 0;
+}
+"#;
+
+/// Runs `argv[1..]` as the session leader of a fresh pseudo-terminal,
+/// its process group the terminal's foreground, types one Ctrl-C once
+/// `$ARMED` exists, then creates `$STOP`, and prints how the program
+/// ended. The Ctrl-C is the terminal's own SIGINT to the whole group.
+const PTY_HARNESS_SRC: &str = r#"#define _XOPEN_SOURCE 600
+#define _DEFAULT_SOURCE
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    const char *armed = getenv("ARMED");
+    const char *stop = getenv("STOP");
+    if (argc < 2) {
+        return 89;
+    }
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0 || grantpt(m) || unlockpt(m)) {
+        return 90;
+    }
+    char *name = ptsname(m);
+    pid_t p = fork();
+    if (p == 0) {
+        setsid();
+        int s = open(name, O_RDWR);
+        if (s < 0 || ioctl(s, TIOCSCTTY, 0)) {
+            _exit(91);
+        }
+        dup2(s, 0);
+        dup2(s, 1);
+        dup2(s, 2);
+        if (s > 2) {
+            close(s);
+        }
+        close(m);
+        execv(argv[1], argv + 1);
+        _exit(92);
+    }
+    fcntl(m, F_SETFL, O_NONBLOCK);
+    char buf[512];
+    int status = 0, sent = 0, stopped = 0;
+    for (int i = 0; i < 1200; i++) {
+        while (read(m, buf, sizeof buf) > 0) {
+        }
+        if (!sent && access(armed, F_OK) == 0) {
+            usleep(200000);
+            if (write(m, "\x03", 1) == 1) {
+                sent = 1;
+            }
+        } else if (sent && !stopped) {
+            usleep(500000);
+            FILE *f = fopen(stop, "w");
+            if (f) {
+                fputs("1", f);
+                fclose(f);
+            }
+            stopped = 1;
+        }
+        if (waitpid(p, &status, WNOHANG) == p) {
+            printf("sent=%d exit=%d signal=%d\n", sent,
+                   WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                   WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+            return 0;
+        }
+        usleep(50000);
+    }
+    kill(p, SIGKILL);
+    return 93;
+}
+"#;
+
+/// Pack the signal counter as `bin/run`, and compile the terminal
+/// harness beside it. `None` without a compiler.
+fn pack_signal_counter(td: &Path) -> Option<(PathBuf, PathBuf)> {
+    let app = td.join("sigapp");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(&td.join("sig.c"), SIGNAL_COUNTER_SRC);
+    if !cc(&td.join("sig.c"), &app.join("bin/run")) {
+        return None;
+    }
+    write(&td.join("pty.c"), PTY_HARNESS_SRC);
+    let harness = td.join("ptyrun");
+    if !cc(&td.join("pty.c"), &harness) {
+        return None;
+    }
+    let pkg = td.join("sigapp.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0", "--name", "sigapp"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    Some((pkg, harness))
+}
+
+/// A Ctrl-C typed at the terminal reaches the whole foreground process
+/// group: the launcher, its guardian and the app. The app must receive
+/// it exactly once, so neither the launcher nor the guardian forwards a
+/// signal the terminal already delivered, and an app that handles the
+/// first Ctrl-C is not hit again by forwarded copies.
+#[test]
+fn a_terminal_ctrl_c_reaches_a_guarded_app_once() {
+    let td = workdir("ttysig");
+    let Some((pkg, harness)) = pack_signal_counter(&td) else {
+        return; // no compiler: documented soft-skip
+    };
+    for (mode, run_mode, mode_env) in guarded_modes() {
+        let armed = td.join(format!("armed-{run_mode}-{}", mode_env.len()));
+        let stop = td.join(format!("stop-{run_mode}-{}", mode_env.len()));
+        let count = td.join(format!("count-{run_mode}-{}", mode_env.len()));
+        let mut run = Command::new(&harness);
+        run.arg(&pkg)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", run_mode)
+            .env("ARMED", &armed)
+            .env("STOP", &stop)
+            .env("COUNT", &count);
+        isolate(&mut run, &td);
+        for (name, value) in mode_env {
+            run.env(name, value);
+        }
+        let o = run_package(&mut run);
+        let report = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "{mode}: the harness failed: {report}");
+        assert!(report.contains("sent=1 exit=0"), "{mode}: {report}");
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap_or_default(),
+            "1",
+            "{mode}: the app must see the terminal's Ctrl-C once"
+        );
+    }
+}
+
+/// An app killed by a signal makes the launcher die of the same signal,
+/// so a shell loop or a supervisor sees the signal rather than an exit
+/// status of 128 plus its number.
+#[test]
+fn a_signal_killed_app_kills_its_launcher_with_the_same_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    let td = workdir("sigdeath");
+    let Some((pkg, _)) = pack_signal_counter(&td) else {
+        return; // no compiler: documented soft-skip
+    };
+    for (mode, run_mode, mode_env) in guarded_modes() {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", run_mode)
+            .env("RAISE", "15");
+        isolate(&mut run, &td);
+        for (name, value) in mode_env {
+            run.env(name, value);
+        }
+        let status = run_package(&mut run).status;
+        assert_eq!(
+            status.signal(),
+            Some(15),
+            "{mode}: the launcher must die of the app's SIGTERM: {status}"
+        );
+    }
 }
 
 /// The environment a development run needs to stay hermetic: a PATH, an

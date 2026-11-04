@@ -42,12 +42,6 @@ use onelf_rt::portable;
 use onelf_rt::rundir;
 use onelf_rt::sets;
 
-/// The directory of the cache's execution-view store, under the cache
-/// root. The cache's collection reclaims exactly this layout when the
-/// views it finds are idle, and every cache-mode launch publishes its
-/// view here, keyed by its full identity.
-const VIEW_STORE_DIR: &str = "views";
-
 fn main() {
     // The updater's client serves acquisition's https:// sources. The
     // slim build leaves the update feature, and with it this client,
@@ -462,18 +456,6 @@ fn exec_cache(
 
     let package_id = cache::hex(&pkg.manifest.header.package_id);
 
-    // Auto-GC: prune stale cache entries and reclaim the view store's
-    // idle views (best-effort; skip if no cache base).
-    let gc_max_age = std::env::var("ONELF_GC_MAX_AGE")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
-    if gc_max_age > 0
-        && let Some(cache_base) = cache::base_dir()
-    {
-        cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
-    }
-
     let target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
     let target_path = pkg_dir.join(pkg.manifest.entry_path(target_entry));
     if !target_path.exists() {
@@ -508,6 +490,38 @@ fn exec_cache(
         .manifest
         .get_string(pkg.manifest.entrypoints[ep_idx].name)
         .to_string();
+    // The evaluated environment input belongs to the view: it is part of
+    // the identity, and the view carries it, so an application that
+    // clears its environment and re-execs still finds the generated
+    // mappings. It is evaluated against the base, which shows the same
+    // content; the identity normalizes the base's path, and the view
+    // carries the input made again for its own root.
+    let (generated, resolved) = {
+        let mut probe = launch::Launch {
+            pkg,
+            pkg_root: &pkg_dir,
+            mode: "cache",
+            ep_idx,
+            argv0,
+            exec_path,
+            args,
+            interp_data,
+            env_data,
+            private_ns: false,
+            tree_writable: false,
+            links: launch::Links::Served,
+            resolved,
+        };
+        (launch::generated_env(&probe), probe.resolved.take())
+    };
+    let runtime_env = match generated.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("onelf-rt: the generated environment input is {e} and is not written");
+            Vec::new()
+        }
+    };
+
     let pins = sets::pins();
     let metadata = metadata_digest(
         loader::read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE),
@@ -520,13 +534,12 @@ fn exec_cache(
         pins: &pins,
         policy,
         host_libc: false,
-        placement: links::view::Placement::Tree,
         loader: resolved
             .as_ref()
             .and_then(|r| r.resolution.host_interp.as_ref().map(|p| p.as_os_str())),
         entrypoint: Some(&ep_name),
         links: &links,
-        runtime_env: &[],
+        runtime_env: &runtime_env,
         root: pkg_dir.as_os_str(),
     };
     let Some(identity) = links::view::ViewIdentity::new(&inputs) else {
@@ -542,7 +555,7 @@ fn exec_cache(
             "no safe cache directory (set HOME or XDG_RUNTIME_DIR)",
         );
     };
-    let store = cache_base.join(VIEW_STORE_DIR);
+    let store = cache::view_store(&cache_base);
     if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&store)
         && e.kind() != ErrorKind::AlreadyExists
     {
@@ -574,12 +587,29 @@ fn exec_cache(
         return std::io::Error::other("the view's lease cannot be locked");
     }
 
-    let built = links::view::ensure_view(&store, &identity, |staging| {
+    // Auto-GC: prune stale cache entries and reclaim the view store's
+    // idle views (best-effort). Only now, with this launch's view leased,
+    // so the sweep cannot take the view the launch is about to use.
+    let gc_max_age = std::env::var("ONELF_GC_MAX_AGE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    if gc_max_age > 0 {
+        cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
+    }
+
+    let built = links::view::ensure_view(&store, &identity, &lease, |staging| {
         stage_view_from_base(staging, &pkg.manifest, &pkg.codec, &pkg_dir)?;
         if let Some(dir) = &link_dir {
             staging.place_links(&pkg.manifest, dir, &links)?;
         }
-        Ok(None)
+        if runtime_env.is_empty() {
+            return Ok(None);
+        }
+        let expanded = generated.encode_rooted(&pkg_dir, &view_dir).map_err(|e| {
+            std::io::Error::other(format!("the generated environment input is {e}"))
+        })?;
+        Ok(Some(expanded))
     });
     let view = match built {
         Ok(view) => view,
@@ -632,33 +662,16 @@ fn exec_cache(
         }
     };
 
-    // Signals meant for this process still reach the application, one hop
-    // further along: this forwards to the guardian, and the guardian
-    // forwards to the application.
-    fuse::CHILD_PID.store(supervision.pid as i32, std::sync::atomic::Ordering::Relaxed);
-    fuse::install_signal_handlers();
-
-    match guardian::receive(&supervision.status) {
-        Ok(outcome) => {
-            if outcome == guardian::Outcome::Unavailable {
-                eprintln!("onelf-rt: cache: the lifetime guardian could not be established");
-            }
-            std::process::exit(outcome.exit_code())
-        }
-        Err(e) => {
-            eprintln!("onelf-rt: cache: guardian status: {e}");
-            std::process::exit(1);
-        }
-    }
+    // Signals sent to this process still reach the application, one hop
+    // further along, and this process ends the way the application did.
+    guardian::proxy(supervision, "cache")
 }
 
 /// Fill a view's staging tree from the verified base extraction. Every
 /// package file is hardlinked out of the base, which shares the verified
 /// bytes without copying them, every symlink is recreated under the
 /// validation the staging surface applies, and the base itself is never
-/// touched. The cache view carries no caller input: everything the
-/// launch evaluates at exec time stays in the process, so one identity's
-/// view can serve every launch that computes it.
+/// touched.
 fn stage_view_from_base(
     staging: &links::view::Staging,
     manifest: &onelf_format::Manifest,
@@ -740,6 +753,25 @@ mod cache_view_tests {
         dir
     }
 
+    /// The in-use lease of `identity`'s view in `store`, held shared as a
+    /// launch holds it.
+    fn lease(store: &Path, identity: &links::view::ViewIdentity) -> std::fs::File {
+        std::fs::create_dir_all(store).unwrap();
+        let name = links::view::dir_name(identity.key()).unwrap();
+        let path = links::view::lease_lock_path(&store.join(name)).unwrap();
+        // Close-on-exec, unlike a launch's: a test worker another thread
+        // spawns must not inherit the claim.
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+        file
+    }
+
     /// A manifest whose entries are `(name, kind, parent, symlink target
     /// offset)`, over a string table that holds every name and target.
     fn manifest(parts: &[(&str, EntryKind, u32, Option<&str>)]) -> Manifest {
@@ -811,7 +843,6 @@ mod cache_view_tests {
             pins: &[],
             policy: onelf_format::HostLibsPolicy::Never,
             host_libc: false,
-            placement: links::view::Placement::Tree,
             loader: None,
             entrypoint: Some("app"),
             links: &links::Links::new(),
@@ -819,11 +850,12 @@ mod cache_view_tests {
             root: base.as_os_str(),
         })
         .unwrap();
-        let view = links::view::ensure_view(&store, &identity, |staging| {
-            stage_view_from_base(staging, manifest, &Codec::Zstd(None), base)?;
-            Ok(None)
-        })
-        .unwrap();
+        let view =
+            links::view::ensure_view(&store, &identity, &lease(&store, &identity), |staging| {
+                stage_view_from_base(staging, manifest, &Codec::Zstd(None), base)?;
+                Ok(None)
+            })
+            .unwrap();
         (store, view.dir().to_path_buf())
     }
 
@@ -870,7 +902,6 @@ mod cache_view_tests {
             pins: &[],
             policy: onelf_format::HostLibsPolicy::Never,
             host_libc: false,
-            placement: links::view::Placement::Tree,
             loader: None,
             entrypoint: Some("app"),
             links: &links::Links::new(),
@@ -879,18 +910,19 @@ mod cache_view_tests {
         })
         .unwrap();
 
-        links::view::ensure_view(&store, &identity, |staging| {
+        links::view::ensure_view(&store, &identity, &lease(&store, &identity), |staging| {
             stage_view_from_base(staging, &manifest, &Codec::Zstd(None), &base)?;
             Ok(None)
         })
         .unwrap();
 
         let rebuilt = Cell::new(false);
-        let again = links::view::ensure_view(&store, &identity, |_staging| {
-            rebuilt.set(true);
-            Ok(None)
-        })
-        .unwrap();
+        let again =
+            links::view::ensure_view(&store, &identity, &lease(&store, &identity), |_staging| {
+                rebuilt.set(true);
+                Ok(None)
+            })
+            .unwrap();
         assert!(
             !rebuilt.get(),
             "a ready view of the same identity is reused, not rebuilt"
@@ -924,7 +956,6 @@ mod cache_view_tests {
                 pins: &[],
                 policy: onelf_format::HostLibsPolicy::Never,
                 host_libc: false,
-                placement: links::view::Placement::Tree,
                 loader: None,
                 entrypoint: Some("app"),
                 links: &links,
@@ -932,12 +963,13 @@ mod cache_view_tests {
                 root: base.as_os_str(),
             })
             .unwrap();
-            let view = links::view::ensure_view(&store, &identity, |staging| {
-                stage_view_from_base(staging, &manifest, &Codec::Zstd(None), &base)?;
-                staging.place_links(&manifest, "lib", &links)?;
-                Ok(None)
-            })
-            .unwrap();
+            let view =
+                links::view::ensure_view(&store, &identity, &lease(&store, &identity), |staging| {
+                    stage_view_from_base(staging, &manifest, &Codec::Zstd(None), &base)?;
+                    staging.place_links(&manifest, "lib", &links)?;
+                    Ok(None)
+                })
+                .unwrap();
             (store, view.dir().to_path_buf())
         };
 

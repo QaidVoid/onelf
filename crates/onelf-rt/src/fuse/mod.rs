@@ -3,9 +3,9 @@
 //! Mounts the package contents as a read-only FUSE filesystem and executes
 //! the entrypoint directly from the mount. Concurrent launches of one
 //! package share a mount and the server behind it (see [`share`]). A
-//! launch that does not share serves its own mount from the parent process
-//! while the child runs the target binary, and a death pipe detects child
-//! exit for reliable cleanup.
+//! launch that does not share forks its own server, which is the launch's
+//! guardian (see [`crate::guardian`]): it serves the mount while the app
+//! runs and until `wait` proves every descendant gone.
 
 pub mod fs;
 pub(crate) use fs::TRACE_ARM;
@@ -19,20 +19,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use rustix::io::FdFlags;
-use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+use rustix::process::Signal;
 use rustix::runtime::{KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sigaction};
 
 use crate::loader::PackageData;
 
-/// The foreground child the signal handlers forward to, or `0` while
-/// nothing is running. The launching process stores the pid of the
-/// child a guardian supervises, so a signal aimed at the launcher
-/// reaches the application.
-pub static CHILD_PID: AtomicI32 = AtomicI32::new(0);
-
-/// Write end of the pipe the `SIGCHLD` handler writes a byte to, so the event
-/// loop can wait on the launched process exiting rather than only on the death
-/// pipe. `poll` cannot wait on a signal, so the signal has to become readable
+/// Write end of the pipe the `SIGCHLD` handler writes a byte to, so the
+/// private server's event loop wakes when a child of its subtree exits:
+/// `poll` cannot wait on a signal, so the signal has to become readable
 /// data. `-1` means no pipe is installed and the write is skipped.
 static SIGCHLD_PIPE: AtomicI32 = AtomicI32::new(-1);
 
@@ -59,7 +53,8 @@ core::arch::global_asm!(
 
 // i386 Linux also requires SA_RESTORER. Without SA_SIGINFO the kernel builds
 // the legacy (non-rt) sigframe, so the restorer pops the signal number and
-// calls sigreturn (not rt_sigreturn).
+// calls sigreturn (not rt_sigreturn). A handler installed with SA_SIGINFO
+// gets the rt frame instead, which returns through rt_sigreturn.
 #[cfg(target_arch = "x86")]
 core::arch::global_asm!(
     ".global __onelf_signal_restorer",
@@ -68,72 +63,41 @@ core::arch::global_asm!(
     "pop eax",      // discard the signal number pushed on the legacy frame
     "mov eax, 119", // __NR_sigreturn
     "int 0x80",
+    ".global __onelf_rt_signal_restorer",
+    ".type __onelf_rt_signal_restorer, @function",
+    "__onelf_rt_signal_restorer:",
+    "mov eax, 173", // __NR_rt_sigreturn
+    "int 0x80",
 );
 
 unsafe extern "C" {
     fn __onelf_signal_restorer();
 }
 
-unsafe extern "C" fn signal_handler(sig: core::ffi::c_int) {
-    if sig == 17 {
-        // SIGCHLD: wake the event loop so it can see the launched process go.
-        // Waiting only for the death pipe means waiting for every descendant,
-        // and a launcher that does not return until a daemon its child started
-        // has finished is a launcher that reports that daemon dead. Writing a
-        // byte is the whole handler, which keeps it async-signal-safe.
-        let fd = SIGCHLD_PIPE.load(Ordering::Relaxed);
-        if fd >= 0 {
-            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-            let _ = rustix::io::write(borrowed, b"c");
-        }
-        return;
-    }
-    // Forward other signals to child
-    let pid = CHILD_PID.load(Ordering::Relaxed);
-    if pid > 0
-        && let Some(pid) = Pid::from_raw(pid)
-        && let Some(signal) = Signal::from_named_raw(sig)
-    {
-        let _ = kill_process(pid, signal);
+/// Wake the event loop: one byte on [`SIGCHLD_PIPE`]. Writing a byte is
+/// the whole handler, which keeps it async-signal-safe.
+unsafe extern "C" fn wake_on_child_exit(_sig: core::ffi::c_int) {
+    let fd = SIGCHLD_PIPE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let _ = rustix::io::write(borrowed, b"c");
     }
 }
 
-/// Install the handlers that forward `SIGINT` and `SIGTERM` to
-/// [`CHILD_PID`] while the application runs.
-pub fn install_signal_handlers() {
-    let mut mask = KernelSigSet::empty();
-    mask.insert(Signal::INT);
-    mask.insert(Signal::TERM);
-    mask.insert(Signal::HUP);
-    mask.insert(Signal::QUIT);
-
-    let flags = KernelSigactionFlags::RESTORER;
-
-    for &sig in &[
-        Signal::INT,
-        Signal::TERM,
-        Signal::HUP,
-        Signal::QUIT,
-        Signal::CHILD,
-    ] {
-        // Only an exit is worth waking the event loop for. Without
-        // NOCLDSTOP a Ctrl-Z, a `kill -STOP`, or a debugger attaching also
-        // raise SIGCHLD, and the loop would stop serving the mount for a
-        // child that is about to resume and read from it.
-        let sa_flags = if sig == Signal::CHILD {
-            flags | KernelSigactionFlags::NOCLDSTOP
-        } else {
-            flags
-        };
-        let action = KernelSigaction {
-            sa_handler_kernel: Some(signal_handler),
-            sa_flags,
-            sa_restorer: Some(__onelf_signal_restorer),
-            sa_mask: mask.clone(),
-        };
-        unsafe {
-            let _ = kernel_sigaction(sig, Some(action));
-        }
+/// Make `SIGCHLD` write to `pipe`, so the server loop can wait on the
+/// subtree as it serves. Only an exit is worth waking for: without
+/// NOCLDSTOP a Ctrl-Z, a `kill -STOP`, or a debugger attaching would also
+/// raise it, and the loop would reap nothing.
+fn wake_on_child_exits(pipe: &OwnedFd) {
+    SIGCHLD_PIPE.store(rustix::fd::AsRawFd::as_raw_fd(pipe), Ordering::Relaxed);
+    let action = KernelSigaction {
+        sa_handler_kernel: Some(wake_on_child_exit),
+        sa_flags: KernelSigactionFlags::RESTORER | KernelSigactionFlags::NOCLDSTOP,
+        sa_restorer: Some(__onelf_signal_restorer),
+        sa_mask: KernelSigSet::empty(),
+    };
+    unsafe {
+        let _ = kernel_sigaction(Signal::CHILD, Some(action));
     }
 }
 
@@ -378,12 +342,19 @@ pub fn execute_fuse(
     execute_private(pkg, &req, needs_setuid)
 }
 
-/// Mount the package for this launch alone, serve it from this process
-/// while the child runs the app, and hand the mount to a background
-/// server if anything is still using it when the child exits.
+/// Mount the package for this launch alone and run the app from it.
+///
+/// The server is the launch's guardian: this process forks it once the
+/// mount exists and stays behind as the proxy, and the server marks
+/// itself a child subreaper and forks the app. It serves the mount while
+/// it reaps its subtree, reports the app's status the moment the app has
+/// been reaped, and takes the mount down only when `wait` proves every
+/// descendant gone, so a daemon the app left behind, whatever it closed,
+/// keeps its files. No process started after the app exits ever stands
+/// in for it.
 fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> bool {
-    // Held by the parent, which serves the filesystem and outlives the
-    // child, so no concurrent sweep can reclaim the directory.
+    // Held by the server for as long as it serves, so no concurrent sweep
+    // can reclaim the directory.
     let name = pkg.manifest.name();
     let id = &pkg.manifest.header.package_id;
     let Some(claim) = crate::paths::create_mountpoint(name, id) else {
@@ -410,56 +381,100 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
             }
         }
     };
-    let mountpoint = claim.path().to_path_buf();
-    // Set CLOEXEC so child doesn't inherit the FUSE fd after exec.
+    // Set CLOEXEC so the app doesn't inherit the FUSE fd after exec.
     let _ = rustix::io::fcntl_setfd(&fuse_fd, FdFlags::CLOEXEC);
 
     // Set up portable directories (doesn't access FUSE mount)
     req.setup_portable();
 
-    // Death pipe: when the child (and all its descendants) exit, the write end
-    // closes and poll() on the read end returns POLLHUP.
-    let (pipe_read, pipe_write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
-        Ok(p) => p,
-        Err(_) => {
-            cleanup_mountpoint(claim, used_namespace);
-            return false;
-        }
-    };
-    // Remove CLOEXEC from write end so the exec'd child inherits it.
-    let _ = rustix::io::fcntl_setfd(&pipe_write, FdFlags::empty());
-
-    // The child resolves which libraries the mount shows from outside the
-    // package, since only it reads the mount, and the parent serves them.
-    let (links_tx, links_rx) = match crate::links::channel() {
-        Ok(c) => c,
-        Err(_) => {
-            cleanup_mountpoint(claim, used_namespace);
-            return false;
-        }
+    // The app resolves which libraries the mount shows from outside the
+    // package, since only it reads the mount, and the server serves them
+    // together with the app's generated environment input.
+    let channel = crate::links::channel();
+    let wake = rustix::pipe::pipe_with(
+        rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+    );
+    let (Ok((links_tx, links_rx)), Ok((wake_r, wake_w))) = (channel, wake) else {
+        cleanup_mountpoint(claim, used_namespace);
+        return false;
     };
 
-    use rustix::runtime::{Fork, kernel_fork};
-
-    // The launch's own ancestor becomes the subreaper before the fork, so
-    // a descendant that daemonizes out of the mount re-parents to the
-    // launch that serves it instead of to init. Where the kernel refuses
-    // the attribute, the death pipe and the /proc checks below carry the
-    // launch as they always have.
-    if let Err(e) = crate::guardian::mark_subreaper() {
-        eprintln!("onelf-rt: fuse: child subreaper unavailable: {e}");
+    let server = Private {
+        fuse_fd,
+        claim,
+        used_namespace,
+        links_tx,
+        links_rx,
+        wake_r,
+        wake_w,
+    };
+    match crate::guardian::fork_guardian(|report| serve_private(pkg, req, server, report)) {
+        // This process held copies of the mount's descriptors only until
+        // the fork, so a server that dies takes the connection with it.
+        Ok(supervision) => crate::guardian::proxy(supervision, "fuse"),
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: fork failed: {e}");
+            std::process::exit(1);
+        }
     }
+}
 
-    match unsafe { kernel_fork() } {
-        Ok(Fork::Child(_)) => {
-            drop(links_rx);
-            // Everything that reads the mount has to happen in the child,
-            // after the fork: the parent's FUSE event loop is what serves
-            // it, and that loop is only now starting. The mount of this
-            // launch is the launch's view: its content is the verified
-            // package, the links the child resolves are served into it
-            // and never change afterwards, and sharing it is decided by
-            // the served-links match in `share`.
+/// What the proxy hands the private server it forks.
+struct Private {
+    fuse_fd: OwnedFd,
+    claim: crate::paths::Mountpoint,
+    used_namespace: bool,
+    links_tx: crate::links::Sender,
+    links_rx: crate::links::Receiver,
+    wake_r: OwnedFd,
+    wake_w: OwnedFd,
+}
+
+/// The private server's side of one launch: the guardian of the app, and
+/// the server of its mount. Never returns.
+fn serve_private(
+    pkg: &mut PackageData,
+    req: &Request,
+    server: Private,
+    report: crate::guardian::Report,
+) -> ! {
+    let Private {
+        fuse_fd,
+        claim,
+        used_namespace,
+        links_tx,
+        links_rx,
+        wake_r,
+        wake_w,
+    } = server;
+    let mountpoint = claim.path().to_path_buf();
+
+    // Where the kernel refuses the attribute, orphans go elsewhere and
+    // `wait` cannot speak for them; the server then also asks `/proc`
+    // before it lets the mount go, as it always has.
+    let subreaper = match crate::guardian::mark_subreaper() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: child subreaper unavailable: {e}");
+            false
+        }
+    };
+    crate::guardian::prepare_reaping();
+    crate::guardian::install_forwarding();
+    wake_on_child_exits(&wake_w);
+
+    let mut inbox = Some(links_rx);
+    let app = {
+        let inbox = &mut inbox;
+        let pkg: &PackageData = pkg;
+        let mountpoint = mountpoint.clone();
+        crate::guardian::fork_foreground(move || {
+            // The server's ends of the hand-off are not the app's: an ack
+            // pipe the app held would never hang up on a dead server.
+            drop(inbox.take());
+            // Everything that reads the mount has to happen in the app,
+            // after the fork: this server's event loop is what serves it,
+            // and that loop is only now starting.
             crate::launch::exec(&req.launch(
                 pkg,
                 &mountpoint,
@@ -467,142 +482,44 @@ fn execute_private(pkg: &mut PackageData, req: &Request, needs_setuid: bool) -> 
                 crate::launch::Links::Server(&links_tx),
                 None,
             ))
-        }
-        Ok(Fork::ParentOf(child_pid)) => {
-            // Close write end in parent -- only child holds it now
-            drop(pipe_write);
-            drop(links_tx);
-
-            CHILD_PID.store(child_pid.as_raw_nonzero().get(), Ordering::Relaxed);
-
-            // Installed before the handlers, so a child that exits immediately
-            // still finds somewhere to record it.
-            let sigchld = rustix::pipe::pipe_with(
-                rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-            )
-            .ok();
-            if let Some((_, w)) = &sigchld {
-                SIGCHLD_PIPE.store(rustix::fd::AsRawFd::as_raw_fd(w), Ordering::Relaxed);
-            }
-
-            install_signal_handlers();
-
-            let mut state =
-                fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
-            state.expect_links(links_rx);
-
-            let mut fuse_buf = vec![0u8; 1024 * 1024 + 4096];
-            state.run_loop(
-                &fuse_fd,
-                Some(&pipe_read),
-                sigchld.as_ref().map(|(r, _)| r),
-                &mut fuse_buf,
-            );
-
-            // Event loop exited -- reap child. A wake that finds the child
-            // still running (the death pipe closed by an app that shuts every
-            // inherited descriptor, or a stray SIGCHLD) must not park this
-            // process in `waitpid`: nothing else serves the mount, so the
-            // child's next read would block forever. Keep serving on the
-            // exit pipe alone until the child really is gone.
-            let exit_status = loop {
-                match waitpid(Some(child_pid), WaitOptions::NOHANG) {
-                    Ok(Some((_pid, status))) => break status,
-                    Ok(None) => match &sigchld {
-                        Some((r, _)) => {
-                            // Drain, then look again before sleeping: an exit
-                            // that landed between the check above and the
-                            // drain wrote its byte into what was just thrown
-                            // away, and nothing would wake the loop for it.
-                            let mut scratch = [0u8; 64];
-                            while rustix::io::read(r, &mut scratch).is_ok_and(|n| n > 0) {}
-                            if let Ok(Some((_pid, status))) =
-                                waitpid(Some(child_pid), WaitOptions::NOHANG)
-                            {
-                                break status;
-                            }
-                            state.run_loop(&fuse_fd, None::<&OwnedFd>, Some(r), &mut fuse_buf);
-                        }
-                        None => match waitpid(Some(child_pid), WaitOptions::empty()) {
-                            Ok(Some((_pid, status))) => break status,
-                            Ok(None) => continue,
-                            Err(rustix::io::Errno::INTR) => continue,
-                            Err(_) => {
-                                cleanup_mountpoint(claim, used_namespace);
-                                std::process::exit(1);
-                            }
-                        },
-                    },
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(_) => {
-                        cleanup_mountpoint(claim, used_namespace);
-                        std::process::exit(1);
-                    }
-                }
-            };
-
-            // The death pipe hanging up does not mean the package is finished.
-            // An app that daemonizes forks a background copy, lets the
-            // foreground exit, and closes the descriptors it inherited, so the
-            // pipe reports the same thing whether the work ended or moved into
-            // the background. Tearing the filesystem down on that signal alone
-            // leaves the surviving process blocked forever on its next read,
-            // which is indistinguishable from the app having hung.
-            //
-            // So when something is still running out of the mount, the server
-            // moves to a background process of its own and this one exits with
-            // the child's status, keeping the caller's `waitpid` prompt.
-            // Deciding here whether anything still needs the mount does not
-            // work: a process that daemonizes has not necessarily forked by
-            // the time the foreground exits, so the answer is a race, and
-            // losing it tears the filesystem down under the process that was
-            // about to appear. Hand off unconditionally and let the background
-            // server ask once things have settled.
-            state.stop_prefetch();
-            let handed_off = match unsafe { kernel_fork() } {
-                Ok(Fork::Child(_)) => {
-                    detach_from_caller();
-                    state.serve_detached(&fuse_fd, &mut fuse_buf, || !mount_in_use(&mountpoint));
-                    drop(fuse_fd);
-                    cleanup_mountpoint(claim, used_namespace);
-                    std::process::exit(0);
-                }
-                Ok(Fork::ParentOf(_)) => true,
-                // No second process to serve from, so the old behaviour is
-                // all that is left: tear down and let any survivor fail.
-                Err(_) => false,
-            };
-            if !handed_off {
-                drop(fuse_fd);
-                cleanup_mountpoint(claim, used_namespace);
-            }
-
-            if let Some(code) = exit_status.exit_status() {
-                std::process::exit(code)
-            } else if let Some(sig) = exit_status.terminating_signal() {
-                unsafe {
-                    let action = KernelSigaction {
-                        sa_handler_kernel: None,
-                        sa_flags: KernelSigactionFlags::RESTORER,
-                        sa_restorer: Some(__onelf_signal_restorer),
-                        sa_mask: KernelSigSet::empty(),
-                    };
-                    if let Some(signal) = Signal::from_named_raw(sig) {
-                        let _ = kernel_sigaction(signal, Some(action));
-                        let _ = kill_process(rustix::process::getpid(), signal);
-                    }
-                }
-                std::process::exit(128 + sig)
-            } else {
-                std::process::exit(1)
-            }
-        }
+        })
+    };
+    let app = match app {
+        Ok(app) => app,
         Err(e) => {
+            eprintln!("onelf-rt: fuse: fork failed: {e}");
+            report.send(crate::guardian::Outcome::Unavailable);
             cleanup_mountpoint(claim, used_namespace);
-            eprintln!("onelf-rt: fork failed: {e}");
             std::process::exit(1);
         }
+    };
+
+    let mut state = fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
+    if let Some(inbox) = inbox {
+        state.expect_links(inbox);
     }
+    let mut report = Some(report);
+    let mut buf = vec![0u8; 1024 * 1024 + 4096];
+    loop {
+        let end = state.run_loop(&fuse_fd, None::<&OwnedFd>, Some(&wake_r), &mut buf);
+        let mut scratch = [0u8; 64];
+        while rustix::io::read(&wake_r, &mut scratch).is_ok_and(|n| n > 0) {}
+        if crate::guardian::reap_exited(app, &mut report) {
+            break;
+        }
+        if end == fs::LoopEnd::Finished {
+            // The connection is gone, so nothing is left to serve; the
+            // subtree is still reaped to the end.
+            crate::guardian::reap_all(app, &mut report);
+            break;
+        }
+    }
+    if !subreaper {
+        state.serve_detached(&fuse_fd, &mut buf, || !mount_in_use(&mountpoint));
+    }
+    drop(fuse_fd);
+    cleanup_mountpoint(claim, used_namespace);
+    std::process::exit(0);
 }
 
 #[cfg(test)]

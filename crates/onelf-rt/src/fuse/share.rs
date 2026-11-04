@@ -31,23 +31,24 @@
 //! never finds the old server's record, and a launch whose library links
 //! differ from what the mount serves mounts its own.
 //!
-//! Lifetime: the server is a transport, never a launch's guardian. The
-//! first launch execs the application itself, so its claims follow the
-//! exec: the lease is inheritable and stays with the application and its
-//! descendants, while the record lock and the launched pipe close at the
-//! exec, which is what tells the server the launch has started and other
-//! launches may decide whether to join. A launch that joins runs under a
-//! lifetime guardian of its own that holds its lease, so a descendant
+//! Lifetime: the server is a transport, never a launch's guardian. Every
+//! launch, the first one included, runs under a lifetime guardian of its
+//! own (see [`crate::guardian`]) that holds its lease, so a descendant
 //! that closes everything it inherited keeps the mount claimed and no
-//! server or other launch's guardian ever stands in for it. A descendant
-//! of the first launch that closes its descriptors is covered by the
-//! server's scan of the processes still running out of the mount.
+//! server or other launch's guardian ever stands in for it. The first
+//! launch's record lock and launched pipe go with its application and
+//! close at that exec, which is what tells the server the launch has
+//! started and other launches may decide whether to join.
+//!
+//! A mount serves the first launch's generated environment input as
+//! `.onelf/runtime-env`. That input carries caller values and restoration
+//! records, so a launch whose own input differs mounts its own rather
+//! than run with another caller's.
 
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use rustix::fs::FlockOperation;
 use rustix::io::FdFlags;
@@ -287,17 +288,21 @@ fn join(
     }
 
     let mountpoint = share.mountpoint.clone();
-    let private_ns = record.namespace;
+    let launch = req.launch(
+        pkg,
+        &mountpoint,
+        record.namespace,
+        Links::Served,
+        Some(resolved),
+    );
+    if !serves_own_env(&launch) {
+        drop(lease);
+        return Declined::Private;
+    }
     let supervision = match crate::guardian::spawn(
         lease,
         || {
-            crate::launch::exec_served(&req.launch(
-                pkg,
-                &mountpoint,
-                private_ns,
-                Links::Served,
-                Some(resolved),
-            ));
+            crate::launch::exec_served(&launch);
             eprintln!("onelf-rt: fuse: the mount stopped serving the links this launch needs");
             std::process::exit(1);
         },
@@ -309,25 +314,27 @@ fn join(
             std::process::exit(1);
         }
     };
+    crate::guardian::proxy(supervision, "fuse")
+}
 
-    // Signals meant for this process still reach the application, one hop
-    // further along: this forwards to the guardian, and the guardian
-    // forwards to the application.
-    super::CHILD_PID.store(supervision.pid as i32, Ordering::Relaxed);
-    super::install_signal_handlers();
-
-    match crate::guardian::receive(&supervision.status) {
-        Ok(outcome) => {
-            if outcome == crate::guardian::Outcome::Unavailable {
-                eprintln!("onelf-rt: fuse: the lifetime guardian could not be established");
-            }
-            std::process::exit(outcome.exit_code())
-        }
-        Err(e) => {
-            eprintln!("onelf-rt: fuse: guardian status: {e}");
-            std::process::exit(1);
-        }
+/// Whether the mount serves exactly the generated environment input this
+/// launch would serve itself. Values stay out of the diagnostic.
+fn serves_own_env(launch: &crate::launch::Launch) -> bool {
+    if crate::links::dir_index(&launch.pkg.manifest, super::fs::VIEW_ENV_DIR).is_none() {
+        return true;
     }
+    let own = crate::launch::generated_env(launch)
+        .encode()
+        .unwrap_or_default();
+    let served = std::fs::read(launch.pkg_root.join(crate::env::VIEW_ENV_FILE)).unwrap_or_default();
+    if served == own {
+        return true;
+    }
+    eprintln!(
+        "onelf-rt: fuse: the running instance's mount carries another caller's \
+         environment input; mounting its own"
+    );
+    false
 }
 
 /// Enter the user and mount namespaces of the server in `record`, then a
@@ -533,9 +540,32 @@ fn create(
     // every later launch joins.
     let private_ns = namespace && unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.is_ok();
     req.setup_portable();
-    // The record lock and the pipe close at the exec. The lease does not.
-    let _held = (record_lock, lease, launched_w);
-    crate::launch::exec(&req.launch(pkg, &mountpoint, private_ns, Links::Server(&links_tx), None))
+    // The guardian holds the lease for the whole subtree. The record lock
+    // and the launched pipe go with the application alone and close at
+    // its exec; the guardian lets go of its copies at the fork.
+    let pkg: &PackageData = pkg;
+    let held = (record_lock, launched_w);
+    let supervision = match crate::guardian::spawn(
+        lease,
+        move || {
+            let _held = &held;
+            crate::launch::exec(&req.launch(
+                pkg,
+                &mountpoint,
+                private_ns,
+                Links::Server(&links_tx),
+                None,
+            ))
+        },
+        |_lease| {},
+    ) {
+        Ok(supervision) => supervision,
+        Err(e) => {
+            eprintln!("onelf-rt: fuse: fork failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    crate::guardian::proxy(supervision, "fuse")
 }
 
 /// What the first launch hands its server.
@@ -589,7 +619,7 @@ fn serve(pkg: &mut PackageData, share: &Share, server: Server) -> ! {
         super::fs::FuseState::new(&pkg.manifest, &mut pkg.file, &pkg.footer, &pkg.codec);
     state.expect_links(links);
     let mut buf = vec![0u8; 1024 * 1024 + 4096];
-    state.run_loop(&fuse_fd, Some(&launched), None::<&OwnedFd>, &mut buf);
+    let _ = state.run_loop(&fuse_fd, Some(&launched), None::<&OwnedFd>, &mut buf);
     drop(launched);
     let mut settled = false;
     state.serve_detached(&fuse_fd, &mut buf, || {

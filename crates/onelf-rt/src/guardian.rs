@@ -9,43 +9,74 @@
 //! So the runtime forks the guardian first: it takes the launch's claims,
 //! marks itself a child subreaper, and forks the application from there.
 //!
-//! The guardian reports the application's exit status to the invoking
-//! process the moment it has been reaped, so the caller returns promptly
-//! while background descendants keep running. It forwards each termination
-//! signal it receives to the foreground child exactly once. It adopts
-//! every descendant orphaned by a double fork, reaps each one so none is
-//! left a zombie, and releases the launch's claims only after a drained
-//! `wait` proves its subtree empty. No process appearing after the application's
-//! exit can take the ancestry from it: the orphans' nearest subreaper
-//! ancestor was fixed before the application ever forked.
+//! The invoking process stays behind as a proxy (see [`proxy`]). The
+//! guardian reports the application's exit status to it the moment the
+//! application has been reaped, so the caller returns promptly while
+//! background descendants keep running, and the proxy ends the way the
+//! application did: with its exit status, or killed by the same signal.
+//!
+//! The proxy, the guardian and the application share the caller's process
+//! group, so a signal the terminal raises reaches each of them already.
+//! Only a signal some process sent on purpose is forwarded, by the proxy
+//! to the guardian and by the guardian to the application, so either way
+//! the application receives it once. The guardian adopts every descendant
+//! orphaned by a double fork, reaps each one as it exits so none is left
+//! a zombie, and releases the launch's claims only after `wait` proves its
+//! subtree empty. No process appearing after the application's exit can
+//! take the ancestry from it: the orphans' nearest subreaper ancestor was
+//! fixed before the application ever forked.
 
 use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 
 use rustix::io::Errno;
 use rustix::pipe::PipeFlags;
 use rustix::process::{
     Pid, Signal, WaitOptions, WaitStatus, child_subreaper, kill_process, set_child_subreaper, wait,
-    waitpid,
 };
 use rustix::runtime::{
-    Fork, KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_fork, kernel_sigaction,
+    Fork, How, KERNEL_SIG_DFL, KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_fork,
+    kernel_sig_ign, kernel_sigaction, kernel_sigprocmask,
 };
 
-// Signal restorer: kernel_sigaction bypasses libc, and x86_64 and i386
+// Signal restorers: kernel_sigaction bypasses libc, and x86_64 and i386
 // Linux need one for signal return to work. Defined once for the runtime
-// binary in `fuse`; this declaration links to that symbol.
+// binary in `fuse`; these declarations link to those symbols.
 unsafe extern "C" {
     fn __onelf_signal_restorer();
+    #[cfg(target_arch = "x86")]
+    fn __onelf_rt_signal_restorer();
 }
 
-/// The process id the forwarding handlers aim at: the foreground child
-/// while it lives, zero once it has been reaped. Zero keeps a recycled
-/// pid from receiving a stale forward.
+/// The restorer for a handler installed with `SA_SIGINFO`. The kernel
+/// gives such a handler the rt signal frame, which only i386 returns from
+/// through another system call than a plain handler's.
+fn rt_restorer() -> unsafe extern "C" fn() {
+    #[cfg(target_arch = "x86")]
+    {
+        __onelf_rt_signal_restorer
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        __onelf_signal_restorer
+    }
+}
+
+/// The caller-facing termination signals a proxy and a guardian forward.
+const FORWARDED: [Signal; 4] = [Signal::INT, Signal::TERM, Signal::HUP, Signal::QUIT];
+
+/// The process id the forwarding handler aims at: in a proxy its
+/// guardian, in a guardian the foreground child while it lives. Zero
+/// while there is no target, so a recycled pid never receives a stale
+/// forward.
 static FOREGROUND: AtomicI32 = AtomicI32::new(0);
+
+/// Whether this process inherited `SIGCHLD` ignored, which the foreground
+/// child gets back before it runs the application.
+static CHILD_SIGNAL_IGNORED: AtomicBool = AtomicBool::new(false);
 
 /// How the foreground process ended, as the guardian reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,8 +93,8 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The exit code the invoking process exits with, the conversion the
-    /// launch modes have always applied to a child status.
+    /// The exit code a process reports this outcome with when it cannot
+    /// end the same way: `128 + N` for a signal, the shell's convention.
     pub fn exit_code(self) -> i32 {
         match self {
             Outcome::Exit(code) => code,
@@ -119,6 +150,16 @@ pub struct Supervision {
     pub pid: u32,
 }
 
+/// The guardian's end of the report pipe.
+pub(crate) struct Report(OwnedFd);
+
+impl Report {
+    /// Report `outcome` to the proxy and let go of the pipe.
+    pub(crate) fn send(self, outcome: Outcome) {
+        write_record(&self.0, encode_record(outcome));
+    }
+}
+
 /// Fork the guardian for one launch and, inside it, the foreground child.
 ///
 /// The guardian takes `lease` (the launch's claims) with it and holds the
@@ -128,25 +169,44 @@ pub struct Supervision {
 /// which runs `start` and is expected to `exec` and never return. As soon
 /// as the child has been reaped, the guardian leaves the caller's session,
 /// lets go of the caller's standard streams, and reports the child's
-/// [`Outcome`] on [`Supervision::status`]. It then adopts and reaps every
-/// orphaned descendant, runs `release(lease)` once a drained `wait` proves
-/// the subtree empty, and exits.
+/// [`Outcome`] on [`Supervision::status`]. Every orphaned descendant is
+/// reaped as it exits, and `release(lease)` runs once `wait` proves the
+/// subtree empty.
 ///
-/// This returns in the invoking process only. Launching fails with an
-/// error when the report pipe or a fork fails, and the [`Outcome::Unavailable`]
-/// record says so when the kernel refuses the subreaper attribute.
+/// This returns in the invoking process only, with the forwarded signals
+/// blocked until [`proxy`] takes over, so a signal arriving in between is
+/// delivered then instead of lost. Launching fails with an error when the
+/// report pipe or a fork fails, and the [`Outcome::Unavailable`] record
+/// says so when the kernel refuses the subreaper attribute.
 pub fn spawn<L, F, R>(lease: L, start: F, release: R) -> io::Result<Supervision>
 where
     F: FnOnce(),
     R: FnOnce(L),
 {
+    fork_guardian(move |report| supervise(lease, report, start, release))
+}
+
+/// Fork a guardian process that runs `body`, which never returns, and
+/// hand the invoking process its [`Supervision`]. `body` gets the report
+/// pipe and is responsible for the whole lifetime protocol: marking the
+/// subreaper ([`mark_subreaper`]), forwarding ([`install_forwarding`]),
+/// forking the application ([`fork_foreground`]), reporting its outcome,
+/// and reaping until the subtree is empty.
+///
+/// The forwarded signals are blocked in the invoking process from here
+/// until [`proxy`] unblocks them, and the guardian inherits the block.
+pub(crate) fn fork_guardian<B>(body: B) -> io::Result<Supervision>
+where
+    B: FnOnce(Report),
+{
     let (report_read, report_write) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC).map_err(io::Error::from)?;
-
+    mask_forwarded(How::BLOCK);
     match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
             drop(report_read);
-            supervise(lease, report_write, start, release);
+            body(Report(report_write));
+            std::process::exit(0);
         }
         Ok(Fork::ParentOf(child)) => {
             drop(report_write);
@@ -155,85 +215,168 @@ where
                 pid: child.as_raw_nonzero().get() as u32,
             })
         }
-        Err(e) => Err(io::Error::from(e)),
+        Err(e) => {
+            mask_forwarded(How::UNBLOCK);
+            Err(io::Error::from(e))
+        }
     }
 }
 
 /// The guardian's side of one launch. Never returns: the process exits.
-fn supervise<L, F, R>(lease: L, report: OwnedFd, start: F, release: R) -> !
+fn supervise<L, F, R>(lease: L, report: Report, start: F, release: R) -> !
 where
     F: FnOnce(),
     R: FnOnce(L),
 {
+    prepare_reaping();
     // The attribute has to be in place before the fork: a descendant that
     // double forks at once would otherwise already be beyond reach. With
     // no descendant forked yet, a failed attribute releases the launch at
     // once and says so.
     if mark_subreaper().is_err() {
         release(lease);
-        write_record(&report, UNAVAILABLE_RECORD);
+        report.send(Outcome::Unavailable);
         std::process::exit(1);
     }
     install_forwarding();
 
-    let child = match unsafe { kernel_fork() } {
+    let child = match fork_foreground(start) {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("onelf-rt: guardian: fork failed: {e}");
+            release(lease);
+            report.send(Outcome::Unavailable);
+            std::process::exit(1);
+        }
+    };
+
+    // Every child the guardian has, the foreground and each orphan the
+    // kernel hands over, is reaped here as it exits, and the loop ends
+    // only when `wait` says the subtree is empty, which is the proof the
+    // release waits for. The plain `wait` is load-bearing: a wait on the
+    // caller's process group would follow a daemonized descendant only
+    // until its first `setsid`, and report an empty subtree while the
+    // launch still runs.
+    let mut report = Some(report);
+    loop {
+        match wait(WaitOptions::empty()) {
+            Ok(Some((pid, status))) => {
+                if pid == child {
+                    foreground_reaped(report.take(), status);
+                }
+            }
+            Ok(None) | Err(Errno::INTR) => continue,
+            Err(Errno::CHILD) => break,
+            Err(e) => {
+                eprintln!("onelf-rt: guardian: wait failed: {e}");
+                break;
+            }
+        }
+    }
+    if let Some(report) = report {
+        // The foreground is unaccounted for, so nothing proves the launch
+        // idle and the claims go with the sweep grace instead of being
+        // released here.
+        report.send(Outcome::Unavailable);
+        std::process::exit(1);
+    }
+    release(lease);
+    std::process::exit(0);
+}
+
+/// The foreground child has been reaped with `status`: stop forwarding,
+/// leave the caller's session, and report. Detached before the caller
+/// learns the foreground is gone, so the session the caller leaves cannot
+/// take the guardian down before the descendants have been reaped.
+pub(crate) fn foreground_reaped(report: Option<Report>, status: WaitStatus) {
+    FOREGROUND.store(0, Ordering::Relaxed);
+    detach_stdio();
+    if let Some(report) = report {
+        report.send(outcome(status));
+    }
+}
+
+/// Reap every child of this process that has exited, without blocking,
+/// handing the foreground's status to [`foreground_reaped`] when `child`
+/// is among them. Returns whether `wait` proved the subtree empty.
+pub(crate) fn reap_exited(child: Pid, report: &mut Option<Report>) -> bool {
+    loop {
+        // `wait`, not `waitpid(None)`, which waits on this process group
+        // alone and misses every descendant that left it with `setsid`.
+        match wait(WaitOptions::NOHANG) {
+            Ok(Some((pid, status))) => {
+                if pid == child {
+                    foreground_reaped(report.take(), status);
+                }
+            }
+            Ok(None) => return false,
+            Err(Errno::INTR) => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// [`reap_exited`] blocking until the subtree is empty.
+pub(crate) fn reap_all(child: Pid, report: &mut Option<Report>) {
+    loop {
+        match wait(WaitOptions::empty()) {
+            Ok(Some((pid, status))) => {
+                if pid == child {
+                    foreground_reaped(report.take(), status);
+                }
+            }
+            Ok(None) | Err(Errno::INTR) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Put `SIGCHLD` back to its default, remembering whether it was ignored.
+/// An inherited `SIG_IGN` makes the kernel reap children on its own, and
+/// `wait` would then never see the foreground's status.
+pub(crate) fn prepare_reaping() {
+    let dfl = KernelSigaction {
+        sa_handler_kernel: KERNEL_SIG_DFL,
+        sa_flags: KernelSigactionFlags::RESTORER,
+        sa_restorer: Some(__onelf_signal_restorer),
+        sa_mask: KernelSigSet::empty(),
+    };
+    if let Ok(old) = unsafe { kernel_sigaction(Signal::CHILD, Some(dfl)) } {
+        CHILD_SIGNAL_IGNORED.store(is_ignored(&old), Ordering::Relaxed);
+    }
+}
+
+/// Fork the foreground child, which runs `start` and is expected to exec.
+///
+/// The forwarded signals stay blocked across the fork. The child puts
+/// back the dispositions the application inherits, the default for every
+/// signal this process forwards and the caller's `SIGCHLD`, before it
+/// unblocks, so a signal that arrived early is delivered to it then. The
+/// parent unblocks once the child is the forwarding target, so a signal
+/// that reached the guardian before the child existed is forwarded to it
+/// rather than dropped. `start` belongs to the child: the parent drops it
+/// unrun, so nothing it captured stays open in the guardian.
+pub(crate) fn fork_foreground<F: FnOnce()>(start: F) -> io::Result<Pid> {
+    mask_forwarded(How::BLOCK);
+    match unsafe { kernel_fork() } {
         Ok(Fork::Child(_)) => {
+            restore_inherited_dispositions();
+            mask_forwarded(How::UNBLOCK);
             start();
             // A `start` that returns ran nothing that reports a status.
             std::process::exit(0);
         }
-        Ok(Fork::ParentOf(child)) => child,
+        Ok(Fork::ParentOf(child)) => {
+            drop(start);
+            FOREGROUND.store(child.as_raw_nonzero().get(), Ordering::Relaxed);
+            mask_forwarded(How::UNBLOCK);
+            Ok(child)
+        }
         Err(e) => {
-            eprintln!("onelf-rt: guardian: fork failed: {e}");
-            release(lease);
-            write_record(&report, UNAVAILABLE_RECORD);
-            std::process::exit(1);
-        }
-    };
-    FOREGROUND.store(child.as_raw_nonzero().get(), Ordering::Relaxed);
-
-    let status = loop {
-        match waitpid(Some(child), WaitOptions::empty()) {
-            Ok(Some((_, status))) => break status,
-            Ok(None) | Err(Errno::INTR) => continue,
-            Err(e) => {
-                eprintln!("onelf-rt: guardian: wait failed: {e}");
-                // The foreground is unaccounted for, so nothing proves the
-                // launch idle and the claims go with the sweep grace
-                // instead of being released here.
-                write_record(&report, UNAVAILABLE_RECORD);
-                std::process::exit(1);
-            }
-        }
-    };
-    FOREGROUND.store(0, Ordering::Relaxed);
-
-    // Detached before the caller learns the foreground is gone, so the
-    // session the caller leaves cannot take the guardian down before the
-    // descendants have been reaped.
-    detach_stdio();
-
-    write_record(&report, encode_record(outcome(status)));
-    drop(report);
-
-    // Every orphan the kernel hands over is reaped here exactly once, and
-    // the loop ends only when `wait` says the subtree is empty, which is
-    // the proof the release waits for. The plain `wait` is load-bearing:
-    // a wait on the caller's process group would follow a daemonized
-    // descendant only until its first `setsid`, and report an empty
-    // subtree while the launch still runs. Anything but an interrupt or
-    // the empty-subtree error cannot happen to a blocking wait, and
-    // releasing then beats waiting on an unknown error forever.
-    loop {
-        match wait(WaitOptions::empty()) {
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(Errno::INTR) => continue,
-            Err(Errno::CHILD) | Err(_) => break,
+            mask_forwarded(How::UNBLOCK);
+            Err(io::Error::from(e))
         }
     }
-
-    release(lease);
-    std::process::exit(0);
 }
 
 /// Mark this process a child subreaper, so descendants orphaned by a
@@ -249,17 +392,31 @@ pub(crate) fn mark_subreaper() -> io::Result<()> {
     Ok(())
 }
 
-/// Forward the caller-facing termination signals to the foreground child.
-fn install_forwarding() {
+/// Forward each of [`FORWARDED`] that some process sends on purpose to
+/// [`FOREGROUND`]. A signal the caller left ignored stays ignored, so a
+/// launch under `nohup` keeps its application immune.
+pub(crate) fn install_forwarding() {
     let mut mask = KernelSigSet::empty();
-    for sig in [Signal::INT, Signal::TERM, Signal::HUP, Signal::QUIT] {
+    for sig in FORWARDED {
         mask.insert(sig);
     }
-    for sig in [Signal::INT, Signal::TERM, Signal::HUP, Signal::QUIT] {
+    // SAFETY: the handler has the three-argument shape the kernel calls
+    // an `SA_SIGINFO` handler with; the type only spells one argument.
+    let handler = unsafe {
+        core::mem::transmute::<
+            unsafe extern "C" fn(c_int, *mut c_void, *mut c_void),
+            unsafe extern "C" fn(c_int),
+        >(forward_to_foreground)
+    };
+    for sig in FORWARDED {
+        let ignored = unsafe { kernel_sigaction(sig, None) }.is_ok_and(|old| is_ignored(&old));
+        if ignored {
+            continue;
+        }
         let action = KernelSigaction {
-            sa_handler_kernel: Some(forward_to_foreground),
-            sa_flags: KernelSigactionFlags::RESTORER,
-            sa_restorer: Some(__onelf_signal_restorer),
+            sa_handler_kernel: Some(handler),
+            sa_flags: KernelSigactionFlags::RESTORER | KernelSigactionFlags::SIGINFO,
+            sa_restorer: Some(rt_restorer()),
             sa_mask: mask.clone(),
         };
         unsafe {
@@ -268,14 +425,132 @@ fn install_forwarding() {
     }
 }
 
-/// One copy of the signal to the foreground child, or nothing when no
-/// child is being waited for. Only async-signal-safe calls.
-unsafe extern "C" fn forward_to_foreground(sig: c_int) {
+/// Put back what the application inherits from the caller: the default
+/// for every forwarded signal this process handles, and `SIGCHLD` as the
+/// caller left it.
+fn restore_inherited_dispositions() {
+    let action = |handler| KernelSigaction {
+        sa_handler_kernel: handler,
+        sa_flags: KernelSigactionFlags::RESTORER,
+        sa_restorer: Some(__onelf_signal_restorer),
+        sa_mask: KernelSigSet::empty(),
+    };
+    for sig in FORWARDED {
+        let ignored = unsafe { kernel_sigaction(sig, None) }.is_ok_and(|old| is_ignored(&old));
+        if !ignored {
+            unsafe {
+                let _ = kernel_sigaction(sig, Some(action(KERNEL_SIG_DFL)));
+            }
+        }
+    }
+    let child = if CHILD_SIGNAL_IGNORED.load(Ordering::Relaxed) {
+        kernel_sig_ign()
+    } else {
+        KERNEL_SIG_DFL
+    };
+    unsafe {
+        let _ = kernel_sigaction(Signal::CHILD, Some(action(child)));
+    }
+}
+
+/// Whether `action` ignores its signal.
+fn is_ignored(action: &KernelSigaction) -> bool {
+    action.sa_handler_kernel.map(|f| f as usize) == kernel_sig_ign().map(|f| f as usize)
+}
+
+/// Block or unblock [`FORWARDED`] in this thread.
+fn mask_forwarded(how: How) {
+    let mut set = KernelSigSet::empty();
+    for sig in FORWARDED {
+        set.insert(sig);
+    }
+    unsafe {
+        let _ = kernel_sigprocmask(how, Some(&set));
+    }
+}
+
+/// The `si_code` of a kernel-generated signal is positive: `SI_KERNEL`
+/// for one the terminal raises for its foreground process group. A signal
+/// sent by a process, `kill(2)`, `sigqueue(3)` or `tgkill(2)`, carries
+/// zero or a negative code.
+fn sent_on_purpose(info: *const c_void) -> bool {
+    if info.is_null() {
+        return true;
+    }
+    // `si_signo`, `si_errno` and `si_code` lead every Linux `siginfo_t`
+    // on the architectures the runtime builds for.
+    let code = unsafe { *(info as *const i32).add(2) };
+    code <= 0
+}
+
+/// One copy of a signal some process sent to the foreground target, or
+/// nothing: a signal the terminal raised already reached the whole
+/// process group, the target included. Only async-signal-safe calls.
+unsafe extern "C" fn forward_to_foreground(sig: c_int, info: *mut c_void, _context: *mut c_void) {
+    if !sent_on_purpose(info) {
+        return;
+    }
     if let Some(pid) = Pid::from_raw(FOREGROUND.load(Ordering::Relaxed))
         && let Some(sig) = Signal::from_named_raw(sig)
     {
         let _ = kill_process(pid, sig);
     }
+}
+
+/// The invoking process's side of a supervised launch. Never returns.
+///
+/// Forwards the signals sent to this process to the guardian, waits for
+/// the reported [`Outcome`], and ends the way the application did (see
+/// [`exit_as`]). `mode` names the execution mode in diagnostics.
+pub fn proxy(supervision: Supervision, mode: &str) -> ! {
+    FOREGROUND.store(supervision.pid as i32, Ordering::Relaxed);
+    install_forwarding();
+    mask_forwarded(How::UNBLOCK);
+    match receive(&supervision.status) {
+        Ok(outcome) => {
+            if outcome == Outcome::Unavailable {
+                eprintln!("onelf-rt: {mode}: the lifetime guardian could not be established");
+            }
+            exit_as(outcome)
+        }
+        Err(e) => {
+            eprintln!("onelf-rt: {mode}: guardian status: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// End this process the way the application ended. A death by signal is
+/// re-raised with the default disposition and no core dump, so the caller
+/// sees the same signal the application died of; a signal that cannot
+/// end this process falls back to [`Outcome::exit_code`].
+pub fn exit_as(outcome: Outcome) -> ! {
+    if let Outcome::Signaled(sig) = outcome
+        && let Some(signal) = Signal::from_named_raw(sig)
+    {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        let _ = setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            },
+        );
+        let dfl = KernelSigaction {
+            sa_handler_kernel: KERNEL_SIG_DFL,
+            sa_flags: KernelSigactionFlags::RESTORER,
+            sa_restorer: Some(__onelf_signal_restorer),
+            sa_mask: KernelSigSet::empty(),
+        };
+        let mut set = KernelSigSet::empty();
+        set.insert(signal);
+        unsafe {
+            let _ = kernel_sigaction(signal, Some(dfl));
+            let _ = kernel_sigprocmask(How::UNBLOCK, Some(&set));
+        }
+        let _ = kill_process(rustix::process::getpid(), signal);
+    }
+    std::process::exit(outcome.exit_code())
 }
 
 /// Leave the caller's session and let go of its standard streams.
@@ -954,6 +1229,94 @@ mod tests {
         let outcome = super::receive(&supervision.status).expect("the reported status");
         assert_eq!(outcome, Outcome::Exit(4), "the original foreground status");
         let _ = std::fs::write(dir.join("guardian_pid"), supervision.pid.to_string());
+    }
+
+    /// The driver of the reaping check: an orphan that exits while the
+    /// foreground still runs is reaped at once, not left a zombie for the
+    /// rest of the session.
+    #[test]
+    fn an_orphan_is_reaped_while_the_foreground_runs() {
+        let dir = temp_dir("zombie");
+        run_worker("worker_orphan_reaped_early", &dir);
+        if dir.join("unsupported").exists() {
+            eprintln!("skipping: this kernel does not take the child subreaper attribute");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs in its own process: the foreground double forks a helper
+    /// that exits at once, then sleeps on, and the helper must be gone
+    /// from `/proc` long before the foreground ends.
+    #[test]
+    #[ignore = "driven by an_orphan_is_reaped_while_the_foreground_runs, in a quiet process"]
+    fn worker_orphan_reaped_early() {
+        let dir = worker_dir();
+        if !subreaper_supported() {
+            let _ = std::fs::write(dir.join("unsupported"), b"");
+            return;
+        }
+        let lease = lease_lock(&dir);
+        let start = {
+            let dir = dir.clone();
+            move || {
+                fork_daemon(&dir, 0, 0);
+                std::thread::sleep(Duration::from_secs(4));
+                std::process::exit(0);
+            }
+        };
+        let began = Instant::now();
+        let supervision = super::spawn(lease, start, |_lease| {}).expect("spawn the guardian");
+        assert!(
+            wait_for(&dir.join("daemon_pid"), 3),
+            "the helper never reported its pid"
+        );
+        let helper = read_u32_file(&dir.join("daemon_pid")).expect("helper pid file");
+        assert!(gone(helper, 2), "the exited helper was left a zombie");
+        assert!(
+            began.elapsed() < Duration::from_secs(4),
+            "the helper was only reaped with the foreground"
+        );
+        let outcome = super::receive(&supervision.status).expect("the reported status");
+        assert_eq!(outcome, Outcome::Exit(0));
+    }
+
+    /// The driver of early delivery: a signal sent to the guardian before
+    /// its foreground child has started still reaches the child.
+    #[test]
+    fn a_signal_before_the_foreground_starts_is_delivered() {
+        let dir = temp_dir("early-signal");
+        run_worker("worker_early_signal", &dir);
+        if dir.join("unsupported").exists() {
+            eprintln!("skipping: this kernel does not take the child subreaper attribute");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs in its own process: TERM goes to the guardian the moment it
+    /// exists, and the foreground, which would otherwise exit 0, dies of
+    /// it.
+    #[test]
+    #[ignore = "driven by a_signal_before_the_foreground_starts_is_delivered, in a quiet process"]
+    fn worker_early_signal() {
+        let dir = worker_dir();
+        if !subreaper_supported() {
+            let _ = std::fs::write(dir.join("unsupported"), b"");
+            return;
+        }
+        let lease = lease_lock(&dir);
+        let start = || {
+            std::thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        };
+        let supervision = super::spawn(lease, start, |_lease| {}).expect("spawn the guardian");
+        let guardian = Pid::from_raw(supervision.pid as i32).expect("the guardian's pid");
+        kill_process(guardian, Signal::TERM).expect("signal the guardian");
+        let outcome = super::receive(&supervision.status).expect("the reported status");
+        assert_eq!(
+            outcome,
+            Outcome::Signaled(15),
+            "the early TERM reached the foreground"
+        );
     }
 
     /// The driver of the prctl check: the attribute reads back set.

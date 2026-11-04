@@ -141,20 +141,40 @@ fn in_onelf_package(path: &Path) -> bool {
 /// application it starts carries the same restoration record a packed
 /// launch leaves.
 pub fn record_host_env(pkg_root: &Path, set_roots: &[PathBuf]) {
-    let Some(start) = STARTING_ENV.get() else {
+    let mut now: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    if !host_records(&mut now, pkg_root, set_roots) {
         return;
+    }
+    for name in [ROOTS_VAR, HOST_ENV_VAR] {
+        if let Some(value) = now.get(OsStr::new(name)) {
+            // SAFETY: the runtime is single-threaded at this point
+            unsafe { env::set_var(name, value) };
+        }
+    }
+}
+
+/// The two records [`record_host_env`] sets, made in `now` rather than in
+/// the process environment, for an environment a launch evaluated for
+/// another root than it applied it under. False when no starting
+/// environment was captured.
+pub(crate) fn host_records(
+    now: &mut BTreeMap<OsString, OsString>,
+    pkg_root: &Path,
+    set_roots: &[PathBuf],
+) -> bool {
+    let Some(start) = STARTING_ENV.get() else {
+        return false;
     };
     let roots: Vec<PathBuf> = std::iter::once(pkg_root)
         .chain(set_roots.iter().map(PathBuf::as_path))
         .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
         .collect();
     if let Ok(joined) = env::join_paths(roots) {
-        // SAFETY: the runtime is single-threaded at this point
-        unsafe { env::set_var(ROOTS_VAR, joined) };
+        now.insert(OsString::from(ROOTS_VAR), joined);
     }
-    let now: BTreeMap<OsString, OsString> = env::vars_os().collect();
-    let record = build_record(start, &now);
-    unsafe { env::set_var(HOST_ENV_VAR, OsString::from_vec(record)) };
+    let record = build_record(start, now);
+    now.insert(OsString::from(HOST_ENV_VAR), OsString::from_vec(record));
+    true
 }
 
 /// Set on the exec command itself after the record is made, so whatever

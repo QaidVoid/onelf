@@ -91,9 +91,7 @@ fn run(launch: &Launch) {
         .pkg_root
         .join(manifest.entry_path(ep.target_entry as usize));
     let target_path_s = target_path.to_str().unwrap_or("");
-    let pkg_root_s = launch.pkg_root.to_str().unwrap_or("");
     let lib_dirs = manifest.lib_dirs();
-    let lib_paths_str = lib_dirs.join(":");
 
     // The sets the package left its dependencies to, obtained before any
     // mode made a mount namespace of its own.
@@ -151,37 +149,33 @@ fn run(launch: &Launch) {
         shadow_bundled_copies(farm, launch, &lib_dirs);
     }
     let runpath = crate::links::origin_runpath(&target_path);
-    if !lib_dirs.is_empty()
-        && !place_links(
+    let wanted = if lib_dirs.is_empty() {
+        None
+    } else {
+        wanted_links(
             launch,
             &lib_dirs,
             &runpath,
             resolution.farm.as_deref(),
             &set_roots,
         )
+    };
+    if let Some((dir, links)) = &wanted
+        && !place_links(launch, dir, links, &lib_dirs)
     {
         return;
     }
 
     let env_before = snapshot_env();
-    let lib_path = crate::env::setup_env(
-        pkg_root_s,
-        launch.argv0,
-        launch.exec_path,
-        &ep_name,
-        launch.mode,
-        &lib_paths_str,
-        target_path_s,
-        resolution.farm.as_deref(),
-        resolved.platform_root.as_deref(),
+    let lib_path = apply_env(launch, resolved, &set_lib_dirs, &set_roots);
+    publish_view_env(
+        launch,
+        &env_before,
+        &lib_dirs,
         &set_lib_dirs,
         &set_roots,
+        wanted.as_ref(),
     );
-    if let Some(data) = launch.env_data {
-        crate::env::apply_custom_env(data, pkg_root_s);
-    }
-    crate::hostenv::record_host_env(launch.pkg_root, &set_roots);
-    publish_view_env(launch, &env_before, &lib_dirs, &set_lib_dirs, &set_roots);
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
     crate::hostpaths::apply(launch.pkg_root);
@@ -255,33 +249,187 @@ fn run(launch: &Launch) {
     std::process::exit(1);
 }
 
-/// Show the libraries this launch takes from the farm and the sets in the
-/// package's library directory. False when the mount another launch
-/// serves shows a different set, which this launch cannot change.
-fn place_links(
+/// The package directory the launch's library links go in, and the links
+/// it takes from the farm and the sets, or `None` when the package has no
+/// directory for them.
+fn wanted_links(
     launch: &Launch,
     lib_dirs: &[&str],
-    runpath: &[std::path::PathBuf],
+    runpath: &[PathBuf],
     farm: Option<&Path>,
-    set_roots: &[std::path::PathBuf],
-) -> bool {
+    set_roots: &[PathBuf],
+) -> Option<(String, crate::links::Links)> {
     let manifest = &launch.pkg.manifest;
-    let Some(dir) = crate::links::dir(manifest, launch.pkg_root, runpath, lib_dirs) else {
-        return true;
-    };
+    let dir = crate::links::dir(manifest, launch.pkg_root, runpath, lib_dirs)?;
     let links = crate::links::wanted(manifest, &dir, farm, set_roots);
+    Some((dir, links))
+}
+
+/// Show `links` in the package's `dir`. False when the mount another
+/// launch serves shows a different set, which this launch cannot change.
+/// A server this launch started learns them with the generated
+/// environment input, in [`publish_view_env`].
+fn place_links(launch: &Launch, dir: &str, links: &crate::links::Links, lib_dirs: &[&str]) -> bool {
+    let manifest = &launch.pkg.manifest;
     match launch.links {
         Links::Tree => {
-            crate::links::place(manifest, launch.pkg_root, &dir, &links);
+            crate::links::place(manifest, launch.pkg_root, dir, links);
             true
         }
-        Links::Server(sender) => {
-            if !links.is_empty() {
-                sender.send(&dir, &links);
+        Links::Server(_) => true,
+        Links::Served => crate::links::served(manifest, launch.pkg_root, dir, links, lib_dirs),
+    }
+}
+
+/// Apply the launch's environment: the generated mappings and the mode's
+/// own variables, the recipe's custom `[env]`, and the host-restoration
+/// record. Returns the library path the mappings computed.
+fn apply_env(
+    launch: &Launch,
+    resolved: &Resolved,
+    set_lib_dirs: &[PathBuf],
+    set_roots: &[PathBuf],
+) -> String {
+    let manifest = &launch.pkg.manifest;
+    let ep = &manifest.entrypoints[launch.ep_idx];
+    let ep_name = manifest.get_string(ep.name);
+    let target_path = launch
+        .pkg_root
+        .join(manifest.entry_path(ep.target_entry as usize));
+    let pkg_root_s = launch.pkg_root.to_str().unwrap_or("");
+    let lib_path = crate::env::setup_env(
+        pkg_root_s,
+        launch.argv0,
+        launch.exec_path,
+        ep_name,
+        launch.mode,
+        &manifest.lib_dirs().join(":"),
+        target_path.to_str().unwrap_or(""),
+        resolved.resolution.farm.as_deref(),
+        resolved.platform_root.as_deref(),
+        set_lib_dirs,
+        set_roots,
+    );
+    if let Some(data) = launch.env_data {
+        crate::env::apply_custom_env(data, pkg_root_s);
+    }
+    crate::hostenv::record_host_env(launch.pkg_root, set_roots);
+    lib_path
+}
+
+/// A launch's environment as evaluated for its per-view input, without
+/// being left applied: see [`generated_env`].
+pub struct GeneratedEnv {
+    before: BTreeMap<OsString, OsString>,
+    applied: BTreeMap<OsString, OsString>,
+    assignments: Vec<crate::env::PathAssignment<'static>>,
+    set_roots: Vec<PathBuf>,
+}
+
+impl GeneratedEnv {
+    /// The per-view input as evaluated.
+    pub fn encode(&self) -> Result<Vec<u8>, crate::env::ViewEnvError> {
+        crate::env::encode_view_env(&self.before, &self.applied, &self.assignments)
+    }
+
+    /// The per-view input of a tree that shows the evaluated tree's
+    /// content under the root `to` instead of `from`: every value the
+    /// launch set has `from` replaced by `to`, and the root and
+    /// host-restoration records are made again over those values, so
+    /// every length and hash the input carries is the rewritten one's.
+    pub fn encode_rooted(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> Result<Vec<u8>, crate::env::ViewEnvError> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let (from_b, to_b) = (from.as_os_str().as_bytes(), to.as_os_str().as_bytes());
+        let rewrite = |value: &OsString| -> OsString {
+            let bytes = value.as_bytes();
+            if from_b.is_empty() {
+                return value.clone();
             }
-            true
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut rest = bytes;
+            while let Some(at) = rest.windows(from_b.len()).position(|w| w == from_b) {
+                out.extend_from_slice(&rest[..at]);
+                out.extend_from_slice(to_b);
+                rest = &rest[at + from_b.len()..];
+            }
+            out.extend_from_slice(rest);
+            OsString::from_vec(out)
+        };
+        let mut applied: BTreeMap<OsString, OsString> = self
+            .applied
+            .iter()
+            .map(|(name, value)| {
+                let value = if self.before.get(name) == Some(value) {
+                    value.clone()
+                } else {
+                    rewrite(value)
+                };
+                (name.clone(), value)
+            })
+            .collect();
+        crate::hostenv::host_records(&mut applied, to, &self.set_roots);
+        let assignments: Vec<crate::env::PathAssignment<'static>> = self
+            .assignments
+            .iter()
+            .map(|a| crate::env::PathAssignment {
+                variables: a.variables.clone(),
+                value: rewrite(&a.value),
+                inheritance: a.inheritance,
+            })
+            .collect();
+        crate::env::encode_view_env(&self.before, &applied, &assignments)
+    }
+}
+
+/// Evaluate the per-view environment input this launch would publish,
+/// against its `pkg_root` with the resolver decision it carries (none
+/// takes nothing from the host). This process's environment is left
+/// exactly as it was found.
+///
+/// A mode that has to know the input before its tree exists, because the
+/// input is part of the tree's identity or decides whether a shared mount
+/// may be joined, evaluates it here.
+pub fn generated_env(launch: &Launch) -> GeneratedEnv {
+    let lib_dirs = launch.pkg.manifest.lib_dirs();
+    let set_roots = crate::sets::roots();
+    let set_lib_dirs: Vec<PathBuf> = set_roots
+        .iter()
+        .flat_map(|r| crate::sets::lib_dirs(r))
+        .collect();
+    let never;
+    let resolved = match &launch.resolved {
+        Some(resolved) => resolved,
+        None => {
+            never = Resolved::never();
+            &never
         }
-        Links::Served => crate::links::served(manifest, launch.pkg_root, &dir, &links, lib_dirs),
+    };
+    let before = snapshot_env();
+    apply_env(launch, resolved, &set_lib_dirs, &set_roots);
+    let assignments =
+        crate::env::view_env_assignments(launch.pkg_root, &lib_dirs, &set_lib_dirs, &set_roots);
+    let applied = snapshot_env();
+    for (name, value) in &before {
+        if applied.get(name) != Some(value) {
+            // SAFETY: the runtime is single-threaded while it launches.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+    for name in applied.keys() {
+        if !before.contains_key(name) {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+    GeneratedEnv {
+        before,
+        applied,
+        assignments,
+        set_roots,
     }
 }
 
@@ -290,12 +438,18 @@ fn snapshot_env() -> BTreeMap<OsString, OsString> {
     std::env::vars_os().collect()
 }
 
-/// Whether this launch may write the per-view environment input into its
-/// tree: the tree must belong to this launch alone, so a shared extracted
-/// tree or a mount another launch serves is never written to. Views that
-/// carry no file run on the packaged `.onelf/env` alone.
+/// Whether this launch publishes the per-view environment input itself:
+/// into a tree that belongs to this launch alone, or through the server
+/// it started. A shared extracted tree or a mount another launch serves
+/// is never written to; a cache view carries the input from its
+/// publication. Views that carry no input run on the packaged
+/// `.onelf/env` alone.
 fn publishes_view_env(links: &Links<'_>, tree_writable: bool, private_ns: bool) -> bool {
-    matches!(links, Links::Tree) && (tree_writable || private_ns)
+    match links {
+        Links::Tree => tree_writable || private_ns,
+        Links::Server(_) => true,
+        Links::Served => false,
+    }
 }
 
 /// Generate and publish this launch's evaluated per-view environment input.
@@ -313,6 +467,7 @@ fn publish_view_env(
     lib_dirs: &[&str],
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
+    wanted: Option<&(String, crate::links::Links)>,
 ) {
     if !publishes_view_env(&launch.links, launch.tree_writable, launch.private_ns) {
         return;
@@ -320,15 +475,25 @@ fn publish_view_env(
     let assignments =
         crate::env::view_env_assignments(launch.pkg_root, lib_dirs, set_lib_dirs, set_roots);
     let now = snapshot_env();
-    match crate::env::encode_view_env(base, &now, &assignments) {
-        Ok(bytes) if !bytes.is_empty() => {
-            if let Err(e) = std::fs::write(launch.pkg_root.join(crate::env::VIEW_ENV_FILE), &bytes)
-            {
-                eprintln!("onelf-rt: cannot write {}: {e}", crate::env::VIEW_ENV_FILE);
-            }
+    let bytes = match crate::env::encode_view_env(base, &now, &assignments) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("onelf-rt: the generated environment input is {e} and is not written");
+            Vec::new()
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("onelf-rt: the generated environment input is {e} and is not written"),
+    };
+    if let Links::Server(sender) = launch.links {
+        let no_links = crate::links::Links::new();
+        let (dir, links) = wanted.map_or(("", &no_links), |(d, l)| (d.as_str(), l));
+        if !links.is_empty() || !bytes.is_empty() {
+            sender.send(dir, links, &bytes);
+        }
+        return;
+    }
+    if !bytes.is_empty()
+        && let Err(e) = std::fs::write(launch.pkg_root.join(crate::env::VIEW_ENV_FILE), &bytes)
+    {
+        eprintln!("onelf-rt: cannot write {}: {e}", crate::env::VIEW_ENV_FILE);
     }
 }
 
@@ -618,12 +783,12 @@ mod view_env_tests {
     use std::ffi::OsString;
 
     #[test]
-    fn only_a_private_tree_publishes_the_input() {
+    fn only_a_private_tree_or_an_own_server_publishes_the_input() {
         let (sender, _receiver) = crate::links::channel().unwrap();
         assert!(publishes_view_env(&Links::Tree, true, false));
         assert!(publishes_view_env(&Links::Tree, false, true));
         assert!(!publishes_view_env(&Links::Tree, false, false));
-        assert!(!publishes_view_env(&Links::Server(&sender), true, true));
+        assert!(publishes_view_env(&Links::Server(&sender), false, false));
         assert!(!publishes_view_env(&Links::Served, true, true));
     }
 

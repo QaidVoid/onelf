@@ -308,12 +308,15 @@ pub(crate) enum Received {
     Done(Option<Message>),
 }
 
-/// The links for one directory, as the server is sent them.
+/// The links for one directory and the launch's generated environment
+/// input, as the server is sent them.
 pub(crate) struct Message {
     /// The directory, relative to the package root.
     pub dir: String,
     /// Each link's name and target.
     pub links: Vec<(String, Vec<u8>)>,
+    /// The generated environment input the mount serves; empty for none.
+    pub env: Vec<u8>,
 }
 
 /// A pipe pair for handing the links from the child that resolves them to
@@ -335,10 +338,12 @@ pub(crate) fn channel() -> io::Result<(Sender, Receiver)> {
 }
 
 impl Sender {
-    /// Send `links` for `dir` and wait until the server serves them. A
-    /// server that has gone away ends the wait as well.
-    pub(crate) fn send(&self, dir: &str, links: &Links) {
-        let mut body = Vec::new();
+    /// Send `links` for `dir` and the generated environment input `env`,
+    /// and wait until the server serves them. A server that has gone away
+    /// ends the wait as well.
+    pub(crate) fn send(&self, dir: &str, links: &Links, env: &[u8]) {
+        let mut body = (env.len() as u64).to_le_bytes().to_vec();
+        body.extend_from_slice(env);
         body.extend_from_slice(dir.as_bytes());
         body.push(0);
         for (name, target) in links {
@@ -393,6 +398,9 @@ impl Receiver {
 }
 
 fn decode(body: &[u8]) -> Option<Message> {
+    let env_len = usize::try_from(u64::from_le_bytes(body.get(..8)?.try_into().ok()?)).ok()?;
+    let env = body.get(8..8usize.checked_add(env_len)?)?.to_vec();
+    let body = &body[8 + env_len..];
     let mut fields = body.split(|&b| b == 0);
     let dir = std::str::from_utf8(fields.next()?).ok()?.to_string();
     let mut links = Vec::new();
@@ -400,7 +408,7 @@ fn decode(body: &[u8]) -> Option<Message> {
         let target = fields.next()?;
         links.push((std::str::from_utf8(name).ok()?.to_string(), target.to_vec()));
     }
-    Some(Message { dir, links })
+    Some(Message { dir, links, env })
 }
 
 /// Execution-view identity and the configuration record stored beside a
@@ -462,7 +470,7 @@ pub mod view {
     use std::fmt;
     use std::io::{self, Write};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use onelf_format::HostLibsPolicy;
@@ -479,32 +487,6 @@ pub mod view {
 
     /// The name of the configuration record inside a view directory.
     pub(crate) const CONFIGURATION_FILE: &str = "config";
-
-    /// How the launch's library links (see [`crate::links`]) reach the
-    /// view.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[allow(dead_code)]
-    pub enum Placement {
-        /// The tree is this launch's own and on disk: the links are
-        /// placed in it directly.
-        Tree,
-        /// The mount is this launch's own, served by the server it
-        /// started.
-        Mount,
-        /// The mount is another launch's, which must already serve the
-        /// links this launch needs.
-        Served,
-    }
-
-    impl Placement {
-        fn as_str(self) -> &'static str {
-            match self {
-                Placement::Tree => "tree",
-                Placement::Mount => "mount",
-                Placement::Served => "served",
-            }
-        }
-    }
 
     /// How many digest bytes a view directory's key keeps.
     const KEY_BYTES: usize = 16;
@@ -530,7 +512,6 @@ pub mod view {
 
     /// The inputs a view identity covers, as plain values. Paths appear
     /// only as values: computing the identity reads and writes nothing.
-    #[allow(dead_code)]
     pub struct ViewInputs<'a> {
         /// The user the view is built for.
         pub uid: u32,
@@ -547,8 +528,6 @@ pub mod view {
         /// Whether the launch can put host files over bundled copies,
         /// which decides whether the host's libc can be taken at all.
         pub host_libc: bool,
-        /// How the library links reach the view.
-        pub placement: Placement,
         /// The loader the entrypoint runs under; `None` for the bundled
         /// one.
         pub loader: Option<&'a OsStr>,
@@ -576,7 +555,6 @@ pub mod view {
     /// and only has to find a record; a record is compared against the
     /// full canonical text before it is trusted.
     #[derive(PartialEq, Eq)]
-    #[allow(dead_code)]
     pub struct ViewIdentity {
         uid: u32,
         canonical: Vec<u8>,
@@ -588,7 +566,6 @@ pub mod view {
         /// outside the bounds a record can carry. A launch the identity
         /// cannot cover builds its view unnamed rather than under a
         /// guessed key.
-        #[allow(dead_code)]
         pub fn new(inputs: &ViewInputs<'_>) -> Option<Self> {
             let selection = SelectionIdentity::new(inputs.pins)?;
             admit(inputs.entrypoint.is_none_or(admitted_entry))?;
@@ -611,14 +588,12 @@ pub mod view {
         /// The bounded store name the identity is keyed by: lowercase
         /// hex over a digest of the canonical text. Equal identities
         /// share it.
-        #[allow(dead_code)]
         pub fn key(&self) -> &str {
             &self.key
         }
 
         /// The canonical text the identity is, as built. This is the
         /// exact text a configuration record stores and binds itself to.
-        #[allow(dead_code)]
         pub fn canonical(&self) -> &[u8] {
             &self.canonical
         }
@@ -634,7 +609,6 @@ pub mod view {
     /// not match the identity it was handed, so hostile or damaged
     /// storage is a miss rather than a misread.
     #[derive(PartialEq, Eq)]
-    #[allow(dead_code)]
     pub(crate) struct ViewRecord {
         canonical: Vec<u8>,
         expanded_env: Option<String>,
@@ -645,7 +619,6 @@ pub mod view {
         /// earlier one atomically. `expanded_env` is the environment
         /// input as finally expanded into the view, hashed here so no
         /// value is stored or echoed; `None` until the view is built.
-        #[allow(dead_code)]
         pub(crate) fn write(
             dir: &Path,
             identity: &ViewIdentity,
@@ -670,7 +643,6 @@ pub mod view {
 
         /// The record beside `dir` that `identity` names, when it is
         /// intact, of this layout, and bound to exactly this identity.
-        #[allow(dead_code)]
         pub(crate) fn load(dir: &Path, identity: &ViewIdentity) -> Option<Self> {
             let path = dir.join(CONFIGURATION_FILE);
             let md = std::fs::metadata(&path).ok()?;
@@ -688,17 +660,21 @@ pub mod view {
             })
         }
 
-        /// The canonical configuration the record was written from.
-        #[allow(dead_code)]
-        pub(crate) fn configuration(&self) -> &[u8] {
-            &self.canonical
-        }
-
-        /// The content hash of the environment input as finally expanded
-        /// into the view, or `None` while the view is still being built.
-        #[allow(dead_code)]
-        pub(crate) fn expanded_env(&self) -> Option<&str> {
-            self.expanded_env.as_deref()
+        /// Whether `dir` carries exactly the environment input the record
+        /// hashes, or none when it records none. Anything else is damage.
+        fn env_intact(&self, dir: &Path) -> bool {
+            let path = dir.join(crate::env::VIEW_ENV_FILE);
+            let Some(expected) = &self.expanded_env else {
+                return std::fs::symlink_metadata(&path).is_err();
+            };
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if !md.is_file() || md.len() > MAX_ENV_BYTES as u64 {
+                return false;
+            }
+            std::fs::read(&path)
+                .is_ok_and(|bytes| crate::cache::hex(blake3::hash(&bytes).as_bytes()) == *expected)
         }
     }
 
@@ -721,7 +697,6 @@ pub mod view {
     /// Whether `dir` holds a completely published view of this layout:
     /// the ready record must be exactly the bytes this layout writes,
     /// with nothing added, missing, or linked in from elsewhere.
-    #[allow(dead_code)]
     pub fn ready(dir: &Path) -> bool {
         let path = dir.join(READY_FILE);
         let Ok(md) = std::fs::symlink_metadata(&path) else {
@@ -737,32 +712,6 @@ pub mod view {
     /// configuration record, and adopted only byte for byte.
     fn ready_bytes() -> Vec<u8> {
         format!("onelf-view-ready {LAYOUT}\n").into_bytes()
-    }
-
-    /// Whether a file may be written in place: only one whose inode no
-    /// other name shares. This is the gate every in-place writer has to
-    /// pass, because a view's files are hardlinked out of the content
-    /// store, and writing through such a link would corrupt the store's
-    /// bytes under every other view and package that link them. The
-    /// staging surface never needs it: [`Staging::write_file`] and
-    /// [`Staging::edit_file`] replace content by renaming a fresh file
-    /// over the name, which leaves the shared inode untouched.
-    #[allow(dead_code)]
-    pub(crate) fn admit_in_place_write(path: &Path) -> io::Result<()> {
-        let md = std::fs::symlink_metadata(path)?;
-        if !md.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "onelf: only a regular file can be written in place",
-            ));
-        }
-        if md.nlink() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "onelf: refusing an in-place write through a file the store hardlinks",
-            ));
-        }
-        Ok(())
     }
 
     /// The name of the staging tree a creator of `view` builds in,
@@ -814,29 +763,40 @@ pub mod view {
     /// Build or reuse the view of `identity` under the private store
     /// `store`, and return it only once it is completely published.
     ///
-    /// The canonical lock order puts artifact claims and the store's
-    /// lock ahead of every view lock: the caller resolves and pins its
-    /// artifacts, and holds the store's shared lock while it populates
-    /// the view from the store, before calling. Inside, this function
-    /// takes only the identity's creation mutex, and no store lock at
-    /// all, so a creator holding the store's exclusive lock for its own
-    /// publication cannot deadlock against it and the other way around.
-    /// The in-use lease a launch holds through exec arrives with view
-    /// collection; until then the creation mutex is the only guard, and
-    /// it never replaces a view that is ready with an intact record.
+    /// `lease` is the caller's in-use lease of this view (see
+    /// [`lease_lock_path`]), already held shared. The canonical lock order
+    /// is artifact claims and the store's lock first, then the lease, then
+    /// the identity's creation mutex, which this function takes; it takes
+    /// no store lock at all, so a creator holding the store's exclusive
+    /// lock for its own publication cannot deadlock against it and the
+    /// other way around.
     ///
     /// A ready view whose configuration record binds it to exactly this
-    /// identity is reused untouched. Anything else is a miss: a missing,
-    /// foreign-versioned, or damaged ready record or record of another
-    /// identity, a leftover tree of the same name, and every staging
-    /// tree a dead creator left are discarded under the creation mutex,
-    /// and `build` stages a fresh tree. What the build returns is the
-    /// environment input as finally expanded into the view, whose hash
-    /// the published record carries; `None` records that the view
-    /// expands none. The build may leave nothing behind: its staging
-    /// tree is removed whether it fails or succeeds.
-    #[allow(dead_code)]
-    pub fn ensure_view<F>(store: &Path, identity: &ViewIdentity, build: F) -> io::Result<ViewReady>
+    /// identity, and whose environment input is the one the record
+    /// hashes, is reused untouched. Anything else is a miss. Every staging
+    /// tree a dead creator left is discarded under the creation mutex, and
+    /// `build` stages a fresh tree. Whatever is left at the view's name, a
+    /// missing, foreign-versioned, or damaged ready record, a record of
+    /// another identity, or an environment input that does not match, is
+    /// replaced only when no other launch holds the lease: a damaged view
+    /// that another launch still runs from is never removed under it, and
+    /// the call fails instead.
+    ///
+    /// What the build returns is the environment input as finally
+    /// expanded into the view. Publication writes it to
+    /// [`crate::env::VIEW_ENV_FILE`] and the record carries its hash;
+    /// `None` publishes a view that expands none. The build may leave
+    /// nothing behind: its staging tree is removed whether it fails or
+    /// succeeds.
+    ///
+    /// Every successful call stamps the lease's modification time, the
+    /// last use collection measures a view's idle age by.
+    pub fn ensure_view<F>(
+        store: &Path,
+        identity: &ViewIdentity,
+        lease: &std::fs::File,
+        build: F,
+    ) -> io::Result<ViewReady>
     where
         F: FnOnce(&Staging) -> io::Result<Option<Vec<u8>>>,
     {
@@ -852,47 +812,75 @@ pub mod view {
 
         if ready(&view)
             && let Some(record) = ViewRecord::load(&view, identity)
+            && record.env_intact(&view)
         {
-            return Ok(ViewReady { dir: view, record });
+            stamp_use(lease);
+            return Ok(ViewReady { dir: view });
         }
 
-        // A miss: the view's name may hold a damaged or interrupted
-        // attempt, and staging may hold a dead creator's tree. Both go,
-        // under the creation mutex that proves no live creator of this
-        // identity is staging.
-        remove_path(&view)?;
+        // A miss: staging may hold a dead creator's tree, which the
+        // creation mutex proves nobody is filling, and the view's name
+        // may hold a damaged or interrupted attempt.
         discard_staging(&view)?;
+        if std::fs::symlink_metadata(&view).is_ok() {
+            replace_unleased(&view, lease)?;
+        }
 
         let staged = Staging::new(&view)?;
         let expanded = build(&staged)?;
         staged.publish(identity, expanded.as_deref())?;
 
-        let record = ViewRecord::load(&view, identity).ok_or_else(|| {
-            io::Error::other("onelf: the view record is unreadable right after publication")
-        })?;
-        Ok(ViewReady { dir: view, record })
+        if ViewRecord::load(&view, identity).is_none() {
+            return Err(io::Error::other(
+                "onelf: the view record is unreadable right after publication",
+            ));
+        }
+        stamp_use(lease);
+        Ok(ViewReady { dir: view })
     }
 
-    /// A view that was completely published: its directory and the
-    /// configuration record it was validated against. Every access
-    /// through this is read-only; a published view never changes.
-    #[allow(dead_code)]
+    /// Remove what stands at `view`'s name, but only while `lease` is the
+    /// only claim on it: the caller's shared lease is converted to an
+    /// exclusive one without waiting, and back once the name is clear.
+    ///
+    /// A conversion that fails because another launch holds the lease
+    /// drops the caller's shared lock, which is taken again before the
+    /// error returns. Collection needs the creation mutex the caller
+    /// holds, so nothing can reclaim the view in that window.
+    fn replace_unleased(view: &Path, lease: &std::fs::File) -> io::Result<()> {
+        use rustix::fs::FlockOperation;
+        if rustix::fs::flock(lease, FlockOperation::NonBlockingLockExclusive).is_err() {
+            rustix::fs::flock(lease, FlockOperation::LockShared)
+                .map_err(|e| io::Error::other(format!("flock: {e}")))?;
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "onelf: the execution view is damaged and another launch still runs from \
+                 it; it is not replaced while in use",
+            ));
+        }
+        let removed = remove_path(view);
+        rustix::fs::flock(lease, FlockOperation::LockShared)
+            .map_err(|e| io::Error::other(format!("flock: {e}")))?;
+        removed
+    }
+
+    /// Record now as the view's last use, on the lease inode that outlives
+    /// every sweep. The published view itself is never touched.
+    fn stamp_use(lease: &std::fs::File) {
+        let _ = lease.set_modified(std::time::SystemTime::now());
+    }
+
+    /// A view that was completely published and validated against its
+    /// configuration record. Every access through this is read-only; a
+    /// published view never changes.
     pub struct ViewReady {
         dir: PathBuf,
-        record: ViewRecord,
     }
 
-    #[allow(dead_code)]
     impl ViewReady {
         /// The view's directory on disk.
         pub fn dir(&self) -> &Path {
             &self.dir
-        }
-
-        /// The configuration record the view was published with,
-        /// carrying the hash of the environment input as expanded.
-        pub(crate) fn record(&self) -> &ViewRecord {
-            &self.record
         }
     }
 
@@ -907,13 +895,11 @@ pub mod view {
     /// copy is edited. The names [`ViewRecord::CONFIGURATION_FILE`]
     /// and [`READY_FILE`] at the tree's root belong to publication:
     /// whatever the build stages there is replaced when it publishes.
-    #[allow(dead_code)]
     pub struct Staging {
         dir: PathBuf,
         view: PathBuf,
     }
 
-    #[allow(dead_code)]
     impl Staging {
         /// Open a fresh staging tree for `view`, replacing any tree a
         /// recycled process id and sequence left at the same name.
@@ -1065,13 +1051,17 @@ pub mod view {
             Ok(())
         }
 
-        /// Publish the staged tree as `view`: write the configuration
-        /// record, flush the whole tree, write the ready record as the
+        /// Publish the staged tree as `view`: write the expanded
+        /// environment input and the configuration record, flush the
+        /// whole tree, write the ready record as the
         /// last staging step, and rename the tree onto the view's name
         /// in one atomic step. A tree that fails anywhere is removed.
         fn publish(self, identity: &ViewIdentity, expanded: Option<&[u8]>) -> io::Result<()> {
             let dir = self.dir.clone();
             let view = self.view.clone();
+            if let Some(env) = expanded {
+                self.write_file(crate::env::VIEW_ENV_FILE, env, 0o644)?;
+            }
             ViewRecord::write(&dir, identity, expanded)?;
             sync_tree(&dir)?;
             write_ready(&dir)?;
@@ -1208,7 +1198,6 @@ pub mod view {
     /// `None` when `key` is not a key [`ViewIdentity`] mints: the name
     /// is one bounded lowercase hex component, so nothing a caller
     /// passes can name anything outside the store.
-    #[allow(dead_code)]
     pub fn dir_name(key: &str) -> Option<String> {
         let hex = !key.is_empty()
             && key.len() <= KEY_BYTES * 2
@@ -1294,7 +1283,6 @@ pub mod view {
         c.extend_from_slice(
             format!("shadow {}\n", if inputs.host_libc { "y" } else { "n" }).as_bytes(),
         );
-        c.extend_from_slice(format!("place {}\n", inputs.placement.as_str()).as_bytes());
         match inputs.loader {
             Some(loader) => push_value(&mut c, b"loader", loader.as_bytes()),
             None => push_absent(&mut c, b"loader"),
@@ -1361,7 +1349,6 @@ pub mod view {
             &b"meta "[..],
             &b"policy "[..],
             &b"shadow "[..],
-            &b"place "[..],
         ] {
             let (line, tail) = split_line(rest)?;
             line.strip_prefix(tag)?;
@@ -1507,7 +1494,6 @@ pub mod view {
                 pins: leaked(vec![pin("gtk", 1)]),
                 policy: HostLibsPolicy::Auto,
                 host_libc: true,
-                placement: Placement::Tree,
                 loader: None,
                 entrypoint: Some("app"),
                 links,
@@ -1603,13 +1589,6 @@ pub mod view {
                     "libc policy",
                     ViewInputs {
                         host_libc: false,
-                        ..inputs(root, &env, &links)
-                    },
-                ),
-                (
-                    "placement",
-                    ViewInputs {
-                        placement: Placement::Mount,
                         ..inputs(root, &env, &links)
                     },
                 ),
@@ -1758,18 +1737,17 @@ pub mod view {
             assert_eq!(names(&dir), [CONFIGURATION_FILE.to_string()]);
 
             let record = ViewRecord::load(&dir, &identity).unwrap();
-            assert_eq!(record.configuration(), identity.canonical());
+            assert_eq!(record.canonical.as_slice(), identity.canonical());
             assert_eq!(
-                record.expanded_env(),
+                record.expanded_env.as_deref(),
                 Some(blake3::hash(&env).to_hex().to_string()).as_deref()
             );
 
             // The configuration answers what was built without
             // recomputing: every input is on the record.
-            let text = String::from_utf8_lossy(record.configuration());
+            let text = String::from_utf8_lossy(record.canonical.as_slice());
             assert!(text.contains("uid 1000"));
             assert!(text.contains("policy auto"));
-            assert!(text.contains("place tree"));
             assert!(text.contains("entry 3:app"));
             assert!(text.contains("libfoo.so.1"));
 
@@ -1778,7 +1756,10 @@ pub mod view {
             ViewRecord::write(&dir, &identity, None).unwrap();
             assert_eq!(names(&dir), [CONFIGURATION_FILE.to_string()]);
             assert_eq!(
-                ViewRecord::load(&dir, &identity).unwrap().expanded_env(),
+                ViewRecord::load(&dir, &identity)
+                    .unwrap()
+                    .expanded_env
+                    .as_deref(),
                 None
             );
 
@@ -1822,7 +1803,6 @@ pub mod view {
             miss(&trailing);
             miss(&swap(&good, b"uid 1000", b"uid 1001"));
             miss(&swap(&good, b"shadow y", b"shadow n"));
-            miss(&swap(&good, b"place tree", b"place mounx"));
             miss(&swap(&good, b"links 1", b"links 2"));
             let mut bad_expanded = good.clone();
             let at = bad_expanded
@@ -2022,6 +2002,25 @@ pub mod view {
             store.join(format!("view-{}", identity.key()))
         }
 
+        /// The in-use lease of `identity`'s view in `store`, held shared
+        /// the way a launch holds it before it builds or reuses the view.
+        fn lease(store: &Path, identity: &ViewIdentity) -> std::fs::File {
+            use rustix::fs::FlockOperation;
+            std::fs::create_dir_all(store).unwrap();
+            let path = lease_lock_path(&view_path(store, identity)).unwrap();
+            // Close-on-exec, unlike a launch's: a test worker another thread
+            // spawns must not inherit the claim.
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap();
+            rustix::fs::flock(&file, FlockOperation::LockShared).unwrap();
+            file
+        }
+
         /// The prefix every staging tree of the fixture's view starts
         /// with, and the staging entries the store still holds.
         fn staging_entries(store: &Path, identity: &ViewIdentity) -> Vec<PathBuf> {
@@ -2082,7 +2081,7 @@ pub mod view {
             let record = ViewRecord::load(view, identity)
                 .expect("the published record binds the view to its identity");
             assert_eq!(
-                record.expanded_env(),
+                record.expanded_env.as_deref(),
                 Some(blake3::hash(&fixture_env()).to_hex().to_string()).as_deref()
             );
             assert_eq!(
@@ -2220,6 +2219,7 @@ pub mod view {
             let published = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 builds.build("first", &dir.join("journal")),
             )
             .expect("the view publishes");
@@ -2242,6 +2242,7 @@ pub mod view {
             let reused = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 builds.build("second", &dir.join("journal")),
             )
             .expect("the view is reused");
@@ -2327,9 +2328,12 @@ pub mod view {
                 "the driver never started the race"
             );
 
-            let published = ensure_view(&store, &identity, |staged: &Staging| {
-                fixture_build(staged, &tag, &dir.join("journal"))
-            })
+            let published = ensure_view(
+                &store,
+                &identity,
+                &lease(&store, &identity),
+                |staged: &Staging| fixture_build(staged, &tag, &dir.join("journal")),
+            )
             .expect("the view");
 
             // Whatever process won, this creator observed a complete
@@ -2421,6 +2425,7 @@ pub mod view {
             let published = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 builds.build("first", &dir.join("journal")),
             )
             .expect("the rebuilt view");
@@ -2454,15 +2459,20 @@ pub mod view {
         fn worker_interrupted_creator() {
             let (dir, store, _index, tag) = worker_env();
             let identity = fixture_identity();
-            let _ = ensure_view(&store, &identity, |staged: &Staging| {
-                staged.write_file("bin/app", format!("app {tag}\n").as_bytes(), 0o755)?;
-                journal(&dir.join("journal"), &format!("partial {tag}"));
-                let _ = std::fs::write(dir.join("started"), b"");
-                for _ in 0..600 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Ok(None)
-            });
+            let _ = ensure_view(
+                &store,
+                &identity,
+                &lease(&store, &identity),
+                |staged: &Staging| {
+                    staged.write_file("bin/app", format!("app {tag}\n").as_bytes(), 0o755)?;
+                    journal(&dir.join("journal"), &format!("partial {tag}"));
+                    let _ = std::fs::write(dir.join("started"), b"");
+                    for _ in 0..600 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Ok(None)
+                },
+            );
         }
 
         /// A missing, truncated, foreign-versioned, or hostile ready
@@ -2481,6 +2491,7 @@ pub mod view {
             let published = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 builds.build("first", &dir.join("journal")),
             )
             .expect("the first publication");
@@ -2495,6 +2506,7 @@ pub mod view {
                 let rebuilt = ensure_view(
                     &store,
                     &identity,
+                    &lease(&store, &identity),
                     builds.build("again", &dir.join("journal")),
                 )
                 .expect("the rebuild");
@@ -2562,6 +2574,105 @@ pub mod view {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A damaged view another launch still leases is never removed
+        /// under it: the creator fails clearly, keeps its own shared
+        /// lease, and leaves the tree whole. Once the other lease is gone
+        /// the damage is rebuilt.
+        #[test]
+        fn a_damaged_view_is_not_replaced_while_another_launch_leases_it() {
+            use rustix::fs::FlockOperation;
+            let dir = temp_dir("leased-damage");
+            let store = dir.join("store");
+            let identity = fixture_identity();
+            let view = view_path(&store, &identity);
+            let builds = BuildCount::default();
+            ensure_view(
+                &store,
+                &identity,
+                &lease(&store, &identity),
+                builds.build("first", &dir.join("journal")),
+            )
+            .expect("the first publication");
+            std::fs::remove_file(view.join(READY_FILE)).unwrap();
+
+            let other = lease(&store, &identity);
+            let mine = lease(&store, &identity);
+            let refused = ensure_view(
+                &store,
+                &identity,
+                &mine,
+                builds.build("again", &dir.join("journal")),
+            );
+            assert_eq!(
+                refused.err().map(|e| e.kind()),
+                Some(io::ErrorKind::ResourceBusy),
+                "a leased damaged view is refused"
+            );
+            assert_eq!(builds.value(), 1, "nothing was rebuilt");
+            assert!(
+                view.join("bin/app").is_file(),
+                "the leased tree stays whole"
+            );
+            let probe = std::fs::File::open(lease_lock_path(&view).unwrap()).unwrap();
+            drop(other);
+            assert!(
+                rustix::fs::flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err(),
+                "the refused creator still holds its shared lease"
+            );
+            drop(probe);
+
+            let rebuilt = ensure_view(
+                &store,
+                &identity,
+                &mine,
+                builds.build("again", &dir.join("journal")),
+            )
+            .expect("the rebuild once the other lease is gone");
+            assert_view_complete(rebuilt.dir(), &identity, "again");
+            assert_eq!(builds.value(), 2);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The environment input a view carries must be exactly the one
+        /// its record hashes: a changed or missing input is damage that
+        /// rebuilds, never a view that is reused.
+        #[test]
+        fn an_environment_input_that_misses_its_hash_is_damage() {
+            let dir = temp_dir("env-damage");
+            let store = dir.join("store");
+            let identity = fixture_identity();
+            let view = view_path(&store, &identity);
+            let env_path = view.join(crate::env::VIEW_ENV_FILE);
+            let builds = BuildCount::default();
+            let publish = |tag: &str| {
+                ensure_view(
+                    &store,
+                    &identity,
+                    &lease(&store, &identity),
+                    builds.build(tag, &dir.join("journal")),
+                )
+                .expect("a publication")
+            };
+
+            publish("first");
+            assert_eq!(std::fs::read(&env_path).unwrap(), fixture_env());
+            publish("first");
+            assert_eq!(builds.value(), 1, "an intact input is reused");
+
+            std::fs::write(&env_path, b"FIXTURE_ENV=2\n").unwrap();
+            let rebuilt = publish("changed");
+            assert_eq!(builds.value(), 2, "a changed input is damage");
+            assert_view_complete(rebuilt.dir(), &identity, "changed");
+            assert_eq!(std::fs::read(&env_path).unwrap(), fixture_env());
+
+            std::fs::remove_file(&env_path).unwrap();
+            publish("missing");
+            assert_eq!(builds.value(), 3, "a missing input is damage");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// Staging is scratch by name, never by content: even a dead
         /// creator's tree carrying a valid ready and configuration
         /// record is discarded, and a reader resolving by identity can
@@ -2592,6 +2703,7 @@ pub mod view {
             let published = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 builds.build("fresh", &dir.join("journal")),
             )
             .expect("the fresh publication");
@@ -2619,6 +2731,7 @@ pub mod view {
             let published = ensure_view(
                 &store,
                 &identity,
+                &lease(&store, &identity),
                 BuildCount::default().build("first", &dir.join("journal")),
             )
             .expect("the view");
@@ -2686,59 +2799,56 @@ pub mod view {
             let identity = fixture_identity();
             let builds = BuildCount::default();
 
-            let published = ensure_view(&store, &identity, |staged: &Staging| {
-                staged.hardlink(&cas, "lib/libf.so.1")?;
-                let linked = staged.dir().join("lib/libf.so.1");
-                assert_eq!(
-                    std::fs::symlink_metadata(&linked).unwrap().nlink(),
-                    3,
-                    "the staged file shares the store's inode"
-                );
-                assert!(
-                    admit_in_place_write(&linked).is_err(),
-                    "the in-place surface refuses a store-linked file"
-                );
+            let published = ensure_view(
+                &store,
+                &identity,
+                &lease(&store, &identity),
+                |staged: &Staging| {
+                    staged.hardlink(&cas, "lib/libf.so.1")?;
+                    let linked = staged.dir().join("lib/libf.so.1");
+                    assert_eq!(
+                        std::fs::symlink_metadata(&linked).unwrap().nlink(),
+                        3,
+                        "the staged file shares the store's inode"
+                    );
 
-                // A second name over the same inode, still unpatched.
-                staged.hardlink(&cas, "lib/raw.so.1")?;
-                assert_eq!(
-                    std::fs::symlink_metadata(staged.dir().join("lib/raw.so.1"))
-                        .unwrap()
-                        .nlink(),
-                    4,
-                    "both staged names share the store's inode"
-                );
+                    // A second name over the same inode, still unpatched.
+                    staged.hardlink(&cas, "lib/raw.so.1")?;
+                    assert_eq!(
+                        std::fs::symlink_metadata(staged.dir().join("lib/raw.so.1"))
+                            .unwrap()
+                            .nlink(),
+                        4,
+                        "both staged names share the store's inode"
+                    );
 
-                // The sanctioned change is a rename over the name: the
-                // name gets a fresh inode, the store keeps its bytes.
-                staged.edit_file("lib/libf.so.1", |bytes| {
-                    let mut edited = bytes.to_vec();
-                    edited.extend_from_slice(b"-patched");
-                    Ok(edited)
-                })?;
-                assert_eq!(
-                    std::fs::symlink_metadata(staged.dir().join("lib/libf.so.1"))
-                        .unwrap()
-                        .nlink(),
-                    1,
-                    "the edit gave the name a fresh inode"
-                );
-                assert_eq!(
-                    std::fs::read(staged.dir().join("lib/libf.so.1")).unwrap(),
-                    b"store-bytes-v1-patched".to_vec()
-                );
-                assert_eq!(
-                    std::fs::read(&cas).unwrap(),
-                    b"store-bytes-v1".to_vec(),
-                    "the store's bytes are untouched by the edit"
-                );
+                    // The sanctioned change is a rename over the name: the
+                    // name gets a fresh inode, the store keeps its bytes.
+                    staged.edit_file("lib/libf.so.1", |bytes| {
+                        let mut edited = bytes.to_vec();
+                        edited.extend_from_slice(b"-patched");
+                        Ok(edited)
+                    })?;
+                    assert_eq!(
+                        std::fs::symlink_metadata(staged.dir().join("lib/libf.so.1"))
+                            .unwrap()
+                            .nlink(),
+                        1,
+                        "the edit gave the name a fresh inode"
+                    );
+                    assert_eq!(
+                        std::fs::read(staged.dir().join("lib/libf.so.1")).unwrap(),
+                        b"store-bytes-v1-patched".to_vec()
+                    );
+                    assert_eq!(
+                        std::fs::read(&cas).unwrap(),
+                        b"store-bytes-v1".to_vec(),
+                        "the store's bytes are untouched by the edit"
+                    );
 
-                // The build's own files have no shared inode, and pass.
-                staged.write_file("lib/own.so", b"own", 0o644)?;
-                assert!(admit_in_place_write(&staged.dir().join("lib/own.so")).is_ok());
-
-                builds.build("first", &dir.join("journal"))(staged)
-            })
+                    builds.build("first", &dir.join("journal"))(staged)
+                },
+            )
             .expect("the view");
 
             // After publication the patched name is the view's alone,
@@ -2753,10 +2863,6 @@ pub mod view {
             let raw = published.dir().join("lib/raw.so.1");
             assert_eq!(std::fs::symlink_metadata(&raw).unwrap().nlink(), 3);
             assert_eq!(std::fs::read(&raw).unwrap(), b"store-bytes-v1".to_vec());
-            assert!(
-                admit_in_place_write(&raw).is_err(),
-                "the published hardlink still refuses an in-place write"
-            );
             assert_eq!(
                 std::fs::read(&cas).unwrap(),
                 b"store-bytes-v1".to_vec(),
@@ -2797,13 +2903,17 @@ pub mod view {
             // creation mutex, build and reuse included.
             {
                 let held = lock_store(FlockOperation::LockExclusive);
-                let published = ensure_view(&store, &identity, |staged: &Staging| {
-                    fixture_build(staged, "first", &dir.join("journal"))
-                })
+                let published = ensure_view(
+                    &store,
+                    &identity,
+                    &lease(&store, &identity),
+                    |staged: &Staging| fixture_build(staged, "first", &dir.join("journal")),
+                )
                 .expect("the view builds under the store's exclusive lock");
                 assert_view_complete(published.dir(), &identity, "first");
-                let reused = ensure_view(&store, &identity, |_| Ok(None))
-                    .expect("the view is reused under the store's exclusive lock");
+                let reused =
+                    ensure_view(&store, &identity, &lease(&store, &identity), |_| Ok(None))
+                        .expect("the view is reused under the store's exclusive lock");
                 assert_eq!(reused.dir(), published.dir());
                 drop(held);
             }
@@ -2827,10 +2937,15 @@ pub mod view {
                     drop(held);
                 });
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                let published = ensure_view(&store, &other, |staged: &Staging| {
-                    staged.hardlink(&cas, "lib/blob.so")?;
-                    Ok(None)
-                })
+                let published = ensure_view(
+                    &store,
+                    &other,
+                    &lease(&store, &other),
+                    |staged: &Staging| {
+                        staged.hardlink(&cas, "lib/blob.so")?;
+                        Ok(None)
+                    },
+                )
                 .expect("the view builds without taking the store's lock");
                 assert!(ready(published.dir()));
                 assert_eq!(
@@ -2853,49 +2968,54 @@ pub mod view {
             let identity = fixture_identity();
             let builds = BuildCount::default();
 
-            let published = ensure_view(&store, &identity, |staged: &Staging| {
-                for rel in ["", "..", "../escape", "a/../b", "/abs", "a\0b", "a/./b"] {
+            let published = ensure_view(
+                &store,
+                &identity,
+                &lease(&store, &identity),
+                |staged: &Staging| {
+                    for rel in ["", "..", "../escape", "a/../b", "/abs", "a\0b", "a/./b"] {
+                        assert!(
+                            staged.write_file(rel, b"x", 0o644).is_err(),
+                            "{rel:?} must be refused"
+                        );
+                    }
+                    let deep = (0..MAX_REL_DEPTH + 1)
+                        .map(|i| format!("d{i}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
                     assert!(
-                        staged.write_file(rel, b"x", 0o644).is_err(),
-                        "{rel:?} must be refused"
+                        staged.write_file(&deep, b"x", 0o644).is_err(),
+                        "a path past the depth bound is refused"
                     );
-                }
-                let deep = (0..MAX_REL_DEPTH + 1)
-                    .map(|i| format!("d{i}"))
-                    .collect::<Vec<_>>()
-                    .join("/");
-                assert!(
-                    staged.write_file(&deep, b"x", 0o644).is_err(),
-                    "a path past the depth bound is refused"
-                );
-                assert!(
-                    staged.hardlink(&dir, "lib/dir").is_err(),
-                    "a non-regular source is refused"
-                );
-                assert!(
-                    staged.symlink("lib/up.so", "../../outside").is_err(),
-                    "a target that walks out is refused"
-                );
-                assert!(
-                    staged.symlink("lib/abs.so", "/etc/passwd").is_err(),
-                    "an absolute target is refused"
-                );
-                assert!(
-                    staged
-                        .place_links(&empty_manifest(), "../lib", &Links::new())
-                        .is_err(),
-                    "a hostile link directory is refused"
-                );
-                for outside in [
-                    dir.join("escape"),
-                    store.join("escape"),
-                    store.join("b"),
-                    dir.join("b"),
-                ] {
-                    assert!(!outside.exists(), "{} must not exist", outside.display());
-                }
-                builds.build("first", &dir.join("journal"))(staged)
-            })
+                    assert!(
+                        staged.hardlink(&dir, "lib/dir").is_err(),
+                        "a non-regular source is refused"
+                    );
+                    assert!(
+                        staged.symlink("lib/up.so", "../../outside").is_err(),
+                        "a target that walks out is refused"
+                    );
+                    assert!(
+                        staged.symlink("lib/abs.so", "/etc/passwd").is_err(),
+                        "an absolute target is refused"
+                    );
+                    assert!(
+                        staged
+                            .place_links(&empty_manifest(), "../lib", &Links::new())
+                            .is_err(),
+                        "a hostile link directory is refused"
+                    );
+                    for outside in [
+                        dir.join("escape"),
+                        store.join("escape"),
+                        store.join("b"),
+                        dir.join("b"),
+                    ] {
+                        assert!(!outside.exists(), "{} must not exist", outside.display());
+                    }
+                    builds.build("first", &dir.join("journal"))(staged)
+                },
+            )
             .expect("the valid build publishes");
             assert_view_complete(published.dir(), &identity, "first");
             assert!(
@@ -3020,7 +3140,7 @@ mod tests {
             "libfixture.so.1".into(),
             PathBuf::from("/run/set/lib/libfixture.so.1"),
         );
-        let sender = std::thread::spawn(move || tx.send("lib", &links));
+        let sender = std::thread::spawn(move || tx.send("lib", &links, b"ONELF-RUNTIME-ENV 1 0\n"));
         let got = loop {
             if let Received::Done(got) = rx.read() {
                 break got;
@@ -3030,6 +3150,7 @@ mod tests {
         sender.join().unwrap();
         let got = got.expect("a message");
         assert_eq!(got.dir, "lib");
+        assert_eq!(got.env, b"ONELF-RUNTIME-ENV 1 0\n");
         assert_eq!(
             got.links,
             vec![

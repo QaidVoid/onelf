@@ -312,7 +312,6 @@ pub fn run(
         pins: &pins,
         policy,
         host_libc: false,
-        placement: onelf_rt::links::view::Placement::Tree,
         loader: resolution.host_interp.as_ref().map(|p| p.as_os_str()),
         entrypoint: Some(ep_name.as_str()),
         links: &links,
@@ -341,7 +340,7 @@ pub fn run(
         .map_err(|e| io::Error::other(format!("the view lease: {e}")))?;
 
     let paths_bytes = paths_file_bytes(&declared_paths);
-    let published = onelf_rt::links::view::ensure_view(&store, &identity, |staging| {
+    let published = onelf_rt::links::view::ensure_view(&store, &identity, &lease, |staging| {
         stage_tree(staging, &dir)?;
         let expanded = expand_view_roots(&view_record, dir.as_os_str(), view.as_os_str());
         staging.write_file(onelf_rt::env::VIEW_ENV_FILE, &expanded, 0o644)?;

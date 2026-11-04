@@ -17,7 +17,6 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 
 use crate::loader::PackageData;
 
@@ -138,24 +137,9 @@ pub fn execute_rundir(
         }
     };
 
-    // Signals meant for this process still reach the application, one hop
-    // further along: this forwards to the guardian, and the guardian
-    // forwards to the application.
-    crate::fuse::CHILD_PID.store(supervision.pid as i32, Ordering::Relaxed);
-    crate::fuse::install_signal_handlers();
-
-    match crate::guardian::receive(&supervision.status) {
-        Ok(outcome) => {
-            if outcome == crate::guardian::Outcome::Unavailable {
-                eprintln!("onelf-rt: rundir: the lifetime guardian could not be established");
-            }
-            std::process::exit(outcome.exit_code())
-        }
-        Err(e) => {
-            eprintln!("onelf-rt: rundir: guardian status: {e}");
-            std::process::exit(1);
-        }
-    }
+    // Signals sent to this process still reach the application, one hop
+    // further along, and this process ends the way the application did.
+    crate::guardian::proxy(supervision, "rundir")
 }
 
 /// Bytes available to this user on the filesystem holding `path`.
