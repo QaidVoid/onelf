@@ -1,0 +1,8 @@
+ONELF-RUNTIME-ENV 1 4
+MAPPED_KEEP=.13:/view/plugins+;
+MAPPED_LINE=!15:/view/a
+/view/b+;
+MAPPED_NONE=.10:/view/none-;
+CHANGED=!3:new+;
+R10:/view:/set;
+H30:CHANGED=0123456789abcdef3:old;;

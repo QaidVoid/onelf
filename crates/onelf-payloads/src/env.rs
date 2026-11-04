@@ -271,7 +271,9 @@ const RENV_CAP: usize = rtenv::MAX_RECORD_BYTES;
 
 static mut G_MAPS: [u8; MAPS_CAP] = [0; MAPS_CAP];
 static mut G_ROOT: [u8; ROOT_CAP] = [0; ROOT_CAP];
-static mut G_BUF: [u8; BUF_CAP] = [0; BUF_CAP];
+/// `.onelf/env` or `.onelf/preload`, with the extra byte [`read_bounded`]
+/// needs to tell a file of exactly `BUF_CAP` bytes from a longer one.
+static mut G_BUF: [u8; BUF_CAP + 1] = [0; BUF_CAP + 1];
 static mut G_RENV: [u8; RENV_CAP + 1] = [0; RENV_CAP + 1];
 
 // ---- tiny freestanding helpers --------------------------------------------
@@ -892,8 +894,7 @@ static ONELF_ENV_CTOR: extern "C" fn() = onelf_env_init;
 mod tests {
     use super::{READ_ABSENT, READ_OVERFLOW, apply_env, apply_runtime_env, read_bounded};
     use crate::harness::{
-        c_path, env, env_lock, fnv1a, runtime_entry, runtime_record, set_env, set_root, unset_env,
-        view,
+        c_path, env, env_lock, runtime_entry, runtime_record, set_env, set_root, unset_env, view,
     };
     use crate::rtenv::Policy;
 
@@ -916,7 +917,7 @@ mod tests {
                     "ONELF_T_PRECEDENCE",
                     Policy::Replace,
                     b"generated",
-                    Some(fnv1a(b"generated")),
+                    true,
                 )],
                 None,
                 None,
@@ -979,7 +980,7 @@ mod tests {
                 "ONELF_T_FROM_VIEW",
                 Policy::Replace,
                 value,
-                Some(fnv1a(value)),
+                true,
             )],
             Some(b"/view"),
             None,

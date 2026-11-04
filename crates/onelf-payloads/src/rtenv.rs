@@ -4,8 +4,8 @@
 //! hooks against the application and its selected sets, applies them, and
 //! encodes what the view requires into `<root>/.onelf/runtime-env`: one
 //! entry per variable with the value the view provides, the application
-//! policy the mapping declared, and the hash of the value the launch left
-//! in the environment for that variable. It also records the active roots
+//! policy the mapping declared, and whether the launch left that variable
+//! set. It also records the active roots
 //! and the host-restoration record, which the exec hooks of [`crate::exec`]
 //! read and which a sandboxed `clearenv` takes away with everything else.
 //!
@@ -18,10 +18,10 @@
 //! H<length>:<host restoration record>;
 //! ```
 //!
-//! `policy` is `.` for preserve and `!` for replace. `applied` is `@` and
-//! 16 lowercase hex digits, the FNV-1a hash of the value the launch left,
-//! or `-` when the launch left the variable unset. Values are raw bytes of
-//! the declared length, so a path list containing a newline survives.
+//! `policy` is `.` for preserve and `!` for replace. `applied` is `+` when
+//! the launch left the variable set and `-` when it left it unset. Values
+//! are raw bytes of the declared length, so a path list containing a
+//! newline survives.
 //!
 //! Reading is bounded: the file is refused beyond [`MAX_RECORD_BYTES`],
 //! every declared length is checked against what remains and against
@@ -31,15 +31,19 @@
 //! ever truncated or trusted.
 //!
 //! An entry applies when its variable is missing, which is what a
-//! `clearenv` re-exec needs. A variable that still holds the value the
-//! launch left is already correct, and a variable holding anything else is
+//! `clearenv` re-exec needs, unless it is a preserve mapping the launch
+//! left unset. A present variable is never touched: one still holding what
+//! the launch left is already correct, and one holding anything else is
 //! an override the application made after the launch and is kept under
-//! either policy; the packaged `.onelf/env` is applied after this record,
+//! either policy. Rewriting a present value to the mapping's would either
+//! change nothing or undo a preserved caller value, a hook's adjustment or
+//! a recipe value, so no record of the applied value is needed to decide.
+//! The packaged `.onelf/env` is applied after this record,
 //! so a recipe value the package declares itself still wins. The active
 //! roots and the host-restoration record return only when missing, since a
 //! live record is the fresher one.
 
-use crate::{getenv, setenv, slen};
+use crate::{getenv, setenv};
 
 /// The complete record is capped at one mebibyte, the bound the workspace
 /// puts on generated metadata transports.
@@ -72,7 +76,7 @@ pub(crate) enum Reject {
     Value,
     /// The policy character is neither preserve nor replace.
     Policy,
-    /// The applied marker is neither a 16 digit hash nor `-`.
+    /// The applied marker is neither `+` nor `-`.
     Applied,
     /// Bytes follow the last scalar.
     Trailing,
@@ -113,9 +117,8 @@ pub(crate) struct Entry<'a> {
     pub(crate) value: &'a [u8],
     /// How the launch applied the mapping behind the entry.
     pub(crate) policy: Policy,
-    /// The hash of the value the launch left, or `None` when it left the
-    /// variable unset.
-    pub(crate) applied: Option<u64>,
+    /// Whether the launch left the variable set.
+    pub(crate) left_set: bool,
 }
 
 /// A record that validated completely.
@@ -265,27 +268,12 @@ impl<'a> Cursor<'a> {
         Ok(bytes)
     }
 
-    /// The applied marker: `@` and 16 lowercase hex digits, or `-`.
-    fn applied(&mut self) -> Result<Option<u64>, Reject> {
-        match self.peek() {
-            Some(b'-') => {
-                self.pos += 1;
-                Ok(None)
-            }
-            Some(b'@') => {
-                self.pos += 1;
-                let mut hash = 0u64;
-                for _ in 0..16 {
-                    let byte = self.bump().ok_or(Reject::Applied)?;
-                    let digit = match byte {
-                        b'0'..=b'9' => (byte - b'0') as u64,
-                        b'a'..=b'f' => (byte - b'a' + 10) as u64,
-                        _ => return Err(Reject::Applied),
-                    };
-                    hash = (hash << 4) | digit;
-                }
-                Ok(Some(hash))
-            }
+    /// The applied marker: `+` for a variable the launch left set, `-`
+    /// for one it left unset.
+    fn applied(&mut self) -> Result<bool, Reject> {
+        match self.bump() {
+            Some(b'+') => Ok(true),
+            Some(b'-') => Ok(false),
             _ => Err(Reject::Applied),
         }
     }
@@ -300,7 +288,7 @@ impl<'a> Cursor<'a> {
             _ => return Err(Reject::Policy),
         };
         let value = self.value()?;
-        let applied = self.applied()?;
+        let left_set = self.applied()?;
         self.take(b';')?;
         if self.peek() == Some(b'\n') {
             self.pos += 1;
@@ -309,7 +297,7 @@ impl<'a> Cursor<'a> {
             name,
             value,
             policy,
-            applied,
+            left_set,
         })
     }
 
@@ -334,13 +322,6 @@ impl<'a> Cursor<'a> {
 static mut NAME_BUF: [u8; MAX_NAME_BYTES + 1] = [0; MAX_NAME_BYTES + 1];
 static mut VALUE_BUF: [u8; MAX_VALUE_BYTES + 1] = [0; MAX_VALUE_BYTES + 1];
 
-/// 64-bit FNV-1a, the applied-value hash the runtime computes the same way.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// Validate a record, then apply it: entries to variables that are missing,
 /// the active roots and the host-restoration record back into the variables
 /// they belong to when those went missing with a cleared environment.
@@ -348,29 +329,21 @@ pub(crate) unsafe fn apply(buf: &[u8]) -> Result<(), Reject> {
     let decoded = Decoded::parse(buf)?;
     for entry in decoded.entries() {
         let name = terminated(core::ptr::addr_of_mut!(NAME_BUF), entry.name);
-        let current = getenv(name.as_ptr());
-        if current.is_null() {
-            // A preserve mapping the launch never applied invents nothing:
-            // restoration is for what the view requires, and this one made
-            // no claim on the variable.
-            if entry.policy == Policy::Preserve && entry.applied.is_none() {
-                continue;
-            }
-            let value = terminated(core::ptr::addr_of_mut!(VALUE_BUF), entry.value);
-            setenv(name.as_ptr(), value.as_ptr(), 1);
-        } else if entry.applied != Some(fnv1a(slice(current))) {
-            // A present value the launch did not leave is an override the
-            // application made afterwards, and is kept under either policy.
+        if !getenv(name.as_ptr()).is_null() {
+            continue;
         }
+        // A preserve mapping the launch left unset invents nothing:
+        // restoration is for what the view requires, and this one made no
+        // claim on the variable.
+        if entry.policy == Policy::Preserve && !entry.left_set {
+            continue;
+        }
+        let value = terminated(core::ptr::addr_of_mut!(VALUE_BUF), entry.value);
+        setenv(name.as_ptr(), value.as_ptr(), 1);
     }
     restore(c"ONELF_ROOTS", decoded.roots());
     restore(c"ONELF_HOST_ENV", decoded.host_record());
     Ok(())
-}
-
-/// The live bytes of a NUL-terminated string.
-unsafe fn slice<'a>(s: *const u8) -> &'a [u8] {
-    core::slice::from_raw_parts(s, slen(s))
 }
 
 /// Copy `bytes` into `buf` NUL-terminated, returning the whole copy
@@ -402,13 +375,13 @@ unsafe fn restore(name: &core::ffi::CStr, value: Option<&[u8]>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{env, env_lock, fnv1a, runtime_entry, runtime_record, set_env, unset_env};
+    use crate::harness::{env, env_lock, runtime_entry, runtime_record, set_env, unset_env};
     use crate::rtenv::{Decoded, MAX_ENTRIES, MAX_NAME_BYTES, MAX_VALUE_BYTES, Policy, Reject};
 
     /// An entry whose declared value length is larger than what follows it,
     /// but still within the per-value cap.
     fn overlong_value(name: &str) -> Vec<u8> {
-        let entry = runtime_entry(name, Policy::Replace, b"v", Some(1));
+        let entry = runtime_entry(name, Policy::Replace, b"v", true);
         let text = String::from_utf8(entry).unwrap();
         let start = text.find('=').unwrap() + 2;
         let end = text[start..].find(':').unwrap() + start;
@@ -424,17 +397,12 @@ mod tests {
         let value = b"/pkg/lib/gstreamer-1.0";
         let record = runtime_record(
             &[
-                runtime_entry(
-                    "GST_PLUGIN_SYSTEM_PATH",
-                    Policy::Replace,
-                    value,
-                    Some(fnv1a(value)),
-                ),
+                runtime_entry("GST_PLUGIN_SYSTEM_PATH", Policy::Replace, value, true),
                 runtime_entry(
                     "ALSA_CONFIG_PATH",
                     Policy::Preserve,
                     b"/pkg/share/alsa",
-                    None,
+                    false,
                 ),
             ],
             Some(b"/pkg:/set"),
@@ -446,18 +414,64 @@ mod tests {
         assert_eq!(entries[0].name, b"GST_PLUGIN_SYSTEM_PATH");
         assert_eq!(entries[0].value, value);
         assert_eq!(entries[0].policy, Policy::Replace);
-        assert_eq!(entries[0].applied, Some(fnv1a(value)));
+        assert!(entries[0].left_set);
         assert_eq!(entries[1].name, b"ALSA_CONFIG_PATH");
         assert_eq!(entries[1].policy, Policy::Preserve);
-        assert_eq!(entries[1].applied, None);
+        assert!(!entries[1].left_set);
         assert_eq!(decoded.roots(), Some(b"/pkg:/set".as_slice()));
         assert_eq!(decoded.host_record(), Some(b"A=-16:/x;".as_slice()));
+    }
+
+    /// The golden record the runtime's encoder must produce byte for byte
+    /// parses back to the entries and scalars it was encoded from.
+    #[test]
+    fn the_runtimes_golden_record_parses_back() {
+        let golden: &[u8] = include_bytes!("../../onelf-rt/tests/fixtures/runtime-env.golden");
+        let decoded = Decoded::parse(golden).unwrap();
+        let entries: Vec<_> = decoded
+            .entries()
+            .map(|e| (e.name, e.value, e.policy, e.left_set))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (
+                    b"MAPPED_KEEP".as_slice(),
+                    b"/view/plugins".as_slice(),
+                    Policy::Preserve,
+                    true
+                ),
+                (
+                    b"MAPPED_LINE".as_slice(),
+                    b"/view/a\n/view/b".as_slice(),
+                    Policy::Replace,
+                    true
+                ),
+                (
+                    b"MAPPED_NONE".as_slice(),
+                    b"/view/none".as_slice(),
+                    Policy::Preserve,
+                    false
+                ),
+                (
+                    b"CHANGED".as_slice(),
+                    b"new".as_slice(),
+                    Policy::Replace,
+                    true
+                ),
+            ]
+        );
+        assert_eq!(decoded.roots(), Some(b"/view:/set".as_slice()));
+        assert_eq!(
+            decoded.host_record(),
+            Some(b"CHANGED=0123456789abcdef3:old;".as_slice())
+        );
     }
 
     #[test]
     fn a_truncated_record_is_rejected() {
         let record = runtime_record(
-            &[runtime_entry("A", Policy::Replace, b"1", Some(fnv1a(b"1")))],
+            &[runtime_entry("A", Policy::Replace, b"1", true)],
             None,
             None,
         );
@@ -482,7 +496,7 @@ mod tests {
     fn an_oversized_value_is_rejected() {
         let big = vec![b'x'; MAX_VALUE_BYTES + 1];
         let record = runtime_record(
-            &[runtime_entry("A", Policy::Replace, &big, Some(fnv1a(&big)))],
+            &[runtime_entry("A", Policy::Replace, &big, true)],
             None,
             None,
         );
@@ -513,7 +527,7 @@ mod tests {
     #[test]
     fn names_of_the_wrong_shape_are_rejected() {
         let empty = runtime_record(
-            &[runtime_entry("", Policy::Replace, b"1", Some(1))],
+            &[runtime_entry("", Policy::Replace, b"1", true)],
             None,
             None,
         );
@@ -521,7 +535,7 @@ mod tests {
 
         let long = "A".repeat(MAX_NAME_BYTES + 1);
         let oversized = runtime_record(
-            &[runtime_entry(&long, Policy::Replace, b"1", Some(1))],
+            &[runtime_entry(&long, Policy::Replace, b"1", true)],
             None,
             None,
         );
@@ -530,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_nul_in_a_value_is_rejected() {
-        let mut entry = runtime_entry("A", Policy::Replace, b"1", Some(1));
+        let mut entry = runtime_entry("A", Policy::Replace, b"1", true);
         let colon = entry.iter().position(|&b| b == b':').unwrap();
         entry[colon + 1] = 0;
         rejects_to(&runtime_record(&[entry], None, None), Reject::Value);
@@ -538,26 +552,21 @@ mod tests {
 
     #[test]
     fn a_bad_policy_or_marker_is_rejected() {
-        let mut entry = runtime_entry("A", Policy::Replace, b"1", Some(1));
+        let mut entry = runtime_entry("A", Policy::Replace, b"1", true);
         let at = entry.iter().position(|&b| b == b'=').unwrap() + 1;
         entry[at] = b'?';
         rejects_to(&runtime_record(&[entry], None, None), Reject::Policy);
 
-        let mut entry = runtime_entry("A", Policy::Replace, b"1", Some(1));
-        let at = entry.iter().position(|&b| b == b'@').unwrap();
+        let mut entry = runtime_entry("A", Policy::Replace, b"1", true);
+        let at = entry.iter().position(|&b| b == b'+').unwrap();
         entry[at] = b'*';
-        rejects_to(&runtime_record(&[entry], None, None), Reject::Applied);
-
-        let mut entry = runtime_entry("A", Policy::Replace, b"1", Some(1));
-        let at = entry.iter().position(|&b| b == b'@').unwrap() + 1;
-        entry[at] = b'A';
         rejects_to(&runtime_record(&[entry], None, None), Reject::Applied);
     }
 
     #[test]
     fn trailing_bytes_are_rejected() {
         let mut record = runtime_record(
-            &[runtime_entry("A", Policy::Replace, b"1", Some(fnv1a(b"1")))],
+            &[runtime_entry("A", Policy::Replace, b"1", true)],
             None,
             None,
         );
@@ -576,7 +585,7 @@ mod tests {
                     "ONELF_T_CLEARED",
                     Policy::Replace,
                     value.as_bytes(),
-                    Some(fnv1a(value.as_bytes())),
+                    true,
                 )],
                 None,
                 None,
@@ -598,7 +607,7 @@ mod tests {
                     "ONELF_T_OVERRIDE",
                     Policy::Replace,
                     mapped.as_bytes(),
-                    Some(fnv1a(mapped.as_bytes())),
+                    true,
                 )],
                 None,
                 None,
@@ -621,7 +630,7 @@ mod tests {
                     "ONELF_T_LEFT",
                     Policy::Preserve,
                     mapped.as_bytes(),
-                    Some(fnv1a(callers.as_bytes())),
+                    true,
                 )],
                 None,
                 None,
@@ -642,7 +651,7 @@ mod tests {
                     "ONELF_T_INVENT",
                     Policy::Preserve,
                     b"/view/lib/plugins",
-                    None,
+                    false,
                 )],
                 None,
                 None,
@@ -688,7 +697,7 @@ mod tests {
                     "ONELF_T_ALL_OR_NOTHING",
                     Policy::Replace,
                     b"/view/lib",
-                    Some(fnv1a(b"/view/lib")),
+                    true,
                 )],
                 None,
                 None,

@@ -40,19 +40,12 @@ pub(crate) fn view(tag: &str) -> std::path::PathBuf {
     root
 }
 
-/// 64-bit FNV-1a, the applied-value hash the runtime computes.
-pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// One entry of the evaluated per-view input, the way the launch writes it.
 pub(crate) fn runtime_entry(
     name: &str,
     policy: crate::rtenv::Policy,
     value: &[u8],
-    applied: Option<u64>,
+    left_set: bool,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(name.as_bytes());
@@ -64,13 +57,7 @@ pub(crate) fn runtime_entry(
     out.extend_from_slice(value.len().to_string().as_bytes());
     out.push(b':');
     out.extend_from_slice(value);
-    match applied {
-        Some(hash) => {
-            out.push(b'@');
-            out.extend_from_slice(format!("{hash:016x}").as_bytes());
-        }
-        None => out.push(b'-'),
-    }
+    out.push(if left_set { b'+' } else { b'-' });
     out.extend_from_slice(b";\n");
     out
 }

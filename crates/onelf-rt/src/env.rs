@@ -644,7 +644,7 @@ struct ViewEnvEntry {
     name: Vec<u8>,
     value: Vec<u8>,
     policy: Inheritance,
-    applied: Option<u64>,
+    left_set: bool,
 }
 
 /// Why a generated input was refused instead of written short.
@@ -695,14 +695,14 @@ pub fn view_env_assignments(
 /// Encode the evaluated per-view environment input.
 ///
 /// Every framework mapping alias is listed with the mapping's own value,
-/// what the launch left in the environment to compare against, and the
-/// mapping's inheritance policy. Every other variable the launch changed
-/// is listed with the value it left, under a replace policy. A variable
-/// the launch left unset is not listed: restoration never invents an
-/// unset. The active roots and the host-restoration record ride along as
-/// scalar records when `now` carries them. A name or value beyond what
-/// the constructor reads back is skipped, since the packaged `.onelf/env`
-/// still carries recipe values.
+/// whether the launch left the variable set, and the mapping's
+/// inheritance policy. Every other variable the launch changed is listed
+/// with the value it left, under a replace policy. A variable the launch
+/// left unset is not listed: restoration never invents an unset. The
+/// active roots and the host-restoration record ride along as scalar
+/// records when `now` carries them. A name or value of either kind beyond
+/// what the constructor reads back is skipped, since the packaged
+/// `.onelf/env` still carries recipe values.
 pub fn encode_view_env(
     base: &BTreeMap<OsString, OsString>,
     now: &BTreeMap<OsString, OsString>,
@@ -715,14 +715,15 @@ pub fn encode_view_env(
             if !mapped.insert(OsString::from(*name)) {
                 continue;
             }
-            let applied = now
-                .get(OsStr::new(name))
-                .map(|left| crate::hostenv::fnv1a(left.as_bytes()));
+            let value = assignment.value.as_bytes();
+            if !fits_view_env(name.as_bytes(), value) {
+                continue;
+            }
             entries.push(ViewEnvEntry {
                 name: name.as_bytes().to_vec(),
-                value: assignment.value.as_bytes().to_vec(),
+                value: value.to_vec(),
                 policy: assignment.inheritance,
-                applied,
+                left_set: now.contains_key(OsStr::new(name)),
             });
         }
     }
@@ -735,20 +736,14 @@ pub fn encode_view_env(
             continue;
         }
         let (name, value) = (name.as_bytes(), value.as_bytes());
-        if name.is_empty()
-            || name.len() > MAX_VIEW_ENV_NAME
-            || name.contains(&0)
-            || name.contains(&b'=')
-            || value.len() > MAX_VIEW_ENV_VALUE
-            || value.contains(&0)
-        {
+        if !fits_view_env(name, value) {
             continue;
         }
         entries.push(ViewEnvEntry {
             name: name.to_vec(),
             value: value.to_vec(),
             policy: Inheritance::Replace,
-            applied: Some(crate::hostenv::fnv1a(value)),
+            left_set: true,
         });
     }
     if entries.len() > MAX_VIEW_ENV_ENTRIES {
@@ -774,13 +769,7 @@ pub fn encode_view_env(
         put(&mut out, entry.value.len().to_string().as_bytes())?;
         put(&mut out, b":")?;
         put(&mut out, &entry.value)?;
-        match entry.applied {
-            Some(hash) => {
-                put(&mut out, b"@")?;
-                put(&mut out, format!("{hash:016x}").as_bytes())?;
-            }
-            None => put(&mut out, b"-")?,
-        }
+        put(&mut out, if entry.left_set { b"+" } else { b"-" })?;
         put(&mut out, b";\n")?;
     }
     for (tag, scalar) in [(b'R', roots), (b'H', host_record)] {
@@ -798,6 +787,18 @@ pub fn encode_view_env(
         put(&mut out, b";\n")?;
     }
     Ok(out)
+}
+
+/// Whether the constructor reads an entry of `name` and `value` back: a
+/// nonempty name within the name cap holding neither NUL nor `=`, and a
+/// value within the value cap holding no NUL.
+fn fits_view_env(name: &[u8], value: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_VIEW_ENV_NAME
+        && !name.contains(&0)
+        && !name.contains(&b'=')
+        && value.len() <= MAX_VIEW_ENV_VALUE
+        && !value.contains(&0)
 }
 
 /// Append `bytes` while the whole input stays within the constructor's
@@ -3920,18 +3921,10 @@ mod view_env_tests {
             .collect()
     }
 
-    fn hash(value: &str) -> u64 {
-        crate::hostenv::fnv1a(value.as_bytes())
-    }
-
     /// The one entry line the encoder writes for these fields.
-    fn expected_entry(name: &str, policy: char, value: &str, applied: Option<u64>) -> String {
-        match applied {
-            Some(hash) => {
-                format!("{name}={policy}{}:{value}@{hash:016x};\n", value.len())
-            }
-            None => format!("{name}={policy}{}:{value}-;\n", value.len()),
-        }
+    fn expected_entry(name: &str, policy: char, value: &str, left_set: bool) -> String {
+        let marker = if left_set { '+' } else { '-' };
+        format!("{name}={policy}{}:{value}{marker};\n", value.len())
     }
 
     #[test]
@@ -3953,19 +3946,9 @@ mod view_env_tests {
         let bytes = encode_view_env(&base, &now, &maps).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("ONELF-RUNTIME-ENV 1 3\n"));
-        assert!(text.contains(&expected_entry(
-            "MAPPED",
-            '.',
-            "/view/plugins",
-            Some(hash("caller"))
-        )));
-        assert!(text.contains(&expected_entry("CHANGED", '!', "new", Some(hash("new")))));
-        assert!(text.contains(&expected_entry(
-            "HOOKOUT",
-            '!',
-            "/private/font.conf",
-            Some(hash("/private/font.conf"))
-        )));
+        assert!(text.contains(&expected_entry("MAPPED", '.', "/view/plugins", true)));
+        assert!(text.contains(&expected_entry("CHANGED", '!', "new", true)));
+        assert!(text.contains(&expected_entry("HOOKOUT", '!', "/private/font.conf", true)));
         assert!(!text.contains("UNCHANGED"));
         assert!(!text.contains("ONELF_HOST_ENV="));
         assert!(text.ends_with("R5:/view;\nH3:rec;\n"));
@@ -3978,12 +3961,7 @@ mod view_env_tests {
         let bytes = encode_view_env(&env_state, &env_state, &maps).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("ONELF-RUNTIME-ENV 1 1\n"));
-        assert!(text.contains(&expected_entry(
-            "MAPPED",
-            '!',
-            "/view/plugins",
-            Some(hash("caller"))
-        )));
+        assert!(text.contains(&expected_entry("MAPPED", '!', "/view/plugins", true)));
         assert!(!text.contains("OTHER"));
 
         let plain = map(&[("OTHER", "same")]);
@@ -4003,8 +3981,45 @@ mod view_env_tests {
         let bytes = encode_view_env(&base, &now, &[]).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("ONELF-RUNTIME-ENV 1 1\n"));
-        assert!(text.contains(&expected_entry("KEPT", '!', "fine", Some(hash("fine")))));
+        assert!(text.contains(&expected_entry("KEPT", '!', "fine", true)));
         assert!(!text.contains("HUGE"));
+
+        let huge = "x".repeat(40_000);
+        let maps = assignments(&[
+            ("MAPPED_HUGE", huge.as_str(), Inheritance::Replace),
+            ("MAPPED_KEPT", "/view/plugins", Inheritance::Replace),
+        ]);
+        let bytes = encode_view_env(&base, &base, &maps).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("ONELF-RUNTIME-ENV 1 1\n"), "{text}");
+        assert!(text.contains(&expected_entry("MAPPED_KEPT", '!', "/view/plugins", false)));
+        assert!(!text.contains("MAPPED_HUGE"));
+    }
+
+    /// The encoder's output for a fixed launch is the byte-level golden
+    /// record the payload constructor's parser is tested against, so the
+    /// writer and the reader cannot drift apart unnoticed.
+    #[test]
+    fn the_encoded_input_matches_the_golden_record_the_constructor_parses() {
+        let base = map(&[("MAPPED_KEEP", "/caller/plugins"), ("CHANGED", "old")]);
+        let now = map(&[
+            ("MAPPED_KEEP", "/caller/plugins"),
+            ("MAPPED_LINE", "/view/a\n/view/b"),
+            ("CHANGED", "new"),
+            (ROOTS_VAR, "/view:/set"),
+            (HOST_ENV_VAR, "CHANGED=0123456789abcdef3:old;"),
+        ]);
+        let maps = assignments(&[
+            ("MAPPED_KEEP", "/view/plugins", Inheritance::Preserve),
+            ("MAPPED_LINE", "/view/a\n/view/b", Inheritance::Replace),
+            ("MAPPED_NONE", "/view/none", Inheritance::Preserve),
+        ]);
+        let bytes = encode_view_env(&base, &now, &maps).unwrap();
+        let golden: &[u8] = include_bytes!("../tests/fixtures/runtime-env.golden");
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            String::from_utf8_lossy(golden)
+        );
     }
 
     #[test]
