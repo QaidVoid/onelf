@@ -27,7 +27,8 @@ The rules this page encodes:
 | Launch | Guardian |
 |--------|----------|
 | `memfd` | none: nothing is on disk, so there is nothing to hold |
-| `fuse`, first launch | none: the detached server holds the mount, and the application inherits the shared mount's lease (see [Instances share a mount](./execution-modes#instances-share-a-mount)) |
+| `fuse`, a launch that does not share | yes: the guardian is the mount's server, and holds the mount and its claim |
+| `fuse`, first launch of a shared mount | yes: the guardian holds that launch's lease on the shared mount; the detached server only serves it (see [Instances share a mount](./execution-modes#instances-share-a-mount)) |
 | `fuse`, a launch joining a running instance | yes: the guardian holds that launch's lease on the shared mount |
 | `tmpfs` | yes: the guardian holds the mountpoint claim |
 | `rundir` | yes: the guardian holds the claim on the extraction tree |
@@ -36,7 +37,9 @@ The rules this page encodes:
 
 A guardian exists only for a launch that has something on disk to keep.
 It is a fork of the runtime: one extra process that sits between the
-invoking command and the application for the whole launch.
+invoking command and the application for the whole launch. A shared
+mount's server is never a launch's guardian: it is not the ancestor of
+any launch's application, so it cannot adopt what they leave behind.
 
 ## What it holds
 
@@ -56,7 +59,8 @@ What the descriptors claim depends on the mode:
   concurrent launch's sweep can remove the tree out from under the app.
 - On the `fuse` rungs, the shared mount's lease
   (`.onelf-<name>-<id>.lease`), which keeps the server up and the mount
-  served.
+  served. A launch that does not share holds its mount itself: its
+  guardian is the server, and unmounts only once its subtree is empty.
 - In `cache` mode, the base extraction's in-use lock, which keeps the
   package's shared extraction from being collected, and the execution
   view's lease, which keeps the view from being reclaimed.
@@ -72,9 +76,11 @@ ancestry is fixed before anything of the application exists:
   the launch. No process appearing after the application's exit can take
   that ancestry away.
 - It reports the application's exit status to the invoking process the
-  moment it has reaped it. The invoker exits with that status: an
-  application terminated by signal N exits `128+N`, the conversion the
-  launch has always applied.
+  moment it has reaped it. The invoker ends the same way: it exits with
+  the application's exit status, and an application killed by a signal
+  makes the invoker die of that same signal, with no core dump of its
+  own, so a shell loop or a supervisor sees the signal. Only a signal
+  that cannot end the invoker falls back to exit status `128+N`.
 - Once the application has been reaped, it leaves the caller's session
   and lets go of the caller's standard streams. A Ctrl-C aimed at the
   caller's foreground process group, or the hangup that follows a
@@ -82,15 +88,30 @@ ancestry is fixed before anything of the application exists:
   has descendants to reap. Letting go of the streams is also what makes
   `$(app)` and `app | head` finish when the application finishes instead
   of waiting for the guardian.
-- It adopts and reaps every orphaned descendant, so none is left a
-  zombie, and releases the launch's claims only after a drained `wait`
-  proves its subtree empty.
+- It adopts every orphaned descendant and reaps each one the moment it
+  exits, so none is left a zombie even while the application still
+  runs, and releases the launch's claims only after `wait` proves its
+  subtree empty.
 
-Terminal signals reach the application. A SIGINT, SIGTERM, SIGHUP or
-SIGQUIT that the invoking process receives is forwarded to the guardian,
-and the guardian forwards it to the application, once each. After the
-application has been reaped, further signals are dropped, so a recycled
-process id never receives a stale one.
+Signals reach the application once each. The invoking process, the
+guardian and the application share the caller's process group, so a
+SIGINT, SIGQUIT or SIGHUP the terminal raises for its foreground group,
+a Ctrl-C among them, reaches the application directly, and neither the
+invoker nor the guardian forwards it again. A SIGINT, SIGTERM, SIGHUP or
+SIGQUIT some process sends to the invoking process, such as `kill` or a
+supervisor stopping it, is forwarded to the guardian, and the guardian
+forwards it to the application. A signal that arrives while the
+application is still being started is held and delivered to it rather
+than lost. After the application has been reaped, further signals are
+dropped, so a recycled process id never receives a stale one. A signal
+the caller left ignored, as `nohup` does for SIGHUP, stays ignored for
+the application.
+
+⚠️ A signal some process sends to the whole process group, such as
+`kill -s TERM -PGID` or a service manager signalling every process of a
+unit, reaches the application directly and once more through each
+forward. Send it to
+the invoking process alone to deliver it once.
 
 ## When it is killed
 
@@ -116,10 +137,15 @@ held, whatever its state looks like from outside.
 The same claims are what the cache respects. `onelf cache gc` and
 `onelf cache clear` skip a view whose lease a launch or its guardian
 holds, and skip a package extraction whose in-use lock is held, however
-old they are; see [onelf cache](../reference/cli#onelf-cache). What
-they reclaim when both locks of an identity are free is the whole of it:
-a published view, a staging tree a dead creator left half-built, and the
-scratch between them are all idle state the next launch rebuilds.
+old they are; see [onelf cache](../reference/cli#onelf-cache). With
+both locks of an identity free, a published view goes once it has gone
+unused for longer than the age threshold, measured from the last launch
+that used it, so a view the next launch would reuse stays; `clear`
+takes every idle one. A staging tree a dead creator left half-built and
+a view whose records are damaged go whatever their age: they are idle
+state the next launch rebuilds. A launch's own sweep runs only after it
+holds its view's lease, so it never reclaims the view it is about to
+run from.
 
 A launch killed before it could clean up leaves its tree behind, claimed
 by nothing once its processes are gone. The next launch of any package

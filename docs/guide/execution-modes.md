@@ -146,11 +146,15 @@ How it works:
 - Launches that start together take turns on the record. The first one
   holds it until its app runs, so the others find a finished mount and
   never start a second server.
-- A launch that joins the mount runs under a lifetime guardian of its
-  own, which holds that launch's lease. Its descendants keep the mount
-  claimed even when they daemonize and close everything they inherited;
-  the first launch needs no guardian, because its server holds the
-  mount. See [The Lifetime Guardian](./guardian).
+- Every launch, the first one included, runs under a lifetime guardian
+  of its own, which holds that launch's lease. Its descendants keep the
+  mount claimed even when they daemonize and close everything they
+  inherited; the server serves the mount but is never a launch's
+  guardian. See [The Lifetime Guardian](./guardian).
+- The mount serves the first launch's generated environment input at
+  `.onelf/runtime-env`, which carries caller values. A launch whose own
+  input differs, because its caller's environment does, mounts its own
+  rather than run with another caller's.
 - On the `fusermount3` rung the mount is in the host's namespace, and a
   later launch runs from it as it is. On the namespace rung a later launch
   enters the server's user and mount namespace, and then a copy of that
@@ -236,6 +240,13 @@ on disk. The cache extracts under `$XDG_CACHE_HOME/onelf/pkg/{id}/` and
 keeps the extraction between runs. A content-addressable store (`cas/`)
 deduplicates files across packages, and auto-GC removes packages unused
 for 30 days (tunable via `ONELF_GC_MAX_AGE`).
+
+Each launch runs from an execution view published beside the
+extraction and keyed by its full identity, generated environment input
+included, which the view carries as `.onelf/runtime-env`. A later launch
+of the same identity reuses the view as it is. An idle view is
+collected once it has gone unused for the same 30 days, and never
+while a launch holds it.
 
 Because it is the one mode that leaves something behind, the runtime
 never falls into it on its own. It runs when one of three things asks
