@@ -938,9 +938,9 @@ fn set_build(set: &SharedSet) -> Result<PathBuf, String> {
 /// or why they cannot be read.
 ///
 /// A build carrying a provider index answers from it: the index is
-/// packed inside the pinned build, the build itself has already matched
-/// the recipe's pin, and the index must name that set, so its exports
-/// belong to exactly that build. A hand-edited `.onelf/sonames` cannot
+/// packed inside the pinned build and the build itself has already
+/// matched the recipe's pin, so its exports belong to exactly that build
+/// whatever name the recipe declares it under. A hand-edited `.onelf/sonames` cannot
 /// add to or change them. A build without an index, one published
 /// before indexes were written, answers from its recorded sonames as
 /// before and needs no republishing. An index that is present but
@@ -948,20 +948,10 @@ fn set_build(set: &SharedSet) -> Result<PathBuf, String> {
 /// to the listing.
 fn shipped_sonames(set: &SharedSet) -> Result<Vec<String>, String> {
     let build = set_build(set)?;
-    let pin = set
-        .blake3
-        .parse::<blake3::Hash>()
-        .map_err(|_| format!("set {}: pin is not a blake3 digest", set.name))?;
     if let Some(bytes) = crate::metadata::read_packed_file(&build, PROVIDER_INDEX_FILE)
         .map_err(|e| format!("{}: {e}", build.display()))?
     {
         let index = onelf_format::provider_index::ProviderIndex::decode(&bytes)
-            .map_err(|e| format!("{}: {e}", build.display()))?;
-        index
-            .verify(&onelf_format::provider_index::ArtifactIdentity {
-                set: set.name.clone(),
-                blake3: *pin.as_bytes(),
-            })
             .map_err(|e| format!("{}: {e}", build.display()))?;
         return Ok(index.exports);
     }
@@ -1007,22 +997,21 @@ pub(crate) fn encode_provider_index(dir: &Path, name: &str) -> io::Result<Vec<u8
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Check a decoded index against the set, pin and verified exports the
-/// packed artifact must have: the index has to name that set, and its
-/// exports have to be exactly what the artifact's objects export.
-/// Anything else is a bounded failure, never a hint.
+/// Check a just-published index against the set and verified exports
+/// the packed artifact must have: the index has to name the set it was
+/// published as, and its exports have to be exactly what the artifact's
+/// objects export. Anything else is a bounded failure, never a hint.
 fn check_index(
     index: &onelf_format::provider_index::ProviderIndex,
     name: &str,
-    pin: [u8; 32],
     exports: &[String],
 ) -> io::Result<()> {
-    index
-        .verify(&onelf_format::provider_index::ArtifactIdentity {
-            set: name.to_string(),
-            blake3: pin,
-        })
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if index.set != name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("provider index names set {}, not {name}", index.set),
+        ));
+    }
     if index.exports != exports {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1043,9 +1032,6 @@ pub(crate) fn verify_set_artifact(
     exports: &[String],
 ) -> io::Result<String> {
     let hash = crate::sysroot_cmd::hash_file(output)?;
-    let pin = hash
-        .parse::<blake3::Hash>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "hash is not a blake3 digest"))?;
     let bytes =
         crate::metadata::read_packed_file(output, PROVIDER_INDEX_FILE)?.ok_or_else(|| {
             io::Error::new(
@@ -1062,7 +1048,7 @@ pub(crate) fn verify_set_artifact(
             format!("{}: {e}", output.display()),
         )
     })?;
-    check_index(&index, name, *pin.as_bytes(), exports)?;
+    check_index(&index, name, exports)?;
     Ok(hash)
 }
 
@@ -1188,8 +1174,8 @@ pub struct SetExport {
 /// read out of the pinned artifact itself.
 ///
 /// The build must carry a provider index: it is the authority for what
-/// the build exports, it is bound to the set and pin the recipe pins,
-/// and a listing alone does not establish what an export's bytes are,
+/// the build exports, it is bound to the pin the recipe pins, and a
+/// listing alone does not establish what an export's bytes are,
 /// so a build without one is refused here rather than taken on its
 /// recorded word. Every payload object the artifact carries is then
 /// decompressed and verified against its recorded content hash, and the
@@ -1197,10 +1183,6 @@ pub struct SetExport {
 /// records, so the hashes always describe the exports the index names.
 pub(crate) fn verified_export_hashes(set: &SharedSet) -> Result<Vec<SetExport>, String> {
     let build = set_build(set)?;
-    let pin = set
-        .blake3
-        .parse::<blake3::Hash>()
-        .map_err(|_| format!("set {}: pin is not a blake3 digest", set.name))?;
     let bytes = crate::metadata::read_packed_file(&build, PROVIDER_INDEX_FILE)
         .map_err(|e| format!("{}: {e}", build.display()))?
         .ok_or_else(|| {
@@ -1210,12 +1192,6 @@ pub(crate) fn verified_export_hashes(set: &SharedSet) -> Result<Vec<SetExport>, 
             )
         })?;
     let index = onelf_format::provider_index::ProviderIndex::decode(&bytes)
-        .map_err(|e| format!("{}: {e}", build.display()))?;
-    index
-        .verify(&onelf_format::provider_index::ArtifactIdentity {
-            set: set.name.clone(),
-            blake3: *pin.as_bytes(),
-        })
         .map_err(|e| format!("{}: {e}", build.display()))?;
 
     let (footer, manifest) = crate::info::read_footer_and_manifest(&build)
@@ -3499,16 +3475,15 @@ mod tests {
     fn a_published_index_must_match_the_verified_exports() {
         let exports = vec!["liba.so.1".to_owned()];
         let index = onelf_format::provider_index::ProviderIndex::new("gtk", &exports).unwrap();
-        let pin = [9u8; 32];
 
-        check_index(&index, "gtk", pin, &exports).unwrap();
-        assert!(check_index(&index, "qt", pin, &exports).is_err());
+        check_index(&index, "gtk", &exports).unwrap();
+        assert!(check_index(&index, "qt", &exports).is_err());
         let other = vec!["libb.so.2".to_owned()];
-        assert!(check_index(&index, "gtk", pin, &other).is_err());
+        assert!(check_index(&index, "gtk", &other).is_err());
         let mut extra = exports.clone();
         extra.push("libb.so.2".to_owned());
-        assert!(check_index(&index, "gtk", pin, &extra).is_err());
-        assert!(check_index(&index, "gtk", pin, &[]).is_err());
+        assert!(check_index(&index, "gtk", &extra).is_err());
+        assert!(check_index(&index, "gtk", &[]).is_err());
     }
 
     /// The database and sysroot tree the eligibility tests share: an

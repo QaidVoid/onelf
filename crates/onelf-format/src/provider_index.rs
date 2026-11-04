@@ -1,9 +1,8 @@
 //! Verified provider index of a pinned set artifact.
 //!
 //! A pinned set artifact is a shared dependency build identified by its
-//! set declaration name and its full BLAKE3 pin. This index records the
-//! loader-namespace names (sonames) that the artifact's shared objects
-//! verifiably export. It is packed inside the artifact it describes, so
+//! full BLAKE3 pin. This index records the loader-namespace names
+//! (sonames) that the artifact's shared objects verifiably export. It is packed inside the artifact it describes, so
 //! its bytes are covered by the artifact's own hash: the index travels
 //! with, and is bound to, exactly the build it names.
 //!
@@ -19,17 +18,16 @@
 //! ```
 //!
 //! A record is a u32 body length followed by a u8 tag and the tag's
-//! fields. The identity record (tag 1) carries the set declaration name
-//! and comes first, exactly once. Each exported-name record (tag 2)
-//! carries one soname. Exported names are sorted by bytes and unique, so
+//! fields. The identity record (tag 1) carries the set name the artifact
+//! was published under and comes first, exactly once. Each exported-name
+//! record (tag 2) carries one soname. Exported names are sorted by bytes and unique, so
 //! decoding rejects duplicates and noncanonical order, and every accepted
 //! byte string re-encodes byte-for-byte.
 //!
 //! Bounds: a file of at most [`MAX_INDEX_BYTES`], at most [`MAX_RECORDS`]
-//! records, and names of one to 128 UTF-8 bytes. A set name is ASCII
-//! letters, digits, `-` and `_`. An exported name never contains NUL or
-//! `/`, which rules out names the loader could not resolve beside the
-//! file.
+//! records, and names of one to 128 UTF-8 bytes. A set name follows
+//! [`RuleId::set_name`]. An exported name never contains NUL or `/`,
+//! which rules out names the loader could not resolve beside the file.
 //!
 //! Providers are distinguished by artifact identity: two artifacts that
 //! export the same name are different providers, because each index is
@@ -38,9 +36,13 @@
 //! produces no record, and consumers must not treat it as a provider on
 //! that string alone.
 //!
+//! An index is bound to its artifact only by the artifact's full pin.
 //! Consumers MUST verify that the bytes an index was decoded from hash to
-//! the pin they expect before trusting its exports; [`ProviderIndex::verify`]
-//! completes that binding given the full digest of the carrying artifact.
+//! the pin they expect before trusting its exports. The recorded set name
+//! is the publisher's and is informational: different consumers may
+//! declare the same artifact under different names, so a consumer never
+//! compares it with its own declaration name.
+//!
 //! An artifact without an index keeps its documented legacy behavior: its
 //! recorded provision listing is used as before and no republishing is
 //! needed. A present but malformed index is a bounded failure, never a
@@ -50,7 +52,7 @@
 
 use std::fmt;
 
-use crate::rules::{MAX_ID_BYTES, MAX_RECORDS};
+use crate::rules::{MAX_ID_BYTES, MAX_RECORDS, RuleId};
 
 /// Format version this build writes and reads.
 pub const VERSION: u16 = 1;
@@ -79,20 +81,6 @@ impl fmt::Display for ProviderIndexError {
 
 impl std::error::Error for ProviderIndexError {}
 
-/// The pinned set artifact an index belongs to: the set declaration name
-/// and the full BLAKE3 digest of the artifact bytes that carry the index.
-///
-/// The pair is a provider identity. Two artifacts with the same
-/// declaration name but different pins are different providers, and the
-/// same name exported by both is a provider difference, not a duplicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactIdentity {
-    /// Set declaration name, as validated by [`ProviderIndex::new`].
-    pub set: String,
-    /// Full BLAKE3 digest of the artifact that carries the index.
-    pub blake3: [u8; 32],
-}
-
 /// The loader-namespace names one pinned set artifact verifiably exports.
 ///
 /// Every export was derived from the `DT_SONAME` of an object packed in
@@ -100,7 +88,7 @@ pub struct ArtifactIdentity {
 /// basenames read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderIndex {
-    /// Set declaration name the index describes.
+    /// Set name the artifact was published under. Informational only.
     pub set: String,
     /// Exported sonames, sorted by bytes and unique.
     pub exports: Vec<String>,
@@ -139,21 +127,6 @@ impl ProviderIndex {
             return Err(ProviderIndexError::new(
                 "exports: names must be sorted and unique",
             ));
-        }
-        Ok(())
-    }
-
-    /// Require this index to describe exactly `identity`.
-    ///
-    /// The caller must already have verified that the bytes the index was
-    /// decoded from hash to `identity.blake3`; this check completes the
-    /// binding by refusing an index that names any other set.
-    pub fn verify(&self, identity: &ArtifactIdentity) -> Result<(), ProviderIndexError> {
-        if self.set != identity.set {
-            return Err(ProviderIndexError::new(&format!(
-                "provider index: names set {}, not {}",
-                self.set, identity.set
-            )));
         }
         Ok(())
     }
@@ -246,20 +219,11 @@ impl ProviderIndex {
     }
 }
 
-/// Require a set declaration name of one to 128 ASCII letters, digits,
-/// `-` and `_`, the same rule the packer applies to set names everywhere.
+/// Require a set name accepted by [`RuleId::set_name`].
 fn validate_set_name(name: &str) -> Result<(), ProviderIndexError> {
-    if name.is_empty()
-        || name.len() > MAX_ID_BYTES
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(ProviderIndexError::new(
-            "set name: requires 1..=128 ASCII letters, digits, - and _",
-        ));
-    }
-    Ok(())
+    RuleId::set_name(name)
+        .map(drop)
+        .map_err(|e| ProviderIndexError::new(&e.to_string()))
 }
 
 /// Require an exported name of one to 128 UTF-8 bytes with no NUL and no
@@ -453,12 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn set_name_rules_match_the_packer() {
+    fn set_name_rules_match_the_pin_tables() {
         for ok in ["gtk", "a", "A-b_1"] {
             assert!(validate_set_name(ok).is_ok(), "{ok}");
+            assert!(RuleId::set_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "qt6.core", "/abs", "a b", "sp ace", &"x".repeat(129)] {
+        for bad in [
+            "",
+            "qt6.core",
+            "/abs",
+            "a b",
+            "sp ace",
+            "-lead",
+            &"x".repeat(129),
+        ] {
             assert!(validate_set_name(bad).is_err(), "{bad}");
+            assert!(RuleId::set_name(bad).is_err(), "{bad}");
         }
         let longest = "x".repeat(128);
         assert!(validate_set_name(&longest).is_ok());
@@ -606,21 +580,6 @@ mod tests {
             .collect();
         let value = ProviderIndex::new("qt", &fitting).unwrap();
         assert_eq!(value.exports.len(), MAX_RECORDS - 1);
-    }
-
-    #[test]
-    fn verify_binds_the_set_of_an_identity() {
-        let value = index();
-        let identity = ArtifactIdentity {
-            set: "gtk".to_owned(),
-            blake3: [7; 32],
-        };
-        assert!(value.verify(&identity).is_ok());
-        let other = ArtifactIdentity {
-            set: "qt".to_owned(),
-            blake3: [7; 32],
-        };
-        assert!(value.verify(&other).is_err());
     }
 
     /// A file above the size bound is refused before any field is read.
