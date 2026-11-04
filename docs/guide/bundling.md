@@ -46,7 +46,11 @@ With no flags, this:
    comes the data it reads from a path compiled into it: libasound
    brings `share/alsa`, libxkbcommon `share/X11/xkb`, libX11
    `share/X11/locale`, and libmagic its compiled database
-   `magic.mgc`, each copied from beside the resolved library. The
+   `magic.mgc`, each copied from beside the resolved library. When
+   that library is already in the AppDir, put there by the Wayland
+   copier or shipped by the publisher, the data is looked for beside
+   the host copy it came from or that its soname resolves to, after
+   the AppDir's own. A sysroot build never looks on the host. The
    carry is automatic and adds bulk on every matching bundle: a
    GUI toolkit's libxkbcommon brings roughly 3 MB of keymap data,
    libasound about 150 KB. A tree bundled by an older onelf is
@@ -493,6 +497,28 @@ variables = ["VENDOR_PLUGIN_DIR"]
 selection = "first"
 inheritance = "replace"
 candidates = [{ base = "library-root", path = "vendor-plugins" }]
+```
+
+A plugin group collects every compatible member of its directory
+unless it lists `members`: paths relative to the found directory, such
+as `"support/libspa-support.so"`. Then only those members are
+collected, and a listed member the source lacks is simply absent. The
+built-in PipeWire and SPA rules use this to carry the client side
+alone: the modules `client.conf` loads into an application's context,
+the SPA support plugins and the audio converter. The daemon's protocol
+servers, device plugins and Bluetooth codecs are left behind, along
+with the libraries they pull in. The PipeWire rule also carries
+`share/pipewire/client.conf`, without which a client context does not
+start, and points `PIPEWIRE_CONFIG_DIR` at it.
+
+```toml
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/vendor-plugins"
+requirement = "optional"
+candidates = [{ base = "library-dir", path = "vendor-plugins" }]
+members = ["libvendor-core.so", "codecs/libvendor-pcm.so"]
 ```
 
 - ✅ The rules are parsed and checked with the built-ins before the

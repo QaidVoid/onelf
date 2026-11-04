@@ -144,6 +144,9 @@ variable; see [Which values the caller can override](#which-values-the-caller-ca
   `share/drirc.d/`, from the package or else the GL build
 - `LIBDECOR_PLUGIN_DIR` for `share/libdecor/plugins-1/`
 - `XKB_CONFIG_ROOT` for `share/X11/xkb/`
+- `PIPEWIRE_CONFIG_DIR` for `share/pipewire/`, where the PipeWire rule
+  carries `client.conf`. PipeWire reads only that directory then, so a
+  caller who wants their own client configuration sets this variable
 - `GDK_PIXBUF_MODULE_FILE` and `GTK_IM_MODULE_FILE` for the
   `loaders.cache` under `lib/gdk-pixbuf-2.0/*/` and the
   `immodules.cache` under `lib/gtk-3.0/*/`, rewritten with absolute
@@ -314,7 +317,7 @@ and `VK_ADD_DRIVER_FILES`, which stop the runtime from building
 `VK_DRIVER_FILES` at all),
 `DRIRC_CONFIGDIR`, `LIBDRM_IDS_PATH` and `XKB_CONFIG_ROOT`. So do
 the data variables a user sets to choose other data: `ALSA_CONFIG_PATH`,
-`XLOCALEDIR`, `MAGIC` and `TEXTDOMAINDIR`. `ALSA_CONFIG_DIR` is the
+`XLOCALEDIR`, `MAGIC`, `TEXTDOMAINDIR` and `PIPEWIRE_CONFIG_DIR`. `ALSA_CONFIG_DIR` is the
 exception: the carried `alsa.conf` hook is anchored at the data
 directory, so an inherited value would point the hook away from the
 package's own snippets, and the package's copy replaces it.

@@ -48,6 +48,7 @@ another directory, it passes the original one as `ONELF_USER_CWD`.
 | `GST_PLUGIN_SYSTEM_PATH_1_0`, `GST_PLUGIN_SYSTEM_PATH` | a library directory of the package or a set has `gstreamer-1.0/` | colon-joined list of those dirs. Replaces a value the caller set. |
 | `GST_PLUGIN_SCANNER_1_0`, `GST_PLUGIN_SCANNER` | the bundle carries `gst-plugin-scanner` in `gstreamer-1.0/`, `gstreamer1.0/gstreamer-1.0/` or `libexec/gstreamer-1.0/` | that scanner. Replaces a value the caller set. |
 | `PIPEWIRE_MODULE_DIR`, `SPA_PLUGIN_DIR` | a library directory has `pipewire-0.3/` or `spa-0.2/` | colon-joined list of those dirs. Replaces a value the caller set. |
+| `PIPEWIRE_CONFIG_DIR` | `share/pipewire/` exists | that dir, which holds the carried `client.conf`. PipeWire then reads its client configuration there alone, so drop-ins under `~/.config/pipewire` are not read. A value the caller set wins. |
 | `ALSA_PLUGIN_DIR` | a library directory has `alsa-lib/` | the first such dir. Replaces a value the caller set. |
 | `GI_TYPELIB_PATH` | a library directory has `girepository-1.0/` | colon-joined list of those dirs. Replaces a value the caller set. |
 | `LIBHEIF_PLUGIN_PATH` | a library directory has `libheif/` | colon-joined list of their `plugins/` subdirs, or of the dirs themselves where they have none. Replaces a value the caller set. |
