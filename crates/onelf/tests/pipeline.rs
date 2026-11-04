@@ -1448,6 +1448,50 @@ fn bundle_with_plugin_tree(
     Some((app, c.output().expect("spawn onelf bundle-libs")))
 }
 
+/// Same-named plugin members at different places in a group's layout
+/// all arrive, each at its own destination with the bytes found there,
+/// and a symlinked member, an ALSA module alias, arrives under its own
+/// name from the file it names.
+#[test]
+fn nested_same_named_and_symlinked_members_all_arrive() {
+    let td = workdir("plugin-nested-names");
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "babl-0.1",
+            &["cmyk.so", "x86-64-v2/cmyk.so", "x86-64-v3/cmyk.so"],
+        ),
+        ("alsa-lib", &["libasound_module_pcm_pulse.so"]),
+    ];
+    let Some(libdir) = plugin_tree_sources(&td, &["libbabl-0.1.so.0", "libasound.so.2"], groups)
+    else {
+        return;
+    };
+    std::os::unix::fs::symlink(
+        "libasound_module_pcm_pulse.so",
+        libdir.join("alsa-lib/libasound_module_pcm_alias.so"),
+    )
+    .unwrap();
+    let Some((app, out)) =
+        bundle_with_plugin_tree(&td, &["libbabl-0.1.so.0", "libasound.so.2"], &libdir)
+    else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    for rel in ["cmyk.so", "x86-64-v2/cmyk.so", "x86-64-v3/cmyk.so"] {
+        assert!(
+            app.join("lib/babl-0.1").join(rel).is_file(),
+            "babl {rel} arrives at its own place:\n{err}"
+        );
+    }
+    assert!(
+        app.join("lib/alsa-lib/libasound_module_pcm_alias.so")
+            .exists(),
+        "the module alias arrives:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Every activated framework group arrives complete and in its
 /// preserved layout, with no `--include` and no `--search-path` per
 /// plugin: the app names only the framework sonames, the search path
@@ -13587,7 +13631,7 @@ fn a_policy_removed_need_of_a_retained_object_names_the_removal() {
         error,
         "error: bin/app needs libpinned.so.1, which core holds but the policy \
          or a trace removed; the conflict stops the build rather than dropping \
-         the object or restoring the file",
+         the object or restoring the file (entrypoint 'app')",
         "{stderr}"
     );
     assert_eq!(
@@ -14874,6 +14918,142 @@ fn an_entrypoints_unselected_set_fails_its_build_with_attribution() {
         "sets = [\"alpha\", \"beta\"]",
         "sets = [\"alpha\"]",
     );
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(pkg.is_file(), "the passing build packs");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A database-backed sysroot whose package owns the `cli` and `gui`
+/// entrypoints, each needing `libalpha.so.1`, which the `libalpha`
+/// package owns and the recipe's sets replace. Returns the archive a
+/// recipe materializes the sysroot from, or None without a compiler.
+fn selection_sysroot_archive(td: &Path, tree_a: &Path) -> Option<PathBuf> {
+    let rootfs = td.join("selroot");
+    for d in ["usr/bin", "usr/lib"] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    let cli_dir = td.join("selbins");
+    for rel in ["bin/cli", "bin/gui"] {
+        if !entrypoint_app(td, &cli_dir, rel, tree_a, "libalpha.so.1") {
+            return None;
+        }
+        std::fs::copy(cli_dir.join(rel), rootfs.join("usr").join(rel)).unwrap();
+    }
+    std::fs::copy(
+        tree_a.join("lib/libalpha.so.1.0.0"),
+        rootfs.join("usr/lib/libalpha.so.1"),
+    )
+    .unwrap();
+    let (Some(host_libc), Some(host_ld)) = (
+        ldd_path(&rootfs.join("usr/bin/cli"), "libc.so.6"),
+        ldd_path(&rootfs.join("usr/bin/cli"), "ld-linux"),
+    ) else {
+        return None;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "libalpha",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &["usr/lib/libalpha.so.1"],
+    );
+    write_pacman_entry(&rootfs, "libbeta", "1.0-1", &["glibc"], &[], &[]);
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "libalpha"],
+        &[],
+        &["usr/bin/cli", "usr/bin/gui"],
+    );
+    let archive = td.join("selroot.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+    Some(archive)
+}
+
+/// The per-entrypoint provider audit runs for a database-backed sysroot
+/// build too, whose sets live in the sysroot section: an entrypoint
+/// whose selection leaves out the set that exports its library fails
+/// with the same attribution a sysroot-less build gives, rather than
+/// being served by the union of every declared set, and selecting the
+/// set builds.
+#[test]
+fn a_sysroot_entrypoints_unselected_set_fails_its_build_with_attribution() {
+    let td = workdir("syssetsel");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libalpha.so.1",
+        "int libalpha_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_library(
+        &td,
+        "beta",
+        "libbeta.so.1",
+        "int libbeta_value(void){return 2;}\n",
+    )
+    .expect("compile beta");
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+    let Some(archive) = selection_sysroot_archive(&td, &tree_a) else {
+        return;
+    };
+    let recipe = |dir: &Path, command_sets: &str| {
+        write(
+            &dir.join("onelf.toml"),
+            &format!(
+                "[package]\ncommand = \"bin/cli\"\nmtime = 0\n{command_sets}\n\n\
+                 [sysroot]\npath = \"../selsysroot\"\narchive = \"{}\"\n\n\
+                 [sysroot.sets.alpha]\npackages = [\"libalpha\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n\n\
+                 [sysroot.sets.beta]\npackages = [\"libbeta\"]\nurl = \"file://{}\"\nblake3 = \"{hash_b}\"\n\n\
+                 [[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\nsets = [\"alpha\"]\n",
+                archive.display(),
+                set_a.display(),
+                set_b.display(),
+            ),
+        );
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    recipe(&dir, "sets = [\"beta\"]");
+    let pkg = td.join("s.onelf");
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("provider audit failed"), "{err}");
+    assert!(err.contains("entrypoint 'cli'"), "{err}");
+    assert!(err.contains("bin/cli needs libalpha.so.1"), "{err}");
+    assert!(
+        err.contains("which alpha exports and the entrypoint does not select"),
+        "{err}"
+    );
+    assert!(!err.contains("entrypoint 'gui'"), "{err}");
+    assert!(!pkg.exists(), "a refused build writes no output");
+
+    recipe(&dir, "sets = [\"alpha\", \"beta\"]");
     let o = build_recipe(&dir, &pkg);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{err}");
@@ -22150,8 +22330,8 @@ fn a_host_scan_build_attributes_its_source() {
     assert_eq!(
         summary_lines(&stderr),
         [
-            "Source: host scan; unresolved dependencies are warnings, \
-             not failures",
+            "Source: host scan; unresolved required dependencies fail the \
+             build, host-platform providers are reported",
             "Not inferred: computed plugin paths, script subprocesses, \
              application assets, kernel features and external services are \
              not audited",
@@ -22159,6 +22339,81 @@ fn a_host_scan_build_attributes_its_source() {
         "{stderr}"
     );
 
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A high-level host-scan build is strict: an entrypoint whose required
+/// library the scan cannot find fails `onelf build` and `onelf run
+/// --bundle`, naming the object, the soname and the entrypoint, and no
+/// package is written. The low-level `bundle-libs` over the same tree
+/// keeps its warning and succeeds.
+#[test]
+fn a_host_scan_build_fails_on_a_missing_required_dependency() {
+    let td = workdir("hoststrict");
+    let libs = td.join("gone");
+    std::fs::create_dir_all(&libs).unwrap();
+    write(&td.join("dep.c"), "int missingdep_value(void){return 3;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libmissingdep.so.1",
+            td.join("dep.c").to_str().unwrap(),
+        ],
+        &libs.join("libmissingdep.so.1"),
+    ) {
+        let _ = std::fs::remove_dir_all(&td);
+        return; // no compiler: documented soft-skip
+    }
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &td.join("app.c"),
+        "int missingdep_value(void);\nint main(void){return missingdep_value() == 3 ? 0 : 1;}\n",
+    );
+    assert!(cc_with(
+        &[
+            td.join("app.c").to_str().unwrap(),
+            &format!("-L{}", libs.display()),
+            "-l:libmissingdep.so.1",
+        ],
+        &dir.join("bin/app"),
+    ));
+    std::fs::remove_dir_all(&libs).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"hoststrict\"\ncommand = \"bin/app\"\nmtime = 0\n",
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("bin/app needs libmissingdep.so.1"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("entrypoint '"), "{stderr}");
+    let packages: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "onelf"))
+        .collect();
+    assert!(packages.is_empty(), "a refused build writes no output");
+
+    let mut run = dev_run(&td, &["--bundle"]);
+    run.arg(&dir);
+    let out = run.output().expect("spawn onelf run");
+    let run_err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{run_err}");
+    assert!(run_err.contains("libmissingdep.so.1"), "{run_err}");
+
+    let out = run_onelf(&["bundle-libs", dir.to_str().unwrap()], None);
+    let low = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{low}");
+    assert!(
+        low.contains("warning:") && low.contains("libmissingdep.so.1"),
+        "{low}"
+    );
     let _ = std::fs::remove_dir_all(&td);
 }
 

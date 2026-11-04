@@ -6,7 +6,7 @@ use super::*;
 mod candidates;
 pub(crate) use candidates::{
     AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, MissReason,
-    discover_group,
+    discover_group, resolve_within,
 };
 
 /// Scan `dir` for existing shared libraries. Returns the set of sonames

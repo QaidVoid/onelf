@@ -156,6 +156,16 @@ pub(crate) enum PlanFinding {
         /// Where the destination came from.
         source: String,
     },
+    /// A planned destination's parent directory is a symlink in the
+    /// tree, so the write would land wherever the link points.
+    ThroughLink {
+        /// The destination planned beneath the link.
+        dest: PathBuf,
+        /// The tree path that is a symlink.
+        link: PathBuf,
+        /// Where the destination came from.
+        source: String,
+    },
     /// A formerly generated path publication stops on, judged by the
     /// generated ledger's own disposition.
     Generated(GeneratedFinding),
@@ -168,7 +178,8 @@ impl PlanFinding {
             PlanFinding::ConflictingContent { dest, .. }
             | PlanFinding::KindClash { dest, .. }
             | PlanFinding::PublisherCollision { dest, .. }
-            | PlanFinding::Escape { dest, .. } => dest,
+            | PlanFinding::Escape { dest, .. }
+            | PlanFinding::ThroughLink { dest, .. } => dest,
             PlanFinding::Overlap { file, .. } => file,
             PlanFinding::SourceChanged { source, .. } => source,
             PlanFinding::Generated(finding) => Path::new(&finding.path),
@@ -185,7 +196,8 @@ impl PlanFinding {
             PlanFinding::PublisherCollision { .. } => 3,
             PlanFinding::Escape { .. } => 4,
             PlanFinding::SourceChanged { .. } => 5,
-            PlanFinding::Generated(_) => 6,
+            PlanFinding::ThroughLink { .. } => 6,
+            PlanFinding::Generated(_) => 7,
         }
     }
 }
@@ -262,6 +274,14 @@ impl std::fmt::Display for PlanFinding {
                 "{}: destination planned by {} reaches outside the tree",
                 dest.display(),
                 source
+            ),
+            PlanFinding::ThroughLink { dest, link, source } => write!(
+                f,
+                "{}: destination planned by {} passes through the symlink {}, so the write \
+                 would land wherever it points; replace the link with a directory",
+                dest.display(),
+                source,
+                link.display()
             ),
             PlanFinding::Generated(finding) => {
                 let replaced = if finding.refreshable {
@@ -381,14 +401,16 @@ pub(crate) fn tree_hash(root: &Path) -> io::Result<blake3::Hash> {
                 stack.push((child_rel, child, depth + 1));
                 continue;
             }
-            hasher.update(child_rel.as_os_str().as_encoded_bytes());
-            hasher.update(b"\0");
             if kind.is_file() {
+                hasher.update(child_rel.as_os_str().as_encoded_bytes());
+                hasher.update(b"\0");
                 hasher.update(b"file ");
                 hasher.update_reader(fs::File::open(&child)?)?;
             } else if kind.is_symlink() {
                 let target = fs::read_link(&child)?;
                 if target.is_relative() {
+                    hasher.update(child_rel.as_os_str().as_encoded_bytes());
+                    hasher.update(b"\0");
                     hasher.update(b"link ");
                     hasher.update(target.as_os_str().as_encoded_bytes());
                 }
@@ -401,6 +423,26 @@ pub(crate) fn tree_hash(root: &Path) -> io::Result<blake3::Hash> {
 /// Whether `rel` is a plain relative path with no way out of the tree.
 fn is_plain_rel(rel: &Path) -> bool {
     !rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// The first existing directory above `rel` under `appdir` that is a
+/// symlink, relative to `appdir`, read without following any link. A
+/// destination beneath one would be written wherever the link points.
+pub(crate) fn symlinked_ancestor(appdir: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut ancestors: Vec<&Path> = rel
+        .ancestors()
+        .skip(1)
+        .filter(|a| !a.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        match fs::symlink_metadata(appdir.join(ancestor)) {
+            Ok(meta) if meta.file_type().is_symlink() => return Some(ancestor.to_path_buf()),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 impl DestinationPlan {
@@ -453,7 +495,29 @@ impl DestinationPlan {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"file ");
         hasher.update_reader(fs::File::open(path)?)?;
-        let actual = hasher.finalize();
+        self.check_stamp(path, stamp, hasher.finalize())
+    }
+
+    /// The bytes a source holds now, read once and checked against the
+    /// stamp planning took, so what the caller writes is exactly what
+    /// was verified. A source planning never stamped is read as is.
+    pub(crate) fn read_verified(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let bytes = fs::read(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        if let Some(stamp) = self.sources.get(path) {
+            self.check_stamp(path, stamp, file_hash(&bytes))?;
+        }
+        Ok(bytes)
+    }
+
+    /// The finding for a source whose content no longer hashes to its
+    /// stamp.
+    fn check_stamp(
+        &self,
+        path: &Path,
+        stamp: &SourceStamp,
+        actual: blake3::Hash,
+    ) -> io::Result<()> {
         if actual == stamp.hash {
             return Ok(());
         }
@@ -468,8 +532,9 @@ impl DestinationPlan {
         ))
     }
 
-    /// Verify a directory source still holds the aggregate the plan
-    /// recorded for the destination `rel`.
+    /// Verify a directory holds the aggregate the plan recorded for the
+    /// destination `rel`: the source before a copy, or the copy itself
+    /// after, which proves the bytes written are the bytes planned.
     pub(crate) fn verify_tree(&self, src: &Path, rel: &Path) -> io::Result<()> {
         let Some(entry) = self.entries.get(rel) else {
             return Ok(());
@@ -526,6 +591,30 @@ impl DestinationPlan {
         src: &Path,
         origin: &str,
     ) -> io::Result<Admission> {
+        self.admit_source(rel, src, origin, false)
+    }
+
+    /// Admit one file the build copies from `src` and refreshes on every
+    /// run, a framework library say: judged like a carried file, except
+    /// that the build's own unchanged output from a previous run is
+    /// rewritten from the current source rather than kept.
+    pub(crate) fn admit_refreshed(
+        &mut self,
+        rel: &Path,
+        src: &Path,
+        origin: &str,
+    ) -> io::Result<Admission> {
+        self.admit_source(rel, src, origin, true)
+    }
+
+    /// The shared admission path for a destination copied from `src`.
+    fn admit_source(
+        &mut self,
+        rel: &Path,
+        src: &Path,
+        origin: &str,
+        refresh: bool,
+    ) -> io::Result<Admission> {
         let meta = fs::symlink_metadata(src)?;
         let kind = if meta.is_dir() {
             PlannedKind::Dir
@@ -535,13 +624,18 @@ impl DestinationPlan {
         let planned = if meta.is_dir() {
             tree_hash(src)?
         } else {
-            file_hash(&fs::read(src)?)
+            let bytes = fs::read(src)?;
+            self.note_source(src, &bytes)?;
+            file_hash(&bytes)
         };
         if !is_plain_rel(rel) {
             self.findings.push(PlanFinding::Escape {
                 dest: rel.to_path_buf(),
                 source: origin.to_string(),
             });
+            return Ok(Admission::Rejected);
+        }
+        if !self.check_ancestors(rel, origin) {
             return Ok(Admission::Rejected);
         }
         if let Some(prev) = self.entries.get(rel).cloned() {
@@ -575,7 +669,7 @@ impl DestinationPlan {
                 if actual == planned && existing_kind == kind {
                     Admission::Skip
                 } else {
-                    self.judge_carried(rel, existing_kind, actual, planned, origin)?
+                    self.judge_carried(rel, existing_kind, actual, planned, origin, refresh)?
                 }
             }
         };
@@ -650,6 +744,9 @@ impl DestinationPlan {
             });
             return Ok(Admission::Rejected);
         }
+        if !self.check_ancestors(rel, origin) {
+            return Ok(Admission::Rejected);
+        }
         if let Some(prev) = self.entries.get(rel).cloned() {
             if prev.kind == PlannedKind::Link && kind == PlannedKind::File {
                 self.entries.insert(
@@ -706,8 +803,9 @@ impl DestinationPlan {
 
     /// Decide what happens to existing content at a carried data
     /// destination: identical bytes satisfy the carry, the ledger's
-    /// disposition answers for the build's own output, a legacy entry
-    /// the plan rewrites is left for the copy to migrate, and anything
+    /// disposition answers for the build's own output, a legacy
+    /// path-only entry whose bytes differ from the carry proves nothing
+    /// and is an ownership conflict the author resolves, and anything
     /// else is a publisher collision.
     fn judge_carried(
         &mut self,
@@ -716,16 +814,17 @@ impl DestinationPlan {
         actual: blake3::Hash,
         planned: blake3::Hash,
         origin: &str,
+        refresh: bool,
     ) -> io::Result<Admission> {
         if existing_kind == PlannedKind::File
             && let Some(entry) = self.ledger.get(rel.to_string_lossy().as_ref())
         {
             match decide_generated_disposal(entry, Some(actual)) {
+                Disposition::Dispose | Disposition::Excuse if refresh => {
+                    return Ok(Admission::Write);
+                }
                 Disposition::Dispose | Disposition::Excuse => return Ok(Admission::Skip),
                 Disposition::Absent => return Ok(Admission::Write),
-                Disposition::Conflict(GeneratedConflict::Unproven { .. }) => {
-                    return Ok(Admission::Skip);
-                }
                 Disposition::Conflict(why) => {
                     self.findings.push(PlanFinding::Generated(GeneratedFinding {
                         path: rel.to_string_lossy().into_owned(),
@@ -744,6 +843,23 @@ impl DestinationPlan {
             planned,
         });
         Ok(Admission::Rejected)
+    }
+
+    /// Whether every existing directory above `rel` in the tree is a
+    /// real directory. A symlink there would carry the write wherever
+    /// it points, so the plan records the finding instead.
+    fn check_ancestors(&mut self, rel: &Path, origin: &str) -> bool {
+        match symlinked_ancestor(&self.appdir, rel) {
+            Some(link) => {
+                self.findings.push(PlanFinding::ThroughLink {
+                    dest: rel.to_path_buf(),
+                    link,
+                    source: origin.to_string(),
+                });
+                false
+            }
+            None => true,
+        }
     }
 
     /// Whether `rel` can hold a `kind` destination beside what the
@@ -998,18 +1114,73 @@ mod tests {
         assert!(plan.error().to_string().contains("ledger records"));
     }
 
-    /// A source stamped at planning time verifies while its content
-    /// stands and fails with a finding once its bytes change.
+    /// A destination beneath a symlinked tree directory is refused
+    /// before anything is written, wherever the link points, and a
+    /// legacy path-only ledger entry whose bytes differ from the carry
+    /// is preserved as an ownership conflict, never silently kept or
+    /// replaced.
+    #[test]
+    fn symlinked_parents_and_unproven_legacy_paths_stop_the_plan() {
+        let (dir, mut plan) = seeded("throughlink");
+        fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("lib")).unwrap();
+        let out = plan
+            .admit_file(
+                Path::new("lib/libfoo.so.1"),
+                file_hash(b"x"),
+                "walk",
+                Existing::SkipOnAny,
+            )
+            .unwrap();
+        assert_eq!(out, Admission::Rejected);
+        let text = plan.error().to_string();
+        assert!(text.contains("passes through the symlink lib"), "{text}");
+
+        let (dir, _plan) = seeded("legacycarry");
+        fs::create_dir_all(dir.join("share/.onelf")).unwrap();
+        fs::create_dir_all(dir.join(".onelf")).unwrap();
+        fs::write(dir.join("share/data.conf"), b"maybe a publisher edit").unwrap();
+        fs::write(
+            dir.join(crate::bundle::sysroot::GENERATED_FILE),
+            "share/data.conf\n",
+        )
+        .unwrap();
+        fs::write(dir.join("src"), b"what the carry writes").unwrap();
+        let mut plan = DestinationPlan::load(&dir).unwrap();
+        let legacy = plan
+            .admit_carried(Path::new("share/data.conf"), &dir.join("src"), "carry")
+            .unwrap();
+        assert_eq!(legacy, Admission::Rejected);
+        assert!(
+            matches!(
+                plan.findings().as_slice(),
+                [PlanFinding::Generated(GeneratedFinding {
+                    why: GeneratedConflict::Unproven { .. },
+                    ..
+                })]
+            ),
+            "{:?}",
+            plan.findings()
+        );
+        assert_eq!(
+            fs::read(dir.join("share/data.conf")).unwrap(),
+            b"maybe a publisher edit"
+        );
+    }
+
+    /// A source stamped at planning time reads back verified while its
+    /// content stands, and the read the copy writes from fails with a
+    /// finding once its bytes change, whatever its timestamps say.
     #[test]
     fn a_changed_source_fails_verification_by_content() {
         let (dir, mut plan) = seeded("source");
         let src = dir.join("src.so");
         fs::write(&src, b"planned").unwrap();
         plan.note_source(&src, b"planned").unwrap();
-        plan.verify_source(&src).unwrap();
+        assert_eq!(plan.read_verified(&src).unwrap(), b"planned");
 
         fs::write(&src, b"changed").unwrap();
-        let err = plan.verify_source(&src).unwrap_err();
+        let err = plan.read_verified(&src).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("changed while the bundle"), "{text}");
         assert!(text.contains("src.so"), "{text}");

@@ -335,7 +335,7 @@ const MAX_CANDIDATE_LINKS: usize = 40;
 /// is taken against the link's directory; an absolute one keeps the
 /// machine's own meaning of `/` and is refused when it names a place
 /// outside the root.
-fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, MissReason> {
+pub(crate) fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, MissReason> {
     let mut out = PathBuf::new();
     let mut pending: Vec<std::ffi::OsString> = rel
         .components()

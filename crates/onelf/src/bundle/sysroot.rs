@@ -6,7 +6,7 @@
 //! line, the policy and an optional trace decide what stays out. Nothing
 //! from the packer's own machine is consulted.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -460,6 +460,12 @@ pub fn populate(appdir: &Path, opts: &SysrootOptions) -> io::Result<(SysrootRepo
         }
     };
 
+    // Every destination the population writes is judged before the
+    // disposal or the first copy touches the tree.
+    let collisions = population_collisions(appdir, root, &pruned.kept)?;
+    if !collisions.is_empty() {
+        return Err(population_collision_error(&collisions));
+    }
     let conflicts = dispose_generated(appdir, root, &pruned.kept)?;
     if !conflicts.is_empty() {
         return Err(generated_conflict_error(&conflicts));
@@ -1252,6 +1258,7 @@ pub(crate) struct VerifiedSet {
     footer: onelf_format::Footer,
     manifest: onelf_format::Manifest,
     codec: onelf_format::payload::Codec,
+    files: HashMap<String, usize>,
 }
 
 impl VerifiedSet {
@@ -1263,6 +1270,13 @@ impl VerifiedSet {
         let file = fs::File::open(&build).map_err(|e| format!("{}: {e}", build.display()))?;
         let codec = onelf_format::payload::Codec::open(&file, &footer)
             .map_err(|e| format!("{}: {e}", build.display()))?;
+        let files = manifest
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == onelf_format::EntryKind::File)
+            .map(|(at, _)| (manifest.entry_path(at), at))
+            .collect();
         Ok(Self {
             set: set.name.clone(),
             build,
@@ -1270,6 +1284,7 @@ impl VerifiedSet {
             footer,
             manifest,
             codec,
+            files,
         })
     }
 
@@ -1302,15 +1317,7 @@ impl VerifiedSet {
     /// they are returned, so a corrupted payload is an error naming the
     /// build and the path, never a partial answer.
     pub(crate) fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
-        let at = self
-            .manifest
-            .entries
-            .iter()
-            .enumerate()
-            .position(|(at, e)| {
-                e.kind == onelf_format::EntryKind::File && self.manifest.entry_path(at) == path
-            });
-        let Some(at) = at else {
+        let Some(&at) = self.files.get(path) else {
             return Ok(None);
         };
         let entry = &self.manifest.entries[at];
@@ -1844,6 +1851,79 @@ fn expected_output_hash(root: &Path, rel: &str) -> io::Result<Option<blake3::Has
     Ok(Some(hasher.finalize()))
 }
 
+/// The destinations the population of `kept` would replace without
+/// the authority to: a path whose existing content differs from what
+/// the sysroot supplies and that the ledger does not record as the
+/// build's own output, and a path beneath a symlinked tree directory,
+/// where the copy would land wherever the link points. A recorded path
+/// is left to [`dispose_generated`], which judges it by content. Reads
+/// only, so a finding stops the build before anything is written.
+fn population_collisions(appdir: &Path, root: &Path, kept: &[String]) -> io::Result<Vec<String>> {
+    let recorded: HashSet<String> = read_generated(appdir)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    let mut findings = Vec::new();
+    for rel in kept {
+        let dest_rel = appdir_path(rel);
+        if let Some(link) = super::plan::symlinked_ancestor(appdir, Path::new(dest_rel)) {
+            findings.push(format!(
+                "{dest_rel}: passes through the symlink {}, so the copy would land wherever \
+                 it points; replace the link with a directory",
+                link.display()
+            ));
+            continue;
+        }
+        let dest = appdir.join(dest_rel);
+        let Some(actual) = hash_entry(&dest)? else {
+            continue;
+        };
+        if recorded.contains(dest_rel) {
+            continue;
+        }
+        let Some(expected) = expected_output_hash(root, rel)? else {
+            continue;
+        };
+        // A link planned where the tree holds a directory is left
+        // alone by the copy, so it replaces nothing.
+        let src_is_link = entry_in_root(root, Path::new(rel))
+            .ok()
+            .and_then(|src| fs::symlink_metadata(src).ok())
+            .is_some_and(|m| m.file_type().is_symlink());
+        if src_is_link && dest.is_dir() {
+            continue;
+        }
+        if actual != expected {
+            findings.push(format!(
+                "{dest_rel}: holds content hashing to {actual}, but the sysroot's {rel} \
+                 hashes to {expected}; the build would replace it, so remove the existing \
+                 path or move it to one the build does not write"
+            ));
+        }
+    }
+    findings.sort();
+    Ok(findings)
+}
+
+/// The bounded error a population collision stops the build with,
+/// before anything was written.
+fn population_collision_error(findings: &[String]) -> io::Error {
+    const SHOWN: usize = 8;
+    let mut text = format!(
+        "populating from the sysroot stopped before anything was written; {} conflict(s):\n",
+        findings.len()
+    );
+    for finding in findings.iter().take(SHOWN) {
+        text.push_str("  ");
+        text.push_str(finding);
+        text.push('\n');
+    }
+    if findings.len() > SHOWN {
+        text.push_str(&format!("  and {} more\n", findings.len() - SHOWN));
+    }
+    io::Error::new(io::ErrorKind::InvalidData, text)
+}
+
 /// Remove what a previous build generated, judging each recorded path
 /// by content before anything is touched: a file whose bytes still
 /// match its recorded hash goes, and the directories it emptied go
@@ -1855,10 +1935,11 @@ fn expected_output_hash(root: &Path, rel: &str) -> io::Result<Option<blake3::Has
 /// longer names it and left for the copy to replace when it does. A
 /// path-only legacy entry is adopted, and its file removed, when the
 /// file provably equals the output this build would write for it,
-/// which `kept`, the sysroot paths the plan copies, supplies; a legacy
-/// path the plan no longer writes proves nothing and stops publication
-/// with a finding rather than being guessed safe to delete. Nothing is
-/// removed while any path conflicts.
+/// which `kept`, the sysroot paths the plan copies, supplies. Any other
+/// legacy path proves nothing about its bytes, whether the plan still
+/// writes it or not, so it is preserved and stops publication as an
+/// ownership conflict rather than being guessed safe to delete or
+/// replace. Nothing is removed while any path conflicts.
 pub(crate) fn dispose_generated(
     appdir: &Path,
     root: &Path,
@@ -1902,13 +1983,6 @@ pub(crate) fn dispose_generated(
                 }
             }
             Disposition::Conflict(why) => {
-                // A legacy path the plan still writes is re-derived by
-                // this build either way, so its unproven bytes are
-                // replaced rather than packed; only a path nothing
-                // reproduces has to stand on proof.
-                if judged.hash.is_none() && planned.contains_key(entry.path.as_str()) {
-                    continue;
-                }
                 findings.push(GeneratedFinding {
                     path: entry.path.clone(),
                     refreshable: planned.contains_key(entry.path.as_str()),
@@ -2757,19 +2831,58 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A legacy entry whose file matches nothing the plan writes is
-    /// not adopted, but the plan rewrites the path, so the file is
-    /// left for the copy to replace and nothing conflicts: the next
-    /// record names the build's own bytes, and the ledger has
-    /// migrated.
+    /// A populated destination already holding different content that
+    /// no ledger entry records is the publisher's: the population stops
+    /// before the disposal or any copy runs, naming the path and both
+    /// hashes, and the file is untouched. Identical content and a path
+    /// the ledger records pass the check.
     #[test]
-    fn a_mismatched_legacy_file_the_plan_writes_is_left_for_the_copy() {
+    fn a_publisher_file_at_a_populated_destination_stops_before_writing() {
+        let root = std::env::temp_dir().join(format!("onelf-popcollide-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        let appdir = root.join("appdir");
+        fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(sysroot.join("usr/lib/libfoo.so.1"), b"sysroot bytes").unwrap();
+        fs::write(sysroot.join("usr/lib/libsame.so.1"), b"same bytes").unwrap();
+        fs::write(appdir.join("lib/libfoo.so.1"), b"publisher bytes").unwrap();
+        fs::write(appdir.join("lib/libsame.so.1"), b"same bytes").unwrap();
+        let kept = vec![
+            "usr/lib/libfoo.so.1".to_string(),
+            "usr/lib/libsame.so.1".to_string(),
+        ];
+        let findings = population_collisions(&appdir, &sysroot, &kept).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].starts_with("lib/libfoo.so.1:"), "{findings:?}");
+        assert!(findings[0].contains("would replace it"), "{findings:?}");
+        assert_eq!(
+            fs::read(appdir.join("lib/libfoo.so.1")).unwrap(),
+            b"publisher bytes"
+        );
+
+        record_generated(&appdir, vec!["lib/libfoo.so.1".to_string()]).unwrap();
+        assert!(
+            population_collisions(&appdir, &sysroot, &kept)
+                .unwrap()
+                .is_empty(),
+            "a recorded path is left to the ledger's disposal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A legacy path-only entry the plan still writes, whose bytes are
+    /// not the output this build reproduces, proves nothing: the file is
+    /// preserved and the build stops with an ownership conflict naming
+    /// the path, rather than replacing bytes that may be a publisher's.
+    #[test]
+    fn a_mismatched_legacy_file_the_plan_writes_is_an_ownership_conflict() {
         let root = std::env::temp_dir().join(format!("onelf-legacyedit-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let sysroot = root.join("sysroot");
         let appdir = root.join("appdir");
         fs::create_dir_all(sysroot.join("usr/lib")).unwrap();
-        fs::create_dir_all(appdir.join("lib/.onelf")).unwrap();
+        fs::create_dir_all(appdir.join("lib")).unwrap();
         fs::write(sysroot.join("usr/lib/libfoo.so"), b"current output").unwrap();
         fs::write(appdir.join("lib/libfoo.so"), b"something else").unwrap();
         fs::create_dir_all(appdir.join(".onelf")).unwrap();
@@ -2778,26 +2891,19 @@ mod tests {
         let kept = vec!["usr/lib/libfoo.so".to_string()];
         let stale = appdir.join("lib/libfoo.so");
         let conflicts = dispose_generated(&appdir, &sysroot, &kept).unwrap();
-        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].path, "lib/libfoo.so");
+        assert!(conflicts[0].refreshable, "{conflicts:?}");
+        assert!(
+            matches!(conflicts[0].why, GeneratedConflict::Unproven { .. }),
+            "{conflicts:?}"
+        );
         assert_eq!(
             fs::read(&stale).unwrap(),
             b"something else",
-            "cleanup does not guess an unproven file safe to delete"
+            "the unproven file is preserved"
         );
-
-        // The copy writes the path, and the record is taken anew.
-        fs::write(&stale, b"current output").unwrap();
-        record_generated(&appdir, vec!["lib/libfoo.so".to_string()]).unwrap();
-        let fresh = hash_entry(&stale).unwrap().unwrap();
-        assert_eq!(
-            read_generated(&appdir).unwrap(),
-            vec![GeneratedEntry {
-                path: "lib/libfoo.so".to_string(),
-                hash: Some(fresh),
-                pending: false,
-            }],
-            "the legacy path-only record has migrated to a hash"
-        );
+        assert!(appdir.join(GENERATED_FILE).is_file(), "nothing was mutated");
         let _ = fs::remove_dir_all(&root);
     }
 

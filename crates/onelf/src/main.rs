@@ -987,6 +987,7 @@ fn main() {
                 sets: Vec::new(),
                 entrypoint_selections: Vec::new(),
                 platform_pin: None,
+                strict: false,
             })
         }),
         Commands::Sysroot { action } => match action {

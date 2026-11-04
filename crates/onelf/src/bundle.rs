@@ -183,32 +183,27 @@ fn repair_admits(
     sysroot_root.is_some_and(|root| dir.starts_with(root))
 }
 
-/// Copy libraries matching any of `prefixes` (prefix match on filename) from
-/// `search_dirs` into `dest`. Resolves symlinks, deduplicates by filename,
-/// and filters by ELF class. Returns (files_copied, total_bytes).
-/// Copy libraries from `search_dirs` into `dest`, selecting entries by
-/// `name_pred` (on the file name). Resolves symlinks, filters by ELF class
-/// and machine, dedups by soname only after every filter passes (so a
-/// wrong-arch or dangling earlier copy never shadows a valid later one),
-/// removes an alias symlink at the destination before copying, and never
-/// copies a file onto itself. Returns `(files_copied, total_bytes)`.
-// Threads one bundling context; a parameter object belongs with the
-// bundler restructure.
-#[allow(clippy::too_many_arguments)]
-fn copy_libs(
+/// One library a framework copier selected: the file name it lands
+/// under, the resolved source, and its size.
+pub(crate) struct LibCopy {
+    pub(crate) name: String,
+    pub(crate) resolved: PathBuf,
+    pub(crate) size: u64,
+}
+
+/// Select libraries from `search_dirs` by `name_pred` (on the file
+/// name). Resolves symlinks, filters by ELF class and machine, and dedups
+/// by name only after every filter passes, so a wrong-arch or dangling
+/// earlier copy never shadows a valid later one. Reads only.
+pub(crate) fn select_libs(
     search_dirs: &[PathBuf],
-    dest: &Path,
     name_pred: impl Fn(&str) -> bool,
     target_class: Option<u8>,
     target_machine: Option<u16>,
     excludes: &[&str],
-    dry_run: bool,
-    strip: bool,
-) -> io::Result<(usize, u64)> {
-    let mut copied = 0usize;
-    let mut total_bytes = 0u64;
+) -> Vec<LibCopy> {
+    let mut selected = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-
     for dir in search_dirs {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
@@ -245,38 +240,83 @@ fn copy_libs(
             }
             seen.insert(name.clone());
             let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-            eprintln!(
-                "  {} <- {} ({})",
-                color::bold_green(&name),
-                resolved.display(),
-                color::dim(&format_size(size))
-            );
-            if !dry_run {
-                fs::create_dir_all(dest)?;
-                let dest_path = dest.join(&name);
-                // Copying onto an existing alias symlink corrupts the alias
-                // target; drop the symlink first (propagate failure so we
-                // never fall through to fs::copy and clobber the target).
-                if dest_path.is_symlink() {
-                    fs::remove_file(&dest_path)?;
-                }
-                // Never copy a file onto itself (an $ORIGIN search dir that
-                // resolved to the bundle's own lib dir): fs::copy truncates it.
-                if !is_same_file(&resolved, &dest_path) {
-                    ensure_writable(&dest_path);
-                    fs::copy(&resolved, &dest_path)?;
-                    let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
-                    if strip {
-                        strip_debug(&dest_path);
-                    }
-                    normalize_mtime(&dest_path);
-                }
-            }
-            copied += 1;
-            total_bytes += size;
+            selected.push(LibCopy {
+                name,
+                resolved,
+                size,
+            });
         }
     }
-    Ok((copied, total_bytes))
+    selected
+}
+
+/// Print the line a selected library gets.
+pub(crate) fn report_lib(copy: &LibCopy) {
+    eprintln!(
+        "  {} <- {} ({})",
+        color::bold_green(&copy.name),
+        copy.resolved.display(),
+        color::dim(&format_size(copy.size))
+    );
+}
+
+/// Write one selected library into `dest`, removing an alias symlink at
+/// the destination first and never copying a file onto itself.
+pub(crate) fn write_lib(copy: &LibCopy, dest: &Path, strip: bool) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let dest_path = dest.join(&copy.name);
+    // Copying onto an existing alias symlink corrupts the alias target;
+    // drop the symlink first (propagate failure so we never fall through
+    // to fs::copy and clobber the target).
+    if dest_path.is_symlink() {
+        fs::remove_file(&dest_path)?;
+    }
+    // Never copy a file onto itself (an $ORIGIN search dir that resolved
+    // to the bundle's own lib dir): fs::copy truncates it.
+    if !is_same_file(&copy.resolved, &dest_path) {
+        ensure_writable(&dest_path);
+        fs::copy(&copy.resolved, &dest_path)?;
+        let _ = fs::set_permissions(&dest_path, PermissionsExt::from_mode(0o755));
+        if strip {
+            strip_debug(&dest_path);
+        }
+        normalize_mtime(&dest_path);
+    }
+    Ok(())
+}
+
+/// Copy libraries from `search_dirs` into `dest`, selecting entries by
+/// `name_pred` the way [`select_libs`] does. Returns
+/// `(files_copied, total_bytes)`.
+// Threads one bundling context; a parameter object belongs with the
+// bundler restructure.
+#[allow(clippy::too_many_arguments)]
+fn copy_libs(
+    search_dirs: &[PathBuf],
+    dest: &Path,
+    name_pred: impl Fn(&str) -> bool,
+    target_class: Option<u8>,
+    target_machine: Option<u16>,
+    excludes: &[&str],
+    dry_run: bool,
+    strip: bool,
+) -> io::Result<(usize, u64)> {
+    let selected = select_libs(
+        search_dirs,
+        name_pred,
+        target_class,
+        target_machine,
+        excludes,
+    );
+    let mut total_bytes = 0u64;
+    for copy in &selected {
+        report_lib(copy);
+        if !dry_run {
+            write_lib(copy, dest, strip)?;
+        }
+        total_bytes += copy.size;
+    }
+    Ok((selected.len(), total_bytes))
 }
 
 /// Copy libraries whose file name starts with any of `prefixes`.
@@ -449,8 +489,9 @@ fn link_target(from_dir: &Path, to: &Path) -> String {
 /// Copy a data directory into the tree, pinning each file's mtime like
 /// every other copy. Regular files and relative symlinks go; absolute
 /// symlinks stay behind with a warning, since their target has no place
-/// in the tree. Returns the bytes copied.
-fn copy_data_dir(src: &Path, dst: &Path) -> io::Result<u64> {
+/// in the tree. Every path written is pushed to `written`. Returns the
+/// bytes copied.
+fn copy_data_dir(src: &Path, dst: &Path, written: &mut Vec<PathBuf>) -> io::Result<u64> {
     let mut total = 0u64;
     fs::create_dir_all(dst)?;
     let mut entries: Vec<std::fs::DirEntry> = fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
@@ -458,11 +499,12 @@ fn copy_data_dir(src: &Path, dst: &Path) -> io::Result<u64> {
     for entry in entries {
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            total += copy_data_dir(&entry.path(), &dst.join(entry.file_name()))?;
+            total += copy_data_dir(&entry.path(), &dst.join(entry.file_name()), written)?;
         } else if kind.is_file() {
             let to = dst.join(entry.file_name());
             ensure_writable(&to);
             fs::copy(entry.path(), &to)?;
+            written.push(to.clone());
             normalize_mtime(&to);
             total += entry.metadata().map(|m| m.len()).unwrap_or(0);
         } else if kind.is_symlink() {
@@ -473,6 +515,7 @@ fn copy_data_dir(src: &Path, dst: &Path) -> io::Result<u64> {
                     let _ = fs::remove_file(&to);
                 }
                 std::os::unix::fs::symlink(target, &to)?;
+                written.push(to);
             } else {
                 eprintln!(
                     "  {} absolute symlink in {} left out: {} -> {}",
@@ -488,18 +531,58 @@ fn copy_data_dir(src: &Path, dst: &Path) -> io::Result<u64> {
 }
 
 /// Copy one carried path, a directory or a single file, returning the
-/// bytes copied.
-fn copy_data(src: &Path, dst: &Path) -> io::Result<u64> {
+/// bytes copied. A single file is written from the bytes the plan
+/// verified against its stamp.
+fn copy_data(
+    src: &Path,
+    dst: &Path,
+    plan: &DestinationPlan,
+    written: &mut Vec<PathBuf>,
+) -> io::Result<u64> {
     if src.is_dir() {
-        return copy_data_dir(src, dst);
+        return copy_data_dir(src, dst, written);
     }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
+    let bytes = plan.read_verified(src)?;
     ensure_writable(dst);
-    let bytes = fs::copy(src, dst)?;
+    fs::write(dst, &bytes)?;
+    written.push(dst.to_path_buf());
     normalize_mtime(dst);
-    Ok(bytes)
+    Ok(bytes.len() as u64)
+}
+
+/// Copy the admitted members of a sysroot directory carry, each from
+/// the bytes the plan verified, a relative link as a link, and nothing
+/// the build's universe left out. Returns the bytes copied.
+fn copy_members(
+    members: &[(PathBuf, PathBuf)],
+    directory: &Path,
+    plan: &DestinationPlan,
+    written: &mut Vec<PathBuf>,
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    for (from, rel) in members {
+        let to = directory.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let meta = fs::symlink_metadata(from)?;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(from)?;
+            if target.is_relative() {
+                if to.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(&to);
+                }
+                std::os::unix::fs::symlink(target, &to)?;
+                written.push(to);
+            }
+            continue;
+        }
+        total += copy_data(from, &to, plan, written)?;
+    }
+    Ok(total)
 }
 
 /// A carried `share/alsa` must not let the host's distro snippets name
@@ -616,8 +699,12 @@ fn carry_data_group(
     plan: &mut DestinationPlan,
     actions: &mut Vec<WalkAction>,
     preparation: &mut SetPreparation,
+    required: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
+    if declared.requirement == Requirement::Required {
+        required.insert(PathBuf::from(declared.destination.as_str()));
+    }
     let hooks: Vec<BuildHookId> = descriptor.build.hooks.clone();
     let origin = format!("rule {rule} group {} data carry", declared.id.as_str());
     let owners: Vec<AdmittedLibrary> = admitted
@@ -654,6 +741,22 @@ fn carry_data_group(
             }
             return Ok(());
         }
+        // A sysroot directory carries only what the build admitted
+        // under it, so a file the policy or a trace pruned never comes
+        // back through a carry whose destination differs.
+        if let (Some(universe), ResourceKind::Directory) = (sysroot, hit.kind) {
+            let members = admitted_members(universe, hit, plan, &origin)?;
+            if !members.is_empty() {
+                actions.push(WalkAction::CarryData {
+                    rule: rule.to_string(),
+                    src: hit.resolved.clone(),
+                    rel: hit.destination.clone(),
+                    hooks,
+                    members: Some(members),
+                });
+            }
+            return Ok(());
+        }
         if plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?
             == Admission::Write
         {
@@ -662,6 +765,7 @@ fn carry_data_group(
                 src: hit.resolved.clone(),
                 rel: hit.destination.clone(),
                 hooks,
+                members: None,
             });
         }
         return Ok(());
@@ -694,6 +798,79 @@ fn carry_data_group(
             Ok(())
         }
     }
+}
+
+/// Plan the copy of one collected group member to its own destination,
+/// from the file the group found: an existing destination is the tree's
+/// own and is kept, the way the walk keeps a library it already holds.
+fn plan_member_copy(
+    directory: &Path,
+    plugin: &collect::CollectedPlugin,
+    origin: &str,
+    plan: &mut DestinationPlan,
+    actions: &mut Vec<WalkAction>,
+) -> io::Result<()> {
+    let rel = &plugin.destination;
+    if fs::symlink_metadata(directory.join(rel)).is_ok() {
+        return Ok(());
+    }
+    let bytes = fs::read(&plugin.resolved)?;
+    plan.note_source(&plugin.resolved, &bytes)?;
+    if plan.admit_file(rel, plan::file_hash(&bytes), origin, Existing::SkipOnAny)?
+        == Admission::Write
+    {
+        actions.push(WalkAction::CopyLib {
+            soname: plugin.soname.clone(),
+            resolved: plugin.resolved.clone(),
+            rel: rel.clone(),
+            size: bytes.len() as u64,
+            requirer: origin.to_string(),
+            stale_flat: false,
+            libc_data: false,
+        });
+    }
+    Ok(())
+}
+
+/// The admitted files under a sysroot directory hit, each admitted to
+/// the plan at its destination beneath the hit's, as the source and the
+/// tree-relative destination the carry writes. A relative link is
+/// planned as a link; an absolute one has no place in the tree and is
+/// left out, as a host carry leaves it.
+fn admitted_members(
+    universe: &sysroot::SysrootUniverse,
+    hit: &CandidateHit,
+    plan: &mut DestinationPlan,
+    origin: &str,
+) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let Ok(dir_rel) = hit.resolved.strip_prefix(universe.root()) else {
+        return Ok(Vec::new());
+    };
+    let dir_rel = dir_rel.to_string_lossy().into_owned();
+    let mut members = Vec::new();
+    for file in universe.admitted_under(&dir_rel) {
+        let Ok(under) = Path::new(&file).strip_prefix(&dir_rel) else {
+            continue;
+        };
+        let from = universe.root().join(&file);
+        let rel = hit.destination.join(under);
+        let meta = fs::symlink_metadata(&from)?;
+        let admission = if meta.file_type().is_symlink() {
+            let target = fs::read_link(&from)?;
+            if !target.is_relative() {
+                continue;
+            }
+            plan.admit_link(&rel, &target.to_string_lossy(), origin, Existing::SkipOnAny)?
+        } else if meta.is_file() {
+            plan.admit_carried(&rel, &from, origin)?
+        } else {
+            continue;
+        };
+        if admission == Admission::Write {
+            members.push((from, rel));
+        }
+    }
+    Ok(members)
 }
 
 /// The required-data failure: which rule's data is missing, at what
@@ -809,8 +986,12 @@ fn collect_helper_group(
     discovery: &mut Discovery,
     preparation: &mut SetPreparation,
     plan: &mut DestinationPlan,
+    required: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     let rule = descriptor.id.as_str();
+    if declared.requirement == Requirement::Required {
+        required.insert(PathBuf::from(declared.destination.as_str()));
+    }
     let owners: Vec<AdmittedLibrary> = admitted
         .iter()
         .filter(|lib| {
@@ -1181,6 +1362,15 @@ impl<'a> SetPreparation<'a> {
     /// source holds. Returns whether any pin ended up supplying the
     /// group, which satisfies a required declaration whose tree carry
     /// missed.
+    ///
+    /// What satisfies the requirement at launch today is the selected
+    /// set's own root: the rule's runtime path mapping searches every
+    /// selected set root after the package root, and finds the resource
+    /// there. The prepared copy under [`PREPARED_DIR`] is not mapped by
+    /// any launch yet, since no runtime rule binds a subtree to its pin.
+    /// Wiring that activation is what makes the prepared copy, not the
+    /// raw set root, the one a launch resolves, as the design requires
+    /// for a helper that needs application-relative relocation.
     fn supply_group(
         &mut self,
         plan: &mut DestinationPlan,
@@ -1479,6 +1669,10 @@ enum WalkAction {
         src: PathBuf,
         rel: PathBuf,
         hooks: Vec<BuildHookId>,
+        /// The admitted files of a sysroot directory carry, each as its
+        /// source and its destination relative to the tree root. `None`
+        /// carries the whole source path, as a host scan does.
+        members: Option<Vec<(PathBuf, PathBuf)>>,
     },
     /// Run a rule's declared hooks over a destination the tree already
     /// holds.
@@ -1500,10 +1694,19 @@ enum WalkAction {
 }
 
 /// What executing the planned actions produced, for the summary and
-/// the generated record.
+/// the generated record: every path written, relative to the tree root,
+/// in the order the writes ran, so a walk that stops part way still
+/// records what it left behind.
+#[derive(Default)]
 struct WalkOutcome {
     copied: Vec<(String, PathBuf, u64, String)>,
-    libc_data_files: Vec<String>,
+    written: Vec<String>,
+}
+
+impl WalkOutcome {
+    fn wrote(&mut self, rel: &Path) {
+        self.written.push(rel.to_string_lossy().into_owned());
+    }
 }
 
 /// Execute the planned walk actions in planning order, each with its
@@ -1519,15 +1722,12 @@ fn execute_walk(
     lib_dest: &Path,
     actions: &[WalkAction],
     plan: &DestinationPlan,
-) -> io::Result<WalkOutcome> {
+    outcome: &mut WalkOutcome,
+) -> io::Result<()> {
     let lib_dir = lib_dest
         .strip_prefix(directory)
         .unwrap_or(lib_dest)
         .to_path_buf();
-    let mut outcome = WalkOutcome {
-        copied: Vec::new(),
-        libc_data_files: Vec::new(),
-    };
     for action in actions {
         match action {
             WalkAction::CopyLib {
@@ -1539,7 +1739,15 @@ fn execute_walk(
                 stale_flat,
                 libc_data,
             } => {
-                plan.verify_source(resolved)?;
+                // The bytes written are the bytes verified against the
+                // planning stamp, read once, so a source changing after
+                // the check cannot reach the tree.
+                let bytes = if dry_run {
+                    plan.verify_source(resolved)?;
+                    Vec::new()
+                } else {
+                    plan.read_verified(resolved)?
+                };
                 let dest = directory.join(rel);
                 eprintln!(
                     "  {} <- {} (needed by {}, {})",
@@ -1558,7 +1766,8 @@ fn execute_walk(
                         let _ = fs::remove_file(&dest);
                     }
                     ensure_writable(&dest);
-                    fs::copy(resolved, &dest)?;
+                    fs::write(&dest, &bytes)?;
+                    outcome.wrote(rel);
                     let _ = fs::set_permissions(
                         &dest,
                         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1604,7 +1813,9 @@ fn execute_walk(
                                 color::bold_green("Copied"),
                                 files.len()
                             );
-                            outcome.libc_data_files = files;
+                            for file in &files {
+                                outcome.wrote(&lib_dir.join(file));
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => eprintln!(
@@ -1615,7 +1826,9 @@ fn execute_walk(
                     match bundle_c_utf8(resolved, lib_dest) {
                         Ok(files) if !files.is_empty() => {
                             eprintln!("  {} the C.UTF-8 locale", color::bold_green("Copied"));
-                            outcome.libc_data_files.extend(files);
+                            for file in &files {
+                                outcome.wrote(&lib_dir.join(file));
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => eprintln!(
@@ -1652,13 +1865,14 @@ fn execute_walk(
                         let _ = fs::remove_file(&dest);
                     }
                     let target = link_target(rel.parent().unwrap_or(Path::new("")), existing);
-                    if let Err(e) = std::os::unix::fs::symlink(&target, &dest) {
-                        eprintln!(
+                    match std::os::unix::fs::symlink(&target, &dest) {
+                        Ok(()) => outcome.wrote(rel),
+                        Err(e) => eprintln!(
                             "  {} failed to symlink {} -> {}: {e}",
                             color::bold_red("warning:"),
                             soname,
                             target
-                        );
+                        ),
                     }
                 }
                 if *stale_flat {
@@ -1670,8 +1884,13 @@ fn execute_walk(
                 src,
                 rel,
                 hooks,
+                members,
             } => {
-                if src.is_dir() {
+                if let Some(members) = members {
+                    for (from, _) in members {
+                        plan.verify_source(from)?;
+                    }
+                } else if src.is_dir() {
                     plan.verify_tree(src, rel)?;
                 } else {
                     plan.verify_source(src)?;
@@ -1686,8 +1905,24 @@ fn execute_walk(
                     );
                     continue;
                 }
-                match copy_data(src, &dest) {
+                let mut carried: Vec<PathBuf> = Vec::new();
+                let copied = match members {
+                    Some(members) => copy_members(members, directory, plan, &mut carried),
+                    None => copy_data(src, &dest, plan, &mut carried).and_then(|bytes| {
+                        // The copy itself must hold what planning hashed,
+                        // so a source that changed while it was read is
+                        // caught over the bytes the tree now holds.
+                        if src.is_dir() {
+                            plan.verify_tree(&dest, rel)?;
+                        }
+                        Ok(bytes)
+                    }),
+                };
+                match copied {
                     Ok(bytes) => {
+                        for path in &carried {
+                            outcome.wrote(path.strip_prefix(directory).unwrap_or(path));
+                        }
                         eprintln!(
                             "  {} {} <- {} (data of {}, {})",
                             color::bold_green("Copied"),
@@ -1700,11 +1935,13 @@ fn execute_walk(
                     }
                     Err(e) => {
                         // A half-copied path reads as carried to the lint
-                        // while missing half its files; take it back.
-                        if dest.is_dir() {
-                            let _ = fs::remove_dir_all(&dest);
-                        } else {
-                            let _ = fs::remove_file(&dest);
+                        // while missing half its files; take back what
+                        // this carry wrote.
+                        for path in carried.iter().rev() {
+                            let _ = fs::remove_file(path);
+                        }
+                        if e.kind() == io::ErrorKind::InvalidData {
+                            return Err(e);
                         }
                         eprintln!(
                             "  {} could not carry {}: {e}",
@@ -1748,6 +1985,7 @@ fn execute_walk(
                     }
                     ensure_writable(&dest);
                     fs::write(&dest, bytes)?;
+                    outcome.wrote(&root.join(rel));
                     let mode = if *executable { 0o755 } else { 0o644 };
                     let _ = fs::set_permissions(
                         &dest,
@@ -1772,7 +2010,7 @@ fn execute_walk(
             }
         }
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Anchor the carried snippet directory in a carried `share/alsa/alsa.conf`.
@@ -1926,6 +2164,9 @@ fn alias_links_to(root: &Path, target: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// One bundling invocation: the tree, what is scanned, where the
+/// contents come from, and how strictly the outcome is audited.
+#[derive(Default)]
 pub struct BundleOptions {
     pub directory: PathBuf,
     /// Restricts *which* binaries are scanned for dependencies.
@@ -1985,6 +2226,12 @@ pub struct BundleOptions {
     pub entrypoint_selections: Vec<AuditedEntrypoint>,
     /// A GL build pinned without a sysroot, named whole by the recipe.
     pub platform_pin: Option<onelf_sysroot::platform::Pin>,
+    /// Fail on an unresolved required dependency whatever the source,
+    /// the contract of high-level `onelf build` and `onelf run --bundle`.
+    /// A sysroot build is always strict. Without this a host scan keeps
+    /// the low-level `bundle-libs` behavior: unresolved needs are
+    /// reported as warnings and nothing is omitted.
+    pub strict: bool,
 }
 
 /// Strip debug symbols from a shared library (best-effort).
@@ -2028,10 +2275,9 @@ fn strip_debug(path: &Path) {
 /// loader scrubbing, bootstrap injection) has run over them, so every
 /// entry attests the final bytes and a later rebuild stops on a
 /// publisher's edit instead of excusing the rewriting as the build's
-/// own doing. Only a build tracking generated paths through a sysroot
-/// attests: a tree without a ledger gets none written.
+/// own doing. A tree without a ledger gets none written.
 fn attest_staged_outputs(opts: &BundleOptions) -> io::Result<()> {
-    if opts.sysroot.is_some() && opts.directory.join(sysroot::GENERATED_FILE).is_file() {
+    if opts.directory.join(sysroot::GENERATED_FILE).is_file() {
         sysroot::attest_generated(&opts.directory)?;
     }
     Ok(())
@@ -2530,9 +2776,17 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // is written, and the per-entrypoint audit below refuses a tree an
     // entrypoint cannot launch from. Both fetch nothing the declared
     // sets' own reporting does not, and a dry run consults no build at
-    // all, so it fetches nothing either.
-    let set_audit = if !opts.sets.is_empty() && !opts.dry_run {
-        let (providers, unchecked) = sysroot::audit_providers(&opts.sets);
+    // all, so it fetches nothing either. A database-backed sysroot
+    // declares its sets in its own section, and they are audited the
+    // same way.
+    let declared_sets: Vec<sysroot::SharedSet> = opts
+        .sets
+        .iter()
+        .chain(opts.sysroot.iter().flat_map(|sr| sr.sets.iter()))
+        .cloned()
+        .collect();
+    let set_audit = if !declared_sets.is_empty() && !opts.dry_run {
+        let (providers, unchecked) = sysroot::audit_providers(&declared_sets);
         audit_declared_sets(opts, &providers)?;
         Some((providers, unchecked))
     } else {
@@ -2692,8 +2946,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         )?;
     }
 
+    // The destinations the assembly intends to write, resolved against
+    // each other and against the tree before any of them is written.
+    // The framework copiers without replacement authority plan into it
+    // first, and the dependency walk below plans the rest.
+    let mut plan = DestinationPlan::load(&opts.directory)?;
     if want_wayland {
-        bundle_wayland(
+        let written = bundle_wayland(
             &opts.directory,
             &opts.lib_dir,
             &opts.search_path,
@@ -2702,7 +2961,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             target_machine,
             opts.dry_run,
             opts.strip,
+            &mut plan,
         )?;
+        if !opts.dry_run {
+            sysroot::record_generated(&opts.directory, written)?;
+        }
     }
 
     if want_gtk {
@@ -3011,7 +3274,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             }
             attest_staged_outputs(opts)?;
             // After injection, so the audit sees the final DT_NEEDED set.
-            verify_needs(opts, sysroot_platform.as_ref(), &set_sonames, &classifier)?;
+            verify_needs(
+                opts,
+                sysroot_platform.as_ref(),
+                &set_sonames,
+                &classifier,
+                &HashSet::new(),
+            )?;
         }
         return Ok(());
     }
@@ -3173,6 +3442,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // and helpers they collected, which supersede flat placement for
     // those sonames.
     let mut group_dests: HashMap<String, PathBuf> = HashMap::new();
+    // Where each collected group member was found, which the walk copies
+    // from instead of resolving the name through the search paths.
+    let mut group_sources: HashMap<String, PathBuf> = HashMap::new();
     // The collected helper executables among them, whose declared
     // destinations sit wherever the tree root keeps them, not
     // necessarily in the library directory.
@@ -3181,10 +3453,8 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // relative to the tree root, so aliases with identical bytes
     // symlink instead of copy.
     let mut bundled_by_hash: HashMap<[u8; 32], PathBuf> = HashMap::new();
-    // The destinations the walk intends to write, resolved against each
-    // other and against the tree before any of them is written, with the
-    // writes themselves queued for the executor.
-    let mut plan = DestinationPlan::load(&opts.directory)?;
+    // The walk's writes, queued for the executor once the plan holds no
+    // finding.
     let mut actions: Vec<WalkAction> = Vec::new();
     // What the declared sets supply when an activated group's tree carry
     // misses: read verified out of each pin's build into the pin's own
@@ -3192,12 +3462,25 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // a sysroot and in the sysroot section of a database-backed one.
     // A set-less build consults nothing here, and neither does a dry
     // run, which fetches nothing.
-    let sysroot_sets = opts
-        .sysroot
-        .as_ref()
-        .map(|sr| sr.sets.as_slice())
-        .unwrap_or(&[]);
-    let mut preparation = SetPreparation::new(&opts.sets, sysroot_sets, opts.dry_run);
+    // Only a set some entrypoint selects is ever read for preparation:
+    // a declared set no selection names is never fetched.
+    let selected = |sets: &[sysroot::SharedSet]| -> Vec<sysroot::SharedSet> {
+        sets.iter()
+            .filter(|set| selected_by_an_entrypoint(opts, &set.name))
+            .cloned()
+            .collect()
+    };
+    let tree_sets = selected(&opts.sets);
+    let sysroot_sets = selected(
+        opts.sysroot
+            .as_ref()
+            .map(|sr| sr.sets.as_slice())
+            .unwrap_or(&[]),
+    );
+    let mut preparation = SetPreparation::new(&tree_sets, &sysroot_sets, opts.dry_run);
+    // The destinations a required descriptor group placed, which the
+    // drop pass never omits to make the assembly succeed.
+    let mut required_dests: HashSet<PathBuf> = HashSet::new();
     // The walk's initial objects enter the shared discovery queue, and
     // their sonames activate rules. Seeds are sorted, so the drain order
     // is a function of the input set, not of enumeration order.
@@ -3313,10 +3596,46 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         }
                     }
                     report_collection(&collection);
+                    if declared.requirement == Requirement::Required {
+                        required_dests
+                            .extend(collection.plugins.iter().map(|p| p.destination.clone()));
+                    }
                     for plugin in &collection.plugins {
-                        group_dests
+                        let first = group_dests
                             .entry(plugin.soname.clone())
                             .or_insert_with(|| plugin.destination.clone());
+                        if *first != plugin.destination {
+                            // A second member under the same name at its
+                            // own place in the layout: copied from where
+                            // the group found it, never re-resolved by
+                            // name, with its own needs entering the walk.
+                            let origin = format!(
+                                "rule {rule} group {group} plugin {}",
+                                plugin.destination.display()
+                            );
+                            plan_member_copy(
+                                &opts.directory,
+                                plugin,
+                                &origin,
+                                &mut plan,
+                                &mut actions,
+                            )?;
+                            for dep in parse_needed(&plugin.resolved).unwrap_or_default() {
+                                if already_processed.contains(&dep)
+                                    || is_excluded(&dep, &excludes)
+                                    || reachable.contains(&dep)
+                                    || libc_family_of_soname(&dep).is_some()
+                                {
+                                    continue;
+                                }
+                                needed_by
+                                    .entry(dep.clone())
+                                    .or_insert_with(|| origin.clone());
+                                discovery.enqueue(&dep)?;
+                            }
+                            continue;
+                        }
+                        group_sources.insert(plugin.soname.clone(), plugin.resolved.clone());
                         needed_by
                             .entry(plugin.soname.clone())
                             .or_insert_with(|| format!("rule {rule} group {group}"));
@@ -3347,6 +3666,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &mut plan,
                         &mut actions,
                         &mut preparation,
+                        &mut required_dests,
                     )?;
                 }
                 if let Some(declared) = descriptor
@@ -3370,6 +3690,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                         &mut discovery,
                         &mut preparation,
                         &mut plan,
+                        &mut required_dests,
                     )?;
                 }
                 continue;
@@ -3406,7 +3727,9 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         // A soname the tree already carries repairs only from sources
         // the build declares or owns; a soname absent from it resolves
         // the way the host-scan walk always has.
-        let located = if already_flat {
+        let located = if let Some(found) = group_sources.get(&soname) {
+            Some(found.clone())
+        } else if already_flat {
             let sources: Vec<PathBuf> = search_paths
                 .iter()
                 .filter(|dir| {
@@ -3724,7 +4047,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 }
                 _ => "the selected source hands it to a host package whole".to_string(),
             })
-        } else if opts.sysroot.is_some()
+        } else if (opts.sysroot.is_some() || opts.strict)
             && listed(&not_found)
             && !matches!(verdict, SourceVerdict::Carried)
         {
@@ -3753,7 +4076,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // The pins whose resources the sets supplied: each write is already
     // admitted to the plan, so a finding anywhere stops the build here,
     // before any tree write and any pin write.
-    let prepared = preparation.queue_actions(&mut actions);
+    preparation.queue_actions(&mut actions);
 
     // The interpreter alias links the loader needs, planned here so a
     // finding anywhere in the plan stops the build before the first
@@ -3792,17 +4115,23 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     if plan.has_findings() {
         return Err(plan.error());
     }
-    let WalkOutcome {
-        mut copied,
-        libc_data_files,
-    } = execute_walk(
+    let mut outcome = WalkOutcome::default();
+    let executed = execute_walk(
         &opts.directory,
         opts.dry_run,
         opts.strip,
         &lib_dest,
         &actions,
         &plan,
-    )?;
+        &mut outcome,
+    );
+    // What the walk wrote is the build's own output whether or not it
+    // finished, so the next build can tell it from a publisher's edit.
+    if !opts.dry_run {
+        sysroot::record_generated(&opts.directory, std::mem::take(&mut outcome.written))?;
+    }
+    executed?;
+    let mut copied = outcome.copied;
 
     // Summary
     copied.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3827,31 +4156,6 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             color::bold(&format_size(total_size)),
             lib_dest.display()
         );
-    }
-
-    if opts.sysroot.is_some() && !opts.dry_run {
-        let generated = copied
-            .iter()
-            .map(|(_, rel, _, _)| rel.to_string_lossy().into_owned())
-            .chain(
-                libc_data_files
-                    .iter()
-                    .map(|f| opts.lib_dir.join(f).to_string_lossy().into_owned()),
-            )
-            .chain(prepared.iter().flat_map(|p| p.files.iter().cloned()))
-            .collect();
-        sysroot::record_generated(&opts.directory, generated)?;
-    } else if !opts.dry_run && !prepared.is_empty() {
-        // A set-only build records what it prepared, so the next build
-        // can tell its own output from a publisher's edit at the same
-        // paths.
-        sysroot::record_generated(
-            &opts.directory,
-            prepared
-                .iter()
-                .flat_map(|p| p.files.iter().cloned())
-                .collect(),
-        )?;
     }
 
     // The outcome lists carry the classification with them, so the
@@ -3917,6 +4221,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // the alias the kernel can't find the interpreter at runtime. The links
     // were planned before anything was written; this only executes them.
     if !opts.dry_run {
+        let mut linked: Vec<String> = Vec::new();
         for (interp_name, libc_name) in &interp_links {
             let target = lib_dest.join(interp_name);
             if target.exists() || target.is_symlink() {
@@ -3940,8 +4245,15 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     interp_name,
                     libc_name
                 );
+                linked.push(
+                    opts.lib_dir
+                        .join(interp_name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
+        sysroot::record_generated(&opts.directory, linked)?;
     }
 
     // Strip RPATHs from all ELF files in the directory for portability.
@@ -3992,7 +4304,13 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
             &find_elf_files(&opts.directory),
         ));
         // After injection, so the audit sees the final DT_NEEDED set.
-        verify_needs(opts, sysroot_platform.as_ref(), &set_sonames, &classifier)?;
+        verify_needs(
+            opts,
+            sysroot_platform.as_ref(),
+            &set_sonames,
+            &classifier,
+            &required_dests,
+        )?;
         // The assembled tree is what a launch resolves against, so the
         // build's own entrypoints are audited against it before the
         // packer runs: each with its own selection, so a set the
@@ -4006,6 +4324,16 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     Ok(())
 }
 
+/// One object the drop pass omitted: where it sat relative to the tree,
+/// the names its dependants ask for it by, the need that condemned it,
+/// and the verdict recorded for that need.
+struct Dropped {
+    object: PathBuf,
+    names: Vec<String>,
+    need: String,
+    verdict: SourceVerdict,
+}
+
 /// Remove bundled objects that could never load: their need is a soname
 /// the classification found absent from the selected source, held only
 /// behind an unselected optional package, or handed to the host.
@@ -4013,45 +4341,51 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
 /// A distribution's closure carries plugins for stacks that were never
 /// installed, Qt modules and Python bindings for optional dependencies,
 /// and each would otherwise be one more line of policy. Only what this
-/// build generated is dropped, and only for one of those three verdicts:
-/// the entrypoint, a file the publisher placed by hand, and an object at
-/// an explicitly included soname's destination stay, each as a finding.
-/// A soname a selected package holds but the policy or a trace removed
-/// is a conflict, not a reason to drop the object that needs it, so that
-/// finding stays too and the build fails naming the removal.
+/// build generated is dropped, and only for one of those three verdicts.
+/// What the assembly requires stays, each as a finding: the primary
+/// entrypoint and every named manifest entrypoint, a file the publisher
+/// placed by hand, an object at an explicitly included soname's
+/// destination, and anything at or under a destination a required
+/// descriptor group placed, listed in `required`. A soname a selected
+/// package holds but the policy or a trace removed is a conflict, not a
+/// reason to drop the object that needs it, so that finding stays too
+/// and the build fails naming the removal.
 ///
-/// Returns the dropped objects, relative to the tree, with the soname
-/// that condemned each and the verdict recorded for it. `findings` is
-/// re-audited until nothing changes, because dropping a library leaves
-/// its own dependants unloadable.
+/// Returns the dropped objects in path order. `findings` is re-audited
+/// until nothing changes, because dropping a library leaves its own
+/// dependants unloadable.
 fn drop_unloadable(
     opts: &BundleOptions,
     findings: &mut Vec<(PathBuf, Vec<String>)>,
     audit: impl Fn() -> Vec<(PathBuf, Vec<String>)>,
     classifier: &SourceClassifier,
-) -> io::Result<Vec<(PathBuf, String, SourceVerdict)>> {
-    let generated: HashSet<PathBuf> =
-        fs::read_to_string(opts.directory.join(sysroot::GENERATED_FILE))
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(PathBuf::from)
-            .collect();
-    let entrypoint = opts
-        .primary
-        .as_deref()
-        .or(opts.target.as_deref())
-        .map(|t| t.strip_prefix(&opts.directory).unwrap_or(t).to_path_buf());
-    let explicit = explicit_include_paths(opts);
+    required: &HashSet<PathBuf>,
+) -> io::Result<Vec<Dropped>> {
+    let generated: HashSet<PathBuf> = sysroot::read_generated(&opts.directory)?
+        .into_iter()
+        .map(|entry| PathBuf::from(entry.path))
+        .collect();
+    let mut kept: HashSet<PathBuf> = explicit_include_paths(opts);
+    kept.extend(
+        opts.primary
+            .as_deref()
+            .or(opts.target.as_deref())
+            .map(|t| t.strip_prefix(&opts.directory).unwrap_or(t).to_path_buf()),
+    );
+    kept.extend(
+        opts.entrypoint_selections
+            .iter()
+            .filter_map(|e| e.path.clone()),
+    );
     let mut gone: HashSet<String> = HashSet::new();
-    let mut dropped: Vec<(PathBuf, String, SourceVerdict)> = Vec::new();
+    let mut dropped: Vec<Dropped> = Vec::new();
     loop {
         let mut progressed = false;
         for (object, libs) in findings.iter() {
             let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
-            if entrypoint.as_deref() == Some(rel)
+            if kept.contains(rel)
                 || !generated.contains(rel)
-                || explicit.contains(rel)
+                || required.iter().any(|dest| rel.starts_with(dest))
             {
                 continue;
             }
@@ -4071,18 +4405,22 @@ fn drop_unloadable(
             // recording only the former leaves everything that needed it
             // looking satisfied, and the failure surfaces later as an
             // unmet need nothing can explain.
-            let dropped_soname = crate::bundle::elf::parse_soname(object);
+            let mut names: Vec<String> = object
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .into_iter()
+                .chain(crate::bundle::elf::parse_soname(object))
+                .collect();
+            names.dedup();
             fs::remove_file(object)?;
             remove_dangling_links_beside(object);
-            if let Some(name) = object.file_name() {
-                gone.insert(name.to_string_lossy().into_owned());
-            }
-            gone.extend(dropped_soname);
-            dropped.push((
-                rel.to_path_buf(),
-                soname.clone(),
-                classifier.classify(soname),
-            ));
+            gone.extend(names.iter().cloned());
+            dropped.push(Dropped {
+                object: rel.to_path_buf(),
+                names,
+                need: soname.clone(),
+                verdict: classifier.classify(soname),
+            });
             progressed = true;
         }
         if !progressed {
@@ -4090,7 +4428,7 @@ fn drop_unloadable(
         }
         *findings = audit();
     }
-    dropped.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    dropped.sort_by(|a, b| (&a.object, &a.need).cmp(&(&b.object, &b.need)));
     Ok(dropped)
 }
 
@@ -4129,108 +4467,205 @@ pub(crate) fn remove_dangling_links_beside(object: &Path) {
     }
 }
 
-/// The verifier: every `DT_NEEDED` of every bundled ELF resolves inside
-/// the bundle, or names something the platform line hands to the host.
-///
-/// From a sysroot the universe was complete, so an omission is a policy
-/// or platform-line mistake the publisher can fix, and the bundle fails.
-/// From a host scan the universe was a guess, and the finding stays a
-/// warning. What a set-only build's pinned sets ship, read from their
-/// builds, is neither: it is reported as theirs, since the launch fetches
-/// it.
+/// Whether the host may supply `soname` to a host-scan build: the libc
+/// family a launch weighs against the host's copy, the driver stacks that
+/// must match the running kernel, and the names the build leaves to the
+/// host by its default or recipe exclusions. A strict host-scan build
+/// reports such a need and does not fail on it.
+fn host_platform_provider(soname: &str, exclude: &[String]) -> bool {
+    onelf_format::resolve::is_libc_family(soname)
+        || libc_family_of_soname(soname).is_some()
+        || onelf_format::drivers::DRIVER_FAMILIES
+            .iter()
+            .any(|prefix| soname.starts_with(prefix))
+        || DEFAULT_EXCLUDES.iter().any(|p| soname.starts_with(p))
+        || exclude.iter().any(|p| soname.starts_with(p.as_str()))
+}
+
 /// Audit the assembled tree for objects whose needs nothing in the
 /// bundle satisfies where the loader will look.
 ///
-/// In a sysroot build an auto-selected object left unloadable by the
-/// classification is omitted here, with the recorded reason, and the
-/// audit runs again over the survivors. What the classification cannot
-/// omit stays: the entrypoint, a publisher's file, an explicitly
-/// included object, and any object whose condemning need is a deliberate
+/// A strict build, a sysroot build or a high-level host scan, fails on
+/// an unresolved required need. Its auto-selected objects left
+/// unloadable by the classification are omitted first, with the
+/// recorded reason, and the audit runs again over the survivors. What
+/// the classification cannot omit stays: the entrypoints, a publisher's
+/// file, an explicitly included object, what a required descriptor
+/// group placed, and any object whose condemning need is a deliberate
 /// policy or trace removal. Those fail the build, and the error names
-/// the class and the package involved.
+/// the object, the need, the entrypoints that reach it, and the package
+/// involved. In a host scan a need the host platform may supply, see
+/// [`host_platform_provider`], is reported and never fails or condemns.
+///
+/// Without `strict` a host scan only warns: the low-level `bundle-libs`
+/// contract. What a set-only build's pinned sets ship, read from their
+/// builds, is neither: it is reported as theirs, since the launch
+/// fetches it.
 fn verify_needs(
     opts: &BundleOptions,
     platform: Option<&PlatformLine>,
     set_sonames: &HashSet<String>,
     classifier: &SourceClassifier,
+    required: &HashSet<PathBuf>,
 ) -> io::Result<()> {
-    let audit = || {
-        let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
-        for (_, libs) in &mut findings {
-            libs.retain(|s| {
-                !platform.is_some_and(|p| p.matches_soname(s)) && !set_sonames.contains(s)
-            });
-        }
-        findings.retain(|(_, libs)| !libs.is_empty());
-        findings
-    };
-    let mut findings = audit();
-    if opts.sysroot.is_some() {
-        let dropped = drop_unloadable(opts, &mut findings, audit, classifier)?;
-        if !dropped.is_empty() {
-            eprintln!(
-                "\n{} {} file(s) needing libraries the sysroot does not hold:",
-                color::bold("Dropped"),
-                dropped.len()
-            );
-            const SHOWN_DROPS: usize = 8;
-            for (object, soname, verdict) in dropped.iter().take(SHOWN_DROPS) {
-                eprintln!(
-                    "  {} omitted, needs {} ({})",
-                    object.display(),
-                    soname,
-                    color::dim(&verdict.reason())
-                );
-            }
-            let hidden = dropped.len().saturating_sub(SHOWN_DROPS);
-            if hidden > 0 {
-                eprintln!("  and {hidden} more omitted");
-            }
-        }
-    }
+    let strict = opts.sysroot.is_some() || opts.strict;
+    let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+    let mut set_report = None;
+    let mut set_provided: HashSet<String> = HashSet::new();
     if opts.sysroot.is_none() && !opts.sets.is_empty() {
         let (provides, unchecked) = sysroot::take_set_provides(&opts.sets, &mut findings);
-        sysroot::report_set_provides(&provides, &unchecked);
+        set_provided.extend(provides.iter().flat_map(|p| p.sonames.iter().cloned()));
+        set_report = Some((provides, unchecked));
+    }
+    let open = |s: &str| {
+        !platform.is_some_and(|p| p.matches_soname(s))
+            && !set_sonames.contains(s)
+            && !set_provided.contains(s)
+    };
+    let host_allowed = |s: &str| opts.sysroot.is_none() && host_platform_provider(s, &opts.exclude);
+    let condemnable = |findings: &mut Vec<(PathBuf, Vec<String>)>| {
+        for (_, libs) in findings.iter_mut() {
+            libs.retain(|s| open(s) && !host_allowed(s));
+        }
+        findings.retain(|(_, libs)| !libs.is_empty());
+    };
+    let audit = || {
+        let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+        condemnable(&mut findings);
+        findings
+    };
+    for (_, libs) in &mut findings {
+        libs.retain(|s| open(s));
+    }
+    findings.retain(|(_, libs)| !libs.is_empty());
+    let mut dropped = Vec::new();
+    if strict {
+        let mut failing = findings.clone();
+        condemnable(&mut failing);
+        dropped = drop_unloadable(opts, &mut failing, audit, classifier, required)?;
+        if !dropped.is_empty() {
+            findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+            for (_, libs) in &mut findings {
+                libs.retain(|s| open(s));
+            }
+            findings.retain(|(_, libs)| !libs.is_empty());
+            report_dropped(opts, &dropped);
+        }
+    }
+    if let Some((provides, unchecked)) = &set_report {
+        sysroot::report_set_provides(provides, unchecked);
     }
     report_unbundled_needs(&findings);
-    if opts.sysroot.is_some()
-        && let Some((object, libs)) = first_failure(opts, &findings)
-    {
-        let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
-        let object = rel.display();
-        let soname = &libs[0];
-        let verdict = classifier.classify(soname);
-        let explicit = explicit_include_paths(opts).contains(rel);
-        let why = if explicit {
-            format!(
-                "{object} is explicitly included and needs {soname}: {}; an explicit include \
-                 cannot be dropped",
-                verdict.reason()
-            )
-        } else if let SourceVerdict::Pruned { owner } = &verdict {
-            format!(
-                "{object} needs {soname}, which {owner} holds but the policy or a trace \
-                 removed; the conflict stops the build rather than dropping the object or \
-                 restoring the file"
-            )
-        } else if matches!(verdict, SourceVerdict::Absent) {
-            format!(
-                "{object} needs {soname}, which is neither in the sysroot closure, on the \
-                 platform line, nor in a shared set"
-            )
-        } else {
-            format!("{object} needs {soname}: {}", verdict.reason())
-        };
-        let more = match findings.len() {
-            1 => String::new(),
-            n => format!(" ({} more listed above)", n - 1),
-        };
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{why}{more}"),
-        ));
+    if !strict {
+        return Ok(());
     }
-    Ok(())
+    let mut failing = findings;
+    condemnable(&mut failing);
+    let Some((object, libs)) = first_failure(opts, &failing) else {
+        return Ok(());
+    };
+    let rel = object.strip_prefix(&opts.directory).unwrap_or(object);
+    let shown = rel.display();
+    let soname = &libs[0];
+    let verdict = classifier.classify(soname);
+    let explicit = explicit_include_paths(opts).contains(rel);
+    let omitted = dropped.iter().find(|d| d.names.iter().any(|n| n == soname));
+    let why = if let Some(d) = omitted {
+        format!(
+            "{shown} needs {soname}, which the build omitted because {} needs {}: {}",
+            d.object.display(),
+            d.need,
+            d.verdict.reason()
+        )
+    } else if explicit {
+        format!(
+            "{shown} is explicitly included and needs {soname}: {}; an explicit include \
+             cannot be dropped",
+            verdict.reason()
+        )
+    } else if let SourceVerdict::Pruned { owner } = &verdict {
+        format!(
+            "{shown} needs {soname}, which {owner} holds but the policy or a trace \
+             removed; the conflict stops the build rather than dropping the object or \
+             restoring the file"
+        )
+    } else if opts.sysroot.is_none() {
+        format!(
+            "{shown} needs {soname}, which neither the tree, the host libraries the scan \
+             searched, a host-platform provider, nor a selected set supplies; add it with \
+             --search-path or [bundle] search-paths, or exclude it to leave it to the host"
+        )
+    } else if matches!(verdict, SourceVerdict::Absent) {
+        format!(
+            "{shown} needs {soname}, which is neither in the sysroot closure, on the \
+             platform line, nor in a shared set"
+        )
+    } else {
+        format!("{shown} needs {soname}: {}", verdict.reason())
+    };
+    let reached = entrypoints_reaching(opts, rel, soname);
+    let by = if reached.is_empty() {
+        String::new()
+    } else {
+        format!(" (entrypoint {})", reached.join(", "))
+    };
+    let more = match failing.len() {
+        1 => String::new(),
+        n => format!(" ({} more listed above)", n - 1),
+    };
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{why}{by}{more}"),
+    ))
+}
+
+/// Report what the drop pass omitted, bounded like every summary.
+fn report_dropped(opts: &BundleOptions, dropped: &[Dropped]) {
+    let source = if opts.sysroot.is_some() {
+        "the sysroot does not hold"
+    } else {
+        "the host scan did not find"
+    };
+    eprintln!(
+        "\n{} {} file(s) needing libraries {source}:",
+        color::bold("Dropped"),
+        dropped.len()
+    );
+    const SHOWN_DROPS: usize = 8;
+    for d in dropped.iter().take(SHOWN_DROPS) {
+        eprintln!(
+            "  {} omitted, needs {} ({})",
+            d.object.display(),
+            d.need,
+            color::dim(&d.verdict.reason())
+        );
+    }
+    let hidden = dropped.len().saturating_sub(SHOWN_DROPS);
+    if hidden > 0 {
+        eprintln!("  and {hidden} more omitted");
+    }
+}
+
+/// The names of the build's entrypoints whose statically known closure
+/// holds `object` asking for `soname`, sorted, so a failure names who is
+/// affected. Read only on the failure path.
+fn entrypoints_reaching(opts: &BundleOptions, object: &Path, soname: &str) -> Vec<String> {
+    let lib_root = opts.directory.join(&opts.lib_dir);
+    let mut names: Vec<String> = opts
+        .entrypoint_selections
+        .iter()
+        .filter(|e| {
+            e.path.as_ref().is_some_and(|path| {
+                entrypoint_requirements(&opts.directory, &lib_root, &opts.directory.join(path))
+                    .iter()
+                    .any(|(o, s)| Path::new(o) == object && s == soname)
+            })
+        })
+        .map(|e| format!("'{}'", e.name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The finding the failure names: an explicit include's own finding
@@ -4354,6 +4789,20 @@ pub fn audit_entrypoint_providers(
     Err(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
+/// Whether some entrypoint of the build selects the set `name`. A build
+/// without a resolved selection table, a bare `bundle-libs`, selects
+/// every set it declares.
+fn selected_by_an_entrypoint(opts: &BundleOptions, name: &str) -> bool {
+    opts.entrypoint_selections.is_empty()
+        || opts
+            .entrypoint_selections
+            .iter()
+            .any(|e| match &e.selection {
+                recipe::SetSelection::All => true,
+                recipe::SetSelection::Names(names) => names.iter().any(|n| n == name),
+            })
+}
+
 /// The declared providers a selection names, in canonical order by set
 /// name. A name the recipe never declares is the error, since a launch
 /// would refuse the selection for the same reason.
@@ -4451,7 +4900,16 @@ fn entrypoint_requirements(
     lib_root: &Path,
     entry: &Path,
 ) -> Vec<(String, String)> {
-    let lib_names = names_in(lib_root);
+    // Each directory is listed once per audit, however many objects
+    // resolve against it.
+    let mut listings: HashMap<PathBuf, std::rc::Rc<HashSet<String>>> = HashMap::new();
+    let mut listed = |dir: &Path| -> std::rc::Rc<HashSet<String>> {
+        listings
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| std::rc::Rc::new(names_in(dir)))
+            .clone()
+    };
+    let lib_names = listed(lib_root);
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: std::collections::VecDeque<PathBuf> =
         std::collections::VecDeque::from([entry.to_path_buf()]);
@@ -4471,17 +4929,17 @@ fn entrypoint_requirements(
         // directory, the way its siblings do; elsewhere, the `../lib`
         // beside the object is the convention the bundled layout keeps.
         let parent_names = if parent.starts_with(lib_root) {
-            names_in(&parent)
+            listed(&parent)
         } else {
-            HashSet::new()
+            std::rc::Rc::default()
         };
-        let origin_names = names_in(&parent.join("../lib"));
-        let mut run_dirs: Vec<(PathBuf, HashSet<String>)> =
+        let origin_names = listed(&parent.join("../lib"));
+        let mut run_dirs: Vec<(PathBuf, std::rc::Rc<HashSet<String>>)> =
             parse_rpaths_under(&real, Some(directory))
                 .into_iter()
                 .filter(|dir| dir.starts_with(directory))
                 .map(|dir| {
-                    let names = names_in(&dir);
+                    let names = listed(&dir);
                     (dir, names)
                 })
                 .collect();
@@ -5254,6 +5712,79 @@ fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
 mod plugin_dir_tests {
     use super::*;
 
+    /// A sysroot data carry whose destination differs from the source
+    /// copies only the files the build admitted: a file the policy
+    /// pruned under the carried directory stays out, and every carried
+    /// file is recorded as the build's own output.
+    #[test]
+    fn a_sysroot_carry_copies_only_admitted_files() {
+        let dir = std::env::temp_dir().join(format!("onelf-carry-admit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("sysroot");
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let files = [
+            "usr/lib/libtcl8.6.so",
+            "usr/share/tcltk/tcl8.6/init.tcl",
+            "usr/share/tcltk/tcl8.6/encoding/ascii.enc",
+        ];
+        for file in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, file.as_bytes()).unwrap();
+        }
+        let packages = [sysroot::fixture::package("app", &files)];
+        let policy_path = dir.join("policy.txt");
+        fs::write(&policy_path, "usr/share/tcltk/tcl8.6/encoding/*\n").unwrap();
+        let policy = Policy::load(&policy_path).unwrap();
+        let universe =
+            sysroot::fixture::populate_universe(&root, &packages, "app", &[], Some(&policy), None);
+        let descriptor = onelf_format::catalog::builtins()
+            .iter()
+            .find(|d| d.id.as_str() == "tcl-8.6")
+            .unwrap();
+        let admitted = [AdmittedLibrary::new(
+            "libtcl8.6.so",
+            root.join("usr/lib/libtcl8.6.so"),
+        )];
+        let mut plan = DestinationPlan::load(&tree).unwrap();
+        let mut actions: Vec<WalkAction> = Vec::new();
+        let mut preparation = SetPreparation::new(&[], &[], false);
+        for declared in &descriptor.resources.data {
+            carry_data_group(
+                &tree,
+                descriptor,
+                declared,
+                &admitted,
+                Some(&universe),
+                &mut plan,
+                &mut actions,
+                &mut preparation,
+                &mut HashSet::new(),
+            )
+            .unwrap();
+        }
+        assert!(!plan.has_findings(), "{:?}", plan.findings());
+        let mut outcome = WalkOutcome::default();
+        execute_walk(
+            &tree,
+            false,
+            false,
+            &tree.join("lib"),
+            &actions,
+            &plan,
+            &mut outcome,
+        )
+        .unwrap();
+        assert!(tree.join("lib/tcl8.6/init.tcl").is_file());
+        assert!(
+            !tree.join("lib/tcl8.6/encoding").exists(),
+            "the pruned file is not resurrected"
+        );
+        assert_eq!(outcome.written, vec!["lib/tcl8.6/init.tcl".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn link_targets_stay_inside_the_library_directory() {
         // Beside each other: the bare name.
@@ -5312,6 +5843,7 @@ mod plugin_dir_tests {
                 &mut plan,
                 &mut actions,
                 &mut preparation,
+                &mut HashSet::new(),
             )
             .unwrap();
         }
@@ -5323,6 +5855,7 @@ mod plugin_dir_tests {
             &directory.join("lib"),
             &actions,
             &plan,
+            &mut WalkOutcome::default(),
         )
         .unwrap();
     }
@@ -5486,6 +6019,7 @@ pcm.default cards.pcm.default
             &mut plan,
             &mut actions,
             &mut preparation,
+            &mut HashSet::new(),
         )
         .expect_err("a required data miss must fail the assembly");
         let text = err.to_string();
@@ -5532,6 +6066,7 @@ pcm.default cards.pcm.default
             &mut plan,
             &mut actions,
             &mut preparation,
+            &mut HashSet::new(),
         )
         .unwrap();
         assert!(actions.is_empty(), "{actions:?}");
@@ -5792,6 +6327,7 @@ mod helper_tests {
             &mut discovery,
             &mut preparation,
             &mut plan,
+            &mut HashSet::new(),
         )?;
         let _ = tag;
         Ok(Collected {
@@ -5857,6 +6393,7 @@ mod helper_tests {
             &mut discovery,
             &mut preparation,
             &mut plan,
+            &mut HashSet::new(),
         )
         .unwrap();
         assert!(
@@ -7173,6 +7710,65 @@ mod provider_audit_tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// The drop pass never omits what the assembly requires: a named
+    /// manifest entrypoint and an object a required descriptor group
+    /// placed stay as findings, while a generated auto-collected plugin
+    /// with the same unmet need is omitted.
+    #[test]
+    fn the_drop_pass_keeps_named_entrypoints_and_required_objects() {
+        let d = tmp("protect");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib/plugins")).unwrap();
+        fs::create_dir_all(d.join("libexec")).unwrap();
+        let unmet = dyn_object(&["libgone.so.1"], None);
+        for rel in ["bin/gui", "lib/plugins/auto.so", "libexec/helper"] {
+            fs::write(d.join(rel), &unmet).unwrap();
+        }
+        sysroot::record_generated(
+            &d,
+            vec![
+                "bin/gui".to_string(),
+                "lib/plugins/auto.so".to_string(),
+                "libexec/helper".to_string(),
+            ],
+        )
+        .unwrap();
+        let opts = BundleOptions {
+            directory: d.clone(),
+            lib_dir: PathBuf::from("lib"),
+            primary: Some(PathBuf::from("bin/cli")),
+            entrypoint_selections: vec![entrypoint(
+                "gui",
+                Some("bin/gui"),
+                recipe::SetSelection::All,
+            )],
+            strict: true,
+            ..Default::default()
+        };
+        let required: HashSet<PathBuf> = HashSet::from([PathBuf::from("libexec/helper")]);
+        let audit = || audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+        let mut findings = audit();
+        let dropped = drop_unloadable(
+            &opts,
+            &mut findings,
+            audit,
+            &SourceClassifier::host_only(),
+            &required,
+        )
+        .unwrap();
+        let gone: Vec<&Path> = dropped.iter().map(|x| x.object.as_path()).collect();
+        assert_eq!(gone, vec![Path::new("lib/plugins/auto.so")]);
+        assert!(d.join("bin/gui").is_file());
+        assert!(d.join("libexec/helper").is_file());
+        let left: Vec<PathBuf> = findings
+            .iter()
+            .map(|(o, _)| o.strip_prefix(&d).unwrap().to_path_buf())
+            .collect();
+        assert!(left.contains(&PathBuf::from("bin/gui")), "{left:?}");
+        assert!(left.contains(&PathBuf::from("libexec/helper")), "{left:?}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// Providers that agree on the bytes form one side of a collision,
     /// so a finding names one set per distinct content, never two sets
     /// that ship the same export.
@@ -7656,7 +8252,15 @@ mod set_preparation_tests {
         assert!(!plan.has_findings());
         let mut actions = Vec::new();
         let prepared = preparation.queue_actions(&mut actions);
-        execute_walk(appdir, false, false, &appdir.join("lib"), &actions, &plan)?;
+        execute_walk(
+            appdir,
+            false,
+            false,
+            &appdir.join("lib"),
+            &actions,
+            &plan,
+            &mut WalkOutcome::default(),
+        )?;
         Ok(prepared)
     }
 
@@ -8097,7 +8701,16 @@ mod set_preparation_tests {
         assert!(!plan.has_findings());
         let mut actions = Vec::new();
         let prepared = preparation.queue_actions(&mut actions);
-        execute_walk(&appdir, false, false, &appdir.join("lib"), &actions, &plan).unwrap();
+        execute_walk(
+            &appdir,
+            false,
+            false,
+            &appdir.join("lib"),
+            &actions,
+            &plan,
+            &mut WalkOutcome::default(),
+        )
+        .unwrap();
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].set, "audio");
         assert_eq!(prepared[0].pin, set.blake3);

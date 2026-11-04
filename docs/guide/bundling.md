@@ -106,9 +106,17 @@ How a finding is treated depends on where the tree came from:
 - ✅ From a sysroot an unresolved soname is an **error**, since the
   universe was complete and the omission is a policy or platform-line
   mistake you can fix.
-- ⚠️ From a host scan it stays a **warning**, since the universe was a
-  guess. This is true of the low-level command and of
-  `onelf build` on an AppDir without a sysroot alike.
+- ✅ From a host scan, `onelf build` and `onelf run --bundle` fail on
+  an unresolved required dependency too, before anything is published
+  or run. A need the host platform supplies (the libc family, the GPU
+  driver stacks, and what `[bundle] exclude` leaves to the host) is
+  reported and never fails the build. An auto-collected plugin whose
+  dependency the scan cannot find is omitted and reported instead, and
+  what the build requires (an entrypoint, an explicit include, a file
+  you placed, a required helper or data group) is never omitted.
+- ⚠️ The low-level `onelf bundle-libs` keeps the old behavior: from a
+  host scan an unresolved soname stays a **warning** and nothing is
+  omitted.
 - ⚠️ A recipe with `[bundle] skip` runs no walk and no audit at all:
   the tree is packed **unchecked**, exactly as it stands. See
   [Unchecked trees](./recipe#unchecked-trees).

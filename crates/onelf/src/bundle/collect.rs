@@ -13,7 +13,7 @@
 //! Collection is bounded: a directory past the member or depth cap is a
 //! refused group, not an unbounded walk.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use onelf_format::rules::{Requirement, ResourceGroup};
 
 use super::{
     AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, discover_group, is_nix_stub_ld,
-    miss_text, read_elf_class, read_elf_machine,
+    miss_text, read_elf_class, read_elf_machine, resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -102,7 +102,11 @@ pub(crate) fn collect_group(
         skipped: Vec::new(),
         misses: Vec::new(),
     };
-    let mut seen: HashSet<String> = HashSet::new();
+    // Members are keyed by where they land: a nested layout keeps
+    // same-named members apart (babl's `x86-64-v2/` and `x86-64-v3/`
+    // variants), and only a second member for one destination is
+    // refused, with the member that took it named.
+    let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
     for hit in &outcome.found {
         collection.search_dirs.push(hit.resolved.clone());
         for (rel, path) in members(hit, sysroot)? {
@@ -112,21 +116,30 @@ pub(crate) fn collect_group(
             if !name.ends_with(".so") {
                 continue;
             }
+            let shown = rel.to_string_lossy().into_owned();
             if let Err(reason) = compatible_object(&path, target_class, target_machine) {
-                collection
-                    .skipped
-                    .push((rel.to_string_lossy().into_owned(), reason));
+                collection.skipped.push((shown, reason));
                 continue;
             }
-            if !seen.insert(name.to_string()) {
+            let destination = hit.destination.join(&rel);
+            if let Some(first) = taken.get(&destination) {
+                collection.skipped.push((
+                    shown,
+                    format!(
+                        "{} is already collected from {}",
+                        destination.display(),
+                        first.display()
+                    ),
+                ));
                 continue;
             }
             if collection.plugins.len() >= MAX_GROUP_MEMBERS {
                 return Err(bounded(rule, declared.id.as_str(), MAX_GROUP_MEMBERS));
             }
+            taken.insert(destination.clone(), path.clone());
             collection.plugins.push(CollectedPlugin {
                 soname: name.to_string(),
-                destination: hit.destination.join(&rel),
+                destination,
                 resolved: path.clone(),
             });
         }
@@ -189,24 +202,34 @@ fn members(
             })?
             .to_string_lossy()
             .into_owned();
+        // Each admitted member, a link among them, resolves inside the
+        // sysroot, never through an absolute link onto the packer's
+        // machine.
         return Ok(universe
             .admitted_under(&dir_rel)
             .into_iter()
-            .map(|f| {
+            .filter_map(|f| {
                 let rel = PathBuf::from(&f)
                     .strip_prefix(&dir_rel)
                     .unwrap_or(Path::new(&f))
                     .to_path_buf();
-                (rel, universe.root().join(f))
+                let path = onelf_sysroot::path::in_root(universe.root(), Path::new(&f)).ok()?;
+                Some((rel, path))
             })
             .collect());
     }
     let mut out = Vec::new();
-    walk_members(&hit.resolved, Path::new(""), 0, &mut out)?;
+    walk_members(&hit.root, &hit.resolved, Path::new(""), 0, &mut out)?;
     Ok(out)
 }
 
+/// The regular-file members under `dir`, as pairs of the path relative
+/// to the group directory and the file to read. A symlinked member, an
+/// ALSA module alias say, is followed with every landing confined to
+/// `root`, the admitted root the group was found under, so the alias
+/// is collected under its own name and a link leaving the root is not.
 fn walk_members(
+    root: &Path,
     dir: &Path,
     rel: &Path,
     depth: usize,
@@ -225,11 +248,18 @@ fn walk_members(
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let child_rel = rel.join(entry.file_name());
+        let child = dir.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            walk_members(&dir.join(entry.file_name()), &child_rel, depth + 1, out)?;
+            walk_members(root, &child, &child_rel, depth + 1, out)?;
         } else if kind.is_file() {
-            out.push((child_rel, dir.join(entry.file_name())));
+            out.push((child_rel, child));
+        } else if kind.is_symlink()
+            && let Ok(inside) = child.strip_prefix(root)
+            && let Ok(target) = resolve_within(root, inside)
+            && target.is_file()
+        {
+            out.push((child_rel, target));
         }
     }
     Ok(())
@@ -341,6 +371,111 @@ mod tests {
             PathBuf::from("lib/alsa-lib/pulse.so")
         );
         assert!(collection.skipped.is_empty(), "{:?}", collection.skipped);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same-named members in different subdirectories of one group are
+    /// different plugins: each lands at its own destination, copied
+    /// from where it was found, and none is dropped as a duplicate.
+    #[test]
+    fn same_named_members_in_nested_layouts_are_all_collected() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let lib = dir.join("usr/lib");
+        write(&lib.join("libbabl-0.1.so.0"), &fake_elf(2, 62));
+        write(&lib.join("babl-0.1/x86-64-v2/cmyk.so"), &fake_elf(2, 62));
+        write(&lib.join("babl-0.1/x86-64-v3/cmyk.so"), &fake_elf(2, 62));
+        write(&lib.join("babl-0.1/cmyk.so"), &fake_elf(2, 62));
+        let libs = [admitted_lib(&lib.join("libbabl-0.1.so.0"))];
+
+        let collection = collect_group(
+            "babl",
+            &builtin_group("babl"),
+            &libs,
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+        let mut found: Vec<(PathBuf, PathBuf)> = collection
+            .plugins
+            .iter()
+            .map(|p| (p.destination.clone(), p.resolved.clone()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    PathBuf::from("lib/babl-0.1/cmyk.so"),
+                    lib.join("babl-0.1/cmyk.so")
+                ),
+                (
+                    PathBuf::from("lib/babl-0.1/x86-64-v2/cmyk.so"),
+                    lib.join("babl-0.1/x86-64-v2/cmyk.so")
+                ),
+                (
+                    PathBuf::from("lib/babl-0.1/x86-64-v3/cmyk.so"),
+                    lib.join("babl-0.1/x86-64-v3/cmyk.so")
+                ),
+            ]
+        );
+        assert!(collection.skipped.is_empty(), "{:?}", collection.skipped);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked member, an ALSA module alias, is collected under its
+    /// own name from the file it names inside the admitted root, and a
+    /// link that leaves the root is not followed.
+    #[test]
+    fn a_symlinked_member_is_followed_inside_its_root() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let lib = dir.join("usr/lib");
+        let outside = dir.join("outside/libasound_module_pcm_far.so");
+        write(&lib.join("libasound.so.2"), &fake_elf(2, 62));
+        write(
+            &lib.join("alsa-lib/libasound_module_pcm_pulse.so"),
+            &fake_elf(2, 62),
+        );
+        write(&outside, &fake_elf(2, 62));
+        std::os::unix::fs::symlink(
+            "libasound_module_pcm_pulse.so",
+            lib.join("alsa-lib/libasound_module_pcm_alias.so"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, lib.join("alsa-lib/libasound_module_pcm_far.so"))
+            .unwrap();
+        let libs = [admitted_lib(&lib.join("libasound.so.2"))];
+
+        let collection = collect_group(
+            "alsa",
+            &builtin_group("alsa"),
+            &libs,
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+        let alias = collected(&collection, "libasound_module_pcm_alias.so");
+        assert_eq!(
+            alias.destination,
+            PathBuf::from("lib/alsa-lib/libasound_module_pcm_alias.so")
+        );
+        assert_eq!(
+            alias.resolved,
+            lib.join("alsa-lib/libasound_module_pcm_pulse.so")
+        );
+        assert!(
+            !collection
+                .plugins
+                .iter()
+                .any(|p| p.soname == "libasound_module_pcm_far.so"),
+            "{:?}",
+            collection.plugins
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

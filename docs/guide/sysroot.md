@@ -155,10 +155,25 @@ usr/lib/*.a
   under "Left out by policy" and the verifier names the file that needed
   it, which is the next thing to prune.
 
-A build records what it put into the AppDir in `.onelf/generated` and
-removes those files first the next time, so a changed policy or
-closure takes effect on its own while anything you added by hand
-stays.
+A build records what it put into the AppDir in `.onelf/generated`, with
+the hash of each file, and removes those files first the next time, so
+a changed policy or closure takes effect on its own while anything you
+added by hand stays. Before it writes anything, the build checks every
+destination it is about to fill:
+
+- ❌ A file you placed where the sysroot puts a different one. The
+  build stops, names both hashes, and replaces nothing. Remove the
+  file, or move it to a path the build does not write.
+- ❌ A recorded file whose bytes changed since the build wrote it, or
+  an entry from an older ledger that carries no hash and whose bytes
+  are not what this build writes. Either stays as it is, and the build
+  stops until you remove or relocate it.
+- ❌ A destination beneath a directory of the AppDir that is a symlink.
+  The write would land wherever the link points, so the build stops.
+
+A framework data directory the build carries to another destination
+holds only the files the closure and the pruning kept, so a pruned file
+never comes back through it.
 
 **A trace**, when you have one, lists the paths a test run opened, one per
 line. A file survives when it was opened, when any file in its directory

@@ -562,6 +562,13 @@ const WAYLAND_LIB_PREFIXES: &[&str] = &[
 ];
 
 /// Bundle Wayland client libraries and libdecor plugins.
+///
+/// Detection turns this on without the publisher asking, so it has no
+/// authority to replace what the tree holds: every destination is
+/// admitted to `plan` before the first write, and an existing path with
+/// different content that the ledger does not record as the build's own
+/// output stops the build with nothing written. Returns the paths
+/// written, relative to the tree.
 // Threads one bundling context; a parameter object belongs with the
 // bundler restructure.
 #[allow(clippy::too_many_arguments)]
@@ -574,7 +581,8 @@ pub(crate) fn bundle_wayland(
     target_machine: Option<u16>,
     dry_run: bool,
     strip: bool,
-) -> io::Result<()> {
+    plan: &mut DestinationPlan,
+) -> io::Result<Vec<String>> {
     eprintln!("{} Wayland libraries...", color::bold("Bundling"));
 
     // Target class/machine are passed in; only search dirs come from the
@@ -587,62 +595,77 @@ pub(crate) fn bundle_wayland(
         Vec::new()
     };
     let search_dirs = build_lib_search_dirs(&elf_files, extra_search, &nix_paths);
-    let lib_dest = directory.join(lib_dir);
-
-    // Copy Wayland libraries
-    let (copied, total_bytes) = copy_prefixed_libs(
+    let libs = select_libs(
         &search_dirs,
-        WAYLAND_LIB_PREFIXES,
-        &lib_dest,
+        |name| WAYLAND_LIB_PREFIXES.iter().any(|p| name.starts_with(p)),
         target_class,
         target_machine,
         excludes,
-        dry_run,
-        strip,
-    )?;
-    if copied > 0 {
-        eprintln!(
-            "  {} {} Wayland lib(s) ({})",
-            verb_str(dry_run),
-            copied,
-            format_size(total_bytes)
-        );
-    }
-
-    // Copy libdecor plugins from libdecor/plugins-1/ subdirs
+    );
+    // libdecor plugins from the libdecor/plugins-1/ subdirs.
     let plugin_dirs: Vec<PathBuf> = search_dirs
         .iter()
         .map(|d| d.join("libdecor/plugins-1"))
         .filter(|d| d.is_dir())
         .collect();
-
-    let plugin_dest = directory.join("share/libdecor/plugins-1");
-    let (plugin_count, _) = copy_so_dir(
+    let plugins = select_libs(
         &plugin_dirs,
-        &plugin_dest,
+        |name| name.contains(".so"),
         target_class,
         target_machine,
-        None,
         excludes,
-        dry_run,
-        strip,
-    )?;
-    if plugin_count > 0 {
+    );
+    let plugin_rel = Path::new("share/libdecor/plugins-1");
+
+    let mut writes: Vec<(&LibCopy, PathBuf)> = Vec::new();
+    for (selected, under) in [(&libs, lib_dir), (&plugins, plugin_rel)] {
+        for copy in selected {
+            let rel = under.join(&copy.name);
+            let origin = format!("wayland {} from {}", copy.name, copy.resolved.display());
+            if plan.admit_refreshed(&rel, &copy.resolved, &origin)? == Admission::Write {
+                writes.push((copy, rel));
+            }
+        }
+    }
+    if plan.has_findings() {
+        return Err(plan.error());
+    }
+
+    let mut written = Vec::new();
+    for copy in libs.iter().chain(plugins.iter()) {
+        report_lib(copy);
+    }
+    if !dry_run {
+        for (copy, rel) in &writes {
+            let dest = directory.join(rel.parent().unwrap_or(Path::new("")));
+            write_lib(copy, &dest, strip)?;
+            written.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    if !libs.is_empty() {
+        eprintln!(
+            "  {} {} Wayland lib(s) ({})",
+            verb_str(dry_run),
+            libs.len(),
+            format_size(libs.iter().map(|c| c.size).sum())
+        );
+    }
+    if !plugins.is_empty() {
         eprintln!(
             "  {} {} libdecor plugin(s)",
             verb_str(dry_run),
-            plugin_count
+            plugins.len()
         );
     }
 
-    if copied == 0 && plugin_count == 0 {
+    if libs.is_empty() && plugins.is_empty() {
         eprintln!(
             "  {} no Wayland libraries found on this system",
             color::bold_red("warning:")
         );
     }
 
-    Ok(())
+    Ok(written)
 }
 
 /// Bundle GSettings compiled schemas so GTK/GLib apps don't crash with

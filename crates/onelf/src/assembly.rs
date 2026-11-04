@@ -256,8 +256,8 @@ impl AssemblyReport {
                     .to_string(),
             ),
             Source::HostScan => lines.push(
-                "Source: host scan; unresolved dependencies are warnings, not \
-                 failures"
+                "Source: host scan; unresolved required dependencies fail the \
+                 build, host-platform providers are reported"
                     .to_string(),
             ),
             Source::Unchecked => lines.push(
@@ -710,6 +710,7 @@ impl AssemblyRequest {
             sysroot: self.bundle.sysroot.clone(),
             sets: self.bundle.sets.clone(),
             platform_pin: self.bundle.platform_pin.clone(),
+            strict: true,
         }
     }
 
@@ -1629,9 +1630,9 @@ mod tests {
     }
 
     /// A host scan names its frameworks and says its unresolved
-    /// dependencies stay warnings, the way the low-level contract keeps.
+    /// required dependencies fail the build.
     #[test]
-    fn a_host_scan_report_names_its_frameworks_and_keeps_warnings_as_warnings() {
+    fn a_host_scan_report_names_its_frameworks_and_its_strictness() {
         let report = AssemblyReport {
             source: Source::HostScan,
             frameworks: vec!["wayland", "gtk"],
@@ -1642,8 +1643,8 @@ mod tests {
         assert_eq!(
             report.summary_lines(),
             vec![
-                "Source: host scan; unresolved dependencies are warnings, \
-                 not failures"
+                "Source: host scan; unresolved required dependencies fail the \
+                 build, host-platform providers are reported"
                     .to_string(),
                 "Frameworks requested: wayland, gtk".to_string(),
                 "Not inferred: computed plugin paths, script subprocesses, \
