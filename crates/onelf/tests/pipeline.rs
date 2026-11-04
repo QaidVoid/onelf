@@ -11655,6 +11655,9 @@ fn root_serves_its_own_set_view_not_a_users_mount() {
     let (build, hash, pkg) = pack_pinned_set(&td);
     let store = plant_user_store(&td, &build, &hash);
     let run_dir = td.join("xdg-run");
+    // Without a user launch to make it, the user's runtime directory is
+    // still the place root must leave alone, so it exists to compare.
+    std::fs::create_dir_all(&run_dir).unwrap();
 
     // A user launch holds a mount of the user's stored copy while root
     // runs. The first line arrives only after the set is acquired and
