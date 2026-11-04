@@ -454,8 +454,78 @@ warning: alsa/plugins: no usable plugin group (1 location(s) unavailable, 0 cand
 - ⚠️ Activation reads sonames, not behavior. A plugin loaded under a
   name the binary computes at run time still needs `--trace-run` (host
   scan) or a sysroot trace, like every other `dlopen` by computed name.
-- ⚠️ The catalog is built in. There is no recipe or CLI surface for
-  project-local rules or for disabling a built-in one yet.
+
+### Project-local rules
+
+A recipe can extend the catalog with descriptor files of its own and
+switch built-in rules off. Rule paths resolve against the recipe's
+directory, like every other recipe path:
+
+```toml
+[package]
+command = "bin/app"
+
+[bundle]
+rules = ["vendor-framework.toml"]
+disable-rules = ["translations"]
+```
+
+A local descriptor uses the same schema as the built-in ones:
+
+```toml
+schema = 1
+id = "vendor-framework"
+
+[[triggers]]
+soname-prefix = "libvendor.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/vendor-plugins"
+requirement = "optional"
+candidates = [{ base = "library-dir", path = "vendor-plugins" }]
+
+[[runtime.paths]]
+id = "plugins"
+kind = "directory"
+variables = ["VENDOR_PLUGIN_DIR"]
+selection = "first"
+inheritance = "replace"
+candidates = [{ base = "library-root", path = "vendor-plugins" }]
+```
+
+- ✅ The rules are parsed and checked with the built-ins before the
+  AppDir is touched. A parse error, an unsupported schema, an unknown
+  field or hook, a refused variable such as `LD_LIBRARY_PATH`, a local
+  identity that repeats another file's, and an unknown or repeated
+  `disable-rules` entry all fail the build naming the file and the rule.
+- ❌ A local rule cannot take a built-in identity, not even one the
+  recipe disables. Give it its own identity and disable the built-in.
+  A variable may be mapped by one enabled rule only, so a local rule
+  that maps a built-in's variable needs that built-in disabled.
+- ✅ A disabled rule never activates: its groups are not collected and
+  its runtime mappings are not carried.
+- ✅ The package carries the enabled rules' runtime mappings in
+  `.onelf/runtime-rules`, so a launch needs neither the descriptor files
+  nor a TOML parser. A recipe whose rules leave the runtime behavior the
+  built-ins already give carries no record and packs exactly as before.
+- ✅ `onelf run --bundle` assembles with the same rules, and a
+  development launch evaluates the record a build would carry.
+- ✅ `[bundle] skip` builds still validate the rules and carry their
+  mappings, without claiming any dependency was audited.
+
+### Resources prepared from a set
+
+When a declared set, not the AppDir's source, supplies a rule's helper
+or small configuration resource, the build reads it verified out of the
+pinned set and prepares it into `.onelf-prepared/<set>/<pin>/` inside
+the application. The package's runtime record binds that subtree to
+the pin, so a launch uses it only when its entrypoint selects that pin.
+For each mapping the application's own resources come first, then the
+selected pins' prepared copies, then the raw set roots. A resource is
+prepared only where one of the rule's runtime mappings would find it,
+so a prepared copy is never left unmapped.
 
 ## Extra library search paths
 

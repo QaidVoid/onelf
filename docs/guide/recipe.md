@@ -265,6 +265,8 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `trace-seconds` | int | `5` | How long the traced run may go |
 | `trace-args` | array | `[]` | Arguments for the traced run |
 | `skip` | bool | `false` | Don't run bundle-libs at all: the tree stands as authored, unchecked. See [Unchecked trees](#unchecked-trees) |
+| `rules` | array | `[]` | Project-local framework descriptor files, relative to the recipe's directory. See [Project-local rules](./bundling#project-local-rules) |
+| `disable-rules` | array | `[]` | Built-in or local rule identities that never activate and whose mappings are not carried |
 
 ### `[sysroot]`
 
@@ -305,8 +307,9 @@ a tree that was assembled and verified some other way, such as a
 set-only recipe whose tree is an upstream release unpacked into place.
 
 - ❌ Expecting skip to mean checked. Nothing about the tree is
-  verified: the build validates the recipe's declared pins and the
-  runtime's capabilities, and nothing more. What the tree lacks shows
+  verified: the build validates the recipe's declared pins, its rules
+  and the runtime's capabilities, and nothing more. The enabled rules'
+  runtime mappings are still carried. What the tree lacks shows
   up at launch, as a missing library named at load time.
 - ✅ A sysroot with a `path` is the checked route: a build from a
   package database stops on an unresolved `DT_NEEDED`, because the

@@ -258,7 +258,22 @@ package carrying them; it just does not interpret them.
   otherwise damaged, fails the launch before any acquisition or
   application execution instead of degrading to a default.
 - `.onelf/runtime-rules`, magic `ORUL`: the normalized framework rules
-  a launch applies, as path groups and hook selections.
+  a launch applies. Each record names a rule, an optional binding to one
+  declared pin (set name and full BLAKE3), the rule's runtime path
+  groups (kind, first, all or first-per-library-root selection,
+  preserve or replace inheritance, package-root or library-root
+  candidates and variable aliases) and its runtime hook IDs from the
+  closed registry. Absence is the legacy default: the built-in catalog's
+  mappings and every registered hook. Presence is exact: a launch
+  evaluates only the carried groups and runs only the carried hooks.
+  An unbound record applies to every launch. A bound record applies
+  only while its pin is selected, and adds the pin's prepared subtree,
+  `.onelf-prepared/<set>/<pin hex>`, to the same rule's groups, searched
+  after the application and before the raw set roots. Every binding
+  must name a pin the selection table, or without one the set table,
+  declares. A build carries the record only when its rules differ from
+  the built-ins (a project-local runtime rule or a disabled built-in
+  mapping) or it prepared resources from a set.
 
 Both formats share a bounded binary grammar: a 16-byte header (magic,
 little-endian u16 version 1, u16 reserved flags, u32 payload length,

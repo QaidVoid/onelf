@@ -212,7 +212,21 @@ trace-run = false                # run the command and bundle what it loads at r
 trace-seconds = 5                # how long the traced run may go
 trace-args = ["--version"]       # arguments for the traced run
 skip = false                     # don't run bundle-libs at all (pre-bundled AppDir)
+rules = ["vendor-framework.toml"]  # Vec<PathBuf>, local descriptor files, relative to the recipe's directory
+disable-rules = ["translations"] # Vec<String>, built-in or local rule identities to switch off
 ```
+
+`rules` names project-local framework descriptors in the built-in
+catalog's schema. They are validated together with the built-ins before
+the AppDir changes: a local identity may not repeat a built-in one, even
+a disabled one, or another local file's, and every `disable-rules` entry
+must name a known rule exactly once. Each failure names the file and the
+rule. A disabled rule never activates and its runtime mappings are not
+carried. The enabled rules' runtime mappings travel in
+`.onelf/runtime-rules` (see the [File Format](./file-format#runtime-metadata-records)),
+which a build writes only when they differ from the built-ins or a set's
+resources were prepared, so the descriptor files are not needed at
+launch.
 
 The GPU stack (`gl`, `dri`, `vulkan`) is bundled only when asked for,
 because the host's driver is the one that works. Wayland and GTK data
