@@ -44,10 +44,9 @@ struct Loaded {
 
 /// What a bundle launch assembles before it resolves its entrypoint.
 struct Assembled {
-    /// The shared assembly request a build would pack from.
+    /// The shared assembly request a build would pack from, carrying
+    /// the resolved selection table a build lowers into its record.
     request: assembly::AssemblyRequest,
-    /// The recipe's normalized set selections.
-    selections: recipe::SetSelections,
 }
 
 /// Assemble the AppDir for a bundle launch the way a build assembles it:
@@ -63,13 +62,9 @@ struct Assembled {
 /// the runtime stays out of this build.
 fn assemble_for_launch(loaded: Loaded) -> io::Result<Assembled> {
     onelf_rt::platform::supply_https_fetch(https_fetch);
-    let selections = recipe::SetSelections::normalize(&loaded.recipe)?;
     let request = assembly::AssemblyRequest::plan(&loaded.path, loaded.recipe, None)?;
     request.stage()?;
-    Ok(Assembled {
-        request,
-        selections,
-    })
+    Ok(Assembled { request })
 }
 
 /// The CLI's HTTPS client, supplied as acquisition's `https://`
@@ -179,7 +174,7 @@ pub fn run(
     let mut set_lib_dirs: Vec<PathBuf> = Vec::new();
     let mut pinned_gl: Option<(PathBuf, std::fs::File)> = None;
     if let Some(a) = &assembled {
-        let selection = selected_sets(&a.request, &a.selections, &ep_name)?;
+        let selection = selected_sets(&a.request, &ep_name)?;
         acquire_sets(&dir, selection, &ep_name)?;
         set_roots = onelf_rt::sets::roots();
         set_lib_dirs = set_roots
@@ -743,21 +738,20 @@ fn request_entrypoint(
 }
 
 /// The set selection the chosen entrypoint launches with, read from the
-/// same resolution table a build lowers into its selection record: the
-/// row naming the chosen entrypoint, or the default row for a
-/// `--command` override or the package command. Refusals a build
-/// raises over that table, a duplicate name or a row without a
-/// declared selection, end the launch here too.
+/// resolved selection table the assembly carried: the row naming the
+/// chosen entrypoint, or the default row for a `--command` override or
+/// the package command. Refusals a build raises over that table, a
+/// duplicate name or a row without a declared selection, ended the
+/// assembly before this launch got here.
 fn selected_sets(
     request: &assembly::AssemblyRequest,
-    selections: &recipe::SetSelections,
     ep_name: &str,
 ) -> io::Result<recipe::SetSelection> {
-    let table = crate::resolve_set_selections(selections, request)?;
-    let row = table
+    let row = request
+        .selections
         .iter()
         .find(|row| row.name == ep_name)
-        .unwrap_or(&table[0]);
+        .unwrap_or(&request.selections[0]);
     Ok(row.sets.clone())
 }
 
@@ -1178,7 +1172,8 @@ mod selection_tests {
         dir
     }
 
-    /// Plan an assembly request from a recipe body.
+    /// Plan an assembly request from a recipe body; the request carries
+    /// the resolved selection table.
     fn request(dir: &std::path::Path, body: &str) -> AssemblyRequest {
         let path = dir.join("onelf.toml");
         std::fs::write(&path, body).unwrap();
@@ -1197,22 +1192,19 @@ mod selection_tests {
              [[entrypoint]]\nname = \"gui\"\npath = \"bin/app\"\nsets = [\"toolkit\"]\n"
         );
         let request = request(&dir, &body);
-        let path = dir.join("onelf.toml");
-        let recipe = recipe::load(&path).unwrap();
-        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
 
         assert_eq!(
-            selected_sets(&request, &selections, "gui").unwrap(),
+            selected_sets(&request, "gui").unwrap(),
             SetSelection::Names(vec!["toolkit".to_string()])
         );
         assert_eq!(
-            selected_sets(&request, &selections, "cli").unwrap(),
+            selected_sets(&request, "cli").unwrap(),
             SetSelection::Names(Vec::new())
         );
         // A --command override names no table row, so the default row's
         // selection applies.
         assert_eq!(
-            selected_sets(&request, &selections, "elsewhere").unwrap(),
+            selected_sets(&request, "elsewhere").unwrap(),
             SetSelection::Names(Vec::new())
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1227,13 +1219,7 @@ mod selection_tests {
              blake3 = \"{HASH}\"\n"
         );
         let request = request(&dir, &body);
-        let path = dir.join("onelf.toml");
-        let recipe = recipe::load(&path).unwrap();
-        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
-        assert_eq!(
-            selected_sets(&request, &selections, "app").unwrap(),
-            SetSelection::All
-        );
+        assert_eq!(selected_sets(&request, "app").unwrap(), SetSelection::All);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

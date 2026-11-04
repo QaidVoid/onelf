@@ -985,6 +985,7 @@ fn main() {
                 trace_args: trace_arg,
                 sysroot,
                 sets: Vec::new(),
+                entrypoint_selections: Vec::new(),
                 platform_pin: None,
             })
         }),
@@ -1088,120 +1089,29 @@ fn main() {
 
 /// Build the package a recipe describes: resolve the recipe once into an
 /// assembly request, stage the AppDir from it, then pack the result.
+///
+/// The request carries the resolved selection table, so the record the
+/// pack lowers and the selections the assembly audited answer the same
+/// resolution of the recipe's lists.
 fn run_build(
     path: &std::path::Path,
     output_override: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let recipe_path = recipe::resolve(path)?;
     let recipe = recipe::load(&recipe_path)?;
-    // Selections normalize and resolve before anything is staged, so a
-    // recipe naming an unknown or repeated set fails while the AppDir
-    // stands exactly as its author left it.
-    let selections = recipe::SetSelections::normalize(&recipe)?;
     let request = assembly::AssemblyRequest::plan(&recipe_path, recipe, output_override)?;
-    let selected = resolve_set_selections(&selections, &request)?;
     let _report = request.stage()?;
     let update_key = request.update.read_key()?;
     let runtime = assembly::embed_runtime(&request)?;
     pack::require_store_runtime(&runtime.note, fetches_over_https(&request))?;
-    require_selection_runtime(&runtime.note, &selected)?;
+    require_selection_runtime(&runtime.note, &request.selections)?;
     let profile = match &request.compression.profile {
         Some(p) => pack::read_profile(p)?,
         None => Vec::new(),
     };
     let mut options = request.pack_options(update_key, runtime.note, profile);
-    options.metadata = entrypoint_sets_metadata(&request, &selected)?;
+    options.metadata = entrypoint_sets_metadata(&request, &request.selections)?;
     pack::pack(&options, runtime.bytes)
-}
-
-/// One final manifest entrypoint and the sets its recipe selects.
-#[derive(Debug)]
-struct ResolvedSelection {
-    /// The name the manifest gives the entrypoint.
-    name: String,
-    /// The normalized selection the recipe declares for it.
-    sets: recipe::SetSelection,
-}
-
-impl ResolvedSelection {
-    /// Whether the recipe wrote an explicit list, which makes the
-    /// selection nonlegacy and capability-gated.
-    fn is_explicit(&self) -> bool {
-        self.sets.is_explicit()
-    }
-}
-
-/// Pair the recipe's normalized selections with the final entrypoint
-/// table the packer emits: the package command under its manifest name,
-/// then every named entrypoint the default does not already cover. The
-/// entrypoint the default names carries its own selection into the
-/// primary record rather than a second record under the same name.
-///
-/// Two records answering to one name would leave which selection a
-/// launch reads up to table order, so the ambiguity is refused here,
-/// before the AppDir is touched.
-fn resolve_set_selections(
-    selections: &recipe::SetSelections,
-    request: &assembly::AssemblyRequest,
-) -> std::io::Result<Vec<ResolvedSelection>> {
-    let default_name = request
-        .default_entrypoint
-        .clone()
-        .or_else(|| {
-            std::path::Path::new(&request.package.command)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "main".to_string());
-    let named_by_default = request
-        .default_entrypoint
-        .as_deref()
-        .and_then(|name| request.entrypoints.iter().find(|e| e.name == name));
-    let primary = match named_by_default {
-        Some(entrypoint) => set_selection_named(&selections.named, &entrypoint.name)?,
-        None => selections.primary.clone(),
-    };
-    let mut table = vec![ResolvedSelection {
-        name: default_name,
-        sets: primary,
-    }];
-    for entrypoint in &request.entrypoints {
-        if request.default_entrypoint.as_deref() == Some(entrypoint.name.as_str()) {
-            continue;
-        }
-        table.push(ResolvedSelection {
-            name: entrypoint.name.clone(),
-            sets: set_selection_named(&selections.named, &entrypoint.name)?,
-        });
-    }
-    if let Some(dup) = table
-        .iter()
-        .enumerate()
-        .find(|(i, e)| table[..*i].iter().any(|m| m.name == e.name))
-        .map(|(_, e)| e.name.clone())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("duplicate entrypoint name '{dup}'"),
-        ));
-    }
-    Ok(table)
-}
-
-/// The selection a named entrypoint declares. Every final entrypoint
-/// comes from the recipe the selections were normalized from, so a
-/// missing entry means the table was built from something else.
-fn set_selection_named(
-    named: &std::collections::BTreeMap<String, recipe::SetSelection>,
-    name: &str,
-) -> std::io::Result<recipe::SetSelection> {
-    named.get(name).cloned().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("entrypoint '{name}': no declared set selection"),
-        )
-    })
 }
 
 /// Whether this build's pins are fetched over HTTPS at launch, which only
@@ -1240,9 +1150,9 @@ fn fetches_over_https(request: &assembly::AssemblyRequest) -> bool {
 /// runtime.
 fn require_selection_runtime(
     note: &onelf_format::elf::RuntimeNote,
-    table: &[ResolvedSelection],
+    table: &[assembly::ResolvedSelection],
 ) -> std::io::Result<()> {
-    if !table.iter().any(ResolvedSelection::is_explicit) {
+    if !table.iter().any(assembly::ResolvedSelection::is_explicit) {
         return Ok(());
     }
     let mut required = onelf_format::elf::RuntimeRequirements::metadata(
@@ -1283,9 +1193,9 @@ fn require_selection_runtime(
 /// table and the recorded pins before anything is written.
 fn entrypoint_sets_metadata(
     request: &assembly::AssemblyRequest,
-    table: &[ResolvedSelection],
+    table: &[assembly::ResolvedSelection],
 ) -> std::io::Result<pack::MetadataPayload> {
-    if !table.iter().any(ResolvedSelection::is_explicit) {
+    if !table.iter().any(assembly::ResolvedSelection::is_explicit) {
         return Ok(pack::MetadataPayload::default());
     }
     let declared = declared_set_pins(request)?;
@@ -1452,11 +1362,8 @@ mod block_size_tests {
 
 #[cfg(test)]
 mod selection_tests {
-    use super::{
-        ResolvedSelection, entrypoint_sets_metadata, require_selection_runtime,
-        resolve_set_selections,
-    };
-    use crate::assembly;
+    use super::{entrypoint_sets_metadata, require_selection_runtime};
+    use crate::assembly::{self, ResolvedSelection};
     use crate::metadata;
     use crate::recipe;
     use onelf_format::elf::{RUNTIME_METADATA_VERSION, RuntimeCapabilities, RuntimeNote};
@@ -1470,11 +1377,11 @@ mod selection_tests {
         format!("[package]\ncommand = \"bin/app\"\nmtime = 0\n{package}\n{SETS}\n{entrypoints}")
     }
 
-    /// Load, normalize and plan a recipe written into a scratch
-    /// directory: the exact prefix `run_build` runs, minus staging.
-    /// Plan reads nothing from the tree, so the recipe file is the only
-    /// file the scratch needs.
-    fn resolve(body: &str) -> std::io::Result<Vec<ResolvedSelection>> {
+    /// Load and plan a recipe written into a scratch directory: the
+    /// exact prefix `run_build` runs, minus staging. Plan reads nothing
+    /// from the tree, so the recipe file is the only file the scratch
+    /// needs, and the request carries the resolved table.
+    fn resolve(body: &str) -> std::io::Result<assembly::AssemblyRequest> {
         let dir = std::env::temp_dir().join(format!(
             "onelf-selection-{}-{}",
             std::process::id(),
@@ -1487,10 +1394,8 @@ mod selection_tests {
         std::fs::write(dir.join("onelf.toml"), body).unwrap();
         let path = recipe::resolve(&dir).unwrap();
         let recipe = recipe::load(&path).unwrap();
-        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
-        let request = assembly::AssemblyRequest::plan(&path, recipe, None).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        resolve_set_selections(&selections, &request)
+        assembly::AssemblyRequest::plan(&path, recipe, None)
     }
 
     /// The table mirrors the manifest: the package command under its
@@ -1498,11 +1403,12 @@ mod selection_tests {
     /// declared set when no list was written.
     #[test]
     fn an_omitted_selection_resolves_over_the_final_table() {
-        let table = resolve(&recipe(
+        let request = resolve(&recipe(
             "",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
         ))
         .unwrap();
+        let table = &request.selections;
         assert_eq!(table.len(), 2);
         assert_eq!(table[0].name, "app");
         assert_eq!(table[0].sets, recipe::SetSelection::All);
@@ -1515,11 +1421,12 @@ mod selection_tests {
     /// keeps exactly its names in canonical order.
     #[test]
     fn explicit_lists_resolve_to_what_they_wrote() {
-        let table = resolve(&recipe(
+        let request = resolve(&recipe(
             "sets = []",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = [\"gtk\"]\n",
         ))
         .unwrap();
+        let table = &request.selections;
         assert_eq!(table[0].sets, recipe::SetSelection::Names(Vec::new()));
         assert!(table[0].is_explicit());
         assert_eq!(
@@ -1533,11 +1440,12 @@ mod selection_tests {
     /// independent.
     #[test]
     fn a_named_omission_does_not_inherit_an_explicit_primary_list() {
-        let table = resolve(&recipe(
+        let request = resolve(&recipe(
             "sets = [\"gtk\"]",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
         ))
         .unwrap();
+        let table = &request.selections;
         assert_eq!(
             table[0].sets,
             recipe::SetSelection::Names(vec!["gtk".to_string()])
@@ -1551,11 +1459,12 @@ mod selection_tests {
     /// the same name.
     #[test]
     fn the_default_entrypoint_carries_its_own_selection() {
-        let table = resolve(&recipe(
+        let request = resolve(&recipe(
             "",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\ndefault = true\nsets = [\"gtk\"]\n",
         ))
         .unwrap();
+        let table = &request.selections;
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].name, "cli");
         assert_eq!(
@@ -1636,16 +1545,11 @@ mod selection_tests {
         0x32, 0x10,
     ];
 
-    /// Plan and resolve a recipe written into a scratch directory,
-    /// keeping the scratch: the record builder needs only the request,
-    /// and the packing tests need the tree.
-    fn planned(
-        body: &str,
-    ) -> (
-        std::path::PathBuf,
-        assembly::AssemblyRequest,
-        Vec<ResolvedSelection>,
-    ) {
+    /// Plan a recipe written into a scratch directory, keeping the
+    /// scratch: the record builder needs only the request, and the
+    /// packing tests need the tree. The request carries the resolved
+    /// table.
+    fn planned(body: &str) -> (std::path::PathBuf, assembly::AssemblyRequest) {
         let dir = std::env::temp_dir().join(format!(
             "onelf-selection-{}-{}",
             std::process::id(),
@@ -1659,10 +1563,8 @@ mod selection_tests {
         std::fs::write(dir.join("onelf.toml"), body).unwrap();
         let path = recipe::resolve(&dir).unwrap();
         let recipe = recipe::load(&path).unwrap();
-        let selections = recipe::SetSelections::normalize(&recipe).unwrap();
         let request = assembly::AssemblyRequest::plan(&path, recipe, None).unwrap();
-        let table = resolve_set_selections(&selections, &request).unwrap();
-        (dir, request, table)
+        (dir, request)
     }
 
     /// The sets one entrypoint selects, by name, from a decoded record.
@@ -1680,11 +1582,11 @@ mod selection_tests {
     /// manifest entrypoint name.
     #[test]
     fn an_explicit_selection_lowers_the_complete_record() {
-        let (dir, request, table) = planned(&recipe(
+        let (dir, request) = planned(&recipe(
             "sets = [\"gtk\"]",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\nsets = []\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
         assert!(
             payload.runtime_rules.is_none(),
             "selections carry no rule records"
@@ -1711,9 +1613,9 @@ mod selection_tests {
     /// byte-identical to what the recipe always packed.
     #[test]
     fn a_legacy_selection_lowers_no_record() {
-        let (dir, request, table) = planned(&recipe("", ""));
+        let (dir, request) = planned(&recipe("", ""));
         assert_eq!(
-            entrypoint_sets_metadata(&request, &table).unwrap(),
+            entrypoint_sets_metadata(&request, &request.selections).unwrap(),
             crate::pack::MetadataPayload::default()
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1723,11 +1625,11 @@ mod selection_tests {
     /// name while a written list keeps exactly its names.
     #[test]
     fn an_omitted_list_expands_beside_a_written_one() {
-        let (dir, request, table) = planned(&recipe(
+        let (dir, request) = planned(&recipe(
             "sets = [\"audio\"]",
             "[[entrypoint]]\nname = \"cli\"\npath = \"bin/app\"\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
         let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
         assert_eq!(selection(&record, "app"), ["audio"]);
         assert_eq!(selection(&record, "cli"), ["audio", "gtk"]);
@@ -1739,11 +1641,11 @@ mod selection_tests {
     /// a second one under the command's name.
     #[test]
     fn the_default_named_entrypoint_keeps_one_record_under_its_recipe_name() {
-        let (dir, request, table) = planned(&recipe(
+        let (dir, request) = planned(&recipe(
             "",
             "[[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\ndefault = true\nsets = [\"gtk\"]\n",
         ));
-        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
         let record = EntrypointSets::decode(payload.entrypoint_sets.as_deref().unwrap()).unwrap();
         assert_eq!(
             record
@@ -1762,7 +1664,7 @@ mod selection_tests {
     /// rather than lowered.
     #[test]
     fn a_record_names_only_declared_sets() {
-        let (dir, request, _table) = planned(&recipe("", ""));
+        let (dir, request) = planned(&recipe("", ""));
         let hostile = vec![ResolvedSelection {
             name: "app".to_string(),
             sets: recipe::SetSelection::Names(vec!["ghost".to_string()]),
@@ -1799,11 +1701,9 @@ mod selection_tests {
         std::fs::write(dir.join("onelf.toml"), body).unwrap();
         let path = recipe::resolve(&dir).unwrap();
         let loaded = recipe::load(&path).unwrap();
-        let selections = recipe::SetSelections::normalize(&loaded).unwrap();
         let request = assembly::AssemblyRequest::plan(&path, loaded, None).unwrap();
-        let table = resolve_set_selections(&selections, &request).unwrap();
         let _report = request.stage().unwrap();
-        let payload = entrypoint_sets_metadata(&request, &table).unwrap();
+        let payload = entrypoint_sets_metadata(&request, &request.selections).unwrap();
 
         let out = dir.join("pkg.onelf");
         let mut opts = request.pack_options(None, RuntimeNote::Absent, Vec::new());
@@ -1818,7 +1718,7 @@ mod selection_tests {
         let runtime = assembly::embed_runtime(&request).unwrap();
         let mut opts = request.pack_options(None, runtime.note, Vec::new());
         opts.output = out.clone();
-        opts.metadata = entrypoint_sets_metadata(&request, &table).unwrap();
+        opts.metadata = entrypoint_sets_metadata(&request, &request.selections).unwrap();
         crate::pack::pack(&opts, runtime.bytes).unwrap();
         let carried = metadata::read_packed_file(&out, ".onelf/entrypoint-sets")
             .unwrap()

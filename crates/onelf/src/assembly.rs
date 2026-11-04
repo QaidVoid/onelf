@@ -134,6 +134,28 @@ pub struct BinaryImport {
     pub source: PathBuf,
 }
 
+/// One final manifest entrypoint and the sets its recipe selects.
+///
+/// The build lowers this table into the package's selection record, the
+/// launch reads the row naming the entrypoint it starts, and the
+/// assembly audits each row's entrypoint against its own selection, so
+/// every consumer answers the same resolution of the recipe's lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSelection {
+    /// The name the manifest gives the entrypoint.
+    pub name: String,
+    /// The normalized selection the recipe declares for it.
+    pub sets: recipe::SetSelection,
+}
+
+impl ResolvedSelection {
+    /// Whether the recipe wrote an explicit list, which makes the
+    /// selection nonlegacy and capability-gated.
+    pub fn is_explicit(&self) -> bool {
+        self.sets.is_explicit()
+    }
+}
+
 /// How the AppDir contents are produced, normalized from the recipe's
 /// `[bundle]` and `[sysroot]` sections.
 #[derive(Debug, Clone)]
@@ -313,6 +335,12 @@ pub struct AssemblyRequest {
     /// The bare binary imported to the package command's path before
     /// the AppDir is assembled, when the recipe asks for one.
     pub input: Option<BinaryImport>,
+    /// The resolved set selection table: one row per final manifest
+    /// entrypoint, pairing each name with the selection its recipe
+    /// declares. Resolved once here, so the selection record a build
+    /// lowers, the row a bundle launch reads, and the selection the
+    /// assembly audits against are the same table.
+    pub selections: Vec<ResolvedSelection>,
     /// How the AppDir contents are produced.
     pub bundle: BundleRequest,
 }
@@ -327,6 +355,10 @@ impl AssemblyRequest {
         recipe: recipe::Recipe,
         output_override: Option<&Path>,
     ) -> io::Result<Self> {
+        // Selections normalize first, exactly as they did before the
+        // request existed: a recipe naming an unknown or repeated set
+        // fails while the AppDir stands exactly as its author left it.
+        let selections = recipe::SetSelections::normalize(&recipe)?;
         let dir = recipe_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -485,6 +517,12 @@ impl AssemblyRequest {
                 args: e.args,
             })
             .collect();
+        let selections = resolve_selections(
+            &selections,
+            &package.command,
+            &default_entrypoint,
+            &entrypoints,
+        )?;
         let lib_dirs = rb
             .lib_dirs
             .clone()
@@ -546,6 +584,7 @@ impl AssemblyRequest {
             paths: paths.into_iter().collect(),
             preload,
             input: import,
+            selections,
             bundle: BundleRequest {
                 skip: rb.skip && sysroot.is_none(),
                 gl: rb.gl,
@@ -637,13 +676,16 @@ impl AssemblyRequest {
         })
     }
 
-    /// The bundle-libs invocation this request normalizes to.
+    /// The bundle-libs invocation this request normalizes to, carrying
+    /// the resolved selection table the assembly audits each entrypoint
+    /// against.
     fn bundle_options(&self) -> bundle::BundleOptions {
         bundle::BundleOptions {
             directory: self.directory.clone(),
             target: None,
             primary: Some(PathBuf::from(&self.package.command)),
             lib_dir: PathBuf::from("lib"),
+            entrypoint_selections: self.audit_entrypoints(),
             exclude: self.bundle.exclude.clone(),
             include: self.bundle.include.clone(),
             search_path: self.bundle.search_paths.clone(),
@@ -670,6 +712,30 @@ impl AssemblyRequest {
             sets: self.bundle.sets.clone(),
             platform_pin: self.bundle.platform_pin.clone(),
         }
+    }
+
+    /// The entrypoints the assembly audits: each resolved selection row
+    /// paired with the executable the packer roots that entrypoint's
+    /// requirements at. A row naming a manifest entrypoint carries its
+    /// path; the primary row, the package command under its manifest
+    /// name, roots at the command.
+    fn audit_entrypoints(&self) -> Vec<bundle::AuditedEntrypoint> {
+        self.selections
+            .iter()
+            .map(|row| {
+                let path = self
+                    .entrypoints
+                    .iter()
+                    .find(|e| e.name == row.name)
+                    .map(|e| PathBuf::from(&e.path))
+                    .unwrap_or_else(|| PathBuf::from(&self.package.command));
+                bundle::AuditedEntrypoint {
+                    name: row.name.clone(),
+                    path: Some(path),
+                    selection: row.sets.clone(),
+                }
+            })
+            .collect()
     }
 
     /// The low-level pack invocation this request resolves to.
@@ -723,6 +789,79 @@ impl AssemblyRequest {
             runtime_note,
         }
     }
+}
+
+/// Pair the recipe's normalized selections with the final entrypoint
+/// table the packer emits: the package command under its manifest name,
+/// then every named entrypoint the default does not already cover. The
+/// entrypoint the default names carries its own selection into the
+/// primary record rather than a second record under the same name.
+///
+/// Two records answering to one name would leave which selection a
+/// launch reads up to table order, so the ambiguity is refused here,
+/// before the AppDir is touched.
+fn resolve_selections(
+    selections: &recipe::SetSelections,
+    command: &str,
+    default_entrypoint: &Option<String>,
+    entrypoints: &[Entrypoint],
+) -> io::Result<Vec<ResolvedSelection>> {
+    let default_name = default_entrypoint
+        .clone()
+        .or_else(|| {
+            std::path::Path::new(command)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "main".to_string());
+    let named_by_default = default_entrypoint
+        .as_deref()
+        .and_then(|name| entrypoints.iter().find(|e| e.name == name));
+    let primary = match named_by_default {
+        Some(entrypoint) => set_selection_named(&selections.named, &entrypoint.name)?,
+        None => selections.primary.clone(),
+    };
+    let mut table = vec![ResolvedSelection {
+        name: default_name,
+        sets: primary,
+    }];
+    for entrypoint in entrypoints {
+        if default_entrypoint.as_deref() == Some(entrypoint.name.as_str()) {
+            continue;
+        }
+        table.push(ResolvedSelection {
+            name: entrypoint.name.clone(),
+            sets: set_selection_named(&selections.named, &entrypoint.name)?,
+        });
+    }
+    if let Some(dup) = table
+        .iter()
+        .enumerate()
+        .find(|(i, e)| table[..*i].iter().any(|m| m.name == e.name))
+        .map(|(_, e)| e.name.clone())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("duplicate entrypoint name '{dup}'"),
+        ));
+    }
+    Ok(table)
+}
+
+/// The selection a named entrypoint declares. Every final entrypoint
+/// comes from the recipe the selections were normalized from, so a
+/// missing entry means the table was built from something else.
+fn set_selection_named(
+    named: &std::collections::BTreeMap<String, recipe::SetSelection>,
+    name: &str,
+) -> io::Result<recipe::SetSelection> {
+    named.get(name).cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("entrypoint '{name}': no declared set selection"),
+        )
+    })
 }
 
 /// The AppDir path an import writes to: the package command as a plain

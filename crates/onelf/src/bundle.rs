@@ -1978,6 +1978,12 @@ pub struct BundleOptions {
     /// for the runtime to fetch at launch. Host-scan rules apply, and the
     /// verifier reports what the sets supply instead of warning about it.
     pub sets: Vec<sysroot::SharedSet>,
+    /// The build's resolved entrypoints with their own set selections,
+    /// which the assembly audits each against the assembled tree: a set
+    /// an entrypoint does not select satisfies nothing of its. Empty
+    /// when no selection table was resolved, as in a bare `bundle-libs`
+    /// invocation, which audits only the declared sets.
+    pub entrypoint_selections: Vec<AuditedEntrypoint>,
     /// A GL build pinned without a sysroot, named whole by the recipe.
     pub platform_pin: Option<onelf_sysroot::platform::Pin>,
 }
@@ -2519,12 +2525,20 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
     }
 
-    // The provider audit runs before anything is written, so a pair of
-    // declared sets that cannot be selected together stops the build
-    // with the tree exactly as it stood.
-    if !opts.sets.is_empty() && !opts.dry_run {
-        audit_declared_sets(opts)?;
-    }
+    // The provider audits run on the verified exports of the declared
+    // sets, read once here and shared by both: the all-selected
+    // collision audit stops contradictory declarations before anything
+    // is written, and the per-entrypoint audit below refuses a tree an
+    // entrypoint cannot launch from. Both fetch nothing the declared
+    // sets' own reporting does not, and a dry run consults no build at
+    // all, so it fetches nothing either.
+    let set_audit = if !opts.sets.is_empty() && !opts.dry_run {
+        let (providers, unchecked) = sysroot::audit_providers(&opts.sets);
+        audit_declared_sets(opts, &providers)?;
+        Some((providers, unchecked))
+    } else {
+        None
+    };
 
     let mut host_files: HashSet<String> = HashSet::new();
     let mut set_sonames: HashSet<String> = HashSet::new();
@@ -3980,6 +3994,14 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         ));
         // After injection, so the audit sees the final DT_NEEDED set.
         verify_needs(opts, sysroot_platform.as_ref(), &set_sonames, &classifier)?;
+        // The assembled tree is what a launch resolves against, so the
+        // build's own entrypoints are audited against it before the
+        // packer runs: each with its own selection, so a set the
+        // selection leaves out satisfies nothing and the failure names
+        // who asked, what for, and who could have supplied it.
+        if let Some((providers, unchecked)) = set_audit.as_ref() {
+            audit_entrypoint_selections(opts, sysroot_platform.as_ref(), providers, unchecked)?;
+        }
     }
 
     Ok(())
@@ -4260,9 +4282,9 @@ pub struct AuditedEntrypoint {
 
 /// Audit the required providers and the simultaneous set providers of
 /// every entrypoint given, against the assembled tree. Ok means every
-/// entrypoint's needs resolve inside the tree, its selected sets'
-/// verified exports, or the permitted host closure, and that no two of
-/// its selected sets export one loader-namespace name with different
+/// entrypoint's needs resolve inside the tree, the sonames its selected
+/// sets verifiably ship, or the permitted host closure, and that no two
+/// of its selected sets export one loader-namespace name with different
 /// content. The audit reads the tree and the providers and writes
 /// nothing, so a caller may run it before the assembly touches the
 /// AppDir and fail without leaving a trace.
@@ -4519,7 +4541,7 @@ fn names_in(dir: &Path) -> HashSet<String> {
 /// The findings for one entrypoint's requirements: a need the tree
 /// cannot resolve and its selection cannot supply is one line naming
 /// the entrypoint, the requesting object, the soname, and what was
-/// found instead, which is a declared set that exports the soname the
+/// found instead, which is a declared set that ships the soname the
 /// selection left out, when there is one.
 fn unsatisfied_requirements(
     directory: &Path,
@@ -4539,19 +4561,14 @@ fn unsatisfied_requirements(
     }
     let lib_root = directory.join(lib_dir);
     let requirements = entrypoint_requirements(directory, &lib_root, &resolved);
+    let ships = |p: &sysroot::SetProvider, soname: &str| p.provides.iter().any(|s| s == soname);
     let mut findings = Vec::new();
     for (object, soname) in requirements {
-        if selected
-            .iter()
-            .any(|p| p.exports.iter().any(|e| e.soname == soname))
-            || host(&soname)
-        {
+        if selected.iter().any(|p| ships(p, &soname)) || host(&soname) {
             continue;
         }
-        let mut owners: Vec<&sysroot::SetProvider> = providers
-            .iter()
-            .filter(|p| p.exports.iter().any(|e| e.soname == soname))
-            .collect();
+        let mut owners: Vec<&sysroot::SetProvider> =
+            providers.iter().filter(|p| ships(p, &soname)).collect();
         owners.sort_by(|a, b| a.set.cmp(&b.set));
         let why = if owners.is_empty() {
             "which nothing in the application, its selection, or the host line \
@@ -4580,11 +4597,9 @@ fn unsatisfied_requirements(
 /// pair. A set whose exports cannot be verified claims nothing here and
 /// keeps its existing reporting, so a build that cannot reach a pinned
 /// build fails, when it fails, for the reason it always did. The
-/// per-object requirements of an entrypoint's own selection are audited
-/// by [`audit_entrypoint_providers`] once the resolved selection table
-/// reaches the build.
-fn audit_declared_sets(opts: &BundleOptions) -> io::Result<()> {
-    let (providers, _) = sysroot::audit_providers(&opts.sets);
+/// entrypoints' own selections are audited later, against the assembled
+/// tree, by [`audit_entrypoint_selections`].
+fn audit_declared_sets(opts: &BundleOptions, providers: &[sysroot::SetProvider]) -> io::Result<()> {
     let name = opts
         .primary
         .as_deref()
@@ -4601,8 +4616,68 @@ fn audit_declared_sets(opts: &BundleOptions) -> io::Result<()> {
             path: None,
             selection: recipe::SetSelection::All,
         }],
-        &providers,
+        providers,
         &|_| false,
+    )
+}
+
+/// Audit the build's real entrypoints against the assembled tree, each
+/// with its own selection.
+///
+/// By the time this runs, the tree holds everything the assembly copied
+/// for it, which is what a launch resolves against, so an entrypoint's
+/// statically known dependency edges resolve the way the loader will:
+/// inside the tree, from a set its selection names, or from what the
+/// host is permitted to supply, which is the platform line's sonames,
+/// the libc family a launch may weigh against the host's copy, and the
+/// driver stacks that must match the running kernel. A need nothing of
+/// the three answers fails the build naming the entrypoint, the object
+/// that asked, the soname, and, when a declared set exports it, that
+/// set, so a recipe whose CLI left out the one set that carries its
+/// library is refused here rather than at first launch.
+///
+/// A set whose exports could not be verified claims nothing, so a
+/// selection resting on one fails the same way, with the set's own
+/// reporting naming why. The audit reads the tree and the verified set
+/// exports and writes nothing.
+fn audit_entrypoint_selections(
+    opts: &BundleOptions,
+    platform: Option<&PlatformLine>,
+    providers: &[sysroot::SetProvider],
+    unchecked: &[(String, String)],
+) -> io::Result<()> {
+    if opts.entrypoint_selections.is_empty() {
+        return Ok(());
+    }
+    // A set whose build could not be checked still answers its
+    // selection, claiming nothing: the audit then names what the
+    // selection could not supply instead of pretending the recipe
+    // named a set it never declared.
+    let mut audited = providers.to_vec();
+    for (name, _) in unchecked {
+        if audited.iter().any(|p| p.set == *name) {
+            continue;
+        }
+        audited.push(sysroot::SetProvider {
+            set: name.clone(),
+            pin: String::new(),
+            provides: Vec::new(),
+            exports: Vec::new(),
+        });
+    }
+    let host = |soname: &str| {
+        platform.is_some_and(|p| p.matches_soname(soname))
+            || onelf_format::resolve::is_libc_family(soname)
+            || onelf_format::drivers::DRIVER_FAMILIES
+                .iter()
+                .any(|prefix| soname.starts_with(prefix))
+    };
+    audit_entrypoint_providers(
+        &opts.directory,
+        &opts.lib_dir,
+        &opts.entrypoint_selections,
+        &audited,
+        &host,
     )
 }
 
@@ -6830,6 +6905,7 @@ mod provider_audit_tests {
         sysroot::SetProvider {
             set: set.to_string(),
             pin: format!("{pin:064x}"),
+            provides: exports.iter().map(|(s, _)| s.to_string()).collect(),
             exports: exports
                 .iter()
                 .map(|(soname, id)| sysroot::SetExport {
@@ -6922,6 +6998,76 @@ mod provider_audit_tests {
         ];
         audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
             .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The providers a build's sets actually produce when their
+    /// sonames never overlap: names without content hashes, because a
+    /// hash is what the collision rule alone weighs. Such a provider
+    /// still answers its own selection, and an unselected one satisfies
+    /// nothing, with the failure naming the set that was left out.
+    #[test]
+    fn an_exports_free_provider_answers_its_own_selection_alone() {
+        let d = tmp("exports-free");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/cli"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![
+            sysroot::SetProvider {
+                set: "alpha".to_string(),
+                pin: format!("{:064x}", 1u64),
+                provides: vec!["libshared.so.1".to_string()],
+                exports: Vec::new(),
+            },
+            sysroot::SetProvider {
+                set: "beta".to_string(),
+                pin: format!("{:064x}", 2u64),
+                provides: vec!["libbeta.so.1".to_string()],
+                exports: Vec::new(),
+            },
+        ];
+        let entrypoints = vec![entrypoint("cli", Some("bin/cli"), names(&["beta"]))];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("entrypoint 'cli'"), "{text}");
+        assert!(text.contains("bin/cli needs libshared.so.1"), "{text}");
+        assert!(text.contains("which alpha exports"), "{text}");
+        assert!(!text.contains("entrypoint 'beta'"), "{text}");
+
+        // Naming the exporting set too supplies the need: the
+        // selection, not the audit, decides what counts.
+        let entrypoints = vec![entrypoint(
+            "cli",
+            Some("bin/cli"),
+            names(&["alpha", "beta"]),
+        )];
+        audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+            .unwrap();
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A selected set that claims nothing, the shape an unchecked build
+    /// leaves, satisfies nothing: the need fails for its own reason
+    /// instead of hiding behind an unverifiable claim.
+    #[test]
+    fn a_selected_provider_that_claims_nothing_satisfies_nothing() {
+        let d = tmp("claims-nothing");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::write(d.join("bin/app"), dyn_object(&["libshared.so.1"], None)).unwrap();
+        let providers = vec![sysroot::SetProvider {
+            set: "opaque".to_string(),
+            pin: format!("{:064x}", 1u64),
+            provides: Vec::new(),
+            exports: Vec::new(),
+        }];
+        let entrypoints = vec![entrypoint("app", Some("bin/app"), names(&["opaque"]))];
+        let err =
+            audit_entrypoint_providers(&d, Path::new("lib"), &entrypoints, &providers, &no_host)
+                .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("bin/app needs libshared.so.1"), "{text}");
+        assert!(text.contains("nothing in the application"), "{text}");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -7044,11 +7190,13 @@ mod provider_audit_tests {
             sysroot::SetProvider {
                 set: "alpha".to_string(),
                 pin: format!("{:064x}", 1u64),
+                provides: alpha_exports.iter().map(|e| e.soname.clone()).collect(),
                 exports: alpha_exports,
             },
             sysroot::SetProvider {
                 set: "beta".to_string(),
                 pin: format!("{:064x}", 2u64),
+                provides: beta_exports.iter().map(|e| e.soname.clone()).collect(),
                 exports: beta_exports,
             },
         ];

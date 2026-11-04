@@ -1161,8 +1161,16 @@ pub struct SetProvider {
     pub set: String,
     /// The BLAKE3 pin of the build the exports belong to.
     pub pin: String,
+    /// The loader-namespace names the pinned build verifiably ships,
+    /// read from its provider index, or from its recorded listing when
+    /// it publishes no index. This is what answers whether a selection
+    /// supplies a soname; it needs no content hashes, so every set
+    /// whose build could be read carries it.
+    pub provides: Vec<String>,
     /// The sonames the pinned build exports with their content hashes,
-    /// sorted by soname and unique.
+    /// sorted by soname and unique. Filled only for the sets an export
+    /// overlap makes comparable, since a hash is what the collision
+    /// rule weighs and nothing else.
     pub exports: Vec<SetExport>,
 }
 
@@ -1379,6 +1387,7 @@ pub(crate) fn audit_providers(sets: &[SharedSet]) -> (Vec<SetProvider>, Vec<(Str
             providers.push(SetProvider {
                 set: name,
                 pin,
+                provides: exports,
                 exports: Vec::new(),
             });
             continue;
@@ -1388,6 +1397,7 @@ pub(crate) fn audit_providers(sets: &[SharedSet]) -> (Vec<SetProvider>, Vec<(Str
             Some(Ok(hashes)) => providers.push(SetProvider {
                 set: name,
                 pin,
+                provides: hashes.iter().map(|e| e.soname.clone()).collect(),
                 exports: hashes,
             }),
             Some(Err(why)) => unchecked.push((name, why)),

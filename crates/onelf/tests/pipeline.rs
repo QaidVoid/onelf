@@ -13776,6 +13776,289 @@ fn identical_set_exports_deduplicate() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// Compile an executable whose one need is `soname`, linked against the
+/// set tree that supplies it, so the built need has a declared provider
+/// and nothing on the packer's machine. False when the compile could
+/// not run, the documented soft-skip.
+fn entrypoint_app(td: &Path, dir: &Path, rel: &str, tree: &Path, soname: &str) -> bool {
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let stem = soname.trim_end_matches(".so.1");
+    write(
+        &td.join("ep.c"),
+        &format!(
+            "#include <stdio.h>\nint {stem}_value(void);\nint main(void){{printf(\"{stem}=%d\\n\", {stem}_value());return 0;}}\n"
+        ),
+    );
+    cc_with(
+        &[
+            td.join("ep.c").to_str().unwrap(),
+            &format!("-L{}", tree.join("lib").display()),
+            &format!("-l:{soname}"),
+        ],
+        &dir.join(rel),
+    )
+}
+
+/// A set-only recipe over the two sets `alpha` and `beta`, the package
+/// command `bin/cli` selecting `command_sets`, and a named `gui`
+/// entrypoint selecting `gui_sets`.
+fn selection_recipe(
+    dir: &Path,
+    alpha: (&Path, &str),
+    beta: (&Path, &str),
+    command_sets: &str,
+    gui_sets: &str,
+) {
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/cli\"\nmtime = 0\n{command_sets}\n\n\
+             [sysroot.sets.alpha]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{}\"\n\n\
+             [sysroot.sets.beta]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{}\"\n\n\
+             [[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\n{gui_sets}\n",
+            alpha.0.display(),
+            alpha.1,
+            beta.0.display(),
+            beta.1,
+        ),
+    );
+}
+
+fn build_recipe(dir: &Path, out: &Path) -> std::process::Output {
+    Command::new(onelf())
+        .args([
+            "build",
+            dir.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build")
+}
+
+/// An entrypoint whose selection leaves out the one set that carries a
+/// library it needs fails the build, naming the entrypoint, the object
+/// that asked, the dependency, and the set that exports it. Naming the
+/// set as well builds. A development launch assembles through the same
+/// machinery and refuses the same recipe with the same attribution.
+#[test]
+fn an_entrypoints_unselected_set_fails_its_build_with_attribution() {
+    let td = workdir("setsel-unselected");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libalpha.so.1",
+        "int libalpha_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_library(
+        &td,
+        "beta",
+        "libbeta.so.1",
+        "int libbeta_value(void){return 2;}\n",
+    )
+    .expect("compile beta");
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+
+    let dir = td.join("app");
+    assert!(entrypoint_app(
+        &td,
+        &dir,
+        "bin/cli",
+        &tree_a,
+        "libalpha.so.1"
+    ));
+    assert!(entrypoint_app(
+        &td,
+        &dir,
+        "bin/gui",
+        &tree_a,
+        "libalpha.so.1"
+    ));
+    // The command selects beta only, so its need for libalpha.so.1 has
+    // a provider its selection leaves out; the GUI selects alpha and is
+    // served.
+    selection_recipe(
+        &dir,
+        (&set_a, &hash_a),
+        (&set_b, &hash_b),
+        "sets = [\"beta\"]",
+        "sets = [\"alpha\"]",
+    );
+    let pkg = td.join("u.onelf");
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("provider audit failed"), "{err}");
+    assert!(err.contains("entrypoint 'cli'"), "{err}");
+    assert!(err.contains("bin/cli needs libalpha.so.1"), "{err}");
+    assert!(
+        err.contains("which alpha exports and the entrypoint does not select"),
+        "{err}"
+    );
+    assert!(!err.contains("entrypoint 'gui'"), "{err}");
+    assert!(!pkg.exists(), "a refused build writes no output");
+
+    // A development launch stages through the same assembly, so the
+    // same recipe ends the launch with the same attribution.
+    let mut cmd = dev_run(&td, &["--bundle"]);
+    cmd.arg(&dir);
+    let out = cmd.output().expect("spawn onelf run");
+    let run_err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{run_err}");
+    assert!(run_err.contains("entrypoint 'cli'"), "{run_err}");
+    assert!(run_err.contains("which alpha exports"), "{run_err}");
+
+    // Naming the exporting set too supplies the command, and the build
+    // goes through with each entrypoint audited on its own selection.
+    selection_recipe(
+        &dir,
+        (&set_a, &hash_a),
+        (&set_b, &hash_b),
+        "sets = [\"alpha\", \"beta\"]",
+        "sets = [\"alpha\"]",
+    );
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(pkg.is_file(), "the passing build packs");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Every entrypoint is audited against its own selection alone: two
+/// entrypoints each naming the set that serves its own need build, and
+/// one of them naming the wrong set fails alone, with the other's
+/// selection neither answering for it nor blamed with it.
+#[test]
+fn each_entrypoint_is_audited_against_its_own_selection() {
+    let td = workdir("setsel-own");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libalpha.so.1",
+        "int libalpha_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    let Some(tree_b) = set_library(
+        &td,
+        "beta",
+        "libbeta.so.1",
+        "int libbeta_value(void){return 2;}\n",
+    ) else {
+        return;
+    };
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+
+    let dir = td.join("app");
+    assert!(entrypoint_app(
+        &td,
+        &dir,
+        "bin/cli",
+        &tree_b,
+        "libbeta.so.1"
+    ));
+    assert!(entrypoint_app(
+        &td,
+        &dir,
+        "bin/gui",
+        &tree_a,
+        "libalpha.so.1"
+    ));
+    selection_recipe(
+        &dir,
+        (&set_a, &hash_a),
+        (&set_b, &hash_b),
+        "sets = [\"beta\"]",
+        "sets = [\"alpha\"]",
+    );
+    let pkg = td.join("o.onelf");
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "each selection serves its own: {err}");
+    assert!(pkg.is_file());
+
+    // The GUI naming beta instead fails for its own need alone: the
+    // command's satisfied selection neither answers for it nor takes
+    // the blame.
+    selection_recipe(
+        &dir,
+        (&set_a, &hash_a),
+        (&set_b, &hash_b),
+        "sets = [\"beta\"]",
+        "sets = [\"beta\"]",
+    );
+    let pkg = td.join("x.onelf");
+    let o = build_recipe(&dir, &pkg);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("entrypoint 'gui'"), "{err}");
+    assert!(err.contains("bin/gui needs libalpha.so.1"), "{err}");
+    assert!(err.contains("which alpha exports"), "{err}");
+    assert!(!err.contains("entrypoint 'cli'"), "{err}");
+    assert!(!pkg.exists(), "{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Two declared sets exporting one soname with different bytes stop the
+/// build even when every entrypoint selects only one of them: the
+/// all-selected collision audit keeps refusing contradictory
+/// declarations before anything is written.
+#[test]
+fn a_declared_sets_collision_stops_selected_builds_too() {
+    let td = workdir("setsel-collision");
+    let Some(tree_a) = set_library(
+        &td,
+        "alpha",
+        "libshared.so.1",
+        "int libshared_value(void){return 1;}\n",
+    ) else {
+        return;
+    };
+    set_library(
+        &td,
+        "beta",
+        "libshared.so.1",
+        "int libshared_value(void){return 2;}\n",
+    )
+    .expect("compile beta");
+    let (hash_a, set_a) = pack_set(&td, "alpha", "alpha");
+    let (hash_b, set_b) = pack_set(&td, "beta", "beta");
+    assert_ne!(hash_a, hash_b, "different builds pin differently");
+
+    let dir = td.join("app");
+    assert!(soname_needing_app(&td, &dir, &[&tree_a], "libshared.so.1"));
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/app\"\nmtime = 0\nsets = [\"alpha\"]\n\n\
+             [sysroot.sets.alpha]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_a}\"\n\n\
+             [sysroot.sets.beta]\npackages = [\"libshared\"]\nurl = \"file://{}\"\nblake3 = \"{hash_b}\"\n",
+            set_a.display(),
+            set_b.display()
+        ),
+    );
+    let pkg = td.join("c.onelf");
+    let o = build_recipe(&dir, &pkg);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{stderr}");
+    assert!(stderr.contains("entrypoint 'app'"), "{stderr}");
+    assert!(stderr.contains("libshared.so.1"), "{stderr}");
+    assert!(stderr.contains("alpha"), "{stderr}");
+    assert!(stderr.contains("beta"), "{stderr}");
+    assert!(stderr.contains("exported with different bytes"), "{stderr}");
+    assert!(stderr.contains("cannot be selected together"), "{stderr}");
+    assert!(!pkg.exists(), "{stderr}");
+    assert!(
+        !dir.join(".onelf/sets").exists(),
+        "the collision stops the build before anything is written: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The ALSA configuration a hand-made set tree ships, with the hooks
 /// block the carried snippet anchor belongs in and a version marker a
 /// test can tell apart across pins.
