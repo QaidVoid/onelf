@@ -102,14 +102,17 @@ fn run(launch: &Launch) {
         .collect();
 
     // What the selected providers can run beside: their objects against
-    // the application's bundled libc and loader pair, checked before the
-    // resolver edits a tree, the environment is touched, or the app
-    // starts. Wrong-architecture objects, needs beyond the bundled pair
-    // and the selection, and unrelated libc families all end it here.
+    // the application's own libraries, the other selected sets and the
+    // bundled libc and loader pair, checked before the resolver edits a
+    // tree, the environment is touched, or the app starts.
+    // Wrong-architecture objects, versions a supplied library lacks,
+    // differing copies of one exported library and unrelated libc
+    // families all end it here.
     let bundled_interp_rel = launch
         .interp_data
         .and_then(crate::interp::parse_bundled_interp_rel);
     if let Err(why) = crate::providers::validate_selected(
+        manifest,
         launch.pkg_root,
         &lib_dirs,
         &target_path,
@@ -734,17 +737,22 @@ pub fn resolve_launch(
         None => (None, None),
     };
 
-    let resolution = resolve::resolve(&Request {
-        pkg_root,
-        lib_dirs: &lib_dirs,
-        policy,
-        store: &store,
-        ld_cache: &ld_cache,
-        icd_dirs: resolve::ICD_DIRS,
-        extra_root: platform_root.as_deref(),
-        set_roots: &set_roots,
-        host_libc: private_ns || tree_writable,
-    });
+    // The decision is this selection's own: another entrypoint of the
+    // package with other sets, or none, never reuses it.
+    let resolution = resolve::resolve_selected(
+        &Request {
+            pkg_root,
+            lib_dirs: &lib_dirs,
+            policy,
+            store: &store,
+            ld_cache: &ld_cache,
+            icd_dirs: resolve::ICD_DIRS,
+            extra_root: platform_root.as_deref(),
+            set_roots: &set_roots,
+            host_libc: private_ns || tree_writable,
+        },
+        &crate::sets::pins(),
+    );
     Resolved {
         resolution,
         policy,

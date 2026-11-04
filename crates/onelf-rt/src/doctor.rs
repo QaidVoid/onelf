@@ -26,8 +26,6 @@ use onelf_rt::loader::PackageData;
 use onelf_rt::loader::read_package_file;
 use onelf_rt::pkgmeta;
 use onelf_rt::platform::Pin;
-use onelf_rt::sets;
-use onelf_rt::sets::SETS_FILE;
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
@@ -230,13 +228,7 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
 
     // The entrypoint's selection, resolved the way a launch resolves it,
     // without acquiring any of it.
-    let sets_table = read_package_file(pkg, SETS_FILE);
-    let selection = sets::selection(
-        sets_table.as_deref(),
-        table.as_deref(),
-        &pkg.manifest,
-        &ep_name,
-    );
+    let selection = pkgmeta::validate(pkg, &ep_name).map_err(|e| e.to_string());
 
     let lib_dirs: Vec<String> = pkg
         .manifest

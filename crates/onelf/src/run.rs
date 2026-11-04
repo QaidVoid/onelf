@@ -200,17 +200,20 @@ pub fn run(
 
     let resolution = match run_store(&dir) {
         Some(store) if target_is_elf && !lib_dirs.is_empty() && !disabled => {
-            resolve::resolve(&Request {
-                pkg_root: &dir,
-                lib_dirs: &lib_dir_strs,
-                policy,
-                store: &store,
-                ld_cache: &drivers::cache_file(),
-                icd_dirs: resolve::ICD_DIRS,
-                extra_root: pinned_gl.as_ref().map(|(root, _)| root.as_path()),
-                set_roots: &set_roots,
-                host_libc: false,
-            })
+            resolve::resolve_selected(
+                &Request {
+                    pkg_root: &dir,
+                    lib_dirs: &lib_dir_strs,
+                    policy,
+                    store: &store,
+                    ld_cache: &drivers::cache_file(),
+                    icd_dirs: resolve::ICD_DIRS,
+                    extra_root: pinned_gl.as_ref().map(|(root, _)| root.as_path()),
+                    set_roots: &set_roots,
+                    host_libc: false,
+                },
+                &onelf_rt::sets::pins(),
+            )
         }
         _ => Resolution::default(),
     };

@@ -76,7 +76,7 @@ pub fn dir_where(
 }
 
 /// The names the package itself has in `dir`.
-fn carried<'m>(manifest: &'m Manifest, dir: &str) -> HashSet<&'m str> {
+pub(crate) fn carried<'m>(manifest: &'m Manifest, dir: &str) -> HashSet<&'m str> {
     let Some(idx) = dir_index(manifest, dir) else {
         return HashSet::new();
     };

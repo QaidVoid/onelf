@@ -20,6 +20,8 @@ use std::io;
 use onelf_format::runtime_metadata::{EntrypointSets, MAX_METADATA_BYTES, RuntimeRuleMetadata};
 
 use crate::loader::{self, PackageData};
+use crate::platform::Pin;
+use crate::sets::SETS_FILE;
 
 /// Where the package carries its validated runtime rule record.
 pub const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
@@ -29,18 +31,23 @@ pub const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
 pub const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
 
 /// Read, decode and cross-validate both metadata records ahead of every
-/// dispatch decision.
+/// dispatch decision, and return the pins `entrypoint` selects.
 ///
 /// Each record is checked on its own when the other is absent. When both
 /// are present, the rules' set-pin bindings must all name pins the
-/// selection table declares.
-pub fn validate(pkg: &PackageData) -> io::Result<()> {
+/// selection table declares. A selection record is also checked against
+/// the manifest's entrypoint names and the set table's actual pins, so a
+/// record the package cannot back ends even a memfd launch before it
+/// executes anything.
+pub fn validate(pkg: &PackageData, entrypoint: &str) -> io::Result<Vec<Pin>> {
     let rules = runtime_rules(pkg)?;
     let sets = entrypoint_sets(pkg)?;
     if let (Some(rules), Some(sets)) = (&rules, &sets) {
         rules.validate_bindings(sets).map_err(rejected)?;
     }
-    Ok(())
+    let table = loader::read_bounded_record(pkg, SETS_FILE, MAX_METADATA_BYTES)?;
+    crate::sets::selection(table.as_deref(), sets.as_ref(), &pkg.manifest, entrypoint)
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
 /// The package's runtime rule record, or `None` for the legacy default.
@@ -112,7 +119,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("onelf-pkgmeta-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let built = fixture::build(b"onelf fixture prefix", files, &[]);
+        let built = fixture::build(b"onelf fixture prefix", files, &[("app", 0)]);
         std::fs::write(&path, &built.bytes).unwrap();
         let pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
         Case { pkg, path }
@@ -183,7 +190,7 @@ mod tests {
     #[test]
     fn a_package_without_records_keeps_the_legacy_defaults() {
         let case = case("plain", &[("bin/app", b"elf bytes".to_vec())]);
-        assert!(validate(&case.pkg).is_ok());
+        assert!(validate(&case.pkg, "app").is_ok());
     }
 
     #[test]
@@ -192,6 +199,7 @@ mod tests {
             "valid",
             &[
                 ("bin/app", b"elf bytes".to_vec()),
+                (SETS_FILE, sets_record()),
                 (RUNTIME_RULES_FILE, bound_rule_bytes(PIN_A)),
                 (
                     ENTRYPOINT_SETS_FILE,
@@ -199,21 +207,24 @@ mod tests {
                 ),
             ],
         );
-        assert!(validate(&case.pkg).is_ok());
+        assert!(validate(&case.pkg, "app").is_ok());
     }
 
     #[test]
     fn either_record_alone_still_validates() {
         let rules = case("lone-rules", &[(RUNTIME_RULES_FILE, plain_rule_bytes())]);
-        assert!(validate(&rules.pkg).is_ok());
+        assert!(validate(&rules.pkg, "app").is_ok());
         let sets = case(
             "lone-sets",
-            &[(
-                ENTRYPOINT_SETS_FILE,
-                sets_bytes(&[("qt", PIN_A)], &[("app", &["qt"])]),
-            )],
+            &[
+                (SETS_FILE, sets_record()),
+                (
+                    ENTRYPOINT_SETS_FILE,
+                    sets_bytes(&[("qt", PIN_A)], &[("app", &["qt"])]),
+                ),
+            ],
         );
-        assert!(validate(&sets.pkg).is_ok());
+        assert!(validate(&sets.pkg, "app").is_ok());
     }
 
     #[test]
@@ -228,7 +239,7 @@ mod tests {
                 ),
             ],
         );
-        let err = validate(&case.pkg).unwrap_err();
+        let err = validate(&case.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("runtime binding"), "{err}");
     }
 
@@ -237,7 +248,7 @@ mod tests {
         let encoded = sets_bytes(&[("qt", PIN_A)], &[("app", &["qt"])]);
         let truncated = encoded[..encoded.len() - 1].to_vec();
         let case = case("truncated", &[(ENTRYPOINT_SETS_FILE, truncated)]);
-        let err = validate(&case.pkg).unwrap_err();
+        let err = validate(&case.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("runtime metadata"), "{err}");
     }
 
@@ -247,7 +258,7 @@ mod tests {
         let mut version = encoded.clone();
         version[4] = 2;
         let wrong_version = case("version", &[(ENTRYPOINT_SETS_FILE, version)]);
-        let err = validate(&wrong_version.pkg).unwrap_err();
+        let err = validate(&wrong_version.pkg, "app").unwrap_err();
         assert!(
             err.to_string().contains("unsupported metadata version"),
             "{err}"
@@ -256,7 +267,7 @@ mod tests {
         let mut magic = encoded;
         magic[0] = b'X';
         let wrong_magic = case("magic", &[(ENTRYPOINT_SETS_FILE, magic)]);
-        let err = validate(&wrong_magic.pkg).unwrap_err();
+        let err = validate(&wrong_magic.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("invalid metadata magic"), "{err}");
     }
 
@@ -275,7 +286,7 @@ mod tests {
         swapped[20..64].copy_from_slice(&second);
         swapped[64..108].copy_from_slice(&first);
         let case = case("noncanonical", &[(ENTRYPOINT_SETS_FILE, swapped)]);
-        let err = validate(&case.pkg).unwrap_err();
+        let err = validate(&case.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("noncanonical"), "{err}");
     }
 
@@ -298,7 +309,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, &bytes).unwrap();
         let pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
-        let err = validate(&pkg).unwrap_err();
+        let err = validate(&pkg, "app").unwrap_err();
         assert!(err.to_string().contains("hash mismatch"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
@@ -314,7 +325,7 @@ mod tests {
         );
         let idx = loader::find_file_entry(&case.pkg, ENTRYPOINT_SETS_FILE).unwrap();
         case.pkg.manifest.entries[idx].blocks[0].original_size = MAX_METADATA_BYTES as u64 + 1;
-        let err = validate(&case.pkg).unwrap_err();
+        let err = validate(&case.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("record limit"), "{err}");
     }
 
@@ -329,7 +340,7 @@ mod tests {
         );
         let idx = loader::find_file_entry(&case.pkg, ENTRYPOINT_SETS_FILE).unwrap();
         case.pkg.manifest.entries[idx].blocks[0].payload_offset = u64::MAX;
-        assert!(validate(&case.pkg).is_err());
+        assert!(validate(&case.pkg, "app").is_err());
     }
 
     /// The built runtime's bytes: the executable prefix every packed
@@ -429,6 +440,38 @@ mod tests {
         assert!(stderr.contains("dependency set"), "{stderr}");
     }
 
+    /// A memfd-eligible entrypoint needs no set, yet a selection record
+    /// the package cannot back still stops it before it executes. The
+    /// consistent record shows the same entrypoint does run in memfd.
+    #[test]
+    fn an_inconsistent_selection_stops_a_memfd_entrypoint_before_it_runs() {
+        let runtime = runtime_bytes();
+        let script = b"#!/bin/sh\necho MEMFD-RAN >&2\nexit 42\n".to_vec();
+        let package = |record: Vec<u8>| {
+            fixture::build_flagged(
+                &runtime,
+                &[
+                    ("bin/app", script.clone()),
+                    (SETS_FILE, sets_record()),
+                    (ENTRYPOINT_SETS_FILE, record),
+                ],
+                &[("app", 0)],
+                EntryPointFlags::MEMFD_ELIGIBLE,
+            )
+        };
+
+        let stale = sets_bytes(&[("qt", PIN_A)], &[("app", &["qt"]), ("ghost", &[])]);
+        let (code, stderr) = launch("gate-memfd-stale", &package(stale));
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(!stderr.contains("MEMFD-RAN"), "{stderr}");
+        assert!(stderr.contains("entrypoint-sets"), "{stderr}");
+
+        let consistent = sets_bytes(&[("qt", PIN_A)], &[("app", &["qt"])]);
+        let (code, stderr) = launch("gate-memfd-ok", &package(consistent));
+        assert_eq!(code, Some(42), "{stderr}");
+        assert!(stderr.contains("MEMFD-RAN"), "{stderr}");
+    }
+
     /// Minimal stored-mode packages the runtime loader can open.
     ///
     /// The layout is `[prefix][manifest][stored payload][footer]`: one
@@ -450,6 +493,16 @@ mod tests {
             prefix: &[u8],
             files: &[(&str, Vec<u8>)],
             entrypoints: &[(&str, u32)],
+        ) -> Package {
+            build_flagged(prefix, files, entrypoints, EntryPointFlags::empty())
+        }
+
+        /// [`build`] with every entrypoint carrying `flags`.
+        pub(crate) fn build_flagged(
+            prefix: &[u8],
+            files: &[(&str, Vec<u8>)],
+            entrypoints: &[(&str, u32)],
+            flags: EntryPointFlags,
         ) -> Package {
             let mut string_table: Vec<u8> = vec![0];
             let mut name_offsets = Vec::new();
@@ -500,7 +553,7 @@ mod tests {
                     target_entry: *target,
                     args: 0,
                     working_dir: WorkingDir::Inherit,
-                    flags: EntryPointFlags::empty(),
+                    flags,
                 })
                 .collect();
             let manifest = Manifest {

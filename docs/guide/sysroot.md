@@ -423,7 +423,21 @@ objects fit the package's libc are read out of the pinned build's
 verified manifest and ELF objects at check time, so a set packed by an
 older onelf needs no republishing when the checks grow stricter. A
 wrong-architecture object or an unsatisfied symbol version in any
-pinned build, old or new, fails before the application runs.
+pinned build, old or new, fails before the application runs. A version
+is checked against the copy of its library the launch supplies: the
+package's own copy first, which keeps its precedence only while it
+defines what the set needs, then a selected set's, then the bundled
+libc for the libc family. A library none of them supplies, such as a
+host GPU or media driver the set leaves out, is the host's and is not
+checked. Two selected sets that export one name from their library
+directories with different bytes fail the launch naming the name and
+both pins, which also covers trees packed with `[bundle] skip`, where
+the build audits nothing.
+
+Resolver decisions are recorded per selection. An entrypoint that
+selects no set never reuses the host-library decision a toolkit
+entrypoint recorded, while two entrypoints naming the same pins in a
+different order share one.
 
 ### Execution views
 

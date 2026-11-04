@@ -98,14 +98,19 @@ fn main() {
         .to_string();
 
     // The launch gate for versioned payload metadata: a record that is
-    // present but unreadable, truncated, unsupported, tampered or
-    // self-inconsistent ends the launch here, before the memfd read, set
+    // present but unreadable, truncated, unsupported, tampered,
+    // self-inconsistent, or not backed by the set table and the
+    // entrypoints ends the launch here, before the memfd read, set
     // acquisition, hooks or any environment change. A package with neither
-    // record launches with the legacy defaults.
-    if let Err(e) = pkgmeta::validate(&pkg) {
-        eprintln!("onelf-rt: {e}");
-        std::process::exit(1);
-    }
+    // record launches with the legacy defaults. The invoked entrypoint's
+    // pins are acquired later, once no mode can still run without them.
+    let selected = match pkgmeta::validate(&pkg, &ep_name) {
+        Ok(pins) => pins,
+        Err(e) => {
+            eprintln!("onelf-rt: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Handle --onelf-icon / --onelf-desktop before dispatching
     if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
@@ -278,22 +283,7 @@ fn main() {
     // namespace so every package naming it shares one mount, and a mode
     // that unshares first would make that mount private to this launch.
     // The carried selection record scopes acquisition to the invoked
-    // entrypoint's selection, and a record the set table cannot back
-    // ends the launch here, before any namespace or artifact exists.
-    let sets_table = loader::read_package_file(&mut pkg, sets::SETS_FILE);
-    let set_selections = loader::read_package_file(&mut pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
-    let selected = match sets::selection(
-        sets_table.as_deref(),
-        set_selections.as_deref(),
-        &pkg.manifest,
-        &ep_name,
-    ) {
-        Ok(pins) => pins,
-        Err(why) => {
-            eprintln!("onelf-rt: {why}");
-            std::process::exit(1);
-        }
-    };
+    // entrypoint's selection, which the launch gate resolved and checked.
     sets::init(&selected, &ep_name);
 
     // The app runs setuid binaries, so it has to stay in the namespace it

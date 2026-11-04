@@ -21483,6 +21483,168 @@ fn host_driver_pair(td: &Path, tag: &str, dir: &Path, value: i32) -> bool {
     true
 }
 
+/// The resolver's per-selection decision records under the private
+/// runtime directory, one `sel-<key>/decision` per selection identity.
+fn selection_records_of(td: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for store in std::fs::read_dir(td.join("xdg-run"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("resolve-"))
+    {
+        for entry in std::fs::read_dir(store.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("sel-"))
+        {
+            out.push(entry.path().join("decision"));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Resolver decisions belong to the selection that made them. A toolkit
+/// entrypoint and a `sets = []` entrypoint of one package on one host
+/// keep separate records, so the empty selection never reuses the
+/// toolkit's decision, while an entrypoint naming the same sets in
+/// another order reuses the toolkit's record untouched.
+#[test]
+fn each_selection_keeps_its_own_resolver_decision() {
+    let td = workdir("resolver-selection");
+    for (tag, soname) in [
+        ("alpha", "libalpha.so.7fixture"),
+        ("beta", "libbeta.so.7fixture"),
+    ] {
+        if set_library(&td, tag, soname, "int set_value(void){return 1;}\n").is_none() {
+            return;
+        }
+    }
+    let (alpha, alpha_pkg) = pack_set(&td, "alpha", "alpha");
+    let (beta, beta_pkg) = pack_set(&td, "beta", "beta");
+
+    // A host whose loader cache names one driver, so every launch has a
+    // decision to record.
+    let host = td.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    write(&td.join("gl.c"), "int gl_value(void){return 1;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libGL.so.1",
+            td.join("gl.c").to_str().unwrap(),
+        ],
+        &host.join("libGL.so.1")
+    ));
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&host.join("libGL.so.1")])).unwrap();
+
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    write(&td.join("plain.c"), "int plain_value(void){return 1;}\n");
+    assert!(cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libplain.so.1",
+            td.join("plain.c").to_str().unwrap(),
+        ],
+        &dir.join("lib/libplain.so.1")
+    ));
+    for name in ["cli", "gui", "gui2"] {
+        let script = dir.join("bin").join(name);
+        write(&script, &format!("#!/bin/sh\necho ran={name}\n"));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/cli\"\nmtime = 0\n\n[bundle]\nskip = true\n\n\
+             [sysroot.sets.alpha]\npackages = [\"alpha\"]\nurl = \"file://{}\"\nblake3 = \"{alpha}\"\n\n\
+             [sysroot.sets.beta]\npackages = [\"beta\"]\nurl = \"file://{}\"\nblake3 = \"{beta}\"\n\n\
+             [[entrypoint]]\nname = \"cli\"\npath = \"bin/cli\"\nsets = []\ndefault = true\n\n\
+             [[entrypoint]]\nname = \"gui\"\npath = \"bin/gui\"\nsets = [\"alpha\", \"beta\"]\n\n\
+             [[entrypoint]]\nname = \"gui2\"\npath = \"bin/gui2\"\nsets = [\"beta\", \"alpha\"]\n",
+            alpha_pkg.display(),
+            beta_pkg.display()
+        ),
+    );
+    let pkg = td.join("app.onelf");
+    let out = Command::new(onelf())
+        .args([
+            "build",
+            dir.to_str().unwrap(),
+            "--output",
+            pkg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn onelf build");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let launch = |entrypoint: &str| {
+        let mut cmd = Command::new(&pkg);
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_ENTRYPOINT", entrypoint)
+            .env("ONELF_MODE", "rundir")
+            .env("ONELF_SET_MODE", "extract")
+            .env("ONELF_LD_CACHE", &cache)
+            .env("ONELF_PLATFORM_STORE", td.join("store"));
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{entrypoint}: {report}");
+        assert!(report.contains(&format!("ran={entrypoint}")), "{report}");
+    };
+
+    launch("gui");
+    let toolkit = selection_records_of(&td);
+    assert_eq!(toolkit.len(), 1, "{toolkit:?}");
+    let record = std::fs::read_to_string(&toolkit[0]).unwrap();
+    assert!(
+        record.contains(&alpha) && record.contains(&beta),
+        "the toolkit record names its pins:\n{record}"
+    );
+
+    launch("cli");
+    let both = selection_records_of(&td);
+    assert_eq!(
+        both.len(),
+        2,
+        "the empty selection reused the toolkit's: {both:?}"
+    );
+    let empty = both.iter().find(|p| **p != toolkit[0]).unwrap();
+    let empty_record = std::fs::read_to_string(empty).unwrap();
+    assert!(
+        !empty_record.contains(&alpha) && !empty_record.contains(&beta),
+        "the empty selection's record names a toolkit pin:\n{empty_record}"
+    );
+
+    let stamp = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+    let before = stamp(&toolkit[0]);
+    launch("gui2");
+    assert_eq!(selection_records_of(&td), both);
+    assert_eq!(
+        stamp(&toolkit[0]),
+        before,
+        "an equivalent selection rewrote the record instead of reusing it"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The resolver's link farms under the private runtime directory: one
 /// per host state, named by its fingerprint and its winners.
 fn farms_of(td: &Path) -> Vec<PathBuf> {

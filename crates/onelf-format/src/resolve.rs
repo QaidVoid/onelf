@@ -244,47 +244,19 @@ fn is_driver_family(soname: &str) -> bool {
     DRIVER_FAMILIES.iter().any(|p| soname.starts_with(p))
 }
 
-/// Decide what this launch takes from the host.
-pub fn resolve(req: &Request) -> Resolution {
-    if req.policy == HostLibsPolicy::Never {
-        return Resolution::default();
-    }
-    let host = HostIndex::load(req.ld_cache, req.icd_dirs, req.extra_root);
-    if host.libs.is_empty() {
-        return Resolution::default();
-    }
-    let fingerprint = fingerprint(
-        req.ld_cache,
-        req.icd_dirs,
-        req.policy,
-        req.extra_root,
-        req.host_libc,
-    );
-    if let Some(recorded) = load_recorded(req.store, &fingerprint) {
-        return recorded;
-    }
-    let decision = decide_on(req, &host);
-    let resolution = materialized(req, &fingerprint, &decision);
-    if let Err(e) = record(req.store, &fingerprint, &resolution, &decision.winners) {
-        eprintln!(
-            "onelf-rt: resolver: cannot record {}: {e}",
-            req.store.display()
-        );
-    }
-    resolution
-}
-
-/// [`resolve`] for a launch that activates part of the package's
-/// dependency sets, named by `pins`.
+/// Decide what this launch takes from the host, for a launch whose
+/// active dependency sets are `pins`, empty for a launch that activates
+/// none.
 ///
 /// The decision is read and written under the launch's
-/// [`SelectionIdentity`] instead of the host alone: a changed subset or
-/// pin misses and is recomputed against only its own library universe, an
-/// equivalent list order hits and is served as it stands, and the record
-/// [`resolve`] keeps is never read here. A list outside the identity's
-/// bounds decides afresh every launch rather than being cached under a
-/// guessed key. The host fingerprint, the farm and the vanished-winner
-/// checks are the ones [`resolve`] uses.
+/// [`SelectionIdentity`] as well as the host: a changed subset or pin
+/// misses and is recomputed against only its own library universe, an
+/// empty selection never reads a toolkit selection's record, and an
+/// equivalent list order hits and is served as it stands. A list outside
+/// the identity's bounds decides afresh every launch rather than being
+/// cached under a guessed key. A host change, a winner swapped in place
+/// and a vanished winner each void a record, as does a record left by a
+/// release that keyed decisions on the host alone.
 pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
     if req.policy == HostLibsPolicy::Never {
         return Resolution::default();
@@ -362,8 +334,8 @@ pub struct Decision {
     pub farm: Option<PathBuf>,
 }
 
-/// [`resolve`] without the store: neither the recorded decision is read
-/// nor a farm or record written. For reporting what a launch would do.
+/// [`resolve_selected`] without the store: neither the recorded decision
+/// is read nor a farm or record written. For reporting what a launch would do.
 pub fn decide(req: &Request) -> Decision {
     if req.policy == HostLibsPolicy::Never {
         return Decision::default();
@@ -862,10 +834,6 @@ fn fingerprint(
 
 const DECISION_FILE: &str = "decision";
 
-/// The record format [`resolve`] reads and writes: one decision per
-/// package store, keyed on the host alone.
-const LEGACY_RECORD_HEADER: &str = "onelf-resolve 2";
-
 /// The record format [`resolve_selected`] reads and writes, keyed on the
 /// host and the launch's selection identity. The version in the header
 /// steps up whenever the layout changes, so a record naming another
@@ -1003,23 +971,6 @@ fn write_decision(
     fs::rename(&tmp, dir.join(DECISION_FILE))
 }
 
-/// Record the launch-path decision for this host state.
-fn record(
-    store: &Path,
-    fingerprint: &str,
-    resolution: &Resolution,
-    winners: &BTreeMap<String, PathBuf>,
-) -> io::Result<()> {
-    write_decision(
-        store,
-        LEGACY_RECORD_HEADER,
-        "",
-        fingerprint,
-        resolution,
-        winners,
-    )
-}
-
 /// Record a selection's decision under its identity.
 fn record_selection(
     dir: &Path,
@@ -1056,18 +1007,6 @@ fn stat_line(path: &Path) -> String {
         }
         Err(_) => "missing".to_string(),
     }
-}
-
-/// The recorded decision, when it was made for this exact host state and
-/// everything it names still exists.
-fn load_recorded(store: &Path, fingerprint: &str) -> Option<Resolution> {
-    let text = fs::read_to_string(store.join(DECISION_FILE)).ok()?;
-    let (mut resolution, winners) = parse_decision(&text, LEGACY_RECORD_HEADER, &[], fingerprint)?;
-    if winners.is_empty() {
-        return Some(resolution);
-    }
-    resolution.farm = Some(farm_checked(store, fingerprint, &winners)?);
-    Some(resolution)
 }
 
 /// A selection's recorded decision, when it was made for this exact
@@ -1258,17 +1197,20 @@ mod tests {
         ) -> Resolution {
             let icd_dir = self.icd_dir.to_string_lossy().into_owned();
             let set_roots = self.set_roots();
-            let r = resolve(&Request {
-                pkg_root: &self.pkg,
-                lib_dirs: &["lib"],
-                policy,
-                store: &self.store,
-                ld_cache: &self.cache,
-                icd_dirs: &[icd_dir.as_str()],
-                extra_root,
-                set_roots: &set_roots,
-                host_libc,
-            });
+            let r = resolve_selected(
+                &Request {
+                    pkg_root: &self.pkg,
+                    lib_dirs: &["lib"],
+                    policy,
+                    store: &self.store,
+                    ld_cache: &self.cache,
+                    icd_dirs: &[icd_dir.as_str()],
+                    extra_root,
+                    set_roots: &set_roots,
+                    host_libc,
+                },
+                &[],
+            );
             *self.last_farm.borrow_mut() = r.farm.clone();
             r
         }
@@ -1442,7 +1384,7 @@ mod tests {
         assert_eq!(d.winners.get("libGL.so.1"), Some(&host_gl));
         assert!(!w.store.exists(), "deciding wrote the store");
 
-        let r = resolve(&req);
+        let r = resolve_selected(&req, &[]);
         assert_eq!(
             r.farm, d.farm,
             "the farm a launch builds is the one reported"
@@ -2372,30 +2314,27 @@ mod tests {
         assert_eq!(names(&dir), ["decision"]);
     }
 
-    /// The two record formats share one store without reading each
-    /// other: the launch path keeps its single record keyed on the host,
-    /// the selection path keeps one per identity, and each still hits
-    /// after the other wrote.
+    /// A record a release keyed on the host alone left at the store's top
+    /// is never read: its winner is not served, and the launch decides
+    /// for its own selection.
     #[test]
-    fn the_legacy_and_selection_records_share_a_store_without_mixing() {
+    fn a_host_only_record_is_never_served() {
         let w = World::new();
         w.host("libGL.so.1", &driver_needing(&["libfoo.so.1"]));
-        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
-        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
-        let pins = [pin("gtk", 1)];
+        let host_foo = w.host("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0", "FOO_1.1"]));
+        fs::create_dir_all(&w.store).unwrap();
+        fs::write(
+            w.store.join(DECISION_FILE),
+            format!(
+                "onelf-resolve 2\nfingerprint x\nhost libfoo.so.1\t{}\n",
+                host_foo.display()
+            ),
+        )
+        .unwrap();
 
-        let legacy = w.resolve(HostLibsPolicy::Auto);
-        assert!(w.store.join(DECISION_FILE).is_file());
-        let selected = w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
-        assert!(sel_dir(&w.store, &pins).join(DECISION_FILE).is_file());
-        assert_eq!(selected, legacy);
-        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
-
-        assert_eq!(w.resolve(HostLibsPolicy::Auto), legacy);
-        assert_eq!(
-            w.resolve_selection(HostLibsPolicy::Auto, &[], &pins),
-            selected
-        );
-        assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo));
+        w.resolve_selection(HostLibsPolicy::Auto, &[], &[pin("gtk", 1)]);
+        assert!(w.farm_link("libfoo.so.1").is_none());
+        assert!(w.farm_link("libGL.so.1").is_some());
     }
 }

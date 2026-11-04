@@ -104,28 +104,26 @@ pub fn parse(text: &str) -> Vec<Pin> {
 }
 
 /// The pins the invoked entrypoint acquires, resolved from the set
-/// table `table` and the carried selection record `record`.
+/// table `table` and the decoded selection record `selections`.
 ///
 /// No record is the legacy launch: every set the table declares, in
-/// table order. A record is decoded and checked against the manifest's
-/// entrypoint names and the table's actual pins first, so a record the
-/// package cannot back is refused before anything is acquired. The
-/// entrypoint's own list then names exactly the pins to obtain, in the
-/// record's canonical name order; an empty list names none.
+/// table order. A record is checked against the manifest's entrypoint
+/// names and the table's actual pins first, so a record the package
+/// cannot back is refused before anything is acquired. The entrypoint's
+/// own list then names exactly the pins to obtain, in the record's
+/// canonical name order; an empty list names none.
 pub fn selection(
     table: Option<&[u8]>,
-    record: Option<&[u8]>,
+    selections: Option<&EntrypointSets>,
     manifest: &Manifest,
     entrypoint: &str,
 ) -> Result<Vec<Pin>, String> {
     let pins = table
         .map(|bytes| parse(&String::from_utf8_lossy(bytes)))
         .unwrap_or_default();
-    let Some(record) = record else {
+    let Some(selections) = selections else {
         return Ok(pins);
     };
-    let selections =
-        EntrypointSets::decode(record).map_err(|why| format!("entrypoint-sets: {why}"))?;
     let backed = pins
         .iter()
         .map(declared_pin)
@@ -228,19 +226,21 @@ pub fn init(pins: &[Pin], entrypoint: &str) {
     let mut prepared = Vec::new();
     for pin in pins {
         match obtain(pin, &out) {
-            Ok(obtained) => match crate::providers::prepare(&pin.label, &obtained.root) {
-                Ok(facts) => {
-                    prepared.push(facts);
-                    out.push(obtained);
+            Ok(obtained) => {
+                match crate::providers::prepare(&pin.label, &pin.blake3, &obtained.root) {
+                    Ok(facts) => {
+                        prepared.push(facts);
+                        out.push(obtained);
+                    }
+                    Err(why) => {
+                        eprintln!(
+                            "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
+                            pin.label
+                        );
+                        std::process::exit(1);
+                    }
                 }
-                Err(why) => {
-                    eprintln!(
-                        "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
-                        pin.label
-                    );
-                    std::process::exit(1);
-                }
-            },
+            }
             Err(why) => {
                 eprintln!(
                     "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
@@ -666,6 +666,11 @@ mod selection_tests {
         .unwrap()
     }
 
+    /// The selection record `bytes` decodes to.
+    fn decoded(bytes: &[u8]) -> EntrypointSets {
+        EntrypointSets::decode(bytes).unwrap()
+    }
+
     /// A manifest whose entrypoints are the named records.
     fn manifest(names: &[&str]) -> Manifest {
         let mut string_table: Vec<u8> = vec![0];
@@ -727,7 +732,13 @@ mod selection_tests {
     fn an_empty_selection_acquires_nothing() {
         let table = unreachable_table(&[("gtk", &hex(&PIN_A)), ("qt", &hex(&PIN_B))]);
         let record = record(&[("gtk", PIN_A), ("qt", PIN_B)], &[("app", &[])]);
-        let pins = selection(Some(&table), Some(&record), &manifest(&["app"]), "app").unwrap();
+        let pins = selection(
+            Some(&table),
+            Some(&decoded(&record)),
+            &manifest(&["app"]),
+            "app",
+        )
+        .unwrap();
         assert!(pins.is_empty(), "{pins:?}");
     }
 
@@ -739,9 +750,9 @@ mod selection_tests {
             &[("app", &["qt"]), ("gui", &["gtk", "qt"])],
         );
         let manifest = manifest(&["app", "gui"]);
-        let app = selection(Some(&table), Some(&record), &manifest, "app").unwrap();
+        let app = selection(Some(&table), Some(&decoded(&record)), &manifest, "app").unwrap();
         assert_eq!(labels(&app), ["qt"]);
-        let gui = selection(Some(&table), Some(&record), &manifest, "gui").unwrap();
+        let gui = selection(Some(&table), Some(&decoded(&record)), &manifest, "gui").unwrap();
         assert_eq!(labels(&gui), ["gtk", "qt"], "the record's canonical order");
         assert_eq!(gui[0].blake3, hex(&PIN_A));
         assert_eq!(gui[1].blake3, hex(&PIN_B));
@@ -751,7 +762,13 @@ mod selection_tests {
     fn a_record_the_table_cannot_back_is_refused() {
         let table = unreachable_table(&[("qt", &hex(&PIN_A))]);
         let record = record(&[("qt", PIN_B)], &[("app", &["qt"])]);
-        let err = selection(Some(&table), Some(&record), &manifest(&["app"]), "app").unwrap_err();
+        let err = selection(
+            Some(&table),
+            Some(&decoded(&record)),
+            &manifest(&["app"]),
+            "app",
+        )
+        .unwrap_err();
         assert!(err.contains("entrypoint-sets"), "{err}");
         assert!(err.contains("pin table"), "{err}");
     }
@@ -759,30 +776,28 @@ mod selection_tests {
     #[test]
     fn a_record_for_a_manifest_it_does_not_match_is_refused() {
         let record = record(&[("qt", PIN_A)], &[("app", &["qt"]), ("ghost", &["qt"])]);
-        let err = selection(None, Some(&record), &manifest(&["app"]), "app").unwrap_err();
+        let err = selection(None, Some(&decoded(&record)), &manifest(&["app"]), "app").unwrap_err();
         assert!(err.contains("manifest"), "{err}");
-    }
-
-    #[test]
-    fn a_corrupt_record_is_refused() {
-        let mut record = record(&[("qt", PIN_A)], &[("app", &["qt"])]);
-        record.truncate(record.len() - 1);
-        let err = selection(None, Some(&record), &manifest(&["app"]), "app").unwrap_err();
-        assert!(err.contains("entrypoint-sets"), "{err}");
     }
 
     #[test]
     fn a_table_name_the_record_cannot_name_is_refused() {
         let table = unreachable_table(&[("-qt", &hex(&PIN_A))]);
         let record = record(&[], &[("app", &[])]);
-        let err = selection(Some(&table), Some(&record), &manifest(&["app"]), "app").unwrap_err();
+        let err = selection(
+            Some(&table),
+            Some(&decoded(&record)),
+            &manifest(&["app"]),
+            "app",
+        )
+        .unwrap_err();
         assert!(err.contains("canonical set name"), "{err}");
     }
 
     #[test]
     fn a_record_without_a_table_declares_no_sets() {
         let record = record(&[], &[("app", &[])]);
-        let pins = selection(None, Some(&record), &manifest(&["app"]), "app").unwrap();
+        let pins = selection(None, Some(&decoded(&record)), &manifest(&["app"]), "app").unwrap();
         assert!(pins.is_empty());
     }
 
