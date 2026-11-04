@@ -561,6 +561,10 @@ const WAYLAND_LIB_PREFIXES: &[&str] = &[
     "libxkbcommon.so",
 ];
 
+/// Each library a framework copier selected, by name, with the host file
+/// it is copied from.
+pub(crate) type CopySources = Vec<(String, PathBuf)>;
+
 /// Bundle Wayland client libraries and libdecor plugins.
 ///
 /// Detection turns this on without the publisher asking, so it has no
@@ -568,7 +572,9 @@ const WAYLAND_LIB_PREFIXES: &[&str] = &[
 /// admitted to `plan` before the first write, and an existing path with
 /// different content that the ledger does not record as the build's own
 /// output stops the build with nothing written. Returns the paths
-/// written, relative to the tree.
+/// written, relative to the tree, and each selected library's name with
+/// the host file it is copied from, written or not, so a later walk that
+/// admits the tree copy still knows its host installation.
 // Threads one bundling context; a parameter object belongs with the
 // bundler restructure.
 #[allow(clippy::too_many_arguments)]
@@ -582,7 +588,7 @@ pub(crate) fn bundle_wayland(
     dry_run: bool,
     strip: bool,
     plan: &mut DestinationPlan,
-) -> io::Result<Vec<String>> {
+) -> io::Result<(Vec<String>, CopySources)> {
     eprintln!("{} Wayland libraries...", color::bold("Bundling"));
 
     // Target class/machine are passed in; only search dirs come from the
@@ -665,7 +671,11 @@ pub(crate) fn bundle_wayland(
         );
     }
 
-    Ok(written)
+    let sources = libs
+        .iter()
+        .map(|copy| (copy.name.clone(), copy.resolved.clone()))
+        .collect();
+    Ok((written, sources))
 }
 
 /// Bundle GSettings compiled schemas so GTK/GLib apps don't crash with

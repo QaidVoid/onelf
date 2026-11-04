@@ -3882,6 +3882,99 @@ fn xkb_and_x11_data_are_carried_beside_their_libraries() {
     );
 }
 
+/// A host scan's tree copies still find their data on the host: a
+/// publisher-shipped Xlib whose host twin the host search resolves
+/// carries the twin's locale data, and an xkbcommon the Wayland copier
+/// placed carries the keymaps of the installation it was copied from,
+/// laid out the current xkeyboard-config way, with `X11/xkb` an
+/// absolute link to `xkeyboard-config-2`. The sonames are ones no
+/// loader cache lists, so only the fixtures can answer.
+#[test]
+fn tree_copies_carry_data_from_their_host_installations() {
+    let td = workdir("data-tree-copies");
+    let Some(x11_dist) = data_tree_sources(
+        &td,
+        &["libX11.so.99"],
+        &[("usr/share/X11/locale/Compose", "host-compose\n")],
+    ) else {
+        return;
+    };
+    let xkb_dist = td.join("wayland-dist");
+    let xkb_lib = xkb_dist.join("usr/lib");
+    std::fs::create_dir_all(&xkb_lib).unwrap();
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libxkbcommon.so.99",
+            td.join("dist/framework.c").to_str().unwrap(),
+        ],
+        &xkb_lib.join("libxkbcommon.so.99"),
+    ) {
+        return;
+    }
+    write(
+        &xkb_dist.join("usr/share/xkeyboard-config-2/symbols/us"),
+        "host-us\n",
+    );
+    std::fs::create_dir_all(xkb_dist.join("usr/share/X11")).unwrap();
+    std::os::unix::fs::symlink(
+        xkb_dist.join("usr/share/xkeyboard-config-2"),
+        xkb_dist.join("usr/share/X11/xkb"),
+    )
+    .unwrap();
+
+    let app = td.join("app");
+    let x11_lib = x11_dist.join("usr/lib");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", x11_lib.display()),
+            &format!("-L{}", xkb_lib.display()),
+            &format!("-Wl,-rpath,{}", xkb_lib.display()),
+            "-l:libX11.so.99",
+            "-l:libxkbcommon.so.99",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::copy(x11_lib.join("libX11.so.99"), app.join("lib/libX11.so.99")).unwrap();
+
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .args(["--wayland", "--exclude", "libwayland", "--exclude"])
+        .args(["libdecor", "--exclude", "libxkbcommon.so.0"])
+        .env("LD_LIBRARY_PATH", &x11_lib);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "bundle-libs failed:\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/X11/locale/Compose")).unwrap(),
+        "host-compose\n",
+        "the publisher's Xlib carries its host twin's locale data:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/X11/xkb/symbols/us")).unwrap(),
+        "host-us\n",
+        "the copied xkbcommon carries the keymaps behind the link:\n{err}"
+    );
+    assert!(
+        !std::fs::symlink_metadata(app.join("share/X11/xkb"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the keymaps are carried as a directory, not a link out of the tree"
+    );
+}
+
 /// GI typelibs ride along in the library directory the runtime's
 /// `GI_TYPELIB_PATH` mapping names, laid out as the source kept them.
 #[test]

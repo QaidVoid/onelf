@@ -131,7 +131,7 @@ fn existing_library_data_and_runtime_data_tables_are_covered() {
         (
             "xkb",
             "libxkbcommon.so.0",
-            &["share/X11/xkb"][..],
+            &["share/X11/xkb", "share/xkeyboard-config-2"][..],
             ResourceKind::Directory,
         ),
         (

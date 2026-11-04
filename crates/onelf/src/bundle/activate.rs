@@ -213,6 +213,14 @@ impl Discovery {
         Ok(())
     }
 
+    /// Whether any enabled rule's trigger matches `soname`, active yet
+    /// or not.
+    pub(crate) fn triggers(&self, soname: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|state| state.triggers.iter().any(|t| t.matches_soname(soname)))
+    }
+
     /// Observe a soname and queue it for resolution: a seed of the walk
     /// or a dependency discovered along the way.
     pub(crate) fn enqueue(&mut self, soname: &str) -> io::Result<()> {

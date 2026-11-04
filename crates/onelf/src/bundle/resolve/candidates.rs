@@ -11,7 +11,9 @@
 //! shape, the installation prefix above it. The layouts the resolver
 //! already handles are covered: the flat `usr/lib`, Debian's
 //! `usr/lib/<triplet>` multiarch directories, a Nix store path's own
-//! `lib`, and a populated AppDir's flattened `lib`.
+//! `lib`, and a populated AppDir's flattened `lib`. A library a host
+//! scan admitted from the tree itself may add its host provenance's
+//! roots after those.
 //!
 //! Enumeration is bounded. The hits and examinations one group may
 //! yield are capped, and every path is resolved with the confinement
@@ -40,10 +42,19 @@ const MAX_GROUP_CHECKS: usize = 4096;
 
 /// A shared object the dependency walk admitted, with the roots
 /// discovery may search beneath it.
+///
+/// A host scan can admit a library from the tree itself: one a
+/// framework copier placed there, or one the publisher shipped. Its own
+/// roots are then the tree's, which hold no installation data, so it may
+/// carry the host object it came from or resolves to as its provenance,
+/// whose roots data groups search after every admitted library's own.
+/// Plugin and helper groups do not: their members are code built
+/// against one library build, and the host object may be another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdmittedLibrary {
     soname: String,
     path: PathBuf,
+    provenance: Option<PathBuf>,
 }
 
 impl AdmittedLibrary {
@@ -54,6 +65,24 @@ impl AdmittedLibrary {
         Self {
             soname: soname.into(),
             path: path.into(),
+            provenance: None,
+        }
+    }
+
+    /// The same object with the host file it was copied from, or the
+    /// compatible host file its soname resolves to, as an additional
+    /// root source. Only a host scan records one.
+    pub(crate) fn with_provenance(mut self, host: impl Into<PathBuf>) -> Self {
+        self.provenance = Some(host.into());
+        self
+    }
+
+    /// The same object without its provenance, for a plugin or helper
+    /// group, whose roots are the object's own alone.
+    pub(crate) fn without_provenance(&self) -> Self {
+        Self {
+            provenance: None,
+            ..self.clone()
         }
     }
 
@@ -76,16 +105,22 @@ impl AdmittedLibrary {
     /// another shape contributes no prefix, so an installation-prefix
     /// base skips it rather than guessing one.
     pub(crate) fn installation_prefix(&self) -> Option<PathBuf> {
-        let root = self.library_root()?;
-        if is_lib_dir(root) {
-            return root.parent().map(Path::to_path_buf);
-        }
-        let parent = root.parent()?;
-        if is_lib_dir(parent) {
-            return parent.parent().map(Path::to_path_buf);
-        }
-        None
+        prefix_of(&self.path)
     }
+}
+
+/// The installation prefix above the library at `path`, by the shapes
+/// [`AdmittedLibrary::installation_prefix`] describes.
+fn prefix_of(path: &Path) -> Option<PathBuf> {
+    let root = path.parent()?;
+    if is_lib_dir(root) {
+        return root.parent().map(Path::to_path_buf);
+    }
+    let parent = root.parent()?;
+    if is_lib_dir(parent) {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 /// Whether `dir` is a directory a distribution keeps shared libraries
@@ -98,16 +133,23 @@ fn is_lib_dir(dir: &Path) -> bool {
 
 /// The roots one declared base searches: each admitted library's
 /// directory or installation prefix, in the order the libraries were
-/// admitted, without repetition.
+/// admitted, then the same for each recorded provenance, without
+/// repetition.
 pub(crate) fn roots_for(base: SourceBase, libraries: &[AdmittedLibrary]) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for lib in libraries {
-        let root = match base {
-            SourceBase::LibraryDir => lib.library_root().map(Path::to_path_buf),
-            SourceBase::InstallationPrefix => lib.installation_prefix(),
-        };
-        let Some(root) = root else { continue };
+    let own = libraries.iter().map(|lib| match base {
+        SourceBase::LibraryDir => lib.library_root().map(Path::to_path_buf),
+        SourceBase::InstallationPrefix => lib.installation_prefix(),
+    });
+    let provenance = libraries
+        .iter()
+        .filter_map(|lib| lib.provenance.as_deref())
+        .map(|host| match base {
+            SourceBase::LibraryDir => host.parent().map(Path::to_path_buf),
+            SourceBase::InstallationPrefix => prefix_of(host),
+        });
+    for root in own.chain(provenance).flatten() {
         if seen.insert(root.clone()) {
             roots.push(root);
         }
@@ -495,6 +537,85 @@ mod tests {
                 PathBuf::from("/two/usr/lib"),
             ]
         );
+    }
+
+    /// A recorded provenance adds its own roots after every admitted
+    /// library's, so a tree copy's prefix is searched first and the host
+    /// object it came from next, never ahead of another admitted library.
+    #[test]
+    fn provenance_roots_follow_every_admitted_root() {
+        let libs = [
+            library("/appdir/lib/libX11.so.6").with_provenance("/usr/lib/libX11.so.6"),
+            library("/opt/other/lib/libxkbcommon.so.0")
+                .with_provenance("/usr/lib/x86_64-linux-gnu/libxkbcommon.so.0"),
+        ];
+        assert_eq!(
+            roots_for(SourceBase::InstallationPrefix, &libs),
+            [
+                PathBuf::from("/appdir"),
+                PathBuf::from("/opt/other"),
+                PathBuf::from("/usr"),
+            ],
+            "the shared host prefix appears once, after both tree roots"
+        );
+        assert_eq!(
+            roots_for(SourceBase::LibraryDir, &libs),
+            [
+                PathBuf::from("/appdir/lib"),
+                PathBuf::from("/opt/other/lib"),
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+            ]
+        );
+        assert_eq!(
+            roots_for(
+                SourceBase::InstallationPrefix,
+                &[library("/appdir/lib/libX11.so.6")]
+            ),
+            [PathBuf::from("/appdir")],
+            "no provenance, no host root"
+        );
+    }
+
+    /// A tree copy holding no data is answered by its provenance's
+    /// prefix, through a confined absolute link to another directory the
+    /// way current xkeyboard-config installs `X11/xkb`.
+    #[test]
+    fn provenance_answers_a_group_the_tree_copy_lacks() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-prov-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let tree = dir.join("appdir");
+        let host = dir.join("host/usr");
+        fs::create_dir_all(tree.join("lib")).unwrap();
+        fs::create_dir_all(host.join("lib")).unwrap();
+        fs::create_dir_all(host.join("share/X11")).unwrap();
+        fs::create_dir_all(host.join("share/xkeyboard-config-2/symbols")).unwrap();
+        fs::write(host.join("share/xkeyboard-config-2/symbols/us"), b"us").unwrap();
+        std::os::unix::fs::symlink(
+            host.join("share/xkeyboard-config-2"),
+            host.join("share/X11/xkb"),
+        )
+        .unwrap();
+        let libs = [
+            library(tree.join("lib/libxkbcommon.so.0").to_str().unwrap())
+                .with_provenance(host.join("lib/libxkbcommon.so.0")),
+        ];
+        let candidates = [candidate(SourceBase::InstallationPrefix, "share/X11/xkb")];
+
+        let outcome = discover(ResourceKind::Directory, &candidates, &libs, None).unwrap();
+        assert_eq!(outcome.found.len(), 1, "{:?}", outcome.misses);
+        assert_eq!(outcome.found[0].root, host);
+        assert_eq!(
+            outcome.found[0].resolved,
+            host.join("share/xkeyboard-config-2")
+        );
+        assert_eq!(
+            outcome.misses.iter().map(|m| &m.root).collect::<Vec<_>>(),
+            [&tree],
+            "the tree's own prefix was examined first"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Alternatives are enumerated in declaration order, each against

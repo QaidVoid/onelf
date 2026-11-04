@@ -11,6 +11,7 @@ destination = "share/X11/xkb"
 requirement = "required"
 candidates = [
   { base = "installation-prefix", path = "share/X11/xkb" },
+  { base = "installation-prefix", path = "share/xkeyboard-config-2" },
 ]
 
 [[runtime.paths]]

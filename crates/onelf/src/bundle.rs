@@ -183,6 +183,139 @@ fn repair_admits(
     sysroot_root.is_some_and(|root| dir.starts_with(root))
 }
 
+/// The host object a tree-resident library a host scan admitted stands
+/// for: the file a framework copier copied it from when one did, or else
+/// the file `lookup`, the host search the walk resolves an absent soname
+/// with, finds. A candidate inside one of the `tree` roots is the tree
+/// itself, and one linking another libc family than `target_libc` is
+/// not the installation the bundle runs with, so neither answers.
+fn host_provenance(
+    copied_from: Option<&Path>,
+    tree: &[&Path],
+    target_libc: Option<LibcFamily>,
+    lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let found = copied_from.map(Path::to_path_buf).or_else(lookup)?;
+    let real = fs::canonicalize(&found).unwrap_or(found);
+    if tree.iter().any(|root| real.starts_with(root)) {
+        return None;
+    }
+    let family = parse_needed(&real)
+        .unwrap_or_default()
+        .iter()
+        .find_map(|d| libc_family_of_soname(d));
+    if let (Some(want), Some(have)) = (target_libc, family)
+        && want != have
+    {
+        return None;
+    }
+    Some(real)
+}
+
+/// Admit a host scan's tree copy of a rule's library at `copy`, with
+/// the host object it stands for as its provenance when one answers:
+/// the file a framework copier took it from, or the compatible file the
+/// soname resolves to through the host search past the `tree` roots.
+fn admit_tree_copy(
+    soname: &str,
+    copy: &Path,
+    copied_from: &HashMap<String, PathBuf>,
+    tree: &[&Path],
+    search_paths: &[PathBuf],
+    ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
+    (class, machine, libc): (Option<u8>, Option<u16>, Option<LibcFamily>),
+) -> AdmittedLibrary {
+    let library = AdmittedLibrary::new(soname, copy);
+    let host_dirs: Vec<PathBuf> = search_paths
+        .iter()
+        .filter(|d| !tree.iter().any(|root| d.starts_with(root)))
+        .cloned()
+        .collect();
+    let twin = host_provenance(
+        copied_from.get(soname).map(PathBuf::as_path),
+        tree,
+        libc,
+        || {
+            locate_lib(
+                soname,
+                ldconfig_cache,
+                &host_dirs,
+                class,
+                machine,
+                None,
+                LookupScope::Host,
+            )
+        },
+    );
+    match twin {
+        Some(twin) => library.with_provenance(twin),
+        None => library,
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    /// The copier's recorded source wins over the host search, a
+    /// candidate inside the tree is never a provenance, and one of
+    /// another libc family than the bundle's is refused.
+    #[test]
+    fn provenance_prefers_the_copy_source_and_refuses_tree_and_libc_mismatch() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-twin-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let tree = dir.join("appdir");
+        let host = dir.join("host/usr/lib");
+        fs::create_dir_all(tree.join("lib")).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(tree.join("lib/libX11.so.6"), b"tree").unwrap();
+        fs::write(host.join("libX11.so.6"), b"host").unwrap();
+        fs::write(host.join("libxkbcommon.so.0"), b"copied").unwrap();
+        let tree_root = fs::canonicalize(&tree).unwrap();
+        let host = fs::canonicalize(&host).unwrap();
+        let roots = [tree_root.as_path()];
+
+        assert_eq!(
+            host_provenance(Some(&host.join("libxkbcommon.so.0")), &roots, None, || {
+                panic!("a recorded copy source needs no host search")
+            }),
+            Some(host.join("libxkbcommon.so.0"))
+        );
+        assert_eq!(
+            host_provenance(None, &roots, None, || Some(host.join("libX11.so.6"))),
+            Some(host.join("libX11.so.6"))
+        );
+        assert_eq!(
+            host_provenance(None, &roots, None, || Some(
+                tree_root.join("lib/libX11.so.6")
+            )),
+            None,
+            "the tree's own copy is not its provenance"
+        );
+        assert_eq!(host_provenance(None, &roots, None, || None), None);
+
+        let exe = std::env::current_exe().unwrap();
+        if let Some(family) = parse_needed(&exe)
+            .unwrap_or_default()
+            .iter()
+            .find_map(|d| libc_family_of_soname(d))
+        {
+            let other = match family {
+                LibcFamily::Glibc => LibcFamily::Musl,
+                LibcFamily::Musl => LibcFamily::Glibc,
+            };
+            assert_eq!(
+                host_provenance(None, &roots, Some(other), || Some(exe.clone())),
+                None,
+                "a host object of another libc family is refused"
+            );
+            assert!(host_provenance(None, &roots, Some(family), || Some(exe.clone())).is_some());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 /// One library a framework copier selected: the file name it lands
 /// under, the resolved source, and its size.
 pub(crate) struct LibCopy {
@@ -1001,7 +1134,7 @@ fn collect_helper_group(
                 .iter()
                 .any(|t| t.matches_soname(lib.soname()))
         })
-        .cloned()
+        .map(AdmittedLibrary::without_provenance)
         .collect();
     let outcome = discover_group(
         &GroupQuery {
@@ -2959,8 +3092,11 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     // The framework copiers without replacement authority plan into it
     // first, and the dependency walk below plans the rest.
     let mut plan = DestinationPlan::load(&opts.directory)?;
+    // The host file each framework-copied library came from, which a
+    // host scan's descriptor discovery searches after the tree copy.
+    let mut copied_from: HashMap<String, PathBuf> = HashMap::new();
     if want_wayland {
-        let written = bundle_wayland(
+        let (written, sources) = bundle_wayland(
             &opts.directory,
             &opts.lib_dir,
             &opts.search_path,
@@ -2974,6 +3110,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
         if !opts.dry_run {
             sysroot::record_generated(&opts.directory, written)?;
         }
+        copied_from.extend(sources);
     }
 
     if want_gtk {
@@ -3570,7 +3707,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                     // admitted: a directory another installation keeps
                     // beside an unrelated admitted library never answers
                     // for this rule, the same boundary the data groups
-                    // read.
+                    // read, less the host provenance only data may use.
                     let owners: Vec<AdmittedLibrary> = admitted
                         .iter()
                         .filter(|lib| {
@@ -3579,7 +3716,7 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                                 .iter()
                                 .any(|t| t.matches_soname(lib.soname()))
                         })
-                        .cloned()
+                        .map(AdmittedLibrary::without_provenance)
                         .collect();
                     let collection = collect::collect_group(
                         &rule,
@@ -3837,8 +3974,27 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 };
                 // Every object the walk resolved is a root descriptor
                 // discovery may search its group directories against.
+                // A host scan's tree copy of a rule's library also
+                // searches the host installation it came from or
+                // resolves to.
                 if admitted_names.insert(soname.clone()) {
-                    admitted.push(AdmittedLibrary::new(soname.clone(), resolved.clone()));
+                    let host_copy = opts.sysroot.is_none()
+                        && (resolved.starts_with(&tree_root)
+                            || resolved.starts_with(&opts.directory))
+                        && discovery.triggers(&soname);
+                    admitted.push(if host_copy {
+                        admit_tree_copy(
+                            &soname,
+                            &resolved,
+                            &copied_from,
+                            &[&tree_root, &opts.directory],
+                            &search_paths,
+                            &ldconfig_cache,
+                            (target_class, target_machine, target_libc),
+                        )
+                    } else {
+                        AdmittedLibrary::new(soname.clone(), resolved.clone())
+                    });
                 }
                 let size = fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
                 // A collected group member's declaration decides its
@@ -4023,10 +4179,31 @@ pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
                 }
             }
             None => {
-                // Already in the tree from a previous run: the tree keeps
-                // its copy, as the skip in place always did. Without a
-                // host copy there is nothing to repair with.
+                // Already in the tree from a previous run, a framework
+                // copier or the publisher: the tree keeps its copy, as
+                // the skip in place always did. Without a host copy there
+                // is nothing to repair with, but in a host scan a rule's
+                // library still answers its groups, from the tree copy
+                // and the host installation it stands for.
                 if already_flat {
+                    if opts.sysroot.is_none()
+                        && discovery.triggers(&soname)
+                        && admitted_names.insert(soname.clone())
+                    {
+                        let copy = match group_dests.get(&soname) {
+                            Some(dest) => opts.directory.join(dest),
+                            None => lib_dest.join(&soname),
+                        };
+                        admitted.push(admit_tree_copy(
+                            &soname,
+                            &real_path(&copy),
+                            &copied_from,
+                            &[&tree_root, &opts.directory],
+                            &search_paths,
+                            &ldconfig_cache,
+                            (target_class, target_machine, target_libc),
+                        ));
+                    }
                     continue;
                 }
                 not_found.push((soname, requirer));
