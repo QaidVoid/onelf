@@ -687,6 +687,16 @@ pub(crate) fn bundle_wayland(
 pub(crate) fn bundle_gtk_data(directory: &Path, dry_run: bool) -> io::Result<()> {
     eprintln!("{} GTK data...", color::bold("Bundling"));
 
+    let mut ancestor = directory.to_path_buf();
+    for part in ["share", "glib-2.0", "schemas"] {
+        ancestor.push(part);
+        if fs::symlink_metadata(&ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(io::Error::other(format!(
+                "{} is a symlink; compiled GSettings schemas are only written inside the AppDir",
+                ancestor.display()
+            )));
+        }
+    }
     let dest = directory.join("share/glib-2.0/schemas");
     if dest.join("gschemas.compiled").exists() {
         eprintln!("  {} already present", color::dim("gschemas.compiled"));
@@ -1145,6 +1155,21 @@ fn copy_data_dir(src: &Path, dest: &Path, dry_run: bool) -> io::Result<u64> {
 #[cfg(test)]
 mod gl_conflict_tests {
     use super::*;
+
+    #[test]
+    fn compiled_schemas_never_follow_a_symlinked_share_out_of_the_tree() {
+        let root = std::env::temp_dir().join(format!("onelf-gtklink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("app");
+        let outside = root.join("outside");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, app.join("share")).unwrap();
+        let err = bundle_gtk_data(&app, true).unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn an_apps_own_gl_beside_its_executable_is_kept() {
