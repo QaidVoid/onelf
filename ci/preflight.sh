@@ -16,12 +16,14 @@
 #                     all absent, so extraction is the only launch path
 #   cache             needs a C compiler
 #   privileged-import needs uid 0, fusermount3 and /dev/fuse
+#   distro            needs docker with a daemon, and a real run with a
+#                     bind mount, for the pinned distro fixture tests
 
 set -u
 
 job="${1:-}"
 [ -n "$job" ] || {
-    echo "usage: preflight.sh namespace-fuse|helper-fuse|no-fuse|cache|privileged-import" >&2
+    echo "usage: preflight.sh namespace-fuse|helper-fuse|no-fuse|cache|privileged-import|distro" >&2
     exit 2
 }
 
@@ -56,6 +58,15 @@ has_cc() {
 }
 
 case "$job" in
+distro)
+    command -v docker >/dev/null 2>&1 || die "needs docker on PATH; install docker"
+    docker info >/dev/null 2>&1 || die "needs a reachable docker daemon; docker info failed"
+    probe=$(mktemp -d) || die "needs a writable temp directory for the bind mount probe"
+    docker run --rm -v "$probe":/probe alpine:3.20 /bin/sh -c 'echo ok > /probe/probe' >/dev/null 2>&1 \
+        || die "needs docker run with a bind mount; the probe container failed"
+    [ -f "$probe/probe" ] || die "the docker bind mount did not reach the host"
+    rm -rf "$probe"
+    ;;
 namespace-fuse)
     userns_works || die "needs unprivileged user namespaces; unshare --user --map-root-user --mount failed. Set kernel.apparmor_restrict_unprivileged_userns=0"
     has_helper || die "needs fusermount3 on PATH; install fuse3"

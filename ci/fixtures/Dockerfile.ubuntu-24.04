@@ -1,0 +1,17 @@
+# Pinned Ubuntu 24.04 fixture image: base locked by digest, package list
+# spelled out, nothing installed later. The distro_fixtures tests compile
+# the fixture applications against these libraries inside the container.
+FROM ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        file \
+        g++ \
+        gcc \
+        libc6-dev \
+        libgtk-3-dev \
+        patchelf \
+        pkg-config \
+        qt6-base-dev \
+    && rm -rf /var/lib/apt/lists/*

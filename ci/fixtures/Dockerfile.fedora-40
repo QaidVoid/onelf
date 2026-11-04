@@ -1,0 +1,15 @@
+# Pinned Fedora 40 fixture image: base locked by digest, package list
+# spelled out, nothing installed later. The distro_fixtures tests compile
+# the fixture applications against these libraries inside the container.
+FROM fedora:40@sha256:2b0571b74dee5d891610276601c6680d622686113488076e7b35c18b455ce879
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        binutils \
+        file \
+        gcc \
+        gcc-c++ \
+        gtk3-devel \
+        patchelf \
+        pkgconf \
+        qt6-qtbase-devel \
+    && dnf clean all

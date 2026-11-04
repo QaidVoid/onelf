@@ -1,0 +1,17 @@
+# Pinned Alpine 3.20 fixture image: musl base locked by digest, package
+# list spelled out, nothing installed later. This is the musl side of the
+# isolation fixtures: a glibc application packed with the static musl
+# runtime must run here on its bundled glibc, never on the host's musl.
+FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
+
+RUN apk add --no-cache \
+        binutils \
+        file \
+        g++ \
+        gcc \
+        gtk+3.0-dev \
+        linux-headers \
+        musl-dev \
+        patchelf \
+        pkgconfig \
+        qt6-qtbase-dev
