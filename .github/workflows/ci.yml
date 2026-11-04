@@ -296,6 +296,11 @@ jobs:
       - name: Privileged tests as root
         run: sudo -E env "PATH=$PATH" cargo test -p onelf --locked --test pipeline -- root_serves root_neither root_leaves
 
+      # The import races (a source mutated or replaced mid-copy, an unsafe
+      # source, fetch prohibition) as the uid they defend.
+      - name: Import race tests as root
+        run: sudo -E env "PATH=$PATH" cargo test -p onelf-rt --locked import
+
   # The media stack checks and the traced read counters. The job
   # installs GStreamer with its scanner and base plugins, ALSA headers,
   # configuration and plugins, a PipeWire server and strace, starts the
