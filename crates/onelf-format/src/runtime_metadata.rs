@@ -50,6 +50,11 @@ pub const MAX_METADATA_BYTES: usize = 1024 * 1024;
 pub const HEADER_BYTES: usize = 16;
 /// Supported transport schema version.
 pub const METADATA_VERSION: u16 = 1;
+/// The package directory that holds per-pin prepared resources, each pin
+/// under `<set>/<lowercase hex BLAKE3>`. A bound runtime record resolves
+/// its package-root candidates against that subtree, and its library-root
+/// candidates against the package's library directories inside it.
+pub const PREPARED_DIR: &str = ".onelf-prepared";
 
 /// A bounded diagnostic for malformed or unsupported metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +90,17 @@ pub struct SetPin {
     pub name: RuleId,
     /// Full BLAKE3 artifact digest, not a truncated identifier.
     pub hash: [u8; 32],
+}
+
+impl SetPin {
+    /// The pin's prepared subtree, relative to the package root.
+    pub fn prepared_dir(&self) -> String {
+        let mut dir = format!("{PREPARED_DIR}/{}/", self.name.as_str());
+        for byte in self.hash {
+            dir.push_str(&format!("{byte:02x}"));
+        }
+        dir
+    }
 }
 
 /// One descriptor's runtime behavior, optionally scoped to a selected set pin.

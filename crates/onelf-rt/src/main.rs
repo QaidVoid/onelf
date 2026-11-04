@@ -105,7 +105,12 @@ fn main() {
     // record launches with the legacy defaults. The invoked entrypoint's
     // pins are acquired later, once no mode can still run without them.
     let selected = match pkgmeta::validate(&pkg, &ep_name) {
-        Ok(pins) => pins,
+        Ok(meta) => {
+            if let Some(rules) = meta.rules {
+                env::carry_rules(rules);
+            }
+            meta.pins
+        }
         Err(e) => {
             eprintln!("onelf-rt: {e}");
             std::process::exit(1);

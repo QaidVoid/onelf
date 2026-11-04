@@ -166,6 +166,20 @@ pub fn selection(
         .collect()
 }
 
+/// Every declaration of the set table `table` in the selection record's
+/// form, sorted by name, the pins a runtime rule binding may name when no
+/// selection record carries them. A missing table declares none.
+pub fn declared_pins(table: Option<&[u8]>) -> Result<Vec<SetPin>, String> {
+    let mut pins = table
+        .map(|bytes| parse(&String::from_utf8_lossy(bytes)))
+        .unwrap_or_default()
+        .iter()
+        .map(declared_pin)
+        .collect::<Result<Vec<SetPin>, String>>()?;
+    pins.sort();
+    Ok(pins)
+}
+
 /// The selection record's form of a set table declaration: the table's
 /// name as a canonical set identity and the digest as full bytes, the
 /// exact pairing [`EntrypointSets::validate_against`] checks.

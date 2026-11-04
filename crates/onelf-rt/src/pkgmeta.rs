@@ -30,24 +30,50 @@ pub const RUNTIME_RULES_FILE: &str = ".onelf/runtime-rules";
 /// selections.
 pub const ENTRYPOINT_SETS_FILE: &str = ".onelf/entrypoint-sets";
 
+/// What the launch gate decoded: the runtime rule record a launch
+/// evaluates, and the pins the invoked entrypoint selects.
+#[derive(Debug)]
+pub struct LaunchMetadata {
+    /// The carried runtime rules, or `None` for the built-in fallback.
+    pub rules: Option<RuntimeRuleMetadata>,
+    /// The pins `entrypoint` acquires, in selection order.
+    pub pins: Vec<Pin>,
+}
+
 /// Read, decode and cross-validate both metadata records ahead of every
-/// dispatch decision, and return the pins `entrypoint` selects.
+/// dispatch decision, and return the carried rules with the pins
+/// `entrypoint` selects.
 ///
-/// Each record is checked on its own when the other is absent. When both
-/// are present, the rules' set-pin bindings must all name pins the
-/// selection table declares. A selection record is also checked against
-/// the manifest's entrypoint names and the set table's actual pins, so a
-/// record the package cannot back ends even a memfd launch before it
-/// executes anything.
-pub fn validate(pkg: &PackageData, entrypoint: &str) -> io::Result<Vec<Pin>> {
+/// Each record is checked on its own when the other is absent. The
+/// rules' set-pin bindings must all name pins the selection table
+/// declares, or, without a selection record, pins the set table
+/// declares. A selection record is also checked against the manifest's
+/// entrypoint names and the set table's actual pins, so a record the
+/// package cannot back ends even a memfd launch before it executes
+/// anything.
+pub fn validate(pkg: &PackageData, entrypoint: &str) -> io::Result<LaunchMetadata> {
     let rules = runtime_rules(pkg)?;
     let sets = entrypoint_sets(pkg)?;
-    if let (Some(rules), Some(sets)) = (&rules, &sets) {
-        rules.validate_bindings(sets).map_err(rejected)?;
-    }
     let table = loader::read_bounded_record(pkg, SETS_FILE, MAX_METADATA_BYTES)?;
-    crate::sets::selection(table.as_deref(), sets.as_ref(), &pkg.manifest, entrypoint)
-        .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
+    if let Some(rules) = &rules {
+        match &sets {
+            Some(sets) => rules.validate_bindings(sets).map_err(rejected)?,
+            None if rules.rules.iter().any(|r| r.binding.is_some()) => {
+                let declared = crate::sets::declared_pins(table.as_deref())
+                    .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))?;
+                rules
+                    .validate_bindings(&EntrypointSets {
+                        pins: declared,
+                        entrypoints: Vec::new(),
+                    })
+                    .map_err(rejected)?;
+            }
+            None => {}
+        }
+    }
+    let pins = crate::sets::selection(table.as_deref(), sets.as_ref(), &pkg.manifest, entrypoint)
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))?;
+    Ok(LaunchMetadata { rules, pins })
 }
 
 /// The package's runtime rule record, or `None` for the legacy default.
@@ -240,6 +266,33 @@ mod tests {
             ],
         );
         let err = validate(&case.pkg, "app").unwrap_err();
+        assert!(err.to_string().contains("runtime binding"), "{err}");
+    }
+
+    /// Without a selection record, a binding is checked against the set
+    /// table itself: a pin the table declares passes and the decoded rules
+    /// come back for the launch to evaluate, while any other pin fails.
+    #[test]
+    fn a_binding_is_checked_against_the_set_table_without_a_selection_record() {
+        let bound = case(
+            "table-binding",
+            &[
+                (SETS_FILE, sets_record()),
+                (RUNTIME_RULES_FILE, bound_rule_bytes(PIN_A)),
+            ],
+        );
+        let meta = validate(&bound.pkg, "app").unwrap();
+        assert_eq!(meta.rules, Some(rules_for(Some(pin("qt", PIN_A)))));
+        assert_eq!(meta.pins.len(), 1);
+
+        let stray = case(
+            "table-stray",
+            &[
+                (SETS_FILE, sets_record()),
+                (RUNTIME_RULES_FILE, bound_rule_bytes(PIN_B)),
+            ],
+        );
+        let err = validate(&stray.pkg, "app").unwrap_err();
         assert!(err.to_string().contains("runtime binding"), "{err}");
     }
 

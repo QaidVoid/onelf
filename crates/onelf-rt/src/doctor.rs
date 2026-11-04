@@ -228,7 +228,9 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
 
     // The entrypoint's selection, resolved the way a launch resolves it,
     // without acquiring any of it.
-    let selection = pkgmeta::validate(pkg, &ep_name).map_err(|e| e.to_string());
+    let selection = pkgmeta::validate(pkg, &ep_name)
+        .map(|meta| meta.pins)
+        .map_err(|e| e.to_string());
 
     let lib_dirs: Vec<String> = pkg
         .manifest

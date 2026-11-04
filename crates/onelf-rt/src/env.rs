@@ -28,10 +28,14 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use std::sync::OnceLock;
+
+use onelf_format::resolve::ActivePin;
 use onelf_format::rules::{
     EnvironmentName, Inheritance, PathSelection, ResourceKind, RuntimeBase, RuntimeHookId,
     RuntimePathGroup,
 };
+use onelf_format::runtime_metadata::RuntimeRuleMetadata;
 
 /// `set_var` for a name and value that came from a file: `std` aborts on
 /// an empty name, a `=` in the name, or a NUL in either, and a stray line
@@ -294,13 +298,19 @@ pub fn setup_env(
     // Prepend package's share/ to XDG_DATA_DIRS so bundled GSettings schemas,
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
-    setup_plugin_dirs(pkg, &app_lib_dirs, set_lib_dirs, set_roots);
-    run_runtime_hooks(&HookContext {
-        pkg,
-        lib_dirs: &app_lib_dirs,
-        set_lib_dirs,
-        set_roots,
-    });
+    let active = launch_rules(pkg);
+    setup_plugin_dirs(&active, pkg, &app_lib_dirs, set_lib_dirs, set_roots);
+    let (hook_lib_dirs, hook_roots) =
+        active.with_prepared(pkg, &app_lib_dirs, set_lib_dirs, set_roots);
+    run_runtime_hooks(
+        &active.hooks,
+        &HookContext {
+            pkg,
+            lib_dirs: &app_lib_dirs,
+            set_lib_dirs: &hook_lib_dirs,
+            set_roots: &hook_roots,
+        },
+    );
     setup_terminfo(pkg, set_roots);
     setup_ca_bundle(pkg, set_roots);
     setup_locale(&all_lib_dirs);
@@ -407,7 +417,8 @@ struct RuntimeHook {
 /// The registered runtime hooks, in fixed invocation order.
 ///
 /// The registry is closed and bounded: five handlers, declared once and
-/// never extended from package data, so every launch runs them in this
+/// never extended from package data. A launch runs every one without a
+/// carried rule record and only the carried IDs with one, always in this
 /// order. It is the order the procedural calls used, and each handler
 /// keeps the algorithm it had there.
 fn runtime_hooks() -> &'static [RuntimeHook] {
@@ -436,12 +447,22 @@ fn runtime_hooks() -> &'static [RuntimeHook] {
     HOOKS
 }
 
-/// Run every registered runtime hook in declaration order.
+/// Every registered runtime hook identity, in invocation order: what a
+/// launch without a carried rule record runs.
+fn all_runtime_hooks() -> Vec<RuntimeHookId> {
+    runtime_hooks().iter().map(|hook| hook.id).collect()
+}
+
+/// Run the registered runtime hooks `ids` names, in the registry's fixed
+/// invocation order whatever order `ids` lists them in.
 ///
 /// Dispatch goes through the by-id lookup, so the launch takes the same
 /// path a metadata-declared hook takes.
-pub(crate) fn run_runtime_hooks(context: &HookContext<'_>) {
+pub(crate) fn run_runtime_hooks(ids: &[RuntimeHookId], context: &HookContext<'_>) {
     for hook in runtime_hooks() {
+        if !ids.contains(&hook.id) {
+            continue;
+        }
         if let Some(run) = runtime_hook(hook.id) {
             run(context);
         }
@@ -677,19 +698,7 @@ pub fn view_env_assignments(
     set_roots: &[PathBuf],
 ) -> Vec<PathAssignment<'static>> {
     let app_lib_dirs: Vec<PathBuf> = lib_dirs.iter().map(|d| pkg_root.join(d)).collect();
-    let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
-    let packages = [pkg_root];
-    let scopes = [
-        Scope {
-            packages: &packages,
-            libraries: &app_lib_dirs,
-        },
-        Scope {
-            packages: &set_packages,
-            libraries: set_lib_dirs,
-        },
-    ];
-    evaluate_path_groups(builtin_path_groups(), &scopes)
+    launch_rules(pkg_root).assignments(pkg_root, &app_lib_dirs, set_lib_dirs, set_roots)
 }
 
 /// Encode the evaluated per-view environment input.
@@ -1024,30 +1033,193 @@ pub(crate) fn builtin_path_groups() -> impl Iterator<Item = &'static RuntimePath
 }
 
 /// Point the libraries that load plugins or read data from a compiled-in
-/// directory at the copies the package and its sets carry, by evaluating
-/// the catalog's runtime mappings against the application and set roots.
-/// The version-dependent Tcl and Tk script libraries, the carried ALSA
+/// directory at the copies the package, its active prepared subtrees and
+/// its sets carry, by evaluating the launch's runtime mappings. The
+/// version-dependent Tcl and Tk script libraries, the carried ALSA
 /// snippet list, the GDK and GTK module caches, GIO's module directories
 /// and fontconfig stay with the registered runtime hooks.
 fn setup_plugin_dirs(
+    active: &ActiveRules<'_>,
     pkg: &Path,
     lib_dirs: &[PathBuf],
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
 ) {
-    let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
-    let scopes = [
-        Scope {
-            packages: std::slice::from_ref(&pkg),
-            libraries: lib_dirs,
-        },
-        Scope {
-            packages: &set_packages,
-            libraries: set_lib_dirs,
-        },
-    ];
-    let assignments = evaluate_path_groups(builtin_path_groups(), &scopes);
-    apply_path_assignments(&assignments);
+    apply_path_assignments(&active.assignments(pkg, lib_dirs, set_lib_dirs, set_roots));
+}
+
+/// The runtime rule record this process's launch carries, installed once
+/// by the launch gate or by a development launch before any environment
+/// is applied. Absent, a launch evaluates the built-in catalog.
+static CARRIED_RULES: OnceLock<RuntimeRuleMetadata> = OnceLock::new();
+
+/// Install the decoded runtime rule record the package carries, so every
+/// later environment evaluation in this process uses its groups and hooks
+/// in place of the built-in fallback. Only the first installation counts.
+pub fn carry_rules(rules: RuntimeRuleMetadata) {
+    let _ = CARRIED_RULES.set(rules);
+}
+
+/// One runtime path group a launch evaluates, with the prepared subtrees
+/// of the active pins whose bound records carry it.
+struct ActiveGroup<'a> {
+    group: &'a RuntimePathGroup,
+    prepared: Vec<PathBuf>,
+}
+
+/// The runtime groups and hooks one launch evaluates.
+///
+/// Without a carried record these are the built-in catalog's groups and
+/// every registered hook. With one, they are exactly the carried groups
+/// and hook IDs: each unbound record contributes its groups, and a record
+/// bound to a pin contributes only while that pin is active, adding the
+/// pin's prepared subtree to the same rule's group of the same identity.
+/// Records arrive in canonical order, so a group's subtrees keep the
+/// canonical pin order.
+pub(crate) struct ActiveRules<'a> {
+    groups: Vec<ActiveGroup<'a>>,
+    hooks: Vec<RuntimeHookId>,
+    prepared: Vec<PathBuf>,
+}
+
+/// The rules this process's launch evaluates over the package at `pkg`
+/// and the pins it obtained.
+fn launch_rules(pkg: &Path) -> ActiveRules<'static> {
+    ActiveRules::new(CARRIED_RULES.get(), pkg, &crate::sets::pins())
+}
+
+impl<'a> ActiveRules<'a> {
+    /// Resolve `carried`, or the built-ins when it is `None`, against the
+    /// package root and the active pins.
+    pub(crate) fn new(
+        carried: Option<&'a RuntimeRuleMetadata>,
+        pkg: &Path,
+        pins: &[ActivePin],
+    ) -> Self {
+        let Some(carried) = carried else {
+            return Self {
+                groups: builtin_path_groups()
+                    .map(|group| ActiveGroup {
+                        group,
+                        prepared: Vec::new(),
+                    })
+                    .collect(),
+                hooks: all_runtime_hooks(),
+                prepared: Vec::new(),
+            };
+        };
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        let mut active = Self {
+            groups: Vec::new(),
+            hooks: Vec::new(),
+            prepared: Vec::new(),
+        };
+        for record in &carried.rules {
+            let root = match &record.binding {
+                None => None,
+                Some(pin) => {
+                    let hex: String = pin.hash.iter().map(|b| format!("{b:02x}")).collect();
+                    if !pins
+                        .iter()
+                        .any(|p| p.label == pin.name.as_str() && p.hash.eq_ignore_ascii_case(&hex))
+                    {
+                        continue;
+                    }
+                    Some(pkg.join(pin.prepared_dir()))
+                }
+            };
+            for hook in &record.runtime.hooks {
+                if !active.hooks.contains(hook) {
+                    active.hooks.push(*hook);
+                }
+            }
+            if let Some(root) = &root
+                && !active.prepared.contains(root)
+            {
+                active.prepared.push(root.clone());
+            }
+            for group in &record.runtime.paths {
+                let key = (record.id.as_str(), group.id.as_str());
+                match keys.iter().position(|k| *k == key) {
+                    Some(at) => active.groups[at].prepared.extend(root.clone()),
+                    None => {
+                        keys.push(key);
+                        active.groups.push(ActiveGroup {
+                            group,
+                            prepared: root.clone().into_iter().collect(),
+                        });
+                    }
+                }
+            }
+        }
+        active.prepared.sort();
+        active
+    }
+
+    /// Evaluate every group in order against the application first, then
+    /// the group's active prepared subtrees, then the selected sets. A
+    /// prepared subtree answers package-root candidates at its own root
+    /// and library-root candidates at the application's library
+    /// directories inside it.
+    fn assignments(
+        &self,
+        pkg: &Path,
+        lib_dirs: &[PathBuf],
+        set_lib_dirs: &[PathBuf],
+        set_roots: &[PathBuf],
+    ) -> Vec<PathAssignment<'a>> {
+        let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
+        let mut out = Vec::new();
+        for active in &self.groups {
+            let prepared: Vec<&Path> = active.prepared.iter().map(PathBuf::as_path).collect();
+            let prepared_libs = prepared_lib_dirs(pkg, lib_dirs, &active.prepared);
+            let scopes = [
+                Scope {
+                    packages: std::slice::from_ref(&pkg),
+                    libraries: lib_dirs,
+                },
+                Scope {
+                    packages: &prepared,
+                    libraries: &prepared_libs,
+                },
+                Scope {
+                    packages: &set_packages,
+                    libraries: set_lib_dirs,
+                },
+            ];
+            out.extend(evaluate_path_groups([active.group], &scopes));
+        }
+        out
+    }
+
+    /// The set library directories and roots the runtime hooks search:
+    /// every active prepared subtree before the raw set roots.
+    fn with_prepared(
+        &self,
+        pkg: &Path,
+        lib_dirs: &[PathBuf],
+        set_lib_dirs: &[PathBuf],
+        set_roots: &[PathBuf],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut libs = prepared_lib_dirs(pkg, lib_dirs, &self.prepared);
+        libs.extend_from_slice(set_lib_dirs);
+        let mut roots = self.prepared.clone();
+        roots.extend_from_slice(set_roots);
+        (libs, roots)
+    }
+}
+
+/// The application's library directories `lib_dirs`, rebased from `pkg`
+/// into each prepared subtree in `roots`, in subtree order.
+fn prepared_lib_dirs(pkg: &Path, lib_dirs: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .flat_map(|root| {
+            lib_dirs
+                .iter()
+                .filter_map(move |dir| dir.strip_prefix(pkg).ok().map(|rel| root.join(rel)))
+        })
+        .collect()
 }
 
 /// Set `TCL_LIBRARY` and `TK_LIBRARY` to the script libraries matching
@@ -2487,13 +2659,22 @@ mod plugin_dir_tests {
         let lib_dirs = [lib.clone(), arch.clone()];
         let set_libs = [set_lib.clone()];
         let set_roots = [set.clone()];
-        setup_plugin_dirs(&pkg, &lib_dirs, &set_libs, &set_roots);
-        run_runtime_hooks(&HookContext {
-            pkg: &pkg,
-            lib_dirs: &lib_dirs,
-            set_lib_dirs: &set_libs,
-            set_roots: &set_roots,
-        });
+        setup_plugin_dirs(
+            &ActiveRules::new(None, &pkg, &[]),
+            &pkg,
+            &lib_dirs,
+            &set_libs,
+            &set_roots,
+        );
+        run_runtime_hooks(
+            &all_runtime_hooks(),
+            &HookContext {
+                pkg: &pkg,
+                lib_dirs: &lib_dirs,
+                set_lib_dirs: &set_libs,
+                set_roots: &set_roots,
+            },
+        );
 
         let var = |name| env::var(name).unwrap_or_default();
         assert_eq!(
@@ -2771,12 +2952,15 @@ mod registry_tests {
         }
         let payload_before = files_below(&pkg);
 
-        run_runtime_hooks(&HookContext {
-            pkg: &pkg,
-            lib_dirs: std::slice::from_ref(&lib),
-            set_lib_dirs: &[],
-            set_roots: &[],
-        });
+        run_runtime_hooks(
+            &all_runtime_hooks(),
+            &HookContext {
+                pkg: &pkg,
+                lib_dirs: std::slice::from_ref(&lib),
+                set_lib_dirs: &[],
+                set_roots: &[],
+            },
+        );
 
         let base = crate::paths::private_dir().expect("private base exists in tests");
         let var = |name: &str| env::var(name).unwrap_or_default();
@@ -3443,6 +3627,7 @@ mod path_mapping_tests {
         unsafe { env::set_var("MAGIC", "/caller/magic.mgc") };
 
         setup_plugin_dirs(
+            &ActiveRules::new(None, &pkg, &[]),
             &pkg,
             &[lib.clone(), arch.clone()],
             std::slice::from_ref(&set_lib),
@@ -3569,7 +3754,13 @@ mod path_mapping_tests {
             env::remove_var("GST_PLUGIN_SCANNER");
         }
 
-        setup_plugin_dirs(&pkg, &[pkg.join("lib")], &[], &[]);
+        setup_plugin_dirs(
+            &ActiveRules::new(None, &pkg, &[]),
+            &pkg,
+            &[pkg.join("lib")],
+            &[],
+            &[],
+        );
 
         let libexec = pkg
             .join("libexec/gstreamer-1.0/gst-plugin-scanner")
@@ -3594,6 +3785,7 @@ mod path_mapping_tests {
         }
 
         setup_plugin_dirs(
+            &ActiveRules::new(None, &pkg, &[]),
             &pkg,
             std::slice::from_ref(&pkg.join("lib")),
             std::slice::from_ref(&set_lib),
@@ -4034,5 +4226,186 @@ mod view_env_tests {
         }
         let got = encode_view_env(&base, &now, &[]);
         assert!(matches!(got, Err(super::ViewEnvError::TooLarge)));
+    }
+}
+
+#[cfg(test)]
+mod carried_rule_tests {
+    use super::*;
+    use onelf_format::rules::{RelativePath, RuleId, RuntimeCandidate, RuntimeRules};
+    use onelf_format::runtime_metadata::{RuntimeRuleRecord, SetPin};
+
+    fn work(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("onelf-carried-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    fn group(
+        id: &str,
+        variable: &str,
+        kind: ResourceKind,
+        candidates: &[(RuntimeBase, &str)],
+    ) -> RuntimePathGroup {
+        RuntimePathGroup {
+            id: RuleId::new(id).unwrap(),
+            kind,
+            candidates: candidates
+                .iter()
+                .map(|(base, path)| RuntimeCandidate {
+                    base: *base,
+                    path: RelativePath::new(path).unwrap(),
+                })
+                .collect(),
+            variables: vec![EnvironmentName::new(variable).unwrap()],
+            selection: PathSelection::First,
+            inheritance: Inheritance::Replace,
+        }
+    }
+
+    fn record(
+        id: &str,
+        binding: Option<SetPin>,
+        paths: Vec<RuntimePathGroup>,
+        hooks: Vec<RuntimeHookId>,
+    ) -> RuntimeRuleRecord {
+        RuntimeRuleRecord {
+            id: RuleId::new(id).unwrap(),
+            binding,
+            runtime: RuntimeRules { paths, hooks },
+        }
+    }
+
+    fn values(assignments: &[PathAssignment<'_>]) -> Vec<(String, String)> {
+        assignments
+            .iter()
+            .flat_map(|a| {
+                a.variables
+                    .iter()
+                    .map(|v| (v.to_string(), a.value.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+
+    /// A carried record replaces the built-in catalog whole: its own
+    /// groups map and its hooks are the only ones a launch runs, while a
+    /// built-in group the record leaves out maps nothing, however
+    /// present its resource is. Absent, the built-ins and every hook
+    /// apply.
+    #[test]
+    fn a_carried_record_replaces_the_builtins_whole() {
+        let pkg = work("replace");
+        std::fs::create_dir_all(pkg.join("share/alsa")).unwrap();
+        std::fs::create_dir_all(pkg.join("share/vendor/data")).unwrap();
+        let lib = [pkg.join("lib")];
+        let carried = RuntimeRuleMetadata {
+            rules: vec![record(
+                "vendor",
+                None,
+                vec![group(
+                    "data",
+                    "VENDOR_DATA_DIR",
+                    ResourceKind::Directory,
+                    &[(RuntimeBase::PackageRoot, "share/vendor/data")],
+                )],
+                vec![RuntimeHookId::FontconfigGenerate],
+            )],
+        };
+
+        let active = ActiveRules::new(Some(&carried), &pkg, &[]);
+        assert_eq!(
+            values(&active.assignments(&pkg, &lib, &[], &[])),
+            [(
+                "VENDOR_DATA_DIR".to_string(),
+                pkg.join("share/vendor/data").to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(active.hooks, [RuntimeHookId::FontconfigGenerate]);
+
+        let fallback = ActiveRules::new(None, &pkg, &[]);
+        let mapped = values(&fallback.assignments(&pkg, &lib, &[], &[]));
+        assert!(mapped.iter().any(|(name, _)| name == "ALSA_CONFIG_DIR"));
+        assert!(!mapped.iter().any(|(name, _)| name == "VENDOR_DATA_DIR"));
+        assert_eq!(fallback.hooks, all_runtime_hooks());
+        let _ = std::fs::remove_dir_all(&pkg);
+    }
+
+    /// A record bound to a pin adds that pin's prepared subtree to its
+    /// rule's group only while the pin is active. The application's own
+    /// resource wins first, the subtree answers before the raw set root
+    /// even when the set holds an earlier candidate, and an inactive or
+    /// differently pinned build of the same set leaves the subtree
+    /// dormant.
+    #[test]
+    fn a_bound_record_activates_only_for_its_pin_ahead_of_the_raw_set() {
+        let work = work("bound");
+        let pkg = work.join("pkg");
+        let set = work.join("set");
+        let pin = SetPin {
+            name: RuleId::new("toolkit").unwrap(),
+            hash: [0xab; 32],
+        };
+        let prepared = pkg.join(pin.prepared_dir());
+        touch(&prepared.join("libexec/tool"));
+        touch(&set.join("lib/tool"));
+        let tool = || {
+            group(
+                "tool",
+                "VENDOR_TOOL",
+                ResourceKind::File,
+                &[
+                    (RuntimeBase::LibraryRoot, "tool"),
+                    (RuntimeBase::PackageRoot, "libexec/tool"),
+                ],
+            )
+        };
+        let carried = RuntimeRuleMetadata {
+            rules: vec![
+                record("vendor", None, vec![tool()], Vec::new()),
+                record("vendor", Some(pin.clone()), vec![tool()], Vec::new()),
+            ],
+        };
+        let lib = [pkg.join("lib")];
+        let set_libs = [set.join("lib")];
+        let roots = [set.clone()];
+        let chosen = |pins: &[ActivePin]| {
+            let active = ActiveRules::new(Some(&carried), &pkg, pins);
+            values(&active.assignments(&pkg, &lib, &set_libs, &roots))
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
+        };
+        let selected = ActivePin {
+            label: "toolkit".to_string(),
+            hash: "ab".repeat(32),
+        };
+        let other = ActivePin {
+            label: "toolkit".to_string(),
+            hash: "cd".repeat(32),
+        };
+        let raw = set.join("lib/tool").to_string_lossy().into_owned();
+
+        assert_eq!(
+            chosen(std::slice::from_ref(&selected)),
+            [prepared.join("libexec/tool").to_string_lossy().into_owned()]
+        );
+        assert_eq!(chosen(&[other]), std::slice::from_ref(&raw));
+        assert_eq!(chosen(&[]), [raw]);
+        let active = ActiveRules::new(Some(&carried), &pkg, std::slice::from_ref(&selected));
+        let (libs, hook_roots) = active.with_prepared(&pkg, &lib, &set_libs, &roots);
+        assert_eq!(hook_roots, [prepared.clone(), set.clone()]);
+        assert_eq!(libs, [prepared.join("lib"), set.join("lib")]);
+
+        touch(&pkg.join("lib/tool"));
+        assert_eq!(
+            chosen(&[selected]),
+            [pkg.join("lib/tool").to_string_lossy().into_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
