@@ -80,3 +80,195 @@ jobs:
         run: |
           cargo clippy -p onelf-rt --features update --all-targets --locked -- -D warnings
           cargo test -p onelf-rt --features update --locked
+
+  # One job per capability the suite can only prove in the matching
+  # environment. Each job names its claims in ONELF_REQUIRED_CAPS, so a
+  # test that must skip for a claimed capability fails the job instead of
+  # passing as a skip, and ci/preflight.sh rejects a runner whose
+  # environment cannot honour the claim before cargo runs at all.
+  namespace-fuse:
+    name: Pipeline suite, namespace FUSE
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: fuse,helperfuse,userns,tmpfs,cc,patchelf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools patchelf fuse3
+
+      # Best effort here on purpose: the preflight, not the sysctl exit
+      # code, decides whether this runner may claim namespaces.
+      - name: Allow namespace FUSE mounts
+        run: |
+          sudo modprobe fuse || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Preflight capabilities
+        run: ci/preflight.sh namespace-fuse
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          # llvm-tools provides rust-objcopy, which build.rs uses to flatten
+          # the bootstrap payload.
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Pipeline tests
+        run: cargo test -p onelf --locked --test pipeline
+
+  helper-fuse:
+    name: Pipeline suite, helper FUSE only
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: fuse,helperfuse,cc,patchelf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools patchelf fuse3
+
+      # Mounts must come from the setuid fusermount3 helper alone, so the
+      # user-namespace knob stays at Ubuntu 24.04's denying default. The
+      # preflight refuses a runner where unshare still succeeds, since
+      # such a runner would not be exercising the helper path at all.
+      - name: Allow the helper mount, keep namespaces denied
+        run: |
+          sudo modprobe fuse || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1 || true
+
+      - name: Preflight capabilities
+        run: ci/preflight.sh helper-fuse
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Pipeline tests
+        run: cargo test -p onelf --locked --test pipeline
+
+  no-fuse:
+    name: Pipeline suite, extraction fallback
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: cc,patchelf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Deliberately no fuse3: the fallback claim needs a host that
+      # cannot mount anything.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools patchelf
+
+      # A leftover helper or device node could still mount, and then the
+      # launches this job runs would not take the extraction fallback it
+      # exists to cover. The preflight fails on any of the three.
+      - name: Take FUSE off the runner
+        run: |
+          sudo modprobe -r fuse 2>/dev/null || true
+          sudo rm -f /dev/fuse
+
+      - name: Preflight capabilities
+        run: ci/preflight.sh no-fuse
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Pipeline tests
+        run: cargo test -p onelf --locked --test pipeline
+
+  cache:
+    name: Pipeline tests, extraction cache
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: cc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Preflight capabilities
+        run: ci/preflight.sh cache
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Cache tests
+        run: cargo test -p onelf --locked --test pipeline -- cache
+
+  privileged-import:
+    name: Pipeline tests, privileged root imports
+    runs-on: ubuntu-latest
+    env:
+      ONELF_REQUIRED_CAPS: root,fuse,helperfuse
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools fuse3
+
+      - name: Allow namespace FUSE mounts
+        run: |
+          sudo modprobe fuse || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # The preflight itself must run as root, so it probes the same uid
+      # the tests will run under.
+      - name: Preflight capabilities
+        run: sudo ci/preflight.sh privileged-import
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+          components: llvm-tools
+
+      # The root guarantees are written against a real uid transition, so
+      # the tests that hold them run as actual uid 0, not a mapped one.
+      - name: Privileged tests as root
+        run: sudo -E env "PATH=$PATH" cargo test -p onelf --locked --test pipeline -- root_serves root_neither root_leaves

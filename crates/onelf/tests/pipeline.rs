@@ -12,6 +12,10 @@
 //! is absent the test instead asserts the documented fallback
 //! (first-launch env still works), so it always verifies *something*
 //! meaningful rather than silently passing.
+//!
+//! Capability skips are accounted, not silent: every skip names the
+//! capability it lacks, and a job that promises a capability through
+//! `ONELF_REQUIRED_CAPS` fails when a test must skip for it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,11 +85,44 @@ fn fuse_available() -> bool {
         };
 
         if !ok {
-            skip("FUSE is not mountable here, as with cc and patchelf");
+            skip(
+                "fuse",
+                "FUSE is not mountable here, as with cc and patchelf",
+            );
         }
         let _ = std::fs::remove_dir_all(&td);
         ok
     })
+}
+
+/// Whether a helper mount is possible here: `fusermount3`, or a setuid
+/// `fusermount`, which is the runtime's own fallback rule. A
+/// `fusermount` without the setuid bit cannot mount for an ordinary
+/// user, so it counts for nothing.
+fn helperfuse_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    if have("fusermount3") {
+        return true;
+    }
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("fusermount"))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or(None);
+    let setuid = on_path.as_deref().is_some_and(|p| {
+        std::fs::metadata(p).is_ok_and(|md| md.permissions().mode() & 0o4000 != 0)
+    });
+    if setuid {
+        return true;
+    }
+    skip(
+        "helperfuse",
+        "neither fusermount3 nor a setuid fusermount is on PATH",
+    );
+    false
 }
 
 /// Whether this machine can run the tmpfs mode at all: a user namespace
@@ -125,7 +162,10 @@ fn tmpfs_available() -> bool {
         };
 
         if !ok {
-            skip("the tmpfs mode is not mountable here, as with FUSE and cc");
+            skip(
+                "tmpfs",
+                "the tmpfs mode is not mountable here, as with FUSE and cc",
+            );
         }
         let _ = std::fs::remove_dir_all(&td);
         ok
@@ -173,7 +213,10 @@ fn root_available() -> bool {
     match root_flavor() {
         Some(_) => true,
         None => {
-            skip("no root: the suite is not uid 0 and unshare cannot map one");
+            skip(
+                "root",
+                "no root: the suite is not uid 0 and unshare cannot map one",
+            );
             false
         }
     }
@@ -218,7 +261,10 @@ struct RootBase {
 /// announced when the base cannot be prepared.
 fn root_base(td: &Path) -> Option<RootBase> {
     let Some(flavor) = root_flavor() else {
-        skip("no root: the suite is not uid 0 and unshare cannot map one");
+        skip(
+            "root",
+            "no root: the suite is not uid 0 and unshare cannot map one",
+        );
         return None;
     };
     let _serial = ROOT_RUNS.lock().unwrap_or_else(|e| e.into_inner());
@@ -229,10 +275,13 @@ fn root_base(td: &Path) -> Option<RootBase> {
                 unmount_under(&fixed);
                 if let Err(e) = std::fs::remove_dir_all(&fixed) {
                     drop(_serial);
-                    skip(&format!(
-                        "root's base {} is in use and cannot be cleared: {e}",
-                        fixed.display()
-                    ));
+                    skip(
+                        "root",
+                        &format!(
+                            "root's base {} is in use and cannot be cleared: {e}",
+                            fixed.display()
+                        ),
+                    );
                     return None;
                 }
             }
@@ -518,15 +567,47 @@ fn patchelf() -> Option<String> {
     have("patchelf").then(|| "patchelf".to_string())
 }
 
-/// Announce that a test is skipping for lack of something in the
-/// environment. Under `CI` that is a failure: a runner without a compiler
-/// or a mountable FUSE goes green having tested little, and the point of
-/// the runner is to notice.
-fn skip(reason: &str) {
-    if std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
+/// The capabilities the surrounding job promises, from
+/// `ONELF_REQUIRED_CAPS` (comma-separated names). Empty when the
+/// variable is unset or blank.
+fn required_caps() -> &'static std::collections::HashSet<String> {
+    static CAPS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    CAPS.get_or_init(|| {
+        std::env::var("ONELF_REQUIRED_CAPS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
+    })
+}
+
+/// Whether the surrounding job claims capability `cap` as required: a
+/// skip of a claimed capability means the environment lied about what it
+/// provides, and the job must fail rather than report the coverage.
+fn required(cap: &str) -> bool {
+    required_caps().contains(cap)
+}
+
+/// Announce that a test is skipping for lack of the capability `cap`.
+///
+/// A CI job declares the capabilities it promises in
+/// `ONELF_REQUIRED_CAPS`. A skip of a promised capability is a failure:
+/// the job claimed to cover it, so passing without it reports coverage
+/// it does not have. Under `CI` with no declared capabilities every
+/// skip is still a failure, the long-standing rule, and a skip of a
+/// capability the job does not claim is announced and taken, because
+/// another job owns proving it.
+fn skip(cap: &str, reason: &str) {
+    if required(cap) {
+        panic!("required capability '{cap}' is unavailable: {reason}");
+    }
+    let declared = std::env::var("ONELF_REQUIRED_CAPS").is_ok_and(|v| !v.trim().is_empty());
+    if !declared && std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
         panic!("skip under CI: {reason}");
     }
-    eprintln!("skip: {reason}");
+    eprintln!("skip [{cap}]: {reason}");
 }
 
 /// Spawn a packed binary, retrying briefly while the kernel reports the
@@ -693,7 +774,7 @@ fn cc(src: &Path, out: &Path) -> bool {
     } else if have("gcc") {
         "gcc"
     } else {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         return false;
     };
     let st = Command::new(compiler)
@@ -1132,9 +1213,12 @@ fn a_framework_soname_dependency_activates_its_rule_without_includes() {
         let linked = cc_link_needed(&td.join("dep.c"), &app.join("bin/app"), &[soname]);
         if !linked {
             if !have("patchelf") {
-                skip(&format!(
-                    "neither {soname} nor patchelf is available to give a binary the need"
-                ));
+                skip(
+                    "patchelf",
+                    &format!(
+                        "neither {soname} nor patchelf is available to give a binary the need"
+                    ),
+                );
                 continue;
             }
             write(&td.join("plain.c"), "int main(void){return 0;}\n");
@@ -2817,7 +2901,7 @@ fn a_hundred_object_fixture_activates_rules_deduplicates_groups_and_reproduces_i
 #[test]
 fn traced_reads_stay_per_object_whatever_the_rules_in_play_or_the_tree_size() {
     if !have("strace") {
-        skip("strace is not available");
+        skip("strace", "strace is not available");
         return;
     }
     let td = workdir("scaletrace");
@@ -4049,6 +4133,7 @@ fn cc_libm(src: &Path, out: &Path) -> bool {
     } else if have("gcc") {
         "gcc"
     } else {
+        skip("cc", "no C compiler available");
         return false;
     };
     write(
@@ -4169,7 +4254,7 @@ int main(int argc, char **argv) {{
 /// the runtime sets `QT_PLUGIN_PATH`. `None` when a tool is missing.
 fn build_spawn_fixture(td: &Path) -> Option<PathBuf> {
     let Some(pe) = patchelf() else {
-        skip("no patchelf to inject the onelf-env hooks");
+        skip("patchelf", "no patchelf to inject the onelf-env hooks");
         return None;
     };
     let app = td.join("app");
@@ -4508,7 +4593,7 @@ fn build_parity_fixture(td: &Path, tag: &str) -> Option<PathBuf> {
 /// patchelf, the tool the injection needs.
 fn build_hooked_package(dir: &Path, tag: &str, store: &Path) -> Option<(PathBuf, String)> {
     let Some(pe) = patchelf() else {
-        skip("no patchelf to inject the onelf-env hooks");
+        skip("patchelf", "no patchelf to inject the onelf-env hooks");
         return None;
     };
     let o = Command::new(onelf())
@@ -6407,7 +6492,7 @@ int main(void) {
     let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     if !app.join("lib/libc.so.6").is_file() {
-        skip("the fixture is not a glibc binary");
+        skip("glibc", "the fixture is not a glibc binary");
         return;
     }
     assert!(
@@ -6489,7 +6574,7 @@ int main(int argc, char **argv) {
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("OPENED"))
     {
-        skip("this host has no libz.so.1 to dlopen");
+        skip("hostlibs", "this host has no libz.so.1 to dlopen");
         return;
     }
 
@@ -6541,7 +6626,7 @@ fn a_glibc_bundle_carries_the_compat_name_service() {
     let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     if !app.join("lib/libc.so.6").is_file() {
-        skip("the fixture is not a glibc binary");
+        skip("glibc", "the fixture is not a glibc binary");
         return;
     }
     assert!(
@@ -6785,7 +6870,7 @@ fn cc_with(args: &[&str], out: &Path) -> bool {
     } else if have("gcc") {
         "gcc"
     } else {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         return false;
     };
     // Fixtures link libraries they never call into, to describe a host.
@@ -7219,11 +7304,11 @@ int main(void) {
         &app.join("bin/app"),
     ));
     let Some(host_libc) = ldd_path(&app.join("bin/app"), "libc.so.6") else {
-        skip("ldd does not report libc.so.6");
+        skip("hostlibs", "ldd does not report libc.so.6");
         return;
     };
     let Some(host_ld) = ldd_path(&app.join("bin/app"), "ld-linux") else {
-        skip("ldd does not report the loader");
+        skip("hostlibs", "ldd does not report the loader");
         return;
     };
 
@@ -9293,7 +9378,7 @@ fn a_static_entrypoint_still_runs_from_a_memfd() {
     } else if have("gcc") {
         "gcc"
     } else {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         return;
     };
     let built = Command::new(compiler)
@@ -9304,7 +9389,7 @@ fn a_static_entrypoint_still_runs_from_a_memfd() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !built {
-        skip("no static libc available to link against");
+        skip("staticlibc", "no static libc available to link against");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -9355,7 +9440,7 @@ fn forcing_memfd_on_a_linked_entrypoint_says_so() {
     let bin = app.join("bin/m");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     if !cc_libm(&src, &bin) {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -9395,7 +9480,7 @@ fn forcing_memfd_on_a_linked_entrypoint_says_so() {
 #[test]
 fn packing_refuses_memfd_for_a_bundled_entrypoint() {
     let Some(_pe) = patchelf() else {
-        skip("patchelf not available");
+        skip("patchelf", "patchelf not available");
         return;
     };
     let td = workdir("memfd-pack");
@@ -9404,7 +9489,7 @@ fn packing_refuses_memfd_for_a_bundled_entrypoint() {
     let bin = app.join("bin/m");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     if !cc_libm(&src, &bin) {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -9449,7 +9534,7 @@ fn packing_refuses_memfd_for_a_bundled_entrypoint() {
 #[test]
 fn a_daemonized_process_outlives_the_launcher() {
     if !fuse_available() {
-        skip("FUSE is not mountable here");
+        skip("fuse", "FUSE is not mountable here");
         return;
     }
     let td = workdir("daemonize");
@@ -9537,7 +9622,7 @@ fn a_daemonized_process_outlives_the_launcher() {
 #[test]
 fn the_launcher_returns_without_waiting_for_a_daemon() {
     if !fuse_available() {
-        skip("FUSE is not mountable here");
+        skip("fuse", "FUSE is not mountable here");
         return;
     }
     let td = workdir("prompt-return");
@@ -9660,13 +9745,13 @@ fn launch_via_helper(pkg: &Path, td: &Path) -> Option<(std::process::Child, Path
             return Some((child, mp));
         }
         if child.try_wait().unwrap().is_some() {
-            skip("the FUSE helper cannot mount here");
+            skip("helperfuse", "the FUSE helper cannot mount here");
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let _ = child.kill();
-    skip("the FUSE helper mount did not appear");
+    skip("helperfuse", "the FUSE helper mount did not appear");
     None
 }
 
@@ -9685,7 +9770,7 @@ fn the_app_does_not_inherit_the_fuse_descriptor() {
         "#!/bin/sh\nfor f in /proc/self/fd/*; do readlink \"$f\"; done\n",
     );
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let mut cmd = Command::new(&pkg);
@@ -9699,7 +9784,10 @@ fn the_app_does_not_inherit_the_fuse_descriptor() {
         isolate(&mut cmd, &td);
         let out = run_package(&mut cmd);
         if !out.status.success() {
-            skip("helper={helper} cannot mount here");
+            skip(
+                if helper { "helperfuse" } else { "fuse" },
+                &format!("helper={helper} cannot mount here"),
+            );
             continue;
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -10012,7 +10100,7 @@ fn a_stopped_and_resumed_app_still_reads_from_the_mount() {
 /// launch of any package reclaims it.
 #[test]
 fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
-    if !fuse_available() || !have("fusermount3") {
+    if !fuse_available() || !helperfuse_available() {
         return; // documented soft-skip
     }
     let td = workdir("deadmount");
@@ -10052,7 +10140,7 @@ fn a_dead_helper_mount_is_reclaimed_by_the_next_launch() {
 /// another package's launch.
 #[test]
 fn a_live_helper_mount_survives_another_launch() {
-    if !fuse_available() || !have("fusermount3") {
+    if !fuse_available() || !helperfuse_available() {
         return; // documented soft-skip
     }
     let td = workdir("livemount");
@@ -10327,7 +10415,7 @@ fn concurrent_launches_share_one_mount_and_server() {
     let pkg = td.join("share.onelf");
     pack_share_app(&td, "one", &pkg);
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let envs: &[(&str, &str)] = if helper {
@@ -10404,7 +10492,7 @@ fn a_replaced_package_is_not_served_from_the_old_mount() {
     let pkg = td.join("replaced.onelf");
     pack_share_app(&td, "one", &pkg);
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let envs: &[(&str, &str)] = if helper {
@@ -10458,7 +10546,7 @@ fn the_share_opt_out_gives_each_launch_its_own_mount() {
     let pkg = td.join("optout.onelf");
     pack_share_app(&td, "one", &pkg);
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let mut envs = vec![("ONELF_FUSE_NO_SHARE", "1")];
@@ -10496,7 +10584,7 @@ fn a_killed_shared_server_is_reclaimed_by_the_next_launch() {
     pack_share_app(&td, "one", &pkg);
     let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let envs: &[(&str, &str)] = if helper {
@@ -10606,7 +10694,7 @@ fn a_join_launch_holds_the_mount_with_its_own_guardian() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     for helper in [false, true] {
-        if helper && !have("fusermount3") {
+        if helper && !helperfuse_available() {
             continue;
         }
         let envs: &[(&str, &str)] = if helper {
@@ -10774,7 +10862,7 @@ fn onelf_trace_records_what_the_run_opened() {
     isolate(&mut run, &td);
     let out = run_package(&mut run);
     if !out.status.success() {
-        skip("FUSE cannot mount here");
+        skip("fuse", "FUSE cannot mount here");
         return;
     }
 
@@ -10851,7 +10939,7 @@ fn onelf_trace_leaves_out_what_the_runtime_read() {
     isolate(&mut run, &td);
     let out = run_package(&mut run);
     if !out.status.success() {
-        skip("FUSE cannot mount here");
+        skip("fuse", "FUSE cannot mount here");
         return;
     }
 
@@ -10941,7 +11029,7 @@ fn onelf_profile_records_blocks_and_prefetching_them_reads_the_same_bytes() {
     let profile = td.join("profile.txt");
     let out = run(&plain, Some(&profile));
     if !out.status.success() {
-        skip("FUSE cannot mount here");
+        skip("fuse", "FUSE cannot mount here");
         return;
     }
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
@@ -11297,7 +11385,7 @@ fn root_serves_its_own_set_view_not_a_users_mount() {
     if !root_available() {
         return;
     }
-    if !fuse_available() || !have("fusermount3") {
+    if !fuse_available() || !helperfuse_available() {
         return; // documented soft-skip
     }
     let td = workdir("rootsetview");
@@ -14025,7 +14113,11 @@ fn a_shared_set_is_fetched_and_put_on_the_library_path() {
 #[test]
 fn a_path_the_application_was_built_with_reads_the_bundle() {
     if !user_namespaces_available() {
-        return; // documented soft-skip
+        skip(
+            "userns",
+            "the built-in path overlays need a user namespace this host denies",
+        );
+        return;
     }
     let td = workdir("hostpaths");
     let Some(fixture) = synthetic_sysroot(&td) else {
@@ -15409,7 +15501,7 @@ fn a_shared_set_keeps_what_only_its_run_path_reaches() {
 /// the copy instead, and a host that cannot mount falls back to it.
 #[test]
 fn a_shared_set_is_served_from_its_build_rather_than_copied() {
-    if !fuse_available() || !have("fusermount3") {
+    if !fuse_available() || !helperfuse_available() {
         return; // documented soft-skip
     }
     let td = workdir("setmount");
@@ -15495,7 +15587,10 @@ fn a_shared_set_is_served_from_its_build_rather_than_copied() {
     );
     let mounted = copies_of_the_set();
     if mounted > 0 {
-        skip("this host mounted nothing; the fallback covered the run");
+        skip(
+            "fuse",
+            "this host mounted nothing; the fallback covered the run",
+        );
         return;
     }
 
@@ -16435,7 +16530,7 @@ fn share_recorded(td: &Path) -> bool {
 /// alike, and leaves the shared mount as it was.
 #[test]
 fn a_launch_whose_library_links_differ_gets_its_own_mount() {
-    if !fuse_available() || !have("fusermount3") {
+    if !fuse_available() || !helperfuse_available() {
         return; // documented soft-skip
     }
     let td = workdir("linkreuse");
@@ -17567,7 +17662,7 @@ fn a_fifo_in_the_tree_warns_and_is_not_packed() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        skip("cannot create a FIFO here");
+        skip("fifo", "cannot create a FIFO here");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -17647,7 +17742,7 @@ fn an_external_unmount_ends_the_detached_server() {
     let out = run_package(&mut run);
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.contains("STARTED") {
-        skip("fusermount3 mount path unavailable here");
+        skip("helperfuse", "fusermount3 mount path unavailable here");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -17668,7 +17763,7 @@ fn an_external_unmount_ends_the_detached_server() {
         })
     });
     let Some(server_pid) = server_pid else {
-        skip("detached server not found");
+        skip("fuse", "detached server not found");
         let _ = std::fs::remove_dir_all(&td);
         return;
     };
@@ -17940,7 +18035,7 @@ fn a_dry_run_keeps_the_sysroot_records() {
 #[test]
 fn a_bundled_musl_libc_has_its_search_path_scrubbed() {
     if !have("musl-gcc") {
-        skip("no musl-gcc to build a musl binary");
+        skip("musl", "no musl-gcc to build a musl binary");
         return;
     }
     let td = workdir("muslscrub");
@@ -17962,7 +18057,7 @@ fn a_bundled_musl_libc_has_its_search_path_scrubbed() {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
     else {
-        skip("no musl loader at /lib/ld-musl-x86_64.so.1");
+        skip("musl", "no musl loader at /lib/ld-musl-x86_64.so.1");
         return;
     };
 
@@ -18295,18 +18390,18 @@ int main(void) {{
 #[test]
 fn a_musl_target_without_its_interpreter_is_still_traced() {
     if !have("musl-gcc") {
-        skip("no musl-gcc to build a musl binary");
+        skip("musl", "no musl-gcc to build a musl binary");
         return;
     }
     if !have("strace") {
-        skip("no strace to trace a musl binary");
+        skip("strace", "no strace to trace a musl binary");
         return;
     }
     let Some(musl_dir) = std::fs::canonicalize("/lib/ld-musl-x86_64.so.1")
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
     else {
-        skip("no musl loader at /lib/ld-musl-x86_64.so.1");
+        skip("musl", "no musl loader at /lib/ld-musl-x86_64.so.1");
         return;
     };
     let td = workdir("tracemusl");
@@ -19213,7 +19308,7 @@ fn memfd_mode_applies_the_recipe_env_it_can() {
     } else if have("gcc") {
         "gcc"
     } else {
-        skip("no C compiler available");
+        skip("cc", "no C compiler available");
         return;
     };
     let built = Command::new(compiler)
@@ -19224,7 +19319,7 @@ fn memfd_mode_applies_the_recipe_env_it_can() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !built {
-        skip("no static libc available to link against");
+        skip("staticlibc", "no static libc available to link against");
         let _ = std::fs::remove_dir_all(&td);
         return;
     }
@@ -19709,7 +19804,10 @@ fn an_in_tree_import_source_keeps_its_bytes() {
     assert!(stdout.contains("ELF_IMPORT_INTREE_OK"), "{stdout}");
 
     if !have("readelf") || !have("patchelf") {
-        skip("readelf or patchelf is not available to check the added NEED");
+        skip(
+            "patchelf",
+            "readelf or patchelf is not available to check the added NEED",
+        );
     }
     assert!(
         !needed_sonames(&source).contains(&"libonelf-env.so".to_string()),
@@ -19791,7 +19889,10 @@ fn a_source_that_is_also_the_command_builds_and_runs() {
     assert!(stdout.contains("ELF_IMPORT_SELF_OK"), "{stdout}");
 
     if !have("readelf") || !have("patchelf") {
-        skip("readelf or patchelf is not available to check the added NEED");
+        skip(
+            "patchelf",
+            "readelf or patchelf is not available to check the added NEED",
+        );
     }
     assert!(
         needed_sonames(&app).contains(&"libonelf-env.so".to_string()),
