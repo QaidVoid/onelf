@@ -10,17 +10,18 @@
 //!
 //! The registered runtime hooks and the launch's own procedures assign
 //! further environment names outside the path groups. Their names are
-//! fixed closed lists here, next to the derivation they extend, so the
-//! two consumers classify one set of names.
+//! fixed closed lists in [`crate::rules`], where descriptor validation
+//! also refuses to map them, so every consumer classifies one set of names.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::catalog;
+pub use crate::rules::ValueShape;
 use crate::rules::{
-    Descriptor, PathSelection, ResourceKind, RuntimeBase, RuntimeHookId, RuntimePathGroup,
-    SourceBase,
+    Descriptor, HOOK_NAMES, PROCEDURE_NAMES, PathSelection, ResourceKind, RuntimeBase,
+    RuntimeHookId, RuntimePathGroup, SourceBase,
 };
 
 /// Where the bundle carries a resource so the runtime's search finds it.
@@ -47,15 +48,6 @@ pub struct Subject<'a> {
     pub variable: &'a str,
 }
 
-/// How a library reads one mapped environment name's value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueShape {
-    /// One path naming a single file or directory.
-    Single,
-    /// A colon-separated list of paths.
-    List,
-}
-
 /// The runtime classification of one environment name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NameClass {
@@ -73,109 +65,6 @@ const LINT_EXEMPT: &[&str] = &[
     "GTK_PATH",
     "QT_PLUGIN_PATH",
     "TEXTDOMAINDIR",
-];
-
-/// One environment name a closed list assigns, with how a library reads
-/// its value.
-type NameShape = (&'static str, ValueShape, ResourceKind);
-
-/// The environment names of one closed list.
-type AssignedNames = &'static [NameShape];
-
-/// The environment names each registered runtime hook assigns, with how
-/// a library reads each value. The hook registry is closed, so this is
-/// a fixed list.
-const HOOK_NAMES: &[(RuntimeHookId, AssignedNames)] = &[
-    (
-        RuntimeHookId::AlsaConfigPathNaturalSort,
-        &[("ALSA_CONFIG_PATH", ValueShape::List, ResourceKind::File)],
-    ),
-    (
-        RuntimeHookId::GdkCacheAbsolutise,
-        &[
-            (
-                "GDK_PIXBUF_MODULE_FILE",
-                ValueShape::Single,
-                ResourceKind::File,
-            ),
-            ("GTK_IM_MODULE_FILE", ValueShape::Single, ResourceKind::File),
-        ],
-    ),
-    (
-        RuntimeHookId::FontconfigGenerate,
-        &[("FONTCONFIG_FILE", ValueShape::Single, ResourceKind::File)],
-    ),
-    (
-        RuntimeHookId::GioModulePaths,
-        &[
-            (
-                "GIO_MODULE_DIR",
-                ValueShape::Single,
-                ResourceKind::Directory,
-            ),
-            (
-                "GIO_EXTRA_MODULES",
-                ValueShape::List,
-                ResourceKind::Directory,
-            ),
-        ],
-    ),
-    (
-        RuntimeHookId::TclTkLibraries,
-        &[
-            ("TCL_LIBRARY", ValueShape::Single, ResourceKind::Directory),
-            ("TK_LIBRARY", ValueShape::Single, ResourceKind::Directory),
-        ],
-    ),
-];
-
-/// The environment names the launch's own procedures assign, with how a
-/// library reads each value: the loader's charset converters, the
-/// graphics driver paths, the terminal descriptions, the trust anchors
-/// and the locales.
-const PROCEDURE_NAMES: AssignedNames = &[
-    ("GCONV_PATH", ValueShape::List, ResourceKind::Directory),
-    (
-        "LIBDECOR_PLUGIN_DIR",
-        ValueShape::Single,
-        ResourceKind::Directory,
-    ),
-    (
-        "LIBGL_DRIVERS_PATH",
-        ValueShape::List,
-        ResourceKind::Directory,
-    ),
-    (
-        "LIBVA_DRIVERS_PATH",
-        ValueShape::List,
-        ResourceKind::Directory,
-    ),
-    (
-        "GBM_BACKENDS_PATH",
-        ValueShape::List,
-        ResourceKind::Directory,
-    ),
-    (
-        "__EGL_VENDOR_LIBRARY_DIRS",
-        ValueShape::List,
-        ResourceKind::Directory,
-    ),
-    ("VK_DRIVER_FILES", ValueShape::List, ResourceKind::File),
-    ("VK_ADD_DRIVER_FILES", ValueShape::List, ResourceKind::File),
-    (
-        "DRIRC_CONFIGDIR",
-        ValueShape::Single,
-        ResourceKind::Directory,
-    ),
-    (
-        "LIBDRM_IDS_PATH",
-        ValueShape::Single,
-        ResourceKind::Directory,
-    ),
-    ("TERMINFO_DIRS", ValueShape::List, ResourceKind::Directory),
-    ("SSL_CERT_FILE", ValueShape::Single, ResourceKind::File),
-    ("CURL_CA_BUNDLE", ValueShape::Single, ResourceKind::File),
-    ("LOCPATH", ValueShape::List, ResourceKind::Directory),
 ];
 
 /// One binding of a registered runtime hook to the descriptor group it
@@ -313,26 +202,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 
 /// The runtime classification of one environment name.
 pub fn classify(name: &str) -> Option<NameClass> {
-    classify_in(catalog::builtins(), name)
-        .or_else(|| {
-            HOOK_NAMES
-                .iter()
-                .flat_map(|(_, names)| names.iter())
-                .find(|(candidate, _, _)| *candidate == name)
-                .map(|(_, shape, kind)| NameClass {
-                    shape: *shape,
-                    kind: *kind,
-                })
-        })
-        .or_else(|| {
-            PROCEDURE_NAMES
-                .iter()
-                .find(|(candidate, _, _)| *candidate == name)
-                .map(|(_, shape, kind)| NameClass {
-                    shape: *shape,
-                    kind: *kind,
-                })
-        })
+    classes().get(name).copied()
 }
 
 /// The classification a set of descriptors gives one of its mapped
@@ -479,13 +349,13 @@ mod tests {
     /// same derivation, with no per-consumer list to edit.
     #[test]
     fn a_new_mapping_extends_both_consumers_without_further_tables() {
-        let synthetic = group("proof", "ONELF_PROOF_PLUGIN_PATH", PathSelection::All);
+        let synthetic = group("proof", "PROOF_PLUGIN_PATH", PathSelection::All);
 
         let subject = group_subject(&synthetic).expect("the lint watches the new mapping");
         assert_eq!(subject.endings, ["/proof/plugins"]);
         assert_eq!(subject.places, [Place::Library("proof/plugins")]);
         assert_eq!(subject.kind, ResourceKind::Directory);
-        assert_eq!(subject.variable, "ONELF_PROOF_PLUGIN_PATH");
+        assert_eq!(subject.variable, "PROOF_PLUGIN_PATH");
 
         assert_eq!(
             group_class(&synthetic),
@@ -498,7 +368,7 @@ mod tests {
         let descriptor = descriptor(vec![synthetic]);
         assert_eq!(subjects_in(std::slice::from_ref(&descriptor)).len(), 1);
         assert_eq!(
-            classify_in(std::slice::from_ref(&descriptor), "ONELF_PROOF_PLUGIN_PATH"),
+            classify_in(std::slice::from_ref(&descriptor), "PROOF_PLUGIN_PATH"),
             Some(NameClass {
                 shape: ValueShape::List,
                 kind: ResourceKind::Directory,

@@ -3035,13 +3035,13 @@ mod path_mapping_tests {
                 (RuntimeBase::PackageRoot, "a"),
                 (RuntimeBase::PackageRoot, "b"),
             ],
-            &["ONELF_T_FIRST_G"],
+            &["ONELFTEST_FIRST_G"],
         )];
 
         let got = evaluate_path_groups(&groups, &scopes);
 
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].variables, ["ONELF_T_FIRST_G"]);
+        assert_eq!(got[0].variables, ["ONELFTEST_FIRST_G"]);
         assert_eq!(got[0].value, app.join("b").into_os_string());
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -3078,7 +3078,7 @@ mod path_mapping_tests {
                     (RuntimeBase::LibraryRoot, "m"),
                     (RuntimeBase::LibraryRoot, "m"),
                 ],
-                &["ONELF_T_ALL_A"],
+                &["ONELFTEST_ALL_A"],
             ),
             group(
                 "ordered",
@@ -3089,7 +3089,7 @@ mod path_mapping_tests {
                     (RuntimeBase::PackageRoot, "second"),
                     (RuntimeBase::PackageRoot, "m"),
                 ],
-                &["ONELF_T_ALL_B"],
+                &["ONELFTEST_ALL_B"],
             ),
         ];
 
@@ -3134,7 +3134,7 @@ mod path_mapping_tests {
                 (RuntimeBase::LibraryRoot, "libheif/plugins"),
                 (RuntimeBase::LibraryRoot, "libheif"),
             ],
-            &["ONELF_T_HEIF"],
+            &["ONELFTEST_HEIF"],
         )];
 
         let got = evaluate_path_groups(&groups, &scopes);
@@ -3174,7 +3174,7 @@ mod path_mapping_tests {
                 (RuntimeBase::PackageRoot, "data"),
                 (RuntimeBase::PackageRoot, "real.mgc"),
             ],
-            &["ONELF_T_KIND_FILE"],
+            &["ONELFTEST_KIND_FILE"],
         )];
         let dirs = [group(
             "solo",
@@ -3182,7 +3182,7 @@ mod path_mapping_tests {
             PathSelection::First,
             Inheritance::Replace,
             &[(RuntimeBase::PackageRoot, "plain")],
-            &["ONELF_T_KIND_DIR"],
+            &["ONELFTEST_KIND_DIR"],
         )];
 
         let got = evaluate_path_groups(&files, &scopes);
@@ -3208,7 +3208,7 @@ mod path_mapping_tests {
             PathSelection::First,
             Inheritance::Preserve,
             &[(RuntimeBase::PackageRoot, "share/locale")],
-            &["ONELF_T_ABSENT"],
+            &["ONELFTEST_ABSENT"],
         )];
 
         assert!(evaluate_path_groups(&groups, &scopes).is_empty());
@@ -3240,7 +3240,7 @@ mod path_mapping_tests {
             PathSelection::First,
             Inheritance::Preserve,
             &[(RuntimeBase::PackageRoot, "share/locale")],
-            &["ONELF_T_INACTIVE"],
+            &["ONELFTEST_INACTIVE"],
         )];
 
         assert!(evaluate_path_groups(&groups, &scopes).is_empty());

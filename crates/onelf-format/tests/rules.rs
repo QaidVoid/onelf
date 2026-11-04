@@ -93,8 +93,79 @@ fn identity_and_environment_names_are_bounded_and_portable() {
         "LD_LIBRARY_PATH_32",
         "LD_LIBRARY_PATH_64",
         "LD_AOUT_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_BIND_NOW",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
     ] {
-        error_contains(EnvironmentName::new(name), "prohibited library-search");
+        error_contains(EnvironmentName::new(name), "loader-control");
+    }
+    for name in ["ONELF_DIR", "ONELF_MODE", "ONELF_ANYTHING"] {
+        error_contains(EnvironmentName::new(name), "runtime-owned");
+    }
+    for name in ["LDFLAGS", "XLD_PRELOAD", "ONELF", "MY_ONELF_PATH"] {
+        assert!(EnvironmentName::new(name).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn hook_and_procedure_names_cannot_be_mapped() {
+    for name in [
+        "FONTCONFIG_FILE",
+        "GIO_MODULE_DIR",
+        "TCL_LIBRARY",
+        "LOCPATH",
+    ] {
+        let mut group = runtime_path("owned");
+        group.variables = vec![EnvironmentName::new(name).unwrap()];
+        let rules = RuntimeRules {
+            paths: vec![group],
+            hooks: Vec::new(),
+        };
+        error_contains(rules.validate(), "runtime hook or launch procedure");
+        let mut rule = descriptor("owned");
+        rule.runtime = rules;
+        error_contains(rule.validate(), "runtime hook or launch procedure");
+    }
+}
+
+#[test]
+fn one_variable_cannot_be_mapped_by_two_enabled_groups() {
+    let mut first = descriptor("first");
+    first.runtime.paths = vec![runtime_path("plugins")];
+    let mut second = descriptor("second");
+    second.runtime.paths = vec![runtime_path("plugins")];
+    error_contains(
+        validate_catalog(
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&second),
+            &[],
+        ),
+        "more than one enabled runtime path group",
+    );
+    validate_catalog(
+        std::slice::from_ref(&first),
+        std::slice::from_ref(&second),
+        &[id("first")],
+    )
+    .unwrap();
+    let mut both = descriptor("both");
+    both.runtime.paths = vec![runtime_path("a"), runtime_path("b")];
+    both.validate().unwrap();
+    error_contains(
+        validate_catalog(&[both], &[], &[]),
+        "more than one enabled runtime path group",
+    );
+}
+
+#[test]
+fn set_names_are_identities_without_dots() {
+    for name in ["gtk", "qt6", "A-b_1"] {
+        assert_eq!(RuleId::set_name(name).unwrap().as_str(), name);
+    }
+    for name in ["", "qt6.core", "-x", "_x", "a/b", "a b"] {
+        assert!(RuleId::set_name(name).is_err(), "{name:?}");
     }
 }
 
@@ -350,10 +421,10 @@ mod toml_schema {
     use super::*;
     use onelf_format::rules_toml::parse_descriptor;
 
-    const GST: &str = include_str!("fixtures/rules/gstreamer.toml");
-    const ALSA: &str = include_str!("fixtures/rules/alsa.toml");
-    const MAGIC: &str = include_str!("fixtures/rules/magic.toml");
-    const HEIF: &str = include_str!("fixtures/rules/heif.toml");
+    const GST: &str = include_str!("../rules/gstreamer.toml");
+    const ALSA: &str = include_str!("../rules/alsa.toml");
+    const MAGIC: &str = include_str!("../rules/magic.toml");
+    const HEIF: &str = include_str!("../rules/heif.toml");
 
     fn rejects_replacement(text: &str, from: &str, to: &str, expected: &str) {
         assert!(text.contains(from), "missing test pattern {from:?}");
@@ -672,6 +743,10 @@ mod toml_schema {
             "LD_LIBRARY_PATH_32",
             "LD_LIBRARY_PATH_64",
             "LD_AOUT_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "GCONV_PATH",
+            "ONELF_DIR",
         ] {
             rejects_replacement(
                 MAGIC,

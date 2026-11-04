@@ -81,7 +81,7 @@ impl From<RuleError> for MetadataError {
 /// multiple pins within one table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SetPin {
-    /// Canonical declaration name, validated by [`RuleId`].
+    /// Canonical declaration name, validated by [`RuleId::set_name`].
     pub name: RuleId,
     /// Full BLAKE3 artifact digest, not a truncated identifier.
     pub hash: [u8; 32],
@@ -139,6 +139,9 @@ impl RuntimeRuleMetadata {
                 return Err(MetadataError::new(
                     "runtime rules: duplicate scoped descriptor identity",
                 ));
+            }
+            if let Some(pin) = &rule.binding {
+                RuleId::set_name(pin.name.as_str())?;
             }
             rule.runtime.validate()?;
         }
@@ -278,6 +281,7 @@ impl EntrypointSets {
         self.record_count()?;
         let mut pins = BTreeSet::new();
         for pin in &self.pins {
+            RuleId::set_name(pin.name.as_str())?;
             if !pins.insert(&pin.name) {
                 return Err(MetadataError::new(
                     "pin table: duplicate set name or conflicting pins",

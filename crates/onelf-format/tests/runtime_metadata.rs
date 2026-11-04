@@ -523,6 +523,20 @@ fn invalid_names_environment_paths_and_utf8_are_rejected_on_decode() {
             .to_string()
             .contains("prohibited")
     );
+    for (replacement, reason) in [
+        (b"LD_PRELOAD_PATH", "loader-control"),
+        (b"ONELF_PLUGINPAT", "runtime-owned"),
+        (b"FONTCONFIG_FILE", "runtime hook or launch procedure"),
+    ] {
+        let mut bytes = value.encode().unwrap();
+        replace_equal_length(&mut bytes, b"SAFE_PLUGINPATH", replacement);
+        let error = RuntimeRuleMetadata::decode(&bytes).unwrap_err().to_string();
+        assert!(error.contains(reason), "{error}");
+    }
+    let mut dotted = selections();
+    dotted.pins[0].name = id("s.t");
+    dotted.entrypoints[0].sets = vec![id("s.t")];
+    assert!(dotted.encode().is_err(), "a dotted set name is not a pin");
     let mut bytes = selections().encode().unwrap();
     replace_equal_length(&mut bytes, b"app", &[0xff, b'p', b'p']);
     assert!(EntrypointSets::decode(&bytes).is_err());

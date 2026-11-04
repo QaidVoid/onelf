@@ -126,6 +126,22 @@ impl RuleId {
         Ok(Self(value.to_owned()))
     }
 
+    /// Validate a set declaration name: an identity without dots.
+    ///
+    /// Provider indexes and the selection and pin tables apply this one rule,
+    /// so a set name one of them accepts is never refused by another.
+    pub fn set_name(value: &str) -> Result<Self, RuleError> {
+        let id = Self::new(value)?;
+        if value.contains('.') {
+            return Err(RuleError::value(
+                "set name",
+                "expected ASCII letters, digits, - and _ only",
+                value,
+            ));
+        }
+        Ok(id)
+    }
+
     /// The validated identity text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -189,10 +205,12 @@ impl RelativePath {
 
 /// A portable environment name that cannot configure the application loader.
 ///
-/// Names use `[A-Za-z_][A-Za-z0-9_]*`. Loader search variables
-/// `LD_LIBRARY_PATH`, `LD_LIBRARY_PATH_32`, `LD_LIBRARY_PATH_64` and
-/// `LD_AOUT_LIBRARY_PATH` are prohibited. Framework-specific plugin variables
-/// remain permitted because they do not provide ordinary ELF dependencies.
+/// Names use `[A-Za-z_][A-Za-z0-9_]*`. Every `LD_` name is prohibited because
+/// the dynamic loader reads that namespace, including `LD_LIBRARY_PATH`,
+/// `LD_PRELOAD` and `LD_AUDIT`. `GCONV_PATH` and `GLIBC_TUNABLES`, which make
+/// glibc load code or change loader behavior, and every runtime-owned `ONELF_`
+/// name are prohibited too. Framework-specific plugin variables remain
+/// permitted because they do not provide ordinary ELF dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnvironmentName(String);
 
@@ -216,16 +234,17 @@ impl EnvironmentName {
                 value,
             ));
         }
-        if matches!(
-            value,
-            "LD_LIBRARY_PATH"
-                | "LD_LIBRARY_PATH_32"
-                | "LD_LIBRARY_PATH_64"
-                | "LD_AOUT_LIBRARY_PATH"
-        ) {
+        if value.starts_with("LD_") || matches!(value, "GCONV_PATH" | "GLIBC_TUNABLES") {
             return Err(RuleError::value(
                 "environment",
-                "prohibited library-search variable",
+                "prohibited library-search or loader-control variable",
+                value,
+            ));
+        }
+        if value.starts_with("ONELF_") {
+            return Err(RuleError::value(
+                "environment",
+                "prohibited runtime-owned variable",
                 value,
             ));
         }
@@ -236,6 +255,128 @@ impl EnvironmentName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// How a library reads one runtime-assigned environment name's value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueShape {
+    /// One path naming a single file or directory.
+    Single,
+    /// A colon-separated list of paths.
+    List,
+}
+
+/// One environment name a closed list assigns, with how a library reads
+/// its value.
+pub(crate) type NameShape = (&'static str, ValueShape, ResourceKind);
+
+/// The environment names of one closed list.
+pub(crate) type AssignedNames = &'static [NameShape];
+
+/// The environment names each registered runtime hook assigns, with how
+/// a library reads each value. The hook registry is closed, so this is
+/// a fixed list.
+pub(crate) const HOOK_NAMES: &[(RuntimeHookId, AssignedNames)] = &[
+    (
+        RuntimeHookId::AlsaConfigPathNaturalSort,
+        &[("ALSA_CONFIG_PATH", ValueShape::List, ResourceKind::File)],
+    ),
+    (
+        RuntimeHookId::GdkCacheAbsolutise,
+        &[
+            (
+                "GDK_PIXBUF_MODULE_FILE",
+                ValueShape::Single,
+                ResourceKind::File,
+            ),
+            ("GTK_IM_MODULE_FILE", ValueShape::Single, ResourceKind::File),
+        ],
+    ),
+    (
+        RuntimeHookId::FontconfigGenerate,
+        &[("FONTCONFIG_FILE", ValueShape::Single, ResourceKind::File)],
+    ),
+    (
+        RuntimeHookId::GioModulePaths,
+        &[
+            (
+                "GIO_MODULE_DIR",
+                ValueShape::Single,
+                ResourceKind::Directory,
+            ),
+            (
+                "GIO_EXTRA_MODULES",
+                ValueShape::List,
+                ResourceKind::Directory,
+            ),
+        ],
+    ),
+    (
+        RuntimeHookId::TclTkLibraries,
+        &[
+            ("TCL_LIBRARY", ValueShape::Single, ResourceKind::Directory),
+            ("TK_LIBRARY", ValueShape::Single, ResourceKind::Directory),
+        ],
+    ),
+];
+
+/// The environment names the launch's own procedures assign, with how a
+/// library reads each value: the loader's charset converters, the
+/// graphics driver paths, the terminal descriptions, the trust anchors
+/// and the locales.
+pub(crate) const PROCEDURE_NAMES: AssignedNames = &[
+    ("GCONV_PATH", ValueShape::List, ResourceKind::Directory),
+    (
+        "LIBDECOR_PLUGIN_DIR",
+        ValueShape::Single,
+        ResourceKind::Directory,
+    ),
+    (
+        "LIBGL_DRIVERS_PATH",
+        ValueShape::List,
+        ResourceKind::Directory,
+    ),
+    (
+        "LIBVA_DRIVERS_PATH",
+        ValueShape::List,
+        ResourceKind::Directory,
+    ),
+    (
+        "GBM_BACKENDS_PATH",
+        ValueShape::List,
+        ResourceKind::Directory,
+    ),
+    (
+        "__EGL_VENDOR_LIBRARY_DIRS",
+        ValueShape::List,
+        ResourceKind::Directory,
+    ),
+    ("VK_DRIVER_FILES", ValueShape::List, ResourceKind::File),
+    ("VK_ADD_DRIVER_FILES", ValueShape::List, ResourceKind::File),
+    (
+        "DRIRC_CONFIGDIR",
+        ValueShape::Single,
+        ResourceKind::Directory,
+    ),
+    (
+        "LIBDRM_IDS_PATH",
+        ValueShape::Single,
+        ResourceKind::Directory,
+    ),
+    ("TERMINFO_DIRS", ValueShape::List, ResourceKind::Directory),
+    ("SSL_CERT_FILE", ValueShape::Single, ResourceKind::File),
+    ("CURL_CA_BUNDLE", ValueShape::Single, ResourceKind::File),
+    ("LOCPATH", ValueShape::List, ResourceKind::Directory),
+];
+
+/// Whether a registered runtime hook or the launch's own procedures
+/// assign `name`, so no descriptor may map it.
+fn runtime_owned(name: &str) -> bool {
+    HOOK_NAMES
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .chain(PROCEDURE_NAMES)
+        .any(|(owned, _, _)| *owned == name)
 }
 
 /// A case-sensitive predicate over the complete parsed ELF soname.
@@ -607,6 +748,13 @@ impl RuntimeRules {
             }
             let mut variables = BTreeSet::new();
             for variable in &path.variables {
+                if runtime_owned(variable.as_str()) {
+                    return Err(RuleError::value(
+                        "runtime.paths.variables",
+                        "assigned by a runtime hook or launch procedure",
+                        variable.as_str(),
+                    ));
+                }
                 unique(&mut variables, variable, "environment alias")?;
             }
             if path.selection == PathSelection::FirstPerLibraryRoot
@@ -673,7 +821,9 @@ fn require_candidates<T>(candidates: &[T], id: &str) -> Result<(), RuleError> {
 /// Validate a complete catalog and its explicit disabled identities.
 ///
 /// Built-ins and local rules share an identity namespace even when disabled.
-/// Unknown and repeated disabled IDs are errors. Aggregate records are bounded
+/// Unknown and repeated disabled IDs are errors. An environment name may be
+/// mapped by only one runtime path group across the enabled descriptors, so
+/// every consumer classifies it the same way. Aggregate records are bounded
 /// before indexing. This function neither sorts nor filters its inputs, and does
 /// not load files or define any built-in descriptors.
 pub fn validate_catalog(
@@ -701,6 +851,21 @@ pub fn validate_catalog(
             ));
         }
         unique(&mut disabled_ids, id, "disabled rule id")?;
+    }
+    let mut mapped = BTreeSet::new();
+    for rule in builtins.iter().chain(local) {
+        if disabled_ids.contains(&rule.id) {
+            continue;
+        }
+        for variable in rule.runtime.paths.iter().flat_map(|path| &path.variables) {
+            if !mapped.insert(variable) {
+                return Err(RuleError::value(
+                    "runtime.paths.variables",
+                    "mapped by more than one enabled runtime path group",
+                    variable.as_str(),
+                ));
+            }
+        }
     }
     Ok(())
 }
