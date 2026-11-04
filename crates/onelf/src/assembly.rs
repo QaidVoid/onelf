@@ -222,7 +222,6 @@ pub enum Source {
 
 /// What assembly did, normalized so reports can present outcomes
 /// deterministically instead of re-deriving them from prose output.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblyReport {
     /// Where the AppDir contents came from.
@@ -248,7 +247,6 @@ impl AssemblyReport {
     /// shared sets, the GL pin, and the bounded-inference limit. No
     /// paths, timestamps or color, so the same assembly renders the same
     /// bytes everywhere, and a snapshot can pin them.
-    #[allow(dead_code)]
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         match self.source {

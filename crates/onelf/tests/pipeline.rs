@@ -21103,6 +21103,159 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The assembly summary lines in a build log: the fixed labels the
+/// summary renders, in the order the log carries them. No other build
+/// output starts a line with these labels.
+fn summary_lines(log: &str) -> Vec<&str> {
+    const PREFIXES: [&str; 6] = [
+        "Source: ",
+        "Frameworks requested: ",
+        "Rule ",
+        "Shared sets: ",
+        "Pinned GL build: ",
+        "Not inferred: ",
+    ];
+    log.lines()
+        .filter(|l| PREFIXES.iter().any(|p| l.starts_with(p)))
+        .collect()
+}
+
+/// Write an AppDir whose recipe skips bundling, holding one executable
+/// script as the package command.
+fn skip_appdir(td: &Path, tag: &str) -> PathBuf {
+    let dir = td.join(tag);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("bin/app"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        dir.join("bin/app"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\nmtime = 0\n\n[bundle]\nskip = true\n",
+    );
+    dir
+}
+
+/// A skipped assembly is reported as unchecked, with no completeness
+/// claim: the summary names the tree as authored and the audit that did
+/// not run, then the bounded-inference limit, and nothing else.
+#[test]
+fn a_skip_build_reports_the_tree_unchecked_without_a_completeness_claim() {
+    let td = workdir("skipreport");
+    let dir = skip_appdir(&td, "app");
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        summary_lines(&stderr),
+        [
+            "Source: unchecked; the tree stands as authored, no scan or \
+             dependency audit ran, and nothing here claims it complete",
+            "Not inferred: computed plugin paths, script subprocesses, \
+             application assets, kernel features and external services are \
+             not audited",
+        ],
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A host-scan build attributes its source: the summary says the scan
+/// came from this machine and that unresolved dependencies stay
+/// warnings, never a completeness claim.
+#[test]
+fn a_host_scan_build_attributes_its_source() {
+    let td = workdir("hostscanreport");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    if !cc_libm(&td.join("app.c"), &dir.join("bin/app")) {
+        let _ = std::fs::remove_dir_all(&td);
+        return; // no compiler: documented soft-skip
+    }
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"hostscan\"\ncommand = \"bin/app\"\nmtime = 0\n",
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        summary_lines(&stderr),
+        [
+            "Source: host scan; unresolved dependencies are warnings, \
+             not failures",
+            "Not inferred: computed plugin paths, script subprocesses, \
+             application assets, kernel features and external services are \
+             not audited",
+        ],
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A sysroot build attributes its selected source: the summary says the
+/// contents came from the package database and the closure was audited
+/// against it, with the bounded-inference limit under it.
+#[test]
+fn a_sysroot_build_attributes_its_selected_source() {
+    let td = workdir("sysrootreport");
+    let Some(fixture) = synthetic_sysroot(&td) else {
+        return;
+    };
+    let dir = td.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    sysroot_recipe(&dir, &fixture, "");
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let lines = summary_lines(&stderr);
+    assert!(
+        lines.contains(
+            &"Source: sysroot package database; the dependency closure was \
+              audited against the selected source"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        lines.contains(
+            &"Not inferred: computed plugin paths, script subprocesses, \
+              application assets, kernel features and external services are \
+              not audited"
+        ),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The summary is deterministic: two builds of one fixed fixture, in
+/// separate invocations and directories, render identical summary lines.
+#[test]
+fn the_build_summary_is_deterministic_across_builds() {
+    let build = |tag: &str| -> Vec<String> {
+        let td = workdir(tag);
+        let dir = skip_appdir(&td, "app");
+        let out = onelf_build(&dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        summary_lines(&stderr)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    let a = build("sumdet-a");
+    let b = build("sumdet-b");
+    assert!(!a.is_empty(), "no summary lines in the build output");
+    assert_eq!(a, b, "{a:?} vs {b:?}");
+}
+
 /// A recipe environment naming a loader search path is refused in both
 /// development forms before anything launches, with the supported
 /// alternatives named, while every other recipe setting still applies.

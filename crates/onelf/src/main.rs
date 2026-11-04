@@ -1092,7 +1092,9 @@ fn main() {
 ///
 /// The request carries the resolved selection table, so the record the
 /// pack lowers and the selections the assembly audited answer the same
-/// resolution of the recipe's lists.
+/// resolution of the recipe's lists. The staging report prints to stderr
+/// as the assembly summary: where the AppDir contents came from and what
+/// the assembly did not audit.
 fn run_build(
     path: &std::path::Path,
     output_override: Option<&std::path::Path>,
@@ -1100,7 +1102,10 @@ fn run_build(
     let recipe_path = recipe::resolve(path)?;
     let recipe = recipe::load(&recipe_path)?;
     let request = assembly::AssemblyRequest::plan(&recipe_path, recipe, output_override)?;
-    let _report = request.stage()?;
+    let report = request.stage()?;
+    for line in report.summary_lines() {
+        eprintln!("{line}");
+    }
     let update_key = request.update.read_key()?;
     let runtime = assembly::embed_runtime(&request)?;
     pack::require_store_runtime(&runtime.note, fetches_over_https(&request))?;
