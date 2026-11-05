@@ -1384,9 +1384,21 @@ fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) 
     let libdir = td.join("dist/usr/lib");
     std::fs::create_dir_all(&libdir).unwrap();
     for soname in sonames {
+        // libasound names its plugin and configuration directories the
+        // way a distribution's build does, so inference sees them too.
+        let compiled = if *soname == "libasound.so.2" {
+            let usr = td.canonicalize().unwrap().join("dist/usr");
+            format!(
+                "const char *alsa_dirs[] = {{\"{}\", \"{}\"}};\n",
+                usr.join("lib/alsa-lib").display(),
+                usr.join("share/alsa").display()
+            )
+        } else {
+            String::new()
+        };
         write(
             &td.join("dist/framework.c"),
-            "int framework(void){return 1;}\n",
+            &format!("{compiled}int framework(void){{return 1;}}\n"),
         );
         if !cc_with(
             &[
@@ -26257,8 +26269,9 @@ fn a_skipped_tree_carries_its_local_mappings_unchecked() {
 
 /// A host scan reports the directories a library compiles in against the
 /// library's own installation prefix, and a re-run over the tree that
-/// now holds the library's copy reports the same directories against the
-/// same prefixes. The re-run keeps the tree's copies, since a repair
+/// now holds the library's copy reports the same directories, from the
+/// same sources below the same prefixes, the copies the first run made
+/// now held by the tree. The re-run keeps the tree's copies, since a repair
 /// answers only from declared sources, and a copy whose host file is
 /// still reachable, here through `LD_LIBRARY_PATH`, stands for it.
 #[test]
@@ -26312,8 +26325,12 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(out.status.success(), "{err}");
         err.lines()
-            .filter(|l| l.contains("inference does not carry it"))
-            .map(str::to_string)
+            .filter(|l| l.starts_with("  - "))
+            .filter_map(|l| {
+                let (object, rest) = l.split_once(": ")?;
+                let (_, origin) = rest.split_once("; inferred from ")?;
+                Some(format!("{object}: {origin}"))
+            })
             .collect()
     };
     let first = reported();
@@ -26323,10 +26340,761 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
     let demo: Vec<&String> = first.iter().filter(|l| l.contains("libdemo")).collect();
     assert_eq!(demo.len(), 1, "{first:?}");
     assert!(
-        demo[0].contains(&format!(
-            "{}: unchecked: compiled in by libdemo.so.1",
-            prefix.join("share/demo").display()
-        )) && demo[0].contains(&format!("below the prefix {};", prefix.display())),
+        demo[0].starts_with("  - share/demo: ")
+            && demo[0].contains(&format!(
+                "{} below the prefix {},",
+                prefix.join("share/demo").display(),
+                prefix.display()
+            )),
         "{first:?}"
+    );
+}
+
+/// Minimal ELF bytes of another machine, enough for collection to refuse
+/// them for their architecture.
+fn foreign_object() -> Vec<u8> {
+    let mut v = vec![0u8; 64];
+    v[0..4].copy_from_slice(b"\x7fELF");
+    v[4] = 2;
+    v[5] = 1;
+    v[6] = 1;
+    v[16..18].copy_from_slice(&3u16.to_le_bytes());
+    let machine: u16 = if cfg!(target_arch = "aarch64") {
+        62
+    } else {
+        183
+    };
+    v[18..20].copy_from_slice(&machine.to_le_bytes());
+    v
+}
+
+/// A framework nobody described, installed in a scratch prefix. Its
+/// library compiles in two plugin directories and two data directories.
+/// One plugin directory holds a module that needs a library of the
+/// prefix and compiles in a third data directory, a module built for
+/// another machine, and the scripts and manifests that go with them, the
+/// way Perl's does. The other holds a backend named `*.so.N`. Returns
+/// the prefix and an AppDir whose program links the library, or None
+/// without a compiler.
+fn examplefw_sources(td: &Path) -> Option<(PathBuf, PathBuf)> {
+    let prefix = td.join("dist/usr");
+    let plugins = prefix.join("lib/examplefw/plugins");
+    let backends = prefix.join("lib/examplefw/backends");
+    std::fs::create_dir_all(plugins.join("nested")).unwrap();
+    std::fs::create_dir_all(&backends).unwrap();
+    write(&prefix.join("share/examplefw/conf.d/a.conf"), "conf\n");
+    write(&prefix.join("share/examplefw-extra/b.conf"), "extra\n");
+    write(&prefix.join("share/probefw/c.conf"), "probe\n");
+    write(&plugins.join("Probe.pm"), "package Probe;\n1;\n");
+    write(&plugins.join("nested/probe.conf"), "module probe\n");
+    write_bytes(&plugins.join("foreign.so"), &foreign_object());
+    let library = |name: &str, source: &str, out: &Path, extra: &[&str]| -> bool {
+        let src = td.join(format!("{name}.c"));
+        write(&src, source);
+        let mut args = vec!["-shared", "-fPIC", src.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        cc_with(&args, out)
+    };
+    let compiled = |dirs: &[&str]| -> String {
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("\"{}\"", prefix.join(d).display()))
+            .collect();
+        format!("const char *dirs[] = {{{}}};\n", names.join(", "))
+    };
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    let ok = library(
+        "dep",
+        "int dep_value(void){return 4;}\n",
+        &prefix.join("lib/libdep.so.1"),
+        &["-Wl,-soname,libdep.so.1"],
+    ) && library(
+        "examplefw",
+        &format!(
+            "{}int framework(void){{return 1;}}\n",
+            compiled(&[
+                "lib/examplefw/plugins",
+                "lib/examplefw/backends",
+                "share/examplefw",
+                "share/examplefw-extra",
+            ])
+        ),
+        &prefix.join("lib/libexamplefw.so.1"),
+        &["-Wl,-soname,libexamplefw.so.1"],
+    ) && library(
+        "probe",
+        &format!(
+            "{}int dep_value(void);\nint plugin_probe(void){{return dep_value();}}\n",
+            compiled(&["share/probefw"])
+        ),
+        &plugins.join("nested/probe.so"),
+        &[&lib_dir, "-Wl,--no-as-needed", "-l:libdep.so.1"],
+    ) && library(
+        "backend",
+        "int backend_value(void){return 5;}\n",
+        &backends.join("backend.so.1"),
+        &[],
+    );
+    if !ok {
+        return None;
+    }
+    write(
+        &td.join("main.c"),
+        "int framework(void);\nint main(void){return framework()-1;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libexamplefw.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return None;
+    }
+    Some((prefix, app))
+}
+
+/// The completeness findings an assembly printed.
+fn findings_block(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("Completeness findings ("))
+        .take_while(|l| l.starts_with("Completeness findings (") || l.starts_with("  - "))
+        .collect()
+}
+
+/// Build the descriptor-free framework fixture below `td`, returning the
+/// AppDir and the build's output, or None without a compiler.
+fn build_examplefw(td: &Path) -> Option<(PathBuf, std::process::Output)> {
+    let (prefix, app) = examplefw_sources(td)?;
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let mut c = Command::new(onelf());
+    c.arg("build")
+        .current_dir(&app)
+        .env("SOURCE_DATE_EPOCH", "1700000000");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf build");
+    Some((app, out))
+}
+
+/// A framework without a descriptor has its compiled-in data
+/// directories collected whole and recorded in the generated ledger,
+/// while its plugin directories are reported and not carried. Every
+/// directory is reported with the library that compiles it in, and
+/// building the same inputs again from scratch produces the same
+/// package bytes.
+#[test]
+fn a_descriptor_free_framework_has_its_directories_collected() {
+    let base = workdir("examplefw");
+    let td = base.canonicalize().unwrap().join("tree");
+    let Some((app, out)) = build_examplefw(&td) else {
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    for file in [
+        "share/examplefw/conf.d/a.conf",
+        "share/examplefw-extra/b.conf",
+    ] {
+        assert!(app.join(file).is_file(), "{file}: {err}");
+    }
+    assert!(!app.join("lib/examplefw/plugins").exists());
+    let ledger = std::fs::read_to_string(app.join(".onelf/generated")).unwrap();
+    for file in [
+        "share/examplefw/conf.d/a.conf",
+        "share/examplefw-extra/b.conf",
+    ] {
+        assert!(ledger.contains(file), "{file} is recorded as generated");
+    }
+    let findings = findings_block(&err);
+    for (dir, outcome) in [
+        ("share/examplefw", "selected: data directory"),
+        ("share/examplefw-extra", "selected: data directory"),
+        (
+            "lib/examplefw/plugins",
+            "optional omission: omitted because the bundle does not carry inferred plugin directories",
+        ),
+        (
+            "lib/examplefw/backends",
+            "optional omission: omitted because the bundle does not carry inferred plugin directories",
+        ),
+    ] {
+        assert!(
+            findings
+                .iter()
+                .any(|l| l.contains(&format!("{dir}: {outcome}"))
+                    && l.contains("compiled in by libexamplefw.so.1")),
+            "{dir}: {findings:#?}"
+        );
+    }
+
+    let first = std::fs::read(app.join("examplefw.onelf")).unwrap();
+    std::fs::remove_dir_all(&td).unwrap();
+    let (app, out) = build_examplefw(&td).expect("the compiler stays available");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let second = std::fs::read(app.join("examplefw.onelf")).unwrap();
+    assert!(
+        first == second,
+        "a build of the same inputs is byte-identical ({} vs {} bytes)",
+        first.len(),
+        second.len()
+    );
+}
+
+/// A sysroot build infers from the sysroot's own objects and carries
+/// only what the build admitted: the framework's data directory comes
+/// from the sysroot, never from the packer's machine.
+#[test]
+fn a_sysroot_build_collects_inferred_directories_from_the_sysroot() {
+    let td = workdir("examplefw-sysroot");
+    let rootfs = td.join("rootfs");
+    for d in [
+        "usr/bin",
+        "usr/lib/examplefw/plugins",
+        "usr/share/examplefw",
+    ] {
+        std::fs::create_dir_all(rootfs.join(d)).unwrap();
+    }
+    write(&rootfs.join("usr/share/examplefw/a.conf"), "conf\n");
+    write(
+        &td.join("examplefw.c"),
+        "const char *dirs[] = {\"/usr/lib/examplefw/plugins\", \"/usr/share/examplefw\"};\n\
+         int framework(void){return 1;}\n",
+    );
+    write(&td.join("probe.c"), "int plugin_probe(void){return 2;}\n");
+    write(
+        &td.join("main.c"),
+        "int framework(void);\nint main(void){return framework()-1;}\n",
+    );
+    let lib_dir = format!("-L{}", rootfs.join("usr/lib").display());
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libexamplefw.so.1",
+            td.join("examplefw.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libexamplefw.so.1"),
+    ) || !cc_with(
+        &["-shared", "-fPIC", td.join("probe.c").to_str().unwrap()],
+        &rootfs.join("usr/lib/examplefw/plugins/probe.so"),
+    ) || !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libexamplefw.so.1",
+        ],
+        &rootfs.join("usr/bin/app"),
+    ) {
+        return;
+    }
+    let (Some(host_libc), Some(host_ld)) = (
+        ldd_path(&rootfs.join("usr/bin/app"), "libc.so.6"),
+        ldd_path(&rootfs.join("usr/bin/app"), "ld-linux"),
+    ) else {
+        return;
+    };
+    std::fs::copy(&host_libc, rootfs.join("usr/lib/libc.so.6")).unwrap();
+    std::fs::copy(&host_ld, rootfs.join("usr/lib/ld-linux-x86-64.so.2")).unwrap();
+    write_pacman_entry(
+        &rootfs,
+        "glibc",
+        "2.99-1",
+        &[],
+        &[],
+        &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "examplefw",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &[
+            "usr/lib/libexamplefw.so.1",
+            "usr/lib/examplefw/plugins/probe.so",
+            "usr/share/examplefw/a.conf",
+        ],
+    );
+    write_pacman_entry(
+        &rootfs,
+        "app",
+        "1.0-1",
+        &["glibc", "examplefw"],
+        &[],
+        &["usr/bin/app"],
+    );
+    let archive = td.join("root.tar");
+    let st = Command::new("tar")
+        .args(["--create", "--file"])
+        .arg(&archive)
+        .args(["--sort=name", "--owner=0", "--group=0", "-C"])
+        .arg(&rootfs)
+        .arg(".")
+        .status()
+        .expect("spawn tar");
+    assert!(st.success());
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\n",
+            archive.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("share/examplefw/a.conf")).unwrap(),
+        "conf\n"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/examplefw: selected: data directory")
+                && l.contains("sysroot/usr/share/examplefw below the prefix")),
+        "the data comes from the sysroot: {findings:#?}"
+    );
+}
+
+/// A descriptor that declares a directory inference also finds keeps
+/// its members allowlist: only the listed member is collected, and
+/// inference does not collect the directory a second time.
+#[test]
+fn a_descriptors_members_allowlist_limits_an_inferred_directory() {
+    let td = workdir("examplefw-rule");
+    let td = td.canonicalize().unwrap();
+    let Some((prefix, app)) = examplefw_sources(&td) else {
+        return;
+    };
+    write(&td.join("other.c"), "int other_probe(void){return 3;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("other.c").to_str().unwrap()],
+        &prefix.join("lib/examplefw/plugins/other.so"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("rules/examplefw.toml"),
+        "schema = 1\nid = \"examplefw\"\n\n[[triggers]]\nsoname-prefix = \"libexamplefw.so\"\n\n\
+         [[resources.plugins]]\nid = \"plugins\"\nkind = \"directory\"\n\
+         destination = \"lib/examplefw/plugins\"\nrequirement = \"optional\"\n\
+         candidates = [{ base = \"library-dir\", path = \"examplefw/plugins\" }]\n\
+         members = [\"other.so\"]\n",
+    );
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\nrules = [\"../rules/examplefw.toml\"]\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        app.join("lib/examplefw/plugins/other.so").is_file(),
+        "{err}"
+    );
+    assert!(
+        !app.join("lib/examplefw/plugins/nested/probe.so").exists(),
+        "only the listed member is collected: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        !findings
+            .iter()
+            .any(|l| l.contains("lib/examplefw/plugins") && l.contains("inferred from")),
+        "{findings:#?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/examplefw: selected: data directory")),
+        "the undescribed data directory is still inferred: {findings:#?}"
+    );
+}
+
+/// A descriptor's planned write inside a directory inference collects
+/// stands: the inferred carry is undone whole and omitted naming the
+/// clash, so the descriptor's bytes are what the tree holds.
+#[test]
+fn an_inferred_dir_omits_itself_rather_than_replace_a_descriptors_write() {
+    let td = workdir("infer-clash-inner");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/fw/sub/config"), "host\n");
+    write(&td.join("fp/share/fw/top.conf"), "host top\n");
+    write(&td.join("fp/opt/rulefw/config"), "authored\n");
+    let Some((app, lib_dirs)) = inferred_dirs_app(&td, &[("fp", "libfw.so.1", &["share/fw"])])
+    else {
+        return;
+    };
+    let paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|d| format!("\"{}\"", d.display()))
+        .collect();
+    write(
+        &td.join("rules/fw.toml"),
+        "schema = 1\nid = \"rulefw\"\n\n[[triggers]]\nsoname-prefix = \"libfw.so\"\n\n\
+         [[resources.data]]\nid = \"config\"\nkind = \"file\"\n\
+         destination = \"share/fw/sub/config\"\nrequirement = \"optional\"\n\
+         candidates = [{ base = \"installation-prefix\", path = \"opt/rulefw/config\" }]\n",
+    );
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"inferred\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [{}]\nrules = [\"../rules/fw.toml\"]\n",
+            paths.join(", ")
+        ),
+    );
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/fw/sub/config")).unwrap(),
+        "authored\n",
+        "the descriptor's write stands: {err}"
+    );
+    assert!(
+        !app.join("share/fw/top.conf").exists(),
+        "the inferred directory is omitted whole: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| {
+            l.contains("share/fw: optional omission")
+                && l.contains("collides with the write planned at share/fw/sub/config")
+        }),
+        "{findings:#?}"
+    );
+}
+
+/// A directory inference collects inside a directory a descriptor
+/// carries whole is omitted naming the clash: the descriptor's copy is
+/// planned around it, and its bytes are what the tree holds.
+#[test]
+fn an_inferred_dir_inside_a_descriptors_copy_is_omitted() {
+    let td = workdir("infer-clash-outer");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/fw/sub/host.conf"), "host\n");
+    write(&td.join("fp/opt/ruletree/rule.txt"), "authored\n");
+    let Some((app, lib_dirs)) = inferred_dirs_app(&td, &[("fp", "libfw.so.1", &["share/fw/sub"])])
+    else {
+        return;
+    };
+    let paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|d| format!("\"{}\"", d.display()))
+        .collect();
+    write(
+        &td.join("rules/fw.toml"),
+        "schema = 1\nid = \"rulefw\"\n\n[[triggers]]\nsoname-prefix = \"libfw.so\"\n\n\
+         [[resources.data]]\nid = \"tree\"\nkind = \"directory\"\n\
+         destination = \"share/fw\"\nrequirement = \"optional\"\n\
+         candidates = [{ base = \"installation-prefix\", path = \"opt/ruletree\" }]\n",
+    );
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"inferred\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [{}]\nrules = [\"../rules/fw.toml\"]\n",
+            paths.join(", ")
+        ),
+    );
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("share/fw/rule.txt")).unwrap(),
+        "authored\n",
+        "the descriptor's copy stands: {err}"
+    );
+    assert!(
+        !app.join("share/fw/sub").exists(),
+        "the inferred directory is omitted: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| {
+            l.contains("share/fw/sub: optional omission")
+                && l.contains("collides with the whole-directory copy planned at share/fw")
+        }),
+        "{findings:#?}"
+    );
+}
+
+/// A descriptor's own write inside the directory copy its descriptor
+/// plans stops the build, whichever group is declared first: two writes
+/// in one subtree would replace each other by declaration order, so the
+/// conflict is named instead of settled by luck.
+#[test]
+fn a_descriptors_write_inside_its_directory_copy_stops_the_build() {
+    for tag in ["tree-first", "override-first"] {
+        let td = workdir(&format!("desc-subtree-{tag}"));
+        let td = td.canonicalize().unwrap();
+        write(&td.join("fp/opt/ruletree/rule.txt"), "authored\n");
+        write(&td.join("fp/opt/rulefile/override.conf"), "override\n");
+        let Some((app, _)) = inferred_dirs_app(&td, &[("fp", "libfw.so.1", &["share/nothing"])])
+        else {
+            return;
+        };
+        let tree_group = "[[resources.data]]\nid = \"tree\"\nkind = \"directory\"\n\
+             destination = \"share/fw\"\nrequirement = \"optional\"\n\
+             candidates = [{ base = \"installation-prefix\", path = \"opt/ruletree\" }]\n";
+        let override_group = "[[resources.data]]\nid = \"override\"\nkind = \"file\"\n\
+             destination = \"share/fw/override.conf\"\nrequirement = \"optional\"\n\
+             candidates = [{ base = \"installation-prefix\", path = \"opt/rulefile/override.conf\" }]\n";
+        let (first, second) = if tag == "tree-first" {
+            (tree_group, override_group)
+        } else {
+            (override_group, tree_group)
+        };
+        write(
+            &td.join("rules/fw.toml"),
+            &format!(
+                "schema = 1\nid = \"rulefw\"\n\n[[triggers]]\nsoname-prefix = \"libfw.so\"\n\n\
+                 {first}{second}"
+            ),
+        );
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "[package]\nname = \"inferred\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+                 [bundle]\nsearch-paths = [\"{}\"]\nrules = [\"../rules/fw.toml\"]\n",
+                td.join("fp/lib").display()
+            ),
+        );
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "the clash stops the build: {err}");
+        assert!(
+            err.contains("share/fw: copies a whole directory there")
+                && err.contains("share/fw/override.conf"),
+            "{err}"
+        );
+        assert!(
+            !app.join("share/fw").exists(),
+            "nothing is written once planning fails: {err}"
+        );
+    }
+}
+
+/// An AppDir whose program links one library per prefix, each library
+/// compiling in the directories listed with it below its own prefix.
+/// Returns the AppDir and the libraries' directories, or None without a
+/// compiler.
+fn inferred_dirs_app(
+    td: &Path,
+    libraries: &[(&str, &str, &[&str])],
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let mut lib_dirs = Vec::new();
+    let mut args: Vec<String> = Vec::new();
+    for (prefix, soname, dirs) in libraries {
+        let prefix = td.join(prefix);
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| format!("\"{}\"", prefix.join(d).display()))
+            .collect();
+        let stem = soname.split('.').next().unwrap();
+        let src = td.join(format!("{stem}.c"));
+        write(
+            &src,
+            &format!(
+                "const char *{stem}_dirs[] = {{{}}};\nint {stem}_value(void){{return 0;}}\n",
+                names.join(", ")
+            ),
+        );
+        let out = prefix.join("lib").join(soname);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        if !cc_with(
+            &[
+                "-shared",
+                "-fPIC",
+                &format!("-Wl,-soname,{soname}"),
+                src.to_str().unwrap(),
+            ],
+            &out,
+        ) {
+            return None;
+        }
+        args.push(format!("-L{}", prefix.join("lib").display()));
+        args.push(format!("-l:{soname}"));
+        lib_dirs.push(prefix.join("lib"));
+    }
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let main = td.join("main.c").to_string_lossy().into_owned();
+    let mut refs: Vec<&str> = vec![&main];
+    refs.extend(args.iter().map(String::as_str));
+    if !cc_with(&refs, &app.join("bin/app")) {
+        return None;
+    }
+    let paths: Vec<String> = lib_dirs
+        .iter()
+        .map(|d| format!("\"{}\"", d.display()))
+        .collect();
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"inferred\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [{}]\n",
+            paths.join(", ")
+        ),
+    );
+    Some((app, lib_dirs))
+}
+
+/// A file the build may not read inside an inferred data directory
+/// omits that directory with the reason, and the build goes on. Root
+/// reads it regardless, so the check needs another user.
+#[test]
+fn an_unreadable_file_omits_its_inferred_directory_without_failing() {
+    use std::os::unix::fs::PermissionsExt;
+    if root_flavor() == Some(RootFlavor::AlreadyRoot) {
+        skip("non-root", "root reads a mode 000 file");
+        return;
+    }
+    let td = workdir("infer-unreadable");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/lockedfw/secret"), "secret\n");
+    write(&td.join("fp/share/openfw/a.conf"), "open\n");
+    let Some((app, _)) = inferred_dirs_app(
+        &td,
+        &[("fp", "libfw.so.1", &["share/lockedfw", "share/openfw"])],
+    ) else {
+        return;
+    };
+    let secret = td.join("fp/share/lockedfw/secret");
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = onelf_build(&app);
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(app.join("share/openfw/a.conf").is_file(), "{err}");
+    assert!(!app.join("share/lockedfw").exists(), "{err}");
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| l
+            .contains("share/lockedfw: optional omission: omitted because it cannot be carried")),
+        "{findings:#?}"
+    );
+}
+
+/// Two prefixes whose inferred directories nest at one destination are
+/// never both written: whichever sorts first is carried, and the other
+/// is omitted, the inner one naming the source it overlaps and the outer
+/// one naming the carried directory inside it.
+#[test]
+fn nested_inferred_directories_from_two_sources_are_never_mixed() {
+    for (outer, inner) in [("a", "b"), ("b", "a")] {
+        let td = workdir(&format!("infer-nested-{outer}"));
+        let td = td.canonicalize().unwrap();
+        write(&td.join(outer).join("share/foo/outer.conf"), "outer\n");
+        write(&td.join(inner).join("share/foo/sub/inner.conf"), "inner\n");
+        let Some((app, _)) = inferred_dirs_app(
+            &td,
+            &[
+                (outer, "libouter.so.1", &["share/foo"]),
+                (inner, "libinner.so.1", &["share/foo/sub"]),
+            ],
+        ) else {
+            return;
+        };
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{outer} first: {err}");
+        let findings = findings_block(&err);
+        let omitted: Vec<&&str> = findings
+            .iter()
+            .filter(|l| l.contains("optional omission: omitted because"))
+            .collect();
+        assert_eq!(omitted.len(), 1, "{outer} first: {findings:#?}");
+        if outer == "a" {
+            assert!(
+                omitted[0].contains("overlaps it at"),
+                "{outer} first: {findings:#?}"
+            );
+        } else {
+            assert!(
+                omitted[0].contains("share/foo/sub inside it is carried already"),
+                "{outer} first: {findings:#?}"
+            );
+        }
+        let outer_carried = app.join("share/foo/outer.conf").is_file();
+        let inner_carried = app.join("share/foo/sub/inner.conf").is_file();
+        assert!(
+            outer_carried != inner_carried,
+            "{outer} first: exactly one source is carried: {findings:#?}"
+        );
+        assert_eq!(
+            outer_carried,
+            outer == "a",
+            "{outer} first: the source that sorts first is carried"
+        );
+    }
+}
+
+/// An inferred destination that passes through a symlinked AppDir path
+/// is omitted with the link named, and the build goes on: the plan's
+/// refusal is undone instead of stopping the build over a directory
+/// that was optional all along.
+#[test]
+fn an_inferred_dir_through_a_symlinked_appdir_path_is_omitted_without_failing() {
+    let td = workdir("infer-symlink");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/lockedfw/a.conf"), "conf\n");
+    write(&td.join("gp/lib/twowfw/b.conf"), "two\n");
+    let Some((app, _)) = inferred_dirs_app(
+        &td,
+        &[
+            ("fp", "libfw.so.1", &["share/lockedfw"]),
+            ("gp", "libgw.so.1", &["lib/twowfw"]),
+        ],
+    ) else {
+        return;
+    };
+    std::fs::create_dir_all(app.join("usr/share")).unwrap();
+    std::os::unix::fs::symlink("usr/share", app.join("share")).unwrap();
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(app.join("lib/twowfw/b.conf").is_file(), "{err}");
+    assert!(!app.join("usr/share/lockedfw").exists(), "{err}");
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| {
+            l.contains("share/lockedfw: optional omission")
+                && l.contains("passes through the symlink share")
+        }),
+        "{findings:#?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("lib/twowfw: selected: data directory")),
+        "{findings:#?}"
     );
 }

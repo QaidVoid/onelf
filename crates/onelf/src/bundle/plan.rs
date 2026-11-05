@@ -31,7 +31,7 @@ use super::sysroot::{
 
 /// The largest tree walk admits, so a hostile or pathological source
 /// tree answers with a bounded error instead of an unbounded walk.
-const TREE_WALK_LIMIT: usize = 100_000;
+pub(crate) const TREE_WALK_LIMIT: usize = 100_000;
 
 /// The deepest tree walk descends, for the same bound.
 const TREE_WALK_DEPTH: usize = 64;
@@ -125,6 +125,17 @@ pub(crate) enum PlanFinding {
         /// The destination planned inside it.
         under: PathBuf,
     },
+    /// A whole-directory copy and another planned write share one
+    /// subtree, so one of the two would replace the other.
+    SubtreeClash {
+        /// The destination planned as a whole directory copy.
+        dir: PathBuf,
+        /// The other planned destination, inside it or around it.
+        other: PathBuf,
+        /// The one of the two destinations the plan already holds, so
+        /// the clause names the write that stands.
+        planned: PathBuf,
+    },
     /// The destination exists with different content and nothing
     /// authorizes replacing it.
     PublisherCollision {
@@ -181,6 +192,7 @@ impl PlanFinding {
             | PlanFinding::Escape { dest, .. }
             | PlanFinding::ThroughLink { dest, .. } => dest,
             PlanFinding::Overlap { file, .. } => file,
+            PlanFinding::SubtreeClash { dir, .. } => dir,
             PlanFinding::SourceChanged { source, .. } => source,
             PlanFinding::Generated(finding) => Path::new(&finding.path),
         }
@@ -193,11 +205,50 @@ impl PlanFinding {
             PlanFinding::ConflictingContent { .. } => 0,
             PlanFinding::KindClash { .. } => 1,
             PlanFinding::Overlap { .. } => 2,
-            PlanFinding::PublisherCollision { .. } => 3,
-            PlanFinding::Escape { .. } => 4,
-            PlanFinding::SourceChanged { .. } => 5,
-            PlanFinding::ThroughLink { .. } => 6,
-            PlanFinding::Generated(_) => 7,
+            PlanFinding::SubtreeClash { .. } => 3,
+            PlanFinding::PublisherCollision { .. } => 4,
+            PlanFinding::Escape { .. } => 5,
+            PlanFinding::SourceChanged { .. } => 6,
+            PlanFinding::ThroughLink { .. } => 7,
+            PlanFinding::Generated(_) => 8,
+        }
+    }
+
+    /// The short clause naming what the finding objects to, read after
+    /// "it", for an optional write the plan refuses that is omitted and
+    /// reported instead of stopping the build.
+    pub(crate) fn clause(&self) -> String {
+        match self {
+            PlanFinding::ConflictingContent { dest, .. } | PlanFinding::KindClash { dest, .. } => {
+                format!("collides with another write at {}", dest.display())
+            }
+            PlanFinding::PublisherCollision { dest, .. } => {
+                format!("collides with what the tree holds at {}", dest.display())
+            }
+            PlanFinding::Overlap { file, .. } => {
+                format!("would nest inside the file {}", file.display())
+            }
+            PlanFinding::SubtreeClash { dir, planned, .. } if planned == dir => {
+                format!(
+                    "collides with the whole-directory copy planned at {}",
+                    dir.display()
+                )
+            }
+            PlanFinding::SubtreeClash { planned, .. } => {
+                format!("collides with the write planned at {}", planned.display())
+            }
+            PlanFinding::Escape { dest, .. } => {
+                format!("reaches outside the tree at {}", dest.display())
+            }
+            PlanFinding::SourceChanged { source, .. } => {
+                format!("{} changed while it was being read", source.display())
+            }
+            PlanFinding::ThroughLink { link, .. } => {
+                format!("passes through the symlink {}", link.display())
+            }
+            PlanFinding::Generated(finding) => {
+                format!("collides with generated output at {}", finding.path)
+            }
         }
     }
 }
@@ -239,6 +290,14 @@ impl std::fmt::Display for PlanFinding {
                  of the two destinations has to go",
                 file.display(),
                 under.display()
+            ),
+            PlanFinding::SubtreeClash { dir, other, .. } => write!(
+                f,
+                "{}: copies a whole directory there, and another resource writes {} in the \
+                 same subtree; one of the two writes would replace the other, so give one \
+                 of them a different destination or drop it",
+                dir.display(),
+                other.display()
             ),
             PlanFinding::PublisherCollision {
                 dest,
@@ -456,6 +515,12 @@ pub(crate) fn symlinked_ancestor(appdir: &Path, rel: &Path) -> Option<PathBuf> {
     None
 }
 
+/// What [`DestinationPlan::checkpoint`] keeps to return to.
+pub(crate) struct Checkpoint {
+    entries: BTreeMap<PathBuf, PlannedDest>,
+    findings: usize,
+}
+
 impl DestinationPlan {
     /// Start a plan for the AppDir at `appdir`, reading its generated
     /// ledger so planned destinations can be judged against what the
@@ -664,6 +729,9 @@ impl DestinationPlan {
             self.record_clash(rel, &prev, origin, kind, planned);
             return Ok(Admission::Rejected);
         }
+        if !self.check_subtree(rel, kind) {
+            return Ok(Admission::Rejected);
+        }
         let dest = self.appdir.join(rel);
         let decision = match fs::symlink_metadata(&dest) {
             Err(_) => Admission::Write,
@@ -725,6 +793,30 @@ impl DestinationPlan {
     /// Whether any finding stands.
     pub(crate) fn has_findings(&self) -> bool {
         !self.findings.is_empty()
+    }
+
+    /// A point the plan can return to, for a write that is optional
+    /// and must be admitted whole or not at all.
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            entries: self.entries.clone(),
+            findings: self.findings.len(),
+        }
+    }
+
+    /// Whether a finding was recorded since `checkpoint`.
+    pub(crate) fn found_since(&self, checkpoint: &Checkpoint) -> bool {
+        self.findings.len() > checkpoint.findings
+    }
+
+    /// Return to `checkpoint`: every destination admitted since is
+    /// forgotten, and the findings recorded since are taken out and
+    /// returned, so an optional write the plan refused names why
+    /// without stopping the build.
+    pub(crate) fn restore(&mut self, checkpoint: Checkpoint) -> Vec<PlanFinding> {
+        self.entries = checkpoint.entries;
+        self.findings
+            .split_off(checkpoint.findings.min(self.findings.len()))
     }
 
     /// The bounded error a failed plan stops the build with, before
@@ -795,7 +887,7 @@ impl DestinationPlan {
             self.record_clash(rel, &prev, origin, kind, hash);
             return Ok(Admission::Rejected);
         }
-        if !self.check_nesting(rel, kind) {
+        if !self.check_subtree(rel, kind) {
             return Ok(Admission::Rejected);
         }
         let dest = self.appdir.join(rel);
@@ -885,39 +977,56 @@ impl DestinationPlan {
         }
     }
 
-    /// Whether `rel` can hold a `kind` destination beside what the
-    /// plan already holds: no file-like destination may sit inside
-    /// another file destination, and a directory takes anything.
-    fn check_nesting(&mut self, rel: &Path, kind: PlannedKind) -> bool {
-        if kind == PlannedKind::Dir {
-            return true;
-        }
+    /// Whether `rel`'s subtree is free of other planned writes, for
+    /// every admission path. A whole-directory copy replaces whatever
+    /// is planned inside it and is replaced by a planned write inside
+    /// it, so both directions are findings whichever resource came
+    /// first, and a planned file above cannot hold the write at all.
+    /// A write planned inside a file destination is one too, since a
+    /// file holds nothing.
+    fn check_subtree(&mut self, rel: &Path, kind: PlannedKind) -> bool {
         for ancestor in rel.ancestors().skip(1) {
-            if let Some(prev) = self.entries.get(ancestor)
-                && prev.kind != PlannedKind::Dir
-            {
-                self.findings.push(PlanFinding::Overlap {
-                    file: ancestor.to_path_buf(),
-                    under: rel.to_path_buf(),
-                });
-                return false;
+            match self.entries.get(ancestor) {
+                Some(prev) if prev.kind == PlannedKind::Dir => {
+                    self.findings.push(PlanFinding::SubtreeClash {
+                        dir: ancestor.to_path_buf(),
+                        other: rel.to_path_buf(),
+                        planned: ancestor.to_path_buf(),
+                    });
+                    return false;
+                }
+                Some(_) => {
+                    self.findings.push(PlanFinding::Overlap {
+                        file: ancestor.to_path_buf(),
+                        under: rel.to_path_buf(),
+                    });
+                    return false;
+                }
+                None => {}
             }
         }
-        let rel_buf = rel.to_path_buf();
         let under = self
             .entries
             .range((
-                std::ops::Bound::Excluded(rel_buf.clone()),
+                std::ops::Bound::Excluded(rel.to_path_buf()),
                 std::ops::Bound::Unbounded,
             ))
             .map(|(k, _)| k.clone())
-            .take_while(|k| k.starts_with(&rel_buf))
+            .take_while(|k| k.starts_with(rel))
             .next();
         if let Some(under) = under {
-            self.findings.push(PlanFinding::Overlap {
-                file: rel.to_path_buf(),
-                under,
-            });
+            if kind == PlannedKind::Dir {
+                self.findings.push(PlanFinding::SubtreeClash {
+                    dir: rel.to_path_buf(),
+                    other: under.clone(),
+                    planned: under,
+                });
+            } else {
+                self.findings.push(PlanFinding::Overlap {
+                    file: rel.to_path_buf(),
+                    under,
+                });
+            }
             return false;
         }
         true
@@ -1307,6 +1416,106 @@ mod tests {
             .unwrap();
         assert_eq!(judged, Admission::Skip);
         assert!(!plan.has_findings());
+    }
+
+    /// A whole-directory copy refuses another planned write inside its
+    /// subtree and under a planned directory around it, a planned file
+    /// cannot hold a carried destination at all, and a planned file or
+    /// link cannot sit inside a planned directory copy. Each finding
+    /// names both destinations.
+    #[test]
+    fn a_whole_directory_copy_refuses_writes_inside_and_around_it() {
+        let (dir, mut plan) = seeded("subtree-inner");
+        fs::create_dir_all(dir.join("fw/sub")).unwrap();
+        fs::create_dir_all(dir.join("host")).unwrap();
+        fs::write(dir.join("fw/sub/config"), b"one").unwrap();
+        fs::write(dir.join("host/tree.conf"), b"two").unwrap();
+        let planned = plan
+            .admit_carried(
+                Path::new("share/fw/sub/config"),
+                &dir.join("fw/sub/config"),
+                "rule",
+            )
+            .unwrap();
+        assert_eq!(planned, Admission::Write);
+        let rejected = plan
+            .admit_carried(Path::new("share/fw"), &dir.join("host"), "inferred")
+            .unwrap();
+        assert_eq!(rejected, Admission::Rejected);
+        let text = plan.error().to_string();
+        assert!(text.contains("share/fw"), "{text}");
+        assert!(text.contains("share/fw/sub/config"), "{text}");
+
+        let (dir, mut plan) = seeded("subtree-outer");
+        fs::create_dir_all(dir.join("fw")).unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("fw/rule.conf"), b"one").unwrap();
+        fs::write(dir.join("sub/host.conf"), b"two").unwrap();
+        let planned = plan
+            .admit_carried(Path::new("share/fw"), &dir.join("fw"), "rule")
+            .unwrap();
+        assert_eq!(planned, Admission::Write);
+        let rejected = plan
+            .admit_carried(Path::new("share/fw/sub"), &dir.join("sub"), "inferred")
+            .unwrap();
+        assert_eq!(rejected, Admission::Rejected);
+        assert!(plan.has_findings());
+
+        let (_dir, mut plan) = seeded("subtree-file");
+        let hash = file_hash(b"file");
+        let planned = plan.admit_file(Path::new("share/fw"), hash, "rule", Existing::SkipOnAny);
+        assert_eq!(planned.unwrap(), Admission::Write);
+        let rejected = plan
+            .admit_link(
+                Path::new("share/fw/sub/alias"),
+                "elsewhere",
+                "carry",
+                Existing::SkipOnAny,
+            )
+            .unwrap();
+        assert_eq!(rejected, Admission::Rejected);
+        let text = plan.error().to_string();
+        assert!(text.contains("share/fw"), "{text}");
+        assert!(text.contains("planned as a file"), "{text}");
+
+        let (dir, mut plan) = seeded("subtree-file-under-dir");
+        fs::create_dir_all(dir.join("fw")).unwrap();
+        fs::write(dir.join("fw/rule.conf"), b"one").unwrap();
+        let planned = plan
+            .admit_carried(Path::new("share/fw"), &dir.join("fw"), "rule")
+            .unwrap();
+        assert_eq!(planned, Admission::Write);
+        let rejected = plan
+            .admit_file(
+                Path::new("share/fw/override.conf"),
+                file_hash(b"two"),
+                "pin",
+                Existing::SkipOnAny,
+            )
+            .unwrap();
+        assert_eq!(rejected, Admission::Rejected);
+        let text = plan.error().to_string();
+        assert!(text.contains("share/fw"), "{text}");
+        assert!(text.contains("share/fw/override.conf"), "{text}");
+
+        let (dir, mut plan) = seeded("subtree-link-under-dir");
+        fs::create_dir_all(dir.join("fw")).unwrap();
+        let planned = plan
+            .admit_carried(Path::new("share/fw"), &dir.join("fw"), "rule")
+            .unwrap();
+        assert_eq!(planned, Admission::Write);
+        let rejected = plan
+            .admit_link(
+                Path::new("share/fw/alias"),
+                "elsewhere",
+                "pin",
+                Existing::SkipOnAny,
+            )
+            .unwrap();
+        assert_eq!(rejected, Admission::Rejected);
+        let text = plan.error().to_string();
+        assert!(text.contains("share/fw"), "{text}");
+        assert!(text.contains("share/fw/alias"), "{text}");
     }
 
     /// The aggregate tree hash binds file names to bytes, so two trees

@@ -20,10 +20,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use onelf_format::rules::{RelativePath, Requirement, ResourceGroup};
 
+use super::plan::TREE_WALK_LIMIT;
 use super::{
     AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, discover_group, is_nix_stub_ld,
     miss_text, read_elf_class, read_elf_machine, resolve_within,
@@ -34,8 +36,9 @@ use crate::bundle::sysroot::SysrootUniverse;
 /// this is a hostile or pathological source, not completeness.
 const MAX_GROUP_MEMBERS: usize = 4096;
 
-/// The deepest one found directory is walked for members.
-const MAX_GROUP_DEPTH: usize = 16;
+/// The deepest one found directory is walked for members, so a
+/// hostile or pathological tree cannot recurse without end.
+pub(crate) const MAX_GROUP_DEPTH: usize = 16;
 
 /// The most unavailable locations one report names, so a wide
 /// declaration cannot flood the build log.
@@ -220,6 +223,21 @@ fn members(
     hit: &CandidateHit,
     sysroot: Option<&SysrootUniverse>,
 ) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut out = Vec::new();
+    visit_members(hit, sysroot, &mut |rel, path| {
+        out.push((rel, path));
+        ControlFlow::Continue(())
+    })?;
+    Ok(out)
+}
+
+/// Visit the files [`members`] lists, in the same order, until `visit`
+/// breaks, so a question one member answers stops the walk there.
+pub(crate) fn visit_members(
+    hit: &CandidateHit,
+    sysroot: Option<&SysrootUniverse>,
+    visit: &mut dyn FnMut(PathBuf, PathBuf) -> ControlFlow<()>,
+) -> io::Result<()> {
     if let Some(universe) = sysroot {
         let dir_rel = hit
             .resolved
@@ -238,36 +256,48 @@ fn members(
         // Each admitted member, a link among them, resolves inside the
         // sysroot, never through an absolute link onto the packer's
         // machine.
-        return Ok(universe
-            .admitted_under(&dir_rel)
-            .into_iter()
-            .filter_map(|f| {
-                let rel = PathBuf::from(&f)
-                    .strip_prefix(&dir_rel)
-                    .unwrap_or(Path::new(&f))
-                    .to_path_buf();
-                let path = onelf_sysroot::path::in_root(universe.root(), Path::new(&f)).ok()?;
-                Some((rel, path))
-            })
-            .collect());
+        for f in universe.admitted_under(&dir_rel) {
+            let rel = PathBuf::from(&f)
+                .strip_prefix(&dir_rel)
+                .unwrap_or(Path::new(&f))
+                .to_path_buf();
+            let Ok(path) = onelf_sysroot::path::in_root(universe.root(), Path::new(&f)) else {
+                continue;
+            };
+            if visit(rel, path).is_break() {
+                break;
+            }
+        }
+        return Ok(());
     }
-    let mut out = Vec::new();
-    walk_members(&hit.root, &hit.resolved, Path::new(""), 0, &mut out)?;
-    Ok(out)
+    let mut visited = 0usize;
+    walk_members(
+        &hit.root,
+        &hit.resolved,
+        Path::new(""),
+        0,
+        &mut visited,
+        visit,
+    )
+    .map(|_| ())
 }
 
-/// The regular-file members under `dir`, as pairs of the path relative
-/// to the group directory and the file to read. A symlinked member, an
-/// ALSA module alias say, is followed with every landing confined to
-/// `root`, the admitted root the group was found under, so the alias
-/// is collected under its own name and a link leaving the root is not.
+/// Visit the regular-file members under `dir` as pairs of the path
+/// relative to the group directory and the file to read, until `visit`
+/// breaks. A symlinked member, an ALSA module alias say, is followed
+/// with every landing confined to `root`, the admitted root the group
+/// was found under, so the alias is collected under its own name and a
+/// link leaving the root is not. The walk admits no more entries than
+/// the tree walk limit, counting directories and links with files, and
+/// stops with the bound named before reading past it.
 fn walk_members(
     root: &Path,
     dir: &Path,
     rel: &Path,
     depth: usize,
-    out: &mut Vec<(PathBuf, PathBuf)>,
-) -> io::Result<()> {
+    visited: &mut usize,
+    visit: &mut dyn FnMut(PathBuf, PathBuf) -> ControlFlow<()>,
+) -> io::Result<ControlFlow<()>> {
     if depth > MAX_GROUP_DEPTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -277,25 +307,43 @@ fn walk_members(
             ),
         ));
     }
-    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries: Vec<fs::DirEntry> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        *visited += 1;
+        if *visited > TREE_WALK_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: more than {TREE_WALK_LIMIT} entries, past the walk limit",
+                    dir.display()
+                ),
+            ));
+        }
+        entries.push(entry?);
+    }
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let child_rel = rel.join(entry.file_name());
         let child = dir.join(entry.file_name());
         let kind = entry.file_type()?;
-        if kind.is_dir() {
-            walk_members(root, &child, &child_rel, depth + 1, out)?;
+        let flow = if kind.is_dir() {
+            walk_members(root, &child, &child_rel, depth + 1, visited, visit)?
         } else if kind.is_file() {
-            out.push((child_rel, child));
+            visit(child_rel, child)
         } else if kind.is_symlink()
             && let Ok(inside) = child.strip_prefix(root)
             && let Ok(target) = resolve_within(root, inside)
             && target.is_file()
         {
-            out.push((child_rel, target));
+            visit(child_rel, target)
+        } else {
+            ControlFlow::Continue(())
+        };
+        if flow.is_break() {
+            return Ok(flow);
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 /// Whether a member is an ELF object the bundle can load: the same

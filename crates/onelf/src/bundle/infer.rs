@@ -66,20 +66,24 @@
 //! names the bound, since that is a hostile or pathological input rather
 //! than a framework.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fs;
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
 
 use goblin::elf::program_header::{PF_W, PT_LOAD};
 use onelf_format::catalog;
-use onelf_format::rules::{ExclusionBase, ExclusionEntry, is_multiarch};
+use onelf_format::rules::{
+    Descriptor, ExclusionBase, ExclusionEntry, ResourceKind, SourceBase, is_multiarch,
+};
 use onelf_sysroot::path::in_root;
 
+use super::collect::visit_members;
 use super::datadirs::path_like;
 use super::{
-    Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, is_excluded, libc_family_of_soname,
-    object_prefix, resolve_within,
+    CandidateHit, Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, format_size,
+    is_excluded, libc_family_of_soname, object_prefix, read_elf_class, resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -95,6 +99,16 @@ pub(crate) const MAX_OBJECT_RESOLUTIONS: usize = 65536;
 /// The most distinct directories one build may infer.
 pub(crate) const MAX_INFERRED_DIRS: usize = 256;
 
+/// What an inferred directory holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferredKind {
+    /// ELF objects, directly or in nested directories: a plugin
+    /// directory.
+    Plugins,
+    /// Anything else, carried whole.
+    Data,
+}
+
 /// One directory the bundled objects compile in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InferredDir {
@@ -107,12 +121,39 @@ pub(crate) struct InferredDir {
     pub prefix: PathBuf,
     /// The canonical path relative to the prefix.
     pub rel: PathBuf,
+    /// Where the bundle carries it, relative to the bundle root: below
+    /// the bundle's library directory for a directory below a library
+    /// directory of the prefix, else at its path relative to the prefix,
+    /// with `usr` taken off under a `/` prefix. The least prefix and
+    /// path pair among the objects that named the directory wins, so
+    /// this follows that pair until the directory is handed out.
+    pub destination: PathBuf,
+    /// What the directory holds, classified under the winning prefix.
+    pub kind: InferredKind,
+    /// The bytes a data directory's files hold, read when it is
+    /// classified. A plugin directory's are counted when it is collected.
+    pub size: u64,
     /// Every compiled-in path that names the directory, sorted. Several
     /// spellings reach one directory through links.
     pub compiled: BTreeSet<String>,
     /// The names of the objects that compile it in, sorted: a library's
     /// soname or a program's file name.
     pub objects: BTreeSet<String>,
+}
+
+impl InferredDir {
+    /// The directory as a found source alternative, confined to its
+    /// prefix, for the collection the descriptors' groups go through.
+    pub(crate) fn hit(&self) -> CandidateHit {
+        CandidateHit {
+            candidate: 0,
+            kind: ResourceKind::Directory,
+            source: self.source.clone(),
+            resolved: self.source.clone(),
+            root: self.prefix.clone(),
+            destination: self.destination.clone(),
+        }
+    }
 }
 
 /// What discovery reads objects against.
@@ -130,6 +171,14 @@ pub(crate) struct Scope<'a> {
     /// its library directory or `share`, so `libdecor` drops
     /// `lib/libdecor/plugins-1` while `libx` leaves `libx32` alone.
     pub exclude: &'a [String],
+    /// The descriptors whose locations inference leaves alone: every
+    /// built-in, a disabled one included, and the enabled local rules. A
+    /// directory one of them declares, or one overlapping it, is left to
+    /// it, whose members, requirement and hooks decide what is carried
+    /// there, and disabling a built-in keeps inference out too.
+    pub descriptors: &'a [&'a Descriptor],
+    /// The bundle's library directory, relative to its root.
+    pub lib_dir: &'a Path,
 }
 
 /// One bundled object discovery reads.
@@ -146,61 +195,276 @@ pub(crate) struct Object<'a> {
     pub twin: Option<PathBuf>,
 }
 
-/// The directories `objects` compile in, sorted by source, read against
-/// `scope`.
-pub(crate) fn discover(objects: &[Object], scope: &Scope) -> io::Result<Vec<InferredDir>> {
-    let exclude: Vec<&str> = scope.exclude.iter().map(String::as_str).collect();
-    let mut dirs: BTreeMap<PathBuf, InferredDir> = BTreeMap::new();
-    for object in objects {
-        let name = object.name;
-        for candidate in candidates_of(object, scope, &exclude)? {
-            if !dirs.contains_key(&candidate.source) && dirs.len() >= MAX_INFERRED_DIRS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{name} compiles in more directories than the {MAX_INFERRED_DIRS} one \
-                         build may infer (MAX_INFERRED_DIRS); refusing unbounded inference"
-                    ),
-                ));
-            }
-            let dir = dirs
-                .entry(candidate.source.clone())
-                .or_insert_with(|| InferredDir {
-                    source: candidate.source,
-                    prefix: candidate.prefix.clone(),
-                    rel: candidate.rel.clone(),
-                    compiled: BTreeSet::new(),
-                    objects: BTreeSet::new(),
-                });
-            if (&candidate.prefix, &candidate.rel) < (&dir.prefix, &dir.rel) {
-                dir.prefix = candidate.prefix;
-                dir.rel = candidate.rel;
-            }
-            dir.compiled.insert(candidate.compiled);
-            dir.objects.insert(name.to_string());
-        }
-    }
-    Ok(dirs.into_values().collect())
+/// The directories one build has inferred, across the rounds of the
+/// walk that each admit more objects.
+#[derive(Debug, Default)]
+pub(crate) struct Inference {
+    dirs: BTreeMap<PathBuf, InferredDir>,
+    /// The directories read has handed out, whose pair and
+    /// classification are settled because the caller may already carry
+    /// them.
+    handed: BTreeSet<PathBuf>,
+    /// The directories that could not be read, with the least prefix
+    /// and path pair the refusal was recorded under, so a smaller pair
+    /// is tried again and the omission is reported once.
+    refused: BTreeMap<PathBuf, Refusal>,
 }
 
-/// Record each directory as an unchecked finding naming the objects
-/// that compile it in and how, since the bundle does not carry it from
-/// inference.
-pub(crate) fn record(dirs: &[InferredDir]) {
-    for dir in dirs {
-        let objects: Vec<&str> = dir.objects.iter().map(String::as_str).collect();
-        let compiled: Vec<&str> = dir.compiled.iter().map(String::as_str).collect();
-        completeness::record(Finding::new(
-            dir.source.display().to_string(),
-            Outcome::Unchecked,
-            format!(
-                "compiled in by {} as {} below the prefix {}; inference does not carry it",
-                objects.join(", "),
-                compiled.join(", "),
-                dir.prefix.display()
-            ),
-        ));
+/// A directory classification refused: the directory as the failing
+/// pair names it, for the omission the call reports once it has seen
+/// every candidate, and the reason it names.
+#[derive(Debug)]
+struct Refusal {
+    dir: InferredDir,
+    why: String,
+}
+
+impl Inference {
+    /// Read `objects` against `scope` and return the sources of the
+    /// directories this call found first, sorted, each classified. A
+    /// directory found before gains the new spellings and objects and,
+    /// while it has not been handed out yet, the least prefix and path
+    /// pair with a classification read again under it. A directory
+    /// refused under one pair is tried again under a smaller one, and
+    /// its omission is reported once, under the least pair that failed.
+    pub(crate) fn read(&mut self, objects: &[Object], scope: &Scope) -> io::Result<Vec<PathBuf>> {
+        let exclude: Vec<&str> = scope.exclude.iter().map(String::as_str).collect();
+        let mut fresh = Vec::new();
+        let reported = self.refused.keys().cloned().collect::<BTreeSet<_>>();
+        for object in objects {
+            let name = object.name;
+            for candidate in candidates_of(object, scope, &exclude)? {
+                let at_limit = self.dirs.len() >= MAX_INFERRED_DIRS;
+                // The least prefix and path pair wins, so the
+                // classification and the report do not depend on which
+                // object named the directory first, and the
+                // classification is read again under the winning pair,
+                // since a member link resolves inside its prefix. A
+                // directory an earlier round handed out is carried
+                // already, so its pair and classification stay and the
+                // object only adds spellings.
+                match self.dirs.entry(candidate.source.clone()) {
+                    Entry::Occupied(mut held) => {
+                        let handed_out = self.handed.contains(&candidate.source);
+                        let dir = held.get_mut();
+                        let wins = !handed_out
+                            && (&candidate.prefix, &candidate.rel) < (&dir.prefix, &dir.rel);
+                        if wins {
+                            dir.prefix = candidate.prefix.clone();
+                            dir.rel = candidate.rel.clone();
+                            dir.destination = candidate.destination.clone();
+                        }
+                        dir.compiled.insert(candidate.compiled.clone());
+                        dir.objects.insert(name.to_string());
+                        if !wins {
+                            continue;
+                        }
+                        match classify(held.get(), scope.sysroot) {
+                            Ok((kind, size)) => {
+                                let dir = held.get_mut();
+                                dir.kind = kind;
+                                dir.size = size;
+                            }
+                            Err(error) => {
+                                let (_, dir) = held.remove_entry();
+                                self.refused.insert(
+                                    candidate.source.clone(),
+                                    Refusal {
+                                        dir,
+                                        why: format!("it cannot be read: {error}"),
+                                    },
+                                );
+                                fresh.retain(|source| source != &candidate.source);
+                            }
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        match self.refused.entry(candidate.source.clone()) {
+                            Entry::Occupied(mut failed) => {
+                                let dir = &mut failed.get_mut().dir;
+                                dir.compiled.insert(candidate.compiled.clone());
+                                dir.objects.insert(name.to_string());
+                                if (&candidate.prefix, &candidate.rel) >= (&dir.prefix, &dir.rel) {
+                                    continue;
+                                }
+                                // The smaller pair may classify where the
+                                // recorded one failed. The spellings stay
+                                // with the directory either way.
+                                dir.prefix = candidate.prefix.clone();
+                                dir.rel = candidate.rel.clone();
+                                dir.destination = candidate.destination.clone();
+                                match classify(dir, scope.sysroot) {
+                                    Ok((kind, size)) => {
+                                        if at_limit {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                format!(
+                                                    "{name} compiles in more directories than the \
+                                                     {MAX_INFERRED_DIRS} one build may infer \
+                                                     (MAX_INFERRED_DIRS); refusing unbounded inference"
+                                                ),
+                                            ));
+                                        }
+                                        let refusal = failed.get_mut();
+                                        refusal.dir.kind = kind;
+                                        refusal.dir.size = size;
+                                        let (_, refusal) = failed.remove_entry();
+                                        fresh.push(candidate.source.clone());
+                                        slot.insert(refusal.dir);
+                                    }
+                                    Err(error) => {
+                                        failed.get_mut().why =
+                                            format!("it cannot be read: {error}");
+                                    }
+                                }
+                            }
+                            Entry::Vacant(unread) => {
+                                if at_limit {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "{name} compiles in more directories than the \
+                                             {MAX_INFERRED_DIRS} one build may infer \
+                                             (MAX_INFERRED_DIRS); refusing unbounded inference"
+                                        ),
+                                    ));
+                                }
+                                let mut dir = InferredDir {
+                                    source: candidate.source.clone(),
+                                    prefix: candidate.prefix.clone(),
+                                    rel: candidate.rel.clone(),
+                                    destination: candidate.destination.clone(),
+                                    kind: InferredKind::Data,
+                                    size: 0,
+                                    compiled: BTreeSet::from([candidate.compiled.clone()]),
+                                    objects: BTreeSet::from([name.to_string()]),
+                                };
+                                match classify(&dir, scope.sysroot) {
+                                    Ok((kind, size)) => {
+                                        dir.kind = kind;
+                                        dir.size = size;
+                                        fresh.push(candidate.source.clone());
+                                        slot.insert(dir);
+                                    }
+                                    Err(error) => {
+                                        unread.insert(Refusal {
+                                            dir,
+                                            why: format!("it cannot be read: {error}"),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fresh.sort();
+        self.handed.extend(fresh.iter().cloned());
+        for (source, refusal) in &self.refused {
+            if !reported.contains(source) {
+                omit(&refusal.dir, &refusal.why);
+            }
+        }
+        Ok(fresh)
     }
+
+    /// The directory inferred at `source`.
+    pub(crate) fn get(&self, source: &Path) -> Option<&InferredDir> {
+        self.dirs.get(source)
+    }
+}
+
+/// Whether `dir` holds an ELF object anywhere below it, whatever its
+/// name, read the way a plugin group's members are: a sysroot build's
+/// admitted files alone, a host directory's files with each link confined
+/// to the prefix. The walk stops at the first object, so a data
+/// directory is the only one read whole, and its size comes with it,
+/// counting regular files the way the copy does, which carries a link as
+/// a link. A host directory past the tree walk limit is an error, so it
+/// is omitted as too large rather than read without bound; a sysroot
+/// walk is bounded by the files the build admitted.
+fn classify(
+    dir: &InferredDir,
+    sysroot: Option<&SysrootUniverse>,
+) -> io::Result<(InferredKind, u64)> {
+    let mut size = 0u64;
+    let mut objects = false;
+    let hit = dir.hit();
+    visit_members(&hit, sysroot, &mut |rel, file| {
+        if read_elf_class(&file).is_some() {
+            objects = true;
+            return ControlFlow::Break(());
+        }
+        if file == hit.resolved.join(&rel) {
+            size += fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(if objects {
+        (InferredKind::Plugins, 0)
+    } else {
+        (InferredKind::Data, size)
+    })
+}
+
+/// Record that `dir` is omitted, and why. An inferred directory is
+/// optional, so nothing about it fails the build.
+pub(crate) fn omit(dir: &InferredDir, why: &str) {
+    completeness::record(Finding::new(
+        dir.destination.display().to_string(),
+        Outcome::OptionalOmission,
+        format!("omitted because {why}; {}", origin(dir)),
+    ));
+}
+
+/// Where an inferred directory came from, as its findings name it.
+fn origin(dir: &InferredDir) -> String {
+    let objects: Vec<&str> = dir.objects.iter().map(String::as_str).collect();
+    let compiled: Vec<&str> = dir.compiled.iter().map(String::as_str).collect();
+    format!(
+        "inferred from {} below the prefix {}, compiled in by {} as {}",
+        dir.source.display(),
+        dir.prefix.display(),
+        objects.join(", "),
+        compiled.join(", ")
+    )
+}
+
+/// What the bundle carried of one inferred directory.
+pub(crate) enum Carried<'a> {
+    /// The directory, whole.
+    Data,
+    /// Nothing, since the tree already holds its destination.
+    Held,
+    /// Nothing of its own, since the inferred destination named here
+    /// already holds it, copied from the same place.
+    Within(&'a Path),
+}
+
+/// Record the finding for one inferred directory: what it holds, its
+/// size, how the bundle carries it and where it came from. The compiled-in
+/// paths that name it are not redirected to the bundle's copy yet, and
+/// the finding says so.
+pub(crate) fn report(dir: &InferredDir, carried: Carried) {
+    let kind = match dir.kind {
+        InferredKind::Plugins => "plugin directory",
+        InferredKind::Data => "data directory",
+    };
+    let how = match carried {
+        Carried::Data => "carried".to_string(),
+        Carried::Held => "held by the tree's own copy".to_string(),
+        Carried::Within(outer) => format!("carried within {}", outer.display()),
+    };
+    completeness::record(Finding::new(
+        dir.destination.display().to_string(),
+        Outcome::Selected,
+        format!(
+            "{kind}, {}, {how}, not redirected yet; {}",
+            format_size(dir.size),
+            origin(dir)
+        ),
+    ));
 }
 
 /// One compiled-in path of one object that names a directory below a
@@ -211,6 +475,7 @@ struct Candidate {
     source: PathBuf,
     prefix: PathBuf,
     rel: PathBuf,
+    destination: PathBuf,
 }
 
 /// The candidates the object at `path` compiles in, in file order. An
@@ -304,8 +569,14 @@ fn candidates_of(object: &Object, scope: &Scope, exclude: &[&str]) -> io::Result
         let Ok(rel) = source.strip_prefix(&prefix) else {
             continue;
         };
+        let declared_rel = declared
+            .strip_prefix(&prefix)
+            .ok()
+            .map(|rel| merged(rel, under_root));
         if !in_resource_base(rel, under_root)
             || dropped(merged(rel, under_root), own_rel.as_deref(), exclude)
+            || described(merged(rel, under_root), scope.descriptors)
+            || declared_rel.is_some_and(|rel| described(rel, scope.descriptors))
         {
             continue;
         }
@@ -317,11 +588,13 @@ fn candidates_of(object: &Object, scope: &Scope, exclude: &[&str]) -> io::Result
                 continue;
             }
         }
+        let destination = destination_of(merged(rel, under_root), scope.lib_dir);
         let rel = rel.to_path_buf();
         out.push(Candidate {
             compiled: compiled.to_string(),
             prefix: prefix.clone(),
             rel,
+            destination,
             source,
         });
     }
@@ -368,6 +641,49 @@ fn dropped(rel: &Path, own: Option<&Path>, exclude: &[&str]) -> bool {
             .chain(&exclusions.libc)
             .chain(&exclusions.drivers)
             .any(owned)
+}
+
+/// Whether a descriptor declares a location that equals, contains or
+/// lies below `rel`, relative to the prefix in its merged spelling. A
+/// library-directory candidate of a descriptor names its path below the
+/// innermost library directory `rel` lies in. The test is conservative
+/// on purpose: it compares paths relative to the prefix, not the
+/// directories a descriptor's discovery would find, and it also keeps
+/// inference out of a parent of a declared directory, whose carry would
+/// bypass the descriptor's members, requirement and hooks.
+fn described(rel: &Path, descriptors: &[&Descriptor]) -> bool {
+    let library_dir = library_dir_of(rel);
+    descriptors
+        .iter()
+        .flat_map(|descriptor| {
+            let resources = &descriptor.resources;
+            resources
+                .plugins
+                .iter()
+                .chain(&resources.data)
+                .flat_map(|group| &group.candidates)
+                .chain(resources.helpers.iter().flat_map(|h| &h.candidates))
+        })
+        .any(|candidate| {
+            let declared = match candidate.base {
+                SourceBase::InstallationPrefix => PathBuf::from(candidate.path.as_str()),
+                SourceBase::LibraryDir => match &library_dir {
+                    Some(dir) => dir.join(candidate.path.as_str()),
+                    None => return false,
+                },
+            };
+            rel.starts_with(&declared) || declared.starts_with(rel)
+        })
+}
+
+/// Where the bundle carries a directory at `rel`, relative to the prefix
+/// in its merged spelling: below `lib_dir` for one below a library
+/// directory, else at `rel`.
+fn destination_of(rel: &Path, lib_dir: &Path) -> PathBuf {
+    match library_dir_of(rel).and_then(|dir| rel.strip_prefix(dir).ok().map(Path::to_path_buf)) {
+        Some(below) => lib_dir.join(below),
+        None => rel.to_path_buf(),
+    }
 }
 
 /// The bounded-reading error: which object stopped, and at which bound.
@@ -488,6 +804,8 @@ fn in_resource_base(rel: &Path, under_root: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::collect::MAX_GROUP_DEPTH;
+    use crate::bundle::plan::TREE_WALK_LIMIT;
     use crate::bundle::sysroot::fixture;
     use std::os::unix::fs::symlink;
 
@@ -682,6 +1000,13 @@ mod tests {
         }
     }
 
+    /// Every directory `objects` compile in, sorted by source.
+    fn discover(objects: &[Object], scope: &Scope) -> io::Result<Vec<InferredDir>> {
+        let mut inference = Inference::default();
+        inference.read(objects, scope)?;
+        Ok(inference.dirs.into_values().collect())
+    }
+
     fn run(
         objects: &[(String, PathBuf)],
         sysroot: Option<&SysrootUniverse>,
@@ -709,6 +1034,8 @@ mod tests {
                 sysroot,
                 trees,
                 exclude: &[],
+                descriptors: &[],
+                lib_dir: Path::new("lib"),
             },
         )
     }
@@ -879,6 +1206,214 @@ mod tests {
         let more = tree.object("usr/lib/libmore.so.1", &refs[MAX_INFERRED_DIRS..]);
         let error = run(&[lib, more], None).unwrap_err();
         assert!(error.to_string().contains("MAX_INFERRED_DIRS"), "{error}");
+    }
+
+    /// A data directory holding more entries than the tree walk admits
+    /// is not read without bound: its classification stops with the
+    /// bound named, and the directory is omitted rather than carried.
+    #[test]
+    fn a_directory_past_the_walk_limit_is_never_read_whole() {
+        let tree = Tree::new("classify-bound");
+        for i in 0..=TREE_WALK_LIMIT {
+            tree.file(&format!("usr/share/big/f{i:06}"), b"");
+        }
+        let dir = InferredDir {
+            source: tree.0.join("usr/share/big"),
+            prefix: tree.0.clone(),
+            rel: PathBuf::from("usr/share/big"),
+            destination: PathBuf::from("usr/share/big"),
+            kind: InferredKind::Data,
+            size: 0,
+            compiled: BTreeSet::from([tree.path("usr/share/big")]),
+            objects: BTreeSet::from(["libprobe.so".to_string()]),
+        };
+        let error = classify(&dir, None).unwrap_err();
+        assert!(error.to_string().contains("past the walk limit"), "{error}");
+    }
+
+    /// Two prefixes whose libraries name one directory agree on one
+    /// prefix, path and destination, whichever object was read first:
+    /// the least prefix and path pair wins, and its destination moves
+    /// with it.
+    #[test]
+    fn a_directory_named_from_two_prefixes_keeps_one_destination() {
+        let tree = Tree::new("two-prefixes");
+        tree.dir("p/share/sdk/share/fw");
+        let a = tree.object("p/lib/liba.so.1", &["p/share/sdk/share/fw"]);
+        let b = tree.object("p/share/sdk/lib/libb.so.1", &["p/share/sdk/share/fw"]);
+        let expected = InferredDir {
+            source: tree.0.join("p/share/sdk/share/fw"),
+            prefix: tree.0.join("p"),
+            rel: PathBuf::from("share/sdk/share/fw"),
+            destination: PathBuf::from("share/sdk/share/fw"),
+            kind: InferredKind::Data,
+            size: 0,
+            compiled: BTreeSet::from([tree.path("p/share/sdk/share/fw")]),
+            objects: BTreeSet::from(["liba.so.1".to_string(), "libb.so.1".to_string()]),
+        };
+        let dirs = run(&[a.clone(), b.clone()], None).unwrap();
+        assert_eq!(dirs.len(), 1, "{:?}", rels(&dirs));
+        assert_eq!(dirs[0].prefix, expected.prefix);
+        assert_eq!(dirs[0].destination, expected.destination);
+        let dirs = run(&[b, a], None).unwrap();
+        assert_eq!(dirs.len(), 1, "{:?}", rels(&dirs));
+        assert_eq!(dirs[0].prefix, expected.prefix, "the least prefix wins");
+        assert_eq!(
+            dirs[0].destination, expected.destination,
+            "the destination belongs to the winning prefix"
+        );
+    }
+
+    /// When a second object names a directory from a smaller prefix,
+    /// the classification is read again under the winning prefix: a
+    /// member link resolves inside it, so a directory that looked like
+    /// data under the inner prefix can be plugins. Both read orders
+    /// agree.
+    #[test]
+    fn a_directory_reclassified_under_the_winning_prefix() {
+        let tree = Tree::new("two-prefix-class");
+        tree.dir("p/share/sdk/share/fw");
+        tree.file("p/share/sdk/share/fw/conf", b"data");
+        tree.object("p/lib/plugin.so", &[]);
+        std::os::unix::fs::symlink(
+            "../../../../lib/plugin.so",
+            tree.0.join("p/share/sdk/share/fw/module.so"),
+        )
+        .unwrap();
+        let a = tree.object("p/lib/liba.so.1", &["p/share/sdk/share/fw"]);
+        let b = tree.object("p/share/sdk/lib/libb.so.1", &["p/share/sdk/share/fw"]);
+        for objects in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            let dirs = run(&objects, None).unwrap();
+            assert_eq!(dirs.len(), 1, "{:?}", rels(&dirs));
+            assert_eq!(dirs[0].prefix, tree.0.join("p"), "{:?}", rels(&dirs));
+            assert_eq!(dirs[0].destination, PathBuf::from("share/sdk/share/fw"));
+            assert_eq!(dirs[0].kind, InferredKind::Plugins, "{:?}", rels(&dirs));
+        }
+    }
+
+    /// A directory refused under one pair is tried again when a
+    /// smaller pair arrives, so the refusal is not final while the
+    /// winning prefix is still unknown. A directory holding a link to
+    /// an object only the outer prefix resolves, beside a branch
+    /// deeper than the group walk admits, is plugins under the outer
+    /// prefix in both read orders, though the inner prefix cannot
+    /// finish the walk.
+    #[test]
+    fn a_refused_directory_is_tried_again_under_a_smaller_pair() {
+        let tree = Tree::new("two-prefix-retry");
+        tree.dir("p/share/sdk/share/fw");
+        tree.file("p/share/sdk/share/fw/conf", b"data");
+        tree.object("p/lib/plugin.so", &[]);
+        std::os::unix::fs::symlink(
+            "../../../../lib/plugin.so",
+            tree.0.join("p/share/sdk/share/fw/0link"),
+        )
+        .unwrap();
+        let mut deep = tree.0.join("p/share/sdk/share/fw/zdeep");
+        for level in 0..=MAX_GROUP_DEPTH {
+            deep = deep.join(format!("d{level:02}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let a = tree.object("p/lib/liba.so.1", &["p/share/sdk/share/fw"]);
+        let b = tree.object("p/share/sdk/lib/libb.so.1", &["p/share/sdk/share/fw"]);
+        let expected = InferredDir {
+            source: tree.0.join("p/share/sdk/share/fw"),
+            prefix: tree.0.join("p"),
+            rel: PathBuf::from("share/sdk/share/fw"),
+            destination: PathBuf::from("share/sdk/share/fw"),
+            kind: InferredKind::Plugins,
+            size: 0,
+            compiled: BTreeSet::from([tree.path("p/share/sdk/share/fw")]),
+            objects: BTreeSet::from(["liba.so.1".to_string(), "libb.so.1".to_string()]),
+        };
+        for objects in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            let dirs = run(&objects, None).unwrap();
+            assert_eq!(dirs.len(), 1, "{:?}", rels(&dirs));
+            assert_eq!(dirs[0], expected, "{:?}", rels(&dirs));
+        }
+    }
+
+    /// A source already refused only gains spellings from a later
+    /// object, and that must not trip the directory limit: the limit
+    /// answers a newly admitted directory, not a refusal that stays
+    /// refused.
+    #[test]
+    fn a_refusal_gains_spellings_past_the_directory_limit() {
+        let tree = Tree::new("refusal-full");
+        let mut deep = tree.0.join("p/share/sdk/deepfw/zdeep");
+        for level in 0..=MAX_GROUP_DEPTH {
+            deep = deep.join(format!("d{level:02}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let r1 = tree.object("p/lib/libr1.so.1", &["p/share/sdk/deepfw"]);
+        let fill: Vec<String> = (0..MAX_INFERRED_DIRS)
+            .map(|i| format!("usr/share/fw{i}"))
+            .collect();
+        for dir in &fill {
+            tree.dir(dir);
+        }
+        let fill_refs: Vec<&str> = fill.iter().map(String::as_str).collect();
+        let many = tree.object("usr/lib/libmany.so.1", &fill_refs);
+        let r2 = tree.object("p/lib/libr2.so.1", &["p/share/sdk/deepfw"]);
+        let dirs = run(&[r1, many, r2], None).unwrap();
+        assert_eq!(dirs.len(), MAX_INFERRED_DIRS, "{:?}", rels(&dirs));
+        assert!(!rels(&dirs).iter().any(|rel| rel.contains("deepfw")));
+    }
+
+    /// A directory an earlier read handed out is carried already, so a
+    /// later object naming it from a smaller prefix only adds
+    /// spellings: the pair and the classification the build acted on
+    /// stay.
+    #[test]
+    fn a_directory_handed_out_keeps_its_pair_and_classification() {
+        let tree = Tree::new("two-prefix-handed");
+        tree.dir("p/share/sdk/share/fw");
+        tree.file("p/share/sdk/share/fw/conf", b"data");
+        tree.object("p/lib/plugin.so", &[]);
+        std::os::unix::fs::symlink(
+            "../../../../lib/plugin.so",
+            tree.0.join("p/share/sdk/share/fw/module.so"),
+        )
+        .unwrap();
+        let a = tree.object("p/lib/liba.so.1", &["p/share/sdk/share/fw"]);
+        let b = tree.object("p/share/sdk/lib/libb.so.1", &["p/share/sdk/share/fw"]);
+        let source = tree.0.join("p/share/sdk/share/fw");
+        let scope = Scope {
+            sysroot: None,
+            trees: &[],
+            exclude: &[],
+            descriptors: &[],
+            lib_dir: Path::new("lib"),
+        };
+        let mut inference = Inference::default();
+        let objects_b = [Object {
+            name: b.0.as_str(),
+            file: b.1.as_path(),
+            twin: None,
+        }];
+        let fresh = inference.read(&objects_b, &scope).unwrap();
+        assert_eq!(fresh.len(), 1, "{fresh:?}");
+        assert_eq!(fresh[0], source);
+        let carried = inference.get(&source).unwrap();
+        assert_eq!(carried.prefix, tree.0.join("p/share/sdk"));
+        assert_eq!(carried.destination, PathBuf::from("share/fw"));
+        assert_eq!(carried.kind, InferredKind::Data);
+
+        let objects_a = [Object {
+            name: a.0.as_str(),
+            file: a.1.as_path(),
+            twin: None,
+        }];
+        let fresh = inference.read(&objects_a, &scope).unwrap();
+        assert!(fresh.is_empty(), "the carried pair is not improved");
+        let carried = inference.get(&source).unwrap();
+        assert_eq!(carried.prefix, tree.0.join("p/share/sdk"));
+        assert_eq!(carried.destination, PathBuf::from("share/fw"));
+        assert_eq!(carried.kind, InferredKind::Data);
+        assert_eq!(
+            carried.objects.iter().collect::<Vec<_>>(),
+            ["liba.so.1", "libb.so.1"]
+        );
     }
 
     /// A path is a candidate only when it lies under the object's own
@@ -1129,6 +1664,8 @@ mod tests {
             sysroot: None,
             trees: &[],
             exclude,
+            descriptors: &[],
+            lib_dir: Path::new("lib"),
         };
         rels(&discover(&objects, &scope).unwrap())
     }
@@ -1350,6 +1887,65 @@ mod tests {
         let objects = [("tool".to_string(), app.join("usr/lib/tool/tool"))];
         let dirs = run_in(&objects, Some(&universe), &[&app]).unwrap();
         assert_eq!(rels(&dirs), ["lib/tool/plugins"]);
+    }
+
+    /// The omission findings this thread recorded for `destination`.
+    fn omissions(destination: &str) -> Vec<String> {
+        crate::bundle::completeness::report(&[]);
+        crate::bundle::completeness::take_reported()
+            .into_iter()
+            .filter(|f| f.object == destination && f.outcome == Outcome::OptionalOmission)
+            .map(|f| f.reason)
+            .collect()
+    }
+
+    /// A directory deeper than the member walk goes is omitted and
+    /// reported, not fatal, and the rest is still found.
+    #[test]
+    fn a_directory_too_deep_to_walk_is_omitted_without_failing() {
+        let tree = Tree::new("too-deep");
+        let deep = format!("usr/share/deepfw/{}", vec!["d"; 20].join("/"));
+        tree.file(&format!("{deep}/f"), b"f");
+        tree.dir("usr/share/examplefw");
+        let lib = tree.object(
+            "usr/lib/libexamplefw.so.1",
+            &["usr/share/deepfw", "usr/share/examplefw"],
+        );
+        omissions("");
+        assert_eq!(rels(&run(&[lib], None).unwrap()), ["share/examplefw"]);
+        let omitted = omissions("share/deepfw");
+        assert!(
+            omitted.len() == 1 && omitted[0].contains("cannot be read"),
+            "{omitted:?}"
+        );
+    }
+
+    /// A directory the build may not read is omitted and reported, not
+    /// fatal. Root reads it regardless, so the check needs another user.
+    #[test]
+    fn an_unreadable_directory_is_omitted_without_failing() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+            return;
+        }
+        let tree = Tree::new("unreadable");
+        tree.file("usr/share/lockedfw/sub/f", b"f");
+        tree.dir("usr/share/examplefw");
+        let lib = tree.object(
+            "usr/lib/libexamplefw.so.1",
+            &["usr/share/lockedfw", "usr/share/examplefw"],
+        );
+        let locked = tree.0.join("usr/share/lockedfw/sub");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        omissions("");
+        let dirs = run(&[lib], None);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rels(&dirs.unwrap()), ["share/examplefw"]);
+        let omitted = omissions("share/lockedfw");
+        assert!(
+            omitted.len() == 1 && omitted[0].contains("cannot be read"),
+            "{omitted:?}"
+        );
     }
 
     /// Discovery is a function of the inputs: objects read in another

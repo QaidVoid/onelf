@@ -915,7 +915,7 @@ fn carry_data_group(
         },
     )?;
     if let Some(hit) = outcome.found.first() {
-        return carry_hit(directory, rule, hit, hooks, sysroot, plan, actions, &origin);
+        return carry_hit(directory, rule, hit, hooks, sysroot, plan, actions, &origin).map(|_| ());
     }
     if directory.join(declared.destination.as_str()).exists() {
         if !hooks.is_empty() {
@@ -965,7 +965,7 @@ fn carry_hit(
     plan: &mut DestinationPlan,
     actions: &mut Vec<WalkAction>,
     origin: &str,
-) -> io::Result<()> {
+) -> io::Result<Carry> {
     let dest = directory.join(hit.destination.as_path());
     if dest.exists() {
         if !hooks.is_empty() {
@@ -974,31 +974,50 @@ fn carry_hit(
         if hit.kind == ResourceKind::File {
             plan.admit_carried(hit.destination.as_path(), &hit.resolved, origin)?;
         }
-        return Ok(());
+        return Ok(Carry::Held);
     }
     if let (Some(universe), ResourceKind::Directory) = (sysroot, hit.kind) {
         let members = admitted_members(universe, hit, plan, origin)?;
-        if !members.is_empty() {
-            actions.push(WalkAction::CarryData {
-                rule: rule.to_string(),
-                src: hit.resolved.clone(),
-                rel: hit.destination.clone(),
-                hooks,
-                members: Some(members),
-            });
+        if members.is_empty() {
+            return Ok(Carry::Empty);
         }
-        return Ok(());
-    }
-    if plan.admit_carried(hit.destination.as_path(), &hit.resolved, origin)? == Admission::Write {
         actions.push(WalkAction::CarryData {
             rule: rule.to_string(),
             src: hit.resolved.clone(),
             rel: hit.destination.clone(),
             hooks,
-            members: None,
+            members: Some(members),
         });
+        return Ok(Carry::Planned);
     }
-    Ok(())
+    match plan.admit_carried(hit.destination.as_path(), &hit.resolved, origin)? {
+        Admission::Write => {
+            actions.push(WalkAction::CarryData {
+                rule: rule.to_string(),
+                src: hit.resolved.clone(),
+                rel: hit.destination.clone(),
+                hooks,
+                members: None,
+            });
+            Ok(Carry::Planned)
+        }
+        Admission::Skip => Ok(Carry::Held),
+        Admission::Rejected => Ok(Carry::Rejected),
+    }
+}
+
+/// What carrying one found location planned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// A copy into the tree.
+    Planned,
+    /// Nothing, since the tree already holds the destination.
+    Held,
+    /// Nothing, since the destination clashes with another write, which
+    /// the plan records as a finding.
+    Rejected,
+    /// Nothing, since the build admitted nothing below the location.
+    Empty,
 }
 
 /// The walk's queues and plan, which collecting a plugin group feeds.
@@ -1097,6 +1116,123 @@ fn enqueue_collection(
         // repair that move implies.
         queue.already_processed.remove(&plugin.soname);
         queue.discovery.enqueue(&plugin.soname)?;
+    }
+    Ok(())
+}
+
+/// Collect one inferred directory, as the descriptors' data groups are:
+/// a data directory is carried whole into the generated ledger. A plugin
+/// directory is reported and not carried. Inferred directories are
+/// optional, so one the plan refuses, in whole or in part, is undone
+/// and omitted with the refusal's reason, without failing the build.
+///
+/// `carried` holds the destination, source and outcome of every carried
+/// directory. One inside a carried destination whose source lies at the
+/// same place inside that copy's source is already held by it when the
+/// copy is carried, or when the tree holds the child too; a child the
+/// tree does not hold is carried on its own. An outer one whose
+/// destination contains a carried one is omitted naming it, since its
+/// copy is planned already. Any other overlap with a carried destination
+/// comes from another source and is omitted naming both, so no two
+/// sources write into one place.
+fn collect_inferred(
+    dir: &infer::InferredDir,
+    carried: &mut Vec<(PathBuf, PathBuf, Carry)>,
+    opts: &BundleOptions,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    state: &mut WalkState,
+) -> io::Result<()> {
+    for (dest, source, carry) in carried.iter() {
+        let inner = dir.destination.strip_prefix(dest).ok();
+        let outer = dest.strip_prefix(&dir.destination).ok();
+        match (inner, outer) {
+            (Some(rel), _) if dir.source != source.join(rel) => {
+                infer::omit(
+                    dir,
+                    &format!("{} overlaps it at {}", source.display(), dest.display()),
+                );
+                return Ok(());
+            }
+            (Some(_), _) => {
+                if *carry == Carry::Planned {
+                    infer::report(dir, infer::Carried::Within(dest));
+                    return Ok(());
+                }
+                // A held parent stands for the child only while the
+                // tree holds the child too. A file there, or nothing,
+                // is answered by the carry below.
+                if opts.directory.join(&dir.destination).is_dir() {
+                    infer::report(dir, infer::Carried::Held);
+                    return Ok(());
+                }
+            }
+            (None, Some(_)) => {
+                infer::omit(
+                    dir,
+                    &format!("{} inside it is carried already", dest.display()),
+                );
+                return Ok(());
+            }
+            (None, None) => {}
+        }
+    }
+    let objects = dir.objects.iter().cloned().collect::<Vec<_>>().join(", ");
+    let origin = format!("inferred from {objects}");
+    if dir.kind == infer::InferredKind::Plugins {
+        infer::omit(dir, "the bundle does not carry inferred plugin directories");
+        return Ok(());
+    }
+    // The carry is all or nothing. A directory the plan admits only in
+    // part, or refuses outright, is undone, and the omission names the
+    // first refusal; a finding left behind would stop the build over a
+    // directory that was optional all along.
+    let checkpoint = state.plan.checkpoint();
+    let planned_actions = state.actions.len();
+    let carry = carry_hit(
+        &opts.directory,
+        &objects,
+        &dir.hit(),
+        Vec::new(),
+        sysroot,
+        state.plan,
+        state.actions,
+        &origin,
+    );
+    let carry = match carry {
+        Ok(carry) if !state.plan.found_since(&checkpoint) => carry,
+        otherwise => {
+            let rolled = state.plan.restore(checkpoint);
+            state.actions.truncate(planned_actions);
+            let why = match otherwise {
+                Err(error) => format!("it cannot be carried: {error}"),
+                Ok(_) => rolled
+                    .first()
+                    .map(|finding| format!("it {}", finding.clause()))
+                    .unwrap_or_else(|| "it collides with another write".to_string()),
+            };
+            infer::omit(dir, &why);
+            return Ok(());
+        }
+    };
+    match carry {
+        Carry::Planned => {
+            infer::report(dir, infer::Carried::Data);
+            carried.push((dir.destination.clone(), dir.source.clone(), carry));
+        }
+        Carry::Held => {
+            if opts.directory.join(&dir.destination).is_dir() {
+                infer::report(dir, infer::Carried::Held);
+                carried.push((dir.destination.clone(), dir.source.clone(), carry));
+            } else {
+                infer::omit(dir, "its destination is already in the tree");
+            }
+        }
+        Carry::Rejected => {
+            infer::omit(dir, "its destination clashes with another write");
+        }
+        Carry::Empty => {
+            infer::omit(dir, "the build admitted nothing below it");
+        }
     }
     Ok(())
 }
@@ -3100,6 +3236,65 @@ mod source_verdict_tests {
     }
 }
 
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use sysroot::fixture::{package, populate_universe};
+
+    /// A sysroot member the tree already holds with different content is
+    /// refused while its siblings go through, so a carry is planned
+    /// partly: the finding and the one admitted member. Collecting rolls
+    /// that back whole, so the refused member must be the only thing the
+    /// plan objects to and the sibling the only member it hands out.
+    #[test]
+    fn a_refused_sysroot_member_leaves_one_sibling_and_a_finding() {
+        let root = std::env::temp_dir().join(format!("onelf-carry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        let appdir = root.join("app");
+        fs::create_dir_all(sysroot.join("usr/share/examplefw")).unwrap();
+        fs::create_dir_all(appdir.join("share/examplefw")).unwrap();
+        fs::write(sysroot.join("usr/share/examplefw/a.conf"), "conf\n").unwrap();
+        fs::write(sysroot.join("usr/share/examplefw/b.conf"), "more\n").unwrap();
+        fs::write(appdir.join("share/examplefw/a.conf"), "authored\n").unwrap();
+        let packages = [package(
+            "examplefw",
+            &[
+                "usr/lib/libexamplefw.so.1",
+                "usr/share/examplefw/a.conf",
+                "usr/share/examplefw/b.conf",
+            ],
+        )];
+        let universe = populate_universe(&sysroot, &packages, "examplefw", &[], None, None);
+        let hit = CandidateHit {
+            candidate: 0,
+            kind: ResourceKind::Directory,
+            source: sysroot.join("usr/share/examplefw"),
+            resolved: sysroot.join("usr/share/examplefw"),
+            root: sysroot.clone(),
+            destination: PathBuf::from("share/examplefw"),
+        };
+        let mut plan = DestinationPlan::load(&appdir).unwrap();
+        let members = admitted_members(
+            &universe,
+            &hit,
+            &mut plan,
+            "inferred from libexamplefw.so.1",
+        )
+        .unwrap();
+        assert_eq!(
+            members,
+            vec![(
+                sysroot.join("usr/share/examplefw/b.conf"),
+                PathBuf::from("share/examplefw/b.conf"),
+            )],
+            "the refused member is not handed out, its sibling is"
+        );
+        assert!(plan.has_findings(), "the refusal leaves a finding");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 /// Bundle the shared libraries the tree's ELF files need into its
 /// library directory, rewrite the ELF files for the bundled layout,
 /// and record what the build generated.
@@ -4008,7 +4203,123 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         }
     }
 
-    while let Some(item) = discovery.pop() {
+    // The directories bundled objects compile in, found each time the
+    // queue drains over the objects admitted since, until a round finds
+    // nothing new: an inferred plugin group's members are objects too.
+    let mut inference = infer::Inference::default();
+    let mut inferred_read: HashSet<PathBuf> = HashSet::new();
+    let mut inferred_carried: Vec<(PathBuf, PathBuf, Carry)> = Vec::new();
+    let described: Vec<&Descriptor> = onelf_format::catalog::builtins()
+        .iter()
+        .chain(
+            opts.rules
+                .local()
+                .iter()
+                .filter(|rule| !opts.rules.disabled().contains(&rule.id)),
+        )
+        .collect();
+    let tree_files: Vec<(String, PathBuf)> = elf_files
+        .iter()
+        .filter_map(|file| Some((file.file_name()?.to_str()?.to_string(), real_path(file))))
+        .collect();
+    loop {
+        let Some(item) = discovery.pop() else {
+            // Every bundled object is read: the libraries the walk
+            // admitted and every other ELF file of the tree, programs
+            // among them, since a framework can keep its plugins beside
+            // its own binaries, as Xorg does in `lib/xorg/modules`. A host
+            // scan's tree copy of a library takes its prefix from the host
+            // file it stands for, which is where its compiled-in paths
+            // point. A rule's library was already looked up when it was
+            // admitted, so it keeps what that lookup found. The twin only
+            // places a prefix, so its libc family is not read.
+            let tree_roots: [&Path; 2] = [&tree_root, &opts.directory];
+            // The tree's relative spelling would claim every relative
+            // path, a sysroot's among them, so only absolute ones place
+            // a prefix below the source's root.
+            let prefix_trees: Vec<&Path> = tree_roots
+                .iter()
+                .copied()
+                .filter(|root| root.is_absolute())
+                .collect();
+            let twin_dirs = host_dirs(&search_paths, &tree_roots);
+            let twin_of = |name: &str, file: &Path, admitted_rule_copy: bool| {
+                let library = name.ends_with(".so") || name.contains(".so.");
+                let in_tree = tree_roots.iter().any(|root| file.starts_with(root));
+                if opts.sysroot.is_some() || !in_tree || !library || admitted_rule_copy {
+                    return None;
+                }
+                host_twin(
+                    name,
+                    &copied_from,
+                    &tree_roots,
+                    &twin_dirs,
+                    &ldconfig_cache,
+                    (target_class, target_machine, None),
+                    LookupScope::WithoutStore,
+                )
+            };
+            let mut objects: Vec<infer::Object> = Vec::new();
+            for lib in &admitted {
+                if !inferred_read.insert(lib.path().to_path_buf()) {
+                    continue;
+                }
+                let twin = match lib.provenance() {
+                    Some(host) => Some(host.to_path_buf()),
+                    None => twin_of(lib.soname(), lib.path(), discovery.triggers(lib.soname())),
+                };
+                objects.push(infer::Object {
+                    name: lib.soname(),
+                    file: lib.path(),
+                    twin,
+                });
+            }
+            for (name, path) in &tree_files {
+                if inferred_read.insert(path.clone()) {
+                    objects.push(infer::Object {
+                        name,
+                        file: path,
+                        twin: twin_of(name, path, false),
+                    });
+                }
+            }
+            let fresh = inference.read(
+                &objects,
+                &infer::Scope {
+                    sysroot: sysroot_universe.as_ref(),
+                    trees: &prefix_trees,
+                    exclude: &opts.exclude,
+                    descriptors: &described,
+                    lib_dir: &opts.lib_dir,
+                },
+            )?;
+            if fresh.is_empty() {
+                break;
+            }
+            for source in fresh {
+                let Some(dir) = inference.get(&source).cloned() else {
+                    continue;
+                };
+                collect_inferred(
+                    &dir,
+                    &mut inferred_carried,
+                    opts,
+                    sysroot_universe.as_ref(),
+                    &mut WalkState {
+                        already_processed: &mut already_processed,
+                        search_paths: &mut search_paths,
+                        repair_extra: &mut repair_extra,
+                        group_dests: &mut group_dests,
+                        group_sources: &mut group_sources,
+                        needed_by: &mut needed_by,
+                        discovery: &mut discovery,
+                        plan: &mut plan,
+                        actions: &mut actions,
+                    },
+                )?;
+            }
+            continue;
+        };
         // The activator hands a popped group out as an opaque key; the
         // activation report names the same rules and groups in the order
         // the queue was filled, so mirroring it identifies each popped
@@ -4544,68 +4855,6 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             ));
         }
     }
-
-    // Every bundled object is read: the libraries the walk admitted and
-    // every other ELF file of the tree, programs among them, since a
-    // framework can keep its plugins beside its own binaries, as Xorg
-    // does in `lib/xorg/modules`. A host scan's tree copy of a library
-    // takes its prefix from the host file it stands for, which is where
-    // its compiled-in paths point. A rule's library was already looked
-    // up when it was admitted, so it keeps what that lookup found. The
-    // twin only places a prefix, so its libc family is not read.
-    let tree_roots: [&Path; 2] = [&tree_root, &opts.directory];
-    let twin_dirs = host_dirs(&search_paths, &tree_roots);
-    let twin_of = |name: &str, file: &Path, admitted_rule_copy: bool| -> Option<PathBuf> {
-        let library = name.ends_with(".so") || name.contains(".so.");
-        let in_tree = tree_roots.iter().any(|root| file.starts_with(root));
-        if opts.sysroot.is_some() || !in_tree || !library || admitted_rule_copy {
-            return None;
-        }
-        host_twin(
-            name,
-            &copied_from,
-            &tree_roots,
-            &twin_dirs,
-            &ldconfig_cache,
-            (target_class, target_machine, None),
-            LookupScope::WithoutStore,
-        )
-    };
-    let tree_files: Vec<(&str, PathBuf)> = elf_files
-        .iter()
-        .filter_map(|file| Some((file.file_name()?.to_str()?, real_path(file))))
-        .collect();
-    let mut objects: Vec<infer::Object> = Vec::new();
-    let mut read: HashSet<&Path> = HashSet::new();
-    for lib in &admitted {
-        read.insert(lib.path());
-        let twin = match lib.provenance() {
-            Some(host) => Some(host.to_path_buf()),
-            None => twin_of(lib.soname(), lib.path(), discovery.triggers(lib.soname())),
-        };
-        objects.push(infer::Object {
-            name: lib.soname(),
-            file: lib.path(),
-            twin,
-        });
-    }
-    for (name, path) in &tree_files {
-        if read.insert(path) {
-            objects.push(infer::Object {
-                name,
-                file: path,
-                twin: twin_of(name, path, false),
-            });
-        }
-    }
-    infer::record(&infer::discover(
-        &objects,
-        &infer::Scope {
-            sysroot: sysroot_universe.as_ref(),
-            trees: &tree_roots,
-            exclude: &opts.exclude,
-        },
-    )?);
 
     // Activation has reached its fixed point: every soname the closure
     // encountered has been matched, and no group queues further work
