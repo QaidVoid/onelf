@@ -287,20 +287,50 @@ name, and every accepted byte string re-encodes byte-for-byte.
 
 Which records a runtime understands is advertised by a capability note
 in the runtime ELF's own prefix, in the `ONELF` note vendor namespace:
-a metadata schema version plus capability bits. Two bits are named.
+a metadata schema version plus capability bits. Three bits are named.
 `selection-view` is the per-entrypoint selection table: a runtime
 without it cannot scope a launch's set acquisition to the invoked
 entrypoint. `store-import` is the HTTPS fetch of pinned GL builds and
 sets, which only the update-capable runtime carries; a package that
 pins builds over `https://` needs it, while a `file://` pin runs on the
-slim runtime. Packaging checks the note of the runtime it is about to
-embed and refuses the pack when the recipe's records or pins need
-support the runtime does not advertise, rather than emitting a package
-whose selections could be ignored. `onelf info` and `--onelf-doctor`
+slim runtime. `anchors` is descriptor 77 on the package's anchor
+directory, which a package carrying `.onelf/anchors` needs. Packaging
+checks the note of the runtime it is about to embed and refuses the
+pack when the recipe's records or pins need support the runtime does
+not advertise, rather than emitting a package whose selections could
+be ignored. `onelf info` and `--onelf-doctor`
 print the carried records, the requirement, the advertisement and
 whether the two agree; see
 [Inspecting Packages](../guide/inspecting) and
 [Runtime Flags](./runtime-flags#diagnosis).
+
+## Anchor record
+
+A library built to open an absolute directory can have that string
+rewritten in its bundled copy to `/dev/fd/77/<key>`, padded with NUL
+bytes to the original length. `.onelf/anchors` names the bundle
+directory each key stands for, one `KEY<tab>RELATIVE` line per anchor,
+separated by `\n`, with no trailing newline. The directories are listed
+in byte order, each once, and the keys are `a` to `z`, then `aa`, `ab`
+and so on, in line order, so the same directories always give the same
+record. A directory follows the rules of `.onelf/paths`: relative,
+normalized, inside the package, and free of control characters. A
+record holds at most 1024 anchors in at most 256 KiB, and a reader
+refuses anything else as a whole. Packing also refuses an empty record,
+and one naming anything but a directory of the package reached without
+passing through one of its symlinks.
+
+Before the entrypoint runs, the runtime makes a directory of its own in
+the private runtime directory, links each key in it to the bundle
+directory, and leaves descriptor 77 open on it, without close-on-exec,
+in every mode that runs from a package tree. `/dev/fd/77` names the
+process's own descriptor, so another process or user cannot create or
+replace what an anchored path resolves to, and no namespace is needed.
+The application's children inherit the descriptor. A descriptor 77 the
+launch was started with is replaced, and a process that closes it, or a
+child started without it, finds nothing at the anchored paths. A package
+with anchors never runs from a memfd, which keeps no tree for them to
+name.
 
 ## Format compatibility
 

@@ -195,6 +195,12 @@ pub fn info(path: &Path) -> io::Result<()> {
     }
 
     println!("Entrypoints:");
+    // A package that anchors directories never runs from a memfd, which
+    // keeps no tree for them to name.
+    let anchored = (0..manifest.entries.len()).any(|i| {
+        manifest.entries[i].kind == EntryKind::File
+            && manifest.entry_path(i) == onelf_format::anchors::ANCHORS_FILE
+    });
     for (i, ep) in manifest.entrypoints.iter().enumerate() {
         let name = manifest.get_string(ep.name);
         let target_path = manifest.entry_path(ep.target_entry as usize);
@@ -204,7 +210,7 @@ pub fn info(path: &Path) -> io::Result<()> {
         } else {
             ""
         };
-        let memfd = if ep.is_memfd_eligible() {
+        let memfd = if ep.is_memfd_eligible() && !anchored {
             " [memfd]"
         } else {
             ""
@@ -435,17 +441,30 @@ pub(crate) fn capability_lines(
 ) -> io::Result<Vec<String>> {
     let rules = read_metadata_bytes(path, footer, manifest, RUNTIME_RULES_FILE)?;
     let sets = read_metadata_bytes(path, footer, manifest, ENTRYPOINT_SETS_FILE)?;
-    if rules.is_none() && sets.is_none() {
+    let anchors = read_metadata_bytes(path, footer, manifest, onelf_format::anchors::ANCHORS_FILE)?;
+    if rules.is_none() && sets.is_none() && anchors.is_none() {
         return Ok(Vec::new());
     }
     let sets_record = sets.as_deref().map(EntrypointSets::decode);
-    let mut required = elf::RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION);
+    let mut required = if rules.is_some() || sets.is_some() {
+        elf::RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION)
+    } else {
+        elf::RuntimeRequirements::NONE
+    };
     if let Some(Ok(record)) = &sets_record
         && !record.entrypoints.is_empty()
     {
         required.capabilities = required
             .capabilities
             .union(elf::RuntimeCapabilities::SELECTION_VIEW);
+    }
+    let anchor_record = anchors.as_deref().map(onelf_format::anchors::decode);
+    if let Some(Ok(record)) = &anchor_record
+        && !record.is_empty()
+    {
+        required.capabilities = required
+            .capabilities
+            .union(elf::RuntimeCapabilities::ANCHORS);
     }
 
     let mut carried: Vec<&str> = Vec::new();
@@ -455,12 +474,18 @@ pub(crate) fn capability_lines(
     if sets.is_some() {
         carried.push("entrypoint-sets");
     }
+    if anchors.is_some() {
+        carried.push("anchors");
+    }
     let mut lines = vec![
         format!("  Records:     {}", carried.join(", ")),
         format!("  Requires:    {}", requirements_text(&required)),
     ];
     if let Some(Err(why)) = &sets_record {
         lines.push(format!("  Selection table: unreadable: {why}"));
+    }
+    if let Some(Err(why)) = &anchor_record {
+        lines.push(format!("  Anchor record: unreadable: {why}"));
     }
     let mut file = File::open(path)?;
     let mut prefix = vec![0u8; footer.manifest_offset as usize];
@@ -481,12 +506,20 @@ pub(crate) fn capability_lines(
 /// The support `required` names, as one report line: the metadata
 /// schema version, then any named capability.
 fn requirements_text(required: &elf::RuntimeRequirements) -> String {
-    let mut text = format!("payload metadata version {}", required.metadata_version);
-    if !required.capabilities.is_empty() {
-        text.push_str(", ");
-        text.push_str(&required.capabilities.to_string());
+    let mut parts = Vec::new();
+    if required.metadata_version != 0 {
+        parts.push(format!(
+            "payload metadata version {}",
+            required.metadata_version
+        ));
     }
-    text
+    if !required.capabilities.is_empty() {
+        parts.push(required.capabilities.to_string());
+    }
+    if parts.is_empty() {
+        return "(none)".to_string();
+    }
+    parts.join(", ")
 }
 
 /// What a probed note advertises, as one report line.
@@ -641,4 +674,14 @@ fn read_package_info(
     let data = decompress_verified(&mut file, footer, &manifest.entries[idx], &codec)?;
     let text = String::from_utf8(data).unwrap_or_default();
     Ok(Some(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_requirement_reads_none() {
+        assert_eq!(requirements_text(&elf::RuntimeRequirements::NONE), "(none)");
+    }
 }

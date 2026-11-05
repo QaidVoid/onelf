@@ -19785,6 +19785,319 @@ fn a_bundled_powerpc_loader_is_scrubbed() {
     }
 }
 
+/// A tree carrying an anchor record whose `a` key stands for
+/// `share/fixture`, holding one file, and an entrypoint that reads it
+/// through `/dev/fd/77/a`: directly, from a child, after closing the
+/// descriptor, or by reporting where descriptor 77 points.
+fn anchored_tree(td: &Path) -> PathBuf {
+    let app = td.join("app");
+    write(&app.join("share/fixture/file"), "ANCHORED\n");
+    write(&app.join(".onelf/anchors"), "a\tshare/fixture");
+    write(
+        &app.join("bin/run"),
+        "#!/usr/bin/env bash\n\
+         case \"$1\" in\n\
+         read) cat /dev/fd/77/a/file ;;\n\
+         child) bash -c 'cat /dev/fd/77/a/file' ;;\n\
+         closed) exec 77<&-; cat /dev/fd/77/a/file 2>/dev/null || echo NOTHING ;;\n\
+         peek) cat /dev/fd/77/a/file 2>/dev/null || echo NOTHING ;;\n\
+         where) readlink /proc/self/fd/77; readlink /dev/fd/77/a ;;\n\
+         esac\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    app
+}
+
+/// Build the anchored tree at `app` as `anchored.onelf` beside it. The
+/// recipe also pairs a path, so every launch reads the package file again
+/// after the anchor is set up, and a descriptor of the runtime's lost to
+/// descriptor 77 shows.
+fn pack_anchored(app: &Path) -> std::process::Output {
+    let pkg = app.with_file_name("anchored.onelf");
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run\"\n\n[bundle]\nskip = true\n\n\
+         [paths]\n\"/usr/share/onelf-anchor-fixture\" = \"share/fixture\"\n",
+    );
+    Command::new(onelf())
+        .current_dir(app)
+        .args(["build", "onelf.toml", "-o", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf build")
+}
+
+/// An anchored directory resolves through descriptor 77 in every launch
+/// mode this machine has, a namespace or none: the entrypoint and its
+/// children read the bundled copy, the descriptor names a directory in the
+/// private runtime directory whose link names the package's own
+/// directory, and a process that closes it finds nothing. A descriptor 77
+/// the launch is started with is replaced, and a launch started with
+/// every lower descriptor open still gets its anchor, since the runtime
+/// keeps 77 from its own descriptors.
+#[test]
+fn an_anchored_directory_resolves_in_every_launch_mode() {
+    if !have("bash") {
+        skip("bash", "no bash to drive the anchored entrypoint");
+        return;
+    }
+    let td = workdir("anchors");
+    let app = anchored_tree(&td);
+    let o = pack_anchored(&app);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let pkg = app.with_file_name("anchored.onelf");
+    let mut modes = vec![None, Some("cache"), Some("rundir")];
+    if user_namespaces_available() {
+        modes.push(Some("tmpfs"));
+    }
+    if fuse_available() {
+        modes.push(Some("fuse"));
+    }
+    let private = td.join("xdg-run");
+    for mode in modes {
+        let launch = |arg: &str, before: Option<&str>| {
+            let mut run = if let Some(before) = before {
+                let mut cmd = Command::new("bash");
+                cmd.arg("-c")
+                    .arg(format!("{before}; exec \"$0\" \"$1\""))
+                    .arg(&pkg)
+                    .arg(arg);
+                cmd
+            } else {
+                let mut cmd = Command::new(&pkg);
+                cmd.arg(arg);
+                cmd
+            };
+            run.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", td.to_str().unwrap());
+            if let Some(mode) = mode {
+                run.env("ONELF_MODE", mode);
+            }
+            isolate(&mut run, &td);
+            let out = run_package(&mut run);
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        for arg in ["read", "child"] {
+            let (ok, out, err) = launch(arg, None);
+            assert!(ok && out == "ANCHORED\n", "{mode:?} {arg}:\n{out}{err}");
+        }
+        let (ok, out, err) = launch("read", Some("exec 77</dev/null"));
+        assert!(
+            ok && out == "ANCHORED\n",
+            "{mode:?}: a taken descriptor 77 is replaced:\n{out}{err}"
+        );
+        let crowded = "for fd in $(seq 3 76); do eval \"exec $fd</dev/null\"; done";
+        let (ok, out, err) = launch("read", Some(crowded));
+        assert!(
+            ok && out == "ANCHORED\n" && !err.contains("not overlaying"),
+            "{mode:?}: with 0 to 76 open:\n{out}{err}"
+        );
+        let (_, out, err) = launch("closed", None);
+        assert_eq!(out, "NOTHING\n", "{mode:?}: closed:\n{err}");
+
+        let (ok, out, err) = launch("where", None);
+        let mut lines = out.lines();
+        let dir = PathBuf::from(lines.next().unwrap_or_default());
+        let target = PathBuf::from(lines.next().unwrap_or_default());
+        assert!(ok, "{mode:?} where:\n{out}{err}");
+        assert!(
+            dir.starts_with(&private)
+                && dir
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("onelf-anchor-")),
+            "{mode:?}: the anchor directory is in the private runtime directory: {}",
+            dir.display()
+        );
+        assert!(
+            target.ends_with("share/fixture"),
+            "{mode:?}: the key names the package's directory: {}",
+            target.display()
+        );
+    }
+    assert!(
+        !Path::new("/dev/fd/77/a/file").exists(),
+        "a process without the descriptor finds nothing"
+    );
+
+    let mut doctor = Command::new(&pkg);
+    doctor
+        .arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap());
+    isolate(&mut doctor, &td);
+    let report = run_package(&mut doctor);
+    let text = String::from_utf8_lossy(&report.stdout);
+    assert!(
+        text.contains("anchor /dev/fd/77/a -> share/fixture"),
+        "the doctor names each anchored directory:\n{text}"
+    );
+}
+
+/// A launch whose anchors cannot be set up, here because the private
+/// runtime directory cannot take the anchor directory, closes a
+/// descriptor 77 its caller left open, so an anchored path finds nothing
+/// rather than resolving inside whatever the caller had there.
+#[test]
+fn a_launch_without_its_anchors_closes_an_inherited_descriptor_77() {
+    if !have("bash") {
+        skip("bash", "no bash to drive the anchored entrypoint");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if root_flavor() == Some(RootFlavor::AlreadyRoot) {
+        eprintln!("skip: root writes through a read-only directory, so nothing fails here");
+        return;
+    }
+    let td = workdir("anchors-unwritable");
+    let app = anchored_tree(&td);
+    let o = pack_anchored(&app);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let pkg = app.with_file_name("anchored.onelf");
+    write(&td.join("decoy/a/file"), "DECOY\n");
+
+    let mut run = Command::new("bash");
+    run.arg("-c")
+        .arg("exec 77<\"$1\"; exec \"$0\" peek")
+        .arg(&pkg)
+        .arg(td.join("decoy"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_MODE", "cache");
+    isolate(&mut run, &td);
+    let private = td.join("xdg-run");
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = run_package(&mut run);
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("anchored directories are not available"),
+        "{stderr}"
+    );
+    assert!(
+        out.status.success() && stdout == "NOTHING\n",
+        "an anchored path resolved inside the caller's descriptor:\n{stdout}{stderr}"
+    );
+}
+
+/// A record is checked against the tree the walk packs: an anchor naming
+/// a directory the package lacks, a regular file, or a directory reached
+/// through one of the package's symlinks is refused, and so is an empty
+/// record. A record an exclude leaves out is not looked at.
+#[test]
+fn an_anchor_record_must_name_the_package_s_own_directories() {
+    let td = workdir("anchors-refused");
+    let app = anchored_tree(&td);
+    std::os::unix::fs::symlink("fixture", app.join("share/linked")).unwrap();
+    write(&app.join("share/plain"), "a file\n");
+    for (record, reason) in [
+        ("a\tshare/missing", "does not carry as a directory"),
+        ("a\tshare/plain", "does not carry as a directory"),
+        ("a\tshare/linked", "through the symlink share/linked"),
+        ("a\tshare/linked/deeper", "through the symlink share/linked"),
+        ("", "is empty"),
+    ] {
+        write(&app.join(".onelf/anchors"), record);
+        let o = pack_anchored(&app);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "{record:?} packed");
+        assert!(err.contains(reason), "{record:?}:\n{err}");
+    }
+
+    write(&app.join(".onelf/anchors"), "a\tshare/missing");
+    let pkg = app.with_file_name("excluded.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/run", "--mtime", "0"])
+        .args(["--exclude", "anchors"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        o.status.success(),
+        "an excluded record is not checked: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+/// A memfd exec keeps no package tree for an anchor to name, so a
+/// package with anchors never takes the mode on its own, and forcing it
+/// is refused with the reason.
+#[test]
+fn an_anchored_package_does_not_run_from_a_memfd() {
+    let td = workdir("anchors-memfd");
+    let app = td.join("app");
+    let src = td.join("main.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){FILE *f=fopen(\"/dev/fd/77/a/file\",\"r\");\
+         char b[64]={0};if(f&&fgets(b,sizeof b,f))fputs(b,stdout);else puts(\"NOTHING\");\
+         return 0;}\n",
+    );
+    let bin = app.join("bin/main");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let compiler = if have("cc") {
+        "cc"
+    } else if have("gcc") {
+        "gcc"
+    } else {
+        skip("cc", "no C compiler available");
+        return;
+    };
+    let built = Command::new(compiler)
+        .args(["-O0", "-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !built {
+        skip("staticlibc", "no static libc available to link against");
+        return;
+    }
+    write(&app.join("share/fixture/file"), "ANCHORED\n");
+    write(&app.join(".onelf/anchors"), "a\tshare/fixture");
+    let pkg = td.join("static.onelf");
+    let o = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args(["--command", "bin/main", "--mtime", "0"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let launch = |mode: Option<&str>| {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        if let Some(mode) = mode {
+            run.env("ONELF_MODE", mode);
+        }
+        isolate(&mut run, &td);
+        run_package(&mut run)
+    };
+    let auto = launch(None);
+    assert!(
+        auto.status.success() && String::from_utf8_lossy(&auto.stdout) == "ANCHORED\n",
+        "{}{}",
+        String::from_utf8_lossy(&auto.stdout),
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    let forced = launch(Some("memfd"));
+    assert!(!forced.status.success());
+    let err = String::from_utf8_lossy(&forced.stderr);
+    assert!(err.contains("memfd mode cannot provide"), "{err}");
+}
+
 /// An earlier output inside the packed directory is never content, under
 /// whatever name it was built with.
 #[test]

@@ -31,8 +31,10 @@ The report covers:
 - **Metadata**: the payload records the package carries, the runtime
   support they require (`payload metadata version 1, selection-view`
   for a package with a selection table), what this runtime itself
-  advertises, and whether the requirement is satisfied. A package with
-  neither record prints `records: none carried (legacy defaults)`.
+  advertises, and whether the requirement is satisfied. Each anchored
+  directory is named as `anchor /dev/fd/77/<key> -> <directory>`. A
+  package with none of these records prints `records: none carried
+  (legacy defaults)`.
 - **Execution mode**: each mode in the order a launch tries them, with
   the reason a mode would be skipped, down to the one that would run.
   `ONELF_MODE`, `ONELF_CACHE` and `ONELF_FUSE_NO_NAMESPACE` are taken

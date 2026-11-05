@@ -130,6 +130,8 @@ fn modes(
     let memfd = || {
         if cache_preferred {
             Err("the package prefers the persistent cache".to_string())
+        } else if onelf_rt::anchor::carried(pkg) {
+            Err("the package anchors directories, which need a package tree".to_string())
         } else if pkg.manifest.entrypoints[ep_idx].is_memfd_eligible() {
             Ok(("the static entrypoint runs from memory".to_string(), false))
         } else {
@@ -208,7 +210,8 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
 
     let rules = read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE);
     let table = read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
-    metadata_section(&mut out, &rules, &table);
+    let anchors = read_package_file(pkg, onelf_format::anchors::ANCHORS_FILE);
+    metadata_section(&mut out, &rules, &table, &anchors);
 
     line(&mut out, "\nExecution mode");
     let needs_setuid = read_package_file(pkg, ".onelf/needs-setuid").is_some();
@@ -262,14 +265,23 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
 /// what this runtime itself advertises. The requirement is the one
 /// packaging enforced when the records were emitted; the agreement is
 /// re-stated here for the runtime that would actually apply them.
-fn metadata_section(out: &mut String, rules: &Option<Vec<u8>>, table: &Option<Vec<u8>>) {
+fn metadata_section(
+    out: &mut String,
+    rules: &Option<Vec<u8>>,
+    table: &Option<Vec<u8>>,
+    anchors: &Option<Vec<u8>>,
+) {
     line(out, "\nMetadata");
-    if rules.is_none() && table.is_none() {
+    if rules.is_none() && table.is_none() && anchors.is_none() {
         line(out, "  records: none carried (legacy defaults)");
         return;
     }
     let decoded = table.as_deref().map(EntrypointSets::decode);
-    let mut required = RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION);
+    let mut required = if rules.is_some() || table.is_some() {
+        RuntimeRequirements::metadata(elf::RUNTIME_METADATA_VERSION)
+    } else {
+        RuntimeRequirements::NONE
+    };
     if let Some(Ok(record)) = &decoded
         && !record.entrypoints.is_empty()
     {
@@ -280,12 +292,30 @@ fn metadata_section(out: &mut String, rules: &Option<Vec<u8>>, table: &Option<Ve
     if let Some(Err(why)) = &decoded {
         line(out, &format!("  selection table: unreadable: {why}"));
     }
+    match anchors.as_deref().map(onelf_format::anchors::decode) {
+        Some(Ok(record)) if !record.is_empty() => {
+            required.capabilities = required
+                .capabilities
+                .union(elf::RuntimeCapabilities::ANCHORS);
+            for anchor in &record {
+                line(
+                    out,
+                    &format!("  anchor {} -> {}", anchor.path(), anchor.relative),
+                );
+            }
+        }
+        Some(Err(why)) => line(out, &format!("  anchor record: unreadable: {why}")),
+        _ => {}
+    }
     let mut carried: Vec<&str> = Vec::new();
     if rules.is_some() {
         carried.push("runtime-rules");
     }
     if table.is_some() {
         carried.push("entrypoint-sets");
+    }
+    if anchors.is_some() {
+        carried.push("anchors");
     }
     line(out, &format!("  records: {}", carried.join(", ")));
     line(
@@ -309,12 +339,20 @@ fn metadata_section(out: &mut String, rules: &Option<Vec<u8>>, table: &Option<Ve
 /// The support `required` names, as one report line: the metadata
 /// schema version, then any named capability.
 fn requirements_text(required: &RuntimeRequirements) -> String {
-    let mut text = format!("payload metadata version {}", required.metadata_version);
-    if !required.capabilities.is_empty() {
-        text.push_str(", ");
-        text.push_str(&required.capabilities.to_string());
+    let mut parts = Vec::new();
+    if required.metadata_version != 0 {
+        parts.push(format!(
+            "payload metadata version {}",
+            required.metadata_version
+        ));
     }
-    text
+    if !required.capabilities.is_empty() {
+        parts.push(required.capabilities.to_string());
+    }
+    if parts.is_empty() {
+        return "(none)".to_string();
+    }
+    parts.join(", ")
 }
 
 /// What a note advertises, as one report line.
@@ -677,6 +715,12 @@ fn update(pkg: &mut PackageData, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_requirement_reads_none() {
+        let none = super::RuntimeRequirements::NONE;
+        assert_eq!(super::requirements_text(&none), "(none)");
+    }
+
     use std::fs::File;
     use std::path::PathBuf;
 

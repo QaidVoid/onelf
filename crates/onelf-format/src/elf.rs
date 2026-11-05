@@ -198,13 +198,18 @@ bitflags! {
         const SELECTION_VIEW = 1 << 0;
         /// Imports pinned set artifacts from permitted sources into the store.
         const STORE_IMPORT = 1 << 1;
+        /// Holds descriptor 77 open on the package's anchor directory, so
+        /// paths rewritten to `/dev/fd/77/<key>` resolve.
+        const ANCHORS = 1 << 2;
     }
 }
 
 impl RuntimeCapabilities {
     /// Every flag this decoder names; a set bit outside this mask is a
     /// decode error, so flipped bytes cannot forge an advertisement.
-    pub const ALL_KNOWN: Self = Self::SELECTION_VIEW.union(Self::STORE_IMPORT);
+    pub const ALL_KNOWN: Self = Self::SELECTION_VIEW
+        .union(Self::STORE_IMPORT)
+        .union(Self::ANCHORS);
 
     /// Decode raw bits, rejecting any bit without a named flag.
     pub const fn from_bits(bits: u32) -> Option<Self> {
@@ -237,6 +242,7 @@ impl std::fmt::Display for RuntimeCapabilities {
         for (flag, name) in [
             (Self::SELECTION_VIEW, "selection-view"),
             (Self::STORE_IMPORT, "store-import"),
+            (Self::ANCHORS, "anchors"),
         ] {
             if self.contains(flag) {
                 if !first {

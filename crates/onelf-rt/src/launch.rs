@@ -184,6 +184,19 @@ fn run(launch: &Launch) {
         wanted.as_ref(),
         &shadows,
     );
+    let _anchors = match crate::anchor::read(launch.pkg)
+        .and_then(|anchors| crate::anchor::hold(launch.pkg_root, &anchors))
+    {
+        Ok(claim) => claim,
+        Err(e) => {
+            eprintln!(
+                "onelf-rt: the package's anchored directories are not available, so \
+                 the paths rewritten to them find nothing: {e}"
+            );
+            crate::anchor::release_descriptor();
+            None
+        }
+    };
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
     match crate::hostpaths::read(launch.pkg) {

@@ -50,7 +50,7 @@ Sets:
 Runtime metadata:
   Records:     entrypoint-sets
   Requires:    payload metadata version 1, selection-view
-  Runtime:     advertises payload metadata version 1, selection-view
+  Runtime:     advertises payload metadata version 1, selection-view+anchors
   Agreement:   satisfied
 
 Entrypoints:
@@ -76,11 +76,13 @@ Useful for:
   embedded in it: which records it carries, what support they require
   (`selection-view` for a package with a selection table), what the
   embedded runtime's capability note advertises, and whether the two
-  agree. A package with neither record prints no `Runtime metadata`
-  section and runs on the legacy defaults. The other named capability,
-  `store-import`, is the updater runtime's HTTPS client; packing
-  already chose that runtime for a package whose pins are fetched over
-  HTTPS.
+  agree. A package with none of these records prints no `Runtime
+  metadata` section and runs on the legacy defaults. Of the other named
+  capabilities, `store-import` is the updater runtime's HTTPS client;
+  packing already chose that runtime for a package whose pins are
+  fetched over HTTPS. `anchors` is descriptor 77 on the anchor
+  directory, which packing requires of the runtime for a package
+  carrying `.onelf/anchors`.
 - Checking the update URL, revision and signing key, which an `Update:`
   section shows for a package that has an update URL.
 

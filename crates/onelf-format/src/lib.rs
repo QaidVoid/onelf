@@ -3,6 +3,7 @@
 #[macro_use]
 mod macros;
 
+pub mod anchors;
 pub mod cache_layout;
 pub mod catalog;
 pub mod desktop;

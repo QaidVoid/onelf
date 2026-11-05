@@ -32,6 +32,7 @@
 //! (inspection, desktop metadata, integration), the diagnostics, and the
 //! updater behind the `update` feature.
 
+pub mod anchor;
 pub mod cache;
 pub mod env;
 pub mod ephemeral;

@@ -862,6 +862,34 @@ fn file_based_pins_never_demand_store_import() {
     pack::require_store_runtime(&RuntimeNote::Absent, false).unwrap();
 }
 
+/// Anchored paths resolve only through a capable runtime's descriptor, so
+/// a record refuses a runtime that does not advertise them, and a
+/// malformed or empty record is refused before anything is packed.
+#[test]
+fn anchors_require_a_runtime_advertising_them() {
+    let capable = RuntimeNote::Present {
+        metadata_version: RUNTIME_METADATA_VERSION,
+        capabilities: RuntimeCapabilities::SELECTION_VIEW | RuntimeCapabilities::ANCHORS,
+    };
+    let record: &[u8] = b"a\tshare/alsa";
+    let anchors = pack::require_anchor_runtime(&capable, record).unwrap();
+    assert_eq!(anchors.len(), 1);
+    for incapable in [capable_note(), RuntimeNote::Absent] {
+        let text = pack::require_anchor_runtime(&incapable, record)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("anchor support"), "{text}");
+    }
+    let text = pack::require_anchor_runtime(&capable, b"")
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("is empty"), "{text}");
+    let text = pack::require_anchor_runtime(&capable, b"a\t../out")
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains(".onelf/anchors"), "{text}");
+}
+
 /// A freshly built set-carrying package launches on the current runtime:
 /// the slim embedded runtime passes its own gates, the selected set is
 /// acquired from the file-pinned store, the unselected set is never

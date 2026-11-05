@@ -135,34 +135,41 @@ impl PathsError {
     }
 }
 
-impl fmt::Display for PathsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let reason = match self.kind {
-            PathsErrorKind::RecordTooLarge => {
+impl PathsErrorKind {
+    /// The refusal in words, without where it lies.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::RecordTooLarge => {
                 format!("the record is over {MAX_RECORD_BYTES} bytes")
             }
-            PathsErrorKind::TooManyPairs => format!("the record holds over {MAX_PAIRS} pairs"),
-            PathsErrorKind::NotUtf8 => "the record is not UTF-8".into(),
-            PathsErrorKind::EmptyLine => "the line holds no pair".into(),
-            PathsErrorKind::MissingSeparator => "the line has no tab between its paths".into(),
-            PathsErrorKind::TrailingField => "the line goes on after the bundle path".into(),
-            PathsErrorKind::NotAbsolute => "the target is not an absolute path".into(),
-            PathsErrorKind::AbsoluteTooLong => {
+            Self::TooManyPairs => format!("the record holds over {MAX_PAIRS} pairs"),
+            Self::NotUtf8 => "the record is not UTF-8".into(),
+            Self::EmptyLine => "the line holds no pair".into(),
+            Self::MissingSeparator => "the line has no tab between its paths".into(),
+            Self::TrailingField => "the line goes on after the bundle path".into(),
+            Self::NotAbsolute => "the target is not an absolute path".into(),
+            Self::AbsoluteTooLong => {
                 format!("the target is over {MAX_ABSOLUTE_BYTES} bytes")
             }
-            PathsErrorKind::RelativeIsAbsolute => {
+            Self::RelativeIsAbsolute => {
                 "the bundle path must be relative to the package root".into()
             }
-            PathsErrorKind::RelativeTooLong => {
+            Self::RelativeTooLong => {
                 format!("the bundle path is over {MAX_RELATIVE_BYTES} bytes")
             }
-            PathsErrorKind::Escapes => "the bundle path leaves the package".into(),
-            PathsErrorKind::Unnormalized => {
+            Self::Escapes => "the bundle path leaves the package".into(),
+            Self::Unnormalized => {
                 "a path is not normalized, or names no directory below its base".into()
             }
-            PathsErrorKind::ControlCharacter => "a path holds a control character".into(),
-            PathsErrorKind::DuplicateTarget => "the target is paired more than once".into(),
-        };
+            Self::ControlCharacter => "a path holds a control character".into(),
+            Self::DuplicateTarget => "the target is paired more than once".into(),
+        }
+    }
+}
+
+impl fmt::Display for PathsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = self.kind.reason();
         match &self.at {
             Locus::Record => f.write_str(&reason),
             Locus::Line(number) => write!(f, "line {number}: {reason}"),
@@ -250,14 +257,7 @@ fn check_pair<'a>(
     if absolute.len() > MAX_ABSOLUTE_BYTES {
         return refuse(PathsErrorKind::AbsoluteTooLong);
     }
-    if relative.len() > MAX_RELATIVE_BYTES {
-        return refuse(PathsErrorKind::RelativeTooLong);
-    }
-    if absolute
-        .chars()
-        .chain(relative.chars())
-        .any(char::is_control)
-    {
+    if absolute.chars().any(char::is_control) {
         return refuse(PathsErrorKind::ControlCharacter);
     }
     let Some(below_root) = absolute.strip_prefix('/') else {
@@ -269,19 +269,37 @@ fn check_pair<'a>(
     {
         return refuse(PathsErrorKind::Unnormalized);
     }
-    if relative.starts_with('/') {
-        return refuse(PathsErrorKind::RelativeIsAbsolute);
-    }
-    if relative.split('/').any(|part| part == "..") {
-        return refuse(PathsErrorKind::Escapes);
-    }
-    if relative.split('/').any(|part| matches!(part, "" | ".")) {
-        return refuse(PathsErrorKind::Unnormalized);
+    if let Some(kind) = relative_error(relative) {
+        return refuse(kind);
     }
     if !targets.insert(absolute) {
         return refuse(PathsErrorKind::DuplicateTarget);
     }
     Ok(())
+}
+
+/// Why `relative` is not a bundle directory a record may name, if it is
+/// not: over [`MAX_RELATIVE_BYTES`], holding a control character,
+/// absolute, leaving the package through `..`, or not normalized. Shared
+/// with the other records that name bundle directories, so each refuses
+/// exactly the same paths.
+pub(crate) fn relative_error(relative: &str) -> Option<PathsErrorKind> {
+    if relative.len() > MAX_RELATIVE_BYTES {
+        return Some(PathsErrorKind::RelativeTooLong);
+    }
+    if relative.chars().any(char::is_control) {
+        return Some(PathsErrorKind::ControlCharacter);
+    }
+    if relative.starts_with('/') {
+        return Some(PathsErrorKind::RelativeIsAbsolute);
+    }
+    if relative.split('/').any(|part| part == "..") {
+        return Some(PathsErrorKind::Escapes);
+    }
+    if relative.split('/').any(|part| matches!(part, "" | ".")) {
+        return Some(PathsErrorKind::Unnormalized);
+    }
+    None
 }
 
 /// A bounded, escaped excerpt of a path for a diagnostic.

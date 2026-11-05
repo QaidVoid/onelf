@@ -43,6 +43,8 @@ use onelf_rt::rundir;
 use onelf_rt::sets;
 
 fn main() {
+    onelf_rt::anchor::reserve();
+
     // The updater's client serves acquisition's https:// sources. The
     // slim build leaves the update feature, and with it this client,
     // out; acquisition then refuses https:// and serves file:// alone.
@@ -186,7 +188,10 @@ fn main() {
     }
 
     let ep_target_entry = pkg.manifest.entrypoints[ep_idx].target_entry as usize;
-    let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible();
+    // A memfd exec has no package tree, so the directories anchored paths
+    // stand for exist nowhere: a package with anchors runs from a tree.
+    let anchored = onelf_rt::anchor::carried(&pkg);
+    let ep_memfd = pkg.manifest.entrypoints[ep_idx].is_memfd_eligible() && !anchored;
 
     let target_blocks = pkg.manifest.entries[ep_target_entry].blocks.clone();
     let target_hash = pkg.manifest.entries[ep_target_entry].content_hash;
@@ -226,6 +231,14 @@ fn main() {
         // is the last point at which anything can be said about it: `exec` of
         // a valid ELF succeeds, and the loader's failure happens afterwards,
         // in a process that is no longer ours.
+        if force == Some("memfd") && anchored {
+            eprintln!(
+                "onelf-rt: the package anchors directories its libraries open, which \
+                 memfd mode cannot provide: it keeps no package tree for them to name. \
+                 Unset ONELF_MODE to let the runtime pick a mode that can."
+            );
+            std::process::exit(1);
+        }
         if force == Some("memfd") && !ep_memfd {
             eprintln!(
                 "onelf-rt: entrypoint '{ep_name}' has shared library \

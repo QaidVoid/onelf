@@ -17,10 +17,12 @@ use onelf_format::elf::{
 };
 
 #[cfg(feature = "update")]
-const ADVERTISED: RuntimeCapabilities =
-    RuntimeCapabilities::SELECTION_VIEW.union(RuntimeCapabilities::STORE_IMPORT);
+const ADVERTISED: RuntimeCapabilities = RuntimeCapabilities::SELECTION_VIEW
+    .union(RuntimeCapabilities::ANCHORS)
+    .union(RuntimeCapabilities::STORE_IMPORT);
 #[cfg(not(feature = "update"))]
-const ADVERTISED: RuntimeCapabilities = RuntimeCapabilities::SELECTION_VIEW;
+const ADVERTISED: RuntimeCapabilities =
+    RuntimeCapabilities::SELECTION_VIEW.union(RuntimeCapabilities::ANCHORS);
 
 const NOTE: [u8; CAPABILITY_NOTE_BYTES] =
     encode_capability_note(RUNTIME_METADATA_VERSION, ADVERTISED);

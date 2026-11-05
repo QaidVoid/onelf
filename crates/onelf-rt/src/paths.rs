@@ -170,6 +170,22 @@ pub(crate) fn create_launch_stage(package_name: &str, package_id: &[u8; 32]) -> 
     Some(Mountpoint { path, _lock: lock })
 }
 
+/// Create this launch's anchor directory (see [`crate::anchor`]), claimed
+/// the way [`create_launch_dir`] claims a launch's tree. A random suffix
+/// beside the process id keeps it this launch's own even when a process
+/// that reused the id still holds an older one.
+pub(crate) fn create_anchor_dir() -> Option<Mountpoint> {
+    let mut nonce = [0u8; 8];
+    rustix::rand::getrandom(&mut nonce, rustix::rand::GetRandomFlags::empty()).ok()?;
+    let dir_name = format!(
+        "onelf-anchor-{}-{}",
+        std::process::id(),
+        crate::cache::hex(&nonce)
+    );
+    let (path, lock) = claim_mountpoint(&dir_name)?;
+    Some(Mountpoint { path, _lock: lock })
+}
+
 /// The mountpoint concurrent launches of a package share (see
 /// `fuse::share`), claimed the way [`create_mountpoint`] claims one.
 pub(crate) fn create_shared_mountpoint(dir_name: &str) -> Option<Mountpoint> {

@@ -175,6 +175,91 @@ pub fn require_store_runtime(note: &elf::RuntimeNote, fetches_https: bool) -> io
     })
 }
 
+/// The anchors a tree's record carries, once the runtime about to be
+/// embedded is known to support them. Paths rewritten to
+/// `/dev/fd/77/<key>` resolve only through the descriptor a capable
+/// runtime holds open, so a substitution whose note lacks anchor support
+/// would ship libraries that find nothing. The record is decoded here, so
+/// only one the runtime accepts is packed, and an empty one, which
+/// anchors nothing, is refused rather than shipped.
+pub fn require_anchor_runtime(
+    note: &elf::RuntimeNote,
+    record: &[u8],
+) -> io::Result<Vec<onelf_format::anchors::Anchor>> {
+    let file = onelf_format::anchors::ANCHORS_FILE;
+    let anchors = onelf_format::anchors::decode(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{file}: {e}")))?;
+    if anchors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{file} is empty and anchors nothing; leave it out"),
+        ));
+    }
+    let required = elf::RuntimeRequirements {
+        metadata_version: 0,
+        capabilities: elf::RuntimeCapabilities::ANCHORS,
+    };
+    elf::check_runtime_support(note, required).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the package anchors directories, so the embedded runtime must advertise \
+                 anchor support, and this one does not: {e}"
+            ),
+        )
+    })?;
+    Ok(anchors)
+}
+
+/// Check the anchor record among the walked `files` against the tree the
+/// walk will pack: the runtime must support anchors, and every anchored
+/// directory must be a directory of the package reached without passing
+/// through one of its symlinks, so a key never resolves to a file, to
+/// nothing, or somewhere a link points. A record the walk left out, by an
+/// exclude for one, is not looked at.
+fn check_walked_anchors(
+    note: &elf::RuntimeNote,
+    files: &[CollectedFile],
+    dirs: &[CollectedDir],
+    symlinks: &[CollectedSymlink],
+) -> io::Result<()> {
+    use onelf_format::anchors::{ANCHORS_FILE, MAX_RECORD_BYTES};
+    let Some(record) = files.iter().find(|f| f.rel_path == Path::new(ANCHORS_FILE)) else {
+        return Ok(());
+    };
+    let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+    if record.size > MAX_RECORD_BYTES as u64 {
+        return Err(refuse(format!(
+            "{ANCHORS_FILE}: over the {MAX_RECORD_BYTES}-byte record limit"
+        )));
+    }
+    let bytes = record.source.read()?;
+    let anchors = require_anchor_runtime(note, &bytes)?;
+    let dirs: std::collections::HashSet<&Path> =
+        dirs.iter().map(|d| d.rel_path.as_path()).collect();
+    let links: std::collections::HashSet<&Path> =
+        symlinks.iter().map(|l| l.rel_path.as_path()).collect();
+    for anchor in &anchors {
+        let dir = Path::new(&anchor.relative);
+        if let Some(link) = dir.ancestors().find(|a| links.contains(a)) {
+            return Err(refuse(format!(
+                "{ANCHORS_FILE}: key {} reaches {} through the symlink {}",
+                anchor.key,
+                anchor.relative,
+                link.display()
+            )));
+        }
+        if !dirs.contains(dir) {
+            return Err(refuse(format!(
+                "{ANCHORS_FILE}: key {} names {}, which the package does not carry as a \
+                 directory",
+                anchor.key, anchor.relative
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A metadata record the packer refuses to emit, carrying the codec's
 /// bounded diagnostic.
 fn record_error(why: MetadataError) -> io::Error {
@@ -1236,8 +1321,10 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
 
     // `.onelf/` is reserved for injected metadata, except for the
     // documented user-provided asset dirs `.onelf/icons/` and
-    // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`) and the
-    // provenance record `bundle-libs` writes from a sysroot. The bare
+    // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`), the
+    // provenance records `bundle-libs` writes from a sysroot, and the
+    // anchor record that names the directories rewritten paths stand for,
+    // which is checked against the runtime before packing. The bare
     // `.onelf` directory is allowed as their parent. Any other collision
     // is rejected so injected metadata is never shadowed by, or silently
     // duplicated alongside, source content.
@@ -1256,6 +1343,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != Path::new(crate::bundle::sysroot::PLATFORM_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SETS_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SHIPPED_FILE)
+                && p.as_path() != Path::new(onelf_format::anchors::ANCHORS_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(
@@ -1266,6 +1354,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
             ),
         ));
     }
+    check_walked_anchors(&opts.runtime_note, &files, &dirs, &symlinks)?;
 
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
