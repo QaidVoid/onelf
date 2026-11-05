@@ -915,44 +915,7 @@ fn carry_data_group(
         },
     )?;
     if let Some(hit) = outcome.found.first() {
-        let dest = directory.join(hit.destination.as_path());
-        if dest.exists() {
-            if !hooks.is_empty() {
-                actions.push(WalkAction::RunStagedHooks { hooks });
-            }
-            if hit.kind == ResourceKind::File {
-                plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?;
-            }
-            return Ok(());
-        }
-        // A sysroot directory carries only what the build admitted
-        // under it, so a file the policy or a trace pruned never comes
-        // back through a carry whose destination differs.
-        if let (Some(universe), ResourceKind::Directory) = (sysroot, hit.kind) {
-            let members = admitted_members(universe, hit, plan, &origin)?;
-            if !members.is_empty() {
-                actions.push(WalkAction::CarryData {
-                    rule: rule.to_string(),
-                    src: hit.resolved.clone(),
-                    rel: hit.destination.clone(),
-                    hooks,
-                    members: Some(members),
-                });
-            }
-            return Ok(());
-        }
-        if plan.admit_carried(hit.destination.as_path(), &hit.resolved, &origin)?
-            == Admission::Write
-        {
-            actions.push(WalkAction::CarryData {
-                rule: rule.to_string(),
-                src: hit.resolved.clone(),
-                rel: hit.destination.clone(),
-                hooks,
-                members: None,
-            });
-        }
-        return Ok(());
+        return carry_hit(directory, rule, hit, hooks, sysroot, plan, actions, &origin);
     }
     if directory.join(declared.destination.as_str()).exists() {
         if !hooks.is_empty() {
@@ -985,6 +948,157 @@ fn carry_data_group(
         )),
         _ => Ok(()),
     }
+}
+
+/// Carry the data an alternative was found at into the tree at its
+/// destination, then run `hooks` over it. A destination the tree already
+/// holds is the tree's own and is kept. A sysroot directory carries only
+/// what the build admitted under it, so a file the policy or a trace
+/// pruned never comes back through a carry whose destination differs.
+#[allow(clippy::too_many_arguments)]
+fn carry_hit(
+    directory: &Path,
+    rule: &str,
+    hit: &CandidateHit,
+    hooks: Vec<BuildHookId>,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    plan: &mut DestinationPlan,
+    actions: &mut Vec<WalkAction>,
+    origin: &str,
+) -> io::Result<()> {
+    let dest = directory.join(hit.destination.as_path());
+    if dest.exists() {
+        if !hooks.is_empty() {
+            actions.push(WalkAction::RunStagedHooks { hooks });
+        }
+        if hit.kind == ResourceKind::File {
+            plan.admit_carried(hit.destination.as_path(), &hit.resolved, origin)?;
+        }
+        return Ok(());
+    }
+    if let (Some(universe), ResourceKind::Directory) = (sysroot, hit.kind) {
+        let members = admitted_members(universe, hit, plan, origin)?;
+        if !members.is_empty() {
+            actions.push(WalkAction::CarryData {
+                rule: rule.to_string(),
+                src: hit.resolved.clone(),
+                rel: hit.destination.clone(),
+                hooks,
+                members: Some(members),
+            });
+        }
+        return Ok(());
+    }
+    if plan.admit_carried(hit.destination.as_path(), &hit.resolved, origin)? == Admission::Write {
+        actions.push(WalkAction::CarryData {
+            rule: rule.to_string(),
+            src: hit.resolved.clone(),
+            rel: hit.destination.clone(),
+            hooks,
+            members: None,
+        });
+    }
+    Ok(())
+}
+
+/// The walk's queues and plan, which collecting a plugin group feeds.
+struct WalkState<'a> {
+    already_processed: &'a mut HashSet<String>,
+    search_paths: &'a mut Vec<PathBuf>,
+    repair_extra: &'a mut HashSet<PathBuf>,
+    group_dests: &'a mut HashMap<String, PathBuf>,
+    group_sources: &'a mut HashMap<String, PathBuf>,
+    needed_by: &'a mut HashMap<String, String>,
+    discovery: &'a mut Discovery,
+    plan: &'a mut DestinationPlan,
+    actions: &'a mut Vec<WalkAction>,
+}
+
+/// Hand a collected plugin group to the walk: the recipe's exclusions
+/// leave members out, the found directories become search paths a repair
+/// may answer from, and each member enters the object queue at its
+/// destination. A second member under one name at its own place in the
+/// layout is copied from where the group found it, never re-resolved by
+/// name, with its own needs entering the walk. `origin` names the group
+/// in the walk's report, and the group's finding is recorded for
+/// `destination` before any member is planned, so a build that fails on
+/// a member still reports the group.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_collection(
+    collection: &mut collect::GroupCollection,
+    origin: &str,
+    destination: &str,
+    directory: &Path,
+    recipe_exclude: &[String],
+    excludes: &[&str],
+    reachable: &HashSet<String>,
+    queue: &mut WalkState,
+) -> io::Result<()> {
+    let (plugins, excluded): (Vec<_>, Vec<_>) = std::mem::take(&mut collection.plugins)
+        .into_iter()
+        .partition(|p| !recipe_excludes(&p.soname, recipe_exclude));
+    collection.plugins = plugins;
+    collection.skipped.extend(excluded.into_iter().map(|p| {
+        (
+            p.destination.display().to_string(),
+            "left out by [bundle] exclude".to_string(),
+        )
+    }));
+    for dir in &collection.search_dirs {
+        if !queue.search_paths.contains(dir) {
+            queue.search_paths.push(dir.clone());
+        }
+        queue.repair_extra.insert(dir.clone());
+    }
+    for plugin in &collection.plugins {
+        if let Some(dir) = plugin.resolved.parent() {
+            let dir = dir.to_path_buf();
+            if !queue.search_paths.contains(&dir) {
+                queue.search_paths.push(dir.clone());
+            }
+            queue.repair_extra.insert(dir);
+        }
+    }
+    report_collection(collection, destination);
+    for plugin in &collection.plugins {
+        let first = queue
+            .group_dests
+            .entry(plugin.soname.clone())
+            .or_insert_with(|| plugin.destination.clone());
+        if *first != plugin.destination {
+            let origin = format!("{origin} plugin {}", plugin.destination.display());
+            plan_member_copy(directory, plugin, &origin, queue.plan, queue.actions)?;
+            for dep in parse_needed(&plugin.resolved).unwrap_or_default() {
+                if queue.already_processed.contains(&dep)
+                    || is_excluded(&dep, excludes)
+                    || reachable.contains(&dep)
+                    || libc_family_of_soname(&dep).is_some()
+                {
+                    continue;
+                }
+                queue
+                    .needed_by
+                    .entry(dep.clone())
+                    .or_insert_with(|| origin.clone());
+                queue.discovery.enqueue(&dep)?;
+            }
+            continue;
+        }
+        queue
+            .group_sources
+            .insert(plugin.soname.clone(), plugin.resolved.clone());
+        queue
+            .needed_by
+            .entry(plugin.soname.clone())
+            .or_insert_with(|| origin.to_string());
+        // An object that drained before its group popped chose
+        // its destination flat; the group's declared destination
+        // supersedes it, so the object runs again with the
+        // repair that move implies.
+        queue.already_processed.remove(&plugin.soname);
+        queue.discovery.enqueue(&plugin.soname)?;
+    }
+    Ok(())
 }
 
 /// Plan the copy of one collected group member to its own destination,
@@ -3939,82 +4053,30 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                         target_class,
                         target_machine,
                     )?;
-                    let (plugins, excluded): (Vec<_>, Vec<_>) =
-                        std::mem::take(&mut collection.plugins)
-                            .into_iter()
-                            .partition(|p| !recipe_excludes(&p.soname, &opts.exclude));
-                    collection.plugins = plugins;
-                    collection.skipped.extend(excluded.into_iter().map(|p| {
-                        (
-                            p.destination.display().to_string(),
-                            "left out by [bundle] exclude".to_string(),
-                        )
-                    }));
-                    for dir in &collection.search_dirs {
-                        if !search_paths.contains(dir) {
-                            search_paths.push(dir.clone());
-                        }
-                        repair_extra.insert(dir.clone());
-                    }
-                    for plugin in &collection.plugins {
-                        if let Some(dir) = plugin.resolved.parent() {
-                            let dir = dir.to_path_buf();
-                            if !search_paths.contains(&dir) {
-                                search_paths.push(dir.clone());
-                            }
-                            repair_extra.insert(dir);
-                        }
-                    }
-                    report_collection(&collection, declared.destination.as_str());
+                    let origin = format!("rule {rule} group {group}");
+                    enqueue_collection(
+                        &mut collection,
+                        &origin,
+                        declared.destination.as_str(),
+                        &opts.directory,
+                        &opts.exclude,
+                        &excludes,
+                        &reachable,
+                        &mut WalkState {
+                            already_processed: &mut already_processed,
+                            search_paths: &mut search_paths,
+                            repair_extra: &mut repair_extra,
+                            group_dests: &mut group_dests,
+                            group_sources: &mut group_sources,
+                            needed_by: &mut needed_by,
+                            discovery: &mut discovery,
+                            plan: &mut plan,
+                            actions: &mut actions,
+                        },
+                    )?;
                     if declared.requirement == Requirement::Required {
                         required_dests
                             .extend(collection.plugins.iter().map(|p| p.destination.clone()));
-                    }
-                    for plugin in &collection.plugins {
-                        let first = group_dests
-                            .entry(plugin.soname.clone())
-                            .or_insert_with(|| plugin.destination.clone());
-                        if *first != plugin.destination {
-                            // A second member under the same name at its
-                            // own place in the layout: copied from where
-                            // the group found it, never re-resolved by
-                            // name, with its own needs entering the walk.
-                            let origin = format!(
-                                "rule {rule} group {group} plugin {}",
-                                plugin.destination.display()
-                            );
-                            plan_member_copy(
-                                &opts.directory,
-                                plugin,
-                                &origin,
-                                &mut plan,
-                                &mut actions,
-                            )?;
-                            for dep in parse_needed(&plugin.resolved).unwrap_or_default() {
-                                if already_processed.contains(&dep)
-                                    || is_excluded(&dep, &excludes)
-                                    || reachable.contains(&dep)
-                                    || libc_family_of_soname(&dep).is_some()
-                                {
-                                    continue;
-                                }
-                                needed_by
-                                    .entry(dep.clone())
-                                    .or_insert_with(|| origin.clone());
-                                discovery.enqueue(&dep)?;
-                            }
-                            continue;
-                        }
-                        group_sources.insert(plugin.soname.clone(), plugin.resolved.clone());
-                        needed_by
-                            .entry(plugin.soname.clone())
-                            .or_insert_with(|| format!("rule {rule} group {group}"));
-                        // An object that drained before its group popped chose
-                        // its destination flat; the group's declared destination
-                        // supersedes it, so the object runs again with the
-                        // repair that move implies.
-                        already_processed.remove(&plugin.soname);
-                        discovery.enqueue(&plugin.soname)?;
                     }
                     continue;
                 }

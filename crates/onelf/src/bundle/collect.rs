@@ -22,7 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use onelf_format::rules::{Requirement, ResourceGroup};
+use onelf_format::rules::{RelativePath, Requirement, ResourceGroup};
 
 use super::{
     AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, discover_group, is_nix_stub_ld,
@@ -98,60 +98,15 @@ pub(crate) fn collect_group(
         },
     )?;
 
-    let mut collection = GroupCollection {
-        rule: rule.to_string(),
-        group: declared.id.as_str().to_string(),
-        search_dirs: Vec::new(),
-        plugins: Vec::new(),
-        skipped: Vec::new(),
-        misses: Vec::new(),
-    };
-    // Members are keyed by where they land: a nested layout keeps
-    // same-named members apart (babl's `x86-64-v2/` and `x86-64-v3/`
-    // variants), and only a second member for one destination is
-    // refused, with the member that took it named.
-    let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
-    for hit in &outcome.found {
-        collection.search_dirs.push(hit.resolved.clone());
-        for (rel, path) in members(hit, sysroot)? {
-            let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(".so") {
-                continue;
-            }
-            let shown = rel.to_string_lossy().into_owned();
-            if !declared.members.is_empty() && !declared.members.iter().any(|m| m.as_str() == shown)
-            {
-                continue;
-            }
-            if let Err(reason) = compatible_object(&path, target_class, target_machine) {
-                collection.skipped.push((shown, reason));
-                continue;
-            }
-            let destination = hit.destination.join(&rel);
-            if let Some(first) = taken.get(&destination) {
-                collection.skipped.push((
-                    shown,
-                    format!(
-                        "{} is already collected from {}",
-                        destination.display(),
-                        first.display()
-                    ),
-                ));
-                continue;
-            }
-            if collection.plugins.len() >= MAX_GROUP_MEMBERS {
-                return Err(bounded(rule, declared.id.as_str(), MAX_GROUP_MEMBERS));
-            }
-            taken.insert(destination.clone(), path.clone());
-            collection.plugins.push(CollectedPlugin {
-                soname: name.to_string(),
-                destination,
-                resolved: path.clone(),
-            });
-        }
-    }
+    let mut collection = collect_found(
+        rule,
+        declared.id.as_str(),
+        &declared.members,
+        &outcome.found,
+        sysroot,
+        target_class,
+        target_machine,
+    )?;
     collection.misses = outcome
         .misses
         .iter()
@@ -172,6 +127,76 @@ pub(crate) fn collect_group(
             text.push_str(&format!("; {name}: {reason}"));
         }
         return Err(io::Error::new(io::ErrorKind::NotFound, text));
+    }
+    Ok(collection)
+}
+
+/// Collect the compatible plugins below directories already found, each
+/// at its hit's destination with the layout preserved. A non-empty
+/// `members_allowed` collects only the listed members. Members refused
+/// for their kind, class or machine, and second members for one
+/// destination, are recorded as skipped with the reason.
+pub(crate) fn collect_found(
+    rule: &str,
+    group: &str,
+    members_allowed: &[RelativePath],
+    found: &[CandidateHit],
+    sysroot: Option<&SysrootUniverse>,
+    target_class: Option<u8>,
+    target_machine: Option<u16>,
+) -> io::Result<GroupCollection> {
+    let mut collection = GroupCollection {
+        rule: rule.to_string(),
+        group: group.to_string(),
+        search_dirs: Vec::new(),
+        plugins: Vec::new(),
+        skipped: Vec::new(),
+        misses: Vec::new(),
+    };
+    // Members are keyed by where they land: a nested layout keeps
+    // same-named members apart (babl's `x86-64-v2/` and `x86-64-v3/`
+    // variants), and only a second member for one destination is
+    // refused, with the member that took it named.
+    let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for hit in found {
+        collection.search_dirs.push(hit.resolved.clone());
+        for (rel, path) in members(hit, sysroot)? {
+            let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".so") {
+                continue;
+            }
+            let shown = rel.to_string_lossy().into_owned();
+            if !members_allowed.is_empty() && !members_allowed.iter().any(|m| m.as_str() == shown) {
+                continue;
+            }
+            if let Err(reason) = compatible_object(&path, target_class, target_machine) {
+                collection.skipped.push((shown, reason));
+                continue;
+            }
+            let destination = hit.destination.join(&rel);
+            if let Some(first) = taken.get(&destination) {
+                collection.skipped.push((
+                    shown,
+                    format!(
+                        "{} is already collected from {}",
+                        destination.display(),
+                        first.display()
+                    ),
+                ));
+                continue;
+            }
+            if collection.plugins.len() >= MAX_GROUP_MEMBERS {
+                return Err(bounded(rule, group, MAX_GROUP_MEMBERS));
+            }
+            taken.insert(destination.clone(), path.clone());
+            collection.plugins.push(CollectedPlugin {
+                soname: name.to_string(),
+                destination,
+                resolved: path.clone(),
+            });
+        }
     }
     Ok(collection)
 }
