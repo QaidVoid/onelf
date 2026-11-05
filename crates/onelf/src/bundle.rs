@@ -591,6 +591,23 @@ fn bundle_c_utf8(libc: &Path, lib_dest: &Path) -> io::Result<Vec<String>> {
     Ok(copied)
 }
 
+/// The glibc libraries that objects built against an older glibc link by
+/// name, carried beside a bundled `libc.so.6`.
+///
+/// Since glibc 2.34 all of them but `libresolv` are stubs whose code moved
+/// into libc, so nothing in a bundle built against a current glibc asks
+/// for them. An object from outside the bundle still can: a host plugin
+/// that a user's configuration names, built against the host's older
+/// glibc, fails to load without them.
+const GLIBC_COMPAT_LIBS: &[&str] = &[
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "libutil.so.1",
+    "libanl.so.1",
+    "libresolv.so.2",
+];
+
 const DEFAULT_EXCLUDES: &[&str] = &[
     "libnss_",
     "libcuda.so",
@@ -4263,6 +4280,12 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                             .entry(module.to_string())
                             .or_insert_with(|| "libc.so.6 (nsswitch)".into());
                         discovery.enqueue(module)?;
+                    }
+                    for compat in GLIBC_COMPAT_LIBS {
+                        needed_by
+                            .entry(compat.to_string())
+                            .or_insert_with(|| "libc.so.6 (compatibility)".into());
+                        discovery.enqueue(compat)?;
                     }
                 }
                 if let Some(hash) = content_hash

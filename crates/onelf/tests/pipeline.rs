@@ -6859,6 +6859,57 @@ fn a_glibc_bundle_carries_the_compat_name_service() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A glibc bundle carries the compatibility libraries a program built
+/// against an older glibc links by name, from the same glibc as the
+/// bundled `libc.so.6`, even when nothing in the tree asks for them.
+#[test]
+fn a_glibc_bundle_carries_the_compatibility_libraries() {
+    let td = workdir("glibccompat");
+    let src = td.join("hello.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){puts(\"hi\"); return 0;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc(&src, &app.join("bin/hello")) {
+        return;
+    }
+    let o = run_onelf(&["bundle-libs", app.to_str().unwrap()], None);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    if !app.join("lib/libc.so.6").is_file() {
+        skip("glibc", "the fixture is not a glibc binary");
+        return;
+    }
+    for lib in [
+        "libpthread.so.0",
+        "libdl.so.2",
+        "librt.so.1",
+        "libutil.so.1",
+        "libanl.so.1",
+        "libresolv.so.2",
+    ] {
+        let host = [
+            "/usr/lib",
+            "/lib64",
+            "/usr/lib64",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+        ]
+        .iter()
+        .map(|d| Path::new(d).join(lib))
+        .any(|p| p.exists());
+        if host {
+            assert!(
+                app.join("lib").join(lib).exists(),
+                "{lib} is not bundled:\n{err}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A symlink in the tree that points outside it is not an object to
 /// rewrite. The tree is patched in place, and following the link would
 /// have the host's library stripped, given an `$ORIGIN` run path, and
