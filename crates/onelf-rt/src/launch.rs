@@ -232,7 +232,7 @@ fn run(launch: &Launch) {
     if let Some(host_interp) = &resolution.host_interp {
         exec_under_host_loader(
             &target_path,
-            host_interp,
+            &host_interp.path,
             &lib_path,
             kernel_lib_path.as_deref(),
             app_argv0,
@@ -636,11 +636,13 @@ fn shadow_bundled_copies(launch: &Launch, shadows: &crate::links::Links) {
 /// The host's libc won, so the entrypoint runs under the host loader with
 /// the link farm shadowing every bundled glibc file. The bundled loader
 /// must not run at all here, or it would load a libc that does not match
-/// the one the farm now names.
+/// the one the farm now names. `host_interp` is the resolver's closed copy
+/// of the host loader, which searches no default directory, so a soname
+/// neither bundled nor chosen fails by name.
 ///
 /// A bootstrap-injected binary carries no `PT_INTERP` and maps its loader
-/// itself, so it is kernel-exec'd with `ONELF_INTERP` naming the host
-/// loader; the bootstrap honours that over its own relative path, and so
+/// itself, so it is kernel-exec'd with `ONELF_INTERP` naming the closed
+/// copy; the bootstrap honours that over its own relative path, and so
 /// does every re-exec the app performs. Anything else runs under the host
 /// loader directly: userland exec never updates `/proc/self/exe`, so it
 /// keeps naming the packed file rather than the entrypoint, which ordinary
@@ -657,8 +659,9 @@ fn exec_under_host_loader(
 ) {
     let interp = crate::interp::read_elf_interp(target);
     // A self-extracting binary needs `/proc/self/exe` to be itself, which
-    // only a kernel exec gives it. Its `PT_INTERP` names the host loader,
-    // and the host loader is what won, so the kernel can be left to it.
+    // only a kernel exec gives it. The kernel maps the loader its
+    // `PT_INTERP` names, so such an entrypoint runs under the host's own
+    // loader, not the closed copy, and its default directories stay open.
     let kernel_exec = match &interp {
         None => true,
         Some(interp) => {
@@ -789,6 +792,7 @@ pub fn resolve_launch(
 
     // The decision is this selection's own: another entrypoint of the
     // package with other sets, or none, never reuses it.
+    let loader_place = crate::cache::LoaderPlace::for_this_uid();
     let resolution = resolve::resolve_selected(
         &Request {
             pkg_root,
@@ -800,6 +804,8 @@ pub fn resolve_launch(
             extra_root: platform_root.as_deref(),
             set_roots: &set_roots,
             host_libc: can_shadow,
+            loader_store: loader_place.store(),
+            nsswitch: resolve::nsswitch_file(),
         },
         &crate::sets::pins(),
     );

@@ -10,7 +10,11 @@
 //! The loader and libc are a unit: a libc only runs under the loader it
 //! shipped with. They are compared first, and when the host's pair wins
 //! the whole glibc family comes from the host so nothing bundled is loaded
-//! beside a foreign loader.
+//! beside a foreign loader. The host's loader never runs as installed:
+//! it would still search its compiled-in default directories, where any
+//! host library is found. A private copy closed to those directories by
+//! [`crate::ldso::scrub_glibc_loader`] runs instead, and a host loader
+//! that cannot be closed leaves the bundled pair in place.
 //!
 //! Winners from the host are materialized as symlinks in a link farm, and
 //! the runtime shows each one the bundle lacks in the bundle's library
@@ -26,10 +30,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::drivers::{self, DRIVER_FAMILIES};
 use crate::footer::HostLibsPolicy;
+use crate::ldso::{self, MAX_LOADER_BYTES};
 use crate::verdef::{self, Choice, VersionSet};
 
 /// What a launch takes from the host.
@@ -38,12 +44,67 @@ pub struct Resolution {
     /// Directory of symlinks to the chosen host libraries, when any were
     /// chosen.
     pub farm: Option<PathBuf>,
-    /// The host loader to run the entrypoint under, when the host's libc
-    /// won. The bundled loader is used otherwise.
-    pub host_interp: Option<PathBuf>,
+    /// The closed copy of the host loader to run the entrypoint under,
+    /// when the host's libc won. The bundled loader is used otherwise.
+    pub host_interp: Option<HostLoader>,
     /// Sonames whose two copies could not be ordered. The bundled copy is
     /// used; these are reported so the publisher can see them.
     pub incomparable: Vec<String>,
+}
+
+/// The private copy of the host loader a launch runs, closed to the
+/// loader's default search directories, and the digest it was written
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLoader {
+    /// The copy, under the uid's cache root.
+    pub path: PathBuf,
+    /// BLAKE3 of the copy's bytes.
+    pub hash: blake3::Hash,
+}
+
+impl HostLoader {
+    /// Check the copy against its digest. A recorded decision is served
+    /// and a kept copy reused only after this passes, so a copy damaged or
+    /// replaced since it was written is never handed to a launch.
+    pub fn verify(&self) -> io::Result<()> {
+        let image = read_loader(&self.path)?;
+        if blake3::hash(&image) == self.hash {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the copy does not match the digest it was written with",
+            ))
+        }
+    }
+}
+
+/// A host loader the resolver chose, closed in memory: where it came
+/// from, where its copy goes, and the closed image with its digest. The
+/// image is the one the copy is written from, so the host's loader is
+/// read once per decision.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClosedLoader {
+    /// The host's loader.
+    pub source: PathBuf,
+    /// Where the closed copy is kept.
+    pub copy: PathBuf,
+    /// BLAKE3 of the closed image.
+    pub hash: blake3::Hash,
+    /// The closed image.
+    pub image: Vec<u8>,
+}
+
+impl std::fmt::Debug for ClosedLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosedLoader")
+            .field("source", &self.source)
+            .field("copy", &self.copy)
+            .field("hash", &self.hash)
+            .field("image_len", &self.image.len())
+            .finish()
+    }
 }
 
 /// One launch's inputs.
@@ -75,6 +136,46 @@ pub struct Request<'a> {
     /// executables' run path would still find the bundled libc, and it
     /// cannot run under the host loader.
     pub host_libc: bool,
+    /// Where a closed host loader's copy is kept, as the runtime judged
+    /// it. Without a usable one the host's glibc is never chosen.
+    pub loader_store: LoaderStore<'a>,
+    /// The host's name service configuration. A host libc opens the
+    /// modules it names by soname. [`nsswitch_file`] outside of tests.
+    pub nsswitch: &'a Path,
+}
+
+/// Where hosts keep their name service configuration, in the order the
+/// host libc looks: an administrator's file, then the distribution
+/// default openSUSE ships under `/usr/etc`.
+const NSSWITCH_FILES: &[&str] = &["/etc/nsswitch.conf", "/usr/etc/nsswitch.conf"];
+
+/// The host's name service configuration file, the first of
+/// [`NSSWITCH_FILES`] that exists.
+pub fn nsswitch_file() -> &'static Path {
+    NSSWITCH_FILES
+        .iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .unwrap_or(Path::new(NSSWITCH_FILES[0]))
+}
+
+/// Where closed host loader copies go, or why none can be kept.
+///
+/// A copy is executed, so it has to live on a filesystem that allows it.
+/// The runtime checks that before it builds a request, since it alone can
+/// ask the kernel how a filesystem is mounted.
+#[derive(Debug, Clone, Copy)]
+pub enum LoaderStore<'a> {
+    /// The uid's cache root. Copies go under its `loaders/`, content
+    /// addressed, so one copy serves every package and decision.
+    Root {
+        /// The cache root.
+        root: &'a Path,
+        /// The uid that has to own every directory on the way.
+        uid: u32,
+    },
+    /// No copy can be kept, and why.
+    Refused(&'a str),
 }
 
 /// Library directories of a GL build, relative to its root.
@@ -271,26 +372,30 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
         req.policy,
         req.extra_root,
         req.host_libc,
+        req.nsswitch,
+        req.loader_store,
     );
-    let fresh = || materialized(req, &fingerprint, &decide_on(req, &host));
     let Some(identity) = SelectionIdentity::new(pins) else {
-        return fresh();
+        return fresh(req, &fingerprint, &host).1;
     };
     let Some(dir) = selection_dir(identity.key()).map(|name| req.store.join(name)) else {
-        return fresh();
+        return fresh(req, &fingerprint, &host).1;
     };
-    if let Some(recorded) = load_selection(&dir, &identity, &fingerprint, req.store) {
+    if let Some(recorded) =
+        load_selection(&dir, &identity, &fingerprint, req.store, req.loader_store)
+    {
         return recorded;
     }
-    let decision = decide_on(req, &host);
-    let resolution = materialized(req, &fingerprint, &decision);
-    if let Err(e) = record_selection(
-        &dir,
-        &identity,
-        &fingerprint,
-        &resolution,
-        &decision.winners,
-    ) {
+    let (decision, resolution, recordable) = fresh(req, &fingerprint, &host);
+    if recordable
+        && let Err(e) = record_selection(
+            &dir,
+            &identity,
+            &fingerprint,
+            &resolution,
+            &decision.winners,
+        )
+    {
         eprintln!(
             "onelf-rt: resolver: cannot record {}: {e}",
             req.store.display()
@@ -299,10 +404,47 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
     resolution
 }
 
-/// The resolution of a fresh decision, with the decision's farm built. A
-/// farm that cannot be written leaves nothing taken from the host.
+/// A fresh decision for `req` with its farm and loader copy built, and
+/// whether it may be recorded.
+///
+/// When the closed loader copy cannot be kept after all, a race or a full
+/// disk past what the runtime could judge up front, the request is
+/// decided again with the store refused. The bundled pair runs and the
+/// rest of the decision stands, the driver closure with it. That fallback
+/// is not recorded, so a later launch tries the copy again.
+fn fresh(req: &Request, fingerprint: &str, host: &HostIndex) -> (Decision, Resolution, bool) {
+    let decision = decide_on(req, host);
+    let Some(loader) = &decision.host_interp else {
+        let resolution = materialized(req, fingerprint, &decision);
+        return (decision, resolution, true);
+    };
+    match keep_loader_copy(loader, req.loader_store) {
+        Ok(()) => {
+            let resolution = materialized(req, fingerprint, &decision);
+            (decision, resolution, true)
+        }
+        Err(why) => {
+            eprintln!(
+                "onelf-rt: resolver: the host loader {} is not used, {why}; the bundled loader \
+                 and libc run",
+                loader.source.display()
+            );
+            let refused = Request {
+                loader_store: LoaderStore::Refused("the loader copy cannot be kept"),
+                ..*req
+            };
+            let decision = decide_on(&refused, host);
+            let resolution = materialized(&refused, fingerprint, &decision);
+            (decision, resolution, false)
+        }
+    }
+}
+
+/// The resolution of a decision, with its farm built. A farm that cannot
+/// be written leaves nothing taken from the host.
 fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> Resolution {
-    let farm = match materialize(req.store, fingerprint, &decision.winners) {
+    let copy = decision.host_interp.as_ref().map(|l| l.copy.as_path());
+    let farm = match materialize(req.store, fingerprint, &decision.winners, copy) {
         Ok(farm) => farm,
         Err(e) => {
             eprintln!(
@@ -314,7 +456,10 @@ fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> Resolu
     };
     Resolution {
         farm,
-        host_interp: decision.host_interp.clone(),
+        host_interp: decision.host_interp.as_ref().map(|loader| HostLoader {
+            path: loader.copy.clone(),
+            hash: loader.hash,
+        }),
         incomparable: decision.incomparable.clone(),
     }
 }
@@ -328,7 +473,12 @@ pub struct Decision {
     pub compared: Vec<(String, Option<Choice>)>,
     /// The host libraries chosen, by soname.
     pub winners: BTreeMap<String, PathBuf>,
-    pub host_interp: Option<PathBuf>,
+    /// The host loader the pair runs under, when the host's libc won and
+    /// its loader could be closed.
+    pub host_interp: Option<ClosedLoader>,
+    /// The host loader of a winning host libc that could not be closed,
+    /// and why. The bundled pair runs instead.
+    pub host_interp_refused: Option<(PathBuf, String)>,
     pub incomparable: Vec<String>,
     /// Where in the store the link farm for these winners lives.
     pub farm: Option<PathBuf>,
@@ -352,8 +502,11 @@ pub fn decide(req: &Request) -> Decision {
             req.policy,
             req.extra_root,
             req.host_libc,
+            req.nsswitch,
+            req.loader_store,
         );
-        decision.farm = Some(farm_dir(req.store, &fingerprint, &decision.winners));
+        let copy = decision.host_interp.as_ref().map(|l| l.copy.as_path());
+        decision.farm = Some(farm_dir(req.store, &fingerprint, &decision.winners, copy));
     }
     decision
 }
@@ -377,17 +530,34 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
         match choice {
             Choice::Host => {
                 if let Some(interp) = host.loader_for(host_libc) {
-                    for name in bundled.keys().filter(|n| is_libc_family(n)) {
-                        let path = if name.starts_with("ld-linux") {
-                            Some(interp.clone())
-                        } else {
-                            host.libs.get(name).cloned()
-                        };
-                        if let Some(path) = path {
-                            decision.winners.insert(name.clone(), path);
+                    let closed = match req.loader_store {
+                        LoaderStore::Root { root, .. } => close_loader(&interp).map(|image| {
+                            let hash = blake3::hash(&image);
+                            (loader_copy(root, &hash, &loader_name(&interp)), hash, image)
+                        }),
+                        LoaderStore::Refused(why) => Err(why.to_string()),
+                    };
+                    match closed {
+                        Ok((copy, hash, image)) => {
+                            for name in bundled.keys().filter(|n| is_libc_family(n)) {
+                                let path = if is_loader_soname(name) {
+                                    Some(interp.clone())
+                                } else {
+                                    host.libs.get(name).cloned()
+                                };
+                                if let Some(path) = path {
+                                    decision.winners.insert(name.clone(), path);
+                                }
+                            }
+                            decision.host_interp = Some(ClosedLoader {
+                                source: interp,
+                                copy,
+                                hash,
+                                image,
+                            });
                         }
+                        Err(why) => decision.host_interp_refused = Some((interp, why)),
                     }
-                    decision.host_interp = Some(interp);
                 }
             }
             Choice::Incomparable => decision.incomparable.push(LIBC.to_string()),
@@ -400,6 +570,9 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
     // come from the host. Under `always` every bundled soname is compared
     // as well.
     let mut candidates: Vec<String> = host.driver_closure().into_iter().collect();
+    if decision.host_interp.is_some() {
+        candidates.extend(host.closure(host_libc_opens(req.nsswitch)));
+    }
     if req.policy == HostLibsPolicy::Always {
         candidates.extend(bundled.keys().cloned());
     }
@@ -407,6 +580,17 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
     candidates.dedup();
     for name in candidates {
         if is_libc_family(&name) {
+            // A closed host loader finds nothing on its own, so a member
+            // of its family that the host libc or a host driver opens and
+            // the bundle lacks has to be chosen like any other library.
+            if decision.host_interp.is_some()
+                && !is_loader_soname(&name)
+                && !bundled.contains_key(&name)
+                && let Some(host_path) = host.libs.get(&name)
+            {
+                decision.compared.push((name.clone(), None));
+                decision.winners.insert(name, host_path.clone());
+            }
             continue;
         }
         let Some(host_path) = host.libs.get(&name) else {
@@ -652,7 +836,6 @@ impl HostIndex {
     /// families, the host's dlopen-only seeds, the ICD-named drivers and
     /// what the host's driver modules need.
     fn driver_closure(&self) -> HashSet<String> {
-        let mut seen: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<String> = self
             .libs
             .keys()
@@ -665,6 +848,14 @@ impl HostIndex {
             }
         }
         queue.extend(self.module_needs.iter().cloned());
+        self.closure(queue)
+    }
+
+    /// Every soname reachable through `DT_NEEDED` from `seeds`, the seeds
+    /// included.
+    fn closure(&self, seeds: impl IntoIterator<Item = String>) -> HashSet<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = seeds.into_iter().collect();
         while let Some(name) = queue.pop_front() {
             if !seen.insert(name.clone()) {
                 continue;
@@ -680,6 +871,68 @@ impl HostIndex {
         }
         seen
     }
+}
+
+/// The largest name service configuration read. A real one is a few
+/// hundred bytes.
+const NSSWITCH_MAX_BYTES: u64 = 64 * 1024;
+
+/// The most lines of the name service configuration looked at. A real one
+/// is a few dozen.
+const NSSWITCH_MAX_LINES: usize = 1024;
+
+/// The longest service name taken from the name service configuration.
+const NSS_SERVICE_MAX_LEN: usize = 64;
+
+/// What a host libc opens by name rather than through `DT_NEEDED`: the
+/// module of every service the name service configuration at `nsswitch`
+/// names, and `libgcc_s`, which it opens to unwind a thread on cancellation.
+/// A configuration that cannot be read, or is larger than any real one,
+/// names no service.
+fn host_libc_opens(nsswitch: &Path) -> Vec<String> {
+    let mut opens: BTreeSet<String> = BTreeSet::new();
+    opens.insert("libgcc_s.so.1".to_string());
+    let text = read_nsswitch(nsswitch).unwrap_or_default();
+    for line in text.lines().take(NSSWITCH_MAX_LINES) {
+        let line = line.split('#').next().unwrap_or_default();
+        let Some((_, sources)) = line.split_once(':') else {
+            continue;
+        };
+        let mut in_action = false;
+        for word in sources.split_whitespace() {
+            if word.starts_with('[') {
+                in_action = true;
+            }
+            let service = !in_action
+                && word.len() <= NSS_SERVICE_MAX_LEN
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if service && !word.is_empty() {
+                opens.insert(format!("libnss_{word}.so.2"));
+            }
+            if word.ends_with(']') {
+                in_action = false;
+            }
+        }
+    }
+    opens.into_iter().collect()
+}
+
+/// The name service configuration's text, when it is a regular file no
+/// larger than [`NSSWITCH_MAX_BYTES`] holding UTF-8.
+fn read_nsswitch(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let md = file.metadata().ok()?;
+    if !md.is_file() || md.len() > NSSWITCH_MAX_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(NSSWITCH_MAX_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 /// The `dri` directories beside the host's library directories, where
@@ -783,20 +1036,28 @@ fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// A description of everything on the host the decision depends on: the
-/// cache image, the directories it names, and the driver description
-/// files, each with its size and modification time. Compared whole, so
-/// no hash is needed and nothing has to be added to the format crate's
-/// dependencies.
+/// cache image, the name service configuration, the directories the cache
+/// names and the driver description files, each with its size and
+/// modification time, and where loader copies can be kept. Compared
+/// whole, so no hash is needed.
 fn fingerprint(
     ld_cache: &Path,
     icd_dirs: &[&str],
     policy: HostLibsPolicy,
     extra_root: Option<&Path>,
     host_libc: bool,
+    nsswitch: &Path,
+    loader_store: LoaderStore,
 ) -> String {
     let mut out = format!("onelf-resolve-1 {}", policy.as_str());
     if !host_libc {
         out.push_str(" bundled-libc");
+    }
+    match loader_store {
+        LoaderStore::Root { root, .. } => {
+            out.push_str(&format!(" loader-store={}", root.display()));
+        }
+        LoaderStore::Refused(_) => out.push_str(" loader-store=refused"),
     }
     let mut stamp = |path: &Path| {
         out.push('\x1f');
@@ -815,6 +1076,7 @@ fn fingerprint(
         }
     };
     stamp(ld_cache);
+    stamp(nsswitch);
     for dir in drivers::cache_dirs_in(ld_cache) {
         stamp(Path::new(&dir));
     }
@@ -838,7 +1100,7 @@ const DECISION_FILE: &str = "decision";
 /// host and the launch's selection identity. The version in the header
 /// steps up whenever the layout changes, so a record naming another
 /// version is a miss, never a misread.
-const SELECTION_RECORD_HEADER: &str = "onelf-resolve-selection 1";
+const SELECTION_RECORD_HEADER: &str = "onelf-resolve-selection 2";
 
 /// The store subdirectory a selection's record lives in, named by the
 /// identity's key. Beside the farms, outside the `onelf-` mountpoint
@@ -868,8 +1130,14 @@ const RECORD_MAX_BYTES: u64 = 1024 * 1024;
 /// builds a new one beside the old rather than replacing it: an
 /// instance started earlier may still be loading through the old farm,
 /// and two instances starting together build the same one and race for
-/// nothing.
-fn farm_dir(store: &Path, fingerprint: &str, winners: &BTreeMap<String, PathBuf>) -> PathBuf {
+/// nothing. The closed host loader copy its loader link names keys it
+/// too, so a farm only ever names the copy it was built for.
+fn farm_dir(
+    store: &Path,
+    fingerprint: &str,
+    winners: &BTreeMap<String, PathBuf>,
+    loader_copy: Option<&Path>,
+) -> PathBuf {
     // FNV-1a, so the names are stable across runs without a hash
     // dependency.
     let mix = |h: &mut u64, b: u8| {
@@ -887,11 +1155,117 @@ fn farm_dir(store: &Path, fingerprint: &str, winners: &BTreeMap<String, PathBuf>
         }
         mix(&mut w, 0x1f);
     }
+    for b in loader_copy
+        .map(|p| p.as_os_str().as_bytes())
+        .unwrap_or_default()
+    {
+        mix(&mut w, *b);
+    }
     store.join(format!("farm-{h:016x}-{w:016x}"))
 }
 
+/// The cache root subdirectory closed host loader copies are kept in,
+/// one directory per closed image's digest.
+const LOADERS_DIR: &str = "loaders";
+
+/// Where under the cache `root` the closed image with digest `hash` of a
+/// loader named `name` is kept.
+fn loader_copy(root: &Path, hash: &blake3::Hash, name: &str) -> PathBuf {
+    root.join(LOADERS_DIR)
+        .join(hash.to_hex().as_str())
+        .join(name)
+}
+
+/// The file name a host loader's copy keeps, so the process's mappings
+/// still name the loader they came from.
+fn loader_name(source: &Path) -> String {
+    source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| crate::manifest::is_safe_component(n))
+        .unwrap_or("ld.so")
+        .to_string()
+}
+
+fn is_loader_soname(name: &str) -> bool {
+    name.starts_with("ld-linux")
+}
+
+/// Where the farm link for winner `name` points: the closed copy for the
+/// loader when one runs, the chosen host file for everything else. The
+/// copy is what a bundled loader's path shows once it is shadowed, so a
+/// process that re-execs through that path gets the closed loader too.
+fn link_target<'p>(name: &str, host: &'p Path, copy: Option<&'p Path>) -> &'p Path {
+    match copy {
+        Some(copy) if is_loader_soname(name) => copy,
+        _ => host,
+    }
+}
+
+/// A loader image read whole, refused when it is not a regular file or
+/// is larger than any loader.
+fn read_loader(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let md = file.metadata()?;
+    if !md.is_file() || md.len() > MAX_LOADER_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file of a loader's size",
+        ));
+    }
+    let mut image = Vec::with_capacity(md.len() as usize);
+    file.take(MAX_LOADER_BYTES as u64 + 1)
+        .read_to_end(&mut image)?;
+    if image.len() > MAX_LOADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "grew past a loader's size while read",
+        ));
+    }
+    Ok(image)
+}
+
+/// The image of the host loader at `source` closed to its default search
+/// directories, or why it cannot be. An image in which no default
+/// directory is recognized is refused: nothing then shows that its search
+/// is closed.
+fn close_loader(source: &Path) -> Result<Vec<u8>, String> {
+    let mut image = read_loader(source).map_err(|e| format!("it cannot be read: {e}"))?;
+    let scrub = ldso::scrub_glibc_loader(&mut image).map_err(|e| e.to_string())?;
+    if scrub.default_dirs == 0 {
+        return Err("its image names no default search directory the runtime can close".into());
+    }
+    Ok(image)
+}
+
+/// Write `image` to `path` with execute permission, through a temporary
+/// name beside it, so a reader never sees a partial copy.
+fn write_loader(path: &Path, image: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".loader.{}.{n}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&tmp)?;
+    let written = file.write_all(image).and_then(|()| {
+        drop(file);
+        fs::rename(&tmp, path)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// The link farm for `fingerprint` holding `winners`, built if it does not
-/// exist yet. An empty set leaves no farm.
+/// exist yet, with its loader links naming `copy` when the host's pair
+/// won. An empty set leaves no farm.
 ///
 /// Built in a scratch directory and renamed into place. A rename that finds
 /// the farm already there lost to another instance building the same
@@ -900,11 +1274,12 @@ fn materialize(
     store: &Path,
     fingerprint: &str,
     winners: &BTreeMap<String, PathBuf>,
+    copy: Option<&Path>,
 ) -> io::Result<Option<PathBuf>> {
     if winners.is_empty() {
         return Ok(None);
     }
-    let farm = farm_dir(store, fingerprint, winners);
+    let farm = farm_dir(store, fingerprint, winners, copy);
     if farm.is_dir() {
         return Ok(Some(farm));
     }
@@ -916,7 +1291,7 @@ fn materialize(
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch)?;
     for (name, target) in winners {
-        std::os::unix::fs::symlink(target, scratch.join(name))?;
+        std::os::unix::fs::symlink(link_target(name, target, copy), scratch.join(name))?;
     }
     match fs::rename(&scratch, &farm) {
         Ok(()) => {}
@@ -929,6 +1304,62 @@ fn materialize(
         }
     }
     Ok(Some(farm))
+}
+
+/// Make sure `loader`'s copy holds its closed image, writing it when it is
+/// absent or does not match. Every directory from the cache root down to the
+/// copy's has to be a `0700` one the store's uid owns, as the cache's own
+/// are.
+fn keep_loader_copy(loader: &ClosedLoader, store: LoaderStore) -> io::Result<()> {
+    let LoaderStore::Root { root, uid } = store else {
+        return Err(io::Error::other("no loader store"));
+    };
+    let dir = loader.copy.parent().unwrap_or(root);
+    let loaders = dir.parent().unwrap_or(root);
+    for d in [root, loaders, dir] {
+        if !crate::cache_layout::ensure_safe_dir(d, uid) {
+            return Err(io::Error::other(format!(
+                "{} is not a private directory",
+                d.display()
+            )));
+        }
+    }
+    let copy = HostLoader {
+        path: loader.copy.clone(),
+        hash: loader.hash,
+    };
+    if copy_is_owned_file(&copy.path, uid) && copy.verify().is_ok() {
+        return Ok(());
+    }
+    write_loader(&loader.copy, &loader.image)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot write {}: {e}", dir.display())))
+}
+
+/// Whether `copy`, kept under the cache `root`, can be trusted by its
+/// digest. Its contents are a function of the world-readable host loader,
+/// so anyone can produce a file that hashes right; what makes it this
+/// uid's is where it sits. Every directory from the root down to the
+/// copy's has to be a `0700` one `uid` owns, so nobody else can swap the
+/// file once it is checked, and the copy has to be a regular file `uid`
+/// owns, not a link to one.
+fn copy_is_private(root: &Path, copy: &HostLoader, uid: u32) -> bool {
+    let loaders = root.join(LOADERS_DIR);
+    let dir = loaders.join(copy.hash.to_hex().as_str());
+    [root, &loaders, &dir]
+        .iter()
+        .all(|d| crate::cache_layout::is_safe_owned_dir(d, uid))
+        && copy.path.parent() == Some(dir.as_path())
+        && copy_is_owned_file(&copy.path, uid)
+}
+
+/// Whether `path` is a regular file `uid` owns, not a link to one, that
+/// nobody else may write and that no other name shares, so nothing outside
+/// its private directory can reach it.
+fn copy_is_owned_file(path: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|md| {
+        md.is_file() && md.uid() == uid && md.mode() & 0o022 == 0 && md.nlink() == 1
+    })
 }
 
 /// Write `resolution` and the winners it was decided from to `dir`'s
@@ -951,8 +1382,13 @@ fn write_decision(
         text.push('\n');
     }
     text.push_str(&format!("fingerprint {fingerprint}\n"));
-    if let Some(interp) = &resolution.host_interp {
-        text.push_str(&format!("interp {}\n", interp.display()));
+    if let Some(loader) = &resolution.host_interp {
+        let name = loader
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        text.push_str(&format!("interp {}\t{name}\n", loader.hash.to_hex()));
     }
     for (name, path) in winners {
         text.push_str(&format!("host {name}\t{}\n", path.display()));
@@ -1010,22 +1446,44 @@ fn stat_line(path: &Path) -> String {
 }
 
 /// A selection's recorded decision, when it was made for this exact
-/// identity and host state and everything it names still exists.
-/// `farm_base` is the store the decision's farm lives in.
+/// identity and host state, everything it names still exists, and a
+/// closed loader copy it names still matches its digest.
+/// `farm_base` is the store the decision's farm lives in, and
+/// `loader_store` where loader copies are kept.
 fn load_selection(
     dir: &Path,
     identity: &SelectionIdentity,
     fingerprint: &str,
     farm_base: &Path,
+    loader_store: LoaderStore,
 ) -> Option<Resolution> {
     let text = read_record_bounded(&dir.join(DECISION_FILE))?;
     let lines = identity.identity_lines();
-    let (mut resolution, winners) =
+    let (mut resolution, winners, loader) =
         parse_decision(&text, SELECTION_RECORD_HEADER, &lines, fingerprint)?;
     if winners.is_empty() {
-        return Some(resolution);
+        return loader.is_none().then_some(resolution);
     }
-    resolution.farm = Some(farm_checked(farm_base, fingerprint, &winners)?);
+    let copy = match loader {
+        Some((hash, name)) => {
+            let LoaderStore::Root { root, uid } = loader_store else {
+                return None;
+            };
+            let copy = HostLoader {
+                path: loader_copy(root, &hash, &name),
+                hash,
+            };
+            if !copy_is_private(root, &copy, uid) {
+                return None;
+            }
+            copy.verify().ok()?;
+            Some(copy)
+        }
+        None => None,
+    };
+    let copy_path = copy.as_ref().map(|c| c.path.as_path());
+    resolution.farm = Some(farm_checked(farm_base, fingerprint, &winners, copy_path)?);
+    resolution.host_interp = copy;
     Some(resolution)
 }
 
@@ -1040,15 +1498,23 @@ fn read_record_bounded(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// A record's closed loader: the copy's digest and file name.
+type RecordedLoader = (blake3::Hash, String);
+
 /// The decision a record carries, when its version, identity lines and
 /// host state all check out, together with the winners it was decided
-/// from. Anything else is a miss; nothing is adopted partially.
+/// from and the closed loader it runs, if any. Anything else is a miss;
+/// nothing is adopted partially.
 fn parse_decision(
     text: &str,
     header: &str,
     identity_lines: &[&str],
     fingerprint: &str,
-) -> Option<(Resolution, BTreeMap<String, PathBuf>)> {
+) -> Option<(
+    Resolution,
+    BTreeMap<String, PathBuf>,
+    Option<RecordedLoader>,
+)> {
     let mut lines = text.lines();
     if lines.next()? != header {
         return None;
@@ -1063,13 +1529,14 @@ fn parse_decision(
     }
     let mut resolution = Resolution::default();
     let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut loader = None;
     for line in lines {
-        if let Some(interp) = line.strip_prefix("interp ") {
-            let interp = PathBuf::from(interp);
-            if !interp.is_file() {
+        if let Some(rest) = line.strip_prefix("interp ") {
+            let (hash, name) = rest.split_once('\t')?;
+            if loader.is_some() || !crate::manifest::is_safe_component(name) {
                 return None;
             }
-            resolution.host_interp = Some(interp);
+            loader = Some((blake3::Hash::from_hex(hash).ok()?, name.to_string()));
         } else if let Some(rest) = line.strip_prefix("host ") {
             let (name, path) = rest.split_once('\t')?;
             winners.insert(name.to_string(), PathBuf::from(path));
@@ -1084,20 +1551,23 @@ fn parse_decision(
             resolution.incomparable.push(name.to_string());
         }
     }
-    Some((resolution, winners))
+    Some((resolution, winners, loader))
 }
 
-/// The farm for `fingerprint` holding `winners`, when every link names
-/// the file the decision chose and the file still exists.
+/// The farm for `fingerprint` holding `winners` and naming the loader
+/// `copy`, when every link names what the decision chose and the chosen
+/// file still exists.
 fn farm_checked(
     base: &Path,
     fingerprint: &str,
     winners: &BTreeMap<String, PathBuf>,
+    copy: Option<&Path>,
 ) -> Option<PathBuf> {
-    let farm = farm_dir(base, fingerprint, winners);
+    let farm = farm_dir(base, fingerprint, winners, copy);
     for (name, path) in winners {
+        let expected = link_target(name, path, copy);
         match fs::read_link(farm.join(name)) {
-            Ok(target) if target == path.as_path() && path.is_file() => {}
+            Ok(target) if target == expected && path.is_file() => {}
             _ => return None,
         }
     }
@@ -1120,6 +1590,12 @@ mod tests {
         icd_dir: PathBuf,
         /// The farm the last resolution produced, where `farm_link` looks.
         last_farm: std::cell::RefCell<Option<PathBuf>>,
+        /// The cache root closed loader copies go under.
+        loader_root: PathBuf,
+        /// The host's name service configuration; absent unless a test
+        /// writes one.
+        nsswitch: PathBuf,
+        uid: u32,
     }
 
     impl World {
@@ -1138,6 +1614,19 @@ mod tests {
                 pkg,
                 icd_dir,
                 last_farm: std::cell::RefCell::new(None),
+                loader_root: root.join("cache"),
+                nsswitch: root.join("nsswitch.conf"),
+                uid: {
+                    use std::os::unix::fs::MetadataExt;
+                    fs::metadata(&root).unwrap().uid()
+                },
+            }
+        }
+
+        fn loader_store(&self) -> LoaderStore<'_> {
+            LoaderStore::Root {
+                root: &self.loader_root,
+                uid: self.uid,
             }
         }
 
@@ -1189,6 +1678,24 @@ mod tests {
             self.resolve_full(policy, extra_root, true)
         }
 
+        /// [`decide`] for this world, with launches able to shadow.
+        fn decide(&self, policy: HostLibsPolicy) -> Decision {
+            let icd_dir = self.icd_dir.to_string_lossy().into_owned();
+            decide(&Request {
+                pkg_root: &self.pkg,
+                lib_dirs: &["lib"],
+                policy,
+                store: &self.store,
+                ld_cache: &self.cache,
+                icd_dirs: &[icd_dir.as_str()],
+                extra_root: None,
+                set_roots: &[],
+                host_libc: true,
+                loader_store: self.loader_store(),
+                nsswitch: &self.nsswitch,
+            })
+        }
+
         fn resolve_full(
             &self,
             policy: HostLibsPolicy,
@@ -1208,6 +1715,8 @@ mod tests {
                     extra_root,
                     set_roots: &set_roots,
                     host_libc,
+                    loader_store: self.loader_store(),
+                    nsswitch: &self.nsswitch,
                 },
                 &[],
             );
@@ -1236,6 +1745,8 @@ mod tests {
                     extra_root: None,
                     set_roots,
                     host_libc: true,
+                    loader_store: self.loader_store(),
+                    nsswitch: &self.nsswitch,
                 },
                 pins,
             );
@@ -1369,6 +1880,8 @@ mod tests {
             extra_root: None,
             set_roots: &[],
             host_libc: true,
+            loader_store: w.loader_store(),
+            nsswitch: &w.nsswitch,
         };
 
         let d = decide(&req);
@@ -1485,30 +1998,420 @@ mod tests {
         assert!(!closure.contains("libunrelated.so.1"));
     }
 
-    #[test]
-    fn a_newer_host_glibc_brings_its_loader_and_family() {
-        let w = World::new();
-        let host_ld = w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
-        let host_libc = w.host(
+    /// A synthetic host loader carrying the default directory table and
+    /// cache path a real one has, so it can be closed.
+    fn closable_loader() -> Vec<u8> {
+        let mut image = versioned(&["GLIBC_2.2.5"]);
+        image.extend_from_slice(b"\0/etc/ld.so.cache\0/lib64/\0/usr/lib64/\0");
+        image
+    }
+
+    /// A host libc newer than the bundled one, built for the loader at
+    /// `host_ld`, with the bundle carrying the older pair.
+    fn newer_host_glibc(w: &World, host_ld: &Path) -> PathBuf {
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.bundle("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        w.host(
             "libc.so.6",
             &shared_object_with_interp(
                 &[(0, "GLIBC_2.2.5"), (0, "GLIBC_2.34")],
                 &[],
                 Some(host_ld.to_str().unwrap()),
             ),
-        );
+        )
+    }
+
+    #[test]
+    fn a_newer_host_glibc_brings_its_loader_and_family() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        let host_libc = newer_host_glibc(&w, &host_ld);
         let host_libm = w.host("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]));
-        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
         w.bundle("libm.so.6", &versioned(&["GLIBC_2.2.5"]));
-        w.bundle("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
         w.bundle("libother.so.1", &versioned(&["OTHER_1"]));
 
         let r = w.resolve(HostLibsPolicy::Auto);
-        assert_eq!(r.host_interp, Some(host_ld.clone()));
+        let loader = r.host_interp.clone().expect("the host's loader runs");
+        assert_eq!(
+            loader.path,
+            w.loader_root
+                .join("loaders")
+                .join(loader.hash.to_hex().as_str())
+                .join("ld-linux-x86-64.so.2")
+        );
+        for dir in [&w.loader_root, &w.loader_root.join("loaders")] {
+            assert!(crate::cache_layout::is_safe_owned_dir(dir, w.uid));
+        }
         assert_eq!(w.farm_link("libc.so.6"), Some(host_libc));
         assert_eq!(w.farm_link("libm.so.6"), Some(host_libm));
-        assert_eq!(w.farm_link("ld-linux-x86-64.so.2"), Some(host_ld));
+        assert_eq!(
+            w.farm_link("ld-linux-x86-64.so.2"),
+            Some(loader.path.clone()),
+            "the shadowed bundled loader path shows the closed copy"
+        );
         assert!(w.farm_link("libother.so.1").is_none());
+
+        let mut closed = closable_loader();
+        ldso::scrub_glibc_loader(&mut closed).unwrap();
+        assert_eq!(fs::read(&loader.path).unwrap(), closed);
+        assert_eq!(loader.hash, blake3::hash(&closed));
+        loader.verify().unwrap();
+        assert_eq!(
+            fs::read(&host_ld).unwrap(),
+            closable_loader(),
+            "the host's loader is never written"
+        );
+
+        let decided = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decided.farm, r.farm, "the report names the launch's farm");
+        assert_eq!(decided.host_interp.unwrap().source, host_ld);
+    }
+
+    /// A loader whose image names no default directory the scrub knows
+    /// cannot be shown closed, so the bundled pair runs and the reason
+    /// is there for the report.
+    #[test]
+    fn a_host_loader_that_cannot_be_closed_keeps_the_bundled_pair() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        newer_host_glibc(&w, &host_ld);
+
+        let r = w.resolve(HostLibsPolicy::Always);
+        assert!(r.host_interp.is_none());
+        assert!(w.farm_link("libc.so.6").is_none());
+        assert!(w.farm_link("ld-linux-x86-64.so.2").is_none());
+
+        let decided = w.decide(HostLibsPolicy::Always);
+        assert!(decided.host_interp.is_none());
+        let (source, why) = decided.host_interp_refused.unwrap();
+        assert_eq!(source, host_ld);
+        assert!(why.contains("no default search directory"), "{why}");
+
+        fs::write(&host_ld, b"not an ELF image").unwrap();
+        let (_, why) = w
+            .decide(HostLibsPolicy::Always)
+            .host_interp_refused
+            .unwrap();
+        assert!(why.contains("not an ELF object"), "{why}");
+    }
+
+    /// Without a place a loader copy can run from, the host's pair is not
+    /// taken, and a record made while there was one is not served.
+    #[test]
+    fn a_refused_loader_store_keeps_the_bundled_pair() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        assert!(w.resolve(HostLibsPolicy::Always).host_interp.is_some());
+
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let req = Request {
+            pkg_root: &w.pkg,
+            lib_dirs: &["lib"],
+            policy: HostLibsPolicy::Always,
+            store: &w.store,
+            ld_cache: &w.cache,
+            icd_dirs: &[icd_dir.as_str()],
+            extra_root: None,
+            set_roots: &[],
+            host_libc: true,
+            loader_store: LoaderStore::Refused("the loader copy's filesystem is mounted noexec"),
+            nsswitch: &w.nsswitch,
+        };
+        let r = resolve_selected(&req, &[]);
+        assert!(r.host_interp.is_none());
+        assert!(r.farm.is_none_or(|farm| !farm.join("libc.so.6").exists()));
+        let (source, why) = decide(&req).host_interp_refused.unwrap();
+        assert_eq!(source, host_ld);
+        assert_eq!(why, "the loader copy's filesystem is mounted noexec");
+    }
+
+    /// A copy that cannot be written after all takes the host's pair away
+    /// but nothing else: the driver still comes from the host, and since
+    /// the fallback is not recorded, a later launch tries the copy again.
+    #[test]
+    fn a_copy_that_cannot_be_written_keeps_the_rest_of_the_decision() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let host_gl = w.host("libGL.so.1", &driver_needing(&[]));
+        fs::create_dir_all(&w.loader_root).unwrap();
+        fs::write(w.loader_root.join("loaders"), b"in the way").unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert!(r.host_interp.is_none());
+        assert_eq!(w.farm_link("libGL.so.1"), Some(host_gl));
+        assert!(w.farm_link("libc.so.6").is_none());
+        assert!(w.farm_link("ld-linux-x86-64.so.2").is_none());
+        assert!(!sel_dir(&w.store, &[]).join(DECISION_FILE).exists());
+
+        fs::remove_file(w.loader_root.join("loaders")).unwrap();
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert!(r.host_interp.is_some());
+        assert!(w.farm_link("libc.so.6").is_some());
+    }
+
+    /// Two decisions closing the same loader share one copy.
+    #[test]
+    fn one_copy_serves_every_decision_of_a_loader() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let first = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        let second = w.resolve(HostLibsPolicy::Always).host_interp.unwrap();
+        assert_eq!(first, second);
+        let copies = fs::read_dir(w.loader_root.join("loaders")).unwrap().count();
+        assert_eq!(copies, 1);
+    }
+
+    /// The host libc opens its name service modules and `libgcc_s` by
+    /// name, and the closed loader finds them only in the farm. Each
+    /// service the configuration names is chosen when the bundle lacks
+    /// it, with what it needs, and none is chosen beside the bundled libc.
+    #[test]
+    fn the_host_libc_gets_the_modules_it_opens_by_name() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let sss = w.host("libnss_sss.so.2", &driver_needing(&["libsssdep.so.1"]));
+        let dep = w.host("libsssdep.so.1", &versioned(&[]));
+        let gcc = w.host("libgcc_s.so.1", &versioned(&["GCC_3.0"]));
+        w.host("libnss_unnamed.so.2", &versioned(&[]));
+        fs::write(
+            &w.nsswitch,
+            "# comment: unnamed\npasswd: files sss [NOTFOUND=return] systemd\n\
+             group:    sss\nbogus line\nhosts: Bad.Name dns\n",
+        )
+        .unwrap();
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libnss_sss.so.2"), Some(sss));
+        assert_eq!(w.farm_link("libsssdep.so.1"), Some(dep));
+        assert_eq!(w.farm_link("libgcc_s.so.1"), Some(gcc));
+        assert!(w.farm_link("libnss_unnamed.so.2").is_none());
+        assert_eq!(
+            host_libc_opens(&w.nsswitch),
+            [
+                "libgcc_s.so.1",
+                "libnss_dns.so.2",
+                "libnss_files.so.2",
+                "libnss_sss.so.2",
+                "libnss_systemd.so.2",
+            ]
+        );
+
+        fs::write(&host_ld, versioned(&["GLIBC_2.2.5"])).unwrap();
+        w.write_cache();
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(w.farm_link("libnss_sss.so.2").is_none());
+        assert!(w.farm_link("libgcc_s.so.1").is_none());
+    }
+
+    /// A configuration larger than any real one names nothing, and only
+    /// its first lines are read.
+    #[test]
+    fn the_name_service_configuration_is_read_bounded() {
+        let w = World::new();
+        assert_eq!(host_libc_opens(&w.nsswitch), ["libgcc_s.so.1"]);
+        let mut text = "passwd: files\n".repeat(NSSWITCH_MAX_LINES);
+        text.push_str("group: late\n");
+        fs::write(&w.nsswitch, &text).unwrap();
+        assert!(!host_libc_opens(&w.nsswitch).contains(&"libnss_late.so.2".to_string()));
+        let huge = "passwd: big\n".repeat(NSSWITCH_MAX_BYTES as usize / 4);
+        fs::write(&w.nsswitch, huge).unwrap();
+        assert_eq!(host_libc_opens(&w.nsswitch), ["libgcc_s.so.1"]);
+    }
+
+    /// Where loader copies can be kept is part of the host: a refusal
+    /// recorded while the store was unusable is not served once it is.
+    #[test]
+    fn the_loader_store_keys_the_decision() {
+        let w = World::new();
+        let stamp = |store| {
+            fingerprint(
+                &w.cache,
+                &[],
+                HostLibsPolicy::Auto,
+                None,
+                true,
+                &w.nsswitch,
+                store,
+            )
+        };
+        let refused = stamp(LoaderStore::Refused("noexec"));
+        assert_ne!(refused, stamp(w.loader_store()));
+        assert_eq!(refused, stamp(LoaderStore::Refused("another reason")));
+        let elsewhere = w.loader_root.join("elsewhere");
+        let moved = stamp(LoaderStore::Root {
+            root: &elsewhere,
+            uid: w.uid,
+        });
+        assert_ne!(moved, stamp(w.loader_store()));
+    }
+
+    /// A changed name service configuration is a changed host.
+    #[test]
+    fn the_name_service_configuration_keys_the_decision() {
+        let w = World::new();
+        let before = fingerprint(
+            &w.cache,
+            &[],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        fs::write(&w.nsswitch, "passwd: files\n").unwrap();
+        let after = fingerprint(
+            &w.cache,
+            &[],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        assert_ne!(before, after);
+    }
+
+    /// A recorded decision is served only while its loader copy matches
+    /// the digest it recorded. A damaged copy is a miss, and deciding
+    /// again writes the copy back rather than running what is there.
+    #[test]
+    fn a_damaged_loader_copy_is_never_served() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let first = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+
+        fs::write(&first.path, b"\x7fELF tampered").unwrap();
+        assert!(first.verify().is_err());
+        let again = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        assert_eq!(again, first);
+        again.verify().unwrap();
+
+        fs::remove_file(&first.path).unwrap();
+        let again = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        again.verify().unwrap();
+    }
+
+    /// A copy is trusted by its digest only where nobody else could have
+    /// put it or could swap it: a copy behind a loosened directory, one
+    /// owned by another uid, or a link to an identical file is never
+    /// served, and deciding again writes a private copy back.
+    #[test]
+    fn a_copy_outside_private_directories_is_never_served() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let copy = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        let identity = SelectionIdentity::new(&[]).unwrap();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &[w.icd_dir.to_str().unwrap()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        let dir = sel_dir(&w.store, &[]);
+        let load = || load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store());
+        assert!(load().is_some());
+        assert!(!copy_is_private(
+            &w.loader_root,
+            &copy,
+            w.uid.wrapping_add(1)
+        ));
+
+        let copy_dir = copy.path.parent().unwrap();
+        fs::set_permissions(copy_dir, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(load().is_none(), "a group-writable directory");
+        let again = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        assert!(copy_is_private(&w.loader_root, &again, w.uid));
+
+        let elsewhere = w.loader_root.join("planted");
+        fs::copy(&copy.path, &elsewhere).unwrap();
+        fs::remove_file(&copy.path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &copy.path).unwrap();
+        copy.verify().unwrap();
+        assert!(load().is_none(), "a link to an identical file");
+        let again = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        assert!(!fs::symlink_metadata(&again.path).unwrap().is_symlink());
+        assert!(load().is_some());
+    }
+
+    /// A record naming a digest other than its copy's, or a copy name
+    /// that leaves the farm, is a miss decided afresh.
+    #[test]
+    fn a_record_with_a_foreign_loader_is_a_miss() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let first = w.resolve(HostLibsPolicy::Auto).host_interp.unwrap();
+        let record = sel_dir(&w.store, &[]).join(DECISION_FILE);
+        let text = fs::read_to_string(&record).unwrap();
+        let line = format!("interp {}\tld-linux-x86-64.so.2", first.hash.to_hex());
+        assert!(text.contains(&line), "{text}");
+
+        let identity = SelectionIdentity::new(&[]).unwrap();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &[w.icd_dir.to_str().unwrap()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        let dir = sel_dir(&w.store, &[]);
+        assert!(
+            load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()).is_some()
+        );
+        for forged in [
+            format!(
+                "interp {}\tld-linux-x86-64.so.2",
+                blake3::hash(b"other").to_hex()
+            ),
+            format!("interp {}\t..", first.hash.to_hex()),
+            format!("interp {}", first.hash.to_hex()),
+            "interp nothex\tld-linux-x86-64.so.2".to_string(),
+        ] {
+            fs::write(&record, text.replace(&line, &forged)).unwrap();
+            assert!(
+                load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()).is_none(),
+                "{forged}"
+            );
+        }
+        fs::write(&record, text.replace(&line, &format!("{line}\n{line}"))).unwrap();
+        assert!(
+            load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()).is_none()
+        );
+    }
+
+    /// Under the closed host loader nothing is found outside the farm, so
+    /// a glibc family member a host driver needs and the bundle lacks is
+    /// chosen with the pair.
+    #[test]
+    fn a_driver_gets_the_family_member_the_bundle_lacks() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let host_dl = w.host("libdl.so.2", &versioned(&["GLIBC_2.2.5"]));
+        w.host("libGL.so.1", &driver_needing(&["libdl.so.2"]));
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libdl.so.2"), Some(host_dl));
+
+        fs::write(&host_ld, versioned(&["GLIBC_2.2.5"])).unwrap();
+        w.write_cache();
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(
+            w.farm_link("libdl.so.2").is_none(),
+            "beside the bundled libc no host family member is taken"
+        );
     }
 
     /// Under the host loader the bundled executables' run path still finds
@@ -1517,17 +2420,8 @@ mod tests {
     #[test]
     fn a_launch_that_cannot_shadow_keeps_the_bundled_glibc() {
         let w = World::new();
-        let host_ld = w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
-        w.host(
-            "libc.so.6",
-            &shared_object_with_interp(
-                &[(0, "GLIBC_2.2.5"), (0, "GLIBC_2.34")],
-                &[],
-                Some(host_ld.to_str().unwrap()),
-            ),
-        );
-        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
-        w.bundle("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
 
         let r = w.resolve_full(HostLibsPolicy::Auto, None, false);
         assert!(r.host_interp.is_none());
@@ -1536,7 +2430,7 @@ mod tests {
         // The decision recorded for it is not the one a launch that can
         // shadow gets.
         let r = w.resolve_full(HostLibsPolicy::Auto, None, true);
-        assert_eq!(r.host_interp, Some(host_ld));
+        assert!(r.host_interp.is_some());
     }
 
     #[test]
@@ -1869,6 +2763,8 @@ mod tests {
             extra_root: None,
             set_roots: &[],
             host_libc: true,
+            loader_store: w.loader_store(),
+            nsswitch: &w.nsswitch,
         };
         let d = decide(&req);
         assert_eq!(
@@ -2211,19 +3107,25 @@ mod tests {
             HostLibsPolicy::Auto,
             None,
             true,
+            &w.nsswitch,
+            w.loader_store(),
         );
 
         let decided = w.resolve_selection(HostLibsPolicy::Auto, &set_roots, &pins);
         assert_eq!(w.farm_link("libfoo.so.1"), Some(host_foo.clone()));
         let dir = sel_dir(&w.store, &pins);
 
-        let again = load_selection(&dir, &identity, &fingerprint, &w.store).unwrap();
+        let again =
+            load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()).unwrap();
         assert_eq!(again.farm.as_ref(), decided.farm.as_ref());
 
         let other = SelectionIdentity::new(&[pin("qt", 2)]).unwrap();
-        assert_eq!(load_selection(&dir, &other, &fingerprint, &w.store), None);
         assert_eq!(
-            load_selection(&dir, &identity, "another host", &w.store),
+            load_selection(&dir, &other, &fingerprint, &w.store, w.loader_store()),
+            None
+        );
+        assert_eq!(
+            load_selection(&dir, &identity, "another host", &w.store, w.loader_store()),
             None
         );
     }
@@ -2247,6 +3149,8 @@ mod tests {
             HostLibsPolicy::Auto,
             None,
             true,
+            &w.nsswitch,
+            w.loader_store(),
         );
         w.resolve_selection(HostLibsPolicy::Auto, &set_roots, &pins);
         let dir = sel_dir(&w.store, &pins);
@@ -2255,7 +3159,7 @@ mod tests {
         let miss = |bytes: &[u8]| {
             fs::write(&record, bytes).unwrap();
             assert_eq!(
-                load_selection(&dir, &identity, &fingerprint, &w.store),
+                load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()),
                 None
             );
         };
@@ -2278,7 +3182,7 @@ mod tests {
 
         fs::write(&record, &good).unwrap();
         assert!(
-            load_selection(&dir, &identity, &fingerprint, &w.store).is_some(),
+            load_selection(&dir, &identity, &fingerprint, &w.store, w.loader_store()).is_some(),
             "the intact record is still a hit"
         );
     }

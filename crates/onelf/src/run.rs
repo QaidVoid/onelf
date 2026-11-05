@@ -242,6 +242,10 @@ pub fn run(
                     extra_root: pinned_gl.as_ref().map(|(root, _)| root.as_path()),
                     set_roots: &set_roots,
                     host_libc: false,
+                    loader_store: resolve::LoaderStore::Refused(
+                        "a development run never takes the host's glibc",
+                    ),
+                    nsswitch: resolve::nsswitch_file(),
                 },
                 &onelf_rt::sets::pins(),
             )
@@ -370,7 +374,7 @@ pub fn run(
         pins: &pins,
         policy,
         host_libc: false,
-        loader: resolution.host_interp.as_ref().map(|p| p.as_os_str()),
+        loader: resolution.host_interp.as_ref().map(|l| l.path.as_os_str()),
         entrypoint: Some(ep_name.as_str()),
         links: &links,
         runtime_env: &view_record,
@@ -483,7 +487,7 @@ pub fn run(
         &lib_path,
         kernel_lib_path.as_deref(),
         argv0,
-        resolution.host_interp.as_deref(),
+        resolution.host_interp.as_ref().map(|l| l.path.as_path()),
     )?;
     cmd.args(&ep_args);
     cmd.args(passthrough_args);

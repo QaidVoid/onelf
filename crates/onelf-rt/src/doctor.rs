@@ -463,6 +463,7 @@ fn verdicts(
             "  the dependency sets' libraries are not weighed below",
         );
     }
+    let loader_place = onelf_rt::cache::LoaderPlace::for_this_uid();
     let decision = resolve::decide(&Request {
         pkg_root: root,
         lib_dirs: &lib_dirs,
@@ -473,6 +474,8 @@ fn verdicts(
         extra_root: None,
         set_roots: &[],
         host_libc: places_host_files,
+        loader_store: loader_place.store(),
+        nsswitch: resolve::nsswitch_file(),
     });
     let mut host_only = Vec::new();
     for (name, choice) in &decision.compared {
@@ -505,8 +508,24 @@ fn verdicts(
             "  nothing to compare: the host offers no driver libraries",
         );
     }
-    if let Some(interp) = &decision.host_interp {
-        line(out, &format!("  loader: the host's {}", interp.display()));
+    if let Some(loader) = &decision.host_interp {
+        line(
+            out,
+            &format!(
+                "  loader: the host's {}, run from a private copy closed to its default \
+                 search directories",
+                loader.source.display()
+            ),
+        );
+    }
+    if let Some((source, why)) = &decision.host_interp_refused {
+        line(
+            out,
+            &format!(
+                "  loader: the host's {} is not used, {why}; the bundled loader and libc run",
+                source.display()
+            ),
+        );
     }
     if let Some(farm) = &decision.farm {
         // The farm lives under the private runtime directory, whose place

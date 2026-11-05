@@ -76,10 +76,15 @@ in the bundle and on the host, it reads the symbol versions each copy
 defines and takes the superset. A newer build of a library only ever adds
 versions, so the superset can stand in for the other copy. The loader and
 libc are compared first, as a pair, and if the host's glibc is newer the
-whole process runs under the host loader. The chosen host libraries are
-placed over their bundled counterparts, by a bind mount inside a private
-mount namespace or by a symlink in a tree that belongs to this launch
-alone, so every process the app starts sees the same choice. A launch
+whole process runs under a private copy of the host loader with its
+compiled-in default search directories removed, so a host library the
+resolver did not choose is not found. The exception is an entrypoint
+that carries a self-extracting trailer and names the host loader as its
+interpreter: the kernel starts it under the host's own loader. The
+chosen host libraries are placed over their bundled counterparts, by a
+bind mount inside a private mount namespace or by a symlink in a tree
+that belongs to this launch alone, so every process the app starts sees
+the same choice. A launch
 that can do neither never takes the host's glibc. A chosen library the
 bundle does not carry, the driver itself for one, is shown as a symlink
 in the bundle's library directory, so nothing goes on `LD_LIBRARY_PATH`

@@ -632,9 +632,146 @@ pub fn base_dir() -> Option<PathBuf> {
     cache_dir()
 }
 
+/// Why no loader copy can be kept when this uid has no cache root at all.
+const NO_CACHE_ROOT: &str = "there is no cache directory to keep the loader copy in";
+
+/// Where this uid keeps closed host loader copies, as the resolver is to
+/// be told: the cache root, or why no copy can be kept there.
+pub enum LoaderPlace {
+    /// The cache root the copies go under, and the uid that owns it.
+    Root(PathBuf, u32),
+    /// No copy can be kept, and why.
+    Refused(&'static str),
+}
+
+impl LoaderPlace {
+    /// The place for this uid, judged without creating anything in the
+    /// cache.
+    ///
+    /// An ordinary uid uses its cache root. Root's runtime cache sits in
+    /// its private base under `/run` or `/tmp`, which distributions mount
+    /// `noexec`, so root uses the persistent `/var/cache/onelf` instead
+    /// and refuses when `/var/cache` is not safely its own.
+    pub fn for_this_uid() -> Self {
+        let uid = rustix::process::getuid().as_raw();
+        let root = if uid == 0 {
+            onelf_format::cache_layout::persistent_privileged_root()
+                .ok_or("/var/cache is not owned by root alone")
+        } else {
+            onelf_format::cache_layout::proposed_root(uid, crate::paths::private_dir())
+                .ok_or(NO_CACHE_ROOT)
+        };
+        match root {
+            Ok(root) => Self::judge(root, uid),
+            Err(why) => Self::Refused(why),
+        }
+    }
+
+    /// Whether `root` can hold `uid`'s copies. The copy is written there
+    /// and executed, so an existing root has to be a real directory `uid`
+    /// owns and can write, with any `loaders/` in it one too, and a missing
+    /// root has to have a writable nearest existing ancestor to be created
+    /// in. A loose mode on a directory `uid` owns is no refusal: writing
+    /// the copy tightens it. The filesystem must not be mounted `noexec`.
+    fn judge(root: PathBuf, uid: u32) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let writable = |dir: &Path| rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_ok();
+        let owned_dir =
+            |dir: &Path| fs::symlink_metadata(dir).is_ok_and(|md| md.is_dir() && md.uid() == uid);
+        let Some(existing) = root
+            .ancestors()
+            .find(|dir| fs::symlink_metadata(dir).is_ok())
+        else {
+            return Self::Refused(NO_CACHE_ROOT);
+        };
+        if existing == root {
+            if !(owned_dir(&root) && writable(&root)) {
+                return Self::Refused(
+                    "the cache root is not a private directory this uid can write",
+                );
+            }
+            let loaders = root.join("loaders");
+            if fs::symlink_metadata(&loaders).is_ok() && !owned_dir(&loaders) {
+                return Self::Refused("the cache root's loaders/ is not a directory this uid owns");
+            }
+        } else if !(fs::metadata(existing).is_ok_and(|md| md.is_dir()) && writable(existing)) {
+            return Self::Refused("the cache root is missing and cannot be created");
+        }
+        let noexec = rustix::fs::statvfs(existing)
+            .is_ok_and(|fs| fs.f_flag.contains(rustix::fs::StatVfsMountFlags::NOEXEC));
+        if noexec {
+            Self::Refused("the loader copy's filesystem is mounted noexec")
+        } else {
+            Self::Root(root, uid)
+        }
+    }
+
+    /// The place as the resolver's request carries it.
+    pub fn store(&self) -> onelf_format::resolve::LoaderStore<'_> {
+        match self {
+            Self::Root(root, uid) => onelf_format::resolve::LoaderStore::Root { root, uid: *uid },
+            Self::Refused(why) => onelf_format::resolve::LoaderStore::Refused(why),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cache root that cannot hold a loader copy is refused up front:
+    /// one that is not this uid's writable directory, one whose `loaders/`
+    /// is blocked, and a missing one whose parent cannot take it. A loose
+    /// mode on this uid's own root is no refusal.
+    #[test]
+    fn an_unwritable_cache_root_refuses_loader_copies() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("onelf-loader-place-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        if rustix::fs::statvfs(&base)
+            .is_ok_and(|fs| fs.f_flag.contains(rustix::fs::StatVfsMountFlags::NOEXEC))
+        {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        let uid = fs::metadata(&base).unwrap().uid();
+        let root = base.join("onelf");
+        let judged = || LoaderPlace::judge(root.clone(), uid);
+        let refused = |place: LoaderPlace, reason: &str| matches!(place, LoaderPlace::Refused(why) if why.contains(reason));
+        let mode = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+
+        assert!(matches!(judged(), LoaderPlace::Root(..)));
+        fs::create_dir(&root).unwrap();
+        mode(&root, 0o755).unwrap();
+        assert!(matches!(judged(), LoaderPlace::Root(..)), "a loose mode");
+        assert!(refused(
+            LoaderPlace::judge(root.clone(), uid.wrapping_add(1)),
+            "can write"
+        ));
+
+        let loaders = root.join("loaders");
+        fs::write(&loaders, b"in the way").unwrap();
+        assert!(refused(judged(), "loaders/"), "a file at loaders/");
+        fs::remove_file(&loaders).unwrap();
+        std::os::unix::fs::symlink(&base, &loaders).unwrap();
+        assert!(refused(judged(), "loaders/"), "a link at loaders/");
+        fs::remove_file(&loaders).unwrap();
+        fs::create_dir(&loaders).unwrap();
+        assert!(matches!(judged(), LoaderPlace::Root(..)));
+        fs::remove_dir(&loaders).unwrap();
+
+        if !rustix::process::geteuid().is_root() {
+            mode(&root, 0o500).unwrap();
+            assert!(refused(judged(), "can write"));
+            mode(&root, 0o700).unwrap();
+            fs::remove_dir(&root).unwrap();
+            mode(&base, 0o500).unwrap();
+            assert!(refused(judged(), "cannot be created"));
+            mode(&base, 0o700).unwrap();
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn file_hashes_to_detects_poisoning() {

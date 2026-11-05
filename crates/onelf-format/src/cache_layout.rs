@@ -19,6 +19,7 @@
 //! meta/<id>             last-used timestamp
 //! lock/<id>             in-use lock, held shared for an instance's lifetime
 //! lock/<id>.extract     extraction mutex
+//! loaders/<hash>/<name> closed host loader copy, keyed by its BLAKE3
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -98,6 +99,14 @@ fn persistent_privileged_base() -> Option<PathBuf> {
     persistent_base_in(0, Path::new("/var/cache"))
 }
 
+/// The persistent cache root a privileged process may keep state under
+/// that has to survive a reboot and be executable, `/var/cache/onelf`,
+/// when `/var/cache` is a real directory root owns that group and other
+/// cannot write. Nothing is created.
+pub fn persistent_privileged_root() -> Option<PathBuf> {
+    persistent_privileged_base().map(|base| base.join("onelf"))
+}
+
 /// [`persistent_privileged_base`]'s rule for `uid` over an explicit
 /// candidate: `var_cache` is accepted only as a real directory `uid` owns
 /// that group and other cannot write, so nobody else can have planted
@@ -175,8 +184,9 @@ fn resolve_root_with(
 
 /// Where [`resolve_root`] would place the cache root for `uid`, computed
 /// from the environment alone: nothing is created and nothing on disk is
-/// probed. The launch export answers this so merely starting a launch
-/// never establishes the persistent cache; acquisition keeps using
+/// probed. The launch export answers this so publishing where the cache
+/// is never establishes it. A launch that runs a closed host loader does
+/// create the root, to keep the copy in; acquisition keeps using
 /// [`resolve_root`], which creates the root under its safe-creation
 /// rules on demand. The `fallback` applies only when the environment
 /// names no absolute cache location, and is the only base uid 0 takes.

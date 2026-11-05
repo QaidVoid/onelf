@@ -351,9 +351,9 @@ Then it picks an exec strategy based on what the binary needs:
    libraries, and the host and set libraries linked beside them (see
    [Environment](./environment#library-paths)), so no
    `LD_LIBRARY_PATH` is set. When the host's glibc is newer than the
-   bundled one, the runtime sets `ONELF_INTERP` to the host loader and
-   the bootstrap jumps into that instead, for this process and every
-   one it execs.
+   bundled one, the runtime sets `ONELF_INTERP` to its closed copy of
+   the host loader and the bootstrap jumps into that instead, for this
+   process and every one it execs.
 
 2. **Userland-execve.** For binaries without bootstrap injection that
    are PIE (`ET_DYN`), when the package records its bundled loader in

@@ -528,9 +528,12 @@ fn exec_cache(
         pins: &pins,
         policy,
         host_libc: false,
-        loader: resolved
-            .as_ref()
-            .and_then(|r| r.resolution.host_interp.as_ref().map(|p| p.as_os_str())),
+        loader: resolved.as_ref().and_then(|r| {
+            r.resolution
+                .host_interp
+                .as_ref()
+                .map(|l| l.path.as_os_str())
+        }),
         entrypoint: Some(&ep_name),
         links: &links,
         runtime_env: &runtime_env,

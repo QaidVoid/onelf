@@ -646,7 +646,13 @@ fn spawn_package(cmd: &mut Command) -> std::process::Child {
 }
 
 fn workdir(tag: &str) -> Workdir {
-    let d = std::env::temp_dir().join(format!(
+    workdir_in(&std::env::temp_dir(), tag)
+}
+
+/// [`workdir`] under `base`, for a test that hides the temporary
+/// directory behind a mount of its own.
+fn workdir_in(base: &Path, tag: &str) -> Workdir {
+    let d = base.join(format!(
         "onelf-it-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -7557,16 +7563,34 @@ fn ldd_path(binary: &Path, soname: &str) -> Option<PathBuf> {
     })
 }
 
-/// A host whose glibc is newer than the bundle's runs the entrypoint under
-/// the host loader, with the bundle's own libraries still loading from the
-/// bundle.
+/// A package whose bundled glibc is this machine's with its newest
+/// version definition trimmed away, so the host's copy reads as a strict
+/// superset, beside a loader cache naming the host's glibc family.
 ///
-/// This machine's glibc is both sides of the comparison: the bundled copy
-/// is the same file with its newest version definition trimmed away, so
-/// the host copy reads as a strict superset.
-#[test]
-fn a_newer_host_glibc_runs_the_entrypoint_under_the_host_loader() {
-    let td = workdir("hostloader");
+/// The app prints its mappings and a bundled library's value, and, given
+/// a soname, whether it can `dlopen` it. `bin/app` is bootstrap-injected.
+/// `bin/plain` and `bin/nopie` are the same program left as compiled,
+/// one position-independent and one not, so a launch reaches them through
+/// a userland exec and through the loader's command line.
+struct NewerHostGlibc {
+    td: Workdir,
+    /// The package of `bin/app`.
+    pkg: PathBuf,
+    cache: PathBuf,
+    /// The host's glibc family members besides libc and its loader.
+    family: Vec<PathBuf>,
+    host_libc: PathBuf,
+    host_ld: PathBuf,
+}
+
+/// [`NewerHostGlibc`], or `None` on a machine without a compiler or
+/// `ldd`.
+fn newer_host_glibc_package(tag: &str) -> Option<NewerHostGlibc> {
+    newer_host_glibc_package_in(workdir(tag))
+}
+
+/// [`newer_host_glibc_package`] built in `td`.
+fn newer_host_glibc_package_in(td: Workdir) -> Option<NewerHostGlibc> {
     let app = td.join("app");
     std::fs::create_dir_all(app.join("bin")).unwrap();
 
@@ -7582,38 +7606,51 @@ fn a_newer_host_glibc_runs_the_entrypoint_under_the_host_loader() {
         ],
         &fixture,
     ) {
-        return; // no compiler: documented soft-skip
+        return None; // no compiler: documented soft-skip
     }
     let app_c = td.join("app.c");
     write(
         &app_c,
-        r#"#include <stdio.h>
+        r#"#include <dlfcn.h>
+#include <stdio.h>
 #include <stdlib.h>
 int fix_value(void);
-int main(void) {
+int main(int argc, char **argv) {
     FILE *m = fopen("/proc/self/maps", "r");
     char line[4096];
     while (m && fgets(line, sizeof line, m)) fputs(line, stdout);
     printf("value=%d\n", fix_value() + 1);
+    if (argc > 1) {
+        void *h = dlopen(argv[1], RTLD_NOW);
+        if (h) printf("dlopen=found\n");
+        else printf("dlopen=missing %s\n", dlerror());
+    }
     return 0;
 }
 "#,
     );
+    let link = [
+        app_c.to_str().unwrap().to_string(),
+        format!("-L{}", td.display()),
+        "-l:libfixture.so.1".to_string(),
+    ];
+    let link: Vec<&str> = link.iter().map(String::as_str).collect();
+    assert!(cc_with(&link, &app.join("bin/app")));
     assert!(cc_with(
-        &[
-            app_c.to_str().unwrap(),
-            &format!("-L{}", td.display()),
-            "-l:libfixture.so.1",
-        ],
-        &app.join("bin/app"),
+        &[&["-fPIE", "-pie"], &link[..]].concat(),
+        &td.join("plain")
+    ));
+    assert!(cc_with(
+        &[&["-fno-PIE", "-no-pie"], &link[..]].concat(),
+        &td.join("nopie")
     ));
     let Some(host_libc) = ldd_path(&app.join("bin/app"), "libc.so.6") else {
         skip("hostlibs", "ldd does not report libc.so.6");
-        return;
+        return None;
     };
     let Some(host_ld) = ldd_path(&app.join("bin/app"), "ld-linux") else {
         skip("hostlibs", "ldd does not report the loader");
-        return;
+        return None;
     };
 
     let o = Command::new(onelf())
@@ -7629,74 +7666,154 @@ int main(void) {
     let bundled_libc = app.join("lib/libc.so.6");
     assert!(bundled_libc.is_file(), "bundle-libs bundles libc");
     trim_newest_version(&bundled_libc);
+    for name in ["plain", "nopie"] {
+        std::fs::copy(td.join(name), app.join("bin").join(name)).unwrap();
+    }
 
-    let cache = td.join("ld.so.cache");
-    let mut listed: Vec<PathBuf> = vec![host_libc.clone(), host_ld.clone()];
+    let mut family: Vec<PathBuf> = Vec::new();
     for name in ["libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1"] {
         if let Some(p) = ldd_path(&app.join("bin/app"), name) {
-            listed.push(p);
+            family.push(p);
         }
         let sibling = host_libc.with_file_name(name);
-        if sibling.is_file() && !listed.contains(&sibling) {
-            listed.push(sibling);
+        if sibling.is_file() && !family.contains(&sibling) {
+            family.push(sibling);
         }
     }
-    let refs: Vec<&Path> = listed.iter().map(PathBuf::as_path).collect();
-    std::fs::write(&cache, ld_so_cache(&refs)).unwrap();
+    let cache = td.join("ld.so.cache");
+    write_cache(&cache, &[&host_libc, &host_ld], &family);
 
-    let pkg = td.join("app.onelf");
-    let o = Command::new(onelf())
-        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
-        .args([
-            "--command",
-            "bin/app",
-            "--mtime",
-            "0",
-            "--host-libs",
-            "always",
-        ])
-        .output()
-        .expect("spawn onelf pack");
-    assert!(o.status.success());
+    let mut fx = NewerHostGlibc {
+        pkg: PathBuf::new(),
+        td,
+        cache,
+        family,
+        host_libc,
+        host_ld,
+    };
+    fx.pkg = fx.pack("bin/app");
+    Some(fx)
+}
 
-    let launch_in = |no_resolver: bool, mode: Option<&str>| {
-        let mut run = Command::new(&pkg);
-        run.env_clear()
+/// Write a loader cache image naming `pair` and then `family`.
+fn write_cache(cache: &Path, pair: &[&Path], family: &[PathBuf]) {
+    let listed: Vec<&Path> = pair
+        .iter()
+        .copied()
+        .chain(family.iter().map(PathBuf::as_path))
+        .collect();
+    std::fs::write(cache, ld_so_cache(&listed)).unwrap();
+}
+
+impl NewerHostGlibc {
+    /// Pack the tree with `command` as its entrypoint.
+    fn pack(&self, command: &str) -> PathBuf {
+        let pkg = self
+            .td
+            .join(format!("{}.onelf", command.rsplit('/').next().unwrap()));
+        let app = self.td.join("app");
+        let o = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args([
+                "--command",
+                command,
+                "--mtime",
+                "0",
+                "--host-libs",
+                "always",
+            ])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        pkg
+    }
+
+    /// Run the package with `args`, optionally with the resolver off or
+    /// in a given mode.
+    fn launch(&self, args: &[&str], no_resolver: bool, mode: Option<&str>) -> std::process::Output {
+        self.launch_pkg(&self.pkg, args, no_resolver, mode)
+    }
+
+    /// [`NewerHostGlibc::launch`] for the package at `pkg`.
+    fn launch_pkg(
+        &self,
+        pkg: &Path,
+        args: &[&str],
+        no_resolver: bool,
+        mode: Option<&str>,
+    ) -> std::process::Output {
+        let mut run = Command::new(pkg);
+        run.args(args)
+            .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", td.to_str().unwrap())
-            .env("ONELF_LD_CACHE", &cache);
+            .env("HOME", self.td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &self.cache);
         if no_resolver {
             run.env("ONELF_NO_RESOLVER", "1");
         }
         if let Some(mode) = mode {
             run.env("ONELF_MODE", mode);
         }
-        isolate(&mut run, &td);
+        isolate(&mut run, &self.td);
         run_package(&mut run)
-    };
-    let launch = |no_resolver: bool| launch_in(no_resolver, None);
+    }
+}
 
-    // A host file shadowing a bundled one keeps the bundled path, so the
-    // mapping is identified by inode rather than by name.
-    let inode_of = |p: &Path| {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(p).unwrap().ino()
+fn inode_of(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().ino()
+}
+
+/// The inodes `/proc/self/maps` output in `maps` shows mapped for files
+/// named `soname`.
+fn mapped_inodes(maps: &str, soname: &str) -> Vec<u64> {
+    let mut inodes: Vec<u64> = maps
+        .lines()
+        .filter(|l| l.ends_with(soname) || l.contains(&format!("/{soname} ")))
+        .filter_map(|l| l.split_whitespace().nth(4)?.parse().ok())
+        .collect();
+    inodes.sort();
+    inodes.dedup();
+    inodes
+}
+
+/// Whether `path` is a closed host loader copy in the per-uid cache of a
+/// test isolated under `td`.
+fn is_closed_copy(td: &Path, path: &Path) -> bool {
+    path.starts_with(td.join("xdg-cache/onelf/loaders"))
+}
+
+/// The paths `/proc/self/maps` output in `maps` shows mapped for files
+/// named `soname`.
+fn mapped_paths(maps: &str, soname: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = maps
+        .lines()
+        .filter(|l| l.ends_with(&format!("/{soname}")))
+        .filter_map(|l| l.split_whitespace().nth(5).map(PathBuf::from))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// A host whose glibc is newer than the bundle's runs the entrypoint under
+/// the host loader, with the bundle's own libraries still loading from the
+/// bundle. The loader that runs is the resolver's private copy, closed to
+/// the host loader's default search directories, never the host's file.
+///
+/// This machine's glibc is both sides of the comparison: the bundled copy
+/// is the same file with its newest version definition trimmed away, so
+/// the host copy reads as a strict superset.
+#[test]
+fn a_newer_host_glibc_runs_the_entrypoint_under_the_host_loader() {
+    let Some(fx) = newer_host_glibc_package("hostloader") else {
+        return;
     };
-    let host_libc_ino = inode_of(&host_libc);
-    let host_ld_ino = inode_of(&host_ld);
-    let mapped_inodes = |maps: &str, soname: &str| -> Vec<u64> {
-        let mut inodes: Vec<u64> = maps
-            .lines()
-            .filter(|l| l.ends_with(soname) || l.contains(&format!("/{soname} ")))
-            .filter_map(|l| l.split_whitespace().nth(4)?.parse().ok())
-            .collect();
-        inodes.sort();
-        inodes.dedup();
-        inodes
-    };
+    let host_libc_ino = inode_of(&fx.host_libc);
+    let host_ld_ino = inode_of(&fx.host_ld);
     let maps_of = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
 
-    let without = launch(true);
+    let without = fx.launch(&[], true, None);
     let maps = maps_of(&without);
     assert!(
         without.status.success() && maps.contains("value=42"),
@@ -7708,18 +7825,28 @@ int main(void) {
         "without the resolver the bundled libc is mapped:\n{maps}"
     );
 
-    let with = launch(false);
+    let with = fx.launch(&[], false, None);
     let maps = maps_of(&with);
     assert!(
         with.status.success() && maps.contains("value=42"),
         "the entrypoint runs under the host loader:\n{maps}{}",
         String::from_utf8_lossy(&with.stderr)
     );
-    assert_eq!(
-        mapped_inodes(&maps, "ld-linux-x86-64.so.2"),
-        [host_ld_ino],
-        "only the host loader is mapped:\n{maps}"
+    let loaders = mapped_paths(&maps, "ld-linux-x86-64.so.2");
+    assert_eq!(loaders.len(), 1, "one loader is mapped:\n{maps}");
+    let copy = &loaders[0];
+    assert!(
+        is_closed_copy(&fx.td, copy),
+        "the loader is the resolver's copy:\n{maps}"
     );
+    assert!(
+        !mapped_inodes(&maps, "ld-linux-x86-64.so.2").contains(&host_ld_ino),
+        "the host's own loader file never runs:\n{maps}"
+    );
+    let closed = std::fs::read(copy).unwrap();
+    let original = std::fs::read(&fx.host_ld).unwrap();
+    assert_eq!(closed.len(), original.len());
+    assert_ne!(closed, original, "the copy is closed");
     assert_eq!(
         mapped_inodes(&maps, "libc.so.6"),
         [host_libc_ino],
@@ -7735,7 +7862,7 @@ int main(void) {
     // run path would still find the bundled libc, so the pair stays. The
     // fixture's two libcs come from one build and would even run together,
     // so the loader is what tells the cases apart.
-    let cached = launch_in(false, Some("cache"));
+    let cached = fx.launch(&[], false, Some("cache"));
     let maps = maps_of(&cached);
     assert!(
         cached.status.success() && maps.contains("value=42"),
@@ -7743,15 +7870,220 @@ int main(void) {
         String::from_utf8_lossy(&cached.stderr)
     );
     assert!(
-        !mapped_inodes(&maps, "ld-linux-x86-64.so.2").contains(&host_ld_ino),
+        !mapped_inodes(&maps, "ld-linux-x86-64.so.2").contains(&host_ld_ino)
+            && mapped_paths(&maps, "ld-linux-x86-64.so.2")
+                .iter()
+                .all(|p| !is_closed_copy(&fx.td, p)),
         "a mode that cannot shadow keeps the bundled loader:\n{maps}"
     );
     assert!(
         !mapped_inodes(&maps, "libc.so.6").contains(&host_libc_ino),
         "and the bundled libc:\n{maps}"
     );
+}
 
-    let _ = std::fs::remove_dir_all(&td);
+/// Under the host loader a soname neither bundled nor chosen fails by
+/// name. The host's loader would find it in its default directories; the
+/// closed copy the launch runs has none. That holds on each way a launch
+/// starts its entrypoint under the host loader: a bootstrap-injected one
+/// through `ONELF_INTERP`, a position-independent one through a userland
+/// exec, and any other on the loader's command line.
+#[test]
+fn the_host_loader_finds_no_unchosen_host_library() {
+    let Some(fx) = newer_host_glibc_package("hostclosed") else {
+        return;
+    };
+    let host_dir = fx.host_libc.parent().unwrap();
+    let Some(unchosen) = [
+        "libz.so.1",
+        "libcrypt.so.2",
+        "libcrypt.so.1",
+        "libstdc++.so.6",
+    ]
+    .into_iter()
+    .find(|name| host_dir.join(name).is_file()) else {
+        skip(
+            "hostlibs",
+            "the host has no library beside libc to leave unchosen",
+        );
+        return;
+    };
+    for command in ["bin/app", "bin/plain", "bin/nopie"] {
+        let pkg = fx.pack(command);
+        let out = fx.launch_pkg(&pkg, &[unchosen], false, None);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("value=42"),
+            "{command} runs under the host loader:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let loaders = mapped_paths(&stdout, "ld-linux-x86-64.so.2");
+        assert!(
+            !loaders.is_empty() && loaders.iter().all(|p| is_closed_copy(&fx.td, p)),
+            "{command} runs under the closed copy:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("dlopen=missing {unchosen}")),
+            "{command}: {unchosen} fails by name rather than loading from {}:\n{stdout}",
+            host_dir.display()
+        );
+    }
+}
+
+/// A closed loader copy is executed, so it is kept only where the
+/// filesystem allows that. With the uid's cache on a `noexec` mount the
+/// host's pair is not taken: the bundled pair runs and the doctor says
+/// why.
+///
+/// A private mount namespace whose `/tmp` is a `noexec` tmpfs, entered
+/// back as this uid, stands in for such a host, with the cache under that
+/// `/tmp`. The fixture lives outside `/tmp`, which the mount hides.
+#[test]
+fn a_noexec_loader_store_leaves_the_bundled_pair() {
+    use std::os::unix::fs::MetadataExt;
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let Some(fx) = newer_host_glibc_package_in(workdir_in(base, "hostnoexec")) else {
+        return;
+    };
+    let md = std::fs::metadata(&fx.td).unwrap();
+    let (uid, gid) = (md.uid().to_string(), md.gid().to_string());
+    let script = "mount -t tmpfs -o noexec none /tmp && \
+                  exec unshare --user --map-user=\"$1\" --map-group=\"$2\" \"${@:3}\"";
+    let in_noexec_tmp = |args: &[&str]| {
+        let mut cmd = Command::new("unshare");
+        cmd.args(["-rm", "bash", "-c", script, "bash", &uid, &gid])
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", fx.td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &fx.cache);
+        isolate(&mut cmd, &fx.td);
+        cmd.env("XDG_CACHE_HOME", "/tmp/cache");
+        run_package(&mut cmd)
+    };
+    let pkg = fx.pkg.to_str().unwrap();
+    let probe = in_noexec_tmp(&[
+        "sh",
+        "-c",
+        "test \"$(id -u)\" = \"$0\" && test -x \"$1\"",
+        &uid,
+        pkg,
+    ]);
+    if !probe.status.success() {
+        skip(
+            "userns",
+            "unshare cannot mount a tmpfs over /tmp and map this uid back, or the mount \
+             hides the fixture",
+        );
+        return;
+    }
+
+    let report = in_noexec_tmp(&[pkg, "--onelf-doctor"]);
+    let text = String::from_utf8_lossy(&report.stdout);
+    assert!(report.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "loader: the host's {} is not used, the loader copy's filesystem is mounted \
+             noexec; the bundled loader and libc run",
+            fx.host_ld.display()
+        )),
+        "the doctor reports the fallback:\n{text}"
+    );
+
+    let out = in_noexec_tmp(&[pkg]);
+    let maps = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && maps.contains("value=42"),
+        "the bundled pair runs:\n{maps}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !mapped_inodes(&maps, "libc.so.6").contains(&inode_of(&fx.host_libc))
+            && !mapped_inodes(&maps, "ld-linux-x86-64.so.2").contains(&inode_of(&fx.host_ld))
+            && !maps.contains("/loaders/"),
+        "nothing of the host's pair is mapped:\n{maps}"
+    );
+}
+
+/// A host loader in whose image no default search directory can be found
+/// cannot be shown closed. The bundled pair runs, and the doctor says the
+/// host's loader was not used and why.
+#[test]
+fn a_host_loader_that_cannot_be_closed_leaves_the_bundled_pair() {
+    let Some(fx) = newer_host_glibc_package("hostunclosable") else {
+        return;
+    };
+    let fake = fx.td.join("fakehost");
+    std::fs::create_dir_all(&fake).unwrap();
+    let replace = |data: &mut [u8], from: &[u8], to: &[u8]| {
+        let mut i = 0;
+        while i + from.len() <= data.len() {
+            if &data[i..i + from.len()] == from {
+                data[i..i + from.len()].copy_from_slice(to);
+                i += from.len();
+            } else {
+                i += 1;
+            }
+        }
+    };
+    let mut libc = std::fs::read(&fx.host_libc).unwrap();
+    replace(&mut libc, b"/lib64/ld-linux", b"/qqq64/ld-linux");
+    let fake_libc = fake.join("libc.so.6");
+    std::fs::write(&fake_libc, libc).unwrap();
+    if onelf_format::elf::read_interp(&fake_libc).is_some_and(|i| Path::new(&i).is_file()) {
+        skip(
+            "hostlibs",
+            "the host libc names its loader at a path the rewrite does not reach",
+        );
+        return;
+    }
+    let mut ld = std::fs::read(&fx.host_ld).unwrap();
+    replace(&mut ld, b"/lib", b"/qqq");
+    let fake_ld = fake.join("ld-linux-x86-64.so.2");
+    std::fs::write(&fake_ld, ld).unwrap();
+    write_cache(&fx.cache, &[&fake_libc, &fake_ld], &fx.family);
+
+    let mut doctor = Command::new(&fx.pkg);
+    doctor
+        .arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", fx.td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", &fx.cache);
+    isolate(&mut doctor, &fx.td);
+    let report = run_package(&mut doctor);
+    let text = String::from_utf8_lossy(&report.stdout);
+    assert!(report.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "loader: the host's {} is not used, its image names no default search directory",
+            fake_ld.display()
+        )) && text.contains("the bundled loader and libc run"),
+        "the doctor reports the fallback:\n{text}"
+    );
+
+    let out = fx.launch(&[], false, None);
+    let maps = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && maps.contains("value=42"),
+        "the bundled pair runs:\n{maps}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let loader_inodes = mapped_inodes(&maps, "ld-linux-x86-64.so.2");
+    assert!(
+        !loader_inodes.is_empty()
+            && !loader_inodes.contains(&inode_of(&fx.host_ld))
+            && !loader_inodes.contains(&inode_of(&fake_ld))
+            && mapped_paths(&maps, "ld-linux-x86-64.so.2")
+                .iter()
+                .all(|p| !is_closed_copy(&fx.td, p)),
+        "the bundled loader runs:\n{maps}"
+    );
+    assert!(
+        !mapped_inodes(&maps, "libc.so.6").contains(&inode_of(&fx.host_libc))
+            && !mapped_inodes(&maps, "libc.so.6").contains(&inode_of(&fake_libc)),
+        "and the bundled libc:\n{maps}"
+    );
 }
 
 /// With nothing taken from the host, a soname the bundle lacks fails by

@@ -174,6 +174,26 @@ than the bundled one, the whole glibc family comes from the host and the
 entrypoint runs under the host loader. Every bundled library still loads
 from the bundle, since a newer libc satisfies whatever the older one did.
 
+The host loader never runs as installed, because it would still search
+its compiled-in default directories and find any host library there. The
+runtime runs a copy with those directories removed. The copy is kept
+once per uid and loader under the cache root's `loaders/`, which is
+`/var/cache/onelf/loaders/` for root, and is checked against its BLAKE3
+digest and its private ownership before a launch uses it. Copies are not
+collected by the cache's garbage collection. Each is the size of the
+host's loader, about a megabyte, and a new one appears only when the
+host's loader changes. Removing `loaders/` while no package runs is safe,
+as the next launch writes the copy it needs again.
+
+The host libc opens the name service modules `/etc/nsswitch.conf` (or
+`/usr/etc/nsswitch.conf`) names and `libgcc_s` by name, so those come
+from the host with the pair when the bundle lacks them. A bundled
+`libgcc_s` is compared against the host's like any other library. When
+no copy can be made, because the loader's directories cannot be found in
+its image, the cache root is not a directory the uid can write, or the
+cache sits on a `noexec` mount, the bundled loader and libc run instead
+and `--onelf-doctor` says why.
+
 Host winners are placed over their bundled copies with a bind mount
 inside the private mount namespace, or a symlink in a tree that belongs
 to this launch alone, so every process the app starts sees the same
