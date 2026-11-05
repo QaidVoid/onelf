@@ -345,7 +345,8 @@ pub(crate) fn locate_lib(
 }
 
 /// Detect NixOS's stub-ld, a tiny loader that prints a message and exits.
-/// The stub lives at `/lib*/ld-*` on NixOS when nix-ld isn't enabled.
+/// On NixOS without nix-ld the stub sits at the glibc loader's path, such
+/// as `/lib64/ld-linux-x86-64.so.2`.
 /// We check two signals:
 ///
 /// 1. The canonical path contains `stub-ld` (covers the fresh symlink case).
@@ -353,14 +354,15 @@ pub(crate) fn locate_lib(
 ///    case where a previous bundle copied the stub into the AppDir itself,
 ///    so canonicalize no longer points at the nix store).
 pub(crate) fn is_nix_stub_ld(path: &Path) -> bool {
-    // Only a dynamic-loader-shaped file can be a stub loader. Reject any
-    // non-`ld-*` filename up front, before the canonicalize shortcut, so a
-    // path that merely contains "stub-ld" (or the phrase in its content)
-    // can never be misclassified and, at the call site, deleted.
+    // Only a file named like a glibc loader can be a stub loader, since
+    // stub-ld takes the glibc loader paths. Reject any other filename up
+    // front, before the canonicalize shortcut, so a path that merely
+    // contains "stub-ld" (or the phrase in its content) can never be
+    // misclassified and, at the call site, deleted.
     let is_loader_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("ld-"));
+        .is_some_and(onelf_format::ldso::is_glibc_loader_name);
     if !is_loader_name {
         return false;
     }

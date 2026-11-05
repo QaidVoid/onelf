@@ -6962,10 +6962,15 @@ mod correctness_tests {
         fs::write(&benign, b"the NixOS cannot run message appears here").unwrap();
         assert!(!is_nix_stub_ld(&benign));
 
-        // `ld-*` name but no ELF magic.
-        let noelf = d.join("ld-fake.so");
+        // A glibc loader's name but no ELF magic.
+        let noelf = d.join("ld64.so.2");
         fs::write(&noelf, b"NixOS cannot run").unwrap();
         assert!(!is_nix_stub_ld(&noelf));
+
+        // Loader-shaped but not a glibc loader's name.
+        let musl = d.join("ld-musl-x86_64.so.1");
+        fs::write(&musl, &stub).unwrap();
+        assert!(!is_nix_stub_ld(&musl));
 
         let _ = fs::remove_dir_all(&d);
     }

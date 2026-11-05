@@ -19331,6 +19331,85 @@ fn a_bundled_musl_libc_has_its_search_path_scrubbed() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A PowerPC bundle's glibc loader, `ld.so.1` on 32-bit and `ld64.so.2`
+/// on 64-bit, has its default search directories scrubbed like any other
+/// glibc loader. Built with the cross compilers and their sysroots.
+#[test]
+fn a_bundled_powerpc_loader_is_scrubbed() {
+    let td = workdir("ppcscrub");
+    let src = td.join("main.c");
+    write(&src, "int main(void) { return 0; }\n");
+    let mut built = 0;
+    for (target, loaders) in [
+        ("powerpc-linux-gnu", &["ld.so.1"][..]),
+        ("powerpc64le-linux-gnu", &["ld64.so.2"]),
+        ("powerpc64-linux-gnu", &["ld64.so.2", "ld64.so.1"]),
+    ] {
+        let gcc = format!("{target}-gcc");
+        if !have(&gcc) {
+            continue;
+        }
+        let resolve = |loader: &str| {
+            Command::new(&gcc)
+                .arg(format!("-print-file-name={loader}"))
+                .output()
+                .ok()
+                .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                .filter(|path| path.is_absolute() && path.is_file())
+                .and_then(|path| std::fs::canonicalize(path).ok())
+        };
+        let Some((loader, sysroot_lib)) = loaders.iter().find_map(|loader| {
+            let dir = resolve(loader)?.parent()?.to_path_buf();
+            Some((*loader, dir))
+        }) else {
+            continue;
+        };
+        let app = td.join(target);
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        let st = Command::new(&gcc)
+            .arg("-o")
+            .arg(app.join("bin/main"))
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success(), "{gcc}");
+        let o = run_onelf(
+            &[
+                "bundle-libs",
+                app.to_str().unwrap(),
+                "--search-path",
+                sysroot_lib.to_str().unwrap(),
+            ],
+            None,
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{err}");
+        let bytes = std::fs::read(app.join("lib").join(loader))
+            .unwrap_or_else(|e| panic!("{target}: {e}:\n{err}"));
+        let names_a_dir = |image: &[u8]| {
+            [&b"/lib/"[..], b"/lib64/"]
+                .iter()
+                .any(|dir| image.windows(dir.len()).any(|w| w == *dir))
+        };
+        let original = std::fs::read(sysroot_lib.join(loader)).unwrap();
+        assert!(
+            names_a_dir(&original),
+            "{target}: the sysroot's loader names its directories"
+        );
+        assert!(
+            !names_a_dir(&bytes),
+            "{target}: the bundled {loader} still searches the host:\n{err}"
+        );
+        built += 1;
+    }
+    if built == 0 {
+        skip(
+            "ppc-cross",
+            "no PowerPC cross compiler with its sysroot loader",
+        );
+    }
+}
+
 /// An earlier output inside the packed directory is never content, under
 /// whatever name it was built with.
 #[test]

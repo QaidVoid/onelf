@@ -151,7 +151,7 @@ pub(crate) fn libc_family_from_interp(interp: &str) -> Option<LibcFamily> {
     let name = Path::new(interp).file_name()?.to_str()?;
     if name.starts_with("ld-musl-") {
         Some(LibcFamily::Musl)
-    } else if name.starts_with("ld-linux") {
+    } else if onelf_format::ldso::is_glibc_loader_name(name) {
         Some(LibcFamily::Glibc)
     } else {
         None
@@ -167,7 +167,7 @@ pub(crate) fn parse_soname(path: &Path) -> Option<String> {
 
 /// Map a soname to the libc family it belongs to, when known.
 pub(crate) fn libc_family_of_soname(soname: &str) -> Option<LibcFamily> {
-    if soname == "libc.so.6" || soname.starts_with("ld-linux") {
+    if soname == "libc.so.6" || onelf_format::ldso::is_glibc_loader_name(soname) {
         Some(LibcFamily::Glibc)
     } else if soname.starts_with("libc.musl-")
         || soname.starts_with("ld-musl-")
@@ -1051,7 +1051,9 @@ pub(crate) fn is_excluded(soname: &str, excludes: &[&str]) -> bool {
 
 /// True for sonames that denote the dynamic linker itself.
 pub(crate) fn is_dynamic_loader(soname: &str) -> bool {
-    soname.starts_with("ld-linux") || soname.starts_with("ld-musl-") || soname == "ld.so"
+    onelf_format::ldso::is_glibc_loader_name(soname)
+        || soname.starts_with("ld-musl-")
+        || soname == "ld.so"
 }
 
 /// The byte pattern musl's loader names the packer's filesystem by, and

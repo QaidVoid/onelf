@@ -304,8 +304,9 @@ pub fn gl_situation(
 
 const LIBC: &str = "libc.so.6";
 
-/// The glibc family: everything that must come from the same build as
-/// the loader. Matched as soname prefixes.
+/// Everything that must come from the same build as the loader, matched
+/// as soname prefixes. The loader itself is recognized by
+/// [`ldso::is_glibc_loader_name`].
 const LIBC_FAMILY: &[&str] = &[
     "libc.so",
     "libm.so",
@@ -320,7 +321,6 @@ const LIBC_FAMILY: &[&str] = &[
     "libmvec.so",
     "libc_malloc_debug.so",
     "libthread_db.so",
-    "ld-linux",
 ];
 
 /// Where the host records the graphics drivers it loads by absolute path.
@@ -338,7 +338,7 @@ pub const ICD_DIRS: &[&str] = &[
 /// Whether `soname` belongs to the glibc family, which a package always
 /// carries as a unit with its loader.
 pub fn is_libc_family(soname: &str) -> bool {
-    LIBC_FAMILY.iter().any(|p| soname.starts_with(p))
+    LIBC_FAMILY.iter().any(|p| soname.starts_with(p)) || ldso::is_glibc_loader_name(soname)
 }
 
 fn is_driver_family(soname: &str) -> bool {
@@ -540,7 +540,7 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
                     match closed {
                         Ok((copy, hash, image)) => {
                             for name in bundled.keys().filter(|n| is_libc_family(n)) {
-                                let path = if is_loader_soname(name) {
+                                let path = if ldso::is_glibc_loader_name(name) {
                                     Some(interp.clone())
                                 } else {
                                     host.libs.get(name).cloned()
@@ -584,7 +584,7 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
             // of its family that the host libc or a host driver opens and
             // the bundle lacks has to be chosen like any other library.
             if decision.host_interp.is_some()
-                && !is_loader_soname(&name)
+                && !ldso::is_glibc_loader_name(&name)
                 && !bundled.contains_key(&name)
                 && let Some(host_path) = host.libs.get(&name)
             {
@@ -828,7 +828,7 @@ impl HostIndex {
         }
         self.libs
             .iter()
-            .find(|(name, path)| name.starts_with("ld-linux") && path.is_file())
+            .find(|(name, path)| ldso::is_glibc_loader_name(name) && path.is_file())
             .map(|(_, path)| path.clone())
     }
 
@@ -1187,17 +1187,13 @@ fn loader_name(source: &Path) -> String {
         .to_string()
 }
 
-fn is_loader_soname(name: &str) -> bool {
-    name.starts_with("ld-linux")
-}
-
 /// Where the farm link for winner `name` points: the closed copy for the
 /// loader when one runs, the chosen host file for everything else. The
 /// copy is what a bundled loader's path shows once it is shadowed, so a
 /// process that re-execs through that path gets the closed loader too.
 fn link_target<'p>(name: &str, host: &'p Path, copy: Option<&'p Path>) -> &'p Path {
     match copy {
-        Some(copy) if is_loader_soname(name) => copy,
+        Some(copy) if ldso::is_glibc_loader_name(name) => copy,
         _ => host,
     }
 }

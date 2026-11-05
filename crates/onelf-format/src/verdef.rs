@@ -249,10 +249,7 @@ fn infer_libc(needed: &[String], interpreter: Option<&str>) -> LibcFamily {
             Some((_, base)) => base,
             None => name,
         };
-        glibc |= name == "libc.so.6"
-            || name.starts_with("ld-linux")
-            || name == "ld64.so.1"
-            || name == "ld64.so.2";
+        glibc |= name == "libc.so.6" || crate::ldso::is_glibc_loader_name(name);
         musl |= name.starts_with("libc.musl-") || name.starts_with("ld-musl-");
     }
     match (glibc, musl) {

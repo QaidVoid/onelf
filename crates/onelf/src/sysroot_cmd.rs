@@ -239,7 +239,7 @@ fn pack_tree(
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(String::from))
-        .find(|name| name.starts_with("libc.so") || name.starts_with("ld-linux"))
+        .find(|name| name.starts_with("libc.so") || onelf_format::ldso::is_glibc_loader_name(name))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

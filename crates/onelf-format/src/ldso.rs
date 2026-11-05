@@ -98,6 +98,14 @@ impl fmt::Display for LoaderScrubError {
 
 impl std::error::Error for LoaderScrubError {}
 
+/// Whether `name` is a glibc dynamic loader's file name: `ld-linux*` on
+/// x86, Arm, AArch64, RISC-V, LoongArch and most others, `ld.so.1` on
+/// 32-bit PowerPC, MIPS and s390, `ld64.so.1` on s390x and big-endian
+/// ELFv1 PowerPC, and `ld64.so.2` on ELFv2 PowerPC.
+pub fn is_glibc_loader_name(name: &str) -> bool {
+    name.starts_with("ld-linux") || matches!(name, "ld.so.1" | "ld64.so.1" | "ld64.so.2")
+}
+
 /// Close the glibc loader `image` in place: count the default search
 /// directories it carries, then overwrite every path prefix that names
 /// the host's filesystem. The image keeps its length.
@@ -355,6 +363,32 @@ mod tests {
     }
 
     #[test]
+    fn every_glibc_loader_name_is_recognized() {
+        for name in [
+            "ld-linux-x86-64.so.2",
+            "ld-linux.so.2",
+            "ld-linux-aarch64.so.1",
+            "ld-linux-armhf.so.3",
+            "ld-linux-riscv64-lp64d.so.1",
+            "ld-linux-loongarch-lp64d.so.1",
+            "ld.so.1",
+            "ld64.so.1",
+            "ld64.so.2",
+        ] {
+            assert!(is_glibc_loader_name(name), "{name}");
+        }
+        for name in [
+            "ld-musl-x86_64.so.1",
+            "ld.so",
+            "libc.so.6",
+            "ld64.so.3",
+            "ld.so.2",
+        ] {
+            assert!(!is_glibc_loader_name(name), "{name}");
+        }
+    }
+
+    #[test]
     fn an_empty_needle_is_skipped() {
         let mut data = b"/usr/lib".to_vec();
         assert_eq!(replace_equal_length(&mut data, &[(b"", b"")]), 0);
@@ -408,6 +442,9 @@ mod tests {
             "/usr/aarch64-linux-gnu/usr/lib/ld-linux-aarch64.so.1",
             "/lib/ld-linux.so.2",
             "/usr/lib32/ld-linux.so.2",
+            "/usr/powerpc-linux-gnu/usr/lib/ld.so.1",
+            "/usr/powerpc64-linux-gnu/usr/lib/ld64.so.2",
+            "/usr/powerpc64le-linux-gnu/usr/lib/ld64.so.2",
         ];
         let dir = std::env::temp_dir().join(format!(
             "onelf-ldso-{}-{:?}",

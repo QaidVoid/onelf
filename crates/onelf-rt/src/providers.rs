@@ -242,10 +242,8 @@ fn launch_pair(
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_loader = name.starts_with("ld-linux")
-                || name.starts_with("ld-musl-")
-                || name == "ld64.so.1"
-                || name == "ld64.so.2";
+            let is_loader =
+                onelf_format::ldso::is_glibc_loader_name(&name) || name.starts_with("ld-musl-");
             if is_loader || name.starts_with("libc.") {
                 let path = entry.path();
                 if path.is_file() {
@@ -284,7 +282,7 @@ fn launch_pair(
 /// the file carries is family evidence its contents may not repeat.
 fn name_family(path: &Path) -> Option<LibcFamily> {
     let name = path.file_name()?.to_string_lossy().into_owned();
-    if name.starts_with("ld-linux") || name == "ld64.so.1" || name == "ld64.so.2" {
+    if onelf_format::ldso::is_glibc_loader_name(&name) {
         Some(LibcFamily::Glibc)
     } else if name.starts_with("ld-musl-") {
         Some(LibcFamily::Musl)
