@@ -26254,3 +26254,79 @@ fn a_skipped_tree_carries_its_local_mappings_unchecked() {
         "{stdout}"
     );
 }
+
+/// A host scan reports the directories a library compiles in against the
+/// library's own installation prefix, and a re-run over the tree that
+/// now holds the library's copy reports the same directories against the
+/// same prefixes. The re-run keeps the tree's copies, since a repair
+/// answers only from declared sources, and a copy whose host file is
+/// still reachable, here through `LD_LIBRARY_PATH`, stands for it.
+#[test]
+fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
+    let td = workdir("infer-rerun");
+    let td = td.canonicalize().unwrap();
+    let prefix = td.join("fp");
+    std::fs::create_dir_all(prefix.join("lib")).unwrap();
+    write(&prefix.join("share/demo/a.conf"), "conf\n");
+    write(
+        &td.join("demo.c"),
+        &format!(
+            "const char *demo_dir = \"{}\";\nint demo(void){{return 1;}}\n",
+            prefix.join("share/demo").display()
+        ),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdemo.so.1",
+            td.join("demo.c").to_str().unwrap(),
+        ],
+        &prefix.join("lib/libdemo.so.1"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("main.c"),
+        "int demo(void);\nint main(void){return demo()-1;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libdemo.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let reported = || -> Vec<String> {
+        let out = Command::new(onelf())
+            .args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+            .env("LD_LIBRARY_PATH", prefix.join("lib"))
+            .output()
+            .expect("spawn onelf bundle-libs");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        err.lines()
+            .filter(|l| l.contains("inference does not carry it"))
+            .map(str::to_string)
+            .collect()
+    };
+    let first = reported();
+    assert!(app.join("lib/libdemo.so.1").is_file());
+    let second = reported();
+    assert_eq!(first, second, "a re-run reports the same directories");
+    let demo: Vec<&String> = first.iter().filter(|l| l.contains("libdemo")).collect();
+    assert_eq!(demo.len(), 1, "{first:?}");
+    assert!(
+        demo[0].contains(&format!(
+            "{}: unchecked: compiled in by libdemo.so.1",
+            prefix.join("share/demo").display()
+        )) && demo[0].contains(&format!("below the prefix {};", prefix.display())),
+        "{first:?}"
+    );
+}

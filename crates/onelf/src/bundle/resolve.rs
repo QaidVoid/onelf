@@ -5,8 +5,8 @@ use super::*;
 
 mod candidates;
 pub(crate) use candidates::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, MissReason,
-    discover_group, resolve_within,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, LIBRARY_DIRS,
+    MissReason, discover_group, object_prefix, resolve_within,
 };
 
 /// Scan `dir` for existing shared libraries. Returns the set of sonames
@@ -215,6 +215,10 @@ pub(crate) enum LookupScope {
     /// or owns, so no installation the host happens to have resolves
     /// one, whatever build form runs.
     Declared,
+    /// Every source of [`Self::Host`] but the store sweep, for a lookup
+    /// that runs once per bundled object and must stay cheap when it
+    /// misses.
+    WithoutStore,
 }
 
 /// Resolve one soname against `search_paths` first and, when `scope`
@@ -305,6 +309,10 @@ pub(crate) fn locate_lib(
                 }
             }
         }
+    }
+
+    if scope == LookupScope::WithoutStore {
+        return None;
     }
 
     // 5. NixOS fallback: scan /nix/store/*/lib/ directly. Sort the store

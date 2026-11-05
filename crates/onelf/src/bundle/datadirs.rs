@@ -106,15 +106,21 @@ fn component_of<'a>(
     piece: &[u8],
     components: &'a [Subject<'static>],
 ) -> Option<&'a Subject<'static>> {
-    if piece.first() != Some(&b'/')
-        || piece.len() > 4096
-        || !piece.iter().all(|b| b.is_ascii_graphic())
-    {
+    if !path_like(piece) {
         return None;
     }
     components
         .iter()
         .find(|c| c.endings.iter().any(|e| piece.ends_with(e.as_bytes())))
+}
+
+/// Whether a NUL-terminated piece of an object can be an absolute path:
+/// it begins with `/`, fits in `PATH_MAX` and is printable ASCII without
+/// spaces, which free text in the same data rarely is.
+pub(crate) fn path_like(piece: &[u8]) -> bool {
+    piece.first() == Some(&b'/')
+        && piece.len() <= 4096
+        && piece.iter().all(|b| b.is_ascii_graphic())
 }
 
 /// The directories of the tree holding a shared object, other than

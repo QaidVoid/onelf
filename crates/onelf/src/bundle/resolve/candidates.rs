@@ -86,9 +86,20 @@ impl AdmittedLibrary {
         }
     }
 
+    /// The host file the object stands for, when a host scan recorded
+    /// one for a tree copy.
+    pub(crate) fn provenance(&self) -> Option<&Path> {
+        self.provenance.as_deref()
+    }
+
     /// The soname the object answers to.
     pub(crate) fn soname(&self) -> &str {
         &self.soname
+    }
+
+    /// The file the walk resolved the object to.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The directory the object sits in, which a library-dir base
@@ -123,12 +134,38 @@ fn prefix_of(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The names of the directories a distribution keeps shared libraries in.
+pub(crate) const LIBRARY_DIRS: &[&str] = &["lib", "lib32", "lib64", "libx32"];
+
 /// Whether `dir` is a directory a distribution keeps shared libraries
 /// in, by name.
 fn is_lib_dir(dir: &Path) -> bool {
     dir.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| matches!(n, "lib" | "lib32" | "lib64" | "libx32"))
+        .is_some_and(|n| LIBRARY_DIRS.contains(&n))
+}
+
+/// The installation prefix above the object at `path`: a library's, by
+/// the shapes [`AdmittedLibrary::installation_prefix`] describes, or a
+/// program's in the prefix's `bin`, `sbin` or `libexec`, directly or one
+/// level below `libexec`. Only compiled-in path inference reads a
+/// program's prefix, so descriptor discovery's roots stay those of
+/// libraries.
+pub(crate) fn object_prefix(path: &Path) -> Option<PathBuf> {
+    if let Some(prefix) = prefix_of(path) {
+        return Some(prefix);
+    }
+    let dir = path.parent()?;
+    let named = |dir: &Path, names: &[&str]| {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| names.contains(&n))
+    };
+    if named(dir, &["bin", "sbin", "libexec"]) {
+        return dir.parent().map(Path::to_path_buf);
+    }
+    let parent = dir.parent()?;
+    named(parent, &["libexec"]).then(|| parent.parent().map(Path::to_path_buf))?
 }
 
 /// The roots one declared base searches: each admitted library's

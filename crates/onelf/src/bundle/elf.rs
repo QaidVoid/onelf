@@ -414,13 +414,17 @@ pub(crate) fn origin_runpath_for(root: &Path, path: &Path, lib_rel: &Path) -> St
 /// An object stripped of its section headers (`sstrip`, `llvm-strip
 /// --strip-sections`, some vendor blobs) keeps its dynamic section, and
 /// would otherwise keep its host RUNPATH too.
-fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
+pub(crate) fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     if let Some(sh) = elf
         .section_headers
         .iter()
         .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynstr"))
     {
-        return Some((sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize));
+        let end = sh.sh_offset.checked_add(sh.sh_size)?;
+        return Some((
+            usize::try_from(sh.sh_offset).ok()?,
+            usize::try_from(end).ok()?,
+        ));
     }
     let dynamic = elf.dynamic.as_ref()?;
     let strtab = dynamic.info.strtab as u64;
@@ -431,10 +435,13 @@ fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     let load = elf.program_headers.iter().find(|p| {
         p.p_type == goblin::elf::program_header::PT_LOAD
             && strtab >= p.p_vaddr
-            && strtab < p.p_vaddr + p.p_filesz
+            && p.p_vaddr
+                .checked_add(p.p_filesz)
+                .is_some_and(|end| strtab < end)
     })?;
-    let off = strtab - load.p_vaddr + load.p_offset;
-    Some((off as usize, (off + strsz) as usize))
+    let off = (strtab - load.p_vaddr).checked_add(load.p_offset)?;
+    let end = off.checked_add(strsz)?;
+    Some((usize::try_from(off).ok()?, usize::try_from(end).ok()?))
 }
 
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes and

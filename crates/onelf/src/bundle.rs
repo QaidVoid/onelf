@@ -37,6 +37,7 @@ pub(crate) use ui::{color, format_size};
 mod datadirs;
 mod discover;
 pub(crate) mod gpu;
+mod infer;
 use gpu::{bundle_gpu, bundle_gtk_data, bundle_wayland};
 mod activate;
 mod collect;
@@ -192,6 +193,7 @@ fn repair_admits(
 /// with, finds. A candidate inside one of the `tree` roots is the tree
 /// itself, and one linking another libc family than `target_libc` is
 /// not the installation the bundle runs with, so neither answers.
+/// Without a `target_libc` the candidate is not read at all.
 fn host_provenance(
     copied_from: Option<&Path>,
     tree: &[&Path],
@@ -203,22 +205,22 @@ fn host_provenance(
     if tree.iter().any(|root| real.starts_with(root)) {
         return None;
     }
+    let Some(want) = target_libc else {
+        return Some(real);
+    };
     let family = parse_needed(&real)
         .unwrap_or_default()
         .iter()
         .find_map(|d| libc_family_of_soname(d));
-    if let (Some(want), Some(have)) = (target_libc, family)
-        && want != have
-    {
-        return None;
+    match family {
+        Some(have) if have != want => None,
+        _ => Some(real),
     }
-    Some(real)
 }
 
 /// Admit a host scan's tree copy of a rule's library at `copy`, with
-/// the host object it stands for as its provenance when one answers:
-/// the file a framework copier took it from, or the compatible file the
-/// soname resolves to through the host search past the `tree` roots.
+/// the host object it stands for as its provenance when one answers,
+/// see [`host_twin`].
 fn admit_tree_copy(
     soname: &str,
     copy: &Path,
@@ -229,12 +231,45 @@ fn admit_tree_copy(
     (class, machine, libc): (Option<u8>, Option<u16>, Option<LibcFamily>),
 ) -> AdmittedLibrary {
     let library = AdmittedLibrary::new(soname, copy);
-    let host_dirs: Vec<PathBuf> = search_paths
+    let twin = host_twin(
+        soname,
+        copied_from,
+        tree,
+        &host_dirs(search_paths, tree),
+        ldconfig_cache,
+        (class, machine, libc),
+        LookupScope::Host,
+    );
+    match twin {
+        Some(twin) => library.with_provenance(twin),
+        None => library,
+    }
+}
+
+/// The search paths outside the `tree` roots, which a host twin is
+/// looked up in.
+fn host_dirs(search_paths: &[PathBuf], tree: &[&Path]) -> Vec<PathBuf> {
+    search_paths
         .iter()
         .filter(|d| !tree.iter().any(|root| d.starts_with(root)))
         .cloned()
-        .collect();
-    let twin = host_provenance(
+        .collect()
+}
+
+/// The host object a host scan's tree copy of `soname` stands for: the
+/// file a framework copier took it from, or the compatible file the
+/// soname resolves to through `host_dirs` and the machine sources
+/// `scope` allows.
+fn host_twin(
+    soname: &str,
+    copied_from: &HashMap<String, PathBuf>,
+    tree: &[&Path],
+    host_dirs: &[PathBuf],
+    ldconfig_cache: &HashMap<String, Vec<PathBuf>>,
+    (class, machine, libc): (Option<u8>, Option<u16>, Option<LibcFamily>),
+    scope: LookupScope,
+) -> Option<PathBuf> {
+    host_provenance(
         copied_from.get(soname).map(PathBuf::as_path),
         tree,
         libc,
@@ -242,18 +277,14 @@ fn admit_tree_copy(
             locate_lib(
                 soname,
                 ldconfig_cache,
-                &host_dirs,
+                host_dirs,
                 class,
                 machine,
                 None,
-                LookupScope::Host,
+                scope,
             )
         },
-    );
-    match twin {
-        Some(twin) => library.with_provenance(twin),
-        None => library,
-    }
+    )
 }
 
 #[cfg(test)]
@@ -4451,6 +4482,65 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             ));
         }
     }
+
+    // Every bundled object is read: the libraries the walk admitted and
+    // every other ELF file of the tree, programs among them, since a
+    // framework can keep its plugins beside its own binaries, as Xorg
+    // does in `lib/xorg/modules`. A host scan's tree copy of a library
+    // takes its prefix from the host file it stands for, which is where
+    // its compiled-in paths point. A rule's library was already looked
+    // up when it was admitted, so it keeps what that lookup found. The
+    // twin only places a prefix, so its libc family is not read.
+    let tree_roots: [&Path; 2] = [&tree_root, &opts.directory];
+    let twin_dirs = host_dirs(&search_paths, &tree_roots);
+    let twin_of = |name: &str, file: &Path, admitted_rule_copy: bool| -> Option<PathBuf> {
+        let library = name.ends_with(".so") || name.contains(".so.");
+        let in_tree = tree_roots.iter().any(|root| file.starts_with(root));
+        if opts.sysroot.is_some() || !in_tree || !library || admitted_rule_copy {
+            return None;
+        }
+        host_twin(
+            name,
+            &copied_from,
+            &tree_roots,
+            &twin_dirs,
+            &ldconfig_cache,
+            (target_class, target_machine, None),
+            LookupScope::WithoutStore,
+        )
+    };
+    let tree_files: Vec<(&str, PathBuf)> = elf_files
+        .iter()
+        .filter_map(|file| Some((file.file_name()?.to_str()?, real_path(file))))
+        .collect();
+    let mut objects: Vec<infer::Object> = Vec::new();
+    let mut read: HashSet<&Path> = HashSet::new();
+    for lib in &admitted {
+        read.insert(lib.path());
+        let twin = match lib.provenance() {
+            Some(host) => Some(host.to_path_buf()),
+            None => twin_of(lib.soname(), lib.path(), discovery.triggers(lib.soname())),
+        };
+        objects.push(infer::Object {
+            name: lib.soname(),
+            file: lib.path(),
+            twin,
+        });
+    }
+    for (name, path) in &tree_files {
+        if read.insert(path) {
+            objects.push(infer::Object {
+                name,
+                file: path,
+                twin: twin_of(name, path, false),
+            });
+        }
+    }
+    infer::record(&infer::discover(
+        &objects,
+        sysroot_universe.as_ref(),
+        &tree_roots,
+    )?);
 
     // Activation has reached its fixed point: every soname the closure
     // encountered has been matched, and no group queues further work
