@@ -1054,70 +1054,38 @@ pub(crate) fn is_dynamic_loader(soname: &str) -> bool {
     soname.starts_with("ld-linux") || soname.starts_with("ld-musl-") || soname == "ld.so"
 }
 
-/// Byte patterns a loader bakes in that name the packer's filesystem, and
-/// their equal-length replacements. Each replacement is a path that does
-/// not exist on any sane system, so the loader's lookup fails cleanly
-/// instead of reading a host file.
-///
-/// glibc's `ld-linux` hardcodes its build-time `/etc/ld.so.cache`,
-/// `/etc/ld-nix.so.preload`, `/nix/store/<hash>-glibc-X/lib/`, and its
-/// fallback library directories, and nothing else under those prefixes.
-///
-/// musl's loader is libc itself, so `/etc/passwd`, `/etc/resolv.conf`,
-/// and `/usr/share/zoneinfo/` sit in the same file and must survive: they
-/// are what `getpwnam`, `getaddrinfo`, and `localtime` read at runtime.
-/// Only its default library search path names the host.
-fn loader_scrub_list(family: LibcFamily) -> &'static [(&'static [u8], &'static [u8])] {
-    match family {
-        LibcFamily::Glibc => &[
-            (b"/etc/", b"/XXX/"),
-            (b"/usr/", b"/XXX/"),
-            (b"/nix/", b"/XXX/"),
-            // /lib/ and /lib64/ appear as glibc's hardcoded fallback
-            // library search paths. Our bundled libs live in `lib/` (no
-            // leading slash), so scrubbing absolute /lib doesn't hurt.
-            (b"/lib/", b"/XXX/"),
-            (b"/lib64/", b"/XXX///"),
-        ],
-        LibcFamily::Musl => &[(
-            b"/lib:/usr/local/lib:/usr/lib",
-            b"/XXX:/XXX/local/lib:/XXX/lib",
-        )],
-    }
-}
+/// The byte pattern musl's loader names the packer's filesystem by, and
+/// its equal-length replacement. musl's loader is libc itself, so
+/// `/etc/passwd`, `/etc/resolv.conf`, and `/usr/share/zoneinfo/` sit in
+/// the same file and must survive: they are what `getpwnam`,
+/// `getaddrinfo`, and `localtime` read at runtime. Only its default
+/// library search path names the host.
+const MUSL_LOADER_SCRUB: &[(&[u8], &[u8])] = &[(
+    b"/lib:/usr/local/lib:/usr/lib",
+    b"/XXX:/XXX/local/lib:/XXX/lib",
+)];
 
 /// Rewrite absolute-path byte sequences baked into the dynamic loader.
 ///
 /// The paths exist on the packer's machine but not on the user's; worse,
 /// if any do exist, they'll point at a libc that disagrees with the one
-/// we bundled. The fix is to replace each with a path that is guaranteed
-/// not to resolve (starts with `/XXX`), keeping byte length identical so
-/// ELF offsets stay valid. What gets replaced depends on the libc family,
-/// see [`loader_scrub_list`].
-///
-/// This is the same idea as sharun's `sed` pass, done in pure Rust
-/// with a more targeted prefix list.
+/// we bundled. Each is replaced with a path of the same length that is
+/// guaranteed not to resolve, so ELF offsets stay valid. A glibc loader
+/// is closed by [`onelf_format::ldso::scrub_glibc_loader`], which works on
+/// any glibc loader image; a musl one by [`MUSL_LOADER_SCRUB`]. For a
+/// glibc loader that is not an ELF image or is too large, this returns an
+/// error and leaves the file as it was.
 pub(crate) fn scrub_loader_paths(path: &Path, family: LibcFamily) -> io::Result<()> {
     let mut data = fs::read(path)?;
-    let mut changed = false;
-    let replacements = loader_scrub_list(family);
-
-    for (needle, replace) in replacements {
-        debug_assert_eq!(needle.len(), replace.len());
-        let len = needle.len();
-        let mut i = 0;
-        while i + len <= data.len() {
-            if &data[i..i + len] == *needle {
-                data[i..i + len].copy_from_slice(replace);
-                changed = true;
-                i += len;
-            } else {
-                i += 1;
-            }
+    let replaced = match family {
+        LibcFamily::Glibc => {
+            onelf_format::ldso::scrub_glibc_loader(&mut data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .replaced
         }
-    }
-
-    if changed {
+        LibcFamily::Musl => onelf_format::ldso::replace_equal_length(&mut data, MUSL_LOADER_SCRUB),
+    };
+    if replaced > 0 {
         fs::write(path, &data)?;
     }
     Ok(())
@@ -1918,7 +1886,8 @@ mod scrub_tests {
 
     const MUSL_LIBC: &[u8] =
         b"\0/etc/passwd\0/etc/resolv.conf\0/usr/share/zoneinfo/\0/lib:/usr/local/lib:/usr/lib\0";
-    const GLIBC_LDSO: &[u8] = b"\0/etc/ld.so.cache\0/etc/ld.so.preload\0/usr/lib64/\0/lib64/\0";
+    const GLIBC_LDSO: &[u8] =
+        b"\x7fELF\0/etc/ld.so.cache\0/etc/ld.so.preload\0/usr/lib64/\0/lib64/\0";
 
     fn scrub(tag: &str, bytes: &[u8], family: LibcFamily) -> Vec<u8> {
         let dir = std::env::temp_dir().join(format!("onelf-scrub-{tag}-{}", std::process::id()));
@@ -1947,8 +1916,23 @@ mod scrub_tests {
         assert_eq!(out.len(), GLIBC_LDSO.len());
         assert_eq!(
             out,
-            b"\0/XXX/ld.so.cache\0/XXX/ld.so.preload\0/XXX/XXX///\0/XXX///\0"
+            b"\x7fELF\0/XXX/ld.so.cache\0/XXX/ld.so.preload\0/XXX/XXX///\0/XXX///\0"
         );
+    }
+
+    #[test]
+    fn a_glibc_loader_that_is_not_elf_is_refused_unchanged() {
+        let dir = std::env::temp_dir().join(format!("onelf-scrub-notelf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loader");
+        let bytes = &GLIBC_LDSO[4..];
+        fs::write(&path, bytes).unwrap();
+        let err = scrub_loader_paths(&path, LibcFamily::Glibc).unwrap_err();
+        let out = fs::read(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "the image is not an ELF object");
+        assert_eq!(out, bytes);
     }
 }
 

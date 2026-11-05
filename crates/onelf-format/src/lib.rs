@@ -11,6 +11,7 @@ pub mod elf;
 pub mod entry;
 pub mod footer;
 pub mod knowledge;
+pub mod ldso;
 pub mod manifest;
 pub mod paths;
 pub mod payload;
