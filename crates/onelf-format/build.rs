@@ -23,9 +23,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     let generated = generate_catalog(sources)?;
+    let exclusions = generate_exclusions(Path::new(EXCLUSIONS_SOURCE))?;
     let output = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
     fs::write(output.join("framework_catalog.rs"), generated)?;
+    fs::write(output.join("inference_exclusions.rs"), exclusions)?;
     Ok(())
+}
+
+/// The inference exclusions source, kept in a subdirectory of `rules`,
+/// which descriptor enumeration does not descend into.
+pub(crate) const EXCLUSIONS_SOURCE: &str = "rules/inference/exclusions.toml";
+
+pub(crate) fn generate_exclusions(source: &Path) -> Result<String, Box<dyn Error>> {
+    let text = fs::read_to_string(source)?;
+    let exclusions = rules_toml::parse_inference_exclusions(&text)
+        .map_err(|error| format!("{}: {error}", source.display()))?;
+    Ok(format!(
+        "fn generated_inference_exclusions() -> InferenceExclusions {{ InferenceExclusions {{ shared_roots: {}, shared_trees: {}, libc: {}, drivers: {} }} }}\n",
+        vector_code(&exclusions.shared_roots, path_code),
+        vector_code(&exclusions.shared_trees, exclusion_code),
+        vector_code(&exclusions.libc, exclusion_code),
+        vector_code(&exclusions.drivers, exclusion_code),
+    ))
 }
 
 pub(crate) fn catalog_sources(directory: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
@@ -114,6 +133,14 @@ fn source_code(candidate: &SourceCandidate) -> String {
         "SourceCandidate {{ base: SourceBase::{:?}, path: {} }}",
         candidate.base,
         path_code(&candidate.path)
+    )
+}
+
+fn exclusion_code(entry: &ExclusionEntry) -> String {
+    format!(
+        "ExclusionEntry {{ base: ExclusionBase::{:?}, path: {} }}",
+        entry.base,
+        path_code(&entry.path)
     )
 }
 

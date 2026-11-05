@@ -1,0 +1,89 @@
+# Directories compiled-in path inference never collects.
+#
+# The library directories of an installation prefix are its lib, lib32,
+# lib64 and libx32, and each directory directly below one of them whose
+# name has the multiarch shape <arch>-linux-<abi>, such as
+# x86_64-linux-gnu. The directory an object sits in is a library
+# directory only when it is one of these. An installation-prefix entry is
+# relative to the prefix. A lib-dirs entry names its path joined to the
+# innermost library directory a candidate lies in, never a same-named
+# directory deeper down, so it cannot begin with a multiarch directory.
+#
+# Three rules hold whatever this file says. A candidate must lie strictly
+# below a resource base: a library directory or the prefix's share. A
+# base itself, and anything containing one, is never a candidate. A
+# candidate that equals or contains the directory the object sits in is
+# dropped. When the prefix is `/`, the directory the object sits in, the
+# library directories, the bases and every entry in this file also stand
+# below `usr/`, because `/` and `/usr` are one hierarchy on merged and
+# unmerged hosts alike.
+
+# Prefix-relative directories that hold several packages' directories
+# side by side, with framework directories below them. A candidate that
+# equals or contains one is dropped.
+shared-roots = [
+  "share/X11",
+  "share/xml",
+]
+
+# Hierarchies that hold every package's files, or the host system's own,
+# at every depth. A candidate that equals, contains or lies below one is
+# dropped. PAM modules and policy, udev rules, kernel modules and a host
+# JDK must come from the host.
+shared-trees = [
+  { base = "lib-dirs", path = "debug" },
+  { base = "lib-dirs", path = "firmware" },
+  { base = "lib-dirs", path = "gcc" },
+  { base = "lib-dirs", path = "jvm" },
+  { base = "lib-dirs", path = "modprobe.d" },
+  { base = "lib-dirs", path = "modules" },
+  { base = "lib-dirs", path = "pam.d" },
+  { base = "lib-dirs", path = "security" },
+  { base = "lib-dirs", path = "sysctl.d" },
+  { base = "lib-dirs", path = "systemd" },
+  { base = "lib-dirs", path = "sysusers.d" },
+  { base = "lib-dirs", path = "tmpfiles.d" },
+  { base = "lib-dirs", path = "udev" },
+  { base = "installation-prefix", path = "share/applications" },
+  { base = "installation-prefix", path = "share/doc" },
+  { base = "installation-prefix", path = "share/fonts" },
+  { base = "installation-prefix", path = "share/icons" },
+  { base = "installation-prefix", path = "share/info" },
+  { base = "installation-prefix", path = "share/locale" },
+  { base = "installation-prefix", path = "share/man" },
+  { base = "installation-prefix", path = "share/metainfo" },
+  { base = "installation-prefix", path = "share/mime" },
+  { base = "installation-prefix", path = "share/misc" },
+  { base = "installation-prefix", path = "share/pixmaps" },
+  { base = "installation-prefix", path = "share/polkit-1" },
+]
+
+# glibc's converters, compiled locales, configuration helpers and time
+# zones. The libc handling carries what a bundled glibc needs of them, and
+# the rest stays with the host. A candidate that equals, contains or lies
+# below one is dropped.
+libc = [
+  { base = "lib-dirs", path = "gconv" },
+  { base = "lib-dirs", path = "getconf" },
+  { base = "lib-dirs", path = "locale" },
+  { base = "installation-prefix", path = "share/i18n" },
+  { base = "installation-prefix", path = "share/zoneinfo" },
+]
+
+# The GPU and video driver stacks. Their drivers must match the host's
+# kernel and hardware, so they come from the host, and only the GL, DRI
+# and Vulkan options bundle what they need of them. A candidate that
+# equals, contains or lies below one is dropped.
+drivers = [
+  { base = "lib-dirs", path = "d3d" },
+  { base = "lib-dirs", path = "dri" },
+  { base = "lib-dirs", path = "gallium-pipe" },
+  { base = "lib-dirs", path = "gbm" },
+  { base = "lib-dirs", path = "vdpau" },
+  { base = "installation-prefix", path = "share/drirc.d" },
+  { base = "installation-prefix", path = "share/egl" },
+  { base = "installation-prefix", path = "share/glvnd" },
+  { base = "installation-prefix", path = "share/libdrm" },
+  { base = "installation-prefix", path = "share/nvidia" },
+  { base = "installation-prefix", path = "share/vulkan" },
+]

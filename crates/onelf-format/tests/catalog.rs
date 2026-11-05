@@ -407,6 +407,98 @@ fn tcl_tk_versions_retain_required_scripts_and_library_prefix_alternatives() {
     }
 }
 
+/// The exclusions name the shared roots inside the resource bases, the
+/// trees that hold every package's files or the host system's own below
+/// every library directory or the prefix, glibc's own directories and the
+/// driver stacks, and the generated table is shared without a parser.
+#[test]
+fn inference_exclusions_name_shared_roots_trees_libc_and_drivers() {
+    let exclusions = onelf_format::catalog::inference_exclusions();
+    exclusions.validate().unwrap();
+    assert!(std::ptr::eq(
+        exclusions,
+        onelf_format::catalog::inference_exclusions()
+    ));
+    let roots: Vec<&str> = exclusions
+        .shared_roots
+        .iter()
+        .map(RelativePath::as_str)
+        .collect();
+    assert_eq!(roots, ["share/X11", "share/xml"]);
+    let names = |table: &[ExclusionEntry]| -> Vec<(ExclusionBase, String)> {
+        table
+            .iter()
+            .map(|entry| (entry.base, entry.path.as_str().to_string()))
+            .collect()
+    };
+    let trees = names(&exclusions.shared_trees);
+    for tree in [
+        "gcc", "modules", "debug", "firmware", "udev", "pam.d", "security", "jvm",
+    ] {
+        assert!(
+            trees.contains(&(ExclusionBase::LibraryDirs, tree.into())),
+            "{tree} is a shared tree below every library directory"
+        );
+    }
+    for tree in [
+        "share/locale",
+        "share/icons",
+        "share/fonts",
+        "share/doc",
+        "share/man",
+        "share/info",
+        "share/applications",
+        "share/mime",
+        "share/pixmaps",
+        "share/metainfo",
+        "share/misc",
+        "share/polkit-1",
+    ] {
+        assert!(
+            trees.contains(&(ExclusionBase::InstallationPrefix, tree.into())),
+            "{tree} is a shared tree"
+        );
+    }
+    assert!(
+        !trees
+            .iter()
+            .any(|(_, t)| std::path::Path::new(t).starts_with("share/X11")),
+        "share/X11/xkb and share/X11/locale stay collectable"
+    );
+    let libc = names(&exclusions.libc);
+    for dir in ["gconv", "getconf", "locale"] {
+        assert!(
+            libc.contains(&(ExclusionBase::LibraryDirs, dir.into())),
+            "{dir}"
+        );
+    }
+    assert!(libc.contains(&(ExclusionBase::InstallationPrefix, "share/zoneinfo".into())));
+    let drivers = names(&exclusions.drivers);
+    for dir in ["dri", "gbm", "vdpau"] {
+        assert!(
+            drivers.contains(&(ExclusionBase::LibraryDirs, dir.into())),
+            "{dir}"
+        );
+    }
+    for dir in ["share/drirc.d", "share/libdrm", "share/nvidia"] {
+        assert!(
+            drivers.contains(&(ExclusionBase::InstallationPrefix, dir.into())),
+            "{dir}"
+        );
+    }
+    let lib_relative = exclusions
+        .shared_trees
+        .iter()
+        .chain(&exclusions.libc)
+        .chain(&exclusions.drivers)
+        .filter(|entry| entry.base == ExclusionBase::InstallationPrefix)
+        .find(|entry| !entry.path.as_str().starts_with("share/"));
+    assert!(
+        lib_relative.is_none(),
+        "a library directory entry is lib-dirs relative: {lib_relative:?}"
+    );
+}
+
 #[cfg(feature = "rules-toml")]
 mod generation {
     use super::*;
@@ -507,6 +599,85 @@ mod generation {
             .to_string();
         assert!(
             error.contains("second.toml") && error.contains("unsupported version"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn generated_exclusions_equal_the_parsed_source() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(catalog_build::EXCLUSIONS_SOURCE);
+        let parsed = onelf_format::rules_toml::parse_inference_exclusions(
+            &fs::read_to_string(&source).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(onelf_format::catalog::inference_exclusions(), &parsed);
+        assert_eq!(
+            catalog_build::generate_exclusions(&source).unwrap(),
+            include_str!(concat!(env!("OUT_DIR"), "/inference_exclusions.rs"))
+        );
+        assert!(
+            !sources().contains(&source),
+            "the exclusions are not a descriptor source"
+        );
+    }
+
+    #[test]
+    fn exclusions_reject_unknown_fields_repeats_and_an_empty_root_table() {
+        let parse = onelf_format::rules_toml::parse_inference_exclusions;
+        let error = parse("shared-roots = [\"share/X11\"]\nextra = 1\n").unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        let error = parse("shared-roots = [\"share/X11\", \"./share/X11\"]\n").unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+        let error = parse(
+            "shared-roots = [\"share/X11\"]\n\
+             shared-trees = [{ base = \"lib-dirs\", path = \"gcc\" }]\n\
+             libc = [{ base = \"lib-dirs\", path = \"gcc\" }]\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+        let error =
+            parse("shared-roots = [\"share/X11\"]\nshared-trees = [\"share/doc\"]\n").unwrap_err();
+        assert!(error.to_string().contains("expected a table"), "{error}");
+        let error = parse(
+            "shared-roots = [\"share/X11\"]\nlibc = [{ base = \"lib-dirs\", path = \"dri\" }]\n\
+             drivers = [{ base = \"lib-dirs\", path = \"dri/\" }]\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+        let error = parse(
+            "shared-roots = [\"share/X11\"]\n\
+             shared-trees = [{ base = \"installation-prefix\", path = \"share/X11\" }]\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("also names"), "{error}");
+        let error = parse(
+            "shared-roots = [\"share/X11\"]\n\
+             drivers = [{ base = \"library-dir\", path = \"dri\" }]\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+        let error = parse(
+            "shared-roots = [\"share/X11\"]\n\
+             drivers = [{ base = \"lib-dirs\", path = \"x86_64-linux-gnu/dri\" }]\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiarch"), "{error}");
+        let error = parse("libc = []\n").unwrap_err();
+        assert!(error.to_string().contains("at least one root"), "{error}");
+        let error = parse("shared-roots = [\"/usr/lib\"]\n").unwrap_err();
+        assert!(
+            error.to_string().contains("confined relative path"),
+            "{error}"
+        );
+        let error = parse("shared-roots = [\n").unwrap_err();
+        assert!(error.to_string().contains("TOML line"), "{error}");
+        let oversized = format!(
+            "# {}\nshared-roots = [\"share/X11\"]\n",
+            "x".repeat(1024 * 1024)
+        );
+        let error = parse(&oversized).unwrap_err().to_string();
+        assert!(
+            error.contains("byte limit") && !error.contains("DESCRIPTOR"),
             "{error}"
         );
     }

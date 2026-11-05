@@ -22,17 +22,7 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor, RuleError> {
             "exceeds MAX_DESCRIPTOR_BYTES (1048576)",
         ));
     }
-    let value = text.parse::<Value>().map_err(|error| {
-        let message: String = error.message().chars().take(512).collect();
-        let offset = error.span().map_or(0, |span| span.start.min(text.len()));
-        let preceding = &text.as_bytes()[..offset];
-        let line = preceding.iter().filter(|b| **b == b'\n').count() + 1;
-        let column = preceding
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(offset + 1, |last| offset - last);
-        RuleError::new(&format!("TOML line {line} column {column}"), &message)
-    })?;
+    let value = parse_document(text)?;
     let mut fields = Fields::new(
         value,
         "descriptor",
@@ -53,6 +43,66 @@ pub fn parse_descriptor(text: &str) -> Result<Descriptor, RuleError> {
     };
     descriptor.validate()?;
     Ok(descriptor)
+}
+
+/// Parse the inference exclusions from at most 1 MiB of UTF-8 TOML and
+/// validate them. Every table is a top-level field: `shared-roots`, a list
+/// of prefix-relative paths, and `shared-trees`, `libc` and `drivers`,
+/// lists of entries whose base is `installation-prefix` or `lib-dirs`.
+pub fn parse_inference_exclusions(text: &str) -> Result<InferenceExclusions, RuleError> {
+    if text.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(RuleError::new(
+            "TOML",
+            "exceeds the 1048576 byte limit on TOML input",
+        ));
+    }
+    let value = parse_document(text)?;
+    let mut fields = Fields::new(
+        value,
+        "inference exclusions",
+        &["shared-roots", "shared-trees", "libc", "drivers"],
+    )?;
+    let exclusions = InferenceExclusions {
+        shared_roots: fields.list("shared-roots", parse_shared_root)?,
+        shared_trees: fields.list("shared-trees", parse_exclusion_entry)?,
+        libc: fields.list("libc", parse_exclusion_entry)?,
+        drivers: fields.list("drivers", parse_exclusion_entry)?,
+    };
+    exclusions.validate()?;
+    Ok(exclusions)
+}
+
+/// Parse TOML the caller has already bounded, with a parse error located
+/// by line and column and never copying an unbounded source line.
+fn parse_document(text: &str) -> Result<Value, RuleError> {
+    text.parse::<Value>().map_err(|error| {
+        let message: String = error.message().chars().take(512).collect();
+        let offset = error.span().map_or(0, |span| span.start.min(text.len()));
+        let preceding = &text.as_bytes()[..offset];
+        let line = preceding.iter().filter(|b| **b == b'\n').count() + 1;
+        let column = preceding
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(offset + 1, |last| offset - last);
+        RuleError::new(&format!("TOML line {line} column {column}"), &message)
+    })
+}
+
+fn parse_exclusion_entry(value: Value) -> Result<ExclusionEntry, RuleError> {
+    let mut fields = Fields::new(value, "exclusion entry", &["base", "path"])?;
+    let base = fields.string("base")?;
+    Ok(ExclusionEntry {
+        base: match base.as_str() {
+            "installation-prefix" => ExclusionBase::InstallationPrefix,
+            "lib-dirs" => ExclusionBase::LibraryDirs,
+            _ => return Err(unknown_variant("exclusion base", &base)),
+        },
+        path: RelativePath::new(&fields.string("path")?)?,
+    })
+}
+
+fn parse_shared_root(value: Value) -> Result<RelativePath, RuleError> {
+    RelativePath::new(&string(value, "shared-roots")?)
 }
 
 struct Fields {

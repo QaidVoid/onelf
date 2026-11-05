@@ -798,6 +798,147 @@ impl RuntimeRules {
     }
 }
 
+/// What an inference exclusion entry is relative to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExclusionBase {
+    /// The installation prefix of the object that compiles the
+    /// candidate in.
+    InstallationPrefix,
+    /// The library directories of that prefix. The entry names its path
+    /// joined to the innermost library directory a candidate lies in,
+    /// `lib/x86_64-linux-gnu` rather than `lib` for a path below the
+    /// former, never a same-named directory deeper down. Its first
+    /// component cannot have the multiarch shape, since that would name
+    /// a library directory itself.
+    LibraryDirs,
+}
+
+/// One directory inference never collects, relative to its base.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExclusionEntry {
+    /// What the path is relative to.
+    pub base: ExclusionBase,
+    /// Normalized path below that base.
+    pub path: RelativePath,
+}
+
+/// The directories compiled-in path inference never collects.
+///
+/// A bundled library names many absolute directories, and only those
+/// specific to one framework belong in a package. The library
+/// directories of an installation prefix are its `lib`, `lib32`, `lib64`
+/// and `libx32`, and each directory directly below one of them whose name
+/// has the multiarch shape `<arch>-linux-<abi>`, such as
+/// `x86_64-linux-gnu`. The directory an object sits in is a library
+/// directory only when it is one of these, since a framework can keep
+/// plugins beside its own binaries, as Xorg does in `lib/xorg/modules`.
+///
+/// There are two matching modes.
+///
+/// - A shared root, relative to the prefix, holds several packages'
+///   directories side by side while framework directories live below it,
+///   so a candidate that equals or contains one is dropped.
+/// - Every other entry, a shared tree, a libc directory or a driver
+///   directory, is dropped together with what lies below it: a candidate
+///   that equals, contains or lies below one is dropped. Shared trees
+///   hold every package's files, or the host system's own, at every
+///   depth. The libc table names directories the libc handling carries
+///   or leaves to the host, and the driver table the driver stacks, which
+///   come from the host unless the publisher bundles them.
+///
+/// Three rules are structural and hold whatever the tables say.
+///
+/// - A candidate must lie strictly below a resource base: a library
+///   directory or the prefix's `share`. Frameworks keep their plugins and
+///   data there, and the rest of a prefix is host configuration, build
+///   input or system state. A base itself, and anything containing one,
+///   is never a candidate.
+/// - A candidate that equals or contains the directory the object sits
+///   in is dropped, since that directory holds the object itself, and
+///   every package's libraries when it is a library directory.
+/// - When the prefix is `/`, the directory the object sits in, the library
+///   directories, the bases and every entry of these tables also stand
+///   below `usr/`, because `/` and `/usr` are one hierarchy on merged and
+///   unmerged hosts alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceExclusions {
+    /// Shared roots relative to the prefix. A candidate that equals or
+    /// contains one is dropped.
+    pub shared_roots: Vec<RelativePath>,
+    /// Shared trees. A candidate that equals, contains or lies below one
+    /// is dropped.
+    pub shared_trees: Vec<ExclusionEntry>,
+    /// Directories owned by the libc family. A candidate that equals,
+    /// contains or lies below one is dropped.
+    pub libc: Vec<ExclusionEntry>,
+    /// Directories owned by the driver stacks. A candidate that equals,
+    /// contains or lies below one is dropped.
+    pub drivers: Vec<ExclusionEntry>,
+}
+
+impl InferenceExclusions {
+    /// Check the record bound, that some shared root is listed, that no
+    /// root is listed twice or also names a prefix-relative entry of
+    /// another table, that no entry is listed twice across the tree, libc
+    /// and driver tables, and that no lib-dirs entry begins with a
+    /// multiarch directory.
+    pub fn validate(&self) -> Result<(), RuleError> {
+        let mut budget = RecordBudget::default();
+        budget.add(self.shared_roots.len())?;
+        budget.add(self.shared_trees.len())?;
+        budget.add(self.libc.len())?;
+        budget.add(self.drivers.len())?;
+        if self.shared_roots.is_empty() {
+            return Err(RuleError::new(
+                "shared-roots",
+                "must name at least one root",
+            ));
+        }
+        let mut roots = BTreeSet::new();
+        for root in &self.shared_roots {
+            unique(&mut roots, root, "shared root")?;
+        }
+        let mut owned = BTreeSet::new();
+        for entry in self
+            .shared_trees
+            .iter()
+            .chain(&self.libc)
+            .chain(&self.drivers)
+        {
+            if entry.base == ExclusionBase::InstallationPrefix && roots.contains(&entry.path) {
+                return Err(RuleError::value(
+                    "shared-roots",
+                    "also names a tree, libc or driver directory",
+                    entry.path.as_str(),
+                ));
+            }
+            let first = entry.path.as_str().split('/').next().unwrap_or_default();
+            if entry.base == ExclusionBase::LibraryDirs && is_multiarch(first) {
+                return Err(RuleError::value(
+                    "lib-dirs entry",
+                    "begins with a multiarch library directory",
+                    entry.path.as_str(),
+                ));
+            }
+            unique(&mut owned, entry, "shared tree, libc or driver directory")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a directory name has the multiarch shape `<arch>-linux-<abi>`,
+/// such as `x86_64-linux-gnu` or `arm-linux-gnueabihf`: the name of a
+/// distribution's per-target library directory below `lib`. This is the
+/// one test of that shape, shared by the exclusion table's validation and
+/// the inference that matches against it.
+pub fn is_multiarch(name: &str) -> bool {
+    let mut parts = name.splitn(3, '-');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(arch), Some("linux"), Some(abi)) if !arch.is_empty() && !abi.is_empty()
+    )
+}
+
 #[derive(Default)]
 struct RecordBudget(usize);
 
