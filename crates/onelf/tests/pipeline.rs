@@ -2812,12 +2812,41 @@ struct MeasuredRun {
     peak_kb: u64,
 }
 
+/// The resolved path of the program `cmd` runs, which [`exec_hwm_kb`]
+/// compares the child's executable against.
+fn measured_program(cmd: &Command) -> PathBuf {
+    std::fs::canonicalize(cmd.get_program()).expect("the measured program")
+}
+
+/// The child's `VmHWM` in kB, or `None` until `/proc/<pid>/exe` names
+/// `program`.
+///
+/// The spawn is vfork-style, so until exec has replaced the child's
+/// memory the child still shares this test process's, and the kernel
+/// lets `spawn` return just before that switch. A sample taken in that
+/// window reports the whole test harness, whose own peak can sit well
+/// above any limit a test sets for the child.
+fn exec_hwm_kb(pid: u32, program: &Path) -> Option<u64> {
+    if std::fs::read_link(format!("/proc/{pid}/exe")).ok()? != program {
+        return None;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Run `cmd` to completion, collecting its stderr while polling `/proc`
 /// for the child's high-water resident set, the way [`peak_rss_kb`]
-/// does but with the report kept.
+/// does, refusing a run with no sample, but with the report kept.
 fn run_measured(cmd: &mut Command) -> MeasuredRun {
     use std::io::Read;
     let started = std::time::Instant::now();
+    let program = measured_program(cmd);
     let mut child = cmd
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -2831,17 +2860,16 @@ fn run_measured(cmd: &mut Command) -> MeasuredRun {
     });
     let mut peak = 0u64;
     loop {
-        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            for line in s.lines() {
-                if let Some(v) = line.strip_prefix("VmHWM:")
-                    && let Ok(kb) = v.split_whitespace().next().unwrap_or("").parse::<u64>()
-                {
-                    peak = peak.max(kb);
-                }
-            }
+        if let Some(kb) = exec_hwm_kb(pid, &program) {
+            peak = peak.max(kb);
         }
         match child.try_wait().expect("wait for onelf") {
             Some(status) => {
+                assert!(
+                    peak > 0,
+                    "no sample of {} after it exec'd, since its /proc exe never named the program",
+                    program.display()
+                );
                 let out = reader.join().expect("stderr reader");
                 return MeasuredRun {
                     status,
@@ -6136,10 +6164,13 @@ fn info_reports_no_update_section_without_update_metadata() {
 
 /// Peak RSS of a child process, sampled while it runs.
 ///
-/// `VmHWM` is monotonic, so polling can only ever under-report. That
-/// matters for a test: under-sampling makes an assertion pass, never
-/// fail, so this cannot produce a spurious failure.
+/// Samples go through [`exec_hwm_kb`], so none reports this process.
+/// `VmHWM` is monotonic, so polling that misses the child's last growth
+/// under-reports, which can make a bound pass but never fail. A run with
+/// no sample at all is refused, so a gate that never opens cannot pass a
+/// test without measuring anything.
 fn peak_rss_kb(cmd: &mut Command) -> (std::process::ExitStatus, u64) {
+    let program = measured_program(cmd);
     let mut child = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -6148,18 +6179,18 @@ fn peak_rss_kb(cmd: &mut Command) -> (std::process::ExitStatus, u64) {
     let pid = child.id();
     let mut peak = 0u64;
     loop {
-        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            for line in s.lines() {
-                if let Some(v) = line.strip_prefix("VmHWM:")
-                    && let Some(kb) = v.split_whitespace().next()
-                    && let Ok(kb) = kb.parse::<u64>()
-                {
-                    peak = peak.max(kb);
-                }
-            }
+        if let Some(kb) = exec_hwm_kb(pid, &program) {
+            peak = peak.max(kb);
         }
         match child.try_wait().expect("wait") {
-            Some(status) => return (status, peak),
+            Some(status) => {
+                assert!(
+                    peak > 0,
+                    "no sample of {} after it exec'd, since its /proc exe never named the program",
+                    program.display()
+                );
+                return (status, peak);
+            }
             None => std::thread::sleep(std::time::Duration::from_millis(2)),
         }
     }
