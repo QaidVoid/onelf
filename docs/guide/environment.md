@@ -381,10 +381,11 @@ nothing else on the machine. Where the path already exists it is bound
 over; where it does not, the bundle's directory is laid over the
 parent so that one name appears without hiding what the parent holds.
 
-Two cases fall back to the old behaviour, each with a message on the
+Three cases fall back to the old behaviour, each with a message on the
 terminal rather than a silent difference:
 
 - A host that does not allow an ordinary user to make a user namespace.
+- A package whose path record is damaged. Nothing of it is applied.
 - A package built with `needs-setuid`, or a launch with
   `ONELF_FUSE_NO_NAMESPACE` set. Both ask to stay in the host's user
   namespace, because a setuid bit does nothing inside one onelf made,

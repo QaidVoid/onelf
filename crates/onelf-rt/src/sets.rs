@@ -1206,6 +1206,28 @@ mod selection_tests {
         assert!(tree_is_empty(&sandbox.store));
     }
 
+    /// A path overlay record that does not decode skips the overlays,
+    /// naming the refused pair, and the launch still runs the payload.
+    #[test]
+    fn an_invalid_path_record_skips_the_overlays_and_launches() {
+        let sandbox = sandbox("hostpaths");
+        let (code, stderr) = launch(
+            "hostpaths",
+            &[(
+                onelf_format::paths::PATHS_FILE,
+                b"/usr/share/y\t../outside".to_vec(),
+            )],
+            &sandbox,
+            true,
+        );
+        assert_eq!(code, Some(7), "{stderr}");
+        assert!(stderr.contains("not overlaying"), "{stderr}");
+        assert!(
+            stderr.contains("\"/usr/share/y\" = \"../outside\""),
+            "{stderr}"
+        );
+    }
+
     /// A record whose pins the carried set table does not back ends the
     /// launch before any acquisition, even though its own tables are
     /// internally consistent.

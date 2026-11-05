@@ -186,7 +186,15 @@ fn run(launch: &Launch) {
     );
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
-    crate::hostpaths::apply(launch.pkg_root);
+    match crate::hostpaths::read(launch.pkg) {
+        Ok(wanted) => {
+            crate::hostpaths::apply(launch.pkg_root, &wanted);
+        }
+        Err(e) => eprintln!(
+            "onelf-rt: not overlaying the paths the package was built with, so it \
+             reads the host's: {e}"
+        ),
+    }
 
     match ep.working_dir {
         onelf_format::WorkingDir::PackageRoot => {

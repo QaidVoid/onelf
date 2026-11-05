@@ -337,6 +337,13 @@ to nothing else. For an application that compiled a data path into
 itself and offers no environment variable; prefer `[env]` where one
 exists. See [Environment](../guide/environment#making-the-bundle-answer-for-a-compiled-in-path).
 
+Both sides must be normalized, with no `.` or `..` component, no empty
+component, no trailing `/` and no control character. The key is an
+absolute path below `/` of at most 4095 bytes. The value is relative to
+the package root, stays inside it, and is at most 2048 bytes. A recipe
+holds at most 1024 pairs, and the record they make is at most 256 KiB.
+A pair that breaks a rule fails the build and is named in the error.
+
 ## `[env]`
 
 ```toml

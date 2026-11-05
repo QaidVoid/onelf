@@ -14755,6 +14755,65 @@ fn a_path_the_application_was_built_with_reads_the_bundle() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A `[paths]` pair whose bundle side leaves the package fails the build
+/// with the pair named, rather than packing a record the runtime refuses.
+#[test]
+fn an_escaping_path_pair_fails_the_build() {
+    let td = workdir("hostpaths-escape");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("bin/app"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        dir.join("bin/app"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n\n[paths]\n\"/usr/share/x\" = \"../outside\"\n",
+    );
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the build accepted the pair:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\"/usr/share/x\" = \"../outside\": the bundle path leaves the package"),
+        "the failure names the pair:\n{stderr}"
+    );
+    assert!(!dir.join("app.onelf").exists(), "a package was written");
+}
+
+/// A source tree cannot carry its own `.onelf/paths`: the packer writes
+/// the record from the recipe and nothing else.
+#[test]
+fn a_tree_carried_paths_record_is_refused() {
+    let td = workdir("hostpaths-carried");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("bin/app"), "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(
+        dir.join("bin/app"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\ncommand = \"bin/app\"\n",
+    );
+    write(&dir.join(".onelf/paths"), "/usr/share/x\tshare/x");
+
+    let out = onelf_build(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a tree record was packed:\n{stderr}");
+    assert!(
+        stderr.contains("source contains reserved path .onelf/paths"),
+        "the failure names the record:\n{stderr}"
+    );
+}
+
 /// A set's build says what it ships, and a package pinning it believes
 /// the build rather than working the answer out again from the sysroot.
 /// The two drifted apart before: a build drops what it cannot load, and

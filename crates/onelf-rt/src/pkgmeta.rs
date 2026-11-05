@@ -103,7 +103,7 @@ fn rejected(why: impl std::fmt::Display) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::File;
     use std::path::PathBuf;
     use std::process::Command;
@@ -530,7 +530,7 @@ mod tests {
     /// The layout is `[prefix][manifest][stored payload][footer]`: one
     /// block per file, bytes verbatim, so a fixture payload offset is also
     /// a byte offset a test can tamper with.
-    mod fixture {
+    pub(crate) mod fixture {
         use super::*;
 
         /// A built package and the absolute byte span of each file's

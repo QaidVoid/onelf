@@ -385,6 +385,9 @@ impl AssemblyRequest {
         } = recipe;
 
         refuse_library_search_env(recipe_path, &env)?;
+        let paths: Vec<(String, String)> = paths.into_iter().collect();
+        crate::pack::paths_record(&crate::pack::path_pairs(&paths))
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", recipe_path.display())))?;
         let rules =
             crate::rules::RuleCatalog::load(recipe_path, &dir, &rb.rules, &rb.disable_rules)?;
 
@@ -601,7 +604,7 @@ impl AssemblyRequest {
                 embed: embed_updater,
             },
             env: env.into_iter().collect(),
-            paths: paths.into_iter().collect(),
+            paths,
             preload,
             input: import,
             selections,

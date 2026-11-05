@@ -23,6 +23,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
 use rayon::prelude::*;
 
+use onelf_format::paths::PathPair;
 use onelf_format::rules::RuleId;
 use onelf_format::runtime_metadata::{
     EntrypointSets, MetadataError, RuntimeRuleMetadata, RuntimeRuleRecord, SetPin,
@@ -783,6 +784,26 @@ fn inject_onelf_file(
     });
 }
 
+/// The `.onelf/paths` record for `pairs`, each binding a bundle directory
+/// over the absolute path an application was built to open. A pair the
+/// runtime would refuse at launch is refused here, named as the recipe
+/// wrote it, so no package carries a record its runtime ignores.
+pub(crate) fn paths_record(pairs: &[PathPair]) -> io::Result<Vec<u8>> {
+    onelf_format::paths::encode(pairs)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("[paths]: {e}")))
+}
+
+/// The recipe's `[paths]` entries, absolute target first, as record pairs.
+pub(crate) fn path_pairs(declared: &[(String, String)]) -> Vec<PathPair> {
+    declared
+        .iter()
+        .map(|(absolute, relative)| PathPair {
+            absolute: absolute.clone(),
+            relative: relative.clone(),
+        })
+        .collect()
+}
+
 /// Compile GSettings schemas when the tree ships schema XML without the
 /// compiled blob. The bundle flow does the same inside the AppDir; plain
 /// `pack` must not fall behind, or an app reading GSettings crashes on its
@@ -1235,7 +1256,6 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != Path::new(crate::bundle::sysroot::PLATFORM_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SETS_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SHIPPED_FILE)
-                && p.as_path() != Path::new(crate::bundle::sysroot::PATHS_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(
@@ -1427,21 +1447,12 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         );
     }
 
-    // Write the path overlays as .onelf/paths (ABSOLUTE\tRELATIVE per
-    // line). The runtime makes each bundle directory answer for the
-    // absolute path, for an application that opens one it was built
-    // with and offers no way to say otherwise.
     if !opts.paths.is_empty() {
-        let lines: Vec<String> = opts
-            .paths
-            .iter()
-            .map(|(abs, rel)| format!("{abs}\t{rel}"))
-            .collect();
         inject_onelf_file(
             &mut dirs,
             &mut files,
             crate::bundle::sysroot::PATHS_FILE,
-            lines.join("\n").into_bytes(),
+            paths_record(&path_pairs(&opts.paths))?,
             inject_mtime,
         );
     }
@@ -2514,6 +2525,30 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn recipe_paths_keep_their_record_bytes() {
+        let declared = vec![
+            ("/opt/vendor".to_string(), "share/vendor".to_string()),
+            ("/usr/share/x".to_string(), "share/x".to_string()),
+        ];
+        assert_eq!(
+            paths_record(&path_pairs(&declared)).unwrap(),
+            b"/opt/vendor\tshare/vendor\n/usr/share/x\tshare/x"
+        );
+    }
+
+    #[test]
+    fn a_path_pair_the_runtime_would_refuse_fails_the_pack() {
+        let declared = vec![("/usr/share/x".to_string(), "share/../../etc".to_string())];
+        let err = paths_record(&path_pairs(&declared)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "[paths]: \"/usr/share/x\" = \"share/../../etc\": \
+             the bundle path leaves the package"
+        );
     }
 
     /// The walk saw a regular file; by read time the path is anything.

@@ -702,7 +702,7 @@ pub const PROVIDER_INDEX_FILE: &str = ".onelf/providers";
 
 /// Absolute paths the runtime makes bundle directories answer for, one
 /// `ABSOLUTE<tab>RELATIVE` pair per line.
-pub const PATHS_FILE: &str = ".onelf/paths";
+pub const PATHS_FILE: &str = onelf_format::paths::PATHS_FILE;
 
 /// The sets record as TOML.
 pub fn render_sets(sets: &[SharedSet], closures: &[(String, Vec<String>)]) -> String {

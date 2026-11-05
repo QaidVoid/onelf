@@ -109,7 +109,7 @@ pub fn read_payload_entry(
     if block.has_content_hash() && blake3::hash(&data).as_bytes() != &block.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "onelf: block hash mismatch (tampered or corrupt package)",
+            "block hash mismatch (tampered or corrupt package)",
         ));
     }
     Ok(data)
@@ -130,7 +130,7 @@ pub fn read_verified_entry(
     if blake3::hash(&data).as_bytes() != &entry.content_hash {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "onelf: content hash mismatch (tampered or corrupt package)",
+            "content hash mismatch (tampered or corrupt package)",
         ));
     }
     Ok(data)
@@ -154,7 +154,8 @@ pub(crate) fn find_file_entry(pkg: &PackageData, path: &str) -> Option<usize> {
 /// [`read_verified_entry`], so bytes that no longer match the entry's
 /// content hash are refused before the caller decodes anything. A record
 /// declaring more than `max_bytes` is refused without a read, which keeps
-/// a crafted manifest from steering the allocation.
+/// a crafted manifest from steering the allocation. Every error names
+/// `path`.
 pub(crate) fn read_bounded_record(
     pkg: &PackageData,
     path: &str,
@@ -171,7 +172,9 @@ pub(crate) fn read_bounded_record(
             format!("{path}: declares {declared} bytes, over the {max_bytes}-byte record limit"),
         ));
     }
-    read_verified_entry(&pkg.file, &pkg.footer, entry, &pkg.codec).map(Some)
+    read_verified_entry(&pkg.file, &pkg.footer, entry, &pkg.codec)
+        .map(Some)
+        .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))
 }
 
 /// Read and concatenate every block of an entry.

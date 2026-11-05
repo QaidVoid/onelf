@@ -13,40 +13,44 @@
 //! cannot be had the launch says so once and goes on: the application
 //! then behaves as it did before, which is to say it may fail, and the
 //! reason is on the terminal.
+//!
+//! The record is read from the package file and checked against its
+//! content hash, never from the tree the launch runs in, and decoded by
+//! the shared bounded codec. A record that fails either is refused
+//! whole: nothing of it is mounted, and the launch says why and goes on
+//! as it would without a namespace, so a damaged record never binds a
+//! directory nobody asked for.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use onelf_format::paths::{self, MAX_RECORD_BYTES, PATHS_FILE, PathPair};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind, mount_change, unmount,
 };
 
-/// Where the packer records the pairs, one `ABSOLUTE<tab>RELATIVE` per line.
-pub const PATHS_FILE: &str = ".onelf/paths";
+use crate::loader::{self, PackageData};
 
-/// The pairs a package records, as absolute target and bundle-relative
-/// source. A line without a tab, or naming a relative target, is skipped:
-/// the packer refuses to write one, so anything else is a damaged file
-/// rather than an instruction.
-pub fn parse(text: &str) -> Vec<(PathBuf, PathBuf)> {
-    text.lines()
-        .filter_map(|line| line.split_once('\t'))
-        .map(|(abs, rel)| (PathBuf::from(abs.trim()), PathBuf::from(rel.trim())))
-        .filter(|(abs, rel)| abs.is_absolute() && !rel.as_os_str().is_empty())
-        .collect()
+/// The pairs the package records, read through the verified package
+/// path. A package without the record has no pairs. A record that is
+/// over its size bound, fails its content hash or does not decode is an
+/// error, never an empty list, so the caller can say why nothing is
+/// overlaid.
+pub fn read(pkg: &PackageData) -> io::Result<Vec<PathPair>> {
+    let Some(bytes) = loader::read_bounded_record(pkg, PATHS_FILE, MAX_RECORD_BYTES)? else {
+        return Ok(Vec::new());
+    };
+    paths::decode(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{PATHS_FILE}: {e}")))
 }
 
-/// Make each recorded bundle directory answer for its absolute path.
+/// Make each bundle directory in `wanted` answer for its absolute path.
 ///
 /// Called before the entrypoint is executed and after the package is in
-/// place. Returns whether anything was mounted, so the caller can say so
-/// when it matters.
-pub fn apply(pkg_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(pkg_root.join(PATHS_FILE)) else {
-        return false;
-    };
-    let wanted = parse(&text);
+/// place at `pkg_root`. Returns whether anything was mounted, so the
+/// caller can say so when it matters.
+pub fn apply(pkg_root: &Path, wanted: &[PathPair]) -> bool {
     if wanted.is_empty() {
         return false;
     }
@@ -75,8 +79,9 @@ pub fn apply(pkg_root: &Path) -> bool {
     let mut mounted = 0;
     // Targets that do not exist, by the directory they are to appear in.
     let mut absent: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
-    for (target, rel) in &wanted {
-        let source = pkg_root.join(rel);
+    for pair in wanted {
+        let target = Path::new(&pair.absolute);
+        let source = pkg_root.join(&pair.relative);
         if !source.is_dir() {
             continue;
         }
@@ -212,26 +217,81 @@ fn lay_overlays(staging: &Path, absent: &BTreeMap<PathBuf, Vec<(PathBuf, PathBuf
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use crate::pkgmeta::tests::fixture;
+
     use super::*;
 
+    /// A fixture package carrying `files`, loaded through the real loader.
+    fn load(name: &str, files: &[(&str, Vec<u8>)]) -> PackageData {
+        load_bytes(
+            name,
+            &fixture::build(b"onelf fixture prefix", files, &[]).bytes,
+        )
+    }
+
+    fn load_bytes(name: &str, bytes: &[u8]) -> PackageData {
+        let path =
+            std::env::temp_dir().join(format!("onelf-hostpaths-{name}-{}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        pkg
+    }
+
     #[test]
-    fn pairs_are_read_and_nonsense_is_skipped() {
-        let got = parse(
-            "/usr/share/galculator\tshare/galculator\n\
-             no-tab-here\n\
-             relative/target\tshare/x\n\
-             /usr/share/empty\t\n\
-             /opt/vendor\tshare/vendor\n",
+    fn a_package_without_the_record_has_no_pairs() {
+        let pkg = load("absent", &[("bin/app", b"elf".to_vec())]);
+        assert_eq!(read(&pkg).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn the_record_is_read_from_the_package() {
+        let record = b"/usr/share/galculator\tshare/galculator\n/opt/vendor\tshare/vendor";
+        let pkg = load("valid", &[(PATHS_FILE, record.to_vec())]);
+        let pairs = read(&pkg).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[1].absolute, "/opt/vendor");
+        assert_eq!(pairs[1].relative, "share/vendor");
+    }
+
+    #[test]
+    fn a_present_invalid_record_is_an_error_naming_the_pair() {
+        let record = b"/usr/share/x\tshare/x\n/usr/share/y\t../outside";
+        let pkg = load("escapes", &[(PATHS_FILE, record.to_vec())]);
+        let err = read(&pkg).unwrap_err().to_string();
+        assert!(err.starts_with(PATHS_FILE), "{err}");
+        assert!(err.contains("\"/usr/share/y\" = \"../outside\""), "{err}");
+    }
+
+    #[test]
+    fn a_tampered_record_is_refused_by_its_content_hash() {
+        let built = fixture::build(
+            b"onelf fixture prefix",
+            &[(PATHS_FILE, b"/usr/share/x\tshare/x".to_vec())],
+            &[],
         );
-        assert_eq!(
-            got,
-            vec![
-                (
-                    PathBuf::from("/usr/share/galculator"),
-                    PathBuf::from("share/galculator")
-                ),
-                (PathBuf::from("/opt/vendor"), PathBuf::from("share/vendor")),
-            ]
+        let mut bytes = built.bytes;
+        let (start, len) = built.spans[0];
+        bytes[start + len - 1] = b'y';
+        let pkg = load_bytes("tampered", &bytes);
+        let err = read(&pkg).unwrap_err().to_string();
+        assert!(
+            err.starts_with(PATHS_FILE) && err.contains("hash mismatch"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_record_over_the_size_bound_is_refused_before_reading() {
+        let mut pkg = load("oversized", &[(PATHS_FILE, b"/a\tb".to_vec())]);
+        let idx = loader::find_file_entry(&pkg, PATHS_FILE).unwrap();
+        pkg.manifest.entries[idx].blocks[0].original_size = MAX_RECORD_BYTES as u64 + 1;
+        let err = read(&pkg).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("{PATHS_FILE}: declares")) && err.contains("record limit"),
+            "{err}"
         );
     }
 }

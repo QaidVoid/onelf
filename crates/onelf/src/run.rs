@@ -124,10 +124,19 @@ pub fn run(
     let (dir, mut found) = resolve_app(app_spec)?;
     let dir = dir.canonicalize()?;
 
-    // A recipe environment naming a loader search path is refused in
-    // every development form, before anything stages or launches.
+    // A recipe environment naming a loader search path, or a path pair a
+    // runtime would refuse, is refused in every development form, before
+    // anything stages or launches.
     if let Some(loaded) = &found {
         assembly::refuse_library_search_env(&loaded.path, &loaded.recipe.env)?;
+        let declared: Vec<(String, String)> = loaded
+            .recipe
+            .paths
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        crate::pack::paths_record(&crate::pack::path_pairs(&declared))
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", loaded.path.display())))?;
     }
 
     let mut assembled: Option<Assembled> = None;
@@ -388,7 +397,7 @@ pub fn run(
     rustix::fs::flock(&lease, rustix::fs::FlockOperation::LockShared)
         .map_err(|e| io::Error::other(format!("the view lease: {e}")))?;
 
-    let paths_bytes = paths_file_bytes(&declared_paths);
+    let path_pairs = crate::pack::path_pairs(&declared_paths);
     let published = onelf_rt::links::view::ensure_view(&store, &identity, &lease, |staging| {
         stage_tree(staging, &dir)?;
         for (rel, host) in &shadows {
@@ -400,9 +409,6 @@ pub fn run(
         staging.write_file(onelf_rt::env::VIEW_ENV_FILE, &expanded, 0o644)?;
         if let Some(rel) = &link_dir {
             staging.place_free_links(rel, &links)?;
-        }
-        if !paths_bytes.is_empty() {
-            staging.write_file(onelf_rt::hostpaths::PATHS_FILE, &paths_bytes, 0o644)?;
         }
         if needs_setuid {
             staging.write_file(".onelf/needs-setuid", b"1\n", 0o644)?;
@@ -448,7 +454,7 @@ pub fn run(
          a re-exec that clears the environment is not hooked"
     );
     if !declared_paths.is_empty() {
-        if onelf_rt::hostpaths::apply(&view_root) {
+        if onelf_rt::hostpaths::apply(&view_root, &path_pairs) {
             eprintln!(
                 "onelf run: the view's directories answer for the absolute paths the recipe built with"
             );
@@ -508,17 +514,6 @@ fn env_bytes(env: &[(String, String)]) -> Vec<u8> {
         data.extend_from_slice(format!("{key}={value}\n").as_bytes());
     }
     data
-}
-
-/// The absolute-path overlays as the runtime reads them: one
-/// `ABSOLUTE<tab>RELATIVE` line per pair, where the relative path names
-/// the same layout inside the view as inside the AppDir.
-fn paths_file_bytes(pairs: &[(String, String)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (abs, rel) in pairs {
-        out.extend_from_slice(format!("{abs}\t{rel}\n").as_bytes());
-    }
-    out
 }
 
 /// The names the tree itself has in `dir`, a path inside the AppDir:
