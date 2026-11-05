@@ -433,7 +433,7 @@ fn inference_exclusions_name_shared_roots_trees_libc_and_drivers() {
     };
     let trees = names(&exclusions.shared_trees);
     for tree in [
-        "gcc", "modules", "debug", "firmware", "udev", "pam.d", "security", "jvm",
+        "gcc", "go", "modules", "debug", "firmware", "udev", "pam.d", "security", "jvm",
     ] {
         assert!(
             trees.contains(&(ExclusionBase::LibraryDirs, tree.into())),

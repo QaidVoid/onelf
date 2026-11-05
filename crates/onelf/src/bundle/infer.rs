@@ -30,6 +30,19 @@
 //! `share/xkeyboard-config-2` is found once, under its canonical path. A
 //! sysroot build counts only directories holding files it admitted.
 //!
+//! Within the bases the catalog's inference exclusions drop what holds
+//! several packages' files or belongs to libc or a driver stack: a shared
+//! root such as `share/X11` with what contains it, and a shared tree such
+//! as `share/locale` or a library directory's `security`, a libc
+//! directory such as `gconv` or a driver directory such as `dri` with
+//! what contains it or lies below it. A candidate that equals or contains
+//! the directory the object sits in is dropped too, while what lies below
+//! it stays, as Xorg's `lib/xorg/modules` does. libc's own objects are
+//! not read, since the libc handling owns their directories, and a
+//! recipe exclusion drops a directory by any of its components below its
+//! library directory or `share`. Under a `/` prefix every rule also
+//! stands below `usr`.
+//!
 //! An object the tree itself holds names the source's paths, not the
 //! tree's. A host scan's tree copy of a library takes its prefix from the
 //! host file it stands for. A program, or a library with no host twin,
@@ -59,11 +72,14 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use goblin::elf::program_header::{PF_W, PT_LOAD};
+use onelf_format::catalog;
+use onelf_format::rules::{ExclusionBase, ExclusionEntry, is_multiarch};
 use onelf_sysroot::path::in_root;
 
 use super::datadirs::path_like;
 use super::{
-    Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, object_prefix, resolve_within,
+    Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, is_excluded, libc_family_of_soname,
+    object_prefix, resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -99,6 +115,23 @@ pub(crate) struct InferredDir {
     pub objects: BTreeSet<String>,
 }
 
+/// What discovery reads objects against.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Scope<'a> {
+    /// The sysroot build's admitted universe, `None` for a host scan.
+    pub sysroot: Option<&'a SysrootUniverse>,
+    /// The spellings of the tree being assembled: an object there takes
+    /// its prefix and its own directory at the same place below the
+    /// source's root.
+    pub trees: &'a [&'a Path],
+    /// The recipe's `[bundle] exclude` patterns, which the CLI's
+    /// `--exclude` feeds too. A pattern is a soname prefix, and it drops
+    /// a directory when it begins one of the directory's components below
+    /// its library directory or `share`, so `libdecor` drops
+    /// `lib/libdecor/plugins-1` while `libx` leaves `libx32` alone.
+    pub exclude: &'a [String],
+}
+
 /// One bundled object discovery reads.
 #[derive(Debug, Clone)]
 pub(crate) struct Object<'a> {
@@ -113,20 +146,14 @@ pub(crate) struct Object<'a> {
     pub twin: Option<PathBuf>,
 }
 
-/// The directories `objects` compile in, sorted by source. `sysroot` is
-/// the sysroot build's admitted universe, `None` for a host scan.
-/// `trees` are the spellings of the tree being assembled: an object
-/// installed there takes its prefix at the same place below the
-/// source's root.
-pub(crate) fn discover(
-    objects: &[Object],
-    sysroot: Option<&SysrootUniverse>,
-    trees: &[&Path],
-) -> io::Result<Vec<InferredDir>> {
+/// The directories `objects` compile in, sorted by source, read against
+/// `scope`.
+pub(crate) fn discover(objects: &[Object], scope: &Scope) -> io::Result<Vec<InferredDir>> {
+    let exclude: Vec<&str> = scope.exclude.iter().map(String::as_str).collect();
     let mut dirs: BTreeMap<PathBuf, InferredDir> = BTreeMap::new();
     for object in objects {
         let name = object.name;
-        for candidate in candidates_of(object, sysroot, trees)? {
+        for candidate in candidates_of(object, scope, &exclude)? {
             if !dirs.contains_key(&candidate.source) && dirs.len() >= MAX_INFERRED_DIRS {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -198,27 +225,45 @@ struct Candidate {
 /// in either merged spelling, is resolved, and only those count against
 /// [`MAX_OBJECT_RESOLUTIONS`]. Only one naming an existing directory
 /// counts against [`MAX_OBJECT_PATHS`].
-fn candidates_of(
-    object: &Object,
-    sysroot: Option<&SysrootUniverse>,
-    trees: &[&Path],
-) -> io::Result<Vec<Candidate>> {
+fn candidates_of(object: &Object, scope: &Scope, exclude: &[&str]) -> io::Result<Vec<Candidate>> {
     let path = object.file;
-    let Some(own_prefix) = object_prefix(object.twin.as_deref().unwrap_or(path)) else {
+    let sysroot = scope.sysroot;
+    if libc_family_of_soname(object.name).is_some() {
+        return Ok(Vec::new());
+    }
+    let installed = object.twin.as_deref().unwrap_or(path);
+    let Some(own_prefix) = object_prefix(installed) else {
         return Ok(Vec::new());
     };
     let Ok(data) = fs::read(path) else {
         return Ok(Vec::new());
     };
     let source_root = sysroot.map_or(Path::new("/"), SysrootUniverse::root);
-    let prefix = match trees
+    let below_source = |place: &Path| match scope
+        .trees
         .iter()
-        .find_map(|tree| own_prefix.strip_prefix(tree).ok())
+        .find_map(|tree| place.strip_prefix(tree).ok())
     {
         Some(rel) => source_root.join(rel),
-        None => own_prefix,
+        None => place.to_path_buf(),
     };
+    let prefix = below_source(&own_prefix);
     let under_root = prefix == source_root;
+    let resolve = |place: &Path| -> Option<PathBuf> {
+        let from_root = place.strip_prefix(source_root).ok()?;
+        match sysroot {
+            Some(universe) => in_root(universe.root(), from_root).ok(),
+            None => resolve_within(Path::new("/"), from_root).ok(),
+        }
+    };
+    let own_dir = installed
+        .parent()
+        .map(below_source)
+        .map(|dir| resolve(&dir).unwrap_or(dir));
+    let own_rel = own_dir
+        .as_deref()
+        .and_then(|dir| dir.strip_prefix(&prefix).ok())
+        .map(|rel| merged(rel, under_root).to_path_buf());
     let merged_parent = prefix
         .file_name()
         .is_some_and(|name| name == "usr")
@@ -246,11 +291,7 @@ fn candidates_of(
                 "MAX_OBJECT_RESOLUTIONS",
             ));
         }
-        let resolved = match sysroot {
-            Some(universe) => in_root(universe.root(), from_root).ok(),
-            None => resolve_within(Path::new("/"), from_root).ok(),
-        };
-        let Some(source) = resolved else {
+        let Some(source) = resolve(&declared) else {
             continue;
         };
         if !source.is_dir() {
@@ -263,7 +304,9 @@ fn candidates_of(
         let Ok(rel) = source.strip_prefix(&prefix) else {
             continue;
         };
-        if !in_resource_base(rel, under_root) {
+        if !in_resource_base(rel, under_root)
+            || dropped(merged(rel, under_root), own_rel.as_deref(), exclude)
+        {
             continue;
         }
         if let Some(universe) = sysroot {
@@ -283,6 +326,48 @@ fn candidates_of(
         });
     }
     Ok(out)
+}
+
+/// Whether a candidate at `rel`, relative to the prefix and in its
+/// merged spelling, is dropped: when it equals or contains the directory
+/// the object sits in, `own`, when the catalog's inference exclusions
+/// drop it, or when a recipe exclusion begins one of its components
+/// below its library directory or `share`, as one begins a soname. A
+/// shared root drops what equals or contains it. A tree, libc or driver
+/// entry also drops what lies below it, and one relative to the library
+/// directories names its path joined to the innermost library directory
+/// the candidate lies in.
+fn dropped(rel: &Path, own: Option<&Path>, exclude: &[&str]) -> bool {
+    let exclusions = catalog::inference_exclusions();
+    let library_dir = library_dir_of(rel);
+    let owned = |entry: &ExclusionEntry| {
+        let owner = match entry.base {
+            ExclusionBase::InstallationPrefix => PathBuf::from(entry.path.as_str()),
+            ExclusionBase::LibraryDirs => match &library_dir {
+                Some(dir) => dir.join(entry.path.as_str()),
+                None => return false,
+            },
+        };
+        rel.starts_with(&owner) || owner.starts_with(rel)
+    };
+    let base = library_dir.as_deref().unwrap_or(Path::new("share"));
+    let excluded = rel.strip_prefix(base).is_ok_and(|below| {
+        below
+            .components()
+            .any(|part| is_excluded(&part.as_os_str().to_string_lossy(), exclude))
+    });
+    own.is_some_and(|own| own.starts_with(rel))
+        || excluded
+        || exclusions
+            .shared_roots
+            .iter()
+            .any(|root| Path::new(root.as_str()).starts_with(rel))
+        || exclusions
+            .shared_trees
+            .iter()
+            .chain(&exclusions.libc)
+            .chain(&exclusions.drivers)
+            .any(owned)
 }
 
 /// The bounded-reading error: which object stopped, and at which bound.
@@ -366,16 +451,6 @@ fn merged(rel: &Path, under_root: bool) -> &Path {
         Ok(below) if under_root => below,
         _ => rel,
     }
-}
-
-/// Whether a directory name has the multiarch shape `<arch>-linux-<abi>`,
-/// such as `x86_64-linux-gnu` or `arm-linux-gnueabihf`.
-fn is_multiarch(name: &str) -> bool {
-    let mut parts = name.splitn(3, '-');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(arch), Some("linux"), Some(abi)) if !arch.is_empty() && !abi.is_empty()
-    )
 }
 
 /// The library directory `rel` lies in or is, relative to the prefix:
@@ -628,7 +703,14 @@ mod tests {
                 twin: None,
             })
             .collect();
-        discover(&objects, sysroot, trees)
+        discover(
+            &objects,
+            &Scope {
+                sysroot,
+                trees,
+                exclude: &[],
+            },
+        )
     }
 
     fn rels(dirs: &[InferredDir]) -> Vec<String> {
@@ -1027,6 +1109,247 @@ mod tests {
         let dirs = run_in(&objects, Some(&universe), &[&app]).unwrap();
         assert_eq!(rels(&dirs), ["share/X11/xkb"]);
         assert_eq!(dirs[0].prefix, root.join("usr"));
+    }
+
+    /// The directories of one object under its prefix that survive the
+    /// filter, for an object at `object` compiling in each of `dirs`,
+    /// which all exist.
+    fn surviving(tag: &str, object: &str, dirs: &[&str], exclude: &[String]) -> Vec<String> {
+        let tree = Tree::new(tag);
+        for dir in dirs {
+            tree.dir(dir);
+        }
+        let object = tree.object(object, dirs);
+        let objects = [Object {
+            name: &object.0,
+            file: &object.1,
+            twin: None,
+        }];
+        let scope = Scope {
+            sysroot: None,
+            trees: &[],
+            exclude,
+        };
+        rels(&discover(&objects, &scope).unwrap())
+    }
+
+    /// Shared roots drop what equals or contains them while their
+    /// framework subdirectories stay. Shared trees, libc's directories
+    /// and the driver stacks drop what lies below them too, an entry
+    /// relative to the library directories naming its path below
+    /// whichever library directory the candidate lies in.
+    #[test]
+    fn roots_trees_libc_and_drivers_drop_what_the_table_says() {
+        let kept = surviving(
+            "table",
+            "usr/lib/libexamplefw.so.1",
+            &[
+                "usr/share/X11",
+                "usr/share/X11/xkb",
+                "usr/share/xml",
+                "usr/share/locale",
+                "usr/share/locale/de",
+                "usr/share/doc/slang/v2",
+                "usr/share/fonts/Type1",
+                "usr/share/zoneinfo",
+                "usr/share/drirc.d",
+                "usr/lib/gconv",
+                "usr/lib/locale",
+                "usr/lib/dri",
+                "usr/lib64/dri",
+                "usr/lib64/security",
+                "usr/lib/x86_64-linux-gnu/security",
+                "usr/lib/x86_64-linux-gnu/gconv",
+                "usr/lib/jvm/x",
+                "usr/lib/go",
+                "usr/lib/gcc/x86_64-linux-gnu/14",
+                "usr/lib/examplefw/plugins",
+                "usr/share/examplefw",
+            ],
+            &[],
+        );
+        assert_eq!(
+            kept,
+            ["lib/examplefw/plugins", "share/X11/xkb", "share/examplefw"]
+        );
+    }
+
+    /// A GStreamer-style plugin in a subdirectory of the library
+    /// directory still has `lib64/dri` dropped as a driver directory, and
+    /// its own directory is never a candidate.
+    #[test]
+    fn a_plugin_in_a_subdirectory_drops_driver_and_own_directories() {
+        let kept = surviving(
+            "plugin-subdir",
+            "usr/lib/gstreamer-1.0/libgstva.so",
+            &["usr/lib64/dri", "usr/lib/gstreamer-1.0", "usr/share/gstva"],
+            &[],
+        );
+        assert_eq!(kept, ["share/gstva"]);
+    }
+
+    /// The directory an object sits in, and anything containing it, is
+    /// never a candidate, while what lies below it is: Xorg's modules and
+    /// a framework's own `locale` beside a program stay, since a
+    /// library-directory entry is never matched deeper down.
+    #[test]
+    fn the_objects_own_directory_is_dropped_and_what_lies_below_it_kept() {
+        let kept = surviving(
+            "own-dir",
+            "usr/lib/xorg/Xorg",
+            &[
+                "usr/lib/xorg",
+                "usr/lib/xorg/modules",
+                "usr/lib/xorg/locale",
+            ],
+            &[],
+        );
+        assert_eq!(kept, ["lib/xorg/locale", "lib/xorg/modules"]);
+        let kept = surviving(
+            "own-multiarch",
+            "usr/lib/x86_64-linux-gnu/libfoo.so.1",
+            &[
+                "usr/lib/x86_64-linux-gnu",
+                "usr/lib/x86_64-linux-gnu/security",
+                "usr/lib/x86_64-linux-gnu/foo",
+            ],
+            &[],
+        );
+        assert_eq!(kept, ["lib/x86_64-linux-gnu/foo"]);
+        assert!(
+            dropped(Path::new("lib/foo"), Some(Path::new("lib/foo/bar")), &[]),
+            "a candidate containing the object's own directory is dropped"
+        );
+        assert!(!dropped(
+            Path::new("lib/foo/bar/plugins"),
+            Some(Path::new("lib/foo/bar")),
+            &[]
+        ));
+        let kept = surviving(
+            "multiarch-base",
+            "usr/lib/libbar.so.1",
+            &["usr/lib/x86_64-linux-gnu"],
+            &[],
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// libc's own objects are not read as sources, and a recipe
+    /// exclusion drops a directory by any of its components below its
+    /// library directory or `share`.
+    #[test]
+    fn libc_objects_are_skipped_and_recipe_exclusions_apply() {
+        assert!(surviving("libc", "usr/lib/libc.so.6", &["usr/share/examplefw"], &[]).is_empty());
+        assert!(
+            surviving(
+                "loader",
+                "usr/lib/ld-linux-x86-64.so.2",
+                &["usr/share/examplefw"],
+                &[]
+            )
+            .is_empty()
+        );
+        let kept = surviving(
+            "exclude",
+            "usr/lib/libexamplefw.so.1",
+            &["usr/lib/libdecor/plugins-1", "usr/share/examplefw"],
+            &["libdecor".to_string()],
+        );
+        assert_eq!(kept, ["share/examplefw"]);
+        let kept = surviving(
+            "exclude-base",
+            "usr/lib/libexamplefw.so.1",
+            &["usr/libx32/examplefw", "usr/lib/libxfoo"],
+            &["libx".to_string()],
+        );
+        assert_eq!(kept, ["libx32/examplefw"]);
+    }
+
+    /// Under a `/` prefix every table entry and the object's own
+    /// directory also stand below `usr`: an object in `/lib/firefox` has
+    /// `/usr/lib/firefox` dropped, and `usr/share/locale` is a tree.
+    #[test]
+    fn a_root_prefix_mirrors_the_table_and_the_own_directory_below_usr() {
+        let tree = Tree::new("root-mirror");
+        let root = tree.0.join("sys");
+        let compiled = [
+            "/usr/lib/firefox",
+            "/usr/share/X11",
+            "/usr/share/locale",
+            "/usr/lib/x86_64-linux-gnu/gconv",
+            "/usr/share/firefoxfw",
+        ];
+        tree.file("sys/lib/firefox/libxul.so", &elf(&[(READ, &compiled)]));
+        let mut files = vec!["lib/firefox/libxul.so".to_string()];
+        for dir in compiled {
+            files.push(format!("{}/file", &dir[1..]));
+            tree.file(&format!("sys{dir}/file"), b"x");
+        }
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let universe = fixture::populate_universe(
+            &root,
+            &[fixture::package("app", &refs)],
+            "app",
+            &[],
+            None,
+            None,
+        );
+        let lib = ("libxul.so".to_string(), root.join("lib/firefox/libxul.so"));
+        let dirs = run(&[lib], Some(&universe)).unwrap();
+        assert_eq!(rels(&dirs), ["usr/share/firefoxfw"]);
+    }
+
+    /// The directory an object sits in is resolved through links like a
+    /// candidate, so an object reached through `lib64 -> lib` still has
+    /// `lib/foo` dropped as its own directory.
+    #[test]
+    fn the_own_directory_is_resolved_through_links() {
+        let tree = Tree::new("own-link");
+        let root = tree.0.join("sys");
+        let app = tree.0.join("app");
+        tree.file("sys/usr/lib/foo/plugins/p", b"p");
+        symlink("lib", root.join("usr/lib64")).unwrap();
+        tree.file(
+            "app/usr/lib64/foo/prog",
+            &elf(&[(READ, &["/usr/lib/foo", "/usr/lib/foo/plugins"])]),
+        );
+        let universe = fixture::populate_universe(
+            &root,
+            &[fixture::package("app", &["usr/lib/foo/plugins/p"])],
+            "app",
+            &[],
+            None,
+            None,
+        );
+        let objects = [("prog".to_string(), app.join("usr/lib64/foo/prog"))];
+        let dirs = run_in(&objects, Some(&universe), &[&app]).unwrap();
+        assert_eq!(rels(&dirs), ["lib/foo/plugins"]);
+    }
+
+    /// A program the tree holds has its own directory taken below the
+    /// source's root like its prefix, so the installation directory it
+    /// names for itself is dropped and what lies below it kept.
+    #[test]
+    fn a_tree_programs_own_directory_is_taken_below_the_source_root() {
+        let tree = Tree::new("tree-own-dir");
+        let root = tree.0.join("sys");
+        let app = tree.0.join("app");
+        tree.file("sys/usr/lib/tool/plugins/p", b"p");
+        tree.file(
+            "app/usr/lib/tool/tool",
+            &elf(&[(READ, &["/usr/lib/tool", "/usr/lib/tool/plugins"])]),
+        );
+        let universe = fixture::populate_universe(
+            &root,
+            &[fixture::package("app", &["usr/lib/tool/plugins/p"])],
+            "app",
+            &[],
+            None,
+            None,
+        );
+        let objects = [("tool".to_string(), app.join("usr/lib/tool/tool"))];
+        let dirs = run_in(&objects, Some(&universe), &[&app]).unwrap();
+        assert_eq!(rels(&dirs), ["lib/tool/plugins"]);
     }
 
     /// Discovery is a function of the inputs: objects read in another

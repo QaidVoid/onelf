@@ -28,12 +28,13 @@ shared-roots = [
 
 # Hierarchies that hold every package's files, or the host system's own,
 # at every depth. A candidate that equals, contains or lies below one is
-# dropped. PAM modules and policy, udev rules, kernel modules and a host
-# JDK must come from the host.
+# dropped. PAM modules and policy, udev rules, kernel modules, a host JDK
+# and a Go toolchain must come from the host.
 shared-trees = [
   { base = "lib-dirs", path = "debug" },
   { base = "lib-dirs", path = "firmware" },
   { base = "lib-dirs", path = "gcc" },
+  { base = "lib-dirs", path = "go" },
   { base = "lib-dirs", path = "jvm" },
   { base = "lib-dirs", path = "modprobe.d" },
   { base = "lib-dirs", path = "modules" },

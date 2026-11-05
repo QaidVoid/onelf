@@ -4538,8 +4538,11 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     }
     infer::record(&infer::discover(
         &objects,
-        sysroot_universe.as_ref(),
-        &tree_roots,
+        &infer::Scope {
+            sysroot: sysroot_universe.as_ref(),
+            trees: &tree_roots,
+            exclude: &opts.exclude,
+        },
     )?);
 
     // Activation has reached its fixed point: every soname the closure
