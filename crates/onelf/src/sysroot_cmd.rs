@@ -269,7 +269,7 @@ fn pack_tree(
         .filter(|n| n.contains(".so"))
         .collect();
 
-    let mut findings = audit_unbundled_needs(dir, Path::new("lib"));
+    let mut findings = audit_unbundled_needs(dir, Path::new("lib"), &[]);
     for (_, libs) in &mut findings {
         libs.retain(|s| !carried.contains(s));
         libs.retain(|s| {

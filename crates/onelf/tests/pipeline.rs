@@ -1575,6 +1575,369 @@ fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
     }
 }
 
+/// An inferred member whose dependency the tree cannot satisfy is
+/// omitted and reported even when the scan is not strict, while the
+/// rest of its directory stays carried: the omission is that member's
+/// alone, not the framework's.
+#[test]
+fn an_inferred_member_with_an_unmet_need_is_omitted_not_fatal() {
+    let td = workdir("plugin-unloadable-member");
+    let libdir = td.join("dist/usr/lib");
+    let plugins = libdir.join("libfw/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    // The framework library names its plugin directory the way the
+    // alsa fixture does, so inference sees it.
+    let fw_dirs = format!(
+        "const char *fw_dirs[] = {{\"{}\"}};\n",
+        td.canonicalize()
+            .unwrap()
+            .join("dist/usr/lib/libfw")
+            .display()
+    );
+    write(
+        &td.join("dist/framework.c"),
+        &format!("{fw_dirs}int framework(void){{return 1;}}\n"),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfw.so.1",
+            td.join("dist/framework.c").to_str().unwrap(),
+        ],
+        &libdir.join("libfw.so.1"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("dist/good.c"),
+        "int plugin_probe(void){return 2;}\n",
+    );
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("dist/good.c").to_str().unwrap()],
+        &plugins.join("good.so"),
+    ) {
+        return;
+    }
+    // broken.so is the same bytes as libdup.so.1, a library the app
+    // names and the walk copies into lib/, so the member arrives as a
+    // dedup alias link instead of a file, and its unmet need is the
+    // target's. The dependency exists only while the tree is being
+    // linked, so the bundle cannot resolve it anywhere.
+    std::fs::create_dir_all(td.join("absent")).unwrap();
+    write(&td.join("dist/absent.c"), "int absent(void){return 0;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libmissing.so.9",
+            td.join("dist/absent.c").to_str().unwrap(),
+        ],
+        &td.join("absent/libmissing.so.9"),
+    ) {
+        return;
+    }
+    write(&td.join("dist/dup.c"), "int dup_fn(void){return 4;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,--no-as-needed",
+            td.join("absent/libmissing.so.9").to_str().unwrap(),
+            td.join("dist/dup.c").to_str().unwrap(),
+        ],
+        &libdir.join("libdup.so.1"),
+    ) {
+        return;
+    }
+    std::fs::copy(libdir.join("libdup.so.1"), plugins.join("broken.so")).unwrap();
+    std::fs::remove_dir_all(td.join("absent")).unwrap();
+
+    let app = td.join("app");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", libdir.display()),
+            "-l:libfw.so.1",
+            "-l:libdup.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--search-path")
+        .arg(&libdir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a member's unmet need must not fail the scan:\n{err}"
+    );
+    assert!(app.join("lib/libfw.so.1").is_file(), "{err}");
+    assert!(
+        app.join("lib/libfw/plugins/good.so").is_file(),
+        "the loadable member stays:\n{err}"
+    );
+    let gone = "lib/libfw/plugins/broken.so";
+    assert!(
+        std::fs::symlink_metadata(app.join(gone)).is_err(),
+        "{gone} stays"
+    );
+    assert!(err.contains(gone), "{gone} is named:\n{err}");
+    assert!(err.contains("libmissing.so.9"), "{err}");
+    // The restriction holds: libdup.so.1 is generated, unloadable by
+    // the same need, and outside the inferred directory, so it stays
+    // and only warns.
+    assert!(
+        app.join("lib/libdup.so.1").is_file(),
+        "the non-inferred dedup target stays:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// A dedup alias beside the canonical member it duplicates goes with
+/// that member's omission instead of failing the scan: removing the
+/// file takes the link that names it, and the alias's own finding
+/// then finds nothing left to remove.
+#[test]
+fn a_dedup_alias_beside_an_omitted_member_goes_with_it() {
+    let td = workdir("plugin-alias-beside");
+    let libdir = td.join("dist/usr/lib");
+    let plugins = libdir.join("libfw/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let fw_dirs = format!(
+        "const char *fw_dirs[] = {{\"{}\"}};\n",
+        td.canonicalize()
+            .unwrap()
+            .join("dist/usr/lib/libfw")
+            .display()
+    );
+    write(
+        &td.join("dist/framework.c"),
+        &format!("{fw_dirs}int framework(void){{return 1;}}\n"),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfw.so.1",
+            td.join("dist/framework.c").to_str().unwrap(),
+        ],
+        &libdir.join("libfw.so.1"),
+    ) {
+        return;
+    }
+    std::fs::create_dir_all(td.join("absent")).unwrap();
+    write(&td.join("dist/absent.c"), "int absent(void){return 0;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libmissing.so.9",
+            td.join("dist/absent.c").to_str().unwrap(),
+        ],
+        &td.join("absent/libmissing.so.9"),
+    ) {
+        return;
+    }
+    // a.so is the canonical copy, b.so its same-directory dedup
+    // alias: identical bytes, so the walk links one to the other.
+    write(&td.join("dist/a.c"), "int plugin_a(void){return 5;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,--no-as-needed",
+            td.join("absent/libmissing.so.9").to_str().unwrap(),
+            td.join("dist/a.c").to_str().unwrap(),
+        ],
+        &plugins.join("a.so"),
+    ) {
+        return;
+    }
+    std::fs::copy(plugins.join("a.so"), plugins.join("b.so")).unwrap();
+    std::fs::remove_dir_all(td.join("absent")).unwrap();
+
+    let app = td.join("app");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", libdir.display()),
+            "-l:libfw.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--search-path")
+        .arg(&libdir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the alias's stale finding must not fail the scan:\n{err}"
+    );
+    let gone_a = "lib/libfw/plugins/a.so";
+    let gone_b = "lib/libfw/plugins/b.so";
+    assert!(
+        std::fs::symlink_metadata(app.join(gone_a)).is_err(),
+        "{gone_a} stays"
+    );
+    assert!(
+        std::fs::symlink_metadata(app.join(gone_b)).is_err(),
+        "{gone_b} stays"
+    );
+    // Whichever of the two the walk kept as the canonical copy is the
+    // one the report names; the other went as the link that named it.
+    assert!(
+        (err.contains("lib/libfw/plugins/a.so") || err.contains("lib/libfw/plugins/b.so"))
+            && err.contains("libmissing.so.9"),
+        "the canonical member is named:\n{err}"
+    );
+    assert!(app.join("lib/libfw.so.1").is_file(), "{err}");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// An alias in another carried directory whose own need was satisfied
+/// beside it never had a finding, yet the omission of the file it
+/// duplicated leaves it pointing at nothing. It goes with its target,
+/// and the report names it for the need that took the target.
+#[test]
+fn a_stranded_alias_goes_with_the_member_it_duplicated() {
+    let td = workdir("plugin-alias-stranded");
+    let libdir = td.join("dist/usr/lib");
+    let a_dir = libdir.join("libfw/a");
+    let z_dir = libdir.join("libfw/z");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::create_dir_all(&z_dir).unwrap();
+    let fw_dirs = format!(
+        "const char *fw_dirs[] = {{\"{}\"}};\n",
+        td.canonicalize()
+            .unwrap()
+            .join("dist/usr/lib/libfw")
+            .display()
+    );
+    write(
+        &td.join("dist/framework.c"),
+        &format!("{fw_dirs}int framework(void){{return 1;}}\n"),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfw.so.1",
+            td.join("dist/framework.c").to_str().unwrap(),
+        ],
+        &libdir.join("libfw.so.1"),
+    ) {
+        return;
+    }
+    // The helper sits only beside the a copy, whose bytes the z copy
+    // duplicates: the collection's members are processed last-sorted
+    // first, so the z copy arrives as the canonical file and the a
+    // copy as its dedup alias.
+    write(&td.join("dist/helper.c"), "int helper(void){return 6;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libhelper.so.1",
+            td.join("dist/helper.c").to_str().unwrap(),
+        ],
+        &a_dir.join("libhelper.so.1"),
+    ) {
+        return;
+    }
+    write(&td.join("dist/z.c"), "int plugin_z(void){return 5;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,--no-as-needed",
+            a_dir.join("libhelper.so.1").to_str().unwrap(),
+            td.join("dist/z.c").to_str().unwrap(),
+        ],
+        &z_dir.join("z.so"),
+    ) {
+        return;
+    }
+    // a.so is the same bytes as z.so, so the walk links it to z.so.
+    std::fs::copy(z_dir.join("z.so"), a_dir.join("a.so")).unwrap();
+
+    let main_src = td.join("main.c");
+    write(&main_src, "int main(void){return 0;}\n");
+    // The tree root's spelling must not change the answer: an absolute
+    // path and a `./`-prefixed relative path take the same omissions.
+    for (tag, relative) in [("abs", false), ("dot", true)] {
+        let app = td.join(format!("app-{tag}"));
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        if !cc_with(
+            &[
+                main_src.to_str().unwrap(),
+                &format!("-L{}", libdir.display()),
+                "-l:libfw.so.1",
+            ],
+            &app.join("bin/app"),
+        ) {
+            return;
+        }
+        let mut c = Command::new(onelf());
+        if relative {
+            c.current_dir(&td)
+                .arg("bundle-libs")
+                .arg(format!("./app-{tag}"));
+        } else {
+            c.arg("bundle-libs").arg(&app);
+        }
+        c.arg("--search-path").arg(&libdir);
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        let out = c.output().expect("spawn onelf bundle-libs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{tag}: the strand must not fail the scan:\n{err}"
+        );
+        let gone_z = "lib/libfw/z/z.so";
+        let gone_a = "lib/libfw/a/a.so";
+        assert!(
+            std::fs::symlink_metadata(app.join(gone_z)).is_err(),
+            "{tag}: {gone_z} stays"
+        );
+        assert!(
+            std::fs::symlink_metadata(app.join(gone_a)).is_err(),
+            "{tag}: the stranded alias goes with its target:\n{err}"
+        );
+        assert!(
+            err.contains(gone_z) && err.contains(gone_a) && err.contains("libhelper.so.1"),
+            "{tag}: both omissions are named:\n{err}"
+        );
+        assert!(
+            app.join("lib/libfw/a/libhelper.so.1").is_file(),
+            "{tag}: the helper beside the alias stays:\n{err}"
+        );
+        assert!(app.join("lib/libfw.so.1").is_file(), "{tag}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The PipeWire and SPA rules list their client members: the modules
 /// and plugins an application's context loads arrive at their layout,
 /// while the daemon's protocol servers, device plugins and codecs stay

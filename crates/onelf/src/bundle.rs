@@ -4186,6 +4186,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                 &set_sonames,
                 &classifier,
                 &HashSet::new(),
+                &[],
             )?;
         }
         return Ok(());
@@ -5353,12 +5354,18 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             &find_elf_files(&opts.directory),
         ));
         // After injection, so the audit sees the final DT_NEEDED set.
+        let inferred_dests = inferred_carried
+            .iter()
+            .filter(|(_, _, carry)| *carry == Carry::Planned)
+            .map(|(dest, _, _)| dest.clone())
+            .collect::<Vec<_>>();
         verify_needs(
             opts,
             sysroot_platform.as_ref(),
             &set_sonames,
             &classifier,
             &required_dests,
+            &inferred_dests,
         )?;
         // The assembled tree is what a launch resolves against, so the
         // build's own entrypoints are audited against it before the
@@ -5400,6 +5407,13 @@ struct Dropped {
 /// reason to drop the object that needs it, so that finding stays too
 /// and the build fails naming the removal.
 ///
+/// `droppable` narrows the pass further: when it names directories,
+/// only objects at or under one of them are dropped, whatever the
+/// audit condemns elsewhere. A non-strict build passes the carried
+/// inferred directories, the only optional things it carries, and a
+/// strict build passes none, keeping every generated object a
+/// candidate.
+///
 /// Returns the dropped objects in path order. `findings` is re-audited
 /// until nothing changes, because dropping a library leaves its own
 /// dependants unloadable.
@@ -5409,6 +5423,7 @@ fn drop_unloadable(
     audit: impl Fn() -> Vec<(PathBuf, Vec<String>)>,
     classifier: &SourceClassifier,
     required: &HashSet<PathBuf>,
+    droppable: &[PathBuf],
 ) -> io::Result<Vec<Dropped>> {
     let generated: HashSet<PathBuf> = sysroot::read_generated(&opts.directory)?
         .into_iter()
@@ -5435,6 +5450,7 @@ fn drop_unloadable(
             if kept.contains(rel)
                 || !generated.contains(rel)
                 || required.iter().any(|dest| rel.starts_with(dest))
+                || (!droppable.is_empty() && !droppable.iter().any(|dest| rel.starts_with(dest)))
             {
                 continue;
             }
@@ -5464,8 +5480,22 @@ fn drop_unloadable(
                 .chain(crate::bundle::elf::parse_soname(object))
                 .collect();
             names.dedup();
+            // A link beside an earlier removal in this same pass may
+            // have gone with it already: what is gone needs neither
+            // removal nor report.
+            if let Err(e) = fs::symlink_metadata(object) {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(e);
+            }
             fs::remove_file(object)?;
-            remove_dangling_links_beside(object);
+            // Restricted removals leave sibling links to the sweep
+            // below: it alone knows what the protections and the
+            // ledger keep.
+            if droppable.is_empty() {
+                remove_dangling_links_beside(object);
+            }
             gone.extend(names.iter().cloned());
             dropped.push(Dropped {
                 object: rel.to_path_buf(),
@@ -5480,8 +5510,106 @@ fn drop_unloadable(
         }
         *findings = audit();
     }
+    if !droppable.is_empty() {
+        loop {
+            let before = dropped.len();
+            sweep_dangling_aliases(opts, droppable, &kept, required, &generated, &mut dropped)?;
+            if dropped.len() == before {
+                break;
+            }
+        }
+    }
     dropped.sort_by(|a, b| (&a.object, &a.need).cmp(&(&b.object, &b.need)));
     Ok(dropped)
+}
+
+/// After the omission pass, a deduplicated alias in a carried
+/// directory can dangle behind the file it duplicated: the need that
+/// condemned the original was satisfied beside the alias, so the alias
+/// never had a finding of its own, and the original's removal left it
+/// pointing at nothing. A member that cannot load is omitted all the
+/// same: a generated link that named a removed object goes, matched by
+/// the exact tree path it points at, and the omission is reported for
+/// the need that took its target. A link that dangled for some other
+/// reason is the publisher's, and stays, and what an entrypoint names,
+/// an explicit include, or a required destination needs stays too,
+/// exactly as in the pass above.
+fn sweep_dangling_aliases(
+    opts: &BundleOptions,
+    droppable: &[PathBuf],
+    kept: &HashSet<PathBuf>,
+    required: &HashSet<PathBuf>,
+    generated: &HashSet<PathBuf>,
+    dropped: &mut Vec<Dropped>,
+) -> io::Result<()> {
+    // The tree root's spelling varies (`app`, `./app`, an absolute
+    // path), so both sides of the target comparison resolve to real
+    // absolute paths before the tree-relative remainder is taken.
+    let root = fs::canonicalize(&opts.directory).unwrap_or_else(|_| opts.directory.clone());
+    for dest in droppable {
+        for entry in jwalk::WalkDir::new(opts.directory.join(dest))
+            .skip_hidden(false)
+            .sort(true)
+        {
+            let Ok(entry) = entry else { continue };
+            let link = entry.file_type().is_symlink();
+            let path = entry.path().to_path_buf();
+            if !link || path.exists() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&opts.directory)
+                .unwrap_or(&path)
+                .to_path_buf();
+            if kept.contains(&rel)
+                || required.iter().any(|dest| rel.starts_with(dest))
+                || !generated.contains(&rel)
+            {
+                continue;
+            }
+            let Ok(target) = fs::read_link(&path) else {
+                continue;
+            };
+            // Where the link actually points, lexically from its own
+            // real directory: a dedup alias names its canonical copy's
+            // tree path, and only that exact object's omission takes
+            // the alias with it. A link outside the tree names nothing
+            // the pass removed, and stays.
+            let Ok(base) = fs::canonicalize(path.parent().unwrap_or(Path::new("."))) else {
+                continue;
+            };
+            let joined = base.join(target);
+            let mut resolved = PathBuf::new();
+            for comp in joined.components() {
+                match comp {
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    comp => resolved.push(comp.as_os_str()),
+                }
+            }
+            let Ok(target_rel) = resolved.strip_prefix(&root) else {
+                continue;
+            };
+            let Some(prior) = dropped.iter().find(|d| d.object == target_rel) else {
+                continue;
+            };
+            let Some(alias) = path.file_name().and_then(|n| n.to_str().map(String::from)) else {
+                continue;
+            };
+            let need = prior.need.clone();
+            let verdict = prior.verdict.clone();
+            fs::remove_file(&path)?;
+            dropped.push(Dropped {
+                object: rel,
+                names: vec![alias],
+                need,
+                verdict,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The `libfoo.so -> libfoo.so.1 -> libfoo.so.1.2` chains a dropped
@@ -5541,6 +5669,30 @@ fn recipe_excludes(soname: &str, exclude: &[String]) -> bool {
     !host_platform_provider(soname) && exclude.iter().any(|p| soname.starts_with(p.as_str()))
 }
 
+/// The symlink members below the inferred destinations. Same-content
+/// members are deduplicated into alias links, which the regular-file
+/// audit cannot see, yet an alias loads or fails by its target's needs
+/// exactly as the copied member it stands for would, so the omission
+/// pass must hear about it in its own place. A dangling link names a
+/// target nothing can audit, and is left to the walk that made it.
+fn inferred_aliases(opts: &BundleOptions, inferred: &[PathBuf]) -> Vec<PathBuf> {
+    let mut aliases = Vec::new();
+    for dest in inferred {
+        for entry in jwalk::WalkDir::new(opts.directory.join(dest))
+            .skip_hidden(false)
+            .sort(true)
+        {
+            let Ok(entry) = entry else { continue };
+            let link = entry.file_type().is_symlink();
+            let path = entry.path();
+            if link && path.exists() {
+                aliases.push(path.to_path_buf());
+            }
+        }
+    }
+    aliases
+}
+
 /// Audit the assembled tree for objects whose needs nothing in the
 /// bundle satisfies where the loader will look.
 ///
@@ -5557,18 +5709,33 @@ fn recipe_excludes(soname: &str, exclude: &[String]) -> bool {
 /// [`host_platform_provider`], is reported and never fails or condemns.
 ///
 /// Without `strict` a host scan only warns: the low-level `bundle-libs`
-/// contract. What a set-only build's pinned sets ship, read from their
-/// builds, is neither: it is reported as theirs, since the launch
-/// fetches it.
+/// contract. The one exception is `inferred`, the destinations of the
+/// inferred directories the build carried: inferred directories are
+/// optional whatever the audit's strictness, so a member of one whose
+/// needs nothing satisfies is omitted and reported, while the rest of
+/// its directory is still carried. What a set-only build's pinned sets
+/// ship, read from their builds, is neither: it is reported as theirs,
+/// since the launch fetches it.
 fn verify_needs(
     opts: &BundleOptions,
     platform: Option<&PlatformLine>,
     set_sonames: &HashSet<String>,
     classifier: &SourceClassifier,
     required: &HashSet<PathBuf>,
+    inferred: &[PathBuf],
 ) -> io::Result<()> {
     let strict = opts.sysroot.is_some() || opts.strict;
-    let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+    // Only a non-strict scan audits the inferred aliases: a strict
+    // build's audit is unrestricted and its behavior must not shift,
+    // while the alias members the walk deduplicated into symlinks are
+    // invisible to the regular-file walk yet load or fail by their
+    // targets' needs exactly as a copied member would.
+    let follow = if strict {
+        Vec::new()
+    } else {
+        inferred_aliases(opts, inferred)
+    };
+    let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
     let mut set_report = None;
     let mut set_provided: HashSet<String> = HashSet::new();
     if opts.sysroot.is_none() && !opts.sets.is_empty() {
@@ -5589,7 +5756,7 @@ fn verify_needs(
         findings.retain(|(_, libs)| !libs.is_empty());
     };
     let audit = || {
-        let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+        let mut findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
         condemnable(&mut findings);
         findings
     };
@@ -5601,14 +5768,26 @@ fn verify_needs(
     if strict {
         let mut failing = findings.clone();
         condemnable(&mut failing);
-        dropped = drop_unloadable(opts, &mut failing, audit, classifier, required)?;
+        dropped = drop_unloadable(opts, &mut failing, audit, classifier, required, &[])?;
         if !dropped.is_empty() {
-            findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+            findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
             for (_, libs) in &mut findings {
                 libs.retain(|s| open(s));
             }
             findings.retain(|(_, libs)| !libs.is_empty());
             report_dropped(&dropped);
+        }
+    } else if !inferred.is_empty() {
+        let mut failing = findings.clone();
+        condemnable(&mut failing);
+        let omitted = drop_unloadable(opts, &mut failing, audit, classifier, required, inferred)?;
+        if !omitted.is_empty() {
+            findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
+            for (_, libs) in &mut findings {
+                libs.retain(|s| open(s));
+            }
+            findings.retain(|(_, libs)| !libs.is_empty());
+            report_dropped(&omitted);
         }
     }
     if let Some((provides, unchecked)) = &set_report {
@@ -8810,7 +8989,7 @@ mod provider_audit_tests {
             ..Default::default()
         };
         let required: HashSet<PathBuf> = HashSet::from([PathBuf::from("libexec/helper")]);
-        let audit = || audit_unbundled_needs(&opts.directory, &opts.lib_dir);
+        let audit = || audit_unbundled_needs(&opts.directory, &opts.lib_dir, &[]);
         let mut findings = audit();
         let dropped = drop_unloadable(
             &opts,
@@ -8818,6 +8997,7 @@ mod provider_audit_tests {
             audit,
             &SourceClassifier::host_only(),
             &required,
+            &[],
         )
         .unwrap();
         let gone: Vec<&Path> = dropped.iter().map(|x| x.object.as_path()).collect();
@@ -8830,6 +9010,64 @@ mod provider_audit_tests {
             .collect();
         assert!(left.contains(&PathBuf::from("bin/gui")), "{left:?}");
         assert!(left.contains(&PathBuf::from("libexec/helper")), "{left:?}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Under the restricted omission pass, a link beside a removed
+    /// member goes only through the sweep: a link the pass did not
+    /// generate stays, even though the removal left it dangling, and
+    /// a generated link that points outside the tree names nothing
+    /// the pass removed, so it stays too.
+    #[test]
+    fn a_publisher_sibling_link_beside_an_omitted_member_stays() {
+        let d = tmp("restricted-sibling");
+        fs::create_dir_all(d.join("lib/libfw/plugins")).unwrap();
+        fs::write(
+            d.join("lib/libfw/plugins/a.so"),
+            dyn_object(&["libgone.so.1"], None),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("a.so", d.join("lib/libfw/plugins/b.so")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../escape/lib.so",
+            d.join("lib/libfw/plugins/out.so"),
+        )
+        .unwrap();
+        sysroot::record_generated(
+            &d,
+            vec![
+                "lib/libfw/plugins/a.so".to_string(),
+                "lib/libfw/plugins/out.so".to_string(),
+            ],
+        )
+        .unwrap();
+        let opts = BundleOptions {
+            directory: d.clone(),
+            lib_dir: PathBuf::from("lib"),
+            ..Default::default()
+        };
+        let follow = [d.join("lib/libfw/plugins/b.so")];
+        let audit = || audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
+        let mut findings = audit();
+        let dropped = drop_unloadable(
+            &opts,
+            &mut findings,
+            audit,
+            &SourceClassifier::host_only(),
+            &HashSet::new(),
+            &[PathBuf::from("lib/libfw/plugins")],
+        )
+        .unwrap();
+        let gone: Vec<&Path> = dropped.iter().map(|x| x.object.as_path()).collect();
+        assert_eq!(gone, vec![Path::new("lib/libfw/plugins/a.so")]);
+        assert!(
+            d.join("lib/libfw/plugins/b.so").is_symlink(),
+            "the publisher's link stays"
+        );
+        assert!(
+            d.join("lib/libfw/plugins/out.so").is_symlink(),
+            "the outside-tree link stays"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

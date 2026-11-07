@@ -660,9 +660,16 @@ fn run_path_dirs_in_tree(object: &Path, root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Audit the tree's ELF objects for needs nothing in it satisfies. A
+/// host-scan build then drops what it may and reports the rest. The
+/// `follow` paths are symlink members the regular-file walk cannot
+/// see, typically same-content aliases the bundler deduplicated into;
+/// they are audited through their targets, in their own place, so a
+/// missing need condemns the alias exactly as it would the file.
 pub(crate) fn audit_unbundled_needs(
     directory: &Path,
     lib_dir: &Path,
+    follow: &[PathBuf],
 ) -> Vec<(PathBuf, Vec<String>)> {
     use std::collections::{HashMap, HashSet};
 
@@ -682,7 +689,10 @@ pub(crate) fn audit_unbundled_needs(
     let mut beside: HashMap<PathBuf, HashSet<String>> = HashMap::new();
 
     let mut findings: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    for path in find_elf_files(directory) {
+    for path in find_elf_files(directory)
+        .into_iter()
+        .chain(follow.iter().cloned())
+    {
         let Ok(needed) = parse_needed(&path) else {
             continue;
         };
@@ -1959,7 +1969,7 @@ mod audit_tests {
         fs::copy(std::env::current_exe().unwrap(), tree.join("bin/app")).unwrap();
         std::os::unix::fs::symlink("libc.so.6.pruned", tree.join("lib/libc.so.6")).unwrap();
 
-        let findings = audit_unbundled_needs(&tree, Path::new("lib"));
+        let findings = audit_unbundled_needs(&tree, Path::new("lib"), &[]);
         let _ = fs::remove_dir_all(&tree);
         assert!(
             findings
