@@ -804,6 +804,7 @@ impl AssemblyRequest {
             target: None,
             primary: Some(PathBuf::from(&self.package.command)),
             lib_dir: PathBuf::from("lib"),
+            lib_dirs: self.lib_dirs.clone(),
             entrypoint_selections: self.audit_entrypoints(),
             exclude: self.bundle.exclude.clone(),
             include: self.bundle.include.clone(),

@@ -43,6 +43,7 @@ mod activate;
 mod collect;
 mod completeness;
 mod plan;
+mod redir;
 mod resolve;
 pub(crate) use resolve::*;
 pub(crate) mod elf;
@@ -2873,6 +2874,12 @@ pub struct BundleOptions {
     /// glibc tree silently dropped the entrypoint's own loader.
     pub primary: Option<PathBuf>,
     pub lib_dir: PathBuf,
+    /// The library directory list the manifest will carry, raw: an `auto`
+    /// entry expands on the assembled tree when the redirection decision
+    /// resolves it, through the packer's own resolution. The low-level
+    /// `bundle-libs` command passes `auto`, since the pack command that
+    /// follows names its own list.
+    pub lib_dirs: Vec<String>,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub search_path: Vec<PathBuf>,
@@ -5375,6 +5382,32 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         if let Some((providers, unchecked)) = set_audit.as_ref() {
             audit_entrypoint_selections(opts, sysroot_platform.as_ref(), providers, unchecked)?;
         }
+        // Every carried inferred directory reaches the application by one
+        // mechanism, decided against the final tree: an environment mapping
+        // a descriptor already provides, else an anchor, else a path pair.
+        // The launch evaluates library-root candidates against every
+        // library directory the manifest lists, so the decision mirrors
+        // the packer's own detection of that list on the assembled tree;
+        // a recipe that pins its library directories explicitly packs
+        // with its list instead, and a pinned directory holds shared
+        // objects in any build that carries inferred directories, so the
+        // detector still names it.
+        let carried_dirs: Vec<&infer::InferredDir> = inferred_carried
+            .iter()
+            .filter(|(.., carry)| *carry == Carry::Planned)
+            .filter_map(|(_, source, _)| inference.get(source))
+            .collect();
+        let lib_dirs = crate::pack::resolve_lib_dirs(&opts.lib_dirs, &opts.directory);
+        // The launch evaluates only the rules the package carries, which
+        // are the catalog's enabled descriptors, so a disabled built-in's
+        // runtime mapping covers nothing.
+        let enabled_rules = opts.rules.enabled();
+        redir::report(&redir::choose(
+            &carried_dirs,
+            &enabled_rules,
+            &lib_dirs,
+            &opts.directory,
+        ));
     }
 
     Ok(())

@@ -744,7 +744,7 @@ fn build_dictionary_sampled(files: &[CollectedFile], dict_size: usize) -> io::Re
     compress::build_dictionary(&samples, dict_size)
 }
 
-fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
+pub(crate) fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
     let mut lib_dirs = Vec::new();
     let Ok(canonical) = directory.canonicalize() else {
         return lib_dirs;
@@ -785,7 +785,32 @@ fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
     lib_dirs
 }
 
-fn check_libgl_conflicts(directory: &Path, lib_dirs: &mut Vec<String>) {
+/// The library directory list the manifest carries: explicit entries keep
+/// their order, an `auto` entry expands to every directory of the tree
+/// that holds shared objects, and conflicting GL directories drop out.
+/// The bundler's redirection decision evaluates the launch against the
+/// same list, so both sides resolve through this one function.
+pub(crate) fn resolve_lib_dirs(raw: &[String], directory: &Path) -> Vec<String> {
+    let mut lib_dirs = if raw.iter().any(|d| d == "auto") {
+        let mut dirs: Vec<String> = raw.iter().filter(|d| *d != "auto").cloned().collect();
+        let auto = auto_detect_lib_dirs(directory);
+        for d in auto {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        if !dirs.is_empty() {
+            eprintln!("  Auto-detected lib dirs: {}", dirs.join(", "));
+        }
+        dirs
+    } else {
+        raw.to_vec()
+    };
+    check_libgl_conflicts(directory, &mut lib_dirs);
+    lib_dirs
+}
+
+pub(crate) fn check_libgl_conflicts(directory: &Path, lib_dirs: &mut Vec<String>) {
     let mut glvnd_dirs = Vec::new();
     let mut legacy_dirs = Vec::new();
 
@@ -1138,29 +1163,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     }
     let dir = opts.directory.canonicalize()?;
 
-    // Resolve lib dirs: handle "auto" detection and conflict checking
-    let mut lib_dirs = if opts.lib_dirs.iter().any(|d| d == "auto") {
-        let mut dirs: Vec<String> = opts
-            .lib_dirs
-            .iter()
-            .filter(|d| *d != "auto")
-            .cloned()
-            .collect();
-        let auto = auto_detect_lib_dirs(&dir);
-        for d in auto {
-            if !dirs.contains(&d) {
-                dirs.push(d);
-            }
-        }
-        if !dirs.is_empty() {
-            eprintln!("  Auto-detected lib dirs: {}", dirs.join(", "));
-        }
-        dirs
-    } else {
-        opts.lib_dirs.clone()
-    };
-
-    check_libgl_conflicts(&dir, &mut lib_dirs);
+    let lib_dirs = resolve_lib_dirs(&opts.lib_dirs, &dir);
 
     // Collect all filesystem entries
     let pb = ProgressBar::new_spinner();

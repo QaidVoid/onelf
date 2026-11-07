@@ -983,6 +983,7 @@ fn main() {
                 primary: target.clone(),
                 target,
                 lib_dir,
+                lib_dirs: vec![String::from("auto")],
                 exclude,
                 include,
                 search_path,
