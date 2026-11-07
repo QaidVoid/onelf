@@ -647,7 +647,7 @@ impl DestinationPlan {
         origin: &str,
         existing: Existing,
     ) -> io::Result<Admission> {
-        self.admit(rel, PlannedKind::File, hash, origin, existing)
+        self.admit(rel, PlannedKind::File, hash, origin, existing, true)
     }
 
     /// Admit one planned symlink destination whose target text is
@@ -659,7 +659,35 @@ impl DestinationPlan {
         origin: &str,
         existing: Existing,
     ) -> io::Result<Admission> {
-        self.admit(rel, PlannedKind::Link, link_hash(target), origin, existing)
+        self.admit(
+            rel,
+            PlannedKind::Link,
+            link_hash(target),
+            origin,
+            existing,
+            true,
+        )
+    }
+
+    /// Admit one member link of an inferred directory's carry: like
+    /// [`Self::admit_link`], but a destination another source planned,
+    /// a descriptor's file say, is a clash and not an alias for it, so
+    /// the optional carry is refused whole and omitted.
+    pub(crate) fn admit_strict_link(
+        &mut self,
+        rel: &Path,
+        target: &str,
+        origin: &str,
+        existing: Existing,
+    ) -> io::Result<Admission> {
+        self.admit(
+            rel,
+            PlannedKind::Link,
+            link_hash(target),
+            origin,
+            existing,
+            false,
+        )
     }
 
     /// Admit one carried data resource, a file or a directory copied
@@ -843,7 +871,11 @@ impl DestinationPlan {
         io::Error::new(io::ErrorKind::InvalidData, text)
     }
 
-    /// The shared admission path for file and link destinations.
+    /// The shared admission path for file and link destinations. With
+    /// `coalesce_aliases`, a link beside a planned file is an alias for
+    /// it and a file beside a planned link supersedes it, the way a
+    /// library and its soname link arrive side by side; without it,
+    /// every differing destination is a clash.
     fn admit(
         &mut self,
         rel: &Path,
@@ -851,6 +883,7 @@ impl DestinationPlan {
         hash: blake3::Hash,
         origin: &str,
         existing: Existing,
+        coalesce_aliases: bool,
     ) -> io::Result<Admission> {
         if !is_plain_rel(rel) {
             self.findings.push(PlanFinding::Escape {
@@ -863,7 +896,7 @@ impl DestinationPlan {
             return Ok(Admission::Rejected);
         }
         if let Some(prev) = self.entries.get(rel).cloned() {
-            if prev.kind == PlannedKind::Link && kind == PlannedKind::File {
+            if coalesce_aliases && prev.kind == PlannedKind::Link && kind == PlannedKind::File {
                 self.entries.insert(
                     rel.to_path_buf(),
                     PlannedDest {
@@ -877,7 +910,7 @@ impl DestinationPlan {
                 self.note_origin(rel, origin);
                 return Ok(Admission::Write);
             }
-            if prev.kind == PlannedKind::File && kind == PlannedKind::Link {
+            if coalesce_aliases && prev.kind == PlannedKind::File && kind == PlannedKind::Link {
                 return Ok(prev.decision);
             }
             if prev.hash == hash && prev.kind == kind {
@@ -1146,6 +1179,51 @@ mod tests {
             text.contains(&file_hash(b"two").to_hex().to_string()),
             "{text}"
         );
+    }
+
+    /// A member link of an inferred directory's carry whose
+    /// destination a descriptor planned as a file is refused with a
+    /// kind clash, so the optional carry rolls back and omits instead
+    /// of the copy replacing the descriptor's write; the walk's own
+    /// link beside a planned file is still an alias for it.
+    #[test]
+    fn a_member_link_refuses_a_planned_file_a_walk_link_coalesces_with() {
+        let (_dir, mut plan) = seeded("strict-link");
+        let planned = plan.admit_file(
+            Path::new("share/fw/link.conf"),
+            file_hash(b"authored"),
+            "rule",
+            Existing::SkipOnAny,
+        );
+        assert_eq!(planned.unwrap(), Admission::Write);
+        let member = plan.admit_strict_link(
+            Path::new("share/fw/link.conf"),
+            "module.conf",
+            "inferred carry",
+            Existing::SkipOnAny,
+        );
+        assert_eq!(member.unwrap(), Admission::Rejected);
+        assert!(matches!(
+            plan.findings().as_slice(),
+            [PlanFinding::KindClash { .. }]
+        ));
+
+        let (_dir, mut plan) = seeded("alias-link");
+        let planned = plan.admit_file(
+            Path::new("lib/libfw.so.1"),
+            file_hash(b"object"),
+            "walk",
+            Existing::SkipOnAny,
+        );
+        assert_eq!(planned.unwrap(), Admission::Write);
+        let alias = plan.admit_link(
+            Path::new("lib/libfw.so.1"),
+            "libfw.so.1",
+            "walk",
+            Existing::SkipOnAny,
+        );
+        assert_eq!(alias.unwrap(), Admission::Write);
+        assert!(!plan.has_findings());
     }
 
     /// One path planned as a file by one resource and as a directory

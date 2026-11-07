@@ -732,6 +732,11 @@ fn copy_data(
     let bytes = plan.read_verified(src)?;
     ensure_writable(dst);
     fs::write(dst, &bytes)?;
+    // The copy keeps the source's permission bits, so a helper script
+    // beside a plugin stays executable and a read-only one stays read-
+    // only.
+    let mode = fs::metadata(src)?.permissions().mode();
+    fs::set_permissions(dst, fs::Permissions::from_mode(mode & 0o7777))?;
     written.push(dst.to_path_buf());
     normalize_mtime(dst);
     Ok(bytes.len() as u64)
@@ -1031,28 +1036,12 @@ struct WalkState<'a> {
     discovery: &'a mut Discovery,
     plan: &'a mut DestinationPlan,
     actions: &'a mut Vec<WalkAction>,
+    scan: &'a mut Vec<(String, PathBuf)>,
 }
 
-/// Hand a collected plugin group to the walk: the recipe's exclusions
-/// leave members out, the found directories become search paths a repair
-/// may answer from, and each member enters the object queue at its
-/// destination. A second member under one name at its own place in the
-/// layout is copied from where the group found it, never re-resolved by
-/// name, with its own needs entering the walk. `origin` names the group
-/// in the walk's report, and the group's finding is recorded for
-/// `destination` before any member is planned, so a build that fails on
-/// a member still reports the group.
-#[allow(clippy::too_many_arguments)]
-fn enqueue_collection(
-    collection: &mut collect::GroupCollection,
-    origin: &str,
-    destination: &str,
-    directory: &Path,
-    recipe_exclude: &[String],
-    excludes: &[&str],
-    reachable: &HashSet<String>,
-    queue: &mut WalkState,
-) -> io::Result<()> {
+/// Leave the recipe's excluded members out of a collection, recording
+/// each with its reason.
+fn exclude_recipe_members(collection: &mut collect::GroupCollection, recipe_exclude: &[String]) {
     let (plugins, excluded): (Vec<_>, Vec<_>) = std::mem::take(&mut collection.plugins)
         .into_iter()
         .partition(|p| !recipe_excludes(&p.soname, recipe_exclude));
@@ -1063,6 +1052,66 @@ fn enqueue_collection(
             "left out by [bundle] exclude".to_string(),
         )
     }));
+}
+
+/// Plan a collected plugin group's members into the tree: each member
+/// that sits at its own place in the layout, a second one under a name
+/// another group collected first, is admitted at its destination,
+/// never re-resolved by name, with its copy planned. The members a
+/// group collects first are returned as name and destination pairs, for
+/// [`queue_collection`] to enqueue; nothing in the walk's queues is
+/// touched, so a caller that undoes the plan here leaves the queues
+/// untouched too.
+fn plan_collection(
+    collection: &mut collect::GroupCollection,
+    origin: &str,
+    directory: &Path,
+    queue: &mut WalkState,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    let mut firsts: Vec<(String, PathBuf)> = Vec::new();
+    for plugin in &collection.plugins {
+        // A name this collection claimed stays claimed, in a local list
+        // until the commit, so a second member under one name is
+        // planned at its own place here too.
+        let first = match firsts.iter().find(|(soname, _)| soname == &plugin.soname) {
+            Some((_, dest)) => *dest == plugin.destination,
+            None => match queue.group_dests.get(&plugin.soname) {
+                Some(dest) => *dest == plugin.destination,
+                None => {
+                    firsts.push((plugin.soname.clone(), plugin.destination.clone()));
+                    true
+                }
+            },
+        };
+        if !first {
+            let origin = format!("{origin} plugin {}", plugin.destination.display());
+            plan_member_copy(directory, plugin, &origin, queue.plan, queue.actions)?;
+        }
+    }
+    Ok(firsts)
+}
+
+/// Hand a planned plugin group to the walk's queues: the found
+/// directories become search paths a repair may answer from, each
+/// member enters the object queue at its destination, and a second
+/// member under one name at its own place in the layout has its own
+/// needs entering the walk. The members [`plan_collection`] collected
+/// first are inserted into the group destinations here, after the plan
+/// has admitted the rest, so an undone plan never claims a soname. A
+/// second member the copy carries without owning its name registers
+/// its own file in the walk state's scan list for the inference
+/// rounds, since its compiled-in directories name resources no member
+/// of the walk answers for; a sysroot build needs none of that,
+/// because its populated tree is scanned already.
+fn queue_collection(
+    collection: &collect::GroupCollection,
+    origin: &str,
+    excludes: &[&str],
+    reachable: &HashSet<String>,
+    firsts: &[(String, PathBuf)],
+    queue: &mut WalkState,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+) -> io::Result<()> {
     for dir in &collection.search_dirs {
         if !queue.search_paths.contains(dir) {
             queue.search_paths.push(dir.clone());
@@ -1078,15 +1127,24 @@ fn enqueue_collection(
             queue.repair_extra.insert(dir);
         }
     }
-    report_collection(collection, destination);
+    for (soname, destination) in firsts {
+        queue
+            .group_dests
+            .entry(soname.clone())
+            .or_insert_with(|| destination.clone());
+    }
     for plugin in &collection.plugins {
         let first = queue
             .group_dests
-            .entry(plugin.soname.clone())
-            .or_insert_with(|| plugin.destination.clone());
-        if *first != plugin.destination {
+            .get(&plugin.soname)
+            .is_some_and(|dest| *dest == plugin.destination);
+        if !first {
             let origin = format!("{origin} plugin {}", plugin.destination.display());
-            plan_member_copy(directory, plugin, &origin, queue.plan, queue.actions)?;
+            if sysroot.is_none()
+                && let Some(name) = plugin.resolved.file_name().and_then(|n| n.to_str())
+            {
+                queue.scan.push((name.to_string(), plugin.resolved.clone()));
+            }
             for dep in parse_needed(&plugin.resolved).unwrap_or_default() {
                 if queue.already_processed.contains(&dep)
                     || is_excluded(&dep, excludes)
@@ -1120,11 +1178,113 @@ fn enqueue_collection(
     Ok(())
 }
 
-/// Collect one inferred directory, as the descriptors' data groups are:
-/// a data directory is carried whole into the generated ledger. A plugin
-/// directory is reported and not carried. Inferred directories are
+/// What carrying one inferred directory planned, before the walk's
+/// queues are touched and the carry is committed.
+enum InferredPlan {
+    /// The whole directory, as a data carry.
+    Data(Carry),
+    /// The collection an inferred plugin directory's members went
+    /// through, the members a group collected first, the members that
+    /// are not objects to carry as data, and the planned byte size.
+    Plugins {
+        collection: collect::GroupCollection,
+        firsts: Vec<(String, PathBuf)>,
+        files: Vec<(PathBuf, PathBuf)>,
+        size: u64,
+    },
+}
+
+/// Plan one inferred plugin directory's carry into the tree, with the
+/// walk's queues untouched: the recipe's exclusions leave members out,
+/// each member the collection took that sits at its own place in the
+/// layout is admitted at its destination, the way a second member under
+/// a collected name is, and every member that is not an ELF object is
+/// admitted as data. A member is judged by the entry the sysroot's tree
+/// holds for it, so a link there stays a link and is never followed
+/// into a copy of what it names; an absolute one has no place in the
+/// tree and is left out, as a host carry leaves it, and so is any entry
+/// that is not a regular file, such as a directory the package lists.
+/// On `Ok` the collection, the members a group collected first, the
+/// data members to carry and the planned byte size; the caller hands
+/// them to the walk's queues only after the plan has held.
+fn plan_plugin_carry(
+    dir: &infer::InferredDir,
+    members: &[(PathBuf, PathBuf)],
+    mut collection: collect::GroupCollection,
+    origin: &str,
+    opts: &BundleOptions,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    state: &mut WalkState,
+) -> io::Result<InferredPlan> {
+    exclude_recipe_members(&mut collection, &opts.exclude);
+    let firsts = plan_collection(&mut collection, origin, &opts.directory, state)?;
+    let hit = dir.hit();
+    // The member as the sysroot's tree holds it: every component but
+    // the last resolved, so a link at the entry stays the link. A host
+    // scan's members are already the files they resolved to.
+    let member_of = |rel: &Path| -> Option<PathBuf> {
+        let universe = sysroot?;
+        let dir_rel = hit.resolved.strip_prefix(universe.root()).ok()?;
+        onelf_sysroot::path::entry_in_root(universe.root(), &dir_rel.join(rel)).ok()
+    };
+    let mut size: u64 = collection
+        .plugins
+        .iter()
+        .filter_map(|p| fs::metadata(&p.resolved).ok())
+        .map(|meta| meta.len())
+        .sum();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (rel, file) in members {
+        if read_elf_class(file).is_some() {
+            continue;
+        }
+        let to = dir.destination.join(rel);
+        let member = member_of(rel).unwrap_or_else(|| file.clone());
+        let meta = fs::symlink_metadata(&member)?;
+        let admission = if meta.file_type().is_symlink() {
+            let target = fs::read_link(&member)?;
+            if !target.is_relative() {
+                continue;
+            }
+            state.plan.admit_strict_link(
+                &to,
+                &target.to_string_lossy(),
+                origin,
+                Existing::SkipOnAny,
+            )?
+        } else if meta.is_file() {
+            state.plan.admit_carried(&to, file, origin)?
+        } else {
+            // A package can list a directory among its files. Carrying
+            // it whole would copy whatever stands beside it in the
+            // source, admitted or not, so only regular files are
+            // admitted as data.
+            continue;
+        };
+        if admission == Admission::Write {
+            if !meta.file_type().is_symlink() {
+                size += fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
+            }
+            files.push((member, to));
+        }
+    }
+    Ok(InferredPlan::Plugins {
+        collection,
+        firsts,
+        files,
+        size,
+    })
+}
+
+/// Collect one inferred directory, as the descriptors' groups are: a
+/// data directory is carried whole into the generated ledger, and a
+/// plugin directory's members join the walk, each object the collection
+/// took resolved or copied at its place in the layout, with every other
+/// member carried as data beside them. Inferred directories are
 /// optional, so one the plan refuses, in whole or in part, is undone
 /// and omitted with the refusal's reason, without failing the build.
+/// The walk's queues are fed only once the plan has held, so an undone
+/// directory is not carried through the back door either.
 ///
 /// `carried` holds the destination, source and outcome of every carried
 /// directory. One inside a carried destination whose source lies at the
@@ -1135,11 +1295,15 @@ fn enqueue_collection(
 /// copy is planned already. Any other overlap with a carried destination
 /// comes from another source and is omitted naming both, so no two
 /// sources write into one place.
+#[allow(clippy::too_many_arguments)]
 fn collect_inferred(
     dir: &infer::InferredDir,
     carried: &mut Vec<(PathBuf, PathBuf, Carry)>,
     opts: &BundleOptions,
     sysroot: Option<&sysroot::SysrootUniverse>,
+    (target_class, target_machine): (Option<u8>, Option<u16>),
+    excludes: &[&str],
+    reachable: &HashSet<String>,
     state: &mut WalkState,
 ) -> io::Result<()> {
     for (dest, source, carry) in carried.iter() {
@@ -1155,14 +1319,14 @@ fn collect_inferred(
             }
             (Some(_), _) => {
                 if *carry == Carry::Planned {
-                    infer::report(dir, infer::Carried::Within(dest));
+                    infer::report(dir, dir.size, infer::Carried::Within(dest));
                     return Ok(());
                 }
                 // A held parent stands for the child only while the
                 // tree holds the child too. A file there, or nothing,
                 // is answered by the carry below.
                 if opts.directory.join(&dir.destination).is_dir() {
-                    infer::report(dir, infer::Carried::Held);
+                    infer::report(dir, dir.size, infer::Carried::Held);
                     return Ok(());
                 }
             }
@@ -1178,28 +1342,62 @@ fn collect_inferred(
     }
     let objects = dir.objects.iter().cloned().collect::<Vec<_>>().join(", ");
     let origin = format!("inferred from {objects}");
-    if dir.kind == infer::InferredKind::Plugins {
-        infer::omit(dir, "the bundle does not carry inferred plugin directories");
-        return Ok(());
-    }
+    // A plugin directory's members are read and classified before
+    // anything is planned, so a directory that cannot be read, or one
+    // past the collection bound, is omitted with the plan and the
+    // queues untouched.
+    let plugin = if dir.kind == infer::InferredKind::Plugins {
+        let members = match collect::members(&dir.hit(), sysroot) {
+            Ok(members) => members,
+            Err(error) => {
+                infer::omit(dir, &format!("it cannot be read: {error}"));
+                return Ok(());
+            }
+        };
+        let collection = match collect::collect_objects(
+            "inference",
+            &dir.destination.display().to_string(),
+            &dir.hit(),
+            &members,
+            target_class,
+            target_machine,
+        ) {
+            Ok(collection) => collection,
+            Err(error) => {
+                infer::omit(dir, &error.to_string());
+                return Ok(());
+            }
+        };
+        Some((members, collection))
+    } else {
+        None
+    };
     // The carry is all or nothing. A directory the plan admits only in
     // part, or refuses outright, is undone, and the omission names the
     // first refusal; a finding left behind would stop the build over a
-    // directory that was optional all along.
+    // directory that was optional all along. The walk's queues are fed
+    // only once the plan has held, so an undone directory is not
+    // carried through the back door either.
     let checkpoint = state.plan.checkpoint();
     let planned_actions = state.actions.len();
-    let carry = carry_hit(
-        &opts.directory,
-        &objects,
-        &dir.hit(),
-        Vec::new(),
-        sysroot,
-        state.plan,
-        state.actions,
-        &origin,
-    );
-    let carry = match carry {
-        Ok(carry) if !state.plan.found_since(&checkpoint) => carry,
+    let planned = match plugin {
+        Some((members, collection)) => {
+            plan_plugin_carry(dir, &members, collection, &origin, opts, sysroot, state)
+        }
+        None => carry_hit(
+            &opts.directory,
+            &objects,
+            &dir.hit(),
+            Vec::new(),
+            sysroot,
+            state.plan,
+            state.actions,
+            &origin,
+        )
+        .map(InferredPlan::Data),
+    };
+    let planned = match planned {
+        Ok(planned) if !state.plan.found_since(&checkpoint) => planned,
         otherwise => {
             let rolled = state.plan.restore(checkpoint);
             state.actions.truncate(planned_actions);
@@ -1214,24 +1412,62 @@ fn collect_inferred(
             return Ok(());
         }
     };
-    match carry {
-        Carry::Planned => {
-            infer::report(dir, infer::Carried::Data);
-            carried.push((dir.destination.clone(), dir.source.clone(), carry));
-        }
-        Carry::Held => {
-            if opts.directory.join(&dir.destination).is_dir() {
-                infer::report(dir, infer::Carried::Held);
+    match planned {
+        InferredPlan::Data(carry) => match carry {
+            Carry::Planned => {
+                infer::report(dir, dir.size, infer::Carried::Data);
                 carried.push((dir.destination.clone(), dir.source.clone(), carry));
-            } else {
-                infer::omit(dir, "its destination is already in the tree");
             }
-        }
-        Carry::Rejected => {
-            infer::omit(dir, "its destination clashes with another write");
-        }
-        Carry::Empty => {
-            infer::omit(dir, "the build admitted nothing below it");
+            Carry::Held => {
+                if opts.directory.join(&dir.destination).is_dir() {
+                    infer::report(dir, dir.size, infer::Carried::Held);
+                    carried.push((dir.destination.clone(), dir.source.clone(), carry));
+                } else {
+                    infer::omit(dir, "its destination is already in the tree");
+                }
+            }
+            Carry::Rejected => {
+                infer::omit(dir, "its destination clashes with another write");
+            }
+            Carry::Empty => {
+                infer::omit(dir, "the build admitted nothing below it");
+            }
+        },
+        InferredPlan::Plugins {
+            collection,
+            firsts,
+            files,
+            size,
+        } => {
+            // The plan held: the members join the walk, and the data
+            // members are carried beside them.
+            queue_collection(
+                &collection,
+                &origin,
+                excludes,
+                reachable,
+                &firsts,
+                state,
+                sysroot,
+            )?;
+            let carried_files = files.len();
+            if !files.is_empty() {
+                state.actions.push(WalkAction::CarryData {
+                    rule: objects,
+                    src: dir.source.clone(),
+                    rel: dir.destination.clone(),
+                    hooks: Vec::new(),
+                    members: Some(files),
+                });
+            }
+            infer::report(
+                dir,
+                size,
+                infer::Carried::Plugins(&collection, carried_files),
+            );
+            if !collection.plugins.is_empty() || carried_files > 0 {
+                carried.push((dir.destination.clone(), dir.source.clone(), Carry::Planned));
+            }
         }
     }
     Ok(())
@@ -4209,6 +4445,10 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     let mut inference = infer::Inference::default();
     let mut inferred_read: HashSet<PathBuf> = HashSet::new();
     let mut inferred_carried: Vec<(PathBuf, PathBuf, Carry)> = Vec::new();
+    // Collected members the copy carries without owning their name, as
+    // file name and source path, for the inference rounds to read their
+    // own compiled-in directories from.
+    let mut member_scan: Vec<(String, PathBuf)> = Vec::new();
     let described: Vec<&Descriptor> = onelf_format::catalog::builtins()
         .iter()
         .chain(
@@ -4283,6 +4523,16 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                     });
                 }
             }
+            let scanned = std::mem::take(&mut member_scan);
+            for (name, path) in &scanned {
+                if inferred_read.insert(path.clone()) {
+                    objects.push(infer::Object {
+                        name,
+                        file: path,
+                        twin: twin_of(name, path, false),
+                    });
+                }
+            }
             let fresh = inference.read(
                 &objects,
                 &infer::Scope {
@@ -4305,6 +4555,9 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                     &mut inferred_carried,
                     opts,
                     sysroot_universe.as_ref(),
+                    (target_class, target_machine),
+                    &excludes,
+                    &reachable,
                     &mut WalkState {
                         already_processed: &mut already_processed,
                         search_paths: &mut search_paths,
@@ -4315,6 +4568,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                         discovery: &mut discovery,
                         plan: &mut plan,
                         actions: &mut actions,
+                        scan: &mut member_scan,
                     },
                 )?;
             }
@@ -4365,14 +4619,15 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                         target_machine,
                     )?;
                     let origin = format!("rule {rule} group {group}");
-                    enqueue_collection(
+                    exclude_recipe_members(&mut collection, &opts.exclude);
+                    // The group's finding is recorded before any member
+                    // is planned, so a build that fails on a member
+                    // still reports the group.
+                    report_collection(&collection, declared.destination.as_str());
+                    let firsts = plan_collection(
                         &mut collection,
                         &origin,
-                        declared.destination.as_str(),
                         &opts.directory,
-                        &opts.exclude,
-                        &excludes,
-                        &reachable,
                         &mut WalkState {
                             already_processed: &mut already_processed,
                             search_paths: &mut search_paths,
@@ -4383,7 +4638,28 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                             discovery: &mut discovery,
                             plan: &mut plan,
                             actions: &mut actions,
+                            scan: &mut member_scan,
                         },
+                    )?;
+                    queue_collection(
+                        &collection,
+                        &origin,
+                        &excludes,
+                        &reachable,
+                        &firsts,
+                        &mut WalkState {
+                            already_processed: &mut already_processed,
+                            search_paths: &mut search_paths,
+                            repair_extra: &mut repair_extra,
+                            group_dests: &mut group_dests,
+                            group_sources: &mut group_sources,
+                            needed_by: &mut needed_by,
+                            discovery: &mut discovery,
+                            plan: &mut plan,
+                            actions: &mut actions,
+                            scan: &mut member_scan,
+                        },
+                        sysroot_universe.as_ref(),
                     )?;
                     if declared.requirement == Requirement::Required {
                         required_dests

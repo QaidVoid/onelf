@@ -145,27 +145,30 @@ fn is_lib_dir(dir: &Path) -> bool {
         .is_some_and(|n| LIBRARY_DIRS.contains(&n))
 }
 
+/// The most directory levels [`object_prefix`] climbs above an object.
+const MAX_PREFIX_LEVELS: usize = 16;
+
 /// The installation prefix above the object at `path`: a library's, by
-/// the shapes [`AdmittedLibrary::installation_prefix`] describes, or a
-/// program's in the prefix's `bin`, `sbin` or `libexec`, directly or one
-/// level below `libexec`. Only compiled-in path inference reads a
-/// program's prefix, so descriptor discovery's roots stay those of
-/// libraries.
+/// the shapes [`AdmittedLibrary::installation_prefix`] describes, else
+/// the parent of the nearest enclosing `lib`, `lib32`, `lib64`, `libx32`,
+/// `bin`, `sbin` or `libexec`, so a module deep in a plugin tree and a
+/// program in the prefix's `bin` or `libexec` have one too. Only
+/// compiled-in path inference reads this prefix, so descriptor
+/// discovery's roots stay those of libraries in their own directories.
 pub(crate) fn object_prefix(path: &Path) -> Option<PathBuf> {
     if let Some(prefix) = prefix_of(path) {
         return Some(prefix);
     }
-    let dir = path.parent()?;
-    let named = |dir: &Path, names: &[&str]| {
-        dir.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| names.contains(&n))
-    };
-    if named(dir, &["bin", "sbin", "libexec"]) {
-        return dir.parent().map(Path::to_path_buf);
-    }
-    let parent = dir.parent()?;
-    named(parent, &["libexec"]).then(|| parent.parent().map(Path::to_path_buf))?
+    path.ancestors()
+        .skip(1)
+        .take(MAX_PREFIX_LEVELS)
+        .find(|dir| {
+            dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                LIBRARY_DIRS.contains(&n) || ["bin", "sbin", "libexec"].contains(&n)
+            })
+        })
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
 }
 
 /// The roots one declared base searches: each admitted library's

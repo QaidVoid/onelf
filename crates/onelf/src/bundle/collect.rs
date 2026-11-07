@@ -161,47 +161,107 @@ pub(crate) fn collect_found(
     // variants), and only a second member for one destination is
     // refused, with the member that took it named.
     let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let target = (target_class, target_machine);
     for hit in found {
         collection.search_dirs.push(hit.resolved.clone());
         for (rel, path) in members(hit, sysroot)? {
-            let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(".so") {
+            let named_so = rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".so"));
+            if !named_so {
                 continue;
             }
-            let shown = rel.to_string_lossy().into_owned();
+            let shown = rel.to_string_lossy();
             if !members_allowed.is_empty() && !members_allowed.iter().any(|m| m.as_str() == shown) {
                 continue;
             }
-            if let Err(reason) = compatible_object(&path, target_class, target_machine) {
-                collection.skipped.push((shown, reason));
-                continue;
-            }
-            let destination = hit.destination.join(&rel);
-            if let Some(first) = taken.get(&destination) {
-                collection.skipped.push((
-                    shown,
-                    format!(
-                        "{} is already collected from {}",
-                        destination.display(),
-                        first.display()
-                    ),
-                ));
-                continue;
-            }
-            if collection.plugins.len() >= MAX_GROUP_MEMBERS {
-                return Err(bounded(rule, group, MAX_GROUP_MEMBERS));
-            }
-            taken.insert(destination.clone(), path.clone());
-            collection.plugins.push(CollectedPlugin {
-                soname: name.to_string(),
-                destination,
-                resolved: path.clone(),
-            });
+            take_member(&mut collection, &mut taken, hit, &rel, &path, target)?;
         }
     }
     Ok(collection)
+}
+
+/// Collect every ELF object among `members`, already read from `hit`,
+/// whatever its name: a versioned library, a backend named `*.so.N` or
+/// a helper program beside the modules. A member that is not an ELF
+/// object is left to the caller, which carries it as data.
+pub(crate) fn collect_objects(
+    rule: &str,
+    group: &str,
+    hit: &CandidateHit,
+    members: &[(PathBuf, PathBuf)],
+    target_class: Option<u8>,
+    target_machine: Option<u16>,
+) -> io::Result<GroupCollection> {
+    let mut collection = GroupCollection {
+        rule: rule.to_string(),
+        group: group.to_string(),
+        search_dirs: vec![hit.resolved.clone()],
+        ..GroupCollection::default()
+    };
+    let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for (rel, path) in members {
+        if read_elf_class(path).is_some() {
+            take_member(
+                &mut collection,
+                &mut taken,
+                hit,
+                rel,
+                path,
+                (target_class, target_machine),
+            )?;
+        }
+    }
+    Ok(collection)
+}
+
+/// Take one member into `collection` at its place below the hit's
+/// destination, or record it skipped with the reason: an object the
+/// bundle cannot load, or a second member for a destination already
+/// `taken`.
+fn take_member(
+    collection: &mut GroupCollection,
+    taken: &mut HashMap<PathBuf, PathBuf>,
+    hit: &CandidateHit,
+    rel: &Path,
+    path: &Path,
+    (target_class, target_machine): (Option<u8>, Option<u16>),
+) -> io::Result<()> {
+    let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let shown = rel.to_string_lossy().into_owned();
+    if let Err(reason) = compatible_object(path, target_class, target_machine) {
+        collection.skipped.push((shown, reason));
+        return Ok(());
+    }
+    let destination = hit.destination.join(rel);
+    if let Some(first) = taken.get(&destination) {
+        collection.skipped.push((
+            shown,
+            format!(
+                "{} is already collected from {}",
+                destination.display(),
+                first.display()
+            ),
+        ));
+        return Ok(());
+    }
+    if collection.plugins.len() >= MAX_GROUP_MEMBERS {
+        return Err(bounded(
+            &collection.rule,
+            &collection.group,
+            MAX_GROUP_MEMBERS,
+        ));
+    }
+    taken.insert(destination.clone(), path.to_path_buf());
+    collection.plugins.push(CollectedPlugin {
+        soname: name.to_string(),
+        destination,
+        resolved: path.to_path_buf(),
+    });
+    Ok(())
 }
 
 /// The bounded-collection error: which group stopped, and at what.
@@ -219,7 +279,7 @@ fn bounded(rule: &str, group: &str, cap: usize) -> io::Error {
 /// to the directory and the absolute path, in sorted order. A sysroot
 /// build takes its members from the build's own admitted files, so a
 /// pruned member is never walked; a host scan walks the directory.
-fn members(
+pub(crate) fn members(
     hit: &CandidateHit,
     sysroot: Option<&SysrootUniverse>,
 ) -> io::Result<Vec<(PathBuf, PathBuf)>> {

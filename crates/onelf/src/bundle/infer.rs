@@ -79,7 +79,7 @@ use onelf_format::rules::{
 };
 use onelf_sysroot::path::in_root;
 
-use super::collect::visit_members;
+use super::collect::{GroupCollection, visit_members};
 use super::datadirs::path_like;
 use super::{
     CandidateHit, Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, format_size,
@@ -431,10 +431,16 @@ fn origin(dir: &InferredDir) -> String {
     )
 }
 
+/// The most skipped plugin members one finding names.
+const SHOWN_SKIPS: usize = 3;
+
 /// What the bundle carried of one inferred directory.
 pub(crate) enum Carried<'a> {
     /// The directory, whole.
     Data,
+    /// The ELF objects its collection took, with the ones it skipped
+    /// and why, and the count of its other files.
+    Plugins(&'a GroupCollection, usize),
     /// Nothing, since the tree already holds its destination.
     Held,
     /// Nothing of its own, since the inferred destination named here
@@ -443,27 +449,62 @@ pub(crate) enum Carried<'a> {
 }
 
 /// Record the finding for one inferred directory: what it holds, its
-/// size, how the bundle carries it and where it came from. The compiled-in
-/// paths that name it are not redirected to the bundle's copy yet, and
-/// the finding says so.
-pub(crate) fn report(dir: &InferredDir, carried: Carried) {
+/// size, how the bundle carries it and where it came from. A data
+/// directory's compiled-in paths are not redirected to the bundle's
+/// copy yet, and the finding says so; a plugin directory's objects are
+/// redirected by the walk that admits them, and its finding names what
+/// was skipped and why.
+pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
     let kind = match dir.kind {
         InferredKind::Plugins => "plugin directory",
         InferredKind::Data => "data directory",
     };
-    let how = match carried {
-        Carried::Data => "carried".to_string(),
-        Carried::Held => "held by the tree's own copy".to_string(),
-        Carried::Within(outer) => format!("carried within {}", outer.display()),
+    let (outcome, mut what) = match carried {
+        Carried::Data => (
+            Outcome::Selected,
+            format!("{kind}, {}, carried, not redirected yet", format_size(size)),
+        ),
+        Carried::Held => (
+            Outcome::Selected,
+            format!(
+                "{kind}, {}, held by the tree's own copy, not redirected yet",
+                format_size(size)
+            ),
+        ),
+        Carried::Within(outer) => (
+            Outcome::Selected,
+            format!(
+                "{kind}, {}, carried within {}, not redirected yet",
+                format_size(size),
+                outer.display()
+            ),
+        ),
+        Carried::Plugins(collection, 0) if collection.plugins.is_empty() => (
+            Outcome::OptionalOmission,
+            "plugin directory with nothing the bundle can carry".to_string(),
+        ),
+        Carried::Plugins(collection, files) => (
+            Outcome::Selected,
+            format!(
+                "plugin directory, {} object(s) and {files} other file(s), {}",
+                collection.plugins.len(),
+                format_size(size)
+            ),
+        ),
     };
+    if let Carried::Plugins(collection, _) = carried {
+        let skipped = &collection.skipped;
+        for (name, reason) in skipped.iter().take(SHOWN_SKIPS) {
+            what.push_str(&format!("; {name} omitted: {reason}"));
+        }
+        if skipped.len() > SHOWN_SKIPS {
+            what.push_str(&format!("; {} more omitted", skipped.len() - SHOWN_SKIPS));
+        }
+    }
     completeness::record(Finding::new(
         dir.destination.display().to_string(),
-        Outcome::Selected,
-        format!(
-            "{kind}, {}, {how}, not redirected yet; {}",
-            format_size(dir.size),
-            origin(dir)
-        ),
+        outcome,
+        format!("{what}; {}", origin(dir)),
     ));
 }
 
@@ -1619,6 +1660,22 @@ mod tests {
             dirs[1].objects.iter().collect::<Vec<_>>(),
             ["helper", "tool"]
         );
+    }
+
+    /// A module deep in a plugin tree takes the prefix of the library
+    /// directory it hangs under, so its compiled-in paths are looked
+    /// for below that prefix and not beside the module.
+    #[test]
+    fn a_deep_module_has_the_prefix_of_its_library_directory() {
+        let tree = Tree::new("deep-module");
+        tree.dir("usr/share/modulefw");
+        let module = tree.object(
+            "usr/lib/fw/plugins/nested/module.so",
+            &["usr/share/modulefw"],
+        );
+        let dirs = run(&[module], None).unwrap();
+        assert_eq!(rels(&dirs), ["share/modulefw"]);
+        assert_eq!(dirs[0].prefix, tree.0.join("usr"));
     }
 
     /// A program the tree holds names the source's paths, so its prefix
