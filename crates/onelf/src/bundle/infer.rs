@@ -373,6 +373,14 @@ impl Inference {
     pub(crate) fn get(&self, source: &Path) -> Option<&InferredDir> {
         self.dirs.get(source)
     }
+
+    /// Every directory this inference holds, in source order, whatever
+    /// the carry decision did with it: a directory that rides a carried
+    /// parent has no carry entry of its own, and only this view of the
+    /// scan can still name it.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &InferredDir> {
+        self.dirs.values()
+    }
 }
 
 /// Whether `dir` holds an ELF object anywhere below it, whatever its
@@ -751,11 +759,18 @@ fn compiled_strings(data: &[u8]) -> impl Iterator<Item = &str> {
         .filter_map(normalized_absolute)
 }
 
+/// A minimal ELF image for sibling tests: one read-only `PT_LOAD` per
+/// segment, each holding its strings NUL-terminated.
+#[cfg(test)]
+pub(crate) fn test_elf(segments: &[(u32, &[&str])]) -> Vec<u8> {
+    tests::test_image(segments)
+}
+
 /// The file ranges of the `PT_LOAD` segments the loader maps without
 /// write permission, clamped to `data`, sorted, merged where they
 /// overlap or touch, and with the dynamic string table taken out. Many
 /// overlapping headers are read once.
-fn read_only_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn read_only_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let Ok(elf) = goblin::elf::Elf::parse(data) else {
         return Vec::new();
     };
@@ -989,6 +1004,10 @@ mod tests {
 
     fn elf(segments: &[(u32, &[&str])]) -> Vec<u8> {
         image(true, false, segments, None)
+    }
+
+    pub(crate) fn test_image(segments: &[(u32, &[&str])]) -> Vec<u8> {
+        elf(segments)
     }
 
     fn strings(data: &[u8]) -> Vec<&str> {

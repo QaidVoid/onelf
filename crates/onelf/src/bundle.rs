@@ -5337,6 +5337,92 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         report_unguaranteed_runpath(&unguaranteed, &self_extract);
     }
 
+    // The redirection decision needs the final tree, so it is taken here:
+    // the rewrites land before the ledger attests the copies, and the
+    // needs audit runs on the rewritten bytes. The record lands before
+    // the rewrite, since a build that fails from the first rewritten
+    // byte on still reruns against bytes only the record can interpret;
+    // the drop pass may empty a carried directory the choice named, so
+    // what survives is recorded again after the audit, and only the
+    // report waits for it.
+    let redirections = if opts.dry_run {
+        Vec::new()
+    } else {
+        let tree_elfs = find_elf_files(&opts.directory);
+        let carried_dirs: Vec<&infer::InferredDir> = inferred_carried
+            .iter()
+            .filter(|(.., carry)| *carry == Carry::Planned)
+            .filter_map(|(_, source, _)| inference.get(source))
+            // A plan the walk emptied leaves no destination: a member
+            // every strict-libc skip condemned, say, copies nothing.
+            // The record's keys are positional, so an anchor over
+            // nothing would consume a key the record cannot carry.
+            .filter(|dir| opts.directory.join(&dir.destination).is_dir())
+            .collect();
+        // A directory the tree already holds takes the rewrite too when
+        // an anchor names it: an object newly bundled this run may carry
+        // fresh spellings for it, and only an anchor reaches those
+        // bytes. A directory that rides such a carried parent has no
+        // carry entry of its own, so the scan's own view names it; the
+        // same source test collection applies decides a child rides,
+        // and one overlapping from another source stays out.
+        let rewrite_dirs: Vec<&infer::InferredDir> = inferred_carried
+            .iter()
+            .filter(|(.., carry)| matches!(*carry, Carry::Planned | Carry::Held))
+            .filter_map(|(_, source, _)| inference.get(source))
+            .chain(inference.all().filter(|dir| {
+                inferred_carried.iter().any(|(dest, source, carry)| {
+                    matches!(*carry, Carry::Planned | Carry::Held)
+                        && match dir.destination.strip_prefix(dest) {
+                            Ok(rel) if !rel.as_os_str().is_empty() => {
+                                dir.source == source.join(rel)
+                            }
+                            _ => false,
+                        }
+                })
+            }))
+            .collect();
+        let lib_dirs = crate::pack::resolve_lib_dirs(&opts.lib_dirs, &opts.directory);
+        // The launch evaluates only the rules the package carries, which
+        // are the catalog's enabled descriptors, so a disabled built-in's
+        // runtime mapping covers nothing.
+        let enabled_rules = opts.rules.enabled();
+        let fresh = redir::choose(&carried_dirs, &enabled_rules, &lib_dirs, &opts.directory);
+        let persisted = redir::persisted(&opts.directory)?;
+        let redirections = redir::merge(fresh, &persisted, &opts.directory)?;
+        // The record lands before the rewrite, so a decision the
+        // rewrite would refuse stops first: a fresh anchor's merged
+        // key can be longer than the one its eligibility was checked
+        // against, and a refused rewrite must not leave a record
+        // naming it.
+        redir::ensure_spellings_fit(&redirections, &persisted, &rewrite_dirs)?;
+        // The record lands before the rewrite: a rewrite that fails
+        // part way, or any build that fails after it, leaves the tree
+        // carrying bytes only the record can interpret, and every
+        // anchor the decision holds is known before the first byte
+        // moves. The drop pass may still empty a carried directory, so
+        // what survives is recorded again after the audit, and only the
+        // report waits for it.
+        let survived: Vec<redir::Redirection> = redirections
+            .iter()
+            .filter(|r| r.resolves(&opts.directory))
+            .cloned()
+            .collect();
+        redir::write_record(&survived, &opts.directory)?;
+        // The rewrite lands exactly what the record holds: an anchor
+        // the record cannot name would leave a path nothing resolves.
+        let (files, occurrences) = redir::rewrite_anchors(&survived, &rewrite_dirs, &tree_elfs)?;
+        if occurrences > 0 {
+            eprintln!(
+                "{} {} compiled-in paths to anchor paths in {} binaries",
+                color::bold("Rewrote"),
+                occurrences,
+                files
+            );
+        }
+        redirections
+    };
+
     // Patch PT_INTERP of every ELF with a bundled loader. This is what
     // makes /proc/self/exe point at the real target after kernel exec
     // (Python's stdlib detection, Electron's ASAR locator, Qt's plugin
@@ -5382,32 +5468,15 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         if let Some((providers, unchecked)) = set_audit.as_ref() {
             audit_entrypoint_selections(opts, sysroot_platform.as_ref(), providers, unchecked)?;
         }
-        // Every carried inferred directory reaches the application by one
-        // mechanism, decided against the final tree: an environment mapping
-        // a descriptor already provides, else an anchor, else a path pair.
-        // The launch evaluates library-root candidates against every
-        // library directory the manifest lists, so the decision mirrors
-        // the packer's own detection of that list on the assembled tree;
-        // a recipe that pins its library directories explicitly packs
-        // with its list instead, and a pinned directory holds shared
-        // objects in any build that carries inferred directories, so the
-        // detector still names it.
-        let carried_dirs: Vec<&infer::InferredDir> = inferred_carried
-            .iter()
-            .filter(|(.., carry)| *carry == Carry::Planned)
-            .filter_map(|(_, source, _)| inference.get(source))
+        // The choice was taken before the audit; what it names is
+        // reported, and recorded again for what the drop pass left,
+        // only while the bundled copy is in place.
+        let survived: Vec<redir::Redirection> = redirections
+            .into_iter()
+            .filter(|r| r.resolves(&opts.directory))
             .collect();
-        let lib_dirs = crate::pack::resolve_lib_dirs(&opts.lib_dirs, &opts.directory);
-        // The launch evaluates only the rules the package carries, which
-        // are the catalog's enabled descriptors, so a disabled built-in's
-        // runtime mapping covers nothing.
-        let enabled_rules = opts.rules.enabled();
-        redir::report(&redir::choose(
-            &carried_dirs,
-            &enabled_rules,
-            &lib_dirs,
-            &opts.directory,
-        ));
+        redir::write_record(&survived, &opts.directory)?;
+        redir::report(&survived);
     }
 
     Ok(())

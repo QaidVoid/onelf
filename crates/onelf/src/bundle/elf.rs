@@ -410,10 +410,12 @@ pub(crate) fn origin_runpath_for(root: &Path, path: &Path, lib_rel: &Path) -> St
 /// File range of the dynamic string table.
 ///
 /// From the `.dynstr` section header when there is one, else from
-/// `DT_STRTAB` and `DT_STRSZ` mapped through the `PT_LOAD` holding them.
-/// An object stripped of its section headers (`sstrip`, `llvm-strip
-/// --strip-sections`, some vendor blobs) keeps its dynamic section, and
-/// would otherwise keep its host RUNPATH too.
+/// `DT_STRTAB` and `DT_STRSZ`. An object stripped of its section
+/// headers (`sstrip`, `llvm-strip --strip-sections`, some vendor
+/// blobs) keeps its dynamic section, and would otherwise keep its host
+/// RUNPATH too. Goblin maps `DT_STRTAB` through the program headers to
+/// a file offset, so the value is used as it stands; a table outside
+/// every loadable segment leaves nothing to exclude.
 pub(crate) fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     if let Some(sh) = elf
         .section_headers
@@ -429,19 +431,11 @@ pub(crate) fn dynstr_range(elf: &goblin::elf::Elf) -> Option<(usize, usize)> {
     let dynamic = elf.dynamic.as_ref()?;
     let strtab = dynamic.info.strtab as u64;
     let strsz = dynamic.info.strsz as u64;
-    if strsz == 0 {
+    if strsz == 0 || strtab == 0 {
         return None;
     }
-    let load = elf.program_headers.iter().find(|p| {
-        p.p_type == goblin::elf::program_header::PT_LOAD
-            && strtab >= p.p_vaddr
-            && p.p_vaddr
-                .checked_add(p.p_filesz)
-                .is_some_and(|end| strtab < end)
-    })?;
-    let off = (strtab - load.p_vaddr).checked_add(load.p_offset)?;
-    let end = off.checked_add(strsz)?;
-    Some((usize::try_from(off).ok()?, usize::try_from(end).ok()?))
+    let end = strtab.checked_add(strsz)?;
+    Some((usize::try_from(strtab).ok()?, usize::try_from(end).ok()?))
 }
 
 /// Rewrite RUNPATH within `data`, reporting what the caller still owes and
@@ -759,8 +753,12 @@ pub(crate) fn finalize_tree(
 
     for path in find_elf_files(directory) {
         // Every later edit, here and in the bootstrap injection, writes
-        // the file in place.
-        break_hardlink(&path);
+        // the file in place. A link that cannot be detached would carry
+        // the write to the file it shares its inode with, so the file
+        // keeps its bytes and the pass moves on.
+        if break_hardlink(&path).is_err() {
+            continue;
+        }
         let perms = fs::metadata(&path)
             .map(|m| m.permissions().mode())
             .unwrap_or(0o755);
@@ -800,21 +798,29 @@ pub(crate) fn finalize_tree(
 ///
 /// A hardlinked input shares its inode with the file it was linked from,
 /// often the build's own output, and an in-place write would change that
-/// too. The copy keeps the mode bits; a failure leaves the link as it was.
-fn break_hardlink(path: &Path) {
+/// too. The copy keeps the mode bits. An error means the link still
+/// stands, so a caller that rewrites in place would change the file the
+/// link shares its inode with, and must not write.
+pub(crate) fn break_hardlink(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
+        return Ok(());
     };
     if !meta.is_file() || meta.nlink() < 2 {
-        return;
+        return Ok(());
     }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".onelf-unlink.tmp");
     let tmp = PathBuf::from(tmp);
-    if fs::copy(path, &tmp).is_err() || fs::rename(&tmp, path).is_err() {
+    let detached = fs::copy(path, &tmp).and_then(|_| fs::rename(&tmp, path));
+    if let Err(error) = detached {
         let _ = fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        ));
     }
+    Ok(())
 }
 
 /// Apply every in-place rewrite to one binary with a single read and a
@@ -1490,6 +1496,19 @@ pub(crate) fn inject_bootstraps(app_dir: &Path, lib_dest: &Path) -> io::Result<u
         rel.push(&rel_lib);
         rel.push(basename);
         let rel_interp = rel.to_string_lossy().into_owned();
+
+        // Every injection below writes the file in place, so a link it
+        // cannot detach would carry the write to the file it shares its
+        // inode with: the executable keeps its bytes and gets no
+        // bootstrap rather than touching what it links to.
+        if break_hardlink(&path).is_err() {
+            eprintln!(
+                "  {} could not detach {} from its hardlink; no bootstrap injected",
+                color::bold_red("warning:"),
+                path.display()
+            );
+            continue;
+        }
 
         let perms = fs::metadata(&path)
             .map(|m| m.permissions().mode())

@@ -2017,6 +2017,12 @@ pub(crate) fn dispose_generated(
     let mut removals: Vec<String> = Vec::new();
     let mut findings: Vec<GeneratedFinding> = Vec::new();
     for entry in &entries {
+        // The anchor record is the redirection decision's input across
+        // builds, not an output to rebuild: population keeps it, and
+        // the decision rewrites or drops it once it has folded it in.
+        if entry.path == onelf_format::anchors::ANCHORS_FILE {
+            continue;
+        }
         let actual = hash_entry(&appdir.join(&entry.path))?;
         let mut judged = entry.clone();
         // A path-only record proves nothing on its own. When the plan
@@ -2164,6 +2170,24 @@ pub fn record_generated(appdir: &Path, paths: Vec<String>) -> io::Result<()> {
                 pending,
             },
         );
+    }
+    let entries: Vec<GeneratedEntry> = merged.into_values().collect();
+    write_generated(appdir, &entries)
+}
+
+/// Drop ledger entries, keeping the rest: a generated file the build no
+/// longer writes must not linger in the ledger.
+pub fn remove_generated(appdir: &Path, paths: &[String]) -> io::Result<()> {
+    let existing = read_generated(appdir)?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let mut merged: std::collections::BTreeMap<String, GeneratedEntry> = existing
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    for path in paths {
+        merged.remove(path);
     }
     let entries: Vec<GeneratedEntry> = merged.into_values().collect();
     write_generated(appdir, &entries)
@@ -2793,6 +2817,44 @@ mod tests {
         assert!(!appdir.join("lib/sub/cache.bin").exists());
         assert!(!appdir.join("lib").exists(), "the emptied directories go");
         assert!(!appdir.join(GENERATED_FILE).exists(), "the record goes too");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The anchor record is decision state, not output to rebuild: the
+    /// cleanup leaves it standing, however unchanged its bytes, so the
+    /// next build's redirection decision can fold it in.
+    #[test]
+    fn the_anchor_record_survives_the_cleanup_of_generated_ones() {
+        let root =
+            std::env::temp_dir().join(format!("onelf-dispose-anchor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(appdir.join("lib/cache.bin"), b"generated").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        fs::write(appdir.join(".onelf/anchors"), b"a\tshare/fw").unwrap();
+        record_generated(
+            &appdir,
+            vec![
+                "lib/cache.bin".to_string(),
+                onelf_format::anchors::ANCHORS_FILE.to_string(),
+            ],
+        )
+        .unwrap();
+
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(!appdir.join("lib/cache.bin").exists());
+        assert!(!appdir.join("lib").exists(), "the emptied directories go");
+        assert_eq!(
+            fs::read(appdir.join(".onelf/anchors")).unwrap(),
+            b"a\tshare/fw",
+            "the anchor record stays"
+        );
+        assert!(
+            !appdir.join(GENERATED_FILE).exists(),
+            "the ledger goes with the cleanup, and population rewrites it"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
