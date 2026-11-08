@@ -278,6 +278,17 @@ fn check_pair<'a>(
     Ok(())
 }
 
+/// Why a pair the packer would write is refused, as one sentence
+/// quoting both sides, if it is refused: the same checks one record
+/// line goes through, without the line. The packer's pair extraction
+/// skips a pair this refuses, so a build carries no pair its runtime
+/// ignores.
+pub fn pair_refusal(absolute: &str, relative: &str) -> Option<String> {
+    check_pair(None, absolute, relative, &mut BTreeSet::new())
+        .err()
+        .map(|error| error.to_string())
+}
+
 /// Why `relative` is not a bundle directory a record may name, if it is
 /// not: over [`MAX_RELATIVE_BYTES`], holding a control character,
 /// absolute, leaving the package through `..`, or not normalized. Shared

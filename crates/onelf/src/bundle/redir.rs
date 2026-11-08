@@ -23,14 +23,18 @@
 //! decision, so a re-run keeps reporting and recording the anchors its
 //! bytes already name; `merge` holds those rules.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::infer::InferredDir;
 use onelf_format::anchors;
+use onelf_format::paths::PathPair;
+
+use super::infer::InferredDir;
+use super::{Finding, Outcome, record_finding};
 use onelf_format::rules::{Descriptor, PathSelection, ResourceKind, RuntimeBase, RuntimePathGroup};
 
 /// How one carried inferred directory reaches the application.
@@ -51,6 +55,12 @@ pub(crate) enum Mechanism {
 /// One carried inferred directory's choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Redirection {
+    /// The canonical source directory the destination carries, for a
+    /// choice this scan took: the identity a pair record matches on, so
+    /// an omitted directory that shares the destination cannot stand in
+    /// for the carried one. A redirection restored from the tree's own
+    /// record names none, the record holding only the destination.
+    pub source: Option<PathBuf>,
     /// The bundle directory, relative to the package root.
     pub dest: PathBuf,
     /// The mechanism chosen for it.
@@ -68,21 +78,35 @@ pub(crate) struct Redirection {
 /// `view_env_assignments`). Sets and prepared subtrees answer later
 /// scopes and are skipped, since the application package alone carries
 /// inferred directories and an application scope match outranks theirs.
+/// `held` names the destinations the tree already holds from a previous
+/// build: they take no fresh anchor (the tree's own record restores
+/// theirs, and a fresh key over a held destination could move a
+/// recorded one) and only their pair, which is keyed by the path
+/// itself and safe to re-derive.
 pub(crate) fn choose(
     dirs: &[&InferredDir],
     descriptors: &[&Descriptor],
     lib_dirs: &[String],
     directory: &Path,
+    held: &std::collections::HashSet<PathBuf>,
 ) -> Vec<Redirection> {
     let mut out: Vec<Redirection> = dirs
         .iter()
         .filter(|dir| env_covered(dir, descriptors, lib_dirs, directory))
         .map(|dir| Redirection {
+            source: Some(dir.source.clone()),
             dest: dir.destination.clone(),
             mechanism: Mechanism::Env,
             key: None,
         })
         .collect();
+    // A held carry takes no fresh anchor: the tree's own record restores
+    // its anchors, and a fresh key over a held destination could move a
+    // recorded one, which the key-move refusal exists to stop. Its pair
+    // is keyed by the path itself, so it takes the overlay and a
+    // rebuild restores what it would otherwise lose. An environment
+    // mapping needs no build-time action; the launch evaluates the
+    // descriptors on their own.
     // The rest compete for anchors: keys go to the destinations in sorted
     // order, shortest first. A destination that is not UTF-8 cannot enter
     // the anchor record, so it takes the overlay. A directory keeps its
@@ -93,7 +117,11 @@ pub(crate) fn choose(
     let (utf8, mut pairs): (Vec<&InferredDir>, Vec<&InferredDir>) = dirs
         .iter()
         .filter(|dir| !env_covered(dir, descriptors, lib_dirs, directory))
+        .filter(|dir| !held.contains(&dir.destination))
         .partition(|dir| dir.destination.to_str().is_some());
+    pairs.extend(dirs.iter().filter(|dir| {
+        held.contains(&dir.destination) && !env_covered(dir, descriptors, lib_dirs, directory)
+    }));
     let mut rest = utf8;
     rest.sort_by(|a, b| a.destination.cmp(&b.destination));
     let Ok(provisional) = anchors::assign(
@@ -138,6 +166,7 @@ pub(crate) fn choose(
             .find(|anchor| Path::new(&anchor.relative) == dir.destination)
             .expect("assign returns every destination");
         out.push(Redirection {
+            source: Some(dir.source.clone()),
             dest: dir.destination.clone(),
             mechanism: Mechanism::Anchor,
             key: Some(anchor.key.clone()),
@@ -153,6 +182,7 @@ pub(crate) fn choose(
 fn finish(mut out: Vec<Redirection>, pairs: &[&InferredDir]) -> Vec<Redirection> {
     for dir in pairs {
         out.push(Redirection {
+            source: Some(dir.source.clone()),
             dest: dir.destination.clone(),
             mechanism: Mechanism::Pair,
             key: None,
@@ -184,6 +214,101 @@ impl Redirection {
     pub(crate) fn resolves(&self, directory: &Path) -> bool {
         directory.join(&self.dest).is_dir()
     }
+}
+
+/// The pairs the surviving pair redirections add to the package's
+/// `.onelf/paths` record: every compiled-in spelling of each pair
+/// directory, with the bundle destination that answers for it, sorted
+/// by absolute path. `dirs` is the set the choice was taken over, the
+/// carried directories: an omitted directory that shares a carried
+/// one's destination must not name its spellings into the record. A
+/// destination that cannot enter the record, because it is not UTF-8,
+/// contributes none and stays unredirected, which the completeness
+/// findings report as an inference limit; so does a spelling the
+/// codec refuses, or one past the record's pair bound (the record
+/// holds `MAX_PAIRS`, of which the recipe's own pairs claim
+/// `recipe.len()`), and the build goes on with the limit named. A
+/// spelling one of the recipe's own pairs claims contributes none:
+/// that pair answers for the path, so the spelling cannot spend a
+/// bound slot a fresh one could use. Two directories compiling in one
+/// spelling answer for it once: the first in the choice order wins,
+/// and the rest stay unredirected unnamed.
+pub(crate) fn record_pairs<'a>(
+    survived: &[Redirection],
+    dirs: impl IntoIterator<Item = &'a InferredDir>,
+    recipe: &[PathPair],
+) -> Vec<PathPair> {
+    let dirs: Vec<&InferredDir> = dirs.into_iter().collect();
+    let claimed: std::collections::HashSet<&str> =
+        recipe.iter().map(|pair| pair.absolute.as_str()).collect();
+    let bound = onelf_format::paths::MAX_PAIRS.saturating_sub(recipe.len());
+    let mut out: BTreeMap<&str, PathPair> = BTreeMap::new();
+    let mut dropped: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for choice in survived.iter().filter(|c| c.mechanism == Mechanism::Pair) {
+        let Some(relative) = choice.dest.to_str() else {
+            record_finding(Finding::new(
+                choice.dest.display().to_string(),
+                Outcome::Unchecked,
+                "carried, but its pair cannot enter the paths record (the destination is not \
+                 UTF-8), so its compiled-in paths stay unredirected",
+            ));
+            continue;
+        };
+        let Some(source) = &choice.source else {
+            continue;
+        };
+        let Some(dir) = dirs
+            .iter()
+            .find(|dir| dir.destination == choice.dest && &dir.source == source)
+        else {
+            continue;
+        };
+        for absolute in &dir.compiled {
+            if claimed.contains(absolute.as_str()) {
+                continue;
+            }
+            if out.contains_key(absolute.as_str()) {
+                continue;
+            }
+            if let Some(why) = onelf_format::paths::pair_refusal(absolute, relative) {
+                record_finding(Finding::new(
+                    choice.dest.display().to_string(),
+                    Outcome::Unchecked,
+                    format!(
+                        "carried, but its pair cannot enter the paths record ({why}), so its \
+                         compiled-in paths stay unredirected"
+                    ),
+                ));
+                continue;
+            }
+            if out.len() >= bound {
+                dropped.insert(absolute.as_str());
+                continue;
+            }
+            out.insert(
+                absolute.as_str(),
+                PathPair {
+                    absolute: absolute.clone(),
+                    relative: relative.to_string(),
+                },
+            );
+        }
+    }
+    if !dropped.is_empty() {
+        record_finding(Finding::new(
+            "the paths record",
+            Outcome::OptionalOmission,
+            format!(
+                "is full at its bound of {} pairs ({} reserved by the recipe's own, {} left for \
+                 inference); {} compiled-in spelling(s) stay unredirected",
+                onelf_format::paths::MAX_PAIRS,
+                recipe.len(),
+                bound,
+                dropped.len()
+            ),
+        ));
+    }
+    out.into_values().collect()
 }
 
 /// The anchors a tree already carries, from a previous build. Empty
@@ -259,6 +384,7 @@ pub(crate) fn merge(
     let mut merged: Vec<Redirection> = assigned
         .iter()
         .map(|anchor| Redirection {
+            source: None,
             dest: PathBuf::from(&anchor.relative),
             mechanism: Mechanism::Anchor,
             key: Some(anchor.key.clone()),
@@ -274,7 +400,7 @@ pub(crate) fn merge(
 }
 
 /// Whether the record anchors `dest`.
-fn persisted_anchored(persisted: &[anchors::Anchor], dest: &Path) -> bool {
+pub(crate) fn persisted_anchored(persisted: &[anchors::Anchor], dest: &Path) -> bool {
     persisted
         .iter()
         .any(|anchor| Path::new(&anchor.relative) == dest)
@@ -673,6 +799,256 @@ mod tests {
         }
     }
 
+    /// A pair redirection records every compiled-in spelling of its
+    /// directory, sorted by absolute path, and an anchored directory
+    /// records none: its spellings are rewritten, not overlaid.
+    #[test]
+    fn pair_choices_record_every_spelling_sorted() {
+        let root = temp_root("redir-pairs-record");
+        let dirs = [
+            dir(&root, "lib/short", &["/usr/share/s", "/usr/lib/s2"]),
+            dir(&root, "lib/loong", &["/usr/share/looooooooong"]),
+        ];
+        let refs: Vec<&InferredDir> = dirs.iter().collect();
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(out.len(), 2);
+        let pairs = record_pairs(&out, &dirs, &[]);
+        assert_eq!(
+            pairs,
+            vec![
+                PathPair {
+                    absolute: "/usr/lib/s2".to_string(),
+                    relative: "lib/short".to_string(),
+                },
+                PathPair {
+                    absolute: "/usr/share/s".to_string(),
+                    relative: "lib/short".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// A destination that cannot enter the record, because it is not
+    /// UTF-8, contributes no pair and stays unredirected; the choice
+    /// gives it to the overlay and the findings report the limit.
+    #[test]
+    fn pair_choices_skip_a_destination_outside_the_record() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp_root("redir-pairs-non-utf8");
+        let mut raw = b"lib/fw".to_vec();
+        raw.push(0x80);
+        let bad = InferredDir {
+            destination: PathBuf::from(std::ffi::OsStr::from_bytes(&raw)),
+            compiled: ["/usr/share/fw".to_string()].into(),
+            ..dir(&root, "lib/kept", &["/usr/share/kept"])
+        };
+        let dirs = [bad];
+        let survived = [Redirection {
+            source: Some(dirs[0].source.clone()),
+            dest: PathBuf::from(std::ffi::OsStr::from_bytes(&raw)),
+            mechanism: Mechanism::Pair,
+            key: None,
+        }];
+        assert!(record_pairs(&survived, &dirs, &[]).is_empty());
+        // The limit is named durably: the completeness findings carry
+        // the destination and why its pair stayed out of the record.
+        super::super::completeness::report(&[]);
+        let findings = crate::bundle::take_findings();
+        assert!(
+            findings.iter().any(|f| f.object.contains("lib/fw")
+                && f.reason.contains("cannot enter the paths record")),
+            "{findings:?}"
+        );
+    }
+
+    /// Spellings past the record's pair bound stay out, and the
+    /// finding names the limit: the build goes on with the rest of the
+    /// directory's paths redirected.
+    #[test]
+    fn pair_choices_past_the_record_bound_are_named_and_dropped() {
+        let root = temp_root("redir-pairs-bound");
+        let spellings: Vec<String> = (0..onelf_format::paths::MAX_PAIRS + 6)
+            .map(|i| format!("/u/s{i}"))
+            .collect();
+        let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+        let dirs = [dir(&root, "lib/fw", &refs)];
+        let refs: Vec<&InferredDir> = dirs.iter().collect();
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mechanism, Mechanism::Pair);
+        let pairs = record_pairs(&out, &dirs, &[]);
+        assert_eq!(pairs.len(), onelf_format::paths::MAX_PAIRS);
+        super::super::completeness::report(&[]);
+        let findings = crate::bundle::take_findings();
+        assert!(
+            findings.iter().any(|f| {
+                f.object == "the paths record"
+                    && f.reason
+                        .contains("6 compiled-in spelling(s) stay unredirected")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    /// The recipe's own pairs reserve room in the record: inference's
+    /// cap is the bound less the recipe's count, and the finding names
+    /// both numbers.
+    #[test]
+    fn the_recipe_pairs_reserve_the_record_room() {
+        let root = temp_root("redir-pairs-reserved");
+        let spellings: Vec<String> = (0..8).map(|i| format!("/u/s{i}")).collect();
+        let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
+        let dirs = [dir(&root, "lib/fw", &refs)];
+        let refs: Vec<&InferredDir> = dirs.iter().collect();
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
+        let recipe: Vec<PathPair> = (0..onelf_format::paths::MAX_PAIRS - 5)
+            .map(|i| PathPair {
+                absolute: format!("/u/r{i}"),
+                relative: "lib/recipe".to_string(),
+            })
+            .collect();
+        let pairs = record_pairs(&out, &dirs, &recipe);
+        assert_eq!(pairs.len(), 5);
+        super::super::completeness::report(&[]);
+        let findings = crate::bundle::take_findings();
+        assert!(
+            findings.iter().any(|f| {
+                f.reason
+                    .contains("3 compiled-in spelling(s) stay unredirected")
+                    && f.reason.contains("5 left for inference")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    /// A spelling the recipe's own pair claims spends no bound slot:
+    /// the fresh spelling beside it takes the room the claimed one
+    /// would have burned, and no dropped finding names either.
+    #[test]
+    fn a_recipe_claimed_spelling_spends_no_record_slot() {
+        let mut recipe: Vec<PathPair> = (0..onelf_format::paths::MAX_PAIRS - 2)
+            .map(|i| PathPair {
+                absolute: format!("/u/r{i}"),
+                relative: "lib/recipe".to_string(),
+            })
+            .collect();
+        recipe.push(PathPair {
+            absolute: "/u/claimed".to_string(),
+            relative: "lib/recipe".to_string(),
+        });
+        let root = temp_root("redir-pairs-claimed");
+        let refs = ["/u/claimed", "/u/fresh"];
+        let dirs = [dir(&root, "lib/fw", &refs)];
+        let refs: Vec<&InferredDir> = dirs.iter().collect();
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
+        let pairs = record_pairs(&out, &dirs, &recipe);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].absolute, "/u/fresh");
+        super::super::completeness::report(&[]);
+        let findings = crate::bundle::take_findings();
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.reason.contains("stay unredirected")),
+            "{findings:?}"
+        );
+    }
+
+    /// A held carry takes no fresh decision but its pair: a fresh
+    /// anchor over a held destination is dropped (the record restoring
+    /// its anchor and the launch evaluating the environment mapping on
+    /// its own), the planned directory's key stands without a gap, and
+    /// the held pairs re-enter the record a rebuild would lose.
+    #[test]
+    fn a_held_carry_takes_no_fresh_decision_but_its_pair() {
+        use std::collections::HashSet;
+        let root = temp_root("redir-held");
+        let held_pair = dir(&root, "lib/hp", &["/u/hp"]);
+        let held_anchor = dir(&root, "lib/ha", &["/usr/share/held-anchor"]);
+        let planned_anchor = dir(&root, "lib/pa", &["/usr/share/planned-anchor"]);
+        let dirs = [held_pair, held_anchor, planned_anchor];
+        let held: HashSet<PathBuf> = ["lib/hp", "lib/ha"].iter().map(PathBuf::from).collect();
+        let refs: Vec<&InferredDir> = dirs.iter().collect();
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &held);
+        let kept: Vec<(&Path, Mechanism, Option<&str>)> = out
+            .iter()
+            .map(|r| (r.dest.as_path(), r.mechanism, r.key.as_deref()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (Path::new("lib/ha"), Mechanism::Pair, None),
+                (Path::new("lib/hp"), Mechanism::Pair, None),
+                // The planned directory's key is the first of the
+                // surviving anchor set: the held ones consumed none.
+                (Path::new("lib/pa"), Mechanism::Anchor, Some("a")),
+            ]
+        );
+        // Both held directories' pairs re-enter the record: the
+        // rebuild restores what it would otherwise lose. The planned
+        // directory is anchored, so it names none.
+        let pairs = record_pairs(&out, &dirs, &[]);
+        let relatives: Vec<&str> = pairs.iter().map(|p| p.relative.as_str()).collect();
+        assert_eq!(relatives, vec!["lib/hp", "lib/ha"]);
+    }
+
+    /// A pair redirection matches its directory by source as well as
+    /// destination: an omitted directory that shares the carried one's
+    /// destination cannot name its spellings into the record, even when
+    /// the caller's set still holds it.
+    #[test]
+    fn pair_choices_match_the_carried_directory_by_source() {
+        let root = temp_root("redir-pairs-decoy");
+        let carried = dir(&root, "lib/fw", &["/usr/lib/s"]);
+        let decoy = InferredDir {
+            source: root.join("other/src"),
+            ..dir(&root, "lib/fw", &["/decoy/spelling"])
+        };
+        let dirs = [decoy, carried];
+        let refs: Vec<&InferredDir> = dirs[1..].iter().collect();
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mechanism, Mechanism::Pair);
+        let pairs = record_pairs(&out, &dirs, &[]);
+        assert_eq!(
+            pairs,
+            vec![PathPair {
+                absolute: "/usr/lib/s".to_string(),
+                relative: "lib/fw".to_string(),
+            }]
+        );
+    }
+
     /// A mechanism that already names the directory wins over an anchor,
     /// even when every string is long enough to carry one.
     #[test]
@@ -694,7 +1070,13 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
         assert_eq!(out[0].key, None);
@@ -711,7 +1093,13 @@ mod tests {
             &["lib/appdiraaaaaaaaaaaaaaaaaaaa"],
         )];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
         assert!(out[0].key.is_some());
@@ -724,7 +1112,13 @@ mod tests {
         let root = temp_root("redir-pair");
         let dirs = [dir(&root, "lib/s", &["lib/s"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Pair);
         assert_eq!(out[0].key, None);
@@ -743,7 +1137,13 @@ mod tests {
         ];
         dirs.sort_by(|a, b| a.destination.cmp(&b.destination));
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].dest, Path::new("lib/aaaaaaaaaa"));
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
@@ -777,7 +1177,13 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -816,6 +1222,7 @@ mod tests {
             &refs_rules,
             &["lib".to_string(), "lib/a".to_string()],
             &root,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
@@ -845,7 +1252,13 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
@@ -871,7 +1284,13 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -907,7 +1326,13 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -934,7 +1359,13 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
@@ -969,6 +1400,7 @@ mod tests {
             &refs_rules,
             &["lib".to_string(), "lib64".to_string()],
             &root,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
@@ -998,7 +1430,13 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = vec![&rules];
-        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &refs_rules,
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
@@ -1011,13 +1449,25 @@ mod tests {
         let root = temp_root("redir-boundary");
         let dirs = [dir(&root, "lib/b", &["lib/b1234567"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
 
         let root = temp_root("redir-boundary-short");
         let dirs = [dir(&root, "lib/b", &["lib/b123456"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out[0].mechanism, Mechanism::Pair);
     }
 
@@ -1038,7 +1488,13 @@ mod tests {
         dirs.push(dir(&root, "lib/zz", &["lib/zzaaaaaaaaaaaaaaaaaaaaaaaa"]));
         dirs.sort_by(|a, b| a.destination.cmp(&b.destination));
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root);
+        let out = choose(
+            &refs,
+            &[],
+            &["lib".to_string()],
+            &root,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 27);
         let eligible = out
             .iter()
@@ -1059,6 +1515,7 @@ mod tests {
     /// spellings.
     fn anchored(dir: &InferredDir, key: &str) -> Redirection {
         Redirection {
+            source: Some(dir.source.clone()),
             dest: dir.destination.clone(),
             mechanism: Mechanism::Anchor,
             key: Some(key.to_string()),
@@ -1067,6 +1524,7 @@ mod tests {
 
     fn anchor(key: &str, relative: &str) -> Redirection {
         Redirection {
+            source: None,
             dest: PathBuf::from(relative),
             mechanism: Mechanism::Anchor,
             key: Some(key.to_string()),
@@ -1214,6 +1672,7 @@ mod tests {
         let redirections = [
             anchor("a", "share/fw"),
             Redirection {
+                source: None,
                 dest: PathBuf::from("lib/kept"),
                 mechanism: Mechanism::Env,
                 key: None,
@@ -1348,11 +1807,13 @@ mod tests {
         fs::create_dir_all(root.join("share/new")).unwrap();
         let fresh = vec![
             Redirection {
+                source: None,
                 dest: PathBuf::from("share/fw"),
                 mechanism: Mechanism::Env,
                 key: None,
             },
             Redirection {
+                source: None,
                 dest: PathBuf::from("share/new"),
                 mechanism: Mechanism::Env,
                 key: None,
@@ -1364,6 +1825,7 @@ mod tests {
             [
                 anchor("a", "share/fw"),
                 Redirection {
+                    source: None,
                     dest: PathBuf::from("share/new"),
                     mechanism: Mechanism::Env,
                     key: None,

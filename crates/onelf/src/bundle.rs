@@ -53,6 +53,7 @@ pub use activate::{RuleActivation, take_activations};
 pub(crate) use completeness::record as record_finding;
 pub use completeness::{Finding, Outcome, take_reported as take_findings};
 pub(crate) use elf::*;
+use onelf_format::paths::PathPair;
 use onelf_format::rules::{
     BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, RuntimeBase,
     RuntimePathGroup, SourceBase, SourceCandidate,
@@ -2177,6 +2178,7 @@ impl<'a> SetPreparation<'a> {
 
 thread_local! {
     static LAST_PREPARED: RefCell<Vec<PreparedPin>> = const { RefCell::new(Vec::new()) };
+    static LAST_PAIRS: RefCell<Vec<PathPair>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Publish the pins one bundle run prepared resources into.
@@ -2189,6 +2191,19 @@ fn publish_prepared(prepared: Vec<PreparedPin>) {
 /// failed before preparation, leaves none.
 pub fn take_prepared() -> Vec<PreparedPin> {
     LAST_PREPARED.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Publish the pairs one bundle run chose for the package's paths
+/// record.
+fn publish_pairs(pairs: Vec<PathPair>) {
+    LAST_PAIRS.with(|cell| *cell.borrow_mut() = pairs);
+}
+
+/// Take the pairs of the last bundle run on this thread, sorted by
+/// absolute path. A run that chose no overlay, or failed after the
+/// decision, leaves none.
+pub fn take_pairs() -> Vec<PathPair> {
+    LAST_PAIRS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// The verified reader of one set's pinned build, opened once and reused
@@ -2880,6 +2895,13 @@ pub struct BundleOptions {
     /// `bundle-libs` command passes `auto`, since the pack command that
     /// follows names its own list.
     pub lib_dirs: Vec<String>,
+    /// The recipe's own `[paths]` pairs: their count reserves the
+    /// paths record's room before the inferred pairs' cap, and their
+    /// absolute paths are kept out of the inference, so a spelling the
+    /// recipe already answers for cannot spend a bound slot. The
+    /// low-level `bundle-libs` command carries no recipe and passes
+    /// none.
+    pub recipe_pairs: Vec<PathPair>,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub search_path: Vec<PathBuf>,
@@ -3564,6 +3586,7 @@ mod carry_tests {
 /// populated tree.
 pub fn bundle_libs(opts: &BundleOptions) -> io::Result<()> {
     publish_activations(Vec::new());
+    publish_pairs(Vec::new());
     let _no_fetch = opts.dry_run.then(sysroot::forbid_fetch);
     let result = if opts.dry_run && opts.sysroot.is_some() && opts.directory.is_dir() {
         ScratchTree::copy_of(&opts.directory).and_then(|scratch| {
@@ -5345,20 +5368,42 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     // the drop pass may empty a carried directory the choice named, so
     // what survives is recorded again after the audit, and only the
     // report waits for it.
-    let redirections = if opts.dry_run {
-        Vec::new()
+    // The carried inferred directories, as the redirection decision's
+    // own input: the plan's dirs the tree holds, whether it just plans
+    // to copy them or already holds them from a previous build, so a
+    // rebuild re-decides a held directory and its pair re-enters the
+    // record; the tree's own anchor record still wins for anchors. The
+    // record's pairs are extracted from the same set, so an omitted
+    // directory that shares a carried one's destination cannot name
+    // its spellings into the record.
+    let carried_dirs: Vec<&infer::InferredDir> = inferred_carried
+        .iter()
+        .filter(|(.., carry)| matches!(*carry, Carry::Planned | Carry::Held))
+        .filter_map(|(_, source, _)| inference.get(source))
+        // A plan the walk emptied leaves no destination: a member
+        // every strict-libc skip condemned, say, copies nothing.
+        // The record's keys are positional, so an anchor over
+        // nothing would consume a key the record cannot carry.
+        .filter(|dir| opts.directory.join(&dir.destination).is_dir())
+        .collect();
+    let (redirections, carried_dirs) = if opts.dry_run {
+        (Vec::new(), Vec::new())
     } else {
-        let tree_elfs = find_elf_files(&opts.directory);
-        let carried_dirs: Vec<&infer::InferredDir> = inferred_carried
+        let persisted = redir::persisted(&opts.directory)?;
+        // A destination the record anchors keeps that anchor: a fresh
+        // one over it could move the recorded key, which the merge
+        // refuses, so the choice never sees it as carried.
+        let carried_dirs: Vec<&infer::InferredDir> = carried_dirs
             .iter()
-            .filter(|(.., carry)| *carry == Carry::Planned)
-            .filter_map(|(_, source, _)| inference.get(source))
-            // A plan the walk emptied leaves no destination: a member
-            // every strict-libc skip condemned, say, copies nothing.
-            // The record's keys are positional, so an anchor over
-            // nothing would consume a key the record cannot carry.
-            .filter(|dir| opts.directory.join(&dir.destination).is_dir())
+            .filter(|dir| !redir::persisted_anchored(&persisted, dir.destination.as_path()))
+            .copied()
             .collect();
+        let held: std::collections::HashSet<PathBuf> = inferred_carried
+            .iter()
+            .filter(|(.., carry)| *carry == Carry::Held)
+            .map(|(dest, ..)| dest.clone())
+            .collect();
+        let tree_elfs = find_elf_files(&opts.directory);
         // A directory the tree already holds takes the rewrite too when
         // an anchor names it: an object newly bundled this run may carry
         // fresh spellings for it, and only an anchor reaches those
@@ -5387,8 +5432,13 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         // are the catalog's enabled descriptors, so a disabled built-in's
         // runtime mapping covers nothing.
         let enabled_rules = opts.rules.enabled();
-        let fresh = redir::choose(&carried_dirs, &enabled_rules, &lib_dirs, &opts.directory);
-        let persisted = redir::persisted(&opts.directory)?;
+        let fresh = redir::choose(
+            &carried_dirs,
+            &enabled_rules,
+            &lib_dirs,
+            &opts.directory,
+            &held,
+        );
         let redirections = redir::merge(fresh, &persisted, &opts.directory)?;
         // The record lands before the rewrite, so a decision the
         // rewrite would refuse stops first: a fresh anchor's merged
@@ -5420,7 +5470,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                 files
             );
         }
-        redirections
+        (redirections, carried_dirs)
     };
 
     // Patch PT_INTERP of every ELF with a bundled loader. This is what
@@ -5476,6 +5526,11 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             .filter(|r| r.resolves(&opts.directory))
             .collect();
         redir::write_record(&survived, &opts.directory)?;
+        publish_pairs(redir::record_pairs(
+            &survived,
+            carried_dirs,
+            &opts.recipe_pairs,
+        ));
         redir::report(&survived);
     }
 

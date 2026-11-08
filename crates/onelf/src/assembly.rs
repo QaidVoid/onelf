@@ -246,6 +246,10 @@ pub struct AssemblyReport {
     pub prepared: Vec<bundle::PreparedPin>,
     /// The completeness findings the bundler reported, sorted.
     pub findings: Vec<bundle::Finding>,
+    /// The overlay pairs the bundler chose for inferred directories,
+    /// sorted by absolute path: the pairs the packer appends to the
+    /// package's paths record after the recipe's own.
+    pub inferred_pairs: Vec<onelf_format::paths::PathPair>,
 }
 
 impl AssemblyReport {
@@ -669,6 +673,7 @@ impl AssemblyRequest {
                 active_rules: Vec::new(),
                 prepared: Vec::new(),
                 findings: Vec::new(),
+                inferred_pairs: Vec::new(),
             });
         }
         let bundled = {
@@ -719,6 +724,7 @@ impl AssemblyRequest {
             active_rules: bundle::take_activations(),
             prepared: bundle::take_prepared(),
             findings: bundle::take_findings(),
+            inferred_pairs: bundle::take_pairs(),
         })
     }
 
@@ -745,6 +751,7 @@ impl AssemblyRequest {
                 active_rules: Vec::new(),
                 prepared: Vec::new(),
                 findings: Vec::new(),
+                inferred_pairs: Vec::new(),
             });
         }
         let mut options = self.bundle_options();
@@ -792,6 +799,7 @@ impl AssemblyRequest {
             active_rules: bundle::take_activations(),
             prepared: bundle::take_prepared(),
             findings: bundle::take_findings(),
+            inferred_pairs: bundle::take_pairs(),
         })
     }
 
@@ -805,6 +813,7 @@ impl AssemblyRequest {
             primary: Some(PathBuf::from(&self.package.command)),
             lib_dir: PathBuf::from("lib"),
             lib_dirs: self.lib_dirs.clone(),
+            recipe_pairs: crate::pack::path_pairs(&self.paths),
             entrypoint_selections: self.audit_entrypoints(),
             exclude: self.bundle.exclude.clone(),
             include: self.bundle.include.clone(),
@@ -907,6 +916,7 @@ impl AssemblyRequest {
             mtime: self.package.mtime,
             env: self.env.clone(),
             paths: self.paths.clone(),
+            inferred_pairs: Vec::new(),
             preload: self.preload.clone(),
             needs_setuid: self.package.needs_setuid,
             profile,
@@ -1675,6 +1685,7 @@ mod tests {
                 active_rules: Vec::new(),
                 prepared: Vec::new(),
                 findings: Vec::new(),
+                inferred_pairs: Vec::new(),
             }
         );
         assert!(!dir.join(".onelf").exists());
@@ -1755,6 +1766,7 @@ mod tests {
             active_rules: Vec::new(),
             prepared: Vec::new(),
             findings: Vec::new(),
+            inferred_pairs: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),
@@ -1789,6 +1801,7 @@ mod tests {
             active_rules: rules,
             prepared: Vec::new(),
             findings: Vec::new(),
+            inferred_pairs: Vec::new(),
         };
         let forward = report(vec![
             activation("alsa", "libasound.so.2", &["plugins", "configuration"]),
@@ -1831,6 +1844,7 @@ mod tests {
             active_rules: Vec::new(),
             prepared: Vec::new(),
             findings: Vec::new(),
+            inferred_pairs: Vec::new(),
         };
         assert_eq!(
             report.summary_lines(),

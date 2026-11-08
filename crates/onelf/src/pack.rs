@@ -450,6 +450,10 @@ pub struct PackOptions {
     /// Absolute host path to bundle-relative directory, for an
     /// application that opens a path it was built with.
     pub paths: Vec<(String, String)>,
+    /// The overlay pairs inference chose, appended after `paths` in the
+    /// record, sorted by absolute path, a recipe pair winning its own
+    /// absolute path. Empty for every build that runs no inference.
+    pub inferred_pairs: Vec<PathPair>,
     /// Libraries to dlopen on every exec, written to `.onelf/preload` and
     /// applied by the bundled onelf-env constructor. `${ONELF_DIR}`
     /// expands to the package root at runtime.
@@ -896,8 +900,8 @@ fn inject_onelf_file(
 
 /// The `.onelf/paths` record for `pairs`, each binding a bundle directory
 /// over the absolute path an application was built to open. A pair the
-/// runtime would refuse at launch is refused here, named as the recipe
-/// wrote it, so no package carries a record its runtime ignores.
+/// runtime would refuse at launch is refused here, named by its two
+/// sides, so no package carries a record its runtime ignores.
 pub(crate) fn paths_record(pairs: &[PathPair]) -> io::Result<Vec<u8>> {
     onelf_format::paths::encode(pairs)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("[paths]: {e}")))
@@ -912,6 +916,31 @@ pub(crate) fn path_pairs(declared: &[(String, String)]) -> Vec<PathPair> {
             relative: relative.clone(),
         })
         .collect()
+}
+
+/// The record's pairs: the recipe's first in its own order, then the
+/// inferred ones sorted by absolute path, a recipe pair winning its
+/// absolute path. An inferred pair is keyed by the compiled-in path it
+/// answers for, so a recipe pair for the same path was written by an
+/// author who named it, and the recipe's directory answers instead.
+pub(crate) fn merged_path_pairs(recipe: &[PathPair], inferred: &[PathPair]) -> Vec<PathPair> {
+    let mut out = recipe.to_vec();
+    let claimed: std::collections::HashSet<&str> =
+        recipe.iter().map(|p| p.absolute.as_str()).collect();
+    let mut rest: Vec<&PathPair> = inferred
+        .iter()
+        .filter(|p| !claimed.contains(p.absolute.as_str()))
+        .collect();
+    rest.sort_by(|a, b| a.absolute.cmp(&b.absolute));
+    let mut last: Option<&str> = None;
+    for pair in rest {
+        if last == Some(pair.absolute.as_str()) {
+            continue;
+        }
+        last = Some(pair.absolute.as_str());
+        out.push(pair.clone());
+    }
+    out
 }
 
 /// Compile GSettings schemas when the tree ships schema XML without the
@@ -1539,12 +1568,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         );
     }
 
-    if !opts.paths.is_empty() {
+    if !opts.paths.is_empty() || !opts.inferred_pairs.is_empty() {
+        let pairs = merged_path_pairs(&path_pairs(&opts.paths), &opts.inferred_pairs);
         inject_onelf_file(
             &mut dirs,
             &mut files,
             crate::bundle::sysroot::PATHS_FILE,
-            paths_record(&path_pairs(&opts.paths))?,
+            paths_record(&pairs)?,
             inject_mtime,
         );
     }
@@ -2631,6 +2661,81 @@ mod tests {
         );
     }
 
+    fn pair(absolute: &str, relative: &str) -> PathPair {
+        PathPair {
+            absolute: absolute.to_string(),
+            relative: relative.to_string(),
+        }
+    }
+
+    /// The inferred pairs join the recipe's own: after them, in recipe
+    /// order for theirs and sorted by absolute path for the inferred
+    /// ones, and a recipe pair wins the absolute path it already names.
+    #[test]
+    fn inferred_pairs_follow_the_recipe_which_wins_its_paths() {
+        let recipe = vec![
+            pair("/m/vendor", "share/vendor"),
+            pair("/a/fw", "share/alt"),
+        ];
+        let inferred = vec![
+            pair("/a/fw", "share/fw"),
+            pair("/z/tools", "lib/tools"),
+            pair("/b/data", "share/data"),
+            pair("/z/tools", "other/tools"),
+        ];
+        assert_eq!(
+            merged_path_pairs(&recipe, &inferred),
+            vec![
+                pair("/m/vendor", "share/vendor"),
+                pair("/a/fw", "share/alt"),
+                pair("/b/data", "share/data"),
+                pair("/z/tools", "lib/tools"),
+            ]
+        );
+    }
+
+    /// A build with no recipe pairs still carries the inferred ones,
+    /// sorted by absolute path: what the merged record holds.
+    #[test]
+    fn inferred_pairs_alone_sort_into_the_record() {
+        let inferred = vec![pair("/b/data", "share/data"), pair("/a/fw", "share/fw")];
+        assert_eq!(
+            merged_path_pairs(&[], &inferred),
+            vec![pair("/a/fw", "share/fw"), pair("/b/data", "share/data")]
+        );
+    }
+
+    /// The packed package carries the merged record, read back through
+    /// the same verified decoder the launch applies: inferred pairs
+    /// alone fill it, and a package without either kind carries none.
+    #[test]
+    fn the_packed_package_carries_the_merged_paths_record() {
+        let dir = tmpdir("inferred-pairs");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(app.join("share/fw")).unwrap();
+        fs::write(app.join("share/fw/file"), b"x").unwrap();
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+        opts.inferred_pairs = vec![pair("/b/data", "share/data"), pair("/a/fw", "share/fw")];
+        pack(&opts, b"stub-runtime").unwrap();
+
+        let pkg = onelf_rt::loader::load_file(fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(
+            onelf_rt::hostpaths::read(&pkg).unwrap(),
+            vec![pair("/a/fw", "share/fw"), pair("/b/data", "share/data")]
+        );
+
+        let plain = dir.join("plain.onelf");
+        let opts = base_opts(&app, &plain, "bin/run");
+        pack(&opts, b"stub-runtime").unwrap();
+        let pkg = onelf_rt::loader::load_file(fs::File::open(&plain).unwrap()).unwrap();
+        assert!(onelf_rt::hostpaths::read(&pkg).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_path_pair_the_runtime_would_refuse_fails_the_pack() {
         let declared = vec![("/usr/share/x".to_string(), "share/../../etc".to_string())];
@@ -2679,6 +2784,7 @@ mod tests {
             command: command.to_string(),
             name: None,
             paths: Vec::new(),
+            inferred_pairs: Vec::new(),
             entrypoints: Vec::new(),
             default_entrypoint: None,
             lib_dirs: Vec::new(),

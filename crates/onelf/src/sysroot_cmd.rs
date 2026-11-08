@@ -378,6 +378,7 @@ fn pack_tree(
             mtime: Some(0),
             env: Vec::new(),
             paths: Vec::new(),
+            inferred_pairs: Vec::new(),
             preload: Vec::new(),
             needs_setuid: false,
             profile: Vec::new(),

@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use onelf_format::elf::{self, RuntimeNote, RuntimeRequirements};
+use onelf_format::paths::PathPair;
 use onelf_format::resolve::{self, Gl, Request};
 use onelf_format::runtime_metadata::EntrypointSets;
 use onelf_format::verdef::Choice;
@@ -29,6 +30,101 @@ use onelf_rt::platform::Pin;
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Why a launch's pairs would be left unredirected, in the order the
+/// runtime refuses them: no mode to run in, a memfd launch's missing
+/// tree, the package's own setuid request, the environment's opt-out,
+/// the host's restriction.
+fn pairs_unredirected(chosen: Option<&str>, needs_setuid: bool, ns: bool) -> Option<String> {
+    if chosen.is_none() {
+        Some("no execution mode can run this package here".to_string())
+    } else if chosen == Some("memfd") {
+        Some("the entrypoint runs from memory, which carries no package tree".to_string())
+    } else if needs_setuid {
+        Some(SETUID_REFUSAL.to_string())
+    } else if env_set("ONELF_FUSE_NO_NAMESPACE") {
+        Some(FUSE_NO_NAMESPACE_REFUSAL.to_string())
+    } else if !ns {
+        Some(NS_RESTRICTED.to_string())
+    } else {
+        None
+    }
+}
+
+/// Why a launch stays out of a user namespace of its own, as the
+/// runtime's overlay refuses it: the package's own setuid request, the
+/// environment's opt-out, then the host's capability. The same three
+/// strings the mode verdicts use.
+const SETUID_REFUSAL: &str = "the package runs setuid binaries, which a user namespace disables";
+const NS_RESTRICTED: &str = "user namespaces are restricted on this host";
+const FUSE_NO_NAMESPACE_REFUSAL: &str = "ONELF_FUSE_NO_NAMESPACE is set";
+
+/// The most symlink entries one carried-side lookup follows, a bound
+/// well short of the kernel's own resolution limit, so a crafted
+/// chain or cycle ends the lookup instead of running it forever.
+const SYMLINK_HOPS: usize = 8;
+
+/// Whether the manifest carries `relative` as a directory a launch's
+/// overlay could bind: the lookup walks the manifest one component at
+/// a time the way the kernel resolves the extracted tree. A directory
+/// entry descends; a symlink entry queues its target's components
+/// ahead of the rest and walks on from the link's directory, so a
+/// multi-component target resolves through intermediate links; `..`
+/// ascends one component, and the package root is a real resolution;
+/// a file entry, a missing component, or an ascent above the root
+/// binds nothing. Symlink hops are bounded.
+fn carried_directory(
+    kinds: &std::collections::HashMap<String, onelf_format::EntryKind>,
+    links: &std::collections::HashMap<String, String>,
+    relative: &str,
+) -> bool {
+    use std::collections::VecDeque;
+    let mut hops = 0usize;
+    let mut pending: VecDeque<&str> = relative.split('/').collect();
+    let mut walked = String::new();
+    while let Some(part) = pending.pop_front() {
+        match part {
+            "" | "." => {}
+            ".." => {
+                walked = match walked.rsplit_once('/') {
+                    Some((parent, _)) => parent.to_string(),
+                    None if !walked.is_empty() => String::new(),
+                    None => return false,
+                };
+            }
+            part => {
+                if !walked.is_empty() {
+                    walked.push('/');
+                }
+                walked.push_str(part);
+                match kinds.get(&walked) {
+                    Some(onelf_format::EntryKind::Dir) => {}
+                    Some(onelf_format::EntryKind::Symlink) => {
+                        hops += 1;
+                        if hops > SYMLINK_HOPS {
+                            return false;
+                        }
+                        let Some(target) = links.get(&walked) else {
+                            return false;
+                        };
+                        if target.is_empty() || target.starts_with('/') {
+                            return false;
+                        }
+                        for component in target.split('/').rev() {
+                            pending.push_front(component);
+                        }
+                        walked = match walked.rsplit_once('/') {
+                            Some((parent, _)) => parent.to_string(),
+                            None => String::new(),
+                        };
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    walked.is_empty() || kinds.get(&walked) == Some(&onelf_format::EntryKind::Dir)
 }
 
 /// Append one report line.
@@ -64,16 +160,16 @@ fn modes(
     let needed = onelf_rt::ephemeral::tmpfs_size_for(pkg);
 
     let no_ns = if needs_setuid {
-        Some("the package runs setuid binaries, which a user namespace disables".to_string())
+        Some(SETUID_REFUSAL.to_string())
     } else if !ns {
-        Some("user namespaces are restricted on this host".to_string())
+        Some(NS_RESTRICTED.to_string())
     } else {
         None
     };
     let fuse = || {
         let why_not_ns = no_ns.clone().or_else(|| {
             if env_set("ONELF_FUSE_NO_NAMESPACE") {
-                Some("ONELF_FUSE_NO_NAMESPACE is set".to_string())
+                Some(FUSE_NO_NAMESPACE_REFUSAL.to_string())
             } else {
                 dev_fuse
                     .as_ref()
@@ -211,17 +307,75 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
     let rules = read_package_file(pkg, pkgmeta::RUNTIME_RULES_FILE);
     let table = read_package_file(pkg, pkgmeta::ENTRYPOINT_SETS_FILE);
     let anchors = read_package_file(pkg, onelf_format::anchors::ANCHORS_FILE);
-    metadata_section(&mut out, &rules, &table, &anchors);
+    // The same verified read the launch applies, so the report never
+    // names a pair a launch would refuse whole.
+    let paths = match onelf_rt::hostpaths::read(pkg) {
+        Ok(pairs) if !pairs.is_empty() => Some(Ok(pairs)),
+        Ok(_) => None,
+        Err(e) => Some(Err(e.to_string())),
+    };
+    let needs_setuid = read_package_file(pkg, ".onelf/needs-setuid").is_some();
+    // The mode verdicts come first: the pairs' fate follows the mode a
+    // launch would pick, and a memfd launch carries no package tree to
+    // overlay anything onto.
+    let tried = modes(pkg, ep_idx, needs_setuid, ns);
+    let chosen = tried.iter().find_map(|(name, verdict)| {
+        verdict
+            .as_ref()
+            .ok()
+            .map(|(_, places_host_files)| (*name, *places_host_files))
+    });
+    // The same refusals a launch's overlay applies, in the same order,
+    // each naming the package's pair as that launch would leave it.
+    let unredirected = pairs_unredirected(chosen.map(|(name, _)| name), needs_setuid, ns);
+    // The carried side is resolved only when a record actually reads
+    // it and a launch here would consult it, and resolved once: the
+    // manifest can hold tens of thousands of entries against a record
+    // bound of 1024 pairs. A launch's overlay mounts the extracted
+    // tree's `relative`, and the kernel resolves every symlink on the
+    // way, so the lookup walks the manifest the same way: a directory
+    // entry descends, a symlink entry follows its target (a bounded
+    // number of hops, relative to the link's directory, never above
+    // the root), and a file entry or a missing component means the
+    // mount would have no directory to bind, and the pair stays
+    // unredirected.
+    let carried = matches!((&paths, &unredirected), (Some(Ok(_)), None)).then(|| {
+        let mut kinds = std::collections::HashMap::new();
+        let mut links = std::collections::HashMap::new();
+        for (i, entry) in pkg.manifest.entries.iter().enumerate() {
+            let path = pkg.manifest.entry_path(i);
+            if path.is_empty() {
+                continue;
+            }
+            if entry.kind == onelf_format::EntryKind::Symlink {
+                links.insert(
+                    path.clone(),
+                    pkg.manifest.get_string(entry.symlink_target).to_string(),
+                );
+            }
+            kinds.insert(path, entry.kind);
+        }
+        (kinds, links)
+    });
+    let carries_directory = |relative: &str| {
+        carried
+            .as_ref()
+            .is_some_and(|(kinds, links)| carried_directory(kinds, links, relative))
+    };
+    metadata_section(
+        &mut out,
+        &rules,
+        &table,
+        &anchors,
+        paths,
+        unredirected.as_deref(),
+        &carries_directory,
+    );
 
     line(&mut out, "\nExecution mode");
-    let needs_setuid = read_package_file(pkg, ".onelf/needs-setuid").is_some();
-    let mut chosen = None;
-    for (name, verdict) in modes(pkg, ep_idx, needs_setuid, ns) {
+    for (name, verdict) in tried {
         match verdict {
-            Ok((how, places_host_files)) => {
-                line(&mut out, &format!("  {name}: would run, {how}"));
-                chosen = Some((name, places_host_files));
-            }
+            Ok((how, _)) => line(&mut out, &format!("  {name}: would run, {how}")),
             Err(why) => line(&mut out, &format!("  {name}: skipped, {why}")),
         }
     }
@@ -270,9 +424,12 @@ fn metadata_section(
     rules: &Option<Vec<u8>>,
     table: &Option<Vec<u8>>,
     anchors: &Option<Vec<u8>>,
+    paths: Option<Result<Vec<PathPair>, String>>,
+    unredirected: Option<&str>,
+    carries: &dyn Fn(&str) -> bool,
 ) {
     line(out, "\nMetadata");
-    if rules.is_none() && table.is_none() && anchors.is_none() {
+    if rules.is_none() && table.is_none() && anchors.is_none() && paths.is_none() {
         line(out, "  records: none carried (legacy defaults)");
         return;
     }
@@ -307,6 +464,45 @@ fn metadata_section(
         Some(Err(why)) => line(out, &format!("  anchor record: unreadable: {why}")),
         _ => {}
     }
+    let carried_paths = paths.is_some();
+    match paths {
+        Some(Ok(pairs)) => {
+            for pair in &pairs {
+                let reason = unredirected
+                    .map(|why| why.to_string())
+                    .or_else(|| {
+                        (!carries(&pair.relative)).then(|| {
+                            format!(
+                                "the package does not carry {} as a directory",
+                                pair.relative
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        let target = std::path::Path::new(&pair.absolute);
+                        let placeable = target.is_dir()
+                            || target.parent().is_some_and(|parent| parent.is_dir());
+                        (!placeable)
+                            .then(|| format!("no host directory to place {} under", pair.absolute))
+                    });
+                match reason {
+                    Some(why) => line(
+                        out,
+                        &format!(
+                            "  unredirected {} -> {} ({why})",
+                            pair.absolute, pair.relative
+                        ),
+                    ),
+                    None => line(
+                        out,
+                        &format!("  overlay {} -> {}", pair.absolute, pair.relative),
+                    ),
+                }
+            }
+        }
+        Some(Err(why)) => line(out, &format!("  paths record: unreadable: {why}")),
+        None => {}
+    }
     let mut carried: Vec<&str> = Vec::new();
     if rules.is_some() {
         carried.push("runtime-rules");
@@ -316,6 +512,9 @@ fn metadata_section(
     }
     if anchors.is_some() {
         carried.push("anchors");
+    }
+    if carried_paths {
+        carried.push("paths");
     }
     line(out, &format!("  records: {}", carried.join(", ")));
     line(
@@ -731,8 +930,9 @@ mod tests {
         ManifestHeader, WorkingDir,
     };
 
-    use super::{report, sets_section, view_section};
+    use super::{metadata_section, pairs_unredirected, report, sets_section, view_section};
     use crate::loader;
+    use onelf_format::paths::PathPair;
 
     const PIN_QT: [u8; 32] = [0xaa; 32];
     const PIN_GTK: [u8; 32] = [0xbb; 32];
@@ -944,6 +1144,340 @@ mod tests {
         assert!(!selected.contains("gtk"), "{selected}");
     }
 
+    /// The pairs record is named pair by pair: overlaid when a launch
+    /// here would bind it, unredirected with the reason when it would
+    /// not, and an unreadable record says so instead of naming pairs.
+    #[test]
+    fn a_paths_record_is_named_overlay_or_unredirected() {
+        // The absolute side sits under the temporary directory, whose
+        // parent exists, so the host-side place check passes and the
+        // verdict is the overlay itself.
+        let base = std::env::temp_dir();
+        let place = |name: &str| base.join(name).to_string_lossy().into_owned();
+        let pairs = vec![
+            PathPair {
+                absolute: place("e-fw"),
+                relative: "share/fw".to_string(),
+            },
+            PathPair {
+                absolute: place("m-vendor"),
+                relative: "share/vendor".to_string(),
+            },
+        ];
+        let overlay =
+            |absolute: &str, relative: &str| format!("  overlay {absolute} -> {relative}");
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &None,
+            &None,
+            &None,
+            Some(Ok(pairs.clone())),
+            None,
+            &|_| true,
+        );
+        assert!(
+            out.contains(&overlay(&pairs[0].absolute, "share/fw")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&overlay(&pairs[1].absolute, "share/vendor")),
+            "{out}"
+        );
+        assert!(out.contains("records: paths"), "{out}");
+        assert!(!out.contains("  anchor "), "{out}");
+
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &None,
+            &None,
+            &None,
+            Some(Ok(pairs)),
+            Some("ONELF_FUSE_NO_NAMESPACE is set"),
+            &|_| true,
+        );
+        assert!(
+            out.contains(&format!(
+                "  unredirected {} -> share/fw (ONELF_FUSE_NO_NAMESPACE is set)",
+                place("e-fw")
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("  overlay "), "{out}");
+
+        // A pair whose bundle side the package does not carry as a
+        // directory is not overlaid by the launch, and the report says
+        // so instead of promising one.
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &None,
+            &None,
+            &None,
+            Some(Ok(vec![PathPair {
+                absolute: "/e/fw".to_string(),
+                relative: "share/gone".to_string(),
+            }])),
+            None,
+            &|relative| relative == "share/here",
+        );
+        assert!(
+            out.contains(
+                "  unredirected /e/fw -> share/gone (the package does not carry share/gone as a directory)"
+            ),
+            "{out}"
+        );
+
+        // A pair whose absolute side the host has no place for is not
+        // overlaid either: the launch would skip it.
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &None,
+            &None,
+            &None,
+            Some(Ok(vec![PathPair {
+                absolute: "/nonexistent-parent/fw".to_string(),
+                relative: "share/here".to_string(),
+            }])),
+            None,
+            &|_| true,
+        );
+        assert!(
+            out.contains(
+                "  unredirected /nonexistent-parent/fw -> share/here (no host directory to place /nonexistent-parent/fw under)"
+            ),
+            "{out}"
+        );
+
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &None,
+            &None,
+            &None,
+            Some(Err(".onelf/paths: bad".to_string())),
+            None,
+            &|_| true,
+        );
+        assert!(out.contains("paths record: unreadable"), "{out}");
+        assert!(!out.contains("overlay"), "{out}");
+    }
+
+    /// The pairs' fate follows the launch: no mode, a memfd launch's
+    /// missing tree, the package's setuid request, or a restricted host
+    /// each names the pairs unredirected; a runnable mode names none.
+    #[test]
+    fn the_pair_fate_follows_the_launch() {
+        assert_eq!(
+            pairs_unredirected(None, false, true).as_deref(),
+            Some("no execution mode can run this package here")
+        );
+        assert_eq!(
+            pairs_unredirected(Some("memfd"), false, true).as_deref(),
+            Some("the entrypoint runs from memory, which carries no package tree")
+        );
+        assert_eq!(
+            pairs_unredirected(Some("rundir"), true, true).as_deref(),
+            Some(super::SETUID_REFUSAL)
+        );
+        assert_eq!(
+            pairs_unredirected(Some("rundir"), false, false).as_deref(),
+            Some(super::NS_RESTRICTED)
+        );
+        assert_eq!(pairs_unredirected(Some("rundir"), false, true), None);
+    }
+
+    /// A pair whose bundle side the package carries as a symlink is
+    /// overlaid too: the launch's `is_dir` resolves the tree's links.
+    #[test]
+    fn a_pair_through_a_symlink_is_named_overlay() {
+        let restricted = !onelf_rt::fuse::mount::namespace_usable();
+        if restricted {
+            eprintln!("this host restricts namespaces: the pair is named unredirected");
+        }
+        let absolute = std::env::temp_dir().join("onelf-doctor-symlink-place");
+        let record = format!("{}\tshare/fw", absolute.display());
+        let built = fixture::build_flagged(
+            b"onelf fixture prefix",
+            &[
+                ("bin/app", b"elf bytes".to_vec()),
+                ("share/real/x", b"real".to_vec()),
+                (onelf_format::paths::PATHS_FILE, record.into_bytes()),
+            ],
+            &[("share/fw", "real")],
+            &[("app", "0")],
+            EntryPointFlags::empty(),
+        );
+        let path =
+            std::env::temp_dir().join(format!("onelf-doctor-symlink-{}", std::process::id()));
+        std::fs::write(&path, &built.bytes).unwrap();
+        let mut pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
+        drop(std::fs::remove_file(&path));
+        let out = report(&mut pkg, 0);
+        if restricted {
+            // Some mode may still run; the namespace is what the pair
+            // verdict names here.
+            assert!(
+                out.contains(&format!(
+                    "  unredirected {} -> share/fw",
+                    absolute.display()
+                )),
+                "{out}"
+            );
+            return;
+        }
+        assert!(
+            out.contains(&format!("  overlay {} -> share/fw", absolute.display())),
+            "{out}"
+        );
+        assert!(!out.contains("  unredirected "), "{out}");
+    }
+
+    /// The carried-side lookup resolves like the kernel does: a pair
+    /// descending through a symlinked directory is still carried, a
+    /// symlink to a file carries no directory, a crafted chain or
+    /// cycle ends the lookup, a resolution above the root escapes it,
+    /// and a missing component carries nothing.
+    #[test]
+    fn the_carried_lookup_resolves_symlinks_like_the_kernel() {
+        use onelf_format::EntryKind;
+        let mut kinds = std::collections::HashMap::from([
+            ("share".to_string(), EntryKind::Dir),
+            ("share/fw".to_string(), EntryKind::Symlink),
+            ("share/real".to_string(), EntryKind::Dir),
+            ("share/real/lib".to_string(), EntryKind::Dir),
+            ("share/data".to_string(), EntryKind::File),
+            ("share/top".to_string(), EntryKind::Symlink),
+        ]);
+        let mut links = std::collections::HashMap::from([
+            ("share/fw".to_string(), "real".to_string()),
+            ("share/top".to_string(), "fw".to_string()),
+        ]);
+        // Through one symlink, and through a chain of two.
+        assert!(super::carried_directory(&kinds, &links, "share/fw"));
+        assert!(super::carried_directory(&kinds, &links, "share/fw/lib"));
+        assert!(super::carried_directory(&kinds, &links, "share/top/lib"));
+        // A symlink to a file, and a plain missing component, carry no
+        // directory.
+        kinds.insert("share/link".to_string(), EntryKind::Symlink);
+        links.insert("share/link".to_string(), "data".to_string());
+        assert!(!super::carried_directory(&kinds, &links, "share/link"));
+        assert!(!super::carried_directory(&kinds, &links, "share/gone/lib"));
+        // A multi-component target walks through an intermediate link,
+        // and a link resolving to the root resolves like the kernel,
+        // with the rest of the path walking on from there.
+        kinds.insert("share/into".to_string(), EntryKind::Symlink);
+        links.insert("share/into".to_string(), "alias/lib".to_string());
+        kinds.insert("share/alias".to_string(), EntryKind::Symlink);
+        links.insert("share/alias".to_string(), "real".to_string());
+        assert!(super::carried_directory(&kinds, &links, "share/into"));
+        kinds.insert("share/up".to_string(), EntryKind::Symlink);
+        links.insert("share/up".to_string(), "..".to_string());
+        assert!(super::carried_directory(&kinds, &links, "share/up"));
+        assert!(super::carried_directory(
+            &kinds,
+            &links,
+            "share/up/share/real"
+        ));
+        // A cycle, a chain longer than the bound, and an escape above
+        // the root each end the lookup.
+        kinds.insert("share/loop".to_string(), EntryKind::Symlink);
+        links.insert("share/loop".to_string(), "loop".to_string());
+        assert!(!super::carried_directory(&kinds, &links, "share/loop"));
+        for i in 1..=9 {
+            let name = format!("share/c{i}");
+            kinds.insert(name.clone(), EntryKind::Symlink);
+            let target = if i == 9 {
+                "real".to_string()
+            } else {
+                format!("c{}", i + 1)
+            };
+            links.insert(name, target);
+        }
+        assert!(!super::carried_directory(&kinds, &links, "share/c1"));
+        links.insert("share/escape".to_string(), "../../etc".to_string());
+        kinds.insert("share/escape".to_string(), EntryKind::Symlink);
+        assert!(!super::carried_directory(&kinds, &links, "share/escape"));
+    }
+
+    /// A pair whose bundle side the package carries as a symlink to a
+    /// file binds no directory: the report names it unredirected with
+    /// the not-carried reason instead of promising an overlay.
+    #[test]
+    fn a_pair_over_a_symlink_to_a_file_is_not_named_overlay() {
+        let restricted = !onelf_rt::fuse::mount::namespace_usable();
+        let absolute = std::env::temp_dir().join("onelf-doctor-linkfile-place");
+        let record = format!("{}\tshare/fw", absolute.display());
+        let built = fixture::build_flagged(
+            b"onelf fixture prefix",
+            &[
+                ("bin/app", b"elf bytes".to_vec()),
+                ("share/data", b"not a directory".to_vec()),
+                (onelf_format::paths::PATHS_FILE, record.into_bytes()),
+            ],
+            &[("share/fw", "data")],
+            &[("app", "0")],
+            EntryPointFlags::empty(),
+        );
+        let path =
+            std::env::temp_dir().join(format!("onelf-doctor-linkfile-{}", std::process::id()));
+        std::fs::write(&path, &built.bytes).unwrap();
+        let mut pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
+        drop(std::fs::remove_file(&path));
+        let out = report(&mut pkg, 0);
+        if restricted {
+            assert!(
+                out.contains(&format!(
+                    "  unredirected {} -> share/fw",
+                    absolute.display()
+                )),
+                "{out}"
+            );
+            return;
+        }
+        assert!(
+            out.contains(&format!(
+                "  unredirected {} -> share/fw (the package does not carry share/fw as a \
+                 directory)",
+                absolute.display()
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("  overlay "), "{out}");
+    }
+
+    /// A memfd launch carries no package tree, so its pairs are named
+    /// unredirected with that reason, whatever the host's namespaces:
+    /// the mode verdicts decide the pairs' fate before the report.
+    #[test]
+    fn a_memfd_launch_names_its_pairs_unredirected() {
+        let built = fixture::build_flagged(
+            b"onelf fixture prefix",
+            &[
+                ("bin/app", b"elf bytes".to_vec()),
+                (onelf_format::paths::PATHS_FILE, b"/e/fw\tshare/fw".to_vec()),
+            ],
+            &[],
+            &[("app", "0")],
+            EntryPointFlags::MEMFD_ELIGIBLE,
+        );
+        let path = std::env::temp_dir().join(format!("onelf-doctor-memfd-{}", std::process::id()));
+        std::fs::write(&path, &built.bytes).unwrap();
+        let mut pkg = loader::load_file(File::open(&path).unwrap()).unwrap();
+        drop(std::fs::remove_file(&path));
+        let out = report(&mut pkg, 0);
+        assert!(
+            out.contains(
+                "  unredirected /e/fw -> share/fw (the entrypoint runs from memory, \
+                 which carries no package tree)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("  overlay "), "{out}");
+    }
+
     /// A package without records keeps the legacy defaults and says so.
     #[test]
     fn a_package_without_records_reports_the_legacy_defaults() {
@@ -983,33 +1517,92 @@ mod tests {
             files: &[(&str, Vec<u8>)],
             entrypoints: &[(&str, &str)],
         ) -> Built {
+            build_flagged(prefix, files, &[], entrypoints, EntryPointFlags::empty())
+        }
+
+        /// [`build`] with every entrypoint carrying `flags` and the
+        /// package carrying `symlinks` as `(path, target)` entries.
+        /// Entries are hierarchical, one entry per path component with
+        /// parent indexes, the shape the packer itself emits, so the
+        /// doctor's carried-side walk resolves against a real tree.
+        pub(crate) fn build_flagged(
+            prefix: &[u8],
+            files: &[(&str, Vec<u8>)],
+            symlinks: &[(&str, &str)],
+            entrypoints: &[(&str, &str)],
+            flags: EntryPointFlags,
+        ) -> Built {
             let mut string_table: Vec<u8> = vec![0];
-            let mut name_offsets = Vec::new();
-            for (name, _) in files {
-                name_offsets.push(string_table.len() as u32);
+            let mut names: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            let mut intern = |name: &str| -> u32 {
+                if let Some(&offset) = names.get(name) {
+                    return offset;
+                }
+                let offset = string_table.len() as u32;
                 string_table.extend_from_slice(name.as_bytes());
                 string_table.push(0);
-            }
-            let ep_names: Vec<u32> = entrypoints
+                names.insert(name.to_string(), offset);
+                offset
+            };
+
+            // The directory entries everything hangs from, parents
+            // before children, each once.
+            let mut dir_paths: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for path in files
                 .iter()
-                .map(|(name, _)| {
-                    let offset = string_table.len() as u32;
-                    string_table.extend_from_slice(name.as_bytes());
-                    string_table.push(0);
-                    offset
-                })
-                .collect();
+                .map(|(p, _)| *p)
+                .chain(symlinks.iter().map(|(p, _)| *p))
+            {
+                let mut chain: Vec<String> = Vec::new();
+                let mut parent = path.rsplit_once('/').map(|(p, _)| p.to_string());
+                while let Some(p) = parent {
+                    if !seen.insert(p.clone()) {
+                        break;
+                    }
+                    parent = p.rsplit_once('/').map(|(pp, _)| pp.to_string());
+                    chain.push(p);
+                }
+                chain.reverse();
+                dir_paths.extend(chain);
+            }
 
             let mut payload = Vec::new();
-            let mut entries = Vec::new();
-            for (i, (_, content)) in files.iter().enumerate() {
+            let mut entries: Vec<Entry> = Vec::new();
+            let mut dir_index: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for path in &dir_paths {
+                let (parent_path, name) = match path.rsplit_once('/') {
+                    Some((p, n)) => (Some(p.to_string()), n),
+                    None => (None, path.as_str()),
+                };
+                entries.push(Entry {
+                    kind: EntryKind::Dir,
+                    parent: parent_path.map(|p| dir_index[&p]).unwrap_or(u32::MAX),
+                    name: intern(name),
+                    mode: 0o755,
+                    mtime_secs: 0,
+                    mtime_nsec: 0,
+                    content_hash: [0; 32],
+                    blocks: Vec::new(),
+                    symlink_target: 0,
+                });
+                dir_index.insert(path.clone(), (entries.len() - 1) as u32);
+            }
+            let mut file_indices: Vec<u32> = Vec::new();
+            for (path, content) in files {
                 let offset = payload.len() as u64;
                 payload.extend_from_slice(content);
                 let hash = *blake3::hash(content).as_bytes();
+                let (parent_path, name) = match path.rsplit_once('/') {
+                    Some((p, n)) => (Some(p.to_string()), n),
+                    None => (None, *path),
+                };
                 entries.push(Entry {
                     kind: EntryKind::File,
-                    parent: u32::MAX,
-                    name: name_offsets[i],
+                    parent: parent_path.map(|p| dir_index[&p]).unwrap_or(u32::MAX),
+                    name: intern(name),
                     mode: 0o755,
                     mtime_secs: 0,
                     mtime_nsec: 0,
@@ -1022,16 +1615,33 @@ mod tests {
                     }],
                     symlink_target: 0,
                 });
+                file_indices.push((entries.len() - 1) as u32);
+            }
+            for (path, target) in symlinks {
+                let (parent_path, name) = match path.rsplit_once('/') {
+                    Some((p, n)) => (Some(p.to_string()), n),
+                    None => (None, *path),
+                };
+                entries.push(Entry {
+                    kind: EntryKind::Symlink,
+                    parent: parent_path.map(|p| dir_index[&p]).unwrap_or(u32::MAX),
+                    name: intern(name),
+                    mode: 0o777,
+                    mtime_secs: 0,
+                    mtime_nsec: 0,
+                    content_hash: [0; 32],
+                    blocks: Vec::new(),
+                    symlink_target: intern(target),
+                });
             }
             let eps: Vec<EntryPoint> = entrypoints
                 .iter()
-                .zip(ep_names)
-                .map(|((_, target), name)| EntryPoint {
-                    name,
-                    target_entry: target.parse::<u32>().unwrap(),
+                .map(|(name, target)| EntryPoint {
+                    name: intern(name),
+                    target_entry: file_indices[target.parse::<usize>().unwrap()],
                     args: 0,
                     working_dir: WorkingDir::Inherit,
-                    flags: EntryPointFlags::empty(),
+                    flags,
                 })
                 .collect();
             let manifest = Manifest {

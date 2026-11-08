@@ -19990,6 +19990,122 @@ fn a_launch_without_its_anchors_closes_an_inherited_descriptor_77() {
     );
 }
 
+/// A recorded pair overlays its absolute path when the launch has a
+/// namespace: the bundled copy answers for the path and the host's own
+/// directory is hidden. A launch that cannot overlay says so once,
+/// leaves the host's copy in place, and goes on; the doctor names
+/// every pair the way its launch would leave it.
+#[test]
+fn a_pair_binds_in_a_namespace_and_is_named_unredirected_without_one() {
+    if !have("bash") {
+        skip("bash", "no bash to drive the paired entrypoint");
+        return;
+    }
+    let td = workdir("pair-overlay");
+    let app = td.join("app");
+    write(&app.join("share/fw/file"), "BUNDLED\n");
+    let host = td.join("host-fw");
+    write(&host.join("file"), "HOST\n");
+    let host = host.to_str().unwrap().to_string();
+    write(
+        &app.join("bin/run"),
+        &format!(
+            "#!/usr/bin/env bash\n\
+             case \"$1\" in\n\
+             read) cat \"{host}/file\" ;;\n\
+             esac\n"
+        ),
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\ncommand = \"bin/run\"\n\n[bundle]\nskip = true\n\n\
+             [paths]\n\"{host}\" = \"share/fw\"\n"
+        ),
+    );
+    let pkg = app.with_file_name("paired.onelf");
+    let o = Command::new(onelf())
+        .current_dir(&app)
+        .args(["build", "onelf.toml", "-o", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf build");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let launch = |without_ns: bool| {
+        let mut run = Command::new(&pkg);
+        run.arg("read")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        if without_ns {
+            run.env("ONELF_FUSE_NO_NAMESPACE", "1");
+        }
+        isolate(&mut run, &td);
+        run_package(&mut run)
+    };
+
+    let mut bound = false;
+    if user_namespaces_available() {
+        let out = launch(false);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success() && text == "BUNDLED\n",
+            "the bundled copy answers for the pair's path:\n{text}{err}"
+        );
+        assert!(!err.contains("stays in the host's"), "{err}");
+        bound = true;
+    } else {
+        skip("user-ns", "no user namespace to bind the pair in");
+    }
+
+    // Without a namespace the host's own copy answers, and the launch
+    // says so once and proceeds.
+    let out = launch(true);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success() && text == "HOST\n",
+        "the host's copy answers without a namespace:\n{text}{err}"
+    );
+    assert!(err.contains("stays in the host's user namespace"), "{err}");
+
+    let doctor = |without_ns: bool| {
+        let mut run = Command::new(&pkg);
+        run.arg("--onelf-doctor")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap());
+        if without_ns {
+            run.env("ONELF_FUSE_NO_NAMESPACE", "1");
+        }
+        isolate(&mut run, &td);
+        String::from_utf8_lossy(&run_package(&mut run).stdout).into_owned()
+    };
+    let report = doctor(false);
+    if bound {
+        assert!(
+            report.contains(&format!("\n  overlay {host} -> share/fw")),
+            "the doctor names the pair as overlaid:\n{report}"
+        );
+        assert!(report.contains("records: paths"), "{report}");
+        assert!(!report.contains("  unredirected "), "{report}");
+    }
+    let report = doctor(true);
+    assert!(
+        report.contains(&format!(
+            "\n  unredirected {host} -> share/fw (ONELF_FUSE_NO_NAMESPACE is set)"
+        )),
+        "the doctor names the pair as unredirected:\n{report}"
+    );
+    assert!(!report.contains("\n  overlay "), "{report}");
+}
+
 /// A record is checked against the tree the walk packs: an anchor naming
 /// a directory the package lacks, a regular file, or a directory reached
 /// through one of the package's symlinks is refused, and so is an empty

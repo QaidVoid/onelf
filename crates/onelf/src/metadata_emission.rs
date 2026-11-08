@@ -188,6 +188,7 @@ fn test_opts(app: &Path, out: &Path, note: RuntimeNote) -> pack::PackOptions {
         mtime: Some(0),
         env: Vec::new(),
         paths: Vec::new(),
+        inferred_pairs: Vec::new(),
         preload: Vec::new(),
         needs_setuid: false,
         profile: Vec::new(),

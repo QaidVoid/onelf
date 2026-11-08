@@ -32,9 +32,16 @@ The report covers:
   support they require (`payload metadata version 1, selection-view`
   for a package with a selection table), what this runtime itself
   advertises, and whether the requirement is satisfied. Each anchored
-  directory is named as `anchor /dev/fd/77/<key> -> <directory>`. A
-  package with none of these records prints `records: none carried
-  (legacy defaults)`.
+  directory is named as `anchor /dev/fd/77/<key> -> <directory>`. Each
+  pair of the paths record is named as `overlay <absolute> ->
+  <relative>` when a launch here would bind it, or as
+  `unredirected <absolute> -> <relative> (<why>)` when it would not:
+  no mode to run in, a memfd launch's missing tree, the package's own
+  setuid request, `ONELF_FUSE_NO_NAMESPACE`, restricted user
+  namespaces, or a side of the pair the package or the host lacks. The
+  record carries the recipe's pairs and the inferred directories'
+  pairs alike. A package with none of these records prints
+  `records: none carried (legacy defaults)`.
 - **Execution mode**: each mode in the order a launch tries them, with
   the reason a mode would be skipped, down to the one that would run.
   `ONELF_MODE`, `ONELF_CACHE` and `ONELF_FUSE_NO_NAMESPACE` are taken

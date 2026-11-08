@@ -801,6 +801,7 @@ fn main() {
                                         mtime,
                                         env: Vec::new(),
                                         paths: Vec::new(),
+                                        inferred_pairs: Vec::new(),
                                         preload,
                                         needs_setuid,
                                         profile,
@@ -984,6 +985,7 @@ fn main() {
                 target,
                 lib_dir,
                 lib_dirs: vec![String::from("auto")],
+                recipe_pairs: Vec::new(),
                 exclude,
                 include,
                 search_path,
@@ -1140,6 +1142,7 @@ fn run_build(
     };
     let mut options = request.pack_options(update_key, runtime.note, profile);
     options.metadata = build_metadata(&request, &request.selections, &report.prepared)?;
+    options.inferred_pairs = report.inferred_pairs;
     pack::pack(&options, runtime.bytes)
 }
 
