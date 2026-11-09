@@ -1354,12 +1354,13 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     // `.onelf/` is reserved for injected metadata, except for the
     // documented user-provided asset dirs `.onelf/icons/` and
     // `.onelf/desktop/` (resolved by `integrate`/`icon`/`desktop`), the
-    // provenance records `bundle-libs` writes from a sysroot, and the
-    // anchor record that names the directories rewritten paths stand for,
-    // which is checked against the runtime before packing. The bare
-    // `.onelf` directory is allowed as their parent. Any other collision
-    // is rejected so injected metadata is never shadowed by, or silently
-    // duplicated alongside, source content.
+    // provenance records `bundle-libs` writes from a sysroot, the anchor
+    // record that names the directories rewritten paths stand for, and
+    // the plugin-directory record that names the directories a launch
+    // considers host modules for. The bare `.onelf` directory is allowed
+    // as their parent. Any other collision is rejected so injected
+    // metadata is never shadowed by, or silently duplicated alongside,
+    // source content.
     let reserved = Path::new(".onelf");
     let collision = files
         .iter()
@@ -1376,6 +1377,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != Path::new(crate::bundle::sysroot::SETS_FILE)
                 && p.as_path() != Path::new(crate::bundle::sysroot::SHIPPED_FILE)
                 && p.as_path() != Path::new(onelf_format::anchors::ANCHORS_FILE)
+                && p.as_path() != Path::new(onelf_format::plugindirs::PLUGIN_DIRS_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(

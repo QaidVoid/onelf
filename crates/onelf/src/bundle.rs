@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +54,7 @@ pub(crate) use completeness::record as record_finding;
 pub use completeness::{Finding, Outcome, take_reported as take_findings};
 pub(crate) use elf::*;
 use onelf_format::paths::PathPair;
+use onelf_format::plugindirs::{self, PluginDir};
 use onelf_format::rules::{
     BuildHookId, Descriptor, HelperGroup, Requirement, ResourceGroup, ResourceKind, RuntimeBase,
     RuntimePathGroup, SourceBase, SourceCandidate,
@@ -1186,10 +1187,11 @@ enum InferredPlan {
     /// The whole directory, as a data carry.
     Data(Carry),
     /// The collection an inferred plugin directory's members went
-    /// through, the members a group collected first, the members that
-    /// are not objects to carry as data, and the planned byte size.
+    /// through, boxed to keep the variant small, the members a group
+    /// collected first, the members that are not objects to carry as
+    /// data, and the planned byte size.
     Plugins {
-        collection: collect::GroupCollection,
+        collection: Box<collect::GroupCollection>,
         firsts: Vec<(String, PathBuf)>,
         files: Vec<(PathBuf, PathBuf)>,
         size: u64,
@@ -1271,7 +1273,7 @@ fn plan_plugin_carry(
         }
     }
     Ok(InferredPlan::Plugins {
-        collection,
+        collection: Box::new(collection),
         firsts,
         files,
         size,
@@ -3533,6 +3535,7 @@ mod carry_tests {
         let universe = populate_universe(&sysroot, &packages, "examplefw", &[], None, None);
         let hit = CandidateHit {
             candidate: 0,
+            base: SourceBase::InstallationPrefix,
             kind: ResourceKind::Directory,
             source: sysroot.join("usr/share/examplefw"),
             resolved: sysroot.join("usr/share/examplefw"),
@@ -4476,6 +4479,11 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     let mut inference = infer::Inference::default();
     let mut inferred_read: HashSet<PathBuf> = HashSet::new();
     let mut inferred_carried: Vec<(PathBuf, PathBuf, Carry)> = Vec::new();
+    // Every activated plugin group's destination with the host library
+    // path its found candidate spells, for the plugin-dirs record: a
+    // described group has no compiled-in spellings, so the descriptor's
+    // own declaration is what names its host counterpart.
+    let mut described_dirs: Vec<(String, String)> = Vec::new();
     // Collected members the copy carries without owning their name, as
     // file name and source path, for the inference rounds to read their
     // own compiled-in directories from.
@@ -4651,6 +4659,16 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                     )?;
                     let origin = format!("rule {rule} group {group}");
                     exclude_recipe_members(&mut collection, &opts.exclude);
+                    // Where the group's found candidate spells its host
+                    // counterpart, whether or not a member survives the
+                    // recipe's excludes: the record names destinations
+                    // the tree actually holds, decided later.
+                    if described_group_names_record(&collection.plugins, &collection.counterpart) {
+                        described_dirs.push((
+                            declared.destination.as_str().to_owned(),
+                            collection.counterpart.clone(),
+                        ));
+                    }
                     // The group's finding is recorded before any member
                     // is planned, so a build that fails on a member
                     // still reports the group.
@@ -5386,6 +5404,20 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         // nothing would consume a key the record cannot carry.
         .filter(|dir| opts.directory.join(&dir.destination).is_dir())
         .collect();
+    // Anchoring a directory keeps it in the tree, so it stays a plugin
+    // directory the launch must consider, and a directory riding a
+    // carried parent has no carry entry of its own but is carried all
+    // the same: the plugin-dirs record takes this whole set, while the
+    // redirection choice below takes the one without the anchored.
+    let plugin_candidates: Vec<&infer::InferredDir> = carried_dirs
+        .iter()
+        .copied()
+        .chain(
+            inference
+                .all()
+                .filter(|dir| rides_carried(dir, &inferred_carried)),
+        )
+        .collect();
     let (redirections, carried_dirs) = if opts.dry_run {
         (Vec::new(), Vec::new())
     } else {
@@ -5415,17 +5447,11 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             .iter()
             .filter(|(.., carry)| matches!(*carry, Carry::Planned | Carry::Held))
             .filter_map(|(_, source, _)| inference.get(source))
-            .chain(inference.all().filter(|dir| {
-                inferred_carried.iter().any(|(dest, source, carry)| {
-                    matches!(*carry, Carry::Planned | Carry::Held)
-                        && match dir.destination.strip_prefix(dest) {
-                            Ok(rel) if !rel.as_os_str().is_empty() => {
-                                dir.source == source.join(rel)
-                            }
-                            _ => false,
-                        }
-                })
-            }))
+            .chain(
+                inference
+                    .all()
+                    .filter(|dir| rides_carried(dir, &inferred_carried)),
+            )
             .collect();
         let lib_dirs = crate::pack::resolve_lib_dirs(&opts.lib_dirs, &opts.directory);
         // The launch evaluates only the rules the package carries, which
@@ -5459,6 +5485,23 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             .cloned()
             .collect();
         redir::write_record(&survived, &opts.directory)?;
+        // The plugin-dirs record lands before the rewrite for the same
+        // reason: an anchor rewrite replaces the compiled-in spellings
+        // the record names, so any build that fails after it leaves
+        // bytes only the record can explain. The write after the audit
+        // below stays what a successful build publishes, pruned to
+        // what the drop pass left.
+        let plugin_dirs = merge_plugin_dirs(
+            plugin_dir_records(
+                &opts.directory,
+                &plugin_candidates,
+                &described_dirs,
+                &opts.lib_dir,
+            ),
+            persisted_plugin_dirs(&opts.directory)?,
+            &opts.directory,
+        );
+        write_plugin_dirs_record(&opts.directory, &plugin_dirs)?;
         // The rewrite lands exactly what the record holds: an anchor
         // the record cannot name would leave a path nothing resolves.
         let (files, occurrences) = redir::rewrite_anchors(&survived, &rewrite_dirs, &tree_elfs)?;
@@ -5526,6 +5569,21 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             .filter(|r| r.resolves(&opts.directory))
             .collect();
         redir::write_record(&survived, &opts.directory)?;
+        // The drop pass may have emptied a carried directory, so what
+        // the tree still holds is what the record names, with a
+        // previous record folding in for what this build rediscovered
+        // nothing about.
+        let plugin_dirs = merge_plugin_dirs(
+            plugin_dir_records(
+                &opts.directory,
+                &plugin_candidates,
+                &described_dirs,
+                &opts.lib_dir,
+            ),
+            persisted_plugin_dirs(&opts.directory)?,
+            &opts.directory,
+        );
+        write_plugin_dirs_record(&opts.directory, &plugin_dirs)?;
         publish_pairs(redir::record_pairs(
             &survived,
             carried_dirs,
@@ -5545,6 +5603,472 @@ struct Dropped {
     names: Vec<String>,
     need: String,
     verdict: SourceVerdict,
+}
+
+/// Whether a described group names its destination in the record: one
+/// that collected no member and spells no counterpart leaves the
+/// record alone, so a held destination keeps the naming a previous
+/// build recorded for it.
+fn described_group_names_record(plugins: &[collect::CollectedPlugin], counterpart: &str) -> bool {
+    !plugins.is_empty() || !counterpart.is_empty()
+}
+
+/// Whether an inferred directory rides a carried parent: some carried
+/// directory holds it, at the same place in the parent's copy that it
+/// holds in its own source. Such a child has no carry entry of its own,
+/// so the carry lists and the record must name it from the scan.
+fn rides_carried(dir: &infer::InferredDir, carried: &[(PathBuf, PathBuf, Carry)]) -> bool {
+    carried.iter().any(|(dest, source, carry)| {
+        matches!(*carry, Carry::Planned | Carry::Held)
+            && match dir.destination.strip_prefix(dest) {
+                Ok(rel) if !rel.as_os_str().is_empty() => dir.source == source.join(rel),
+                _ => false,
+            }
+    })
+}
+
+/// The plugin directories the tree holds, as the record names them: an
+/// inferred one with its compiled-in spellings and its path below the
+/// library directory, a described one with the host path its found
+/// candidate spelled. Only destinations the tree still holds are
+/// named, sorted by the relative side.
+fn plugin_dir_records(
+    directory: &Path,
+    inferred: &[&infer::InferredDir],
+    described: &[(String, String)],
+    lib_dir: &Path,
+) -> Vec<PluginDir> {
+    let mut out: Vec<PluginDir> = inferred
+        .iter()
+        .filter(|dir| dir.kind == infer::InferredKind::Plugins)
+        .filter(|dir| directory.join(&dir.destination).is_dir())
+        .map(|dir| PluginDir {
+            relative: dir.destination.to_string_lossy().into_owned(),
+            lib_relative: dir
+                .destination
+                .strip_prefix(lib_dir)
+                .map(|below| below.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            absolutes: dir.compiled.iter().cloned().collect(),
+        })
+        .chain(
+            described
+                .iter()
+                .filter(|(dest, _)| directory.join(dest).is_dir())
+                .map(|(dest, spelling)| PluginDir {
+                    relative: dest.clone(),
+                    lib_relative: spelling.clone(),
+                    absolutes: Vec::new(),
+                }),
+        )
+        .collect();
+    // Two groups may declare one destination, which the plan dedupes to
+    // one entry, so the record names it once: the first collector wins,
+    // the way the first hit spells a shared group's counterpart.
+    let mut seen = HashSet::new();
+    out.retain(|dir| seen.insert(dir.relative.clone()));
+    out.sort_by(|a, b| a.relative.cmp(&b.relative));
+    out
+}
+
+/// The record a previous build left, or none: an absent record names no
+/// directories, and a damaged one stops the build, since the tree's
+/// bytes may name directories only the record can explain.
+fn persisted_plugin_dirs(directory: &Path) -> io::Result<Vec<PluginDir>> {
+    let path = directory.join(plugindirs::PLUGIN_DIRS_FILE);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    (&file)
+        .take(plugindirs::MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    plugindirs::decode(&bytes).map_err(io::Error::other)
+}
+
+/// Fold the record a previous build left into the fresh records: a
+/// directory this build carries again takes the fresh naming, keeping
+/// any recorded spelling no fresh record names, one the tree still
+/// holds but this build discovered nothing about keeps its recorded
+/// naming, and one the tree has lost leaves with the record.
+fn merge_plugin_dirs(
+    fresh: Vec<PluginDir>,
+    persisted: Vec<PluginDir>,
+    directory: &Path,
+) -> Vec<PluginDir> {
+    if persisted.is_empty() {
+        return fresh;
+    }
+    // A recorded naming whose compiled-in spellings the fresh records
+    // name already leaves, so a directory the tree carries elsewhere
+    // owns its spellings and cannot leave the record naming them twice.
+    let named: HashSet<String> = fresh
+        .iter()
+        .flat_map(|dir| dir.absolutes.iter().cloned())
+        .collect();
+    let mut out = fresh;
+    for old in persisted {
+        match out.iter().position(|dir| dir.relative == old.relative) {
+            // The fresh naming wins, but a spelling only the old record
+            // holds, an alias an earlier build's rewrite has anchored
+            // away, still names a host counterpart the tree carries:
+            // it rides along.
+            Some(at) => out[at]
+                .absolutes
+                .extend(old.absolutes.into_iter().filter(|a| !named.contains(a))),
+            None => {
+                if old.absolutes.iter().any(|a| named.contains(a))
+                    || !directory.join(Path::new(&old.relative)).is_dir()
+                {
+                    continue;
+                }
+                out.push(old);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.relative.cmp(&b.relative));
+    out
+}
+
+/// Write `.onelf/plugin-dirs` for the directories the tree holds, and
+/// record the file in the generated ledger. Carrying no directory drops
+/// a record a previous build left, with its ledger entry.
+fn write_plugin_dirs_record(directory: &Path, dirs: &[PluginDir]) -> io::Result<()> {
+    if dirs.is_empty() {
+        let stale = directory.join(plugindirs::PLUGIN_DIRS_FILE);
+        match fs::remove_file(&stale) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
+        // The entry goes even when the record file was already gone: a
+        // ledger attesting a missing file attests nothing.
+        sysroot::remove_generated(directory, &[plugindirs::PLUGIN_DIRS_FILE.to_string()])?;
+        return Ok(());
+    }
+    let bytes = plugindirs::encode(dirs).map_err(io::Error::other)?;
+    let record = directory.join(plugindirs::PLUGIN_DIRS_FILE);
+    if let Some(parent) = record.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&record, bytes)?;
+    normalize_mtime(&record);
+    sysroot::record_generated(directory, vec![plugindirs::PLUGIN_DIRS_FILE.to_string()])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod plugin_dirs_record_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("onelf-plugdirs-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn inferred(
+        destination: &str,
+        kind: infer::InferredKind,
+        compiled: &[&str],
+    ) -> infer::InferredDir {
+        infer::InferredDir {
+            source: PathBuf::from("/usr").join(destination),
+            prefix: PathBuf::from("/usr"),
+            rel: PathBuf::from(destination),
+            destination: PathBuf::from(destination),
+            kind,
+            size: 0,
+            compiled: compiled.iter().map(|s| s.to_string()).collect(),
+            objects: ["libdemo.so.1".to_string()].into_iter().collect(),
+        }
+    }
+
+    /// Only the carried plugin directories the tree still holds are
+    /// named, a data directory is not, and the described groups ride in
+    /// with the spelling their candidate spelled, all sorted.
+    #[test]
+    fn the_record_names_what_the_tree_holds_sorted() {
+        let dir = tmp("records");
+        fs::create_dir_all(dir.join("lib/demo")).unwrap();
+        fs::create_dir_all(dir.join("share/examplefw")).unwrap();
+        fs::create_dir_all(dir.join("share/data")).unwrap();
+        let plugin = inferred("lib/demo", infer::InferredKind::Plugins, &["/usr/lib/demo"]);
+        let data = inferred(
+            "share/data",
+            infer::InferredKind::Data,
+            &["/usr/share/data"],
+        );
+        let gone = inferred("lib/gone", infer::InferredKind::Plugins, &["/usr/lib/gone"]);
+
+        let records = plugin_dir_records(
+            &dir,
+            &[&plugin, &data, &gone],
+            &[
+                ("lib/gone2".to_string(), "gone2".to_string()),
+                ("share/examplefw".to_string(), String::new()),
+            ],
+            Path::new("lib"),
+        );
+
+        let relatives: Vec<&str> = records.iter().map(|d| d.relative.as_str()).collect();
+        assert_eq!(relatives, ["lib/demo", "share/examplefw"]);
+        assert_eq!(records[0].lib_relative, "demo");
+        assert_eq!(records[0].absolutes, ["/usr/lib/demo".to_string()]);
+        assert_eq!(records[1].lib_relative, "");
+        assert!(records[1].absolutes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The record is written with the encoded bytes, and a build that
+    /// carries none drops a previous build's record and its ledger
+    /// entry, twice over.
+    #[test]
+    fn the_record_is_written_and_dropped_with_its_ledger_entry() {
+        let dir = tmp("write");
+        fs::create_dir_all(dir.join("lib/demo")).unwrap();
+        let plugin = inferred("lib/demo", infer::InferredKind::Plugins, &["/usr/lib/demo"]);
+
+        write_plugin_dirs_record(
+            &dir,
+            &plugin_dir_records(&dir, &[&plugin], &[], Path::new("lib")),
+        )
+        .unwrap();
+        let record = dir.join(plugindirs::PLUGIN_DIRS_FILE);
+        assert_eq!(
+            fs::read(&record).unwrap(),
+            plugindirs::encode(&[PluginDir {
+                relative: "lib/demo".to_string(),
+                lib_relative: "demo".to_string(),
+                absolutes: ["/usr/lib/demo".to_string()].to_vec(),
+            }])
+            .unwrap()
+        );
+        assert!(
+            sysroot::read_generated(&dir)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == plugindirs::PLUGIN_DIRS_FILE),
+            "the record joins the generated ledger"
+        );
+
+        write_plugin_dirs_record(&dir, &[]).unwrap();
+        assert!(!record.exists());
+        assert!(
+            !sysroot::read_generated(&dir)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == plugindirs::PLUGIN_DIRS_FILE),
+            "the ledger entry drops with the record"
+        );
+
+        write_plugin_dirs_record(&dir, &[]).unwrap();
+        assert!(!record.exists(), "dropping without a record stays quiet");
+
+        // A ledger entry whose record file other means have lost goes
+        // with the next empty drop all the same.
+        sysroot::record_generated(&dir, vec![plugindirs::PLUGIN_DIRS_FILE.to_string()]).unwrap();
+        write_plugin_dirs_record(&dir, &[]).unwrap();
+        assert!(
+            !sysroot::read_generated(&dir)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == plugindirs::PLUGIN_DIRS_FILE),
+            "a ledger entry attesting a missing record drops too"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rebuild that discovers nothing fresh keeps a held directory's
+    /// recorded naming while the tree holds it, a directory the tree has
+    /// lost leaves, and a fresh naming wins over the recorded one, with
+    /// the recorded alias spelling riding along.
+    #[test]
+    fn a_rebuild_keeps_the_held_directories_the_tree_holds() {
+        let dir = tmp("merge");
+        fs::create_dir_all(dir.join("lib/demo")).unwrap();
+        fs::create_dir_all(dir.join("lib/held")).unwrap();
+
+        // What a previous build recorded: lib/demo (carried again this
+        // build), lib/gone (the tree has lost it) and lib/held (this
+        // build discovers nothing about).
+        fs::create_dir_all(dir.join(".onelf")).unwrap();
+        std::fs::write(
+            dir.join(plugindirs::PLUGIN_DIRS_FILE),
+            plugindirs::encode(&[
+                PluginDir {
+                    relative: "lib/demo".to_string(),
+                    lib_relative: "demo".to_string(),
+                    absolutes: ["/usr/lib/demo".to_string()].to_vec(),
+                },
+                PluginDir {
+                    relative: "lib/gone".to_string(),
+                    lib_relative: "gone".to_string(),
+                    absolutes: ["/usr/lib/gone".to_string()].to_vec(),
+                },
+                PluginDir {
+                    relative: "lib/held".to_string(),
+                    lib_relative: "held".to_string(),
+                    absolutes: ["/usr/lib/held".to_string()].to_vec(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let merged = merge_plugin_dirs(
+            vec![PluginDir {
+                relative: "lib/demo".to_string(),
+                lib_relative: String::new(),
+                absolutes: Vec::new(),
+            }],
+            persisted_plugin_dirs(&dir).unwrap(),
+            &dir,
+        );
+
+        let relatives: Vec<&str> = merged.iter().map(|d| d.relative.as_str()).collect();
+        assert_eq!(relatives, ["lib/demo", "lib/held"]);
+        assert_eq!(merged[0].lib_relative, "", "the fresh naming wins");
+        assert_eq!(
+            merged[0].absolutes,
+            ["/usr/lib/demo".to_string()],
+            "the recorded alias spelling rides along"
+        );
+        assert_eq!(
+            merged[1].absolutes,
+            ["/usr/lib/held".to_string()],
+            "the held directory keeps its recorded naming"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two groups declaring one destination name it once, the first
+    /// collector winning, and a fresh record whose absolutes a recorded
+    /// entry also names takes the spellings over: the directory the tree
+    /// carries elsewhere owns them and the record cannot name them twice.
+    #[test]
+    fn one_destination_is_named_once_and_owns_its_spellings() {
+        let dir = tmp("dedupe");
+        fs::create_dir_all(dir.join("lib/demo")).unwrap();
+        fs::create_dir_all(dir.join("lib/shared")).unwrap();
+        let plugin = inferred("lib/demo", infer::InferredKind::Plugins, &["/usr/lib/demo"]);
+
+        let records = plugin_dir_records(
+            &dir,
+            &[&plugin],
+            &[
+                ("lib/shared".to_string(), "shared".to_string()),
+                ("lib/shared".to_string(), String::new()),
+            ],
+            Path::new("lib"),
+        );
+        let relatives: Vec<&str> = records.iter().map(|d| d.relative.as_str()).collect();
+        assert_eq!(relatives, ["lib/demo", "lib/shared"]);
+        assert_eq!(records[1].lib_relative, "shared", "the first group wins");
+
+        let merged = merge_plugin_dirs(
+            records,
+            vec![PluginDir {
+                relative: "lib/shared".to_string(),
+                lib_relative: "elsewhere".to_string(),
+                absolutes: ["/usr/lib/demo".to_string()].to_vec(),
+            }],
+            &dir,
+        );
+        let relatives: Vec<&str> = merged.iter().map(|d| d.relative.as_str()).collect();
+        assert_eq!(relatives, ["lib/demo", "lib/shared"]);
+        assert_eq!(
+            merged[1].lib_relative, "shared",
+            "the fresh naming owns the spelling"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|d| d.relative == "lib/demo")
+                .unwrap()
+                .absolutes,
+            ["/usr/lib/demo".to_string()],
+        );
+        assert!(
+            merged
+                .iter()
+                .find(|d| d.relative == "lib/shared")
+                .unwrap()
+                .absolutes
+                .is_empty(),
+            "the claimed spelling is not named twice"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory this build rediscovers keeps the recorded spellings
+    /// no fresh record names: an alias an earlier build's rewrite has
+    /// anchored away still names a host counterpart the tree carries.
+    #[test]
+    fn a_rediscovered_directory_keeps_its_unclaimed_aliases() {
+        let dir = tmp("aliases");
+        fs::create_dir_all(dir.join("lib/demo")).unwrap();
+
+        let merged = merge_plugin_dirs(
+            vec![PluginDir {
+                relative: "lib/demo".to_string(),
+                lib_relative: "demo".to_string(),
+                absolutes: ["/usr/lib/demo-direct".to_string()].to_vec(),
+            }],
+            vec![PluginDir {
+                relative: "lib/demo".to_string(),
+                lib_relative: "demo".to_string(),
+                absolutes: [
+                    "/usr/lib/demo-direct".to_string(),
+                    "/usr/lib/demo-link".to_string(),
+                ]
+                .to_vec(),
+            }],
+            &dir,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].lib_relative, "demo");
+        assert_eq!(
+            merged[0].absolutes,
+            [
+                "/usr/lib/demo-direct".to_string(),
+                "/usr/lib/demo-link".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged record stops the read: bytes nothing can explain must
+    /// not pass for naming no directories.
+    #[test]
+    fn a_damaged_record_stops_the_read() {
+        let dir = tmp("damaged");
+        fs::create_dir_all(dir.join(".onelf")).unwrap();
+        std::fs::write(dir.join(plugindirs::PLUGIN_DIRS_FILE), b"not a record").unwrap();
+
+        assert!(persisted_plugin_dirs(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A group that collected no member and spells no counterpart names
+    /// nothing; either alone is naming enough.
+    #[test]
+    fn a_found_nothing_group_names_the_record_by_a_member_or_a_spelling() {
+        assert!(!described_group_names_record(&[], ""));
+        assert!(described_group_names_record(
+            &[collect::CollectedPlugin {
+                soname: "libfw.so".to_string(),
+                destination: PathBuf::from("lib/fw"),
+                resolved: PathBuf::from("/usr/lib/fw/libfw.so"),
+            }],
+            ""
+        ));
+        assert!(described_group_names_record(&[], "fw"));
+    }
 }
 
 /// Remove bundled objects that could never load: their need is a soname

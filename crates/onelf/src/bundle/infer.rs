@@ -70,20 +70,18 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use goblin::elf::program_header::{PF_W, PT_LOAD};
 use onelf_format::catalog;
-use onelf_format::rules::{
-    Descriptor, ExclusionBase, ExclusionEntry, ResourceKind, SourceBase, is_multiarch,
-};
+use onelf_format::rules::{Descriptor, ExclusionBase, ExclusionEntry, ResourceKind, SourceBase};
 use onelf_sysroot::path::in_root;
 
 use super::collect::{GroupCollection, visit_members};
 use super::datadirs::path_like;
 use super::{
-    CandidateHit, Finding, LIBRARY_DIRS, Outcome, completeness, dynstr_range, format_size,
-    is_excluded, libc_family_of_soname, object_prefix, read_elf_class, resolve_within,
+    CandidateHit, Finding, Outcome, completeness, dynstr_range, format_size, is_excluded,
+    libc_family_of_soname, library_dir_of, object_prefix, read_elf_class, resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -147,6 +145,7 @@ impl InferredDir {
     pub(crate) fn hit(&self) -> CandidateHit {
         CandidateHit {
             candidate: 0,
+            base: SourceBase::InstallationPrefix,
             kind: ResourceKind::Directory,
             source: self.source.clone(),
             resolved: self.source.clone(),
@@ -825,25 +824,6 @@ fn merged(rel: &Path, under_root: bool) -> &Path {
     }
 }
 
-/// The library directory `rel` lies in or is, relative to the prefix:
-/// its first component when that is a library directory, with the next
-/// component too when that has the multiarch shape.
-fn library_dir_of(rel: &Path) -> Option<PathBuf> {
-    let mut parts = rel.components().map(|c| match c {
-        Component::Normal(name) => name.to_str(),
-        _ => None,
-    });
-    let first = parts.next().flatten()?;
-    if !LIBRARY_DIRS.contains(&first) {
-        return None;
-    }
-    let dir = PathBuf::from(first);
-    Some(match parts.next().flatten() {
-        Some(second) if is_multiarch(second) => dir.join(second),
-        _ => dir,
-    })
-}
-
 /// Whether `rel` lies strictly below a resource base: a library
 /// directory or `share`, below the prefix or, under a `/` prefix, below
 /// `usr`. A base itself is not below one.
@@ -863,6 +843,7 @@ mod tests {
     use crate::bundle::collect::MAX_GROUP_DEPTH;
     use crate::bundle::plan::TREE_WALK_LIMIT;
     use crate::bundle::sysroot::fixture;
+    use onelf_format::rules::is_multiarch;
     use std::os::unix::fs::symlink;
 
     const READ: u32 = 4;

@@ -27,8 +27,8 @@ use onelf_format::rules::{RelativePath, Requirement, ResourceGroup};
 
 use super::plan::TREE_WALK_LIMIT;
 use super::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, discover_group, is_nix_stub_ld,
-    miss_text, read_elf_class, read_elf_machine, resolve_within,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, counterpart_spelling,
+    discover_group, is_nix_stub_ld, miss_text, read_elf_class, read_elf_machine, resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -73,6 +73,15 @@ pub(crate) struct GroupCollection {
     pub skipped: Vec<(String, String)>,
     /// Why each declared location held nothing usable, bounded.
     pub misses: Vec<String>,
+    /// Where the found directory lives under a host library directory,
+    /// as the first hit's declared location spells it: the candidate's
+    /// path for a library-directory base, the same path with its
+    /// leading library directory taken off for an installation-prefix
+    /// base. Empty when that first hit names no library directory, as
+    /// a `share`-based group does not. Inference derives its own
+    /// spelling from where the tree carries the directory, so its
+    /// collections leave this empty.
+    pub counterpart: String,
 }
 
 /// Collect one activated plugin group over the libraries the walk
@@ -155,6 +164,13 @@ pub(crate) fn collect_found(
         plugins: Vec::new(),
         skipped: Vec::new(),
         misses: Vec::new(),
+        counterpart: found
+            .first()
+            .and_then(|hit| {
+                let declared = hit.source.strip_prefix(&hit.root).ok()?;
+                counterpart_spelling(hit.base, declared)
+            })
+            .unwrap_or_default(),
     };
     // Members are keyed by where they land: a nested layout keeps
     // same-named members apart (babl's `x86-64-v2/` and `x86-64-v3/`
@@ -443,6 +459,7 @@ mod tests {
     use super::*;
     use crate::bundle::sysroot::fixture;
     use onelf_format::catalog;
+    use onelf_format::rules::{ResourceKind, SourceBase};
 
     /// Minimal ELF-shaped bytes: magic + EI_CLASS + e_machine, enough
     /// for the compatibility checks to classify.
@@ -908,6 +925,157 @@ mod tests {
                 .contains("more than 4096 members in one plugin group"),
             "{err}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A hit of one base at one declared path, with the group directory
+    /// laid out and a compatible member placed inside it.
+    fn found(
+        base: SourceBase,
+        root: &Path,
+        path: &str,
+        member: &str,
+        destination: &str,
+    ) -> CandidateHit {
+        write(&root.join(path).join(member), &fake_elf(2, 62));
+        CandidateHit {
+            candidate: 0,
+            base,
+            kind: ResourceKind::Directory,
+            source: root.join(path),
+            resolved: root.join(path),
+            root: root.to_path_buf(),
+            destination: PathBuf::from(destination),
+        }
+    }
+
+    /// The record's host library path comes from the found candidate: a
+    /// library-directory base spells the declared path itself.
+    #[test]
+    fn a_library_dir_base_spells_the_declared_path() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let lib = dir.join("usr/lib");
+
+        let collection = collect_found(
+            "alsa",
+            "plugins",
+            &[],
+            &[found(
+                SourceBase::LibraryDir,
+                &lib,
+                "alsa-lib",
+                "pulse.so",
+                "lib/alsa-lib",
+            )],
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+
+        assert_eq!(collection.counterpart, "alsa-lib");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An installation-prefix base spells the declared path with its
+    /// leading library directory, multiarch level included, taken off.
+    #[test]
+    fn a_prefix_base_spells_below_its_library_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let prefix = dir.join("usr");
+
+        let collection = collect_found(
+            "gstreamer",
+            "plugins",
+            &[],
+            &[found(
+                SourceBase::InstallationPrefix,
+                &prefix,
+                "lib/x86_64-linux-gnu/gstreamer-1.0",
+                "coreelements.so",
+                "lib/gstreamer-1.0",
+            )],
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+
+        assert_eq!(collection.counterpart, "gstreamer-1.0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A prefix path outside every library directory, as a `share`
+    /// location is, spells no host counterpart at all.
+    #[test]
+    fn a_prefix_base_outside_the_library_directories_spells_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let prefix = dir.join("usr");
+
+        let collection = collect_found(
+            "examplefw",
+            "data",
+            &[],
+            &[found(
+                SourceBase::InstallationPrefix,
+                &prefix,
+                "share/examplefw",
+                "keep.so",
+                "share/examplefw",
+            )],
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+
+        assert_eq!(collection.counterpart, "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two installations providing one group leave the first hit's
+    /// spelling as the single host library path the record may name.
+    #[test]
+    fn the_first_hit_spells_the_counterpart() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        let first = dir.join("opt/example");
+        let second = dir.join("usr/lib");
+
+        let collection = collect_found(
+            "alsa",
+            "plugins",
+            &[],
+            &[
+                found(
+                    SourceBase::InstallationPrefix,
+                    &first,
+                    "lib/alsa-lib/deep",
+                    "pulse.so",
+                    "lib/alsa-lib",
+                ),
+                found(
+                    SourceBase::LibraryDir,
+                    &second,
+                    "alsa-lib",
+                    "pulse.so",
+                    "lib/alsa-lib",
+                ),
+            ],
+            None,
+            Some(2),
+            Some(62),
+        )
+        .unwrap();
+
+        assert_eq!(collection.counterpart, "alsa-lib/deep");
         let _ = fs::remove_dir_all(&dir);
     }
 }

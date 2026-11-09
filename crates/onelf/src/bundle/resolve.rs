@@ -5,8 +5,8 @@ use super::*;
 
 mod candidates;
 pub(crate) use candidates::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, LIBRARY_DIRS,
-    MissReason, discover_group, object_prefix, resolve_within,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupOutcome, GroupQuery, MissReason,
+    counterpart_spelling, discover_group, library_dir_of, object_prefix, resolve_within,
 };
 
 /// Scan `dir` for existing shared libraries. Returns the set of sonames

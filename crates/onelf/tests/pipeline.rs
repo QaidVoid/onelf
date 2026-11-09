@@ -1522,6 +1522,15 @@ fn nested_same_named_and_symlinked_members_all_arrive() {
             .exists(),
         "the module alias arrives:\n{err}"
     );
+    // The described groups name their host counterparts: each group's
+    // candidate is a library-directory base, so its declared path is
+    // the spelling, and the record lists them sorted with no compiled-in
+    // absolutes, which a described group never has.
+    assert_eq!(
+        std::fs::read(app.join(".onelf/plugin-dirs")).unwrap(),
+        b"lib/alsa-lib\talsa-lib\nlib/babl-0.1\tbabl-0.1".to_vec(),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(&td);
 }
 
@@ -27165,6 +27174,108 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
         1,
         "no double rewrite"
     );
+}
+
+/// A library's compiled-in plugin directory is carried as a plugin
+/// directory and named in `.onelf/plugin-dirs`, with its path below the
+/// library directory and its compiled-in spelling, so a launch knows
+/// which host directories to consider. A rebuild that discovers nothing
+/// fresh keeps the record byte-identical.
+#[test]
+fn a_carried_plugin_directory_is_named_in_the_record() {
+    let td = workdir("plugdirs");
+    let td = td.canonicalize().unwrap();
+    let prefix = td.join("fp");
+    std::fs::create_dir_all(prefix.join("lib/demo/nested")).unwrap();
+    write(&td.join("plug.c"), "int demo_plugin(void){return 1;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("plug.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-plugin.so"),
+    ) {
+        return;
+    }
+    // A module in the nested directory, and the library naming that
+    // directory itself: an object naming its own containing directory is
+    // a self-reference, not a resource, so the library carries the
+    // nested spelling and the nested dir rides the carried parent.
+    write(&td.join("nested.c"), "int demo_nested(void){return 2;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("nested.c").to_str().unwrap()],
+        &prefix.join("lib/demo/nested/libdemo-nested.so"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("demo.c"),
+        &format!(
+            "const char *demo_dir = \"{}\";\nconst char *nested_dir = \"{}\";\nint demo(void){{return 1;}}\n",
+            prefix.join("lib/demo").display(),
+            prefix.join("lib/demo/nested").display()
+        ),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdemo.so.1",
+            td.join("demo.c").to_str().unwrap(),
+        ],
+        &prefix.join("lib/libdemo.so.1"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("main.c"),
+        "int demo(void);\nint main(void){return demo()-1;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libdemo.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let run = || -> String {
+        let out = Command::new(onelf())
+            .args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+            .env("LD_LIBRARY_PATH", prefix.join("lib"))
+            .output()
+            .expect("spawn onelf bundle-libs");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        err
+    };
+    let first = run();
+    assert!(
+        app.join("lib/demo/libdemo-plugin.so").is_file()
+            && app.join("lib/demo/nested/libdemo-nested.so").is_file(),
+        "the plugin directories' members arrive:\n{first}"
+    );
+    let record_path = app.join(".onelf/plugin-dirs");
+    let want = format!(
+        "lib/demo\tdemo\t{}\nlib/demo/nested\tdemo/nested\t{}",
+        prefix.join("lib/demo").display(),
+        prefix.join("lib/demo/nested").display()
+    );
+    assert_eq!(
+        std::fs::read(&record_path).unwrap(),
+        want.as_bytes(),
+        "{first}"
+    );
+
+    let second = run();
+    assert_eq!(
+        std::fs::read(&record_path).unwrap(),
+        want.as_bytes(),
+        "the rebuild holds the directory and the record stays byte-identical:\n{second}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 /// Minimal ELF bytes of another machine, enough for collection to refuse

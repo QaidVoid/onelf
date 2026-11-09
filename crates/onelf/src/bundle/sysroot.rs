@@ -2023,6 +2023,13 @@ pub(crate) fn dispose_generated(
         if entry.path == onelf_format::anchors::ANCHORS_FILE {
             continue;
         }
+        // The plugin-dirs record is the same kind of cross-build state:
+        // after an anchor rewrite the tree's bytes name plugin
+        // directories only the record can explain, and the record
+        // decision rewrites or drops it once it has folded it in.
+        if entry.path == onelf_format::plugindirs::PLUGIN_DIRS_FILE {
+            continue;
+        }
         let actual = hash_entry(&appdir.join(&entry.path))?;
         let mut judged = entry.clone();
         // A path-only record proves nothing on its own. When the plan
@@ -2854,6 +2861,45 @@ mod tests {
         assert!(
             !appdir.join(GENERATED_FILE).exists(),
             "the ledger goes with the cleanup, and population rewrites it"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The plugin-dirs record is decision state like the anchor record:
+    /// after an anchor rewrite the tree's bytes name plugin directories
+    /// only the record can explain, so the cleanup leaves it standing
+    /// for the record decision to fold in, however unchanged its bytes.
+    #[test]
+    fn the_plugin_dirs_record_survives_the_cleanup_of_generated_ones() {
+        let root =
+            std::env::temp_dir().join(format!("onelf-dispose-plugdirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let appdir = root.join("appdir");
+        fs::create_dir_all(appdir.join("lib")).unwrap();
+        fs::write(appdir.join("lib/cache.bin"), b"generated").unwrap();
+        fs::create_dir_all(appdir.join(".onelf")).unwrap();
+        std::fs::write(
+            appdir.join(".onelf/plugin-dirs"),
+            "lib/demo\tdemo\t/usr/lib/demo\n",
+        )
+        .unwrap();
+        record_generated(
+            &appdir,
+            vec![
+                "lib/cache.bin".to_string(),
+                onelf_format::plugindirs::PLUGIN_DIRS_FILE.to_string(),
+            ],
+        )
+        .unwrap();
+
+        let conflicts = dispose_generated(&appdir, &root, &[]).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(!appdir.join("lib/cache.bin").exists());
+        assert!(!appdir.join("lib").exists(), "the emptied directories go");
+        assert_eq!(
+            fs::read(appdir.join(".onelf/plugin-dirs")).unwrap(),
+            b"lib/demo\tdemo\t/usr/lib/demo\n" as &[u8],
+            "the plugin-dirs record stays"
         );
         let _ = fs::remove_dir_all(&root);
     }

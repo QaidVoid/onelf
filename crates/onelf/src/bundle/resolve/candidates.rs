@@ -26,7 +26,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use onelf_format::rules::{RelativePath, ResourceKind, SourceBase, SourceCandidate};
+use onelf_format::rules::{RelativePath, ResourceKind, SourceBase, SourceCandidate, is_multiarch};
 use onelf_sysroot::path::in_root;
 
 use crate::bundle::sysroot::{Refusal, SysrootUniverse};
@@ -145,6 +145,41 @@ fn is_lib_dir(dir: &Path) -> bool {
         .is_some_and(|n| LIBRARY_DIRS.contains(&n))
 }
 
+/// The library directory `rel` lies in or is, relative to a prefix: its
+/// first component when that names a library directory, with the next
+/// component too when that has the multiarch shape.
+pub(crate) fn library_dir_of(rel: &Path) -> Option<PathBuf> {
+    let mut parts = rel.components().map(|c| match c {
+        Component::Normal(name) => name.to_str(),
+        _ => None,
+    });
+    let first = parts.next().flatten()?;
+    if !LIBRARY_DIRS.contains(&first) {
+        return None;
+    }
+    let dir = PathBuf::from(first);
+    Some(match parts.next().flatten() {
+        Some(second) if is_multiarch(second) => dir.join(second),
+        _ => dir,
+    })
+}
+
+/// Where a declared location lies under a host library directory, or
+/// `None` when it names none: a library-directory base spells the
+/// location itself, an installation-prefix base spells it with its
+/// leading library directory (multiarch level included) taken off, and
+/// a prefix path outside every library directory, as a `share` location
+/// is, spells nothing.
+pub(crate) fn counterpart_spelling(base: SourceBase, declared: &Path) -> Option<String> {
+    match base {
+        SourceBase::LibraryDir => Some(declared.to_string_lossy().into_owned()),
+        SourceBase::InstallationPrefix => {
+            let below = declared.strip_prefix(&library_dir_of(declared)?).ok()?;
+            (!below.as_os_str().is_empty()).then(|| below.to_string_lossy().into_owned())
+        }
+    }
+}
+
 /// The most directory levels [`object_prefix`] climbs above an object.
 const MAX_PREFIX_LEVELS: usize = 16;
 
@@ -230,6 +265,8 @@ pub(crate) struct AdmittedUniverse<'a> {
 pub(crate) struct CandidateHit {
     /// The index of the alternative among the declared candidates.
     pub candidate: usize,
+    /// The admitted location the alternative was declared against.
+    pub base: SourceBase,
     /// The kind verified on disk.
     pub kind: ResourceKind,
     /// The source path as declared against its root.
@@ -400,6 +437,7 @@ fn examine(
     }
     Ok(CandidateHit {
         candidate: index,
+        base: candidate.base,
         kind: actual,
         source: declared,
         resolved: confined,
