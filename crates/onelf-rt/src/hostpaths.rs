@@ -26,6 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use onelf_format::paths::{self, MAX_RECORD_BYTES, PATHS_FILE, PathPair};
+use onelf_format::plugindirs::{self, PLUGIN_DIRS_FILE, PluginDir};
 use rustix::mount::{
     MountFlags, MountPropagationFlags, UnmountFlags, mount, mount_bind, mount_change, unmount,
 };
@@ -43,6 +44,25 @@ pub fn read(pkg: &PackageData) -> io::Result<Vec<PathPair>> {
     };
     paths::decode(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{PATHS_FILE}: {e}")))
+}
+
+/// The plugin directories the package carries, read through the
+/// verified package path like [`read`]. A package without the record
+/// carries none; a record that is over its size bound, fails its
+/// content hash or does not decode is an error, so the caller can say
+/// why the host's modules are not considered.
+pub fn read_plugin_dirs(pkg: &PackageData) -> io::Result<Vec<PluginDir>> {
+    let Some(bytes) =
+        loader::read_bounded_record(pkg, PLUGIN_DIRS_FILE, plugindirs::MAX_RECORD_BYTES)?
+    else {
+        return Ok(Vec::new());
+    };
+    plugindirs::decode(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{PLUGIN_DIRS_FILE}: {e}"),
+        )
+    })
 }
 
 /// Make each bundle directory in `wanted` answer for its absolute path.
@@ -244,6 +264,35 @@ mod tests {
     fn a_package_without_the_record_has_no_pairs() {
         let pkg = load("absent", &[("bin/app", b"elf".to_vec())]);
         assert_eq!(read(&pkg).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_package_without_the_plugin_dirs_record_carries_none() {
+        let pkg = load("pd-absent", &[("bin/app", b"elf".to_vec())]);
+        assert_eq!(read_plugin_dirs(&pkg).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn the_plugin_dirs_record_is_read_from_the_package() {
+        let record = b"lib/alsa-lib\talsa-lib\t/usr/lib/alsa-lib\nlib/xorg/modules\t";
+        let pkg = load("pd-valid", &[(PLUGIN_DIRS_FILE, record.to_vec())]);
+        let dirs = read_plugin_dirs(&pkg).unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].relative, "lib/alsa-lib");
+        assert_eq!(dirs[0].lib_relative, "alsa-lib");
+        assert_eq!(dirs[0].absolutes, vec!["/usr/lib/alsa-lib"]);
+        assert_eq!(dirs[1].relative, "lib/xorg/modules");
+        assert_eq!(dirs[1].lib_relative, "");
+        assert!(dirs[1].absolutes.is_empty());
+    }
+
+    #[test]
+    fn a_present_invalid_plugin_dirs_record_is_an_error_naming_the_directory() {
+        let record = b"lib/alsa-lib\talsa-lib\n../outside\tx";
+        let pkg = load("pd-escapes", &[(PLUGIN_DIRS_FILE, record.to_vec())]);
+        let err = read_plugin_dirs(&pkg).unwrap_err().to_string();
+        assert!(err.starts_with(PLUGIN_DIRS_FILE), "{err}");
+        assert!(err.contains("\"../outside\""), "{err}");
     }
 
     #[test]

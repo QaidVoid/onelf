@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use crate::drivers::{self, DRIVER_FAMILIES};
 use crate::footer::HostLibsPolicy;
 use crate::ldso::{self, MAX_LOADER_BYTES};
+use crate::plugindirs::PluginDir;
 use crate::verdef::{self, Choice, VersionSet};
 
 /// What a launch takes from the host.
@@ -113,6 +114,11 @@ pub struct Request<'a> {
     pub pkg_root: &'a Path,
     /// Library directories relative to `pkg_root`.
     pub lib_dirs: &'a [&'a str],
+    /// The plugin directories the package carries, from its
+    /// `.onelf/plugin-dirs` record. Their host counterparts join the
+    /// decision fingerprint, so installing or removing a host module
+    /// recomputes the decision. A package without the record has none.
+    pub plugin_dirs: &'a [PluginDir],
     pub policy: HostLibsPolicy,
     /// Where the link farm and the recorded decision live. Created on
     /// demand; reused across launches of the same package on the same
@@ -368,6 +374,7 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
     }
     let fingerprint = fingerprint(
         req.ld_cache,
+        req.plugin_dirs,
         req.icd_dirs,
         req.policy,
         req.extra_root,
@@ -498,6 +505,7 @@ pub fn decide(req: &Request) -> Decision {
     if !decision.winners.is_empty() {
         let fingerprint = fingerprint(
             req.ld_cache,
+            req.plugin_dirs,
             req.icd_dirs,
             req.policy,
             req.extra_root,
@@ -947,6 +955,33 @@ fn module_dirs(ld_cache: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The host counterpart directories of the package's carried plugin
+/// directories: each compiled-in absolute path, and the directory's
+/// path under every library directory the loader cache names, which
+/// covers a multiarch host where `/usr/lib/alsa-lib` has
+/// `/usr/lib/x86_64-linux-gnu/alsa-lib` beside it. Only those that
+/// exist are returned, like the driver directories: a directory that
+/// is not there holds no modules for the decision to weigh, and its
+/// absence is the host's business alone.
+fn counterpart_dirs(plugin_dirs: &[PluginDir], ld_cache: &Path) -> Vec<PathBuf> {
+    if plugin_dirs.is_empty() {
+        return Vec::new();
+    }
+    let libs = drivers::cache_dirs_in(ld_cache);
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for dir in plugin_dirs {
+        for absolute in &dir.absolutes {
+            out.insert(PathBuf::from(absolute));
+        }
+        if !dir.lib_relative.is_empty() {
+            for lib in &libs {
+                out.insert(Path::new(lib).join(&dir.lib_relative));
+            }
+        }
+    }
+    out.into_iter().filter(|dir| dir.is_dir()).collect()
+}
+
 /// `library_path` values from Vulkan ICD and EGL vendor files under
 /// `icd_dirs`. A value with a `/` names a file, absolute or relative to
 /// the file; a bare soname is looked up in `bare_names` and dropped when
@@ -1036,12 +1071,16 @@ fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// A description of everything on the host the decision depends on: the
-/// cache image, the name service configuration, the directories the cache
-/// names and the driver description files, each with its size and
+/// cache image, the name service configuration, the directories the
+/// cache names, the driver description files and the counterparts of the
+/// package's carried plugin directories, each with its size and
 /// modification time, and where loader copies can be kept. Compared
-/// whole, so no hash is needed.
+/// whole, so no hash is needed. Every argument is distinct and a
+/// parameter object would be built at each call site and read once.
+#[allow(clippy::too_many_arguments)]
 fn fingerprint(
     ld_cache: &Path,
+    plugin_dirs: &[PluginDir],
     icd_dirs: &[&str],
     policy: HostLibsPolicy,
     extra_root: Option<&Path>,
@@ -1081,6 +1120,9 @@ fn fingerprint(
         stamp(Path::new(&dir));
     }
     for dir in module_dirs(ld_cache) {
+        stamp(&dir);
+    }
+    for dir in counterpart_dirs(plugin_dirs, ld_cache) {
         stamp(&dir);
     }
     for dir in icd_dirs {
@@ -1591,6 +1633,9 @@ mod tests {
         /// The host's name service configuration; absent unless a test
         /// writes one.
         nsswitch: PathBuf,
+        /// The plugin directories the package carries, empty unless a
+        /// test carries some with [`World::carry`].
+        plugin_dirs: std::cell::RefCell<Vec<PluginDir>>,
         uid: u32,
     }
 
@@ -1612,6 +1657,7 @@ mod tests {
                 last_farm: std::cell::RefCell::new(None),
                 loader_root: root.join("cache"),
                 nsswitch: root.join("nsswitch.conf"),
+                plugin_dirs: std::cell::RefCell::new(Vec::new()),
                 uid: {
                     use std::os::unix::fs::MetadataExt;
                     fs::metadata(&root).unwrap().uid()
@@ -1624,6 +1670,12 @@ mod tests {
                 root: &self.loader_root,
                 uid: self.uid,
             }
+        }
+
+        /// Have the package carry plugin directories, whose host
+        /// counterparts join the decision.
+        fn carry(&self, dirs: Vec<PluginDir>) {
+            *self.plugin_dirs.borrow_mut() = dirs;
         }
 
         fn host(&self, name: &str, bytes: &[u8]) -> PathBuf {
@@ -1680,6 +1732,7 @@ mod tests {
             decide(&Request {
                 pkg_root: &self.pkg,
                 lib_dirs: &["lib"],
+                plugin_dirs: &self.plugin_dirs.borrow(),
                 policy,
                 store: &self.store,
                 ld_cache: &self.cache,
@@ -1704,6 +1757,7 @@ mod tests {
                 &Request {
                     pkg_root: &self.pkg,
                     lib_dirs: &["lib"],
+                    plugin_dirs: &self.plugin_dirs.borrow(),
                     policy,
                     store: &self.store,
                     ld_cache: &self.cache,
@@ -1734,6 +1788,7 @@ mod tests {
                 &Request {
                     pkg_root: &self.pkg,
                     lib_dirs: &["lib"],
+                    plugin_dirs: &self.plugin_dirs.borrow(),
                     policy,
                     store: &self.store,
                     ld_cache: &self.cache,
@@ -1869,6 +1924,7 @@ mod tests {
         let req = Request {
             pkg_root: &w.pkg,
             lib_dirs: &["lib"],
+            plugin_dirs: &[],
             policy: HostLibsPolicy::Auto,
             store: &w.store,
             ld_cache: &w.cache,
@@ -2104,6 +2160,7 @@ mod tests {
         let req = Request {
             pkg_root: &w.pkg,
             lib_dirs: &["lib"],
+            plugin_dirs: &[],
             policy: HostLibsPolicy::Always,
             store: &w.store,
             ld_cache: &w.cache,
@@ -2227,6 +2284,7 @@ mod tests {
             fingerprint(
                 &w.cache,
                 &[],
+                &[],
                 HostLibsPolicy::Auto,
                 None,
                 true,
@@ -2252,6 +2310,7 @@ mod tests {
         let before = fingerprint(
             &w.cache,
             &[],
+            &[],
             HostLibsPolicy::Auto,
             None,
             true,
@@ -2262,6 +2321,7 @@ mod tests {
         let after = fingerprint(
             &w.cache,
             &[],
+            &[],
             HostLibsPolicy::Auto,
             None,
             true,
@@ -2269,6 +2329,164 @@ mod tests {
             w.loader_store(),
         );
         assert_ne!(before, after);
+    }
+
+    /// The counterpart directories of the plugin directories the package
+    /// carries join the decision: the compiled-in absolute path itself,
+    /// and the directory's path under every library directory the cache
+    /// names, a multiarch host's included.
+    #[test]
+    fn a_plugin_directory_keys_the_decision_on_its_counterparts() {
+        let w = World::new();
+        let multiarch = w.host_lib.join("x86_64-linux-gnu");
+        let alsa = multiarch.join("alsa-lib");
+        fs::create_dir_all(&alsa).unwrap();
+        let named = multiarch.join("libasound.so.2");
+        fs::write(&named, b"elf").unwrap();
+        let refs: Vec<String> = vec![named.to_string_lossy().into_owned()];
+        let str_refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        fs::write(&w.cache, new_cache(&str_refs)).unwrap();
+        let absolute = w.host_lib.join("alsa-lib");
+        fs::create_dir_all(&absolute).unwrap();
+        let carried = vec![PluginDir {
+            relative: "lib/alsa-lib".to_owned(),
+            lib_relative: "alsa-lib".to_owned(),
+            absolutes: vec![absolute.to_string_lossy().into_owned()],
+        }];
+        let with = fingerprint(
+            &w.cache,
+            &carried,
+            &[],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        assert!(
+            with.contains(&format!("\x1f{}", alsa.display())),
+            "the multiarch counterpart is stamped: {with}"
+        );
+        assert!(
+            with.contains(&format!("\x1f{}", absolute.display())),
+            "the same absolute path is stamped: {with}"
+        );
+        let plain = fingerprint(
+            &w.cache,
+            &[],
+            &[],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        assert!(!plain.contains(alsa.to_string_lossy().as_ref()));
+        assert_ne!(plain, with);
+    }
+
+    /// A counterpart that does not exist is stamped nowhere: neither a
+    /// compiled-in absolute that is missing, nor a library-directory
+    /// join the host has no such directory under.
+    #[test]
+    fn an_absent_counterpart_is_not_stamped() {
+        let w = World::new();
+        w.host("libasound.so.2", &versioned(&[]));
+        let carried = vec![PluginDir {
+            relative: "lib/alsa-lib".to_owned(),
+            lib_relative: "alsa-lib".to_owned(),
+            absolutes: vec![w.host_lib.join("nowhere").to_string_lossy().into_owned()],
+        }];
+        let stamped = fingerprint(
+            &w.cache,
+            &carried,
+            &[],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        assert!(!stamped.contains("nowhere"));
+        assert!(!stamped.contains("alsa-lib"));
+    }
+
+    /// A module arriving in, or leaving, a counterpart directory changes
+    /// the fingerprint, so the decision it keyed recomputes.
+    #[test]
+    fn a_module_added_to_or_removed_from_a_counterpart_rekeys_the_decision() {
+        let w = World::new();
+        w.host("libasound.so.2", &versioned(&[]));
+        let alsa = w.host_lib.join("alsa-lib");
+        fs::create_dir_all(&alsa).unwrap();
+        let carried = vec![PluginDir {
+            relative: "lib/alsa-lib".to_owned(),
+            lib_relative: "alsa-lib".to_owned(),
+            absolutes: Vec::new(),
+        }];
+        let stamp = || {
+            fingerprint(
+                &w.cache,
+                &carried,
+                &[],
+                HostLibsPolicy::Auto,
+                None,
+                true,
+                &w.nsswitch,
+                w.loader_store(),
+            )
+        };
+        let before = stamp();
+        let module = alsa.join("libasound_module_pcm_pipe.so");
+        fs::write(&module, b"elf").unwrap();
+        // Set explicitly: a directory's mtime can be coarser than the
+        // time between the two writes.
+        fs::File::open(&alsa)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let added = stamp();
+        assert_ne!(before, added);
+        fs::remove_file(&module).unwrap();
+        fs::File::open(&alsa)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000))
+            .unwrap();
+        let removed = stamp();
+        assert_ne!(added, removed);
+    }
+
+    /// A launch after a host module arrives in a counterpart directory
+    /// recomputes the decision, and its farm is a new one.
+    #[test]
+    fn a_new_module_in_a_counterpart_resolves_afresh() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let alsa = w.host_lib.join("alsa-lib");
+        fs::create_dir_all(&alsa).unwrap();
+        w.carry(vec![PluginDir {
+            relative: "lib/alsa-lib".to_owned(),
+            lib_relative: "alsa-lib".to_owned(),
+            absolutes: Vec::new(),
+        }]);
+        let first = w.resolve_full(HostLibsPolicy::Always, None, true);
+        let farm1 = first.farm.clone().expect("a farm the launch built");
+        fs::write(alsa.join("libasound_module_pcm_pipe.so"), b"elf").unwrap();
+        fs::File::open(&alsa)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+        let second = w.resolve_full(HostLibsPolicy::Always, None, true);
+        let farm2 = second.farm.clone().expect("a farm the launch built");
+        assert_ne!(farm1, farm2);
+        fs::remove_file(alsa.join("libasound_module_pcm_pipe.so")).unwrap();
+        fs::File::open(&alsa)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000))
+            .unwrap();
+        let third = w.resolve_full(HostLibsPolicy::Always, None, true);
+        assert_ne!(farm2, third.farm.unwrap());
     }
 
     /// A recorded decision is served only while its loader copy matches
@@ -2306,6 +2524,7 @@ mod tests {
         let identity = SelectionIdentity::new(&[]).unwrap();
         let fingerprint = fingerprint(
             &w.cache,
+            &[],
             &[w.icd_dir.to_str().unwrap()],
             HostLibsPolicy::Auto,
             None,
@@ -2355,6 +2574,7 @@ mod tests {
         let identity = SelectionIdentity::new(&[]).unwrap();
         let fingerprint = fingerprint(
             &w.cache,
+            &[],
             &[w.icd_dir.to_str().unwrap()],
             HostLibsPolicy::Auto,
             None,
@@ -2752,6 +2972,7 @@ mod tests {
         let req = Request {
             pkg_root: &w.pkg,
             lib_dirs: &["lib"],
+            plugin_dirs: &[],
             policy: HostLibsPolicy::Auto,
             store: &w.store,
             ld_cache: &w.cache,
@@ -3099,6 +3320,7 @@ mod tests {
         let set_roots: Vec<PathBuf> = Vec::new();
         let fingerprint = fingerprint(
             &w.cache,
+            &[],
             &[icd_dir.as_str()],
             HostLibsPolicy::Auto,
             None,
@@ -3141,6 +3363,7 @@ mod tests {
         let set_roots: Vec<PathBuf> = Vec::new();
         let fingerprint = fingerprint(
             &w.cache,
+            &[],
             &[icd_dir.as_str()],
             HostLibsPolicy::Auto,
             None,

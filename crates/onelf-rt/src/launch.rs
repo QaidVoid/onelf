@@ -762,6 +762,16 @@ pub fn resolve_launch(
         return Resolved::never();
     };
     let ld_cache = drivers::cache_file();
+    // A record the codec refuses is not a reason to launch without the
+    // resolver: the package simply contributes no counterparts, and the
+    // reason is on the terminal.
+    let plugin_dirs = match crate::hostpaths::read_plugin_dirs(pkg) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            eprintln!("onelf-rt: not considering the host's plugin modules ({e})");
+            Vec::new()
+        }
+    };
 
     let mut platform = None;
     // A set holds the toolkit, and the toolkit is what usually names a
@@ -810,6 +820,7 @@ pub fn resolve_launch(
         &Request {
             pkg_root,
             lib_dirs: &lib_dirs,
+            plugin_dirs: &plugin_dirs,
             policy,
             store: &store,
             ld_cache: &ld_cache,

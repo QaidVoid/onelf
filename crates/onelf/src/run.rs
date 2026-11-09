@@ -235,6 +235,7 @@ pub fn run(
                 &Request {
                     pkg_root: &dir,
                     lib_dirs: &lib_dir_strs,
+                    plugin_dirs: &[],
                     policy,
                     store: &store,
                     ld_cache: &drivers::cache_file(),

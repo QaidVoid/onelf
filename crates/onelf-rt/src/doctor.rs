@@ -701,9 +701,23 @@ fn verdicts(
         );
     }
     let loader_place = onelf_rt::cache::LoaderPlace::for_this_uid();
+    let plugin_dirs = match onelf_rt::hostpaths::read_plugin_dirs(pkg) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            line(
+                out,
+                &format!(
+                    "  plugin directories: the record is refused, so no host module \
+                     is considered ({e})"
+                ),
+            );
+            Vec::new()
+        }
+    };
     let decision = resolve::decide(&Request {
         pkg_root: root,
         lib_dirs: &lib_dirs,
+        plugin_dirs: &plugin_dirs,
         policy,
         store: &store,
         ld_cache: &ld_cache,
