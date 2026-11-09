@@ -16,6 +16,7 @@ pub mod ldso;
 pub mod manifest;
 pub mod paths;
 pub mod payload;
+pub mod plugindirs;
 pub mod provider_index;
 pub mod reader;
 pub mod resolve;

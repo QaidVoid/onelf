@@ -41,7 +41,7 @@ pub const MAX_RELATIVE_BYTES: usize = 2048;
 pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 
 /// The longest excerpt of a path an error quotes, in characters.
-const EXCERPT_CHARS: usize = 128;
+pub(crate) const EXCERPT_CHARS: usize = 128;
 
 /// One overlay: the absolute path and the bundle directory, relative to
 /// the package root, that answers for it.
@@ -254,20 +254,8 @@ fn check_pair<'a>(
     targets: &mut BTreeSet<&'a str>,
 ) -> Result<(), PathsError> {
     let refuse = |kind| Err(PathsError::pair(kind, line, absolute, relative));
-    if absolute.len() > MAX_ABSOLUTE_BYTES {
-        return refuse(PathsErrorKind::AbsoluteTooLong);
-    }
-    if absolute.chars().any(char::is_control) {
-        return refuse(PathsErrorKind::ControlCharacter);
-    }
-    let Some(below_root) = absolute.strip_prefix('/') else {
-        return refuse(PathsErrorKind::NotAbsolute);
-    };
-    if below_root
-        .split('/')
-        .any(|part| matches!(part, "" | "." | ".."))
-    {
-        return refuse(PathsErrorKind::Unnormalized);
+    if let Some(kind) = absolute_error(absolute) {
+        return refuse(kind);
     }
     if let Some(kind) = relative_error(relative) {
         return refuse(kind);
@@ -313,8 +301,31 @@ pub(crate) fn relative_error(relative: &str) -> Option<PathsErrorKind> {
     None
 }
 
+/// Why `absolute` is not a target a record may name, if it is not: over
+/// [`MAX_ABSOLUTE_BYTES`], holding a control character, not absolute, or
+/// not normalized. Shared with the other records that name absolute
+/// paths, so each refuses exactly the same paths.
+pub(crate) fn absolute_error(absolute: &str) -> Option<PathsErrorKind> {
+    if absolute.len() > MAX_ABSOLUTE_BYTES {
+        return Some(PathsErrorKind::AbsoluteTooLong);
+    }
+    if absolute.chars().any(char::is_control) {
+        return Some(PathsErrorKind::ControlCharacter);
+    }
+    let Some(below_root) = absolute.strip_prefix('/') else {
+        return Some(PathsErrorKind::NotAbsolute);
+    };
+    if below_root
+        .split('/')
+        .any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Some(PathsErrorKind::Unnormalized);
+    }
+    None
+}
+
 /// A bounded, escaped excerpt of a path for a diagnostic.
-fn excerpt(path: &str) -> String {
+pub(crate) fn excerpt(path: &str) -> String {
     path.chars()
         .take(EXCERPT_CHARS)
         .flat_map(char::escape_default)
