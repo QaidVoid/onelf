@@ -188,11 +188,18 @@ fn facts_for_launch() -> Vec<ProviderFacts> {
 }
 
 /// Whether a file starts with ELF data. A shorter read, like any other
-/// file whose head is not ELF, means there is nothing to inspect.
+/// file whose head is not ELF, means there is nothing to inspect. Opened
+/// nonblocking like every other reader, so a named pipe swapped in
+/// cannot hang the walk.
 fn has_elf_magic(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut magic = [0u8; 4];
-    fs::File::open(path)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+    fs::File::options()
+        .read(true)
+        .custom_flags(0o4000)
+        .open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
         .is_ok_and(|()| magic == *b"\x7fELF")
 }
 
@@ -558,16 +565,24 @@ fn architecture_findings(
 /// `requirements`, whose file names must appear in `needed`.
 #[cfg(test)]
 pub(crate) mod fixture {
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
     const SHT_STRTAB: u32 = 3;
     const SHT_DYNAMIC: u32 = 6;
-    const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
+    const SHT_GNU_VERDEF: u32 = 0x6fff_fffc;
     const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
     const DT_NEEDED: u64 = 1;
     const DT_SONAME: u64 = 14;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+    const DT_VERDEF: u64 = 0x6fff_fffc;
+    const DT_VERDEFNUM: u64 = 0x6fff_fffd;
     const DT_VERNEED: u64 = 0x6fff_fffe;
     const DT_VERNEEDNUM: u64 = 0x6fff_ffff;
     const VERDEF_ENTRY: usize = 20;
     const VERDAUX_ENTRY: usize = 8;
+
+    use onelf_format::verdef::elf_hash;
 
     pub(crate) fn elf64(
         machine: u16,
@@ -590,31 +605,14 @@ pub(crate) mod fixture {
             .map(|(_, n)| intern(n, &mut strings))
             .collect();
 
-        let mut dynamic = Vec::new();
-        for offset in &needed_offsets {
-            dynamic.extend_from_slice(&DT_NEEDED.to_le_bytes());
-            dynamic.extend_from_slice(&(*offset as u64).to_le_bytes());
-        }
-        if let Some(offset) = soname_offset {
-            dynamic.extend_from_slice(&DT_SONAME.to_le_bytes());
-            dynamic.extend_from_slice(&(offset as u64).to_le_bytes());
-        }
-        if !requirements.is_empty() {
-            dynamic.extend_from_slice(&DT_VERNEED.to_le_bytes());
-            dynamic.extend_from_slice(&0x5000u64.to_le_bytes());
-            dynamic.extend_from_slice(&DT_VERNEEDNUM.to_le_bytes());
-            dynamic.extend_from_slice(&(requirements.len() as u64).to_le_bytes());
-        }
-        dynamic.extend_from_slice(&[0; 16]);
-
         let mut verdef = Vec::new();
-        for (i, (flags, _)) in definitions.iter().enumerate() {
+        for (i, (flags, name)) in definitions.iter().enumerate() {
             let last = i + 1 == definitions.len();
             verdef.extend_from_slice(&1u16.to_le_bytes());
             verdef.extend_from_slice(&flags.to_le_bytes());
             verdef.extend_from_slice(&(i as u16).to_le_bytes());
             verdef.extend_from_slice(&1u16.to_le_bytes());
-            verdef.extend_from_slice(&0u32.to_le_bytes());
+            verdef.extend_from_slice(&elf_hash(name).to_le_bytes());
             verdef.extend_from_slice(&(VERDEF_ENTRY as u32).to_le_bytes());
             let next = if last {
                 0
@@ -642,6 +640,7 @@ pub(crate) mod fixture {
             }
             for (j, (flags, name)) in versions.iter().enumerate() {
                 let at = start + 16 + j * 16;
+                verneed[at..at + 4].copy_from_slice(&elf_hash(name).to_le_bytes());
                 verneed[at + 4..at + 6].copy_from_slice(&flags.to_le_bytes());
                 verneed[at + 6..at + 8].copy_from_slice(&((j + 2) as u16).to_le_bytes());
                 verneed[at + 8..at + 12].copy_from_slice(&intern(name, &mut strings).to_le_bytes());
@@ -651,43 +650,116 @@ pub(crate) mod fixture {
             }
         }
 
-        let shoff = 64usize;
+        // The table bodies carry virtual addresses equal to their file
+        // offsets, so every dynamic tag can name its table before the
+        // layout is fixed: the entry count is known up front.
+        let dynamic_entries = needed.len()
+            + usize::from(soname.is_some())
+            + 2
+            + 2 * usize::from(!definitions.is_empty())
+            + 2 * usize::from(!requirements.is_empty())
+            + 1;
+        let ehdr = 64usize;
+        let phentsize = 56usize;
         let shentsize = 64usize;
-        let mut sections: Vec<(u32, Vec<u8>, u64, u32, u32)> = vec![
-            (SHT_STRTAB, strings.clone(), 0, 0, 0),
-            (SHT_DYNAMIC, dynamic, 0, 1, 0),
-        ];
-        if !verdef.is_empty() {
-            sections.push((SHT_GNU_VERDEF, verdef, 0, 1, 0));
+        let shnum =
+            1 + 2 + usize::from(!definitions.is_empty()) + usize::from(!requirements.is_empty());
+        let shoff = ehdr + 2 * phentsize;
+        let strings_at = shoff + shnum * shentsize;
+        let dynamic_at = strings_at + strings.len();
+        let verdef_at = dynamic_at + dynamic_entries * 16;
+        let verneed_at = verdef_at + verdef.len();
+        let total = verneed_at + verneed.len();
+
+        let mut dynamic = Vec::new();
+        let mut entry = |tag: u64, value: u64| {
+            dynamic.extend_from_slice(&tag.to_le_bytes());
+            dynamic.extend_from_slice(&value.to_le_bytes());
+        };
+        for offset in &needed_offsets {
+            entry(DT_NEEDED, *offset as u64);
         }
-        if !verneed.is_empty() {
-            sections.push((SHT_GNU_VERNEED, verneed, 0x5000, 1, verneed_count));
+        if let Some(offset) = soname_offset {
+            entry(DT_SONAME, offset as u64);
         }
-        let shnum = sections.len() + 1;
-        let mut body_at = shoff + shentsize * shnum;
-        let mut offsets = Vec::new();
-        for (_, bytes, _, _, _) in &sections {
-            offsets.push(body_at as u64);
-            body_at += bytes.len();
+        entry(DT_STRTAB, strings_at as u64);
+        entry(DT_STRSZ, strings.len() as u64);
+        if !definitions.is_empty() {
+            entry(DT_VERDEF, verdef_at as u64);
+            entry(DT_VERDEFNUM, definitions.len() as u64);
         }
-        let mut out = vec![0u8; body_at];
+        if !requirements.is_empty() {
+            entry(DT_VERNEED, verneed_at as u64);
+            entry(DT_VERNEEDNUM, requirements.len() as u64);
+        }
+        entry(0, 0);
+        debug_assert_eq!(dynamic.len(), dynamic_entries * 16);
+
+        let sections: Vec<(u32, &[u8], u64, u32, u32)> = [
+            (SHT_STRTAB, &strings[..], strings_at as u64, 0, 0),
+            (SHT_DYNAMIC, &dynamic[..], dynamic_at as u64, 1, 0),
+        ]
+        .into_iter()
+        .chain(
+            [(
+                SHT_GNU_VERDEF,
+                &verdef[..],
+                verdef_at as u64,
+                1,
+                definitions.len() as u32,
+            )]
+            .into_iter()
+            .take(usize::from(!definitions.is_empty())),
+        )
+        .chain(
+            [(
+                SHT_GNU_VERNEED,
+                &verneed[..],
+                verneed_at as u64,
+                1,
+                verneed_count,
+            )]
+            .into_iter()
+            .take(usize::from(!requirements.is_empty())),
+        )
+        .collect();
+
+        let mut out = vec![0u8; total];
         out[0..4].copy_from_slice(b"\x7fELF");
         out[4] = 2;
         out[5] = 1;
         out[16..18].copy_from_slice(&3u16.to_le_bytes());
         out[18..20].copy_from_slice(&machine.to_le_bytes());
+        out[32..40].copy_from_slice(&(ehdr as u64).to_le_bytes());
+        out[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes());
+        out[56..58].copy_from_slice(&2u16.to_le_bytes());
         out[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
         out[58..60].copy_from_slice(&(shentsize as u16).to_le_bytes());
         out[60..62].copy_from_slice(&(shnum as u16).to_le_bytes());
+        let phdr = |out: &mut [u8], index: usize, kind: u32, offset: u64, filesz: u64| {
+            let at = ehdr + index * phentsize;
+            out[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            out[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+            out[at + 16..at + 24].copy_from_slice(&offset.to_le_bytes());
+            out[at + 32..at + 40].copy_from_slice(&filesz.to_le_bytes());
+        };
+        phdr(&mut out, 0, PT_LOAD, 0, total as u64);
+        phdr(
+            &mut out,
+            1,
+            PT_DYNAMIC,
+            dynamic_at as u64,
+            dynamic.len() as u64,
+        );
         for (i, (kind, bytes, address, link, info)) in sections.iter().enumerate() {
             let at = shoff + (i + 1) * shentsize;
             out[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
             out[at + 16..at + 24].copy_from_slice(&address.to_le_bytes());
-            out[at + 24..at + 32].copy_from_slice(&offsets[i].to_le_bytes());
+            out[at + 24..at + 32].copy_from_slice(&address.to_le_bytes());
             out[at + 32..at + 40].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
             out[at + 40..at + 44].copy_from_slice(&link.to_le_bytes());
             out[at + 44..at + 48].copy_from_slice(&info.to_le_bytes());
-            let at = offsets[i] as usize;
+            let at = *address as usize;
             out[at..at + bytes.len()].copy_from_slice(bytes);
         }
         out
@@ -814,13 +886,13 @@ mod tests {
     fn a_truncated_object_ends_preparation_naming_the_set_and_object() {
         let tree = Tree::new("truncated");
         // Cutting the section table's span leaves valid-looking ELF data
-        // whose sections lie outside what survived.
+        // whose mappings lie outside what survived.
         let mut bytes = elf64(62, Some("libcut.so.1"), &["libc.so.6"], &[], &[]);
         bytes.truncate(bytes.len() - 8);
         tree.write("set/lib/libcut.so.1", &bytes);
         let why = prepare("qt", &pin_of("qt"), &tree.set("set")).unwrap_err();
         assert!(why.contains("lib/libcut.so.1"), "{why}");
-        assert!(why.contains("ELF"), "{why}");
+        assert!(why.contains("outside the file"), "{why}");
 
         // Cutting the head between magic and header is refused too.
         fs::remove_file(tree.set("set").join("lib/libcut.so.1")).unwrap();

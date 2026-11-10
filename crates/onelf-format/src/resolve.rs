@@ -37,7 +37,7 @@ use crate::drivers::{self, DRIVER_FAMILIES};
 use crate::footer::HostLibsPolicy;
 use crate::ldso::{self, MAX_LOADER_BYTES};
 use crate::plugindirs::PluginDir;
-use crate::verdef::{self, Choice, VersionSet};
+use crate::verdef::{self, Choice, ElfFacts, LibcFamily, VersionSet};
 
 /// What a launch takes from the host.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -51,6 +51,11 @@ pub struct Resolution {
     /// Sonames whose two copies could not be ordered. The bundled copy is
     /// used; these are reported so the publisher can see them.
     pub incomparable: Vec<String>,
+    /// The host modules the counterpart directories hold that the
+    /// decision admitted, as their host paths, sorted. A launch is
+    /// meant to present them beside the bundled members of their plugin
+    /// directory; their host dependencies come through the farm.
+    pub admitted: Vec<PathBuf>,
 }
 
 /// The private copy of the host loader a launch runs, closed to the
@@ -418,17 +423,19 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
 /// disk past what the runtime could judge up front, the request is
 /// decided again with the store refused. The bundled pair runs and the
 /// rest of the decision stands, the driver closure with it. That fallback
-/// is not recorded, so a later launch tries the copy again.
+/// is not recorded, so a later launch tries the copy again. A resolution
+/// whose farm could not be built is likewise not recorded, so a later
+/// launch tries the farm again.
 fn fresh(req: &Request, fingerprint: &str, host: &HostIndex) -> (Decision, Resolution, bool) {
     let decision = decide_on(req, host);
     let Some(loader) = &decision.host_interp else {
-        let resolution = materialized(req, fingerprint, &decision);
-        return (decision, resolution, true);
+        let (resolution, farm_built) = materialized(req, fingerprint, &decision);
+        return (decision, resolution, farm_built);
     };
     match keep_loader_copy(loader, req.loader_store) {
         Ok(()) => {
-            let resolution = materialized(req, fingerprint, &decision);
-            (decision, resolution, true)
+            let (resolution, farm_built) = materialized(req, fingerprint, &decision);
+            (decision, resolution, farm_built)
         }
         Err(why) => {
             eprintln!(
@@ -441,15 +448,17 @@ fn fresh(req: &Request, fingerprint: &str, host: &HostIndex) -> (Decision, Resol
                 ..*req
             };
             let decision = decide_on(&refused, host);
-            let resolution = materialized(&refused, fingerprint, &decision);
+            let (resolution, _) = materialized(&refused, fingerprint, &decision);
             (decision, resolution, false)
         }
     }
 }
 
-/// The resolution of a decision, with its farm built. A farm that cannot
-/// be written leaves nothing taken from the host.
-fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> Resolution {
+/// The resolution of a decision, with its farm built, and whether the
+/// farm was built. A farm that cannot be written leaves nothing taken
+/// from the host, and the caller leaves the record alone so a later
+/// launch tries again.
+fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> (Resolution, bool) {
     let copy = decision.host_interp.as_ref().map(|l| l.copy.as_path());
     let farm = match materialize(req.store, fingerprint, &decision.winners, copy) {
         Ok(farm) => farm,
@@ -458,17 +467,32 @@ fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> Resolu
                 "onelf-rt: resolver: cannot write {}: {e}",
                 req.store.display()
             );
-            return Resolution::default();
+            return (Resolution::default(), false);
         }
     };
-    Resolution {
+    let resolution = Resolution {
         farm,
         host_interp: decision.host_interp.as_ref().map(|loader| HostLoader {
             path: loader.copy.clone(),
             hash: loader.hash,
         }),
         incomparable: decision.incomparable.clone(),
-    }
+        admitted: decision.admitted.clone(),
+    };
+    (resolution, true)
+}
+
+/// A host module the resolver refused, with the first object of its
+/// closure that failed a check and why it failed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModuleRefusal {
+    /// The module refused.
+    pub module: PathBuf,
+    /// The first object of the module's closure that failed a check,
+    /// the module itself when its own facts fail.
+    pub object: PathBuf,
+    /// Why that object failed.
+    pub reason: String,
 }
 
 /// What the resolver decides for a request, worked out afresh and with
@@ -478,7 +502,8 @@ pub struct Decision {
     /// Every soname weighed, in order, with the copy that won: `None` for
     /// one the bundle lacks, which only the host can supply.
     pub compared: Vec<(String, Option<Choice>)>,
-    /// The host libraries chosen, by soname.
+    /// The host libraries chosen, by soname. A loader soname names the
+    /// interpreter the pair runs, not the cache's entry for it.
     pub winners: BTreeMap<String, PathBuf>,
     /// The host loader the pair runs under, when the host's libc won and
     /// its loader could be closed.
@@ -487,6 +512,12 @@ pub struct Decision {
     /// and why. The bundled pair runs instead.
     pub host_interp_refused: Option<(PathBuf, String)>,
     pub incomparable: Vec<String>,
+    /// The host modules the counterpart directories hold that the
+    /// decision admitted, sorted by path. Their host dependencies are
+    /// among the winners.
+    pub admitted: Vec<PathBuf>,
+    /// The host modules the decision refused, sorted by module path.
+    pub refused: Vec<ModuleRefusal>,
     /// Where in the store the link farm for these winners lives.
     pub farm: Option<PathBuf>,
 }
@@ -573,10 +604,12 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
         }
     }
 
-    // The driver closure is what the host is expected to supply. A member
-    // the bundle also carries is compared; one it does not carry can only
-    // come from the host. Under `always` every bundled soname is compared
-    // as well.
+    // What the host is expected to supply is chosen first, so the
+    // counterpart modules below weigh themselves against the copies the
+    // decision actually installs. A member of the driver closure the
+    // bundle also carries is compared; one it does not carry can only
+    // come from the host. Under `always` every bundled soname is
+    // compared as well.
     let mut candidates: Vec<String> = host.driver_closure().into_iter().collect();
     if decision.host_interp.is_some() {
         candidates.extend(host.closure(host_libc_opens(req.nsswitch)));
@@ -586,34 +619,72 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
     }
     candidates.sort();
     candidates.dedup();
-    for name in candidates {
-        if is_libc_family(&name) {
+    let mut chosen: BTreeSet<String> = BTreeSet::new();
+    let mut choose = |decision: &mut Decision, name: &str| {
+        if !chosen.insert(name.to_string()) {
+            return;
+        }
+        if is_libc_family(name) {
             // A closed host loader finds nothing on its own, so a member
             // of its family that the host libc or a host driver opens and
             // the bundle lacks has to be chosen like any other library.
-            if decision.host_interp.is_some()
-                && !ldso::is_glibc_loader_name(&name)
-                && !bundled.contains_key(&name)
-                && let Some(host_path) = host.libs.get(&name)
-            {
-                decision.compared.push((name.clone(), None));
-                decision.winners.insert(name, host_path.clone());
+            // A glibc loader soname instead names the interpreter the
+            // pair runs, whatever the cache's entry carries: the farm
+            // links the closed copy under the demanded name.
+            if let Some(interp) = decision.host_interp.as_ref() {
+                if ldso::is_glibc_loader_name(name) {
+                    decision
+                        .winners
+                        .entry(name.to_string())
+                        .or_insert(interp.source.clone());
+                } else if !bundled.contains_key(name)
+                    && let Some(host_path) = host.libs.get(name)
+                {
+                    decision.compared.push((name.to_string(), None));
+                    decision.winners.insert(name.to_string(), host_path.clone());
+                }
             }
-            continue;
+            return;
         }
-        let Some(host_path) = host.libs.get(&name) else {
-            continue;
+        let Some(host_path) = host.libs.get(name) else {
+            return;
         };
         let choice = bundled
-            .get(&name)
+            .get(name)
             .map(|bundled_path| verdef::compare(&versions(bundled_path), &versions(host_path)));
-        decision.compared.push((name.clone(), choice));
+        decision.compared.push((name.to_string(), choice));
         match choice.unwrap_or(Choice::Host) {
             Choice::Host => {
-                decision.winners.insert(name, host_path.clone());
+                decision.winners.insert(name.to_string(), host_path.clone());
             }
-            Choice::Incomparable => decision.incomparable.push(name),
+            Choice::Incomparable => decision.incomparable.push(name.to_string()),
             Choice::Bundle => {}
+        }
+    };
+    for name in &candidates {
+        choose(&mut decision, name);
+    }
+
+    // The package's counterpart modules lean on the copies the launch
+    // would load, winners included; the refusals ride the decision for
+    // the doctor to report. The sonames the admitted closures reached
+    // are then chosen like any other, so they and their needs reach the
+    // farm.
+    let counterpart = counterpart_dirs(req.plugin_dirs, req.ld_cache);
+    if !counterpart.is_empty() {
+        let loader = decision.host_interp.as_ref().map(|l| l.source.as_path());
+        let (admitted, refused, reached) = admit_modules(
+            host,
+            &bundled,
+            &decision.winners,
+            &counterpart,
+            bundled.get(LIBC).map(|p| p.as_path()),
+            loader,
+        );
+        decision.admitted = admitted;
+        decision.refused = refused;
+        for name in &reached {
+            choose(&mut decision, name);
         }
     }
     decision
@@ -661,7 +732,7 @@ impl SelectionIdentity {
         pins.dedup();
         let mut canonical = String::new();
         for pin in &pins {
-            admitted(pin)?;
+            pin_in_bounds(pin)?;
             if !canonical.is_empty() {
                 canonical.push('\n');
             }
@@ -707,7 +778,7 @@ impl SelectionIdentity {
 /// Whether `pin` is inside the bounds a record can carry: a nonempty
 /// name of at most the label bound, with no control character, and
 /// exactly one BLAKE3 digest in lowercase hex.
-fn admitted(pin: &ActivePin) -> Option<()> {
+fn pin_in_bounds(pin: &ActivePin) -> Option<()> {
     let label = pin.label.as_bytes();
     if label.is_empty() || label.len() > MAX_PIN_LABEL_BYTES {
         return None;
@@ -825,12 +896,15 @@ impl HostIndex {
         }
     }
 
-    /// The loader the host's libc was built with: its own `PT_INTERP`,
-    /// or failing that any loader the cache names.
+    /// The interpreter the host pair runs: its libc's `PT_INTERP` when
+    /// it names a path that exists here, else the cache's own loader
+    /// soname. An existing path comes back whatever it is, so closing it
+    /// records why it cannot run instead of silently falling back to the
+    /// bundled pair.
     fn loader_for(&self, host_libc: &Path) -> Option<PathBuf> {
         if let Some(interp) = crate::elf::read_interp(host_libc) {
             let interp = PathBuf::from(interp);
-            if interp.is_file() {
+            if interp.exists() {
                 return Some(interp);
             }
         }
@@ -982,6 +1056,330 @@ fn counterpart_dirs(plugin_dirs: &[PluginDir], ld_cache: &Path) -> Vec<PathBuf> 
     out.into_iter().filter(|dir| dir.is_dir()).collect()
 }
 
+/// The module files a directory holds: regular files whose name ends in
+/// `.so`, sorted. A directory that cannot be read holds none.
+fn modules_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|e| e == "so")
+                && fs::metadata(path).is_ok_and(|md| md.is_file())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The facts of one object, read once per decision. A file whose facts
+/// cannot be read is remembered as unreadable.
+fn facts_of(path: &Path, cache: &mut BTreeMap<PathBuf, Option<ElfFacts>>) -> Option<ElfFacts> {
+    cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| verdef::read_facts(path).ok())
+        .clone()
+}
+
+/// The versions the copy of `dependency` this launch would load
+/// defines, or `None` when nothing supplies it.
+///
+/// The copy that loads is the one the decision chose: its winner, when
+/// there is one, which for a glibc loader soname is the loader the
+/// pair runs (the interpreter when the host's pair won, the bundle's
+/// own loader copy under the bundled pair) rather than whatever entry
+/// the cache carries; the host's family copy under its pair whenever
+/// the host has one; the bundled copy otherwise. `loader` is the
+/// interpreter the host's pair runs, when that pair won, and `None` is
+/// the bundled pair. A copy whose facts cannot be read supplies
+/// nothing: the launch would keep it or link it, and nothing could
+/// vouch for its versions. Without a winner the bundle keeps a soname
+/// it carries, and the bundled copy's versions are the conservative
+/// measure, because a host copy only wins by defining a superset.
+fn supplier_versions(
+    dependency: &str,
+    bundled: &BTreeMap<String, PathBuf>,
+    host: &HostIndex,
+    winners: &BTreeMap<String, PathBuf>,
+    loader: Option<&Path>,
+    facts: &mut BTreeMap<PathBuf, Option<ElfFacts>>,
+) -> Option<VersionSet> {
+    if ldso::is_glibc_loader_name(dependency) {
+        let path = if loader.is_some() {
+            loader
+        } else {
+            bundled.get(dependency).map(|p| p.as_path())
+        };
+        return path
+            .and_then(|path| facts_of(path, facts))
+            .filter(|f| f.mappable)
+            .map(|f| f.defined_versions);
+    }
+    if let Some(path) = winners.get(dependency) {
+        return facts_of(path, facts)
+            .filter(|f| f.mappable)
+            .map(|f| f.defined_versions);
+    }
+    if is_libc_family(dependency) {
+        if loader.is_some()
+            && let Some(path) = host.libs.get(dependency)
+        {
+            return facts_of(path, facts)
+                .filter(|f| f.mappable)
+                .map(|f| f.defined_versions);
+        }
+        return bundled
+            .get(dependency)
+            .and_then(|path| facts_of(path, facts))
+            .filter(|f| f.mappable)
+            .map(|f| f.defined_versions);
+    }
+    if !bundled.contains_key(dependency) {
+        return host
+            .libs
+            .get(dependency)
+            .and_then(|path| facts_of(path, facts))
+            .filter(|f| f.mappable)
+            .map(|f| f.defined_versions);
+    }
+    bundled
+        .get(dependency)
+        .and_then(|path| facts_of(path, facts))
+        .filter(|f| f.mappable)
+        .map(|f| f.defined_versions)
+}
+
+/// Admit or refuse each module the counterpart directories hold.
+///
+/// A module is admitted when every object of its closure through the
+/// host's libraries has the bundled pair's class and machine, is of no
+/// foreign libc family, carries no old-style search path the loader
+/// searches ahead of the farm, names no filter object outside the
+/// closure, demands only versions the copy that would load defines,
+/// and needs only sonames something supplies: a decision
+/// winner, a bundled copy, a glibc loader soname, which loads the
+/// loader the pair runs when a host pair won, or a host copy, which is
+/// then chosen like any other winner. Under the bundled pair (`loader`
+/// `None`) the exception is a family member the bundle lacks, which
+/// nothing can supply: the family is not farmed piecemeal. A refusal
+/// names the first object that failed and why. The host sonames the
+/// admitted closures reach come back, to join the decision's
+/// candidates.
+///
+/// Without a bundled pair to check against there is no admission:
+/// every module is refused. `loader` is the interpreter the host's
+/// pair runs, when that pair won.
+fn admit_modules(
+    host: &HostIndex,
+    bundled: &BTreeMap<String, PathBuf>,
+    winners: &BTreeMap<String, PathBuf>,
+    dirs: &[PathBuf],
+    reference: Option<&Path>,
+    loader: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<ModuleRefusal>, BTreeSet<String>) {
+    let mut admitted: Vec<PathBuf> = Vec::new();
+    let mut refused: Vec<ModuleRefusal> = Vec::new();
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    let Some(pair) = reference.and_then(|path| verdef::read_facts(path).ok()) else {
+        for dir in dirs {
+            for module in modules_in(dir) {
+                refused.push(ModuleRefusal {
+                    object: module.clone(),
+                    module,
+                    reason: "no bundled pair to check against".to_string(),
+                });
+            }
+        }
+        refused.sort();
+        return (admitted, refused, candidates);
+    };
+    let mut facts: BTreeMap<PathBuf, Option<ElfFacts>> = BTreeMap::new();
+    for dir in dirs {
+        for module in modules_in(dir) {
+            match closure_verdict(&module, host, bundled, winners, &pair, loader, &mut facts) {
+                Ok(reached) => {
+                    candidates.extend(reached);
+                    admitted.push(module);
+                }
+                Err(refusal) => refused.push(refusal),
+            }
+        }
+    }
+    admitted.sort();
+    refused.sort();
+    (admitted, refused, candidates)
+}
+
+/// Whether `module`'s closure through the host's libraries passes the
+/// checks: `Ok` with the host sonames the closure reaches, to join the
+/// decision's candidates, or `Err` with the first failing object and
+/// its reason. A soname the decision already chose a winner for loads
+/// from that winner, the farm linking it over the bundle's own copy,
+/// so its closure is walked here. A soname without a winner that the
+/// bundle carries loads from the bundle, whose closure is the bundle's
+/// business, validated at launch. `loader` is the interpreter the
+/// host's pair runs, when that pair won: only then can a family member
+/// the bundle lacks be supplied at all, and only then does a glibc
+/// loader soname have a copy to name. `None` is the bundled pair.
+fn closure_verdict(
+    module: &Path,
+    host: &HostIndex,
+    bundled: &BTreeMap<String, PathBuf>,
+    winners: &BTreeMap<String, PathBuf>,
+    pair: &ElfFacts,
+    loader: Option<&Path>,
+    facts: &mut BTreeMap<PathBuf, Option<ElfFacts>>,
+) -> Result<BTreeSet<String>, ModuleRefusal> {
+    let refuse = |object: PathBuf, reason: String| ModuleRefusal {
+        module: module.to_path_buf(),
+        object,
+        reason,
+    };
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    queue.push_back(module.to_path_buf());
+    while let Some(path) = queue.pop_front() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(object) = facts_of(&path, facts) else {
+            return Err(refuse(path, "cannot be read".to_string()));
+        };
+        if object.class != pair.class || object.machine != pair.machine {
+            return Err(refuse(
+                path,
+                "is not built for the package's architecture".to_string(),
+            ));
+        }
+        match object.libc_family {
+            LibcFamily::Glibc | LibcFamily::Unknown => {}
+            LibcFamily::Musl => return Err(refuse(path, "is not of the glibc family".to_string())),
+            LibcFamily::Conflicting => return Err(refuse(path, "mixes libc families".to_string())),
+        }
+        // An object without a load segment cannot be opened as a shared
+        // object at all: admitting it would present a module that fails
+        // at launch instead of a refusal here.
+        if !object.mappable {
+            return Err(refuse(
+                path,
+                "has no load segment, so the loader cannot map it".to_string(),
+            ));
+        }
+        // The loader searches an object's old-style `DT_RPATH` ahead of
+        // the farm, unless the object also carries a runpath, which
+        // supersedes it. A filter object loads its objects outside this
+        // closure: either way would bring in copies the checks never
+        // saw.
+        if object.has_rpath && !object.has_runpath {
+            return Err(refuse(
+                path,
+                "has an old-style search path, which is searched ahead of the farm".to_string(),
+            ));
+        }
+        if object.filtered {
+            return Err(refuse(
+                path,
+                "has a filter object, which loads dependencies the closure does not name"
+                    .to_string(),
+            ));
+        }
+        for (dependency, required) in &object.required_versions {
+            let Some(defined) =
+                supplier_versions(dependency, bundled, host, winners, loader, facts)
+            else {
+                return Err(refuse(
+                    path,
+                    format!("needs {dependency}, which nothing supplies"),
+                ));
+            };
+            let missing = required
+                .iter()
+                .filter(|r| !r.is_weak())
+                .find(|r| !defined.contains(&r.name));
+            if let Some(missing) = missing {
+                return Err(refuse(
+                    path,
+                    format!(
+                        "needs {dependency} version {}, which nothing here defines",
+                        missing.name
+                    ),
+                ));
+            }
+        }
+        for name in &object.needed {
+            // The copy that loads is the decision's winner when there
+            // is one: the farm links it over the bundle's own copy, so
+            // its closure is walked here, whatever the bundle carries.
+            // Without a winner a soname the bundle carries loads from
+            // the bundle, and its closure is the bundle's business,
+            // validated at launch.
+            if let Some(winner) = winners.get(name) {
+                queue.push_back(winner.clone());
+                continue;
+            }
+            if bundled.contains_key(name) {
+                continue;
+            }
+            // A glibc loader soname loads the loader the pair runs,
+            // whatever the cache's entry for the name carries: the
+            // closure walks the interpreter, and the soname is reached
+            // so the farm links the closed copy under it. With only
+            // the bundled pair the bundle's loader copy supplied it
+            // above, or nothing does.
+            if ldso::is_glibc_loader_name(name) {
+                if let Some(loader) = loader {
+                    reached.insert(name.clone());
+                    queue.push_back(loader.to_path_buf());
+                    continue;
+                }
+                // With only the bundled pair the demand is answered by
+                // the loader the process itself runs under, and only by
+                // it: the mapped loader carries its own soname, so a
+                // foreign glibc loader name would still have to load
+                // from disk. Version demands of it stay refused: the
+                // mapped loader's definitions are not on disk to read.
+                let own = pair
+                    .interpreter
+                    .as_deref()
+                    .and_then(|interp| Path::new(interp).file_name())
+                    .and_then(|name| name.to_str());
+                if own == Some(name.as_str()) {
+                    continue;
+                }
+                return Err(refuse(
+                    path,
+                    format!("needs {name}, which nothing supplies"),
+                ));
+            }
+            // A family member rides with the pair that runs. Under the
+            // bundled pair nothing outside the farm can be found, so a
+            // family soname the bundle lacks cannot be supplied at all.
+            if is_libc_family(name) && loader.is_none() {
+                return Err(refuse(
+                    path,
+                    format!("needs {name}, which nothing supplies"),
+                ));
+            }
+            match host.libs.get(name) {
+                Some(host_path) => {
+                    reached.insert(name.clone());
+                    queue.push_back(host_path.clone());
+                }
+                None => {
+                    return Err(refuse(
+                        path,
+                        format!("needs {name}, which nothing supplies"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(reached)
+}
+
 /// `library_path` values from Vulkan ICD and EGL vendor files under
 /// `icd_dirs`. A value with a `/` names a file, absolute or relative to
 /// the file; a bare soname is looked up in `bare_names` and dropped when
@@ -1073,10 +1471,16 @@ fn libs_in(dir: &Path) -> Vec<(String, PathBuf)> {
 /// A description of everything on the host the decision depends on: the
 /// cache image, the name service configuration, the directories the
 /// cache names, the driver description files and the counterparts of the
-/// package's carried plugin directories, each with its size and
-/// modification time, and where loader copies can be kept. Compared
-/// whole, so no hash is needed. Every argument is distinct and a
-/// parameter object would be built at each call site and read once.
+/// package's carried plugin directories with their module files, each
+/// with its size and modification time, and where loader copies can be
+/// kept. Compared whole, so no hash is needed. The stamps carry the
+/// change time as well, which a rewrite always moves and a tool cannot
+/// pin back, so a rewrite beneath a restored modification time still
+/// recomputes. A refusal's evidence in the host's own libraries is not
+/// stamped: it re-examines when any watched host state changes, and
+/// until then the record keeps refusing, which is the safe direction.
+/// Every argument is distinct and a parameter object would be built at
+/// each call site and read once.
 #[allow(clippy::too_many_arguments)]
 fn fingerprint(
     ld_cache: &Path,
@@ -1109,7 +1513,13 @@ fn fingerprint(
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                out.push_str(&format!("={}:{mtime}", md.len()));
+                use std::os::unix::fs::MetadataExt;
+                out.push_str(&format!(
+                    "={}:{mtime}:{}.{}",
+                    md.len(),
+                    md.ctime(),
+                    md.ctime_nsec()
+                ));
             }
             Err(_) => out.push_str("=missing"),
         }
@@ -1124,6 +1534,12 @@ fn fingerprint(
     }
     for dir in counterpart_dirs(plugin_dirs, ld_cache) {
         stamp(&dir);
+        // The module files themselves, so an in-place rewrite at the
+        // same size, invisible to the directory stamp, still recomputes
+        // the decision.
+        for module in modules_in(&dir) {
+            stamp(&module);
+        }
     }
     for dir in icd_dirs {
         stamp(Path::new(dir));
@@ -1142,7 +1558,7 @@ const DECISION_FILE: &str = "decision";
 /// host and the launch's selection identity. The version in the header
 /// steps up whenever the layout changes, so a record naming another
 /// version is a miss, never a misread.
-const SELECTION_RECORD_HEADER: &str = "onelf-resolve-selection 2";
+const SELECTION_RECORD_HEADER: &str = "onelf-resolve-selection 3";
 
 /// The store subdirectory a selection's record lives in, named by the
 /// identity's key. Beside the farms, outside the `onelf-` mountpoint
@@ -1244,7 +1660,14 @@ fn link_target<'p>(name: &str, host: &'p Path, copy: Option<&'p Path>) -> &'p Pa
 /// is larger than any loader.
 fn read_loader(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let file = fs::File::open(path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Opened nonblocking first, so a named pipe or device a hostile
+    // interpreter names cannot hang the open, then refused unless it is
+    // a regular file.
+    let file = fs::File::options()
+        .read(true)
+        .custom_flags(0o4000)
+        .open(path)?;
     let md = file.metadata()?;
     if !md.is_file() || md.len() > MAX_LOADER_BYTES as u64 {
         return Err(io::Error::new(
@@ -1318,13 +1741,19 @@ fn materialize(
         return Ok(None);
     }
     let farm = farm_dir(store, fingerprint, winners, copy);
-    if farm.is_dir() {
+    // A farm left by an earlier launch is reused only when every link
+    // still names exactly the chosen copy, the way a served record's
+    // farm is checked: the launch searches whatever the directory holds.
+    if farm_checked(store, fingerprint, winners, copy).is_some() {
         return Ok(Some(farm));
     }
+    static SCRATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SCRATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = store.join(format!(
-        ".{}.{}",
+        ".{}.{}.{}",
         farm.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        n
     ));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch)?;
@@ -1333,12 +1762,28 @@ fn materialize(
     }
     match fs::rename(&scratch, &farm) {
         Ok(()) => {}
-        Err(_) if farm.is_dir() => {
-            let _ = fs::remove_dir_all(&scratch);
-        }
-        Err(e) => {
-            let _ = fs::remove_dir_all(&scratch);
-            return Err(e);
+        Err(_) => {
+            // The rename lost to a farm that appeared meanwhile. When
+            // that farm checks out it wins; otherwise it is the damaged
+            // one this build exists to replace, so rebuild over it.
+            if farm_checked(store, fingerprint, winners, copy).is_some() {
+                let _ = fs::remove_dir_all(&scratch);
+            } else {
+                // The farm path may be held by a single stray file,
+                // which remove_dir_all cannot clear.
+                match fs::symlink_metadata(&farm) {
+                    Ok(md) if !md.is_dir() => {
+                        let _ = fs::remove_file(&farm);
+                    }
+                    _ => {
+                        let _ = fs::remove_dir_all(&farm);
+                    }
+                }
+                if let Err(e) = fs::rename(&scratch, &farm) {
+                    let _ = fs::remove_dir_all(&scratch);
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(Some(farm))
@@ -1437,10 +1882,31 @@ fn write_decision(
     for (name, path) in winners {
         text.push_str(&format!("stat {name}\t{}\n", stat_line(path)));
     }
+    // The count of admissions, so a record truncated before its module
+    // section is a miss instead of a launch that silently presents
+    // nothing.
+    text.push_str(&format!("admitted {}\n", resolution.admitted.len()));
+    for module in &resolution.admitted {
+        text.push_str(&format!("module {}\n", module.display()));
+    }
+    // The identity of every admitted module, for the same reason the
+    // winners carry one: an in-place same-size swap leaves the
+    // counterpart directory stamps alone.
+    for module in &resolution.admitted {
+        text.push_str(&format!(
+            "module-stat {}\t{}\n",
+            module.display(),
+            stat_line(module)
+        ));
+    }
     for name in &resolution.incomparable {
         text.push_str(&format!("incomparable {name}\n"));
     }
-    let tmp = dir.join(format!(".{DECISION_FILE}.{}", std::process::id()));
+    let tmp = dir.join(format!(".{DECISION_FILE}.{}.{}", std::process::id(), {
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }));
+    let _ = fs::remove_file(&tmp);
     fs::File::create(&tmp)?.write_all(text.as_bytes())?;
     fs::rename(&tmp, dir.join(DECISION_FILE))
 }
@@ -1541,8 +2007,13 @@ type RecordedLoader = (blake3::Hash, String);
 
 /// The decision a record carries, when its version, identity lines and
 /// host state all check out, together with the winners it was decided
-/// from and the closed loader it runs, if any. Anything else is a miss;
-/// nothing is adopted partially.
+/// from and the closed loader it runs, if any. Each admitted module is
+/// named once, the record declares how many it admits, and every
+/// module and every winner carries exactly one `stat` line that still
+/// matches it, so a truncated, damaged, padded or stale record is a
+/// miss and nothing is adopted partially. Each winner is named once on
+/// a `host` line: a repeat would move the winner after its `stat` line
+/// verified a different path.
 fn parse_decision(
     text: &str,
     header: &str,
@@ -1568,6 +2039,10 @@ fn parse_decision(
     let mut resolution = Resolution::default();
     let mut winners: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut loader = None;
+    let mut admitted_count: Option<usize> = None;
+    let mut winner_stats: BTreeSet<String> = BTreeSet::new();
+    let mut modules: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut verified: BTreeSet<PathBuf> = BTreeSet::new();
     for line in lines {
         if let Some(rest) = line.strip_prefix("interp ") {
             let (hash, name) = rest.split_once('\t')?;
@@ -1575,13 +2050,36 @@ fn parse_decision(
                 return None;
             }
             loader = Some((blake3::Hash::from_hex(hash).ok()?, name.to_string()));
+        } else if let Some(rest) = line.strip_prefix("admitted ") {
+            let count = rest.parse::<usize>().ok()?;
+            if admitted_count.is_some() {
+                return None;
+            }
+            admitted_count = Some(count);
         } else if let Some(rest) = line.strip_prefix("host ") {
             let (name, path) = rest.split_once('\t')?;
+            if winners.contains_key(name) {
+                return None;
+            }
             winners.insert(name.to_string(), PathBuf::from(path));
         } else if let Some(rest) = line.strip_prefix("stat ") {
             let (name, recorded) = rest.split_once('\t')?;
             let path = winners.get(name)?;
-            if stat_line(path) != recorded {
+            if !winner_stats.insert(name.to_string()) || stat_line(path) != recorded {
+                return None;
+            }
+        } else if let Some(rest) = line.strip_prefix("module ") {
+            if !modules.insert(PathBuf::from(rest)) {
+                return None;
+            }
+        } else if let Some(rest) = line.strip_prefix("module-stat ") {
+            let (path, recorded) = rest.split_once('\t')?;
+            let path = Path::new(path);
+            if recorded == "missing"
+                || !modules.contains(path)
+                || !verified.insert(path.to_path_buf())
+                || stat_line(path) != recorded
+            {
                 return None;
             }
         } else {
@@ -1589,6 +2087,13 @@ fn parse_decision(
             resolution.incomparable.push(name.to_string());
         }
     }
+    if admitted_count != Some(modules.len())
+        || winner_stats.len() != winners.len()
+        || verified.len() != modules.len()
+    {
+        return None;
+    }
+    resolution.admitted = modules.into_iter().collect();
     Some((resolution, winners, loader))
 }
 
@@ -1609,13 +2114,32 @@ fn farm_checked(
             _ => return None,
         }
     }
+    // The launch searches the whole farm, so any entry beyond the
+    // winners' own links would put an unchecked copy on the search path.
+    let entries = match fs::read_dir(&farm) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+    let mut linked = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !winners.contains_key(name.as_ref()) {
+            return None;
+        }
+        linked += 1;
+    }
+    if linked != winners.len() {
+        return None;
+    }
     Some(farm)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verdef::fixture::{shared_object, shared_object_with_interp, temp_dir};
+    use crate::verdef::fixture::{self, shared_object, shared_object_with_interp, temp_dir};
+    use std::process::Command;
 
     /// A host with a library directory and a loader cache naming its
     /// contents, and a package root with one `lib/` directory.
@@ -2117,6 +2641,109 @@ mod tests {
         let decided = w.decide(HostLibsPolicy::Auto);
         assert_eq!(decided.farm, r.farm, "the report names the launch's farm");
         assert_eq!(decided.host_interp.unwrap().source, host_ld);
+    }
+
+    /// A counterpart module that demands a version of the loader
+    /// soname is weighed against the interpreter the pair runs, not
+    /// the cache's entry for that soname: the interpreter is the copy
+    /// the farm links for the module to load.
+    #[test]
+    fn a_module_demands_versions_of_the_interpreter_not_the_cache_entry() {
+        let w = World::new();
+        // The cache names a loader whose build defines no 2.34; the
+        // interpreter the host libc names does.
+        w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        let interp_dir = w.host_lib.parent().unwrap().join("interp");
+        fs::create_dir_all(&interp_dir).unwrap();
+        let interp = interp_dir.join("ld-linux-x86-64.so.2");
+        let mut image = versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]);
+        image.extend_from_slice(b"\0/etc/ld.so.cache\0/lib64/\0/usr/lib64/\0");
+        fs::write(&interp, &image).unwrap();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.host(
+            "libc.so.6",
+            &shared_object_with_interp(
+                &[(0, "GLIBC_2.2.5"), (0, "GLIBC_2.34")],
+                &[],
+                Some(interp.to_str().unwrap()),
+            ),
+        );
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(
+                0,
+                &["ld-linux-x86-64.so.2"],
+                &[("ld-linux-x86-64.so.2", &[(0, "GLIBC_2.34")])],
+            ),
+        )
+        .unwrap();
+
+        let decided = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(
+            decided.winners.get("ld-linux-x86-64.so.2"),
+            Some(&interp),
+            "the interpreter, not the cache's entry, supplies the soname"
+        );
+        assert_eq!(decided.admitted, vec![module.clone()]);
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(r.admitted, vec![module]);
+        let loader = r.host_interp.expect("the host's loader runs");
+        assert_eq!(w.farm_link("ld-linux-x86-64.so.2"), Some(loader.path));
+    }
+
+    /// A counterpart module that demands a loader soname other than
+    /// the interpreter's own file name is still weighed against the
+    /// interpreter the pair runs, and the farm links the closed copy
+    /// under the demanded name: the cache's distinct entry for that
+    /// soname supplies neither the versions nor the launch.
+    #[test]
+    fn a_module_demands_a_loader_soname_the_interpreter_supplies() {
+        let w = World::new();
+        // The cache's entry for the demanded soname defines no 2.34;
+        // the interpreter the host libc names, under another name, does.
+        w.host("ld-linux-x86-64.so.2", &versioned(&["GLIBC_2.2.5"]));
+        let interp_dir = w.host_lib.parent().unwrap().join("interp");
+        fs::create_dir_all(&interp_dir).unwrap();
+        let interp = interp_dir.join("ld64.so.2");
+        let mut image = versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]);
+        image.extend_from_slice(b"\0/etc/ld.so.cache\0/lib64/\0/usr/lib64/\0");
+        fs::write(&interp, &image).unwrap();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.host(
+            "libc.so.6",
+            &shared_object_with_interp(
+                &[(0, "GLIBC_2.2.5"), (0, "GLIBC_2.34")],
+                &[],
+                Some(interp.to_str().unwrap()),
+            ),
+        );
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(
+                0,
+                &["ld-linux-x86-64.so.2"],
+                &[("ld-linux-x86-64.so.2", &[(0, "GLIBC_2.34")])],
+            ),
+        )
+        .unwrap();
+
+        let decided = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(
+            decided.winners.get("ld-linux-x86-64.so.2"),
+            Some(&interp),
+            "the demanded soname names the interpreter the pair runs"
+        );
+        assert_eq!(decided.admitted, vec![module.clone()]);
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(r.admitted, vec![module]);
+        let loader = r.host_interp.expect("the host's loader runs");
+        assert_eq!(w.farm_link("ld-linux-x86-64.so.2"), Some(loader.path));
     }
 
     /// A loader whose image names no default directory the scrub knows
@@ -2674,6 +3301,1050 @@ mod tests {
         assert!(r.farm.is_none());
     }
 
+    /// The 64-bit bytes of a counterpart module of `machine` that
+    /// needs `needed` and demands `requirements`, matching the
+    /// fixture-built bundled pair's machine.
+    fn module_bytes(
+        machine: u16,
+        needed: &[&str],
+        requirements: &[(&str, &[(u16, &str)])],
+    ) -> Vec<u8> {
+        fixture::facts_elf(true, machine, None, needed, requirements).bytes
+    }
+
+    /// A named pipe at `path`, for tests that must not block on it.
+    fn make_fifo(path: &Path) {
+        let ok = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo(1) must exist")
+            .success();
+        assert!(ok, "mkfifo failed for {}", path.display());
+    }
+
+    /// A package carrying `lib/alsa-lib`, whose host counterpart is the
+    /// `alsa-lib` directory beside the host's libraries.
+    fn carry_counterpart(w: &World) -> PathBuf {
+        let dir = w.host_lib.join("alsa-lib");
+        fs::create_dir_all(&dir).unwrap();
+        w.carry(vec![PluginDir {
+            relative: "lib/alsa-lib".to_string(),
+            lib_relative: "alsa-lib".to_string(),
+            absolutes: Vec::new(),
+        }]);
+        dir
+    }
+
+    /// The refusal recorded for `module`.
+    fn refusal_for<'a>(refused: &'a [ModuleRefusal], module: &Path) -> &'a ModuleRefusal {
+        refused
+            .iter()
+            .find(|r| r.module == module)
+            .expect("the module is refused")
+    }
+
+    /// A counterpart module the checks admit brings its host
+    /// dependencies into the decision, as chosen host libraries.
+    #[test]
+    fn a_counterpart_module_admits_with_its_host_dependencies() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(decision.refused.is_empty());
+        assert_eq!(
+            decision.winners.get("libdep.so.2"),
+            Some(&w.host_lib.join("libdep.so.2"))
+        );
+        assert!(
+            decision
+                .compared
+                .iter()
+                .any(|(n, c)| n == "libdep.so.2" && c.is_none()),
+            "a soname the bundle lacks is named as host-only"
+        );
+    }
+
+    /// A module built for another machine is refused on itself and
+    /// nothing it needs is offered.
+    #[test]
+    fn a_module_for_another_architecture_is_refused_with_its_dependencies() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(183, &["libdep.so.2"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        assert_eq!(decision.refused.len(), 1);
+        assert_eq!(decision.refused[0].module, module);
+        assert_eq!(decision.refused[0].object, module);
+        assert!(decision.refused[0].reason.contains("architecture"));
+        assert!(!decision.winners.contains_key("libdep.so.2"));
+        assert!(!decision.compared.iter().any(|(n, _)| n == "libdep.so.2"));
+    }
+
+    /// A musl-linked module is refused: it must not pull its libc into
+    /// the process.
+    #[test]
+    fn a_musl_module_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libc.musl-x86_64.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        assert_eq!(decision.refused.len(), 1);
+        assert!(decision.refused[0].reason.contains("glibc family"));
+    }
+
+    /// A module is weighed by the versions it demands: one whose demand
+    /// the copies here define is admitted beside one whose demand
+    /// nothing defines, which is refused naming the version.
+    #[test]
+    fn a_module_is_admitted_or_refused_by_the_versions_it_demands() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let fitting = dir.join("libfits.so");
+        fs::write(
+            &fitting,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.32")])]),
+        )
+        .unwrap();
+        let demanding = dir.join("libgreedy.so");
+        fs::write(
+            &demanding,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.99")])]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert_eq!(decision.admitted, vec![fitting]);
+        assert_eq!(decision.refused.len(), 1);
+        assert_eq!(decision.refused[0].module, demanding);
+        assert!(decision.refused[0].reason.contains("GLIBC_2.99"));
+    }
+
+    /// A module whose dependency nothing here supplies is refused, and
+    /// an unreadable file that names itself a module is refused too,
+    /// with a readable neighbour still admitted.
+    #[test]
+    fn an_unsupplied_dependency_or_unreadable_module_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let missing = dir.join("libwants.so");
+        fs::write(&missing, module_bytes(0, &["libnothere.so.9"], &[])).unwrap();
+        let junk = dir.join("libjunk.so");
+        fs::write(&junk, b"not elf").unwrap();
+        let plain = dir.join("libplain.so");
+        fs::write(&plain, module_bytes(0, &[], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert_eq!(decision.admitted, vec![plain]);
+        assert_eq!(decision.refused.len(), 2);
+        let reasons: Vec<(PathBuf, String)> = decision
+            .refused
+            .iter()
+            .map(|r| (r.module.clone(), r.reason.clone()))
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|(m, r)| m == &missing && r.contains("nothing supplies")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|(m, r)| m == &junk && r.contains("read")),
+            "{reasons:?}"
+        );
+    }
+
+    /// A module carrying an old-style `DT_RPATH` is refused: the
+    /// loader searches that path ahead of the farm, so an unchecked
+    /// copy could answer a soname the decision chose.
+    #[test]
+    fn a_module_with_an_old_search_path_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        // DT_RPATH is tag 15.
+        fs::write(
+            &module,
+            fixture::facts_elf_with(true, 0, None, &[], &[], &[(15, 0)]).bytes,
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert_eq!(refusal.object, module);
+        assert!(refusal.reason.contains("search path"), "{refusal:?}");
+    }
+
+    /// A runpath supersedes an old-style search path: the loader ignores
+    /// the rpath of an object that also carries a runpath, so the module
+    /// is admitted like one with a runpath alone.
+    #[test]
+    fn a_runpath_supersedes_an_old_search_path() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        // DT_RPATH is tag 15, DT_RUNPATH is 29.
+        fs::write(
+            &module,
+            fixture::facts_elf_with(true, 0, None, &[], &[], &[(15, 0), (29, 0)]).bytes,
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![module]);
+    }
+
+    /// A module whose need names the loader the bundled pair runs is
+    /// admitted without any copy on disk: the process runs that loader
+    /// already, and glibc answers the demand from the mapped copy.
+    #[test]
+    fn a_module_naming_the_loader_is_admitted_without_a_copy() {
+        let w = World::new();
+        w.bundle(
+            "libc.so.6",
+            &shared_object_with_interp(&[(0, "GLIBC_2.32")], &[], Some("ld-linux-x86-64.so.2")),
+        );
+        w.host("libextra.so.1", &versioned(&["EXTRA_1"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["ld-linux-x86-64.so.2"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(!decision.winners.contains_key("ld-linux-x86-64.so.2"));
+    }
+
+    /// A module naming a glibc loader the pair does not run is refused:
+    /// the mapped loader answers only its own soname, and a foreign
+    /// loader name would have to load from disk.
+    #[test]
+    fn a_foreign_loader_name_is_refused_under_the_bundled_pair() {
+        let w = World::new();
+        w.bundle(
+            "libc.so.6",
+            &shared_object_with_interp(&[(0, "GLIBC_2.32")], &[], Some("ld-linux-x86-64.so.2")),
+        );
+        w.host("libextra.so.1", &versioned(&["EXTRA_1"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["ld.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("nothing supplies"), "{refusal:?}");
+    }
+
+    /// A stray file holding the farm's path is replaced: the launch
+    /// after it serves a real farm again instead of wedging forever.
+    #[test]
+    fn a_stray_file_at_the_farm_path_is_replaced() {
+        let w = World::new();
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        w.resolve(HostLibsPolicy::Auto);
+        let farm = w.last_farm.borrow().clone().expect("a farm");
+        fs::remove_dir_all(&farm).unwrap();
+        fs::write(&farm, b"stray").unwrap();
+
+        let second = w.resolve(HostLibsPolicy::Auto);
+        let rebuilt = second
+            .farm
+            .expect("the farm is rebuilt over the stray file");
+        assert_eq!(rebuilt, farm);
+        assert!(rebuilt.join("libdep.so.2").exists());
+    }
+
+    /// A module naming a filter object is refused: a filter loads its
+    /// objects outside the closure, so nothing vouches for them.
+    #[test]
+    fn a_module_with_a_filter_object_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        // DT_FILTER is 0x7fffffff.
+        fs::write(
+            &module,
+            fixture::facts_elf_with(true, 0, None, &[], &[], &[(0x7fffffff, 0)]).bytes,
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("filter"), "{refusal:?}");
+    }
+
+    /// A module whose requirement hash does not match its name cannot
+    /// be read: the loader would reject the demand at launch, so
+    /// admission refuses instead of presenting a module that fails.
+    #[test]
+    fn a_module_whose_requirement_hash_lies_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        let mut bytes = module_bytes(0, &["libdep.so.2"], &[("libdep.so.2", &[(0, "DEP_1.0")])]);
+        let good = verdef::elf_hash("DEP_1.0").to_le_bytes();
+        let at = bytes
+            .windows(4)
+            .position(|window| window == good)
+            .expect("the fixture carries the requirement hash");
+        bytes[at..at + 4].copy_from_slice(&(verdef::elf_hash("DEP_1.0") ^ 0x10).to_le_bytes());
+        fs::write(&module, bytes).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("read"), "{refusal:?}");
+        assert!(!decision.winners.contains_key("libdep.so.2"));
+    }
+
+    /// A cache entry that is a named pipe cannot hang admission: the
+    /// walk finds nothing that supplies the dependency and refuses.
+    #[test]
+    fn a_fifo_cache_entry_is_refused_without_hanging() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let dep = w.host_lib.join("libdep.so.2");
+        fs::remove_file(&dep).unwrap();
+        make_fifo(&dep);
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("read"), "{refusal:?}");
+        assert_eq!(refusal.object, dep);
+        assert!(!decision.winners.contains_key("libdep.so.2"));
+    }
+
+    /// A loader source that is a named pipe cannot hang the close: the
+    /// host pair is refused as unreadable and the bundled pair runs.
+    #[test]
+    fn a_loader_that_is_a_fifo_is_refused() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        fs::remove_file(&host_ld).unwrap();
+        make_fifo(&host_ld);
+
+        let decided = w.decide(HostLibsPolicy::Always);
+        assert!(decided.host_interp.is_none());
+        let (source, why) = decided.host_interp_refused.unwrap();
+        assert_eq!(source, host_ld);
+        assert!(why.contains("read"), "{why}");
+    }
+
+    /// A module needing a glibc family member the bundle lacks takes it
+    /// from the host when the host's pair won: it joins the farm like
+    /// the rest of its family, or the closed loader could not find it.
+    #[test]
+    fn a_module_takes_an_unbundled_family_soname_through_the_host_pair() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        w.host("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libm.so.6"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![module.clone()]);
+        assert!(decision.refused.is_empty());
+        assert_eq!(
+            decision.winners.get("libm.so.6"),
+            Some(&w.host_lib.join("libm.so.6"))
+        );
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert!(r.host_interp.is_some(), "the host's pair runs");
+        assert_eq!(w.farm_link("libm.so.6"), Some(w.host_lib.join("libm.so.6")));
+    }
+
+    /// Under the bundled pair a module needing a family member the
+    /// bundle lacks is refused, even though the host carries one:
+    /// nothing outside the farm can be found, and the family is not
+    /// farmed piecemeal.
+    #[test]
+    fn an_unbundled_family_soname_refuses_a_module_under_the_bundled_pair() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libm.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libm.so.6"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert_eq!(refusal.object, module);
+        assert!(refusal.reason.contains("libm.so.6"));
+        assert!(!decision.winners.contains_key("libm.so.6"));
+    }
+
+    /// A soname the bundle carries satisfies a module and stays out of
+    /// the decision, unlike a family member only the host's pair can
+    /// supply, which joins the farm: the bundle keeps what it has.
+    #[test]
+    fn a_bundled_soname_satisfies_a_module_without_a_new_candidate() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.bundle("libown.so.1", &versioned(&["OWN_1.0"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libown.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(!decision.winners.contains_key("libown.so.1"));
+        assert!(!decision.compared.iter().any(|(n, _)| n == "libown.so.1"));
+    }
+
+    /// A package without a bundled pair to check against admits
+    /// nothing: every module is refused, sorted by path.
+    #[test]
+    fn a_package_without_a_bundled_pair_refuses_every_module() {
+        let w = World::new();
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        fs::create_dir_all(w.host_lib.join("alsa-lib/xsub")).unwrap();
+        let z = w.host_lib.join("alsa-lib/z.so");
+        let a = w.host_lib.join("alsa-lib/xsub/a.so");
+        fs::write(&z, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::write(&a, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        w.carry(vec![
+            PluginDir {
+                relative: "lib/alsa-lib".to_string(),
+                lib_relative: "alsa-lib".to_string(),
+                absolutes: Vec::new(),
+            },
+            PluginDir {
+                relative: "lib/alsa-lib/xsub".to_string(),
+                lib_relative: "alsa-lib/xsub".to_string(),
+                absolutes: Vec::new(),
+            },
+        ]);
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refused: Vec<PathBuf> = decision.refused.iter().map(|r| r.module.clone()).collect();
+        assert_eq!(refused, vec![a, z]);
+    }
+
+    /// A module added to a counterpart directory between two decisions
+    /// is noticed: the second decision considers it.
+    #[test]
+    fn a_module_added_between_launches_is_considered() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+
+        assert!(w.decide(HostLibsPolicy::Auto).admitted.is_empty());
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+
+        assert_eq!(w.decide(HostLibsPolicy::Auto).admitted, vec![module]);
+    }
+
+    /// A supplied family dependency is walked like any host library:
+    /// what it needs in turn joins the farm, so the closed loader can
+    /// load the whole chain.
+    #[test]
+    fn a_family_dependency_s_own_needs_reach_the_farm_too() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        w.host("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]));
+        w.host("libmvec.so.1", &driver_needing(&["libm.so.6"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libmvec.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(decision.refused.is_empty());
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(
+            w.farm_link("libmvec.so.1"),
+            Some(w.host_lib.join("libmvec.so.1"))
+        );
+        assert_eq!(w.farm_link("libm.so.6"), Some(w.host_lib.join("libm.so.6")));
+    }
+
+    /// A module is weighed against the copy that would load: under the
+    /// host's pair its newer libc defines a demand the bundled copy
+    /// cannot, and the module is admitted.
+    #[test]
+    fn a_module_demands_what_the_pair_in_use_defines() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.34")])]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(decision.refused.is_empty());
+    }
+
+    /// A refusal names the object of the closure that failed, not just
+    /// the module: a dependency whose facts cannot be read is named
+    /// itself.
+    #[test]
+    fn a_refusal_names_the_dependency_that_failed() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", b"not elf");
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert_eq!(refusal.object, w.host_lib.join("libdep.so.2"));
+        assert!(refusal.reason.contains("read"), "{}", refusal.reason);
+    }
+
+    /// Under the host's pair a family demand is weighed against the
+    /// host's copy, the one that loads: a demand only the bundled copy
+    /// defines is refused.
+    #[test]
+    fn a_family_demand_only_the_bundled_copy_defines_is_refused() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        w.host("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.34"]));
+        w.bundle("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.99"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libm.so.6"], &[("libm.so.6", &[(0, "GLIBC_2.99")])]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("GLIBC_2.99"), "{}", refusal.reason);
+    }
+
+    /// The farm links the host's family copy under its pair, so a host
+    /// copy whose facts cannot be read supplies nothing, whatever the
+    /// bundled copy would define.
+    #[test]
+    fn an_unreadable_host_family_copy_supplies_nothing() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        w.bundle("libm.so.6", &versioned(&["GLIBC_2.2.5", "GLIBC_2.99"]));
+        w.host("libm.so.6", b"not elf");
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libm.so.6"], &[("libm.so.6", &[(0, "GLIBC_2.99")])]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(
+            refusal.reason.contains("nothing supplies"),
+            "{}",
+            refusal.reason
+        );
+    }
+
+    /// Under the host's pair a bundled family soname loads from the
+    /// host's copy, so that copy's closure is walked: what it needs
+    /// reaches the farm, and a copy that fails a check refuses the
+    /// module.
+    #[test]
+    fn a_bundled_family_soname_is_walked_through_its_host_copy() {
+        let w = World::new();
+        let host_ld = w.host("ld-linux-x86-64.so.2", &closable_loader());
+        newer_host_glibc(&w, &host_ld);
+        w.bundle("libm.so.6", &versioned(&["GLIBC_2.2.5"]));
+        w.host("libm.so.6", &driver_needing(&["libhidden.so.1"]));
+        let hidden = w.host("libhidden.so.1", &versioned(&["HID_1"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libm.so.6"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![module.clone()]);
+        assert!(decision.refused.is_empty());
+
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(w.farm_link("libhidden.so.1"), Some(hidden));
+
+        // A selected copy that fails a check refuses the module.
+        fs::write(w.host_lib.join("libm.so.6"), module_bytes(183, &[], &[])).unwrap();
+        w.write_cache();
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(
+            refusal.reason.contains("architecture"),
+            "{}",
+            refusal.reason
+        );
+    }
+
+    /// A refused module repaired in place, at the same size, is weighed
+    /// again: the fingerprint stamps the counterpart files themselves,
+    /// so the record cannot serve a stale refusal.
+    #[test]
+    fn a_repaired_module_is_weighed_again() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.99")])]),
+        )
+        .unwrap();
+
+        let first = w.resolve(HostLibsPolicy::Auto);
+        assert!(first.admitted.is_empty());
+
+        // Same size, new demand: the repair is invisible to the
+        // directory stamps.
+        fs::write(
+            &module,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.32")])]),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&module)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_001))
+            .unwrap();
+
+        assert_eq!(w.resolve(HostLibsPolicy::Auto).admitted, vec![module]);
+    }
+
+    /// Under `always` the decision compares the bundle's own sonames,
+    /// so a module needing one walks the copy the decision won: what
+    /// the winning copy demands reaches the farm.
+    #[test]
+    fn a_module_walks_the_copy_the_decision_won() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        w.host(
+            "libfoo.so.1",
+            &shared_object(&[(0, "FOO_1.0"), (0, "FOO_2.0")], &["libhelp.so.1"]),
+        );
+        let help = w.host("libhelp.so.1", &versioned(&["HELP_1"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libfoo.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Always);
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(decision.refused.is_empty());
+
+        w.resolve(HostLibsPolicy::Always);
+        assert_eq!(w.farm_link("libhelp.so.1"), Some(help));
+    }
+
+    /// The same rule for versions: a demand is weighed against the copy
+    /// the decision won, so a version only the winning host copy
+    /// defines admits the module.
+    #[test]
+    fn a_module_weighs_the_copy_the_decision_won() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.bundle("libfoo.so.1", &versioned(&["FOO_1.0"]));
+        w.host(
+            "libfoo.so.1",
+            &shared_object(&[(0, "FOO_1.0"), (0, "FOO_2.0")], &[]),
+        );
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libfoo.so.1"], &[("libfoo.so.1", &[(0, "FOO_2.0")])]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Always);
+
+        assert_eq!(decision.admitted, vec![module]);
+        assert!(decision.refused.is_empty());
+    }
+
+    /// Admissions and refusals come back sorted by path even when the
+    /// counterpart directories' scan order differs, so the launch's
+    /// view and the record's canonical order agree. A nested directory
+    /// sorts before its parent's own modules under path ordering.
+    #[test]
+    fn a_decision_sorts_modules_across_counterparts() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        fs::create_dir_all(w.host_lib.join("alsa-lib/xsub")).unwrap();
+        let z = w.host_lib.join("alsa-lib/z.so");
+        let a = w.host_lib.join("alsa-lib/xsub/a.so");
+        w.carry(vec![
+            PluginDir {
+                relative: "lib/alsa-lib".to_string(),
+                lib_relative: "alsa-lib".to_string(),
+                absolutes: Vec::new(),
+            },
+            PluginDir {
+                relative: "lib/alsa-lib/xsub".to_string(),
+                lib_relative: "alsa-lib/xsub".to_string(),
+                absolutes: Vec::new(),
+            },
+        ]);
+
+        fs::write(&z, module_bytes(0, &[], &[])).unwrap();
+        fs::write(&a, module_bytes(0, &[], &[])).unwrap();
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![a.clone(), z.clone()]);
+
+        fs::write(&z, module_bytes(183, &[], &[])).unwrap();
+        fs::write(&a, module_bytes(183, &[], &[])).unwrap();
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refused: Vec<PathBuf> = decision.refused.iter().map(|r| r.module.clone()).collect();
+        assert_eq!(refused, vec![a, z]);
+    }
+
+    /// A counterpart module rewritten beneath a restored modification
+    /// time is weighed again: the stamp carries the change time, which
+    /// a rewrite always moves and a tool cannot pin back.
+    #[test]
+    fn a_module_rewritten_beneath_a_restored_mtime_is_weighed_again() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.32")])]),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&module)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_002))
+            .unwrap();
+
+        let first = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(first.admitted, vec![module.clone()]);
+
+        // Same size, the modification time pinned back to the same
+        // instant, a new demand: only the change time tells the rewrite
+        // apart. The sleep keeps the two writes in different kernel
+        // timestamp ticks, which coarse inode clocks otherwise share.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            &module,
+            module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.99")])]),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&module)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_002))
+            .unwrap();
+
+        let second = w.resolve(HostLibsPolicy::Auto);
+        assert!(second.admitted.is_empty());
+    }
+
+    /// A record must also carry exactly one surviving stat for every
+    /// winner it chose: a winner without its stat, a duplicated winner
+    /// stat and a stat naming an undeclared winner are each a miss, or
+    /// an in-place swap of an unvouched winner would be served.
+    #[test]
+    fn a_record_without_one_stat_per_winner_is_never_served() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let host_dep = w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let pins = [pin("gtk", 1)];
+        let identity = SelectionIdentity::new(&pins).unwrap();
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let plugin_dirs = w.plugin_dirs.borrow();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &plugin_dirs,
+            &[icd_dir.as_str()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
+        let record = sel_dir(&w.store, &pins).join(DECISION_FILE);
+        let good = fs::read_to_string(&record).unwrap();
+        let winner_entry = format!("stat libdep.so.2\t{}", stat_line(&host_dep));
+        let served = |text: &str| {
+            fs::write(&record, text).unwrap();
+            load_selection(
+                sel_dir(&w.store, &pins).as_path(),
+                &identity,
+                &fingerprint,
+                &w.store,
+                w.loader_store(),
+            )
+        };
+        let miss = |text: String, why: &str| {
+            assert_eq!(served(&text), None, "{why}");
+        };
+
+        assert!(served(&good).is_some(), "the intact record is served");
+
+        miss(
+            good.replace(&format!("{winner_entry}\n"), ""),
+            "a winner without its stat",
+        );
+        miss(
+            good.replace(&winner_entry, &format!("{winner_entry}\n{winner_entry}")),
+            "a duplicated winner stat",
+        );
+        miss(
+            good.replace(
+                &winner_entry,
+                &format!("stat libown.so.9\t{}", stat_line(&host_dep)),
+            ),
+            "a stat naming an undeclared winner",
+        );
+
+        // A repeated `host` line, even one placed after the winner's
+        // stat verified the first path, must not adopt the repeat: its
+        // path was never statted, so the record would vouch a winner
+        // nobody checked.
+        let alt = w.store.join("alt-copy.so.2");
+        fs::write(&alt, b"not the copy the host state vouches").unwrap();
+        let forged = good.replace(
+            &winner_entry,
+            &format!("{winner_entry}\nhost libdep.so.2\t{}", alt.display()),
+        );
+        assert!(
+            parse_decision(
+                &forged,
+                SELECTION_RECORD_HEADER,
+                &identity.identity_lines(),
+                &fingerprint
+            )
+            .is_none(),
+            "a repeated host line moves the winner past its stat"
+        );
+    }
+
+    /// A recorded decision carries its admissions: a launch served
+    /// from the store sees the same modules a fresh decision admitted.
+    #[test]
+    fn the_record_carries_the_admitted_modules() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let first = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(first.admitted, vec![module.clone()]);
+        let served = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(served.admitted, vec![module], "served from the record");
+        assert_eq!(served.farm, first.farm);
+        assert_eq!(served.host_interp, first.host_interp);
+    }
+
+    /// A record with no winners at all serves too: a module admitted
+    /// on bundled sonames alone round trips without a farm or a
+    /// loader.
+    #[test]
+    fn a_record_without_winners_still_serves_its_admissions() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libextra.so.1", &versioned(&["EXTRA_1"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libc.so.6"], &[])).unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let first = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(first.admitted, vec![module.clone()]);
+        assert!(first.farm.is_none());
+        let served = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(served.admitted, vec![module], "served from the record");
+        assert_eq!(served.farm, None);
+        assert!(served.host_interp.is_none());
+    }
+
+    /// A record must carry exactly one surviving stat for every module
+    /// it admits: a duplicated module line, a module without its stat, a
+    /// stat naming an undeclared module, a duplicated stat, a stat
+    /// forged to `missing`, a record truncated before its admissions
+    /// and a module that has since vanished are each a miss, while the
+    /// intact record is served.
+    #[test]
+    fn a_record_without_one_stat_per_module_is_never_served() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let pins = [pin("gtk", 1)];
+        let identity = SelectionIdentity::new(&pins).unwrap();
+        let icd_dir = w.icd_dir.to_string_lossy().into_owned();
+        let plugin_dirs = w.plugin_dirs.borrow();
+        let fingerprint = fingerprint(
+            &w.cache,
+            &plugin_dirs,
+            &[icd_dir.as_str()],
+            HostLibsPolicy::Auto,
+            None,
+            true,
+            &w.nsswitch,
+            w.loader_store(),
+        );
+        w.resolve_selection(HostLibsPolicy::Auto, &[], &pins);
+        let record = sel_dir(&w.store, &pins).join(DECISION_FILE);
+        let good = fs::read_to_string(&record).unwrap();
+        let module_entry = format!("module {}", module.display());
+        let stat_prefix = format!("module-stat {}\t", module.display());
+        let served = |text: &str| {
+            fs::write(&record, text).unwrap();
+            load_selection(
+                sel_dir(&w.store, &pins).as_path(),
+                &identity,
+                &fingerprint,
+                &w.store,
+                w.loader_store(),
+            )
+        };
+        let miss = |text: String, why: &str| {
+            assert_eq!(served(&text), None, "{why}");
+        };
+
+        assert!(served(&good).is_some(), "the intact record is served");
+
+        let stat_at = good
+            .find(&stat_prefix)
+            .expect("the record stats the module");
+        let stat_end = good[stat_at..].find('\n').unwrap() + stat_at;
+        let recorded_stat = good[stat_at + stat_prefix.len()..stat_end].to_string();
+        let stat_entry = format!("{stat_prefix}{recorded_stat}");
+
+        miss(
+            good.replace(&module_entry, &format!("{module_entry}\n{module_entry}")),
+            "a duplicated module line",
+        );
+        miss(
+            good.replace(&format!("{stat_entry}\n"), ""),
+            "a module without its stat",
+        );
+        miss(
+            good.replacen(
+                &stat_entry,
+                &format!(
+                    "module-stat {}\t{}",
+                    w.host_lib.join("libdep.so.2").display(),
+                    stat_line(&w.host_lib.join("libdep.so.2"))
+                ),
+                1,
+            ),
+            "a stat naming an undeclared module",
+        );
+        miss(
+            good.replace(&stat_entry, &format!("{stat_entry}\n{stat_entry}")),
+            "a duplicated module stat",
+        );
+        miss(
+            good.replace(&stat_entry, &format!("{stat_prefix}missing")),
+            "a stat forged to missing",
+        );
+        miss(
+            good[..good
+                .find("admitted ")
+                .expect("the record declares its count")]
+                .to_string(),
+            "a record truncated before its admissions",
+        );
+
+        fs::remove_file(&module).unwrap();
+        miss(good.clone(), "a module that has since vanished");
+    }
+
     #[test]
     fn the_decision_is_recorded_and_reused_until_the_host_changes() {
         let w = World::new();
@@ -2911,6 +4582,105 @@ mod tests {
             "the old farm was torn down under a running instance"
         );
         assert!(new_farm.join("libGL.so.1").exists());
+    }
+
+    /// A farm left behind by an earlier launch is reused only when its
+    /// links still name exactly the chosen copies: a relinked or extra
+    /// entry in it is rebuilt over, never handed to a launch.
+    #[test]
+    fn a_damaged_or_grown_farm_is_rebuilt_for_the_next_launch() {
+        let w = World::new();
+        let host_dep = w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        w.resolve(HostLibsPolicy::Auto);
+        let farm = w.last_farm.borrow().clone().expect("a farm");
+        let planted = w.store.join("planted.so.1");
+        fs::write(&planted, b"planted").unwrap();
+
+        // A winner link bent to another file is rebuilt.
+        let link = farm.join("libdep.so.2");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(
+            fs::read_link(&link).ok(),
+            Some(host_dep),
+            "the tampered link is re-aimed at the chosen copy"
+        );
+
+        // An entry beyond the winners is dropped with the rebuild.
+        std::os::unix::fs::symlink(&planted, farm.join("extra.so.9")).unwrap();
+        w.resolve(HostLibsPolicy::Auto);
+        assert!(
+            farm.join("extra.so.9").symlink_metadata().is_err(),
+            "the extra farm entry does not survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_failed_materialize_is_not_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let w = World::new();
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        w.resolve(HostLibsPolicy::Auto);
+        let farm = w.last_farm.borrow().clone().expect("a farm");
+        let record = sel_dir(&w.store, &[]).join("decision");
+        let before = fs::metadata(&record).unwrap().modified().unwrap();
+
+        // A farm directory nobody can empty wedges the rebuild, and the
+        // failed materialize must not overwrite the served record.
+        fs::remove_dir_all(&farm).unwrap();
+        fs::create_dir(&farm).unwrap();
+        fs::write(farm.join("stuck.so"), b"stuck").unwrap();
+        fs::set_permissions(&farm, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert!(r.farm.is_none(), "the wedged farm is not served");
+        let after = fs::metadata(&record).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "the failed materialize leaves the recorded decision alone"
+        );
+        assert_eq!(
+            fs::read_link(farm.join("libdep.so.2")).ok(),
+            None,
+            "the wedged occupant is left for the next launch to retry"
+        );
+    }
+
+    /// A file that is only an ELF header has nothing the loader can
+    /// map, so admission refuses it instead of presenting a module that
+    /// fails at launch.
+    #[test]
+    fn a_header_only_module_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libhead.so");
+        let mut head = vec![0u8; 64];
+        head[0..4].copy_from_slice(b"\x7fELF");
+        head[4] = 2;
+        head[5] = 1;
+        head[16..18].copy_from_slice(&3u16.to_le_bytes());
+        fs::write(&module, head).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert!(refusal.reason.contains("map"), "{refusal:?}");
     }
 
     #[test]
