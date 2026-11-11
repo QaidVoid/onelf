@@ -445,11 +445,21 @@ const SHOWN_SKIPS: usize = 3;
 pub(crate) enum Carried<'a> {
     /// The directory, whole.
     Data,
+    /// The trace-limited directory: the members kept of the total the
+    /// trim judged.
+    Trimmed { kept: usize, total: usize },
     /// The ELF objects its collection took, with the ones it skipped
-    /// and why, and the count of its other files.
-    Plugins(&'a GroupCollection, usize),
+    /// and why, and the count of its other files. The last field is
+    /// the (kept, total) member counts the trim judged, when the trace
+    /// limited the directory.
+    Plugins(&'a GroupCollection, usize, Option<(usize, usize)>),
     /// Nothing, since the tree already holds its destination.
     Held,
+    /// Nothing of its own, since the inferred destination named here
+    /// already holds it, copied from the same place. The parent's
+    /// trim governed the child's members too, so the subtree rides
+    /// only with the members the trace opened.
+    WithinTrimmed(&'a Path),
     /// Nothing of its own, since the inferred destination named here
     /// already holds it, copied from the same place.
     Within(&'a Path),
@@ -460,7 +470,8 @@ pub(crate) enum Carried<'a> {
 /// directory's compiled-in paths are not redirected to the bundle's
 /// copy yet, and the finding says so; a plugin directory's objects are
 /// redirected by the walk that admits them, and its finding names what
-/// was skipped and why.
+/// was skipped and why. A directory the trace limited is reported
+/// trace-limited, not complete.
 pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
     let kind = match dir.kind {
         InferredKind::Plugins => "plugin directory",
@@ -471,11 +482,28 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
             Outcome::Selected,
             format!("{kind}, {}, carried, not redirected yet", format_size(size)),
         ),
+        Carried::Trimmed { kept, total } => (
+            Outcome::TraceLimited,
+            format!(
+                "{kind}, {kept} of {total} member(s) kept by the trace, {}; the rest \
+                 the trace did not open, not redirected yet",
+                format_size(size)
+            ),
+        ),
         Carried::Held => (
             Outcome::Selected,
             format!(
                 "{kind}, {}, held by the tree's own copy, not redirected yet",
                 format_size(size)
+            ),
+        ),
+        Carried::WithinTrimmed(outer) => (
+            Outcome::TraceLimited,
+            format!(
+                "{kind}, whole size {}, carried within {}, only what the trace opened \
+                 rides, not redirected yet",
+                format_size(size),
+                outer.display()
             ),
         ),
         Carried::Within(outer) => (
@@ -486,11 +514,11 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
                 outer.display()
             ),
         ),
-        Carried::Plugins(collection, 0) if collection.plugins.is_empty() => (
+        Carried::Plugins(collection, 0, None) if collection.plugins.is_empty() => (
             Outcome::OptionalOmission,
             "plugin directory with nothing the bundle can carry".to_string(),
         ),
-        Carried::Plugins(collection, files) => (
+        Carried::Plugins(collection, files, None) => (
             Outcome::Selected,
             format!(
                 "plugin directory, {} object(s) and {files} other file(s), {}",
@@ -498,8 +526,17 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
                 format_size(size)
             ),
         ),
+        Carried::Plugins(collection, files, Some((kept, total))) => (
+            Outcome::TraceLimited,
+            format!(
+                "plugin directory, {} object(s) and {files} other file(s), {}; {kept} of \
+                 {total} member(s) kept by the trace; the rest the trace did not open",
+                collection.plugins.len(),
+                format_size(size)
+            ),
+        ),
     };
-    if let Carried::Plugins(collection, _) = carried {
+    if let Carried::Plugins(collection, _, _) = carried {
         let skipped = &collection.skipped;
         for (name, reason) in skipped.iter().take(SHOWN_SKIPS) {
             what.push_str(&format!("; {name} omitted: {reason}"));
@@ -2080,5 +2117,74 @@ mod tests {
         let dirs = run(&[lib], Some(&universe)).unwrap();
         assert_eq!(rels(&dirs), ["share/examplefw"]);
         assert_eq!(dirs[0].source, root.join("usr/share/examplefw"));
+    }
+
+    /// The trim names a member by every spelling the trace could have
+    /// recorded: the canonical prefix pair, the resolved source and the
+    /// compiled-in path that names the directory. A member the trace
+    /// did not name is left out; without a trim none is.
+    #[test]
+    fn the_trim_names_a_member_by_any_spelling_the_trace_recorded() {
+        use super::super::{Trim, trimmed_out};
+        use onelf_sysroot::Policy;
+        let dir = InferredDir {
+            source: PathBuf::from("/dist/usr/lib/examplefw/plugins"),
+            prefix: PathBuf::from("/dist/usr"),
+            rel: PathBuf::from("lib/examplefw/plugins"),
+            destination: PathBuf::from("lib/examplefw/plugins"),
+            kind: InferredKind::Data,
+            size: 0,
+            compiled: BTreeSet::from(["/dist/usr/lib/examplefw/plugins".to_string()]),
+            objects: BTreeSet::from(["libexamplefw.so.1".to_string()]),
+        };
+        let a = Path::new("a.conf");
+        // The trace recorded the compiled-in spelling: the canonical
+        // prefix pair names the same member.
+        let opened = Trim::from_paths(
+            vec![PathBuf::from("/dist/usr/lib/examplefw/plugins/a.conf")],
+            None,
+        );
+        assert!(!trimmed_out(&dir, a, None, Some(&opened)));
+        // A keep glob names it through one of the spellings tried.
+        let keep_txt = std::env::temp_dir().join(format!(
+            "onelf-trim-keep-{}-{}.txt",
+            std::process::id(),
+            a.display()
+        ));
+        std::fs::write(&keep_txt, "dist/usr/lib/examplefw/plugins/**\n").unwrap();
+        let keep = Some(Policy::load(&keep_txt).unwrap());
+        let _ = std::fs::remove_file(&keep_txt);
+        let globbed = Trim {
+            opened: Default::default(),
+            keep,
+            tree: None,
+        };
+        assert!(!trimmed_out(&dir, a, None, Some(&globbed)));
+        // Nothing observed, nothing matching: the member goes.
+        let empty = Trim::from_paths(Vec::new(), None);
+        assert!(trimmed_out(&dir, a, None, Some(&empty)));
+        // An open of a same-named copy inside the tree stands in for
+        // the member: the tree's own library directories lead the run's
+        // search path, so on a rebuild the carried copy is what loads,
+        // and that open names a path no spelling spells.
+        let shadowed = Trim::from_paths(
+            vec![PathBuf::from("/tree/lib/a.conf")],
+            Some(Path::new("/tree")),
+        );
+        assert!(!trimmed_out(&dir, a, None, Some(&shadowed)));
+        // A tree copy of another name is not the member, and neither is
+        // the same name outside the tree.
+        let other = Trim::from_paths(
+            vec![PathBuf::from("/tree/lib/b.conf")],
+            Some(Path::new("/tree")),
+        );
+        assert!(trimmed_out(&dir, a, None, Some(&other)));
+        let outside = Trim::from_paths(
+            vec![PathBuf::from("/elsewhere/a.conf")],
+            Some(Path::new("/tree")),
+        );
+        assert!(trimmed_out(&dir, a, None, Some(&outside)));
+        // Without a trim nothing goes.
+        assert!(!trimmed_out(&dir, a, None, None));
     }
 }

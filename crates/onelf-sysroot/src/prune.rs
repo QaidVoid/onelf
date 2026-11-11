@@ -139,6 +139,14 @@ impl Trace {
             None => false,
         }
     }
+
+    /// The paths the run opened itself, relative to the root, without
+    /// the sibling rule [`Trace::keeps`] prunes with. The inference
+    /// trim asks exactly this: a member survives `[bundle]
+    /// trim-inferred` only when the run opened it.
+    pub fn opened_paths(&self) -> &BTreeSet<String> {
+        &self.opened
+    }
 }
 
 /// The directories a distribution keeps flat and full: what a run opened

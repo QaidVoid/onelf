@@ -2317,7 +2317,7 @@ pub fn default_label(root: &Path, archive: Option<&Path>) -> String {
 
 /// The AppDir path a sysroot path lands at: `usr/` is the prefix the
 /// conventional layout leaves out.
-fn appdir_path(rel: &str) -> &str {
+pub(crate) fn appdir_path(rel: &str) -> &str {
     rel.strip_prefix("usr/").unwrap_or(rel)
 }
 

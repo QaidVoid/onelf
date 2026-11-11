@@ -564,6 +564,17 @@ pub struct Bundle {
     /// Arguments for the traced run.
     #[serde(default)]
     pub trace_args: Vec<String>,
+    /// Keep only what a trace observed in the directories inference
+    /// collects: a data directory keeps the members the trace opened,
+    /// the recipe's keep patterns name and the kept relative links'
+    /// targets, a plugin directory keeps the members the trace loaded,
+    /// their dependencies and the keep patterns. Needs a trace:
+    /// `trace-run`, or `[sysroot] trace`. A traced run on a glibc host
+    /// sees only the modules the loader maps, so there a data
+    /// directory keeps nothing; musl runs and sysroot traces record
+    /// file opens.
+    #[serde(default)]
+    pub trim_inferred: bool,
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).
     #[serde(default)]
     pub skip: bool,
@@ -625,6 +636,26 @@ pub fn load(path: &Path) -> std::io::Result<Recipe> {
                 format!("{}: {e}", path.display()),
             )
         })?;
+    }
+    if recipe.bundle.trim_inferred {
+        let traced = match &recipe.sysroot {
+            // A sysroot build trims by its recorded trace alone: the
+            // traced host run cannot apply to it. A section without a
+            // path pins sets on a host scan, so the traced host run
+            // is the trace that applies.
+            Some(sr) if sr.path.is_some() => sr.trace.is_some(),
+            _ => recipe.bundle.trace_run,
+        };
+        if !traced {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: [bundle] trim-inferred is set, but no trace applies to it: \
+                     set [sysroot] trace on a sysroot build, or trace-run on a host scan",
+                    path.display()
+                ),
+            ));
+        }
     }
     if let Some(input) = &recipe.input {
         input.validate().map_err(|e| {

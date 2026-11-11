@@ -28042,10 +28042,563 @@ fn a_sysroot_build_collects_inferred_directories_from_the_sysroot() {
     );
     assert!(
         findings.iter().any(|l| {
-            l.contains("lib/examplefw/plugins: selected: plugin directory, 1 object(s)")
+            l.contains("lib/examplefw/plugins: selected: plugin directory, 4 object(s)")
                 && l.contains("sysroot/usr/lib/examplefw/plugins below the prefix")
         }),
         "the plugin directory and its members come from the sysroot: {findings:#?}"
+    );
+}
+
+/// `[bundle] trim-inferred` keeps only the members a trace opened, and
+/// the recipe's keep patterns: the opened module stays, the unopened
+/// ones go, a keep glob saves a member the run never touched, and the
+/// findings name the directory trace-limited, not complete.
+#[test]
+fn a_trim_inferred_plugin_directory_keeps_the_members_the_trace_opened() {
+    let td = workdir("examplefw-trim");
+    let Some(dir) = examplefw_sysroot(&td) else {
+        return;
+    };
+    let archive = td.join("root.tar");
+    let trace = td.join("trace.txt");
+    write(
+        &trace,
+        "/usr/bin/app\n/usr/lib/examplefw/plugins/probe.so\n/usr/lib/examplefw/plugins/libfoo.so\n/usr/share/examplefw/a.conf\n/usr/share/examplefw/link.conf\n",
+    );
+    let keep = td.join("keep.txt");
+    write(&keep, "usr/lib/examplefw/plugins/run-probe.sh\n");
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\ntrace = \"{}\"\nkeep = \"{}\"\n\n\
+             [bundle]\ntrim-inferred = true\n",
+            archive.display(),
+            trace.display(),
+            keep.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let plugins = dir.join("lib/examplefw/plugins");
+    assert!(plugins.join("probe.so").is_file(), "{err}");
+    assert!(
+        plugins.join("libfoo.so").exists(),
+        "a member the trace opened under its link name stays: {err}"
+    );
+    assert!(
+        !plugins.join("libfoo.so.1.2").exists(),
+        "the unopened link target is trimmed out of the tree: {err}"
+    );
+    assert!(
+        !plugins.join("extra.so").exists(),
+        "an unopened plugin object is trimmed out of the tree: {err}"
+    );
+    assert!(
+        plugins.join("run-probe.sh").is_file(),
+        "a keep pattern saves a member the run never opened: {err}"
+    );
+    assert!(
+        !plugins.join("module.conf").exists(),
+        "an unopened member is trimmed out of the tree: {err}"
+    );
+    assert!(
+        !plugins.join("probe.conf").exists(),
+        "an unopened member link is trimmed out of the tree: {err}"
+    );
+    assert!(
+        dir.join("share/examplefw/a.conf").is_file(),
+        "the opened data file stays: {err}"
+    );
+    assert!(
+        !dir.join("share/examplefw/b.conf").exists(),
+        "an unopened data file is trimmed out of the tree: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| {
+            l.contains(
+                "lib/examplefw/plugins: trace-limited: plugin directory, \
+                 2 object(s) and 0 other file(s), ",
+            ) && l.contains("; 3 of 9 member(s) kept by the trace")
+                && l.contains("the rest the trace did not open")
+                && l.split("other file(s), ")
+                    .nth(1)
+                    .and_then(|rest| rest.split("; ").next())
+                    .is_some_and(|size| {
+                        size.ends_with('B') && size.bytes().any(|b| b.is_ascii_digit())
+                    })
+        }),
+        "the plugin directory is reported trace-limited with its size: {findings:#?}"
+    );
+    assert!(
+        findings.iter().any(|l| {
+            l.contains(
+                "share/examplefw: trace-limited: data directory, \
+                 2 of 3 member(s) kept by the trace, 5 B",
+            )
+        }),
+        "the data directory is reported trace-limited with the kept bytes: {findings:#?}"
+    );
+
+    // A second build over the trimmed tree re-populates every sysroot
+    // member and the trim disposes the same members again by hash, so
+    // the tree and the findings come out the same.
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(plugins.join("probe.so").is_file(), "{err}");
+    assert!(
+        plugins.join("libfoo.so").exists(),
+        "a member the trace opened under its link name stays: {err}"
+    );
+    assert!(
+        !plugins.join("extra.so").exists(),
+        "an unopened member is trimmed out of the tree again: {err}"
+    );
+    assert!(
+        !plugins.join("libfoo.so.1.2").exists(),
+        "the trim follows the link name again: {err}"
+    );
+    assert!(
+        !plugins.join("module.conf").exists(),
+        "an unopened member is trimmed out of the tree again: {err}"
+    );
+    assert!(
+        !plugins.join("probe.conf").exists(),
+        "an unopened member link is trimmed out of the tree again: {err}"
+    );
+    assert!(
+        plugins.join("run-probe.sh").is_file(),
+        "a keep pattern saves a member the run never opened again: {err}"
+    );
+    assert!(
+        dir.join("share/examplefw/a.conf").is_file(),
+        "the opened data file stays: {err}"
+    );
+    assert!(
+        !dir.join("share/examplefw/b.conf").exists(),
+        "an unopened data file is trimmed out of the tree again: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("3 of 9 member(s) kept by the trace")),
+        "the second build reports the same plugin trim: {findings:#?}"
+    );
+    assert!(
+        findings.iter().any(|l| {
+            l.contains(
+                "share/examplefw: trace-limited: data directory, \
+                 2 of 3 member(s) kept by the trace, 5 B",
+            )
+        }),
+        "the second build reports the same data trim: {findings:#?}"
+    );
+    // A tripwire, not a populate proof: record_generated merges prior
+    // entries, so the assertion pins the real invariant, the kept
+    // member's attestation surviving the second build's trim, which a
+    // double-disposal regression would trip.
+    let ledger = std::fs::read_to_string(dir.join(".onelf/generated")).unwrap();
+    assert!(
+        ledger.contains("share/examplefw/a.conf"),
+        "the kept member's attestation survives the second build: {ledger}"
+    );
+}
+
+/// A kept relative link keeps the member it names: the trace opened
+/// the link, so the carry must not leave it dangling once the target
+/// member's tree copy is disposed.
+#[test]
+fn a_kept_link_keeps_the_member_it_names() {
+    let td = workdir("examplefw-trim-link");
+    let Some(dir) = examplefw_sysroot(&td) else {
+        return;
+    };
+    let archive = td.join("root.tar");
+    let trace = td.join("trace.txt");
+    write(&trace, "/usr/bin/app\n/usr/share/examplefw/link.conf\n");
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\ntrace = \"{}\"\n\n\
+             [bundle]\ntrim-inferred = true\n",
+            archive.display(),
+            trace.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        dir.join("share/examplefw/link.conf").exists(),
+        "the opened link stays: {err}"
+    );
+    assert!(
+        dir.join("share/examplefw/a.conf").is_file(),
+        "the kept link's target member is rescued from the trim: {err}"
+    );
+    assert!(
+        !dir.join("share/examplefw/b.conf").exists(),
+        "an unopened data file is trimmed out of the tree: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| {
+            l.contains(
+                "share/examplefw: trace-limited: data directory, \
+                 2 of 3 member(s) kept by the trace, 5 B",
+            )
+        }),
+        "the rescued target rides in the kept count: {findings:#?}"
+    );
+}
+
+/// A traced recipe without the key is unchanged: the trace prunes the
+/// closure as before and inference keeps the plugin directory whole,
+/// the siblings of an opened member among them.
+#[test]
+fn a_traced_recipe_without_trim_inferred_keeps_the_inferred_directories_whole() {
+    let td = workdir("examplefw-trim-off");
+    let Some(dir) = examplefw_sysroot(&td) else {
+        return;
+    };
+    let archive = td.join("root.tar");
+    let trace = td.join("trace.txt");
+    write(
+        &trace,
+        "/usr/bin/app\n/usr/lib/examplefw/plugins/probe.so\n/usr/share/examplefw/a.conf\n",
+    );
+    write(
+        &dir.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [sysroot]\npath = \"../sysroot\"\narchive = \"{}\"\ntrace = \"{}\"\n",
+            archive.display(),
+            trace.display()
+        ),
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let plugins = dir.join("lib/examplefw/plugins");
+    for member in ["probe.so", "module.conf", "probe.conf", "run-probe.sh"] {
+        assert!(
+            plugins.join(member).exists(),
+            "without the key the trace's sibling rule keeps {member}: {err}"
+        );
+    }
+    assert!(
+        dir.join("share/examplefw/a.conf").is_file(),
+        "without the key the data directory is carried whole: {err}"
+    );
+    let findings = findings_block(&err);
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("lib/examplefw/plugins: selected: plugin directory")),
+        "the plugin directory reads selected, not trace-limited: {findings:#?}"
+    );
+    assert!(
+        !findings.iter().any(|l| l.contains("trace-limited")),
+        "no directory is reported trace-limited without the key: {findings:#?}"
+    );
+}
+
+/// A host-scan build with `trace-run` and the key trims what its traced
+/// run never opened: an app that loads none of the compiled-in
+/// directories' members carries none of them, and each is omitted
+/// naming the trace. The dependencies DT_NEEDED names are bundled
+/// regardless: the trim touches only what inference collects.
+#[test]
+fn a_trace_run_with_trim_inferred_leaves_out_the_directories_nothing_opened() {
+    let td = workdir("examplefw-trim-run");
+    let Some((prefix, app)) = examplefw_sources(&td) else {
+        return;
+    };
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\ntrace-run = true\ntrim-inferred = true\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let mut c = Command::new(onelf());
+    c.arg("build")
+        .current_dir(&app)
+        .env("SOURCE_DATE_EPOCH", "1700000000");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf build");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        app.join("lib/libexamplefw.so.1").is_file(),
+        "a DT_NEEDED library is bundled regardless of the trim: {err}"
+    );
+    for gone in [
+        "lib/examplefw/plugins/nested/probe.so",
+        "lib/examplefw/plugins/Probe.pm",
+        "lib/examplefw/backends/backend.so.1",
+        "share/examplefw/conf.d/a.conf",
+        "share/examplefw-extra/b.conf",
+        "share/probefw/c.conf",
+    ] {
+        assert!(
+            !app.join(gone).exists(),
+            "{gone}: the run opened nothing in its directory: {err}"
+        );
+    }
+    let findings = findings_block(&err);
+    let omitted = findings
+        .iter()
+        .filter(|l| l.contains("omitted because the trace opened nothing in it"))
+        .count();
+    assert!(
+        omitted >= 4,
+        "every compiled-in directory is omitted naming the trace: {findings:#?}"
+    );
+}
+
+/// A rebuild keeps what the tree shadows: the first build carries the
+/// traced member and bundles its own flat copy of it, and the tree's
+/// own library directories lead the next run's search path, so the
+/// second run opens that copy and no member spelling. The copy stands
+/// in for the member, so the trim keeps it, and the directory is not
+/// omitted naming a trace that did open it.
+#[test]
+fn a_second_build_keeps_the_members_the_tree_shadows() {
+    let td = workdir("examplefw-trim-shadow");
+    let prefix = td.join("dist/usr");
+    let plugins = prefix.join("lib/examplefw/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let library = |name: &str, source: &str, out: &Path, extra: &[&str]| -> bool {
+        let src = td.join(format!("{name}.c"));
+        write(&src, source);
+        let mut args = vec!["-shared", "-fPIC", src.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        cc_with(&args, out)
+    };
+    let compiled = format!("const char *dirs[] = {{\"{}\"}};\n", plugins.display());
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    let ok = library(
+        "dep",
+        "int dep_value(void){return 4;}\n",
+        &prefix.join("lib/libdep.so.1"),
+        &["-Wl,-soname,libdep.so.1"],
+    ) && library(
+        "examplefw",
+        &format!("{compiled}int framework(void){{return 1;}}\n"),
+        &prefix.join("lib/libexamplefw.so.1"),
+        &["-Wl,-soname,libexamplefw.so.1"],
+    ) && library(
+        "probe",
+        &format!("{compiled}int dep_value(void);\nint plugin_probe(void){{return dep_value();}}\n"),
+        &plugins.join("probe.so"),
+        &[&lib_dir, "-Wl,--no-as-needed", "-l:libdep.so.1"],
+    );
+    if !ok {
+        return;
+    }
+    // The app loads the plugin by its bare name, so the loader searches
+    // `LD_LIBRARY_PATH` and takes whatever copy comes first.
+    write(
+        &td.join("main.c"),
+        "#include <dlfcn.h>\nint framework(void);\n\
+         int main(void){return dlopen(\"probe.so\", 2) ? framework() - 1 : 3;}\n",
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libexamplefw.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\", \"{}\"]\ntrace-run = true\ntrim-inferred = true\n",
+            prefix.join("lib").display(),
+            plugins.display()
+        ),
+    );
+    let build = |what: &str| {
+        let mut c = Command::new(onelf());
+        c.arg("build")
+            .current_dir(&app)
+            .env("SOURCE_DATE_EPOCH", "1700000000");
+        if let Some(pe) = patchelf() {
+            c.env("ONELF_PATCHELF", pe);
+        }
+        let out = c.output().expect("spawn onelf build");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{what}: {err}");
+        err.into_owned()
+    };
+    let first = build("the first build");
+    assert!(
+        first.contains("1 of 1 member(s) kept by the trace"),
+        "the traced run opens the member and the trim keeps it: {first}"
+    );
+    // The lib half bundles the traced member flat and leaves an alias
+    // at its own place in the layout; how that pair migrates on a
+    // rebuild is the lib half's business, not the trim's.
+    assert!(
+        app.join("lib/probe.so").is_file(),
+        "the bundler's own flat copy of the traced member leads the tree: {first}"
+    );
+    assert!(
+        app.join("lib/examplefw/plugins/probe.so")
+            .symlink_metadata()
+            .is_ok(),
+        "the carried member sits at its own place in the layout: {first}"
+    );
+    let second = build("the second build");
+    assert!(
+        second.contains("1 of 1 member(s) kept by the trace"),
+        "the tree's copy stands in for the member on a rebuild: {second}"
+    );
+    assert!(
+        !second.contains("opened nothing in it"),
+        "the directory is not omitted naming a trace that did open it: {second}"
+    );
+    assert!(
+        app.join("lib/examplefw/plugins/probe.so")
+            .symlink_metadata()
+            .is_ok(),
+        "the rebuild does not dispose the member's tree copy: {second}"
+    );
+}
+
+/// A dry run with the key trims nothing: the traced run is skipped, so
+/// nothing was observed, and the members an earlier build carried stay
+/// in the tree, with the unchecked trace reported.
+#[test]
+fn a_dry_run_with_trim_inferred_changes_nothing() {
+    let td = workdir("examplefw-trim-dry");
+    let Some((prefix, app)) = examplefw_sources(&td) else {
+        return;
+    };
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let built = onelf_build(&app);
+    let err = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "{err}");
+    let carried = [
+        "lib/examplefw/plugins/nested/probe.so",
+        "lib/examplefw/plugins/Probe.pm",
+        "lib/examplefw/backends/backend.so.1",
+        "share/examplefw/conf.d/a.conf",
+        "share/examplefw-extra/b.conf",
+        "share/probefw/c.conf",
+    ];
+    for member in carried {
+        assert!(
+            app.join(member).exists(),
+            "the first build carries {member}: {err}"
+        );
+    }
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\ntrace-run = true\ntrim-inferred = true\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let mut c = Command::new(onelf());
+    c.arg("build")
+        .arg("--dry-run")
+        .current_dir(&app)
+        .env("SOURCE_DATE_EPOCH", "1700000000");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf build --dry-run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    for member in carried {
+        assert!(
+            app.join(member).exists(),
+            "a dry run leaves {member} in the tree: {err}"
+        );
+    }
+    assert!(
+        err.contains("trim-inferred trims nothing"),
+        "the dry run reports the trim unchecked: {err}"
+    );
+}
+
+/// A recipe cannot set `trim-inferred` without a trace that applies to
+/// it: no trace-run, and no `[sysroot] trace`.
+#[test]
+fn a_recipe_cannot_trim_inferred_without_a_trace() {
+    let td = workdir("trim-no-trace");
+    let dir = td.join("app");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write(&dir.join("bin/app"), "#!/bin/sh\n");
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+         [bundle]\ntrim-inferred = true\n",
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a trace-less trim built: {err}");
+    assert!(
+        err.contains("trim-inferred is set, but no trace applies"),
+        "{err}"
+    );
+    // A sysroot build trims by its recorded trace alone: trace-run
+    // cannot stand in for it.
+    let sysroot = td.join("sysroot/usr/lib");
+    std::fs::create_dir_all(&sysroot).unwrap();
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+         [sysroot]\npath = \"../sysroot\"\n\n\
+         [bundle]\ntrace-run = true\ntrim-inferred = true\n",
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a sysroot trim without a recorded trace built: {err}"
+    );
+    assert!(
+        err.contains("trim-inferred is set, but no trace applies"),
+        "{err}"
+    );
+    // A path-less [sysroot] pins sets on a host scan: the traced host
+    // run is the trace that applies, so the trim builds.
+    write(
+        &dir.join("onelf.toml"),
+        "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+         [sysroot]\nplatform-url = \"https://example.invalid/fw.tar\"\nplatform-hash = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\n\
+         [bundle]\ntrace-run = true\ntrim-inferred = true\n",
+    );
+    let out = onelf_build(&dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a path-less [sysroot] host scan trims by its run: {err}"
     );
 }
 
@@ -28065,12 +28618,15 @@ fn examplefw_sysroot(td: &Path) -> Option<PathBuf> {
         std::fs::create_dir_all(rootfs.join(d)).unwrap();
     }
     write(&rootfs.join("usr/share/examplefw/a.conf"), "conf\n");
+    write(&rootfs.join("usr/share/examplefw/b.conf"), "extra\n");
     write(
         &td.join("examplefw.c"),
         "const char *dirs[] = {\"/usr/lib/examplefw/plugins\", \"/usr/share/examplefw\"};\n\
          int framework(void){return 1;}\n",
     );
     write(&td.join("probe.c"), "int plugin_probe(void){return 2;}\n");
+    write(&td.join("extra.c"), "int plugin_extra(void){return 3;}\n");
+    write(&td.join("libfoo.c"), "int plugin_libfoo(void){return 4;}\n");
     write(
         &td.join("main.c"),
         "int framework(void);\nint main(void){return framework()-1;}\n",
@@ -28087,6 +28643,12 @@ fn examplefw_sysroot(td: &Path) -> Option<PathBuf> {
     ) || !cc_with(
         &["-shared", "-fPIC", td.join("probe.c").to_str().unwrap()],
         &rootfs.join("usr/lib/examplefw/plugins/probe.so"),
+    ) || !cc_with(
+        &["-shared", "-fPIC", td.join("extra.c").to_str().unwrap()],
+        &rootfs.join("usr/lib/examplefw/plugins/extra.so"),
+    ) || !cc_with(
+        &["-shared", "-fPIC", td.join("libfoo.c").to_str().unwrap()],
+        &rootfs.join("usr/lib/examplefw/plugins/libfoo.so.1.2"),
     ) || !cc_with(
         &[
             td.join("main.c").to_str().unwrap(),
@@ -28121,6 +28683,12 @@ fn examplefw_sysroot(td: &Path) -> Option<PathBuf> {
     )
     .unwrap();
     std::os::unix::fs::symlink(
+        "libfoo.so.1.2",
+        rootfs.join("usr/lib/examplefw/plugins/libfoo.so"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("a.conf", rootfs.join("usr/share/examplefw/link.conf")).unwrap();
+    std::os::unix::fs::symlink(
         "/etc/hosts",
         rootfs.join("usr/lib/examplefw/plugins/abs.conf"),
     )
@@ -28150,12 +28718,17 @@ fn examplefw_sysroot(td: &Path) -> Option<PathBuf> {
         &[
             "usr/lib/libexamplefw.so.1",
             "usr/lib/examplefw/plugins/probe.so",
+            "usr/lib/examplefw/plugins/extra.so",
+            "usr/lib/examplefw/plugins/libfoo.so",
+            "usr/lib/examplefw/plugins/libfoo.so.1.2",
             "usr/lib/examplefw/plugins/module.conf",
             "usr/lib/examplefw/plugins/probe.conf",
             "usr/lib/examplefw/plugins/run-probe.sh",
             "usr/lib/examplefw/plugins/abs.conf",
             "usr/lib/examplefw/plugins/listed",
             "usr/share/examplefw/a.conf",
+            "usr/share/examplefw/b.conf",
+            "usr/share/examplefw/link.conf",
         ],
     );
     write_pacman_entry(

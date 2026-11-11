@@ -1008,6 +1008,7 @@ fn main() {
                 trace_run,
                 trace_seconds,
                 trace_args: trace_arg,
+                trim_inferred: false,
                 sysroot,
                 sets: Vec::new(),
                 entrypoint_selections: Vec::new(),

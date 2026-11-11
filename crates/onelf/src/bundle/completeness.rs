@@ -18,6 +18,10 @@ use super::ui;
 pub enum Outcome {
     /// The source or provider that answers for the object.
     Selected,
+    /// Carried, but limited to what a trace observed: the members a
+    /// `[bundle] trim-inferred` build keeps are the ones the trace
+    /// opened, so the directory is not complete.
+    TraceLimited,
     /// A pinned provider a dry run did not obtain, so it satisfies
     /// nothing yet.
     Unverified,
@@ -39,6 +43,7 @@ impl Outcome {
     fn label(self) -> &'static str {
         match self {
             Outcome::Selected => "selected",
+            Outcome::TraceLimited => "trace-limited",
             Outcome::Unverified => "unverified",
             Outcome::OptionalOmission => "optional omission",
             Outcome::Removed => "removed",

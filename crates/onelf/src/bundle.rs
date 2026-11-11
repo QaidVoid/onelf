@@ -28,7 +28,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use onelf_sysroot::{Database, PlatformLine, Policy};
+use onelf_sysroot::{Database, PlatformLine, Policy, Trace};
 
 use crate::recipe;
 
@@ -1186,16 +1186,150 @@ fn queue_collection(
 enum InferredPlan {
     /// The whole directory, as a data carry.
     Data(Carry),
+    /// The trace-limited directory, as a data carry of the members the
+    /// plan admitted: the planned pairs and bytes, and the member
+    /// counts the trim judged.
+    TrimmedData {
+        files: Vec<(PathBuf, PathBuf)>,
+        size: u64,
+        kept: usize,
+        total: usize,
+    },
     /// The collection an inferred plugin directory's members went
     /// through, boxed to keep the variant small, the members a group
     /// collected first, the members that are not objects to carry as
-    /// data, and the planned byte size.
+    /// data, the planned byte size, and the member counts the trim
+    /// judged, when the trace limited the directory.
     Plugins {
         collection: Box<collect::GroupCollection>,
         firsts: Vec<(String, PathBuf)>,
         files: Vec<(PathBuf, PathBuf)>,
         size: u64,
+        trimmed: Option<(usize, usize)>,
     },
+}
+
+/// The `[bundle] trim-inferred` policy: what a trace observed, and the
+/// keep globs that survive it regardless. A sysroot build reads the
+/// recipe's `[sysroot] trace` and `[sysroot] keep`; a host scan takes
+/// what its traced run opened, and has no keep patterns. A host scan
+/// also carries the tree root, so an open of a copy the tree itself
+/// holds can stand in for a member no spelling names.
+struct Trim {
+    opened: BTreeSet<String>,
+    keep: Option<Policy>,
+    tree: Option<String>,
+}
+
+impl Trim {
+    /// Load the sysroot trace tiers: the paths a test run opened, one
+    /// per line, and the globs the trim may not cut.
+    fn load(trace: Option<&Path>, keep: Option<&Path>) -> io::Result<Self> {
+        let opened = trace
+            .map(Trace::load)
+            .transpose()?
+            .map(|t| t.opened_paths().clone())
+            .unwrap_or_default();
+        let keep = keep.map(Policy::load).transpose()?;
+        Ok(Trim {
+            opened,
+            keep,
+            tree: None,
+        })
+    }
+
+    /// From the absolute paths a traced host run opened, and the tree
+    /// root the run's copies live under.
+    fn from_paths(paths: Vec<PathBuf>, tree: Option<&Path>) -> Self {
+        let slash_trimmed = |p: &Path| {
+            let rel = p.to_string_lossy();
+            let rel = rel.trim_start_matches('/');
+            (!rel.is_empty()).then(|| rel.to_string())
+        };
+        Trim {
+            opened: paths.iter().filter_map(|p| slash_trimmed(p)).collect(),
+            keep: None,
+            tree: tree.and_then(slash_trimmed),
+        }
+    }
+
+    /// Whether the trace observed `path`, or a keep glob names it.
+    fn keeps(&self, path: &Path) -> bool {
+        let rel = path.to_string_lossy();
+        let rel = rel.trim_start_matches('/');
+        if self.opened.contains(rel) {
+            return true;
+        }
+        self.keep.as_ref().is_some_and(|keep| keep.matches(rel))
+    }
+
+    /// Whether the run opened a same-named copy of the member inside
+    /// the tree: the tree's own library directories lead the run's
+    /// search path, so on a rebuild a copy the last build carried
+    /// stands in for the original, and that open names a path no
+    /// member spelling spells. Matching by name alone can keep an
+    /// unrelated member of the same name, which trims on the
+    /// conservative side.
+    fn keeps_tree_shadow(&self, rel: &Path) -> bool {
+        let Some(tree) = &self.tree else {
+            return false;
+        };
+        let Some(name) = rel.file_name() else {
+            return false;
+        };
+        self.opened.iter().any(|opened| {
+            Path::new(opened).strip_prefix(Path::new(tree)).is_ok()
+                && Path::new(opened).file_name() == Some(name)
+        })
+    }
+}
+
+/// Every path spelling the trace could have named `dir`'s member `rel`
+/// (relative to the directory) by: the canonical prefix pair, the
+/// resolved source, every compiled-in path that names the directory,
+/// since an app opens the spelling it compiled in, and, for a sysroot
+/// build, the member's root-relative spellings, since a sysroot trace
+/// records paths below the root while the canonical pair spells host
+/// paths under it. A host scan needs none of these for the tree's own
+/// copies: `Trim::keeps_tree_shadow` answers for every open of a
+/// same-named copy below the tree root.
+fn member_spellings(
+    dir: &infer::InferredDir,
+    rel: &Path,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+) -> Vec<PathBuf> {
+    let mut out = vec![dir.prefix.join(&dir.rel).join(rel), dir.source.join(rel)];
+    out.extend(dir.compiled.iter().map(|s| Path::new(s).join(rel)));
+    if let Some(universe) = sysroot
+        && let Ok(dir_rel) = dir.source.strip_prefix(universe.root())
+    {
+        out.push(dir_rel.join(rel));
+        if let Ok(resolved) = onelf_sysroot::path::in_root(universe.root(), dir_rel)
+            && let Ok(resolved_rel) = resolved.strip_prefix(universe.root())
+        {
+            out.push(resolved_rel.join(rel));
+        }
+    }
+    out
+}
+
+/// Whether the trim leaves `dir`'s member `rel` out: no spelling of it
+/// was observed, no keep glob names it, and the run did not open a
+/// same-named copy of it inside the tree. Without a trim every member
+/// survives, so a recipe without the key reads exactly as before.
+fn trimmed_out(
+    dir: &infer::InferredDir,
+    rel: &Path,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    trim: Option<&Trim>,
+) -> bool {
+    let Some(trim) = trim else {
+        return false;
+    };
+    let kept = member_spellings(dir, rel, sysroot)
+        .iter()
+        .any(|spelling| trim.keeps(spelling));
+    !(kept || trim.keeps_tree_shadow(rel))
 }
 
 /// Plan one inferred plugin directory's carry into the tree, with the
@@ -1211,10 +1345,12 @@ enum InferredPlan {
 /// On `Ok` the collection, the members a group collected first, the
 /// data members to carry and the planned byte size; the caller hands
 /// them to the walk's queues only after the plan has held.
+#[allow(clippy::too_many_arguments)]
 fn plan_plugin_carry(
     dir: &infer::InferredDir,
     members: &[(PathBuf, PathBuf)],
     mut collection: collect::GroupCollection,
+    trimmed_total: Option<(usize, usize)>,
     origin: &str,
     opts: &BundleOptions,
     sysroot: Option<&sysroot::SysrootUniverse>,
@@ -1222,21 +1358,48 @@ fn plan_plugin_carry(
 ) -> io::Result<InferredPlan> {
     exclude_recipe_members(&mut collection, &opts.exclude);
     let firsts = plan_collection(&mut collection, origin, &opts.directory, state)?;
-    let hit = dir.hit();
-    // The member as the sysroot's tree holds it: every component but
-    // the last resolved, so a link at the entry stays the link. A host
-    // scan's members are already the files they resolved to.
-    let member_of = |rel: &Path| -> Option<PathBuf> {
-        let universe = sysroot?;
-        let dir_rel = hit.resolved.strip_prefix(universe.root()).ok()?;
-        onelf_sysroot::path::entry_in_root(universe.root(), &dir_rel.join(rel)).ok()
-    };
     let mut size: u64 = collection
         .plugins
         .iter()
         .filter_map(|p| fs::metadata(&p.resolved).ok())
         .map(|meta| meta.len())
         .sum();
+    let (files, files_size) = plan_member_data(dir, members, origin, sysroot, state)?;
+    size += files_size;
+    Ok(InferredPlan::Plugins {
+        collection: Box::new(collection),
+        firsts,
+        files,
+        size,
+        trimmed: trimmed_total,
+    })
+}
+
+/// Plan an inferred directory's non-object members as data, at their
+/// places beneath its destination: a regular file admitted as a carry,
+/// a relative link as a link, an absolute one left out, as a host carry
+/// leaves it, and so is any entry that is not a regular file, such as a
+/// directory the package lists. A member is judged by the entry the
+/// sysroot's tree holds for it, so a link there stays a link and is
+/// never followed into a copy of what it names; a host scan's members
+/// are already the files they resolved to. On `Ok` the
+/// (source, destination) pairs and the planned bytes.
+fn plan_member_data(
+    dir: &infer::InferredDir,
+    members: &[(PathBuf, PathBuf)],
+    origin: &str,
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    state: &mut WalkState,
+) -> io::Result<(Vec<(PathBuf, PathBuf)>, u64)> {
+    let hit = dir.hit();
+    // The member as the sysroot's tree holds it: every component but
+    // the last resolved, so a link at the entry stays the link.
+    let member_of = |rel: &Path| -> Option<PathBuf> {
+        let universe = sysroot?;
+        let dir_rel = hit.resolved.strip_prefix(universe.root()).ok()?;
+        onelf_sysroot::path::entry_in_root(universe.root(), &dir_rel.join(rel)).ok()
+    };
+    let mut size = 0u64;
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (rel, file) in members {
         if read_elf_class(file).is_some() {
@@ -1259,10 +1422,6 @@ fn plan_plugin_carry(
         } else if meta.is_file() {
             state.plan.admit_carried(&to, file, origin)?
         } else {
-            // A package can list a directory among its files. Carrying
-            // it whole would copy whatever stands beside it in the
-            // source, admitted or not, so only regular files are
-            // admitted as data.
             continue;
         };
         if admission == Admission::Write {
@@ -1272,23 +1431,338 @@ fn plan_plugin_carry(
             files.push((member, to));
         }
     }
-    Ok(InferredPlan::Plugins {
-        collection: Box::new(collection),
-        firsts,
-        files,
-        size,
-    })
+    Ok((files, size))
+}
+
+/// The ledger spelling a member's populate-written tree copy is
+/// recorded under: a sysroot build disposes by the populate's own
+/// spelling of the member's sysroot path; under a prefix below the
+/// sysroot's `usr` the carry destination can spell another directory's
+/// attested key, so it is never consulted for one. A host scan knows
+/// no sysroot and names the carry destination.
+fn disposal_spelling(
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    dir: &infer::InferredDir,
+    rel: &Path,
+) -> String {
+    if let Some(universe) = sysroot
+        && let Ok(dir_rel) = dir.source.strip_prefix(universe.root())
+    {
+        return sysroot::appdir_path(&dir_rel.join(rel).to_string_lossy()).to_string();
+    }
+    dir.destination.join(rel).to_string_lossy().into_owned()
+}
+
+/// The tree copies the sysroot populate wrote of the members the trim
+/// leaves out are disposed the way the populate disposes its own stale
+/// copies: an entry whose recorded hash still matches the bytes, or one
+/// pending the build's own rewriting, is removed with its empty
+/// directories, and the ledger drops it. A copy the ledger cannot
+/// attest may hold a publisher's edit, and stays; the next build's
+/// publication stops on it, where the author can resolve it. Each
+/// member arrives with the ledger spelling its copy is recorded
+/// under: a sysroot build disposes by the populate's own spelling of
+/// the member's sysroot path, a host scan by the carry destination.
+/// The member as its directory holds it: every component but the last
+/// resolved, so a link at the entry stays the link. A host scan has no
+/// sysroot tree and names the entry by the directory itself.
+fn member_entry(
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    resolved_dir: &Path,
+    rel: &Path,
+) -> Option<PathBuf> {
+    match sysroot {
+        Some(universe) => {
+            let dir_rel = resolved_dir.strip_prefix(universe.root()).ok()?;
+            onelf_sysroot::path::entry_in_root(universe.root(), &dir_rel.join(rel)).ok()
+        }
+        None => Some(resolved_dir.join(rel)),
+    }
+}
+
+/// The lexical spelling of `path` with `.` dropped and `..` popped
+/// from what it can. The same normalization on both spellings keeps a
+/// prefix strip aligned across dotted anchors.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            component => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The trimmed member a kept relative link names, when nothing else
+/// answers for the link: a collection object at the link's destination
+/// carries the name itself, so the link rides with it; without one,
+/// the plan would carry the link dangling, or drop it as an ELF and
+/// carry nothing at all.
+fn dangling_target(
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    resolved_dir: &Path,
+    rel: &Path,
+    answered: bool,
+) -> Option<PathBuf> {
+    let entry = member_entry(sysroot, resolved_dir, rel)?;
+    if !fs::symlink_metadata(&entry).ok()?.is_symlink() {
+        return None;
+    }
+    if answered {
+        return None;
+    }
+    let target = fs::read_link(&entry).ok()?;
+    if !target.is_relative() {
+        return None;
+    }
+    let named = entry.parent()?.join(target);
+    // Lexical resolution only, mirroring the sysroot resolver's
+    // component handling: a target through a subdirectory must spell
+    // the member rel the enumeration judged. Both spellings normalize
+    // the same way, so the prefix strip stays aligned, and a climb
+    // past the directory names no member. The sysroot anchor is tried
+    // as the directory spells itself and fully resolved, since a
+    // compatibility link like `bin -> usr/bin` makes the entry's
+    // parent spell the resolved form while the directory keeps the
+    // compiled one.
+    let named = normalize_lexical(&named);
+    let mut anchors = vec![normalize_lexical(resolved_dir)];
+    if let Some(universe) = sysroot
+        && let Ok(dir_rel) = resolved_dir.strip_prefix(universe.root())
+        && let Ok(resolved) = onelf_sysroot::path::in_root(universe.root(), dir_rel)
+    {
+        let resolved = normalize_lexical(&resolved);
+        if !anchors.contains(&resolved) {
+            anchors.push(resolved);
+        }
+    }
+    anchors
+        .iter()
+        .find_map(|anchor| named.strip_prefix(anchor).ok().map(Path::to_path_buf))
+}
+
+/// A kept relative link needs the member it names: the trace used the
+/// link, and the plan would otherwise carry it dangling once the
+/// target member's tree copy is disposed. A link name a collection
+/// object answers for rides with that object. Rescued links rescue
+/// their own targets, until the trim's judgment is closed under
+/// naming. Each pass rescues at least one member, so the passes are
+/// bounded by the trimmed set, and a member whose target was not
+/// trimmed when a pass judged it never rescues later: the trimmed set
+/// only shrinks. A kept link whose target escapes the directory rides
+/// unrescued; if the trim omits the target's home directory, the tree
+/// keeps the link dangling and no finding names it.
+fn keep_link_targets(
+    sysroot: Option<&sysroot::SysrootUniverse>,
+    dir: &infer::InferredDir,
+    objects: Option<&[collect::CollectedPlugin]>,
+    kept: &mut Vec<(PathBuf, PathBuf)>,
+    trimmed: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    let resolved_dir = &dir.hit().resolved;
+    loop {
+        let mut rescued: Option<usize> = None;
+        for (rel, _) in kept.iter() {
+            let answered = objects.is_some_and(|plugins| {
+                plugins
+                    .iter()
+                    .any(|p| p.destination == dir.destination.join(rel))
+            });
+            let Some(target_rel) = dangling_target(sysroot, resolved_dir, rel, answered) else {
+                continue;
+            };
+            if let Some(at) = trimmed.iter().position(|(r, _)| r == &target_rel) {
+                rescued = Some(at);
+                break;
+            }
+        }
+        let Some(at) = rescued else {
+            break;
+        };
+        kept.push(trimmed.swap_remove(at));
+    }
+}
+
+#[cfg(test)]
+mod trim_link_tests {
+    use super::*;
+
+    /// A kept relative link whose target climbs out of its own
+    /// subdirectory names the member it lands on, a climb past the
+    /// directory names no member at all, and a link a collection
+    /// object answers for is never rescued. The dotted-anchor
+    /// spellings a recipe's relative sysroot path produces are pinned
+    /// end to end by the pipeline fixture and lexically below.
+    #[test]
+    fn a_link_target_through_dotdot_names_the_member_it_lands_on() {
+        let dir =
+            std::env::temp_dir().join(format!("onelf-dangling-target-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.conf"), b"conf\n").unwrap();
+        fs::write(dir.join("outside.conf"), b"out\n").unwrap();
+        std::os::unix::fs::symlink("../a.conf", dir.join("sub/link.conf")).unwrap();
+        std::os::unix::fs::symlink("../../outside.conf", dir.join("sub/escape.conf")).unwrap();
+
+        let named = dangling_target(None, &dir, Path::new("sub/link.conf"), false);
+        assert_eq!(named.as_deref(), Some(Path::new("a.conf")));
+        let escaped = dangling_target(None, &dir, Path::new("sub/escape.conf"), false);
+        assert_eq!(escaped, None);
+        let answered = dangling_target(None, &dir, Path::new("sub/link.conf"), true);
+        assert_eq!(answered, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rootfs compatibility link (`bin -> usr/bin`, `lib ->
+    /// usr/lib`) makes the entry's parent spell the resolved form
+    /// while the directory keeps the compiled one; the anchor is
+    /// tried fully resolved, so the target still names the member
+    /// rel.
+    #[test]
+    fn a_target_beside_a_compatibility_link_anchor_still_names_the_member() {
+        use sysroot::fixture::{package, populate_universe};
+
+        let root = std::env::temp_dir().join(format!("onelf-compat-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sysroot = root.join("sysroot");
+        fs::create_dir_all(sysroot.join("usr/lib/examplefw/sub")).unwrap();
+        fs::write(sysroot.join("usr/lib/examplefw/a.conf"), b"conf\n").unwrap();
+        std::os::unix::fs::symlink("usr/lib", sysroot.join("lib")).unwrap();
+        std::os::unix::fs::symlink("../a.conf", sysroot.join("usr/lib/examplefw/sub/link.conf"))
+            .unwrap();
+        let packages = [package(
+            "examplefw",
+            &[
+                "usr/lib/libexamplefw.so.1",
+                "usr/lib/examplefw/a.conf",
+                "usr/lib/examplefw/sub/link.conf",
+            ],
+        )];
+        let universe = populate_universe(&sysroot, &packages, "examplefw", &[], None, None);
+        // The directory spells the compiled form, through the
+        // compatibility link; the entry spells the resolved one.
+        let dir = sysroot.join("lib/examplefw");
+
+        let named = dangling_target(Some(&universe), &dir, Path::new("sub/link.conf"), false);
+        assert_eq!(named.as_deref(), Some(Path::new("a.conf")));
+
+        // A sysroot trace records root-relative paths: the member's
+        // root-relative spelling names it even though the directory
+        // spells itself through the compatibility link.
+        let dir = infer::InferredDir {
+            source: sysroot.join("lib/examplefw"),
+            prefix: sysroot.join("lib"),
+            rel: PathBuf::from("examplefw"),
+            destination: PathBuf::from("lib/examplefw"),
+            kind: infer::InferredKind::Data,
+            size: 0,
+            compiled: BTreeSet::from(["/lib/examplefw".to_string()]),
+            objects: BTreeSet::from(["libexamplefw.so.1".to_string()]),
+        };
+        let trace = Trim::from_paths(vec![PathBuf::from("/usr/lib/examplefw/a.conf")], None);
+        assert!(
+            !trimmed_out(&dir, Path::new("a.conf"), Some(&universe), Some(&trace)),
+            "the trace's root-relative spelling names the member"
+        );
+        let none = Trim::from_paths(Vec::new(), None);
+        assert!(trimmed_out(
+            &dir,
+            Path::new("a.conf"),
+            Some(&universe),
+            Some(&none)
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A leading `.` survives as a `CurDir` a `..` may pop on an
+    /// empty spelling, so the dotted anchor both sides share
+    /// normalizes to one prefix; a target through a subdirectory
+    /// lands on the member rel, and a climb past the directory lands
+    /// outside the anchor.
+    #[test]
+    fn lexical_normalization_keeps_dotted_anchors_comparable() {
+        let anchor = normalize_lexical(Path::new("./../sysroot/usr/share/examplefw"));
+        assert_eq!(anchor, PathBuf::from("sysroot/usr/share/examplefw"));
+        let named = normalize_lexical(Path::new("./../sysroot/usr/share/examplefw/sub/../a.conf"));
+        assert_eq!(named.strip_prefix(&anchor), Ok(Path::new("a.conf")));
+        let escaped = normalize_lexical(Path::new("./../sysroot/usr/share/outside.conf"));
+        assert!(escaped.strip_prefix(&anchor).is_err());
+    }
+}
+
+fn dispose_trimmed_tree_copies(opts: &BundleOptions, trimmed: &[String]) -> io::Result<()> {
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let entries: std::collections::HashMap<String, sysroot::GeneratedEntry> =
+        sysroot::read_generated(&opts.directory)?
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
+    let mut removed: Vec<String> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for rel in trimmed {
+        // The member arrives with the one ledger spelling its copy is
+        // recorded under; a spelling the ledger does not attest
+        // disposes nothing.
+        let Some(entry) = entries.get(rel) else {
+            continue;
+        };
+        let at = opts.directory.join(rel);
+        let actual = sysroot::hash_entry(&at)?;
+        match sysroot::decide_generated_disposal(entry, actual) {
+            sysroot::Disposition::Dispose | sysroot::Disposition::Excuse => {
+                let _ = fs::remove_file(&at);
+                if let Some(parent) = at.parent() {
+                    dirs.push(parent.to_path_buf());
+                }
+                removed.push(rel.clone());
+            }
+            _ => {}
+        }
+    }
+    if removed.is_empty() {
+        return Ok(());
+    }
+    // Deepest first, so a directory is tried after its children; the
+    // total order also puts equal paths side by side for the dedup.
+    dirs.sort_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| a.cmp(b))
+    });
+    dirs.dedup();
+    for dir in dirs {
+        let mut dir = dir.as_path();
+        while dir != opts.directory && fs::remove_dir(dir).is_ok() {
+            let Some(parent) = dir.parent() else {
+                break;
+            };
+            dir = parent;
+        }
+    }
+    sysroot::remove_generated(&opts.directory, &removed)
 }
 
 /// Collect one inferred directory, as the descriptors' groups are: a
 /// data directory is carried whole into the generated ledger, and a
 /// plugin directory's members join the walk, each object the collection
 /// took resolved or copied at its place in the layout, with every other
-/// member carried as data beside them. Inferred directories are
-/// optional, so one the plan refuses, in whole or in part, is undone
-/// and omitted with the refusal's reason, without failing the build.
-/// The walk's queues are fed only once the plan has held, so an undone
-/// directory is not carried through the back door either.
+/// member carried as data beside them. Under the trim, a data directory
+/// keeps the members a trace observed and the keep patterns name, and a
+/// plugin directory keeps the members it observed besides its objects'
+/// own dependencies; a directory nothing survived in is omitted. Inferred
+/// directories are optional, so one the plan refuses, in whole or in
+/// part, is undone and omitted with the refusal's reason, without
+/// failing the build. The walk's queues are fed only once the plan has
+/// held, so an undone directory is not carried through the back door
+/// either.
 ///
 /// `carried` holds the destination, source and outcome of every carried
 /// directory. One inside a carried destination whose source lies at the
@@ -1305,6 +1779,7 @@ fn collect_inferred(
     carried: &mut Vec<(PathBuf, PathBuf, Carry)>,
     opts: &BundleOptions,
     sysroot: Option<&sysroot::SysrootUniverse>,
+    trim: Option<&Trim>,
     (target_class, target_machine): (Option<u8>, Option<u16>),
     excludes: &[&str],
     reachable: &HashSet<String>,
@@ -1322,6 +1797,15 @@ fn collect_inferred(
                 return Ok(());
             }
             (Some(_), _) => {
+                // Under an applied trim the parent's carry is
+                // trace-limited, and its trim judged the child's
+                // members too: the subtree rides only with the
+                // members the trace opened. The child says so instead
+                // of counting the subtree complete.
+                if *carry == Carry::Planned && trim.is_some() {
+                    infer::report(dir, dir.size, infer::Carried::WithinTrimmed(dest));
+                    return Ok(());
+                }
                 if *carry == Carry::Planned {
                     infer::report(dir, dir.size, infer::Carried::Within(dest));
                     return Ok(());
@@ -1350,15 +1834,16 @@ fn collect_inferred(
     // anything is planned, so a directory that cannot be read, or one
     // past the collection bound, is omitted with the plan and the
     // queues untouched.
+    let mut trimmed_total: Option<(usize, usize)> = None;
     let plugin = if dir.kind == infer::InferredKind::Plugins {
-        let members = match collect::members(&dir.hit(), sysroot) {
+        let mut members = match collect::members(&dir.hit(), sysroot) {
             Ok(members) => members,
             Err(error) => {
                 infer::omit(dir, &format!("it cannot be read: {error}"));
                 return Ok(());
             }
         };
-        let collection = match collect::collect_objects(
+        let mut collection = match collect::collect_objects(
             "inference",
             &dir.destination.display().to_string(),
             &dir.hit(),
@@ -1372,7 +1857,115 @@ fn collect_inferred(
                 return Ok(());
             }
         };
+        // The trim keeps only what the trace observed: a member it did
+        // not open, and that no keep pattern names, leaves the
+        // collection with its own reason, and a directory nothing
+        // survived in is omitted. A member the trim cannot name under
+        // the directory, a link landing outside it, keeps: the
+        // conservative side. A kept relative link keeps the member it
+        // names. The tree copies the sysroot populate wrote of the
+        // members left out are disposed by the ledger's hash.
+        if let Some(trim) = trim {
+            let total = members.len();
+            let mut kept = Vec::new();
+            for p in std::mem::take(&mut collection.plugins) {
+                // The member is judged by the name the group collected
+                // it under: a link collected as libfoo.so is what the
+                // trace opened, whatever file it resolves to.
+                let rel = p
+                    .destination
+                    .strip_prefix(&dir.destination)
+                    .or_else(|_| p.resolved.strip_prefix(&dir.source))
+                    .or_else(|_| p.resolved.strip_prefix(&dir.prefix))
+                    .ok()
+                    .map(|r| r.to_path_buf());
+                let out = rel
+                    .as_ref()
+                    .filter(|rel| trimmed_out(dir, rel, sysroot, Some(trim)))
+                    .map(|r| r.display().to_string());
+                if let Some(shown) = out {
+                    collection
+                        .skipped
+                        .push((shown, "the trace did not open it".to_string()));
+                } else {
+                    kept.push(p);
+                }
+            }
+            collection.plugins = kept;
+            let mut trimmed_members: Vec<(PathBuf, PathBuf)> = Vec::new();
+            for (rel, file) in std::mem::take(&mut members) {
+                if trimmed_out(dir, &rel, sysroot, Some(trim)) {
+                    trimmed_members.push((rel, file));
+                } else {
+                    members.push((rel, file));
+                }
+            }
+            keep_link_targets(
+                sysroot,
+                dir,
+                Some(&collection.plugins),
+                &mut members,
+                &mut trimmed_members,
+            );
+            let trimmed_rels: Vec<String> = trimmed_members
+                .iter()
+                .map(|(rel, _)| disposal_spelling(sysroot, dir, rel))
+                .collect();
+            trimmed_total = Some((members.len(), total));
+            dispose_trimmed_tree_copies(opts, &trimmed_rels)?;
+            if collection.plugins.is_empty() && members.is_empty() {
+                infer::omit(dir, "the trace opened nothing in it");
+                return Ok(());
+            }
+        }
         Some((members, collection))
+    } else {
+        None
+    };
+    // The trace-limited data directory: its members are enumerated and
+    // filtered before the plan, so a directory nothing survived in is
+    // omitted with the plan and the queues untouched. A destination the
+    // tree already holds is the tree's own, and the trim does not cut
+    // it; the members the trim leaves out have their populate-written
+    // tree copies disposed by the ledger's hash. The disposal commits
+    // with the trim's judgment, not the carry plan: a directory the
+    // plan later refuses keeps its kept members' populate copies, the
+    // way every omitted directory of a populated tree does, and its
+    // trimmed members' copies are gone either way; the next build
+    // re-populates whatever it needs.
+    let trimmed_data = if plugin.is_none() {
+        match trim {
+            Some(trim) => match collect::members(&dir.hit(), sysroot) {
+                Ok(members) => {
+                    let total = members.len();
+                    let mut kept = Vec::new();
+                    let mut trimmed: Vec<(PathBuf, PathBuf)> = Vec::new();
+                    for (rel, file) in members {
+                        if trimmed_out(dir, &rel, sysroot, Some(trim)) {
+                            trimmed.push((rel, file));
+                        } else {
+                            kept.push((rel, file));
+                        }
+                    }
+                    keep_link_targets(sysroot, dir, None, &mut kept, &mut trimmed);
+                    let trimmed_rels: Vec<String> = trimmed
+                        .iter()
+                        .map(|(rel, _)| disposal_spelling(sysroot, dir, rel))
+                        .collect();
+                    dispose_trimmed_tree_copies(opts, &trimmed_rels)?;
+                    if kept.is_empty() {
+                        infer::omit(dir, "the trace opened nothing in it");
+                        return Ok(());
+                    }
+                    Some((kept, total))
+                }
+                Err(error) => {
+                    infer::omit(dir, &format!("it cannot be read: {error}"));
+                    return Ok(());
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };
@@ -1385,20 +1978,55 @@ fn collect_inferred(
     let checkpoint = state.plan.checkpoint();
     let planned_actions = state.actions.len();
     let planned = match plugin {
-        Some((members, collection)) => {
-            plan_plugin_carry(dir, &members, collection, &origin, opts, sysroot, state)
-        }
-        None => carry_hit(
-            &opts.directory,
-            &objects,
-            &dir.hit(),
-            Vec::new(),
-            sysroot,
-            state.plan,
-            state.actions,
+        Some((members, collection)) => plan_plugin_carry(
+            dir,
+            &members,
+            collection,
+            trimmed_total,
             &origin,
-        )
-        .map(InferredPlan::Data),
+            opts,
+            sysroot,
+            state,
+        ),
+        None => match trimmed_data {
+            Some((members, total)) => {
+                let kept = members.len();
+                // The finding reports the bytes the kept members hold,
+                // judged at the entry each name is: a link at the entry
+                // counts nothing even where it resolves to a file, the
+                // way the whole directory's size is classified. The
+                // plan may skip writing members the tree already
+                // holds, but they are still what the directory keeps.
+                let hit = dir.hit();
+                let size: u64 = members
+                    .iter()
+                    .filter_map(|(rel, _)| {
+                        let entry = member_entry(sysroot, &hit.resolved, rel)?;
+                        let meta = fs::symlink_metadata(entry).ok()?;
+                        meta.is_file().then_some(meta.len())
+                    })
+                    .sum();
+                plan_member_data(dir, &members, &origin, sysroot, state).map(|(files, _)| {
+                    InferredPlan::TrimmedData {
+                        files,
+                        size,
+                        kept,
+                        total,
+                    }
+                })
+            }
+            _ => carry_hit(
+                &opts.directory,
+                &objects,
+                &dir.hit(),
+                Vec::new(),
+                sysroot,
+                state.plan,
+                state.actions,
+                &origin,
+            )
+            .map(InferredPlan::Data),
+        },
     };
     let planned = match planned {
         Ok(planned) if !state.plan.found_since(&checkpoint) => planned,
@@ -1437,11 +2065,37 @@ fn collect_inferred(
                 infer::omit(dir, "the build admitted nothing below it");
             }
         },
+        InferredPlan::TrimmedData {
+            files,
+            size,
+            kept,
+            total,
+        } => {
+            let wrote = !files.is_empty();
+            if wrote {
+                state.actions.push(WalkAction::CarryData {
+                    rule: objects,
+                    src: dir.source.clone(),
+                    rel: dir.destination.clone(),
+                    hooks: Vec::new(),
+                    members: Some(files),
+                });
+            }
+            infer::report(dir, size, infer::Carried::Trimmed { kept, total });
+            // The destination stands for itself only when something was
+            // written under it, like the plugins arm: a trim whose kept
+            // members are all the tree's own copies does not answer for
+            // nested directories.
+            if wrote {
+                carried.push((dir.destination.clone(), dir.source.clone(), Carry::Planned));
+            }
+        }
         InferredPlan::Plugins {
             collection,
             firsts,
             files,
             size,
+            trimmed,
         } => {
             // The plan held: the members join the walk, and the data
             // members are carried beside them.
@@ -1467,7 +2121,7 @@ fn collect_inferred(
             infer::report(
                 dir,
                 size,
-                infer::Carried::Plugins(&collection, carried_files),
+                infer::Carried::Plugins(&collection, carried_files, trimmed),
             );
             if !collection.plugins.is_empty() || carried_files > 0 {
                 carried.push((dir.destination.clone(), dir.source.clone(), Carry::Planned));
@@ -2931,6 +3585,12 @@ pub struct BundleOptions {
     pub trace_seconds: u64,
     /// Arguments for the traced run.
     pub trace_args: Vec<String>,
+    /// Keep only what a trace observed in the directories inference
+    /// collects: a data directory keeps the files the trace opened, a
+    /// plugin directory the members it loaded, plus keep patterns and
+    /// the members' own dependencies. Without a trace nothing is
+    /// trimmed.
+    pub trim_inferred: bool,
     /// Additional sonames added to the dlopen scan allow-list.
     pub dlopen_extra: Vec<String>,
     /// Take the bundle's contents from a pinned sysroot's package database
@@ -3974,6 +4634,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             .or_insert_with(|| "--include".into());
     }
 
+    let mut traced_opened: Vec<PathBuf> = Vec::new();
     // What the target loads when it runs: dlopen by computed name leaves
     // nothing in DT_NEEDED for the scan above to find. The run is against
     // this machine, so it has no meaning for a sysroot build, whose trace
@@ -3988,6 +4649,17 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             "a dry run does not run the target, so the libraries a traced run \
              would load are not listed",
         ));
+        if opts.trim_inferred && opts.sysroot.is_none() {
+            completeness::record(Finding::new(
+                opts.target
+                    .as_deref()
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_default(),
+                Outcome::Unchecked,
+                "a dry run does not run the target, so trim-inferred trims \
+                 nothing and the inferred directories stay whole",
+            ));
+        }
     } else if opts.trace_run {
         if opts.sysroot.is_some() {
             return Err(io::Error::new(
@@ -4037,7 +4709,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             }
         }
         let loader = trace_loader(&target, &library_path, target_class, target_machine)?;
-        let loaded = discover::loaded_libraries(
+        let (loaded, opened) = discover::loaded_libraries(
             &target,
             &opts.trace_args,
             opts.trace_seconds,
@@ -4046,6 +4718,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             &library_path,
             loader.as_deref(),
         )?;
+        traced_opened = opened;
         let (loaded, gpu_stack) = split_gpu_stack(loaded);
         if !gpu_stack.is_empty() {
             let names: Vec<&str> = gpu_stack
@@ -4080,6 +4753,32 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             eprintln!("  nothing beyond what DT_NEEDED already names");
         }
     }
+
+    // The [bundle] trim-inferred policy, built once the traces exist: a
+    // sysroot build reads the recipe's trace tiers, a host scan takes
+    // what its traced run opened. The key without a trace trims
+    // nothing, the way a recipe without the key does.
+    let trim = if opts.trim_inferred {
+        match &opts.sysroot {
+            // A sysroot build trims by its recorded trace alone; the
+            // traced host run cannot apply to it.
+            Some(sr) if sr.trace.is_some() => {
+                Some(Trim::load(sr.trace.as_deref(), sr.keep.as_deref())?)
+            }
+            Some(_) => None,
+            // A dry run skips the traced run, so the host scan has
+            // observed nothing and trims nothing: trimming by an empty
+            // set would plan every member away and dispose the copies
+            // an earlier build carried into the tree.
+            None if opts.trace_run && !opts.dry_run => {
+                let tree = opts.directory.canonicalize().ok();
+                Some(Trim::from_paths(traced_opened, tree.as_deref()))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     // Opt-in dlopen scan: match string literals against a known allow-list
     // of commonly dlopen'd sonames (GL, Wayland, Vulkan, audio, etc.) and
@@ -4594,6 +5293,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                     &mut inferred_carried,
                     opts,
                     sysroot_universe.as_ref(),
+                    trim.as_ref(),
                     (target_class, target_machine),
                     &excludes,
                     &reachable,

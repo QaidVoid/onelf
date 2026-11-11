@@ -32,7 +32,14 @@ use super::elf::LibcFamily;
 
 /// Run `target` with `args` for at most `seconds`, and return every
 /// shared object outside `tree` that the tree's own programs loaded,
-/// sorted and deduplicated.
+/// sorted and deduplicated, with every absolute path the run opened as
+/// the second half: the libraries are what a `--trace-run` bundles, the
+/// opens are what a `[bundle] trim-inferred` build keeps. The opens
+/// keep the tree's own copies, since the tree's library directories
+/// lead the run's search path and on a rebuild a copy the last build
+/// carried stands in for the original: that open is the only evidence
+/// the trim gets. The libraries keep the filter, since bundling the
+/// tree's own copies back would name nothing new.
 ///
 /// `library_path` goes on `LD_LIBRARY_PATH` for the run, in order. The
 /// caller puts the tree's own library directories first, since the
@@ -51,7 +58,7 @@ pub(crate) fn loaded_libraries(
     tree: &Path,
     library_path: &[PathBuf],
     loader: Option<&Path>,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     // The loader names absolute paths, and the run's working directory is
     // the scratch home, so both sides of every comparison are absolute.
     let tree = tree.canonicalize()?;
@@ -68,18 +75,25 @@ pub(crate) fn loaded_libraries(
         &scratch,
     );
     let _ = fs::remove_dir_all(&scratch);
-    let mut libs: Vec<PathBuf> = result?
-        .into_iter()
-        .filter(|p| p.is_absolute() && !p.starts_with(&tree) && p.is_file())
+    let opened: Vec<PathBuf> = result?
+        .iter()
+        .filter(|p| p.is_absolute())
+        .cloned()
+        .collect();
+    let mut libs: Vec<PathBuf> = opened
+        .iter()
+        .filter(|p| !p.starts_with(&tree))
+        .filter(|p| p.is_file())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.contains(".so"))
         })
+        .cloned()
         .collect();
     libs.sort();
     libs.dedup();
-    Ok(libs)
+    Ok((libs, opened))
 }
 
 // One run's whole context; it exists to keep the scratch cleanup in one

@@ -191,6 +191,9 @@ pub struct BundleRequest {
     pub trace_seconds: u64,
     /// Arguments for the traced run.
     pub trace_args: Vec<String>,
+    /// Keep only what a trace observed in the directories inference
+    /// collects. Needs a trace: `trace-run`, or `[sysroot] trace`.
+    pub trim_inferred: bool,
     /// Extra host directories libraries are searched in, resolved
     /// against the recipe directory.
     pub search_paths: Vec<PathBuf>,
@@ -631,6 +634,7 @@ impl AssemblyRequest {
                 trace_run: rb.trace_run,
                 trace_seconds: rb.trace_seconds.unwrap_or(5),
                 trace_args: rb.trace_args,
+                trim_inferred: rb.trim_inferred,
                 search_paths,
                 exclude: rb.exclude,
                 include: rb.include,
@@ -837,6 +841,7 @@ impl AssemblyRequest {
             trace_run: self.bundle.trace_run,
             trace_seconds: self.bundle.trace_seconds,
             trace_args: self.bundle.trace_args.clone(),
+            trim_inferred: self.bundle.trim_inferred,
             sysroot: self.bundle.sysroot.clone(),
             sets: self.bundle.sets.clone(),
             platform_pin: self.bundle.platform_pin.clone(),
