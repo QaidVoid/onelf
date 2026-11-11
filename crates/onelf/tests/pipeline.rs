@@ -21096,6 +21096,251 @@ fn the_doctor_reports_without_running_or_leaving_anything() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// The doctor names every host module admitted or refused, with the
+/// first failing object and the reason for a refusal, and under the
+/// `never` policy or the disabling variable it names none. The report
+/// never prints environment values.
+#[test]
+fn the_doctor_names_admitted_and_refused_host_modules() {
+    let td = workdir("doctormod");
+    let td = td.canonicalize().unwrap();
+    let prefix = td.join("fp");
+    std::fs::create_dir_all(prefix.join("lib/demo")).unwrap();
+    write(&td.join("plug.c"), "int demo_plugin(void){return 1;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("plug.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-plugin.so"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    write(&td.join("carried.c"), "int demo_carried(void){return 4;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("carried.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-carried.so"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("demo.c"),
+        &format!(
+            "const char *demo_dir = \"{}\";\nint demo(void){{return 1;}}\n",
+            prefix.join("lib/demo").display()
+        ),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdemo.so.1",
+            td.join("demo.c").to_str().unwrap(),
+        ],
+        &prefix.join("lib/libdemo.so.1"),
+    ) {
+        return;
+    }
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    write(
+        &td.join("main.c"),
+        &format!(
+            "const char *demo_dir = \"{}\";\nint main(void){{return 0;}}\n",
+            prefix.join("lib/demo").display()
+        ),
+    );
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libdemo.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let bundled = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+        .env("LD_LIBRARY_PATH", prefix.join("lib"))
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        bundled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    assert!(app.join("lib/demo/libdemo-plugin.so").is_file());
+
+    // The host's counterpart holds one module the package lacks, which
+    // the checks admit, and one that is not an ELF object at all, which
+    // is refused naming itself.
+    write(&td.join("type.c"), "int demo_type(void){return 2;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("type.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-type.so"),
+    ) {
+        return;
+    }
+    let bad = prefix.join("lib/demo/libdemo-bad.so");
+    std::fs::write(&bad, b"this is not an object file").unwrap();
+
+    // A module whose dependency name carries a newline must not forge
+    // report lines. Build it against a stub that is never installed,
+    // then patch the needed name in place, same length, to a newline
+    // bearing string, so nothing supplies it and admission refuses it.
+    std::fs::create_dir_all(td.join("link")).unwrap();
+    write(&td.join("gone.c"), "int demo_gone(void){return 0;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("gone.c").to_str().unwrap()],
+        &td.join("link/libdemo-gone.so"),
+    ) {
+        return;
+    }
+    write(&td.join("forged.c"), "int demo_forged(void){return 9;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            td.join("forged.c").to_str().unwrap(),
+            &format!("-L{}", td.join("link").display()),
+            "-l:libdemo-gone.so",
+        ],
+        &td.join("libdemo-forged.built.so"),
+    ) {
+        return;
+    }
+    let mut bytes = std::fs::read(td.join("libdemo-forged.built.so")).unwrap();
+    let from = b"libdemo-gone.so".as_slice();
+    let to = b"\nfake refused\n!".as_slice();
+    let pos = bytes
+        .windows(from.len())
+        .position(|w| w == from)
+        .expect("the needed name is in the object");
+    bytes[pos..pos + from.len()].copy_from_slice(to);
+    std::fs::write(prefix.join("lib/demo/libdemo-forged.so"), bytes).unwrap();
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&prefix.join("lib")])).unwrap();
+
+    let pack = |name: &str, policy: &str| {
+        let pkg = td.join(name);
+        let packed = Command::new(onelf())
+            .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+            .args([
+                "--command",
+                "bin/app",
+                "--mtime",
+                "0",
+                "--name",
+                "doctormod",
+            ])
+            .args(["--host-libs", policy])
+            .output()
+            .expect("spawn onelf pack");
+        assert!(
+            packed.status.success(),
+            "{policy}: {}",
+            String::from_utf8_lossy(&packed.stderr)
+        );
+        pkg
+    };
+    let always = pack("always.onelf", "always");
+    let never = pack("never.onelf", "never");
+
+    let doctor = |pkg: &Path, disabled: bool| {
+        let mut cmd = Command::new(pkg);
+        cmd.arg("--onelf-doctor")
+            .env("ONELF_LD_CACHE", cache.to_str().unwrap());
+        if disabled {
+            cmd.env("ONELF_NO_RESOLVER", "1");
+        }
+        isolate(&mut cmd, &td);
+        let out = run_package(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{}", err);
+        stdout
+    };
+
+    let report = doctor(&always, false);
+    assert!(report.contains("host-libs: always"), "{report}");
+    for name in ["libdemo-plugin.so", "libdemo-carried.so", "libdemo-type.so"] {
+        let module = prefix.join("lib/demo").join(name);
+        assert!(
+            report.contains(&module.display().to_string()),
+            "{name} is not named as admitted:\n{report}"
+        );
+    }
+    assert!(report.contains("host modules admitted (3)"), "{report}");
+    assert!(
+        report.contains("host modules refused (2)")
+            && report.contains("libdemo-bad.so: ")
+            && report.contains("cannot be read"),
+        "{report}"
+    );
+    let forged_line = report
+        .lines()
+        .find(|l| l.contains("libdemo-forged.so: "))
+        .expect("the newline bearing module is refused");
+    assert!(forged_line.contains('?'), "{forged_line}");
+    assert!(
+        !report.lines().any(|l| l.starts_with("fake")),
+        "a module forged a report line:\n{report}"
+    );
+    assert!(
+        !report.contains("ONELF_LD_CACHE"),
+        "the report leaked an environment variable:\n{report}"
+    );
+
+    let report = doctor(&always, true);
+    assert!(
+        report.contains("host-libs: never (ONELF_NO_RESOLVER)")
+            && report.contains("none considered"),
+        "{report}"
+    );
+    assert!(!report.contains("libdemo-"), "{report}");
+
+    let report = doctor(&never, false);
+    assert!(
+        report.contains("host-libs: never") && report.contains("none considered"),
+        "{report}"
+    );
+    assert!(!report.contains("libdemo-"), "{report}");
+
+    // A package name carrying a newline must not forge the report's
+    // header line.
+    let hostile = td.join("hostile.onelf");
+    let packed = Command::new(onelf())
+        .args([
+            "pack",
+            app.to_str().unwrap(),
+            "-o",
+            hostile.to_str().unwrap(),
+        ])
+        .args([
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+            "--name",
+            "p\nfake admitted\nb",
+        ])
+        .args(["--host-libs", "always"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let report = doctor(&hostile, false);
+    assert!(report.contains("p?fake admitted?b"), "{report}");
+    assert!(
+        !report.lines().any(|l| l.starts_with("fake")),
+        "the package name forged a report line:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// The doctor explains the invoked entrypoint's selected sets: an empty
 /// selection names none of the declared sets and consults nothing about
 /// them, so an unreachable or corrupt unselected artifact cannot change
@@ -21238,6 +21483,9 @@ fn the_doctor_never_prints_an_environment_value() {
         ("XDG_CONFIG_DIRS", "/onelf-marker-config"),
         ("XDG_CACHE_HOME", "/onelf-marker-cache"),
         ("XDG_RUNTIME_DIR", "/onelf-marker-run"),
+        // A newline in an environment-derived path must not forge a
+        // report line: the helper is echoed with control bytes as '?'.
+        ("FUSERMOUNT_PROG", "/onelf-marker\nhelper"),
     ];
 
     // A forced mode the runtime does not know skips every mode; the skip
@@ -21266,6 +21514,10 @@ fn the_doctor_never_prints_an_environment_value() {
     assert!(
         !stdout.contains("onelf-marker-mode") && !stdout.contains("onelf-marker-cache"),
         "{stdout}"
+    );
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("helper")),
+        "an environment value forged a report line:\n{stdout}"
     );
 
     // With the mode left to the runtime, a mode is chosen and the

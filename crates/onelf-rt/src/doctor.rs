@@ -32,6 +32,14 @@ fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// The report never repeats a control byte it was handed: names and
+/// reasons a host module carries must not forge report lines.
+fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// Why a launch's pairs would be left unredirected, in the order the
 /// runtime refuses them: no mode to run in, a memfd launch's missing
 /// tree, the package's own setuid request, the environment's opt-out,
@@ -180,7 +188,10 @@ fn modes(
         match (why_not_ns, &helper) {
             (None, _) => Ok(("mounted in a private user namespace".to_string(), true)),
             (Some(why), Some(helper)) => Ok((
-                format!("mounted through {} ({why})", helper.display()),
+                format!(
+                    "mounted through {} ({why})",
+                    plain(&helper.display().to_string())
+                ),
                 false,
             )),
             (Some(why), None) => Err(format!("{why}, and there is no mount helper")),
@@ -281,9 +292,10 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
     line(
         &mut out,
         &format!(
-            "onelf-rt {}: {} (entrypoint {ep_name})",
+            "onelf-rt {}: {} (entrypoint {})",
             env!("CARGO_PKG_VERSION"),
-            pkg.manifest.name()
+            plain(pkg.manifest.name()),
+            plain(&ep_name)
         ),
     );
 
@@ -297,7 +309,10 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
         ),
     );
     match mount::helper() {
-        Some(helper) => line(&mut out, &format!("  mount helper: {}", helper.display())),
+        Some(helper) => line(
+            &mut out,
+            &format!("  mount helper: {}", plain(&helper.display().to_string())),
+        ),
         None => line(
             &mut out,
             "  mount helper: none (no fusermount3 or setuid fusermount)",
@@ -622,7 +637,13 @@ fn libraries(
             sets_weighed,
             out,
         ),
-        Err(e) => line(out, &format!("  cannot read the bundled libraries: {e}")),
+        Err(e) => line(
+            out,
+            &format!(
+                "  cannot read the bundled libraries: {}",
+                plain(&e.to_string())
+            ),
+        ),
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
@@ -676,6 +697,10 @@ fn verdicts(
     }
 
     if policy == HostLibsPolicy::Never {
+        line(
+            out,
+            "  host modules: none considered; the policy admits no module from the host",
+        );
         return;
     }
     let Some(store) = onelf_rt::paths::resolve_store(&pkg.manifest.header.package_id) else {
@@ -728,11 +753,15 @@ fn verdicts(
         loader_store: loader_place.store(),
         nsswitch: resolve::nsswitch_file(),
     });
-    let mut host_only = Vec::new();
+    let mut host_only: Vec<String> = Vec::new();
     for (name, choice) in &decision.compared {
-        let host = decision.winners.get(name).map(|p| p.display());
+        let host = decision
+            .winners
+            .get(name)
+            .map(|p| plain(&p.display().to_string()));
+        let name = plain(name);
         match (choice, host) {
-            (None, _) => host_only.push(name.as_str()),
+            (None, _) => host_only.push(name),
             (Some(Choice::Host), Some(host)) => {
                 line(out, &format!("  {name}: the host's is newer, {host}"))
             }
@@ -765,7 +794,7 @@ fn verdicts(
             &format!(
                 "  loader: the host's {}, run from a private copy closed to its default \
                  search directories",
-                loader.source.display()
+                plain(&loader.source.display().to_string())
             ),
         );
     }
@@ -773,8 +802,9 @@ fn verdicts(
         line(
             out,
             &format!(
-                "  loader: the host's {} is not used, {why}; the bundled loader and libc run",
-                source.display()
+                "  loader: the host's {} is not used, {}; the bundled loader and libc run",
+                plain(&source.display().to_string()),
+                plain(why)
             ),
         );
     }
@@ -787,6 +817,35 @@ fn verdicts(
             "none yet, a launch creates it"
         };
         line(out, &format!("  link farm: {state}"));
+    }
+    if !decision.admitted.is_empty() {
+        line(
+            out,
+            &format!("  host modules admitted ({}):", decision.admitted.len()),
+        );
+        for module in &decision.admitted {
+            line(
+                out,
+                &format!("    {}", plain(&module.display().to_string())),
+            );
+        }
+    }
+    if !decision.refused.is_empty() {
+        line(
+            out,
+            &format!("  host modules refused ({}):", decision.refused.len()),
+        );
+        for refusal in &decision.refused {
+            line(
+                out,
+                &format!(
+                    "    {}: {} {}",
+                    plain(&refusal.module.display().to_string()),
+                    plain(&refusal.object.display().to_string()),
+                    plain(&refusal.reason)
+                ),
+            );
+        }
     }
 }
 
@@ -819,7 +878,10 @@ fn sets_section(
         Err(why) => {
             line(
                 out,
-                &format!("\nDependency sets\n  cannot resolve the selection for {ep_name}: {why}"),
+                &format!(
+                    "\nDependency sets\n  cannot resolve the selection for {}: {why}",
+                    plain(ep_name)
+                ),
             );
             return;
         }
@@ -831,7 +893,10 @@ fn sets_section(
     if pins.is_empty() {
         line(
             out,
-            &format!("  selected for {ep_name}: none; no set is fetched, mounted, or extracted"),
+            &format!(
+                "  selected for {}: none; no set is fetched, mounted, or extracted",
+                plain(ep_name)
+            ),
         );
         return;
     }
@@ -843,7 +908,7 @@ fn sets_section(
     } else {
         "every declared set (the package carries no selection record)".to_string()
     };
-    line(out, &format!("  selected for {ep_name}: {scope}"));
+    line(out, &format!("  selected for {}: {scope}", plain(ep_name)));
     for pin in pins {
         line(out, &format!("  {}: {}", pin.label, stored(pin)));
     }
@@ -869,7 +934,7 @@ fn view_section(
         out,
         &format!("  package: {}", cache::hex(&pkg.manifest.header.package_id)),
     );
-    line(out, &format!("  entrypoint: {ep_name}"));
+    line(out, &format!("  entrypoint: {}", plain(ep_name)));
     match selection {
         Ok(pins) if pins.is_empty() => line(out, "  selected pins: none"),
         Ok(pins) => {
@@ -901,7 +966,7 @@ fn update(pkg: &mut PackageData, out: &mut String) {
         line(out, "  not configured");
         return;
     };
-    line(out, &format!("  url: {url}"));
+    line(out, &format!("  url: {}", plain(&url)));
     let unsigned = read_package_file(pkg, ".onelf/update-unsigned").is_some();
     match read_package_file(pkg, ".onelf/update-key") {
         Some(keys) => line(out, &format!("  signing keys: {}", keys.len() / 32)),
@@ -914,7 +979,7 @@ fn update(pkg: &mut PackageData, out: &mut String) {
         None => line(out, "  signing keys: none, so --onelf-update refuses"),
     }
     if let Some(revision) = text(pkg, ".onelf/update-revision") {
-        line(out, &format!("  revision: {revision}"));
+        line(out, &format!("  revision: {}", plain(&revision)));
     }
     if cfg!(feature = "update") {
         line(out, "  updater: in this runtime");

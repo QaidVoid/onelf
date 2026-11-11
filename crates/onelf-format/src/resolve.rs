@@ -4054,6 +4054,27 @@ mod tests {
         assert_eq!(w.decide(HostLibsPolicy::Auto).admitted, vec![module]);
     }
 
+    /// A `never` policy considers nothing: no module is admitted,
+    /// refused, or weighed, whatever the counterpart directories hold.
+    #[test]
+    fn a_never_policy_considers_no_module() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        fs::write(
+            dir.join("libplug.so"),
+            module_bytes(0, &["libdep.so.2"], &[]),
+        )
+        .unwrap();
+
+        let d = w.decide(HostLibsPolicy::Never);
+        assert!(d.compared.is_empty());
+        assert!(d.winners.is_empty());
+        assert!(d.admitted.is_empty());
+        assert!(d.refused.is_empty());
+    }
+
     /// A supplied family dependency is walked like any host library:
     /// what it needs in turn joins the farm, so the closed loader can
     /// load the whole chain.
