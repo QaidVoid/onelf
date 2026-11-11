@@ -272,6 +272,7 @@ fn main() {
                 None,
                 &[],
                 &[],
+                &[],
             );
             portable::setup_portable(exe_dir, exe_name);
             if let Some(env_data) = loader::read_package_file(&mut pkg, ".onelf/env") {

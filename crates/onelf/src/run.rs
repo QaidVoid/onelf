@@ -353,12 +353,13 @@ pub fn run(
         pinned_gl.as_ref().map(|(root, _)| root.as_path()),
         &set_lib_dirs,
         &set_roots,
+        &[],
     );
     onelf_rt::env::apply_custom_env(&env_data, &dir_str);
     onelf_rt::hostenv::record_host_env(&dir, &set_roots);
     let applied_env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
     let assignments =
-        onelf_rt::env::view_env_assignments(&dir, &lib_dir_strs, &set_lib_dirs, &set_roots);
+        onelf_rt::env::view_env_assignments(&dir, &lib_dir_strs, &set_lib_dirs, &set_roots, &[]);
     let view_record = onelf_rt::env::encode_view_env(&base_env, &applied_env, &assignments)
         .map_err(|e| io::Error::other(format!("the generated environment input is {e}")))?;
     restore_env(&base_env, &applied_env);
@@ -439,6 +440,7 @@ pub fn run(
         pinned_gl.as_ref().map(|(root, _)| root.as_path()),
         &set_lib_dirs,
         &set_roots,
+        &[],
     );
     onelf_rt::env::apply_custom_env(&env_data, &view_str);
     onelf_rt::hostenv::record_host_env(&view_root, &set_roots);
@@ -459,7 +461,7 @@ pub fn run(
          a re-exec that clears the environment is not hooked"
     );
     if !declared_paths.is_empty() {
-        if onelf_rt::hostpaths::apply(&view_root, &path_pairs) {
+        if onelf_rt::hostpaths::apply(&view_root, &path_pairs, &std::collections::BTreeMap::new()) {
             eprintln!(
                 "onelf run: the view's directories answer for the absolute paths the recipe built with"
             );

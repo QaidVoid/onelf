@@ -28,6 +28,7 @@
 //! lists that differ only in order share one.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -56,6 +57,25 @@ pub struct Resolution {
     /// meant to present them beside the bundled members of their plugin
     /// directory; their host dependencies come through the farm.
     pub admitted: Vec<PathBuf>,
+    /// The merged view of each plugin directory with admitted modules,
+    /// sorted by the directory's package path. A view links the bundled
+    /// members first and the admitted host members whose names the
+    /// package does not carry after them, so wherever the directory is
+    /// redirected the launch presents that order. Built only by
+    /// [`resolve_selected`]; a view that cannot be built is left out and
+    /// its directory keeps the bundled members alone.
+    pub plugin_views: Vec<PluginView>,
+}
+
+/// One plugin directory's merged view, built in the decision's store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginView {
+    /// The plugin directory's package path, relative to the package root.
+    pub relative: String,
+    /// The view directory. Every entry is a symlink: one per bundled
+    /// member, aimed at the package's copy, then one per admitted host
+    /// member whose name no bundled member holds, aimed at the host's.
+    pub dir: PathBuf,
 }
 
 /// The private copy of the host loader a launch runs, closed to the
@@ -388,15 +408,15 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
         req.loader_store,
     );
     let Some(identity) = SelectionIdentity::new(pins) else {
-        return fresh(req, &fingerprint, &host).1;
+        return with_plugin_views(fresh(req, &fingerprint, &host).1, req, &fingerprint);
     };
     let Some(dir) = selection_dir(identity.key()).map(|name| req.store.join(name)) else {
-        return fresh(req, &fingerprint, &host).1;
+        return with_plugin_views(fresh(req, &fingerprint, &host).1, req, &fingerprint);
     };
     if let Some(recorded) =
         load_selection(&dir, &identity, &fingerprint, req.store, req.loader_store)
     {
-        return recorded;
+        return with_plugin_views(recorded, req, &fingerprint);
     }
     let (decision, resolution, recordable) = fresh(req, &fingerprint, &host);
     if recordable
@@ -413,7 +433,7 @@ pub fn resolve_selected(req: &Request, pins: &[ActivePin]) -> Resolution {
             req.store.display()
         );
     }
-    resolution
+    with_plugin_views(resolution, req, &fingerprint)
 }
 
 /// A fresh decision for `req` with its farm and loader copy built, and
@@ -478,6 +498,7 @@ fn materialized(req: &Request, fingerprint: &str, decision: &Decision) -> (Resol
         }),
         incomparable: decision.incomparable.clone(),
         admitted: decision.admitted.clone(),
+        plugin_views: Vec::new(),
     };
     (resolution, true)
 }
@@ -1787,6 +1808,245 @@ fn materialize(
         }
     }
     Ok(Some(farm))
+}
+
+/// The merged plugin views of one host state, keyed by the fingerprint,
+/// the admitted modules themselves and the package tree the bundled
+/// members aim at, the way [`farm_dir`] keys a farm: a changed decision
+/// builds beside the old rather than replacing it, an older instance may
+/// still be reading through the one it was given, and a decision whose
+/// admitted set or package tree changed never shares one. The package
+/// tree is part of the key because a view's bundled members aim into
+/// it, and a launch tree belongs to its launch alone.
+fn views_dir(store: &Path, fingerprint: &str, admitted: &[PathBuf], pkg_root: &Path) -> PathBuf {
+    // FNV-1a, so the names are stable across runs without a hash
+    // dependency.
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in fingerprint.bytes() {
+        mix(&mut h, b);
+    }
+    let mut w: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in admitted {
+        for b in path.to_string_lossy().bytes() {
+            mix(&mut w, b);
+        }
+        mix(&mut w, 0x1f);
+    }
+    for b in pkg_root.to_string_lossy().bytes() {
+        mix(&mut w, b);
+    }
+    store.join(format!("view-{h:016x}-{w:016x}"))
+}
+
+/// Whether `dir` links exactly `expected`, names and targets, and
+/// nothing else.
+fn view_checked(dir: &Path, expected: &[(OsString, PathBuf)]) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let got: BTreeMap<OsString, PathBuf> = entries
+        .flatten()
+        .map(|entry| (entry.file_name(), entry.path()))
+        .collect();
+    got.len() == expected.len()
+        && expected.iter().all(|(name, target)| {
+            got.get(name)
+                .is_some_and(|link| fs::read_link(link).is_ok_and(|aimed| &aimed == target))
+        })
+}
+
+/// One record's pending view: its directory name under the decision's
+/// view root, the record's package path, and the entries the view
+/// links.
+struct WantedView {
+    name: String,
+    relative: String,
+    entries: Vec<(OsString, PathBuf)>,
+}
+
+/// The view root for the wanted views under `root`: verified and reused
+/// when every view's directory links exactly its entries, built beside
+/// and renamed over the standing tree otherwise. Each view's directory
+/// name is unique inside the root.
+fn views_materialized(root: &Path, wanted: &[WantedView]) -> io::Result<()> {
+    let stands = |root: &Path| {
+        root.is_dir()
+            && wanted
+                .iter()
+                .all(|w| view_checked(&root.join(&w.name), &w.entries))
+    };
+    if stands(root) {
+        return Ok(());
+    }
+    static SCRATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SCRATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = root.parent().unwrap_or(root).join(format!(
+        ".{}.{}.{}",
+        root.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        n
+    ));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)?;
+    for w in wanted {
+        let dir = scratch.join(&w.name);
+        fs::create_dir(&dir)?;
+        for (member, target) in &w.entries {
+            std::os::unix::fs::symlink(target, dir.join(member))?;
+        }
+    }
+    match fs::rename(&scratch, root) {
+        Ok(()) => {}
+        Err(first) => {
+            // The rename lost to a root that appeared meanwhile. When
+            // that root checks out it wins; otherwise it is the damaged
+            // one this build exists to replace, so rebuild over it.
+            // Siblings can hold the root mid-rebuild for a few rounds,
+            // so the look, the clear and the rename retry a bounded
+            // number of times before this build gives up.
+            let mut last = first;
+            for _ in 0..3 {
+                if stands(root) {
+                    let _ = fs::remove_dir_all(&scratch);
+                    return Ok(());
+                }
+                // The root path may be held by a single stray file,
+                // which remove_dir_all cannot clear.
+                match fs::symlink_metadata(root) {
+                    Ok(md) if !md.is_dir() => {
+                        let _ = fs::remove_file(root);
+                    }
+                    _ => {
+                        let _ = fs::remove_dir_all(root);
+                    }
+                }
+                match fs::rename(&scratch, root) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = e,
+                }
+            }
+            // A sibling launch's rebuild may have landed in between:
+            // when the standing root checks out, it wins and this
+            // build's scratch is dropped.
+            let _ = fs::remove_dir_all(&scratch);
+            if !stands(root) {
+                return Err(last);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The counterpart directories of one record that exist on this host:
+/// its compiled-in absolute paths, and its library-relative path under
+/// every loader-cache library directory.
+fn record_counterpart_dirs(dir: &PluginDir, libs: &[String]) -> Vec<PathBuf> {
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    for absolute in &dir.absolutes {
+        out.insert(PathBuf::from(absolute));
+    }
+    if !dir.lib_relative.is_empty() {
+        for lib in libs {
+            out.insert(Path::new(lib).join(&dir.lib_relative));
+        }
+    }
+    out.into_iter().filter(|dir| dir.is_dir()).collect()
+}
+
+/// The entries a view of `relative` holds, sorted by member name: every
+/// bundled member aimed at the package's copy, then every admitted host
+/// member whose name no bundled member holds, aimed at the host's file.
+/// `None` when the package does not carry the directory, in which case
+/// no redirection would reach the view either.
+fn view_entries(
+    pkg_root: &Path,
+    relative: &str,
+    members: &[&PathBuf],
+) -> Option<Vec<(OsString, PathBuf)>> {
+    let bundled = pkg_root.join(relative);
+    let read = fs::read_dir(&bundled).ok()?;
+    let mut out: Vec<(OsString, PathBuf)> = Vec::new();
+    let mut names: BTreeSet<OsString> = BTreeSet::new();
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        names.insert(name.clone());
+        out.push((name, bundled.join(entry.file_name())));
+    }
+    for member in members {
+        let Some(name) = member.file_name() else {
+            continue;
+        };
+        if names.insert(name.to_os_string()) {
+            out.push((name.to_os_string(), (*member).clone()));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
+/// The merged plugin views of one decision: one per plugin directory
+/// whose counterpart directories hold admitted modules, under one
+/// decision-keyed root in the store. A record whose bundled directory
+/// cannot be read is left out: nothing would reach its view. A root
+/// that cannot be written leaves every directory's bundled members
+/// alone, which loses the host modules of the launch, never the
+/// package's.
+fn plugin_views(req: &Request, fingerprint: &str, admitted: &[PathBuf]) -> Vec<PluginView> {
+    if admitted.is_empty() || req.plugin_dirs.is_empty() {
+        return Vec::new();
+    }
+    let libs = drivers::cache_dirs_in(req.ld_cache);
+    let mut wanted: Vec<WantedView> = Vec::new();
+    for (index, dir) in req.plugin_dirs.iter().enumerate() {
+        let dirs = record_counterpart_dirs(dir, &libs);
+        let members: Vec<&PathBuf> = admitted
+            .iter()
+            .filter(|module| {
+                module
+                    .parent()
+                    .is_some_and(|parent| dirs.contains(&parent.to_path_buf()))
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let Some(entries) = view_entries(req.pkg_root, &dir.relative, &members) else {
+            continue;
+        };
+        wanted.push(WantedView {
+            name: format!("dir-{index}"),
+            relative: dir.relative.clone(),
+            entries,
+        });
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let root = views_dir(req.store, fingerprint, admitted, req.pkg_root);
+    if let Err(e) = views_materialized(&root, &wanted) {
+        eprintln!(
+            "onelf-rt: resolver: cannot build the merged plugin views in {}: {e}",
+            root.display()
+        );
+        return Vec::new();
+    }
+    wanted
+        .into_iter()
+        .map(|w| PluginView {
+            relative: w.relative,
+            dir: root.join(w.name),
+        })
+        .collect()
+}
+
+/// Attach a decision's merged plugin views to its resolution.
+fn with_plugin_views(mut resolution: Resolution, req: &Request, fingerprint: &str) -> Resolution {
+    resolution.plugin_views = plugin_views(req, fingerprint, &resolution.admitted);
+    resolution
 }
 
 /// Make sure `loader`'s copy holds its closed image, writing it when it is
@@ -4657,6 +4917,150 @@ mod tests {
             fs::read_link(farm.join("libdep.so.2")).ok(),
             None,
             "the wedged occupant is left for the next launch to retry"
+        );
+    }
+
+    #[test]
+    fn a_view_links_bundled_members_then_admitted_host_ones() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let counterpart = carry_counterpart(&w);
+        let module = counterpart.join("libtype.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let shadowed = counterpart.join("libcarried.so");
+        fs::write(&shadowed, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let bundled = w.pkg.join("lib/alsa-lib");
+        fs::create_dir_all(&bundled).unwrap();
+        let carried = bundled.join("libcarried.so");
+        fs::write(&carried, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        fs::write(bundled.join("plugin.conf"), b"config").unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+
+        assert_eq!(r.plugin_views.len(), 1, "one view, for the carried record");
+        let view = &r.plugin_views[0];
+        assert_eq!(view.relative, "lib/alsa-lib");
+        let entries: BTreeMap<String, PathBuf> = fs::read_dir(&view.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            3,
+            "two bundled members and the one host member the package lacks"
+        );
+        assert_eq!(
+            fs::read_link(view.dir.join("libcarried.so")).ok(),
+            Some(carried),
+            "a name the package carries links the package's own copy"
+        );
+        assert_eq!(
+            fs::read_link(view.dir.join("plugin.conf")).ok(),
+            Some(bundled.join("plugin.conf")),
+            "bundled data members ride along"
+        );
+        assert_eq!(
+            fs::read_link(view.dir.join("libtype.so")).ok(),
+            Some(module),
+            "the host member the package lacks links the host's file"
+        );
+    }
+
+    #[test]
+    fn a_damaged_view_is_rebuilt_for_the_next_launch() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let counterpart = carry_counterpart(&w);
+        let module = counterpart.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let bundled = w.pkg.join("lib/alsa-lib");
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(bundled.join("libcarried.so"), b"bundled").unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        let view = r.plugin_views[0].dir.clone();
+        let planted = w.store.join("planted.so");
+        fs::write(&planted, b"planted").unwrap();
+        let link = view.join("libplug.so");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        std::os::unix::fs::symlink(&planted, view.join("extra.so")).unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert_eq!(r.plugin_views.len(), 1);
+        let view = r.plugin_views[0].dir.clone();
+        let mut names: Vec<String> = fs::read_dir(&view)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["libcarried.so", "libplug.so"]);
+        assert_eq!(
+            fs::read_link(view.join("libplug.so")).ok(),
+            Some(module),
+            "the bent link is re-aimed at the host's module"
+        );
+        assert_eq!(
+            fs::read_link(view.join("libcarried.so")).ok(),
+            Some(bundled.join("libcarried.so"))
+        );
+    }
+
+    #[test]
+    fn a_served_record_also_presents_its_views() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let counterpart = carry_counterpart(&w);
+        let module = counterpart.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libdep.so.2"], &[])).unwrap();
+        let bundled = w.pkg.join("lib/alsa-lib");
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(bundled.join("libcarried.so"), b"bundled").unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let first = w.resolve(HostLibsPolicy::Auto);
+        let record = sel_dir(&w.store, &[]).join("decision");
+        let before = fs::metadata(&record).unwrap().modified().unwrap();
+
+        let second = w.resolve(HostLibsPolicy::Auto);
+        let after = fs::metadata(&record).unwrap().modified().unwrap();
+        assert_eq!(before, after, "the second launch is served by the record");
+        assert_eq!(second.plugin_views, first.plugin_views);
+        assert_eq!(
+            fs::read_link(second.plugin_views[0].dir.join("libplug.so")).ok(),
+            Some(module)
+        );
+    }
+
+    #[test]
+    fn a_launch_without_admitted_modules_builds_no_view() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        carry_counterpart(&w);
+        let bundled = w.pkg.join("lib/alsa-lib");
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(bundled.join("libcarried.so"), b"bundled").unwrap();
+        fs::create_dir_all(&w.store).unwrap();
+
+        let r = w.resolve(HostLibsPolicy::Auto);
+        assert!(r.plugin_views.is_empty());
+        let strangers: Vec<String> = fs::read_dir(&w.store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("view-"))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "no view root is built without admitted members"
         );
     }
 

@@ -27278,6 +27278,197 @@ fn a_carried_plugin_directory_is_named_in_the_record() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A carried plugin directory whose host counterpart holds modules the
+/// package lacks is presented as a merged view: wherever the directory
+/// is redirected, a configuration naming a member by path and a
+/// framework enumerating the directory see the bundled members and the
+/// admitted host ones together, and a host module whose name the
+/// package carries is never the one that loads. Verified in every
+/// launch mode that carries a package tree.
+#[test]
+fn a_merged_plugin_view_presents_host_modules_in_every_launch_mode() {
+    let td = workdir("mergedview");
+    let td = td.canonicalize().unwrap();
+    let prefix = td.join("fp");
+    std::fs::create_dir_all(prefix.join("lib/demo")).unwrap();
+    write(&td.join("plug.c"), "int demo_plugin(void){return 1;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("plug.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-plugin.so"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+    write(&td.join("carried.c"), "int demo_carried(void){return 4;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("carried.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-carried.so"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("demo.c"),
+        &format!(
+            "const char *demo_dir = \"{}\";\nint demo(void){{return 1;}}\n",
+            prefix.join("lib/demo").display()
+        ),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libdemo.so.1",
+            td.join("demo.c").to_str().unwrap(),
+        ],
+        &prefix.join("lib/libdemo.so.1"),
+    ) {
+        return;
+    }
+    let main_body = r#"#include <dirent.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+static const char *dir = "DIRPLACEHOLDER";
+int main(void) {
+    char path[512];
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)))
+            if (strstr(e->d_name, ".so")) printf("member=%s\n", e->d_name);
+        closedir(d);
+    }
+    snprintf(path, sizeof path, "%s/libdemo-type.so", dir);
+    void *t = dlopen(path, RTLD_NOW);
+    if (t) printf("type=%d\n", ((int (*)(void))dlsym(t, "demo_type"))());
+    else printf("type=missing\n");
+    snprintf(path, sizeof path, "%s/libdemo-carried.so", dir);
+    void *c = dlopen(path, RTLD_NOW);
+    if (c) printf("carried=%d\n", ((int (*)(void))dlsym(c, "demo_carried"))());
+    else printf("carried=missing\n");
+    return 0;
+}
+"#;
+    write(
+        &td.join("main.c"),
+        &main_body.replace(
+            "DIRPLACEHOLDER",
+            &prefix.join("lib/demo").display().to_string(),
+        ),
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            "-l:libdemo.so.1",
+            "-ldl",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let bundled = Command::new(onelf())
+        .args(["bundle-libs", app.to_str().unwrap(), "--target", "bin/app"])
+        .env("LD_LIBRARY_PATH", prefix.join("lib"))
+        .output()
+        .expect("spawn onelf bundle-libs");
+    assert!(
+        bundled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    assert!(app.join("lib/demo/libdemo-plugin.so").is_file());
+
+    // The host's modules: the one the package carries under the same
+    // name, rebuilt with another value, and the type-named one the
+    // package lacks. Both are admitted from the counterpart directory
+    // the record's compiled-in path names.
+    write(&td.join("type.c"), "int demo_type(void){return 2;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("type.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-type.so"),
+    ) {
+        return;
+    }
+    write(
+        &td.join("carried2.c"),
+        "int demo_carried(void){return 3;}\n",
+    );
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("carried2.c").to_str().unwrap()],
+        &prefix.join("lib/demo/libdemo-carried.so"),
+    ) {
+        return;
+    }
+
+    let pkg = td.join("mergedview.onelf");
+    let packed = Command::new(onelf())
+        .args(["pack", app.to_str().unwrap(), "-o", pkg.to_str().unwrap()])
+        .args([
+            "--command",
+            "bin/app",
+            "--mtime",
+            "0",
+            "--name",
+            "mergedview",
+        ])
+        // The fixture studies host-module admission itself, and a bundle
+        // of two demo plugins would otherwise take nothing from the host.
+        .args(["--host-libs", "always"])
+        .output()
+        .expect("spawn onelf pack");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&prefix.join("lib")])).unwrap();
+
+    let mut modes: Vec<&str> = vec!["rundir", "cache"];
+    if tmpfs_available() {
+        modes.push("tmpfs");
+    }
+    if fuse_available() {
+        modes.push("fuse");
+    }
+    for mode in modes {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", mode)
+            .env("ONELF_LD_CACHE", cache.to_str().unwrap())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{mode}: the launch failed: {err}");
+        for want in [
+            "member=libdemo-plugin.so",
+            "member=libdemo-carried.so",
+            "member=libdemo-type.so",
+            "type=2",
+            "carried=4",
+        ] {
+            assert!(
+                report.contains(want),
+                "{mode}: the report lacks {want}:\n{report}\n--- stderr:\n{err}"
+            );
+        }
+        assert!(
+            !report.contains("carried=3"),
+            "{mode}: the host's copy answered for a name the package carries:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// Minimal ELF bytes of another machine, enough for collection to refuse
 /// them for their architecture.
 fn foreign_object() -> Vec<u8> {

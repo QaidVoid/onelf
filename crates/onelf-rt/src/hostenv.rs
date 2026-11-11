@@ -621,7 +621,7 @@ mod classification_tests {
     /// ones the launch evaluates.
     #[test]
     fn every_catalog_alternative_the_runtime_finds_matches_the_definitions() {
-        use crate::env::{Scope, builtin_path_groups, evaluate_path_groups};
+        use crate::env::{Scope, builtin_path_groups, evaluate_path_groups_with};
         use onelf_format::rules::{EnvironmentName, ResourceKind, RuntimeBase};
 
         let work = std::env::temp_dir().join(format!("onelf-alt-{}", std::process::id()));
@@ -648,7 +648,8 @@ mod classification_tests {
                     libraries: std::slice::from_ref(&lib),
                 }];
 
-                let got = evaluate_path_groups([group], &scopes);
+                let got =
+                    evaluate_path_groups_with([group], &scopes, &std::collections::BTreeMap::new());
 
                 assert_eq!(got.len(), 1, "{}", group.id.as_str());
                 assert_eq!(

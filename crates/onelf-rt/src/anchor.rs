@@ -15,6 +15,7 @@
 //! application inherits, so a later launch's sweep removes it once the
 //! last process holding the claim is gone and never while one runs.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -91,9 +92,11 @@ pub fn carried(pkg: &PackageData) -> bool {
 }
 
 /// Where the anchor for `anchor` points in a launch whose package root is
-/// `pkg_root`: the bundle directory it stands for.
-fn link_target(pkg_root: &Path, anchor: &Anchor) -> PathBuf {
-    pkg_root.join(&anchor.relative)
+/// `pkg_root`: the merged view of the directory it stands for when one
+/// stands, else the bundle directory itself, the same choice the mount
+/// side makes.
+fn link_target(pkg_root: &Path, anchor: &Anchor, views: &BTreeMap<PathBuf, PathBuf>) -> PathBuf {
+    crate::hostpaths::mapped_or_bundled(views, pkg_root.join(&anchor.relative))
 }
 
 /// Leave descriptor 77 open on a fresh anchor directory for `anchors`,
@@ -103,7 +106,11 @@ fn link_target(pkg_root: &Path, anchor: &Anchor) -> PathBuf {
 /// execs: its lock is inherited by the application and holds the
 /// directory for as long as any process of it runs. No anchors make no
 /// directory and leave descriptor 77 alone.
-pub fn hold(pkg_root: &Path, anchors: &[Anchor]) -> io::Result<Option<Mountpoint>> {
+pub fn hold(
+    pkg_root: &Path,
+    anchors: &[Anchor],
+    views: &BTreeMap<PathBuf, PathBuf>,
+) -> io::Result<Option<Mountpoint>> {
     if anchors.is_empty() {
         return Ok(None);
     }
@@ -111,7 +118,7 @@ pub fn hold(pkg_root: &Path, anchors: &[Anchor]) -> io::Result<Option<Mountpoint
         .ok_or_else(|| io::Error::other("no private runtime directory to keep the anchors in"))?;
     for anchor in anchors {
         std::os::unix::fs::symlink(
-            link_target(pkg_root, anchor),
+            link_target(pkg_root, anchor, views),
             claim.path().join(&anchor.key),
         )?;
     }
@@ -148,8 +155,35 @@ mod tests {
             relative: "share/alsa".into(),
         };
         assert_eq!(
-            link_target(Path::new("/run/user/1000/onelf-app-1234"), &anchor),
+            link_target(
+                Path::new("/run/user/1000/onelf-app-1234"),
+                &anchor,
+                &BTreeMap::new()
+            ),
             Path::new("/run/user/1000/onelf-app-1234/share/alsa")
         );
+        let root = std::env::temp_dir().join(format!("onelf-anchor-link-{}", std::process::id()));
+        let view = root.join("view");
+        std::fs::create_dir_all(&view).unwrap();
+        let mut views = BTreeMap::new();
+        views.insert(
+            PathBuf::from("/run/user/1000/onelf-app-1234/share/alsa"),
+            view.clone(),
+        );
+        assert_eq!(
+            link_target(Path::new("/run/user/1000/onelf-app-1234"), &anchor, &views),
+            view,
+            "a built view stands in for the bundled directory"
+        );
+        views.insert(
+            PathBuf::from("/run/user/1000/onelf-app-1234/share/alsa"),
+            root.join("gone"),
+        );
+        assert_eq!(
+            link_target(Path::new("/run/user/1000/onelf-app-1234"), &anchor, &views),
+            Path::new("/run/user/1000/onelf-app-1234/share/alsa"),
+            "a vanished view falls back like the mount side"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

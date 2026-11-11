@@ -14,7 +14,7 @@ use std::process::Command;
 use onelf_format::HostLibsPolicy;
 use onelf_format::Manifest;
 use onelf_format::drivers;
-use onelf_format::resolve::{self, Gl, Request, Resolution};
+use onelf_format::resolve::{self, Gl, PluginView, Request, Resolution};
 
 use crate::loader::PackageData;
 
@@ -149,6 +149,13 @@ fn run(launch: &Launch) {
     for name in &resolution.incomparable {
         eprintln!("onelf-rt: resolver: cannot order {name}; keeping the bundled copy");
     }
+    // Wherever a carried plugin directory is redirected, the merged view
+    // of its bundled and admitted host members stands in for it.
+    let plugin_views: BTreeMap<PathBuf, PathBuf> = resolution
+        .plugin_views
+        .iter()
+        .map(|view| (launch.pkg_root.join(&view.relative), view.dir.clone()))
+        .collect();
     let shadows = resolution
         .farm
         .as_deref()
@@ -178,14 +185,12 @@ fn run(launch: &Launch) {
     publish_view_env(
         launch,
         &env_before,
-        &lib_dirs,
-        &set_lib_dirs,
-        &set_roots,
         wanted.as_ref(),
         &shadows,
+        &resolution.plugin_views,
     );
     let _anchors = match crate::anchor::read(launch.pkg)
-        .and_then(|anchors| crate::anchor::hold(launch.pkg_root, &anchors))
+        .and_then(|anchors| crate::anchor::hold(launch.pkg_root, &anchors, &plugin_views))
     {
         Ok(claim) => claim,
         Err(e) => {
@@ -201,7 +206,7 @@ fn run(launch: &Launch) {
     // exec that follows.
     match crate::hostpaths::read(launch.pkg) {
         Ok(wanted) => {
-            crate::hostpaths::apply(launch.pkg_root, &wanted);
+            crate::hostpaths::apply(launch.pkg_root, &wanted, &plugin_views);
         }
         Err(e) => eprintln!(
             "onelf-rt: not overlaying the paths the package was built with, so it \
@@ -334,6 +339,7 @@ fn apply_env(
         resolved.platform_root.as_deref(),
         set_lib_dirs,
         set_roots,
+        &view_pairs(&resolved.resolution.plugin_views),
     );
     if let Some(data) = launch.env_data {
         crate::env::apply_custom_env(data, pkg_root_s);
@@ -435,8 +441,13 @@ pub fn generated_env(launch: &Launch) -> GeneratedEnv {
     };
     let before = snapshot_env();
     apply_env(launch, resolved, &set_lib_dirs, &set_roots);
-    let assignments =
-        crate::env::view_env_assignments(launch.pkg_root, &lib_dirs, &set_lib_dirs, &set_roots);
+    let assignments = crate::env::view_env_assignments(
+        launch.pkg_root,
+        &lib_dirs,
+        &set_lib_dirs,
+        &set_roots,
+        &view_pairs(&resolved.resolution.plugin_views),
+    );
     let applied = snapshot_env();
     for (name, value) in &before {
         if applied.get(name) != Some(value) {
@@ -477,6 +488,15 @@ fn publishes_view_env(links: &Links<'_>, tree_writable: bool, private_ns: bool) 
     }
 }
 
+/// The plugin views as the environment engine takes them: the
+/// directory's package path with the view built over it.
+fn view_pairs(views: &[PluginView]) -> Vec<(String, PathBuf)> {
+    views
+        .iter()
+        .map(|view| (view.relative.clone(), view.dir.clone()))
+        .collect()
+}
+
 /// Generate and publish this launch's evaluated per-view environment input.
 /// A server this launch started is sent it with the launch's library links
 /// and the `shadows` it serves (see [`shadow_bundled_copies`]).
@@ -491,17 +511,26 @@ fn publishes_view_env(links: &Links<'_>, tree_writable: bool, private_ns: bool) 
 fn publish_view_env(
     launch: &Launch,
     base: &BTreeMap<OsString, OsString>,
-    lib_dirs: &[&str],
-    set_lib_dirs: &[PathBuf],
-    set_roots: &[PathBuf],
     wanted: Option<&(String, crate::links::Links)>,
     shadows: &crate::links::Links,
+    plugin_views: &[PluginView],
 ) {
     if !publishes_view_env(&launch.links, launch.tree_writable, launch.private_ns) {
         return;
     }
-    let assignments =
-        crate::env::view_env_assignments(launch.pkg_root, lib_dirs, set_lib_dirs, set_roots);
+    let lib_dirs = launch.pkg.manifest.lib_dirs();
+    let set_roots = crate::sets::roots();
+    let set_lib_dirs: Vec<PathBuf> = set_roots
+        .iter()
+        .flat_map(|r| crate::sets::lib_dirs(r))
+        .collect();
+    let assignments = crate::env::view_env_assignments(
+        launch.pkg_root,
+        &lib_dirs,
+        &set_lib_dirs,
+        &set_roots,
+        &view_pairs(plugin_views),
+    );
     let now = snapshot_env();
     let bytes = match crate::env::encode_view_env(base, &now, &assignments) {
         Ok(bytes) => bytes,

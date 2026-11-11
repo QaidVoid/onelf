@@ -65,12 +65,26 @@ pub fn read_plugin_dirs(pkg: &PackageData) -> io::Result<Vec<PluginDir>> {
     })
 }
 
+/// The directory a pair answers from: its merged view when one stands,
+/// else the package's bundled directory. A view that vanished between
+/// the resolution and the mount or the anchor hold falls back, so a
+/// launch never names content that is gone.
+pub(crate) fn mapped_or_bundled(views: &BTreeMap<PathBuf, PathBuf>, bundled: PathBuf) -> PathBuf {
+    match views.get(&bundled) {
+        Some(view) if view.is_dir() => view.clone(),
+        _ => bundled,
+    }
+}
+
 /// Make each bundle directory in `wanted` answer for its absolute path.
 ///
-/// Called before the entrypoint is executed and after the package is in
-/// place at `pkg_root`. Returns whether anything was mounted, so the
-/// caller can say so when it matters.
-pub fn apply(pkg_root: &Path, wanted: &[PathPair]) -> bool {
+/// A directory with a merged plugin view is mounted from the view
+/// instead of the bundle directory, so the absolute path presents the
+/// bundled members and the admitted host members in one place. Called
+/// before the entrypoint is executed and after the package is in place
+/// at `pkg_root`. Returns whether anything was mounted, so the caller
+/// can say so when it matters.
+pub fn apply(pkg_root: &Path, wanted: &[PathPair], views: &BTreeMap<PathBuf, PathBuf>) -> bool {
     if wanted.is_empty() {
         return false;
     }
@@ -101,7 +115,8 @@ pub fn apply(pkg_root: &Path, wanted: &[PathPair]) -> bool {
     let mut absent: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
     for pair in wanted {
         let target = Path::new(&pair.absolute);
-        let source = pkg_root.join(&pair.relative);
+        let bundled = pkg_root.join(&pair.relative);
+        let source = mapped_or_bundled(views, bundled);
         if !source.is_dir() {
             continue;
         }
@@ -270,6 +285,37 @@ mod tests {
     fn a_package_without_the_plugin_dirs_record_carries_none() {
         let pkg = load("pd-absent", &[("bin/app", b"elf".to_vec())]);
         assert_eq!(read_plugin_dirs(&pkg).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_vanished_or_foreign_view_leaves_the_bundled_directory() {
+        let root =
+            std::env::temp_dir().join(format!("onelf-hostpaths-view-{}", std::process::id()));
+        let view = root.join("view");
+        std::fs::create_dir_all(&view).unwrap();
+        let bundled = PathBuf::from("/pkg/share/alsa");
+        let mut views = BTreeMap::new();
+        views.insert(bundled.clone(), view.clone());
+        assert_eq!(mapped_or_bundled(&views, bundled.clone()), view);
+        views.insert(bundled.clone(), root.join("gone"));
+        assert_eq!(
+            mapped_or_bundled(&views, bundled.clone()),
+            bundled,
+            "a view that is gone answers nothing"
+        );
+        let plain = root.join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        views.insert(bundled.clone(), plain);
+        assert_eq!(
+            mapped_or_bundled(&views, bundled.clone()),
+            bundled,
+            "a plain file never passes for a view"
+        );
+        assert_eq!(
+            mapped_or_bundled(&BTreeMap::new(), bundled.clone()),
+            bundled
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -150,6 +150,7 @@ pub fn setup_env(
     platform_root: Option<&Path>,
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
+    plugin_views: &[(String, PathBuf)],
 ) -> String {
     let launch_dir = env::current_dir()
         .ok()
@@ -299,7 +300,14 @@ pub fn setup_env(
     // icons, mime types, etc. are discoverable by GLib/GTK. Host dirs are kept
     // so system themes, schemas, and desktop integrations still work.
     let active = launch_rules(pkg);
-    setup_plugin_dirs(&active, pkg, &app_lib_dirs, set_lib_dirs, set_roots);
+    setup_plugin_dirs(
+        &active,
+        pkg,
+        &app_lib_dirs,
+        set_lib_dirs,
+        set_roots,
+        plugin_views,
+    );
     let (hook_lib_dirs, hook_roots) =
         active.with_prepared(pkg, &app_lib_dirs, set_lib_dirs, set_roots);
     run_runtime_hooks(
@@ -696,9 +704,14 @@ pub fn view_env_assignments(
     lib_dirs: &[&str],
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
+    plugin_views: &[(String, PathBuf)],
 ) -> Vec<PathAssignment<'static>> {
     let app_lib_dirs: Vec<PathBuf> = lib_dirs.iter().map(|d| pkg_root.join(d)).collect();
-    launch_rules(pkg_root).assignments(pkg_root, &app_lib_dirs, set_lib_dirs, set_roots)
+    let views: BTreeMap<PathBuf, PathBuf> = plugin_views
+        .iter()
+        .map(|(relative, dir)| (pkg_root.join(relative), dir.clone()))
+        .collect();
+    launch_rules(pkg_root).assignments(pkg_root, &app_lib_dirs, set_lib_dirs, set_roots, &views)
 }
 
 /// Encode the evaluated per-view environment input.
@@ -976,9 +989,19 @@ fn first_per_library_root(group: &RuntimePathGroup, scopes: &[Scope<'_>]) -> Vec
 /// nothing, so it can neither invent a path nor override an inherited
 /// value. Probes are bounded by the codec's caps on candidates and
 /// aliases times the launch's root count.
-pub(crate) fn evaluate_path_groups<'a>(
+/// Select and join the paths each mapping finds, in mapping order, with
+/// a plugin directory's chosen path replaced by its merged view.
+///
+/// `views` maps an application package's plugin directory to the view
+/// built over it: bundled members first, then the admitted host members
+/// the package lacks. Only the application package's own directories
+/// are mapped, and only after a candidate has matched the real
+/// directory, so a set or prepared subtree carrying the same relative
+/// path keeps its own.
+pub(crate) fn evaluate_path_groups_with<'a>(
     groups: impl IntoIterator<Item = &'a RuntimePathGroup>,
     scopes: &[Scope<'_>],
+    views: &BTreeMap<PathBuf, PathBuf>,
 ) -> Vec<PathAssignment<'a>> {
     let mut assignments = Vec::new();
     for group in groups {
@@ -990,6 +1013,10 @@ pub(crate) fn evaluate_path_groups<'a>(
         if chosen.is_empty() {
             continue;
         }
+        let chosen = chosen
+            .into_iter()
+            .map(|path| views.get(&path).cloned().unwrap_or(path))
+            .collect::<Vec<_>>();
         let Some(value) = env::join_paths(&chosen).ok() else {
             continue;
         };
@@ -1044,8 +1071,13 @@ fn setup_plugin_dirs(
     lib_dirs: &[PathBuf],
     set_lib_dirs: &[PathBuf],
     set_roots: &[PathBuf],
+    plugin_views: &[(String, PathBuf)],
 ) {
-    apply_path_assignments(&active.assignments(pkg, lib_dirs, set_lib_dirs, set_roots));
+    let views: BTreeMap<PathBuf, PathBuf> = plugin_views
+        .iter()
+        .map(|(relative, dir)| (pkg.join(relative), dir.clone()))
+        .collect();
+    apply_path_assignments(&active.assignments(pkg, lib_dirs, set_lib_dirs, set_roots, &views));
 }
 
 /// The runtime rule record this process's launch carries, installed once
@@ -1172,6 +1204,7 @@ impl<'a> ActiveRules<'a> {
         lib_dirs: &[PathBuf],
         set_lib_dirs: &[PathBuf],
         set_roots: &[PathBuf],
+        views: &BTreeMap<PathBuf, PathBuf>,
     ) -> Vec<PathAssignment<'a>> {
         let set_packages: Vec<&Path> = set_roots.iter().map(PathBuf::as_path).collect();
         let mut out = Vec::new();
@@ -1192,7 +1225,7 @@ impl<'a> ActiveRules<'a> {
                     libraries: set_lib_dirs,
                 },
             ];
-            out.extend(evaluate_path_groups([active.group], &scopes));
+            out.extend(evaluate_path_groups_with([active.group], &scopes, views));
         }
         out
     }
@@ -1940,6 +1973,7 @@ mod setup_env_tests {
             None,
             &[],
             &[],
+            &[],
         )
     }
 
@@ -2031,6 +2065,7 @@ mod library_search_tests {
             None,
             &[PathBuf::from("/set/lib")],
             &[],
+            &[],
         );
 
         assert_eq!(path, "/farm:/pkg/lib:/set/lib");
@@ -2094,6 +2129,7 @@ mod store_hint_tests {
             "/nonexistent/target",
             None,
             None,
+            &[],
             &[],
             &[],
         );
@@ -2670,6 +2706,7 @@ mod plugin_dir_tests {
             &lib_dirs,
             &set_libs,
             &set_roots,
+            &[],
         );
         run_runtime_hooks(
             &all_runtime_hooks(),
@@ -3232,11 +3269,59 @@ mod path_mapping_tests {
             &["ONELFTEST_FIRST_G"],
         )];
 
-        let got = evaluate_path_groups(&groups, &scopes);
+        let got = evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new());
 
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].variables, ["ONELFTEST_FIRST_G"]);
         assert_eq!(got[0].value, app.join("b").into_os_string());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A plugin directory the decision built a view for is named as the
+    /// view in the evaluated value, and a set root carrying the same
+    /// relative path keeps its own directory.
+    #[test]
+    fn a_viewed_plugin_directory_is_named_as_its_view() {
+        let work = tree("viewdir");
+        let (app, set) = (work.join("app"), work.join("set"));
+        mkdir(&app.join("lib/plugins"));
+        mkdir(&set.join("lib/plugins"));
+        let view = work.join("store/view-1/dir-0");
+        mkdir(&view);
+        let set_roots = vec![set.as_path()];
+        let scopes = [
+            Scope {
+                packages: &[app.as_path()],
+                libraries: &[],
+            },
+            Scope {
+                packages: &set_roots,
+                libraries: &[],
+            },
+        ];
+        let groups = [group(
+            "g",
+            ResourceKind::Directory,
+            PathSelection::First,
+            Inheritance::Replace,
+            &[(RuntimeBase::PackageRoot, "lib/plugins")],
+            &["ONELFTEST_VIEW_G"],
+        )];
+        let mut views = BTreeMap::new();
+        views.insert(app.join("lib/plugins"), view.clone());
+
+        let got = evaluate_path_groups_with(&groups, &scopes, &views);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].value, view.into_os_string());
+
+        let got = evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new());
+
+        assert_eq!(
+            got[0].value,
+            app.join("lib/plugins").into_os_string(),
+            "without a view the bundled directory is named"
+        );
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -3287,7 +3372,7 @@ mod path_mapping_tests {
             ),
         ];
 
-        let got = evaluate_path_groups(&groups, &scopes);
+        let got = evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new());
 
         assert_eq!(got[0].value, app.join("lib/m").into_os_string());
         assert_eq!(
@@ -3331,7 +3416,7 @@ mod path_mapping_tests {
             &["ONELFTEST_HEIF"],
         )];
 
-        let got = evaluate_path_groups(&groups, &scopes);
+        let got = evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new());
 
         assert_eq!(
             got[0].value,
@@ -3379,9 +3464,9 @@ mod path_mapping_tests {
             &["ONELFTEST_KIND_DIR"],
         )];
 
-        let got = evaluate_path_groups(&files, &scopes);
+        let got = evaluate_path_groups_with(&files, &scopes, &BTreeMap::new());
         assert_eq!(got[0].value, app.join("real.mgc").into_os_string());
-        assert!(evaluate_path_groups(&dirs, &scopes).is_empty());
+        assert!(evaluate_path_groups_with(&dirs, &scopes, &BTreeMap::new()).is_empty());
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -3405,7 +3490,7 @@ mod path_mapping_tests {
             &["ONELFTEST_ABSENT"],
         )];
 
-        assert!(evaluate_path_groups(&groups, &scopes).is_empty());
+        assert!(evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new()).is_empty());
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -3437,10 +3522,10 @@ mod path_mapping_tests {
             &["ONELFTEST_INACTIVE"],
         )];
 
-        assert!(evaluate_path_groups(&groups, &scopes).is_empty());
+        assert!(evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new()).is_empty());
 
         mkdir(&active.join("share/locale"));
-        let got = evaluate_path_groups(&groups, &scopes);
+        let got = evaluate_path_groups_with(&groups, &scopes, &BTreeMap::new());
         assert_eq!(got[0].value, active.join("share/locale").into_os_string());
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -3521,7 +3606,8 @@ mod path_mapping_tests {
                     unsafe { env::remove_var(variable.as_str()) };
                 }
 
-                let assignments = evaluate_path_groups(std::iter::once(group), &scopes);
+                let assignments =
+                    evaluate_path_groups_with(std::iter::once(group), &scopes, &BTreeMap::new());
                 apply_path_assignments(&assignments);
                 let got = assignments;
 
@@ -3637,6 +3723,7 @@ mod path_mapping_tests {
             &[lib.clone(), arch.clone()],
             std::slice::from_ref(&set_lib),
             &[set],
+            &[],
         );
 
         let expected = [
@@ -3765,6 +3852,7 @@ mod path_mapping_tests {
             &[pkg.join("lib")],
             &[],
             &[],
+            &[],
         );
 
         let libexec = pkg
@@ -3795,6 +3883,7 @@ mod path_mapping_tests {
             std::slice::from_ref(&pkg.join("lib")),
             std::slice::from_ref(&set_lib),
             &[set],
+            &[],
         );
 
         let debian = set_lib
@@ -4002,7 +4091,7 @@ mod locale_tests {
         std::fs::create_dir_all(pkg.join("lib/qt6/plugins")).unwrap();
         std::fs::create_dir_all(set.join("lib/qt6/plugins")).unwrap();
 
-        let alone = view_env_assignments(&pkg, &["lib"], &[], &[]);
+        let alone = view_env_assignments(&pkg, &["lib"], &[], &[], &[]);
         let hit = alone
             .iter()
             .find(|a| a.variables.contains(&"QT_PLUGIN_PATH"))
@@ -4010,7 +4099,7 @@ mod locale_tests {
         assert_eq!(hit.value, pkg.join("lib/qt6/plugins"));
 
         let set_libs = crate::sets::lib_dirs(&set);
-        let both = view_env_assignments(&pkg, &["lib"], &set_libs, std::slice::from_ref(&set));
+        let both = view_env_assignments(&pkg, &["lib"], &set_libs, std::slice::from_ref(&set), &[]);
         let hit = both
             .iter()
             .find(|a| a.variables.contains(&"QT_PLUGIN_PATH"))
@@ -4324,7 +4413,7 @@ mod carried_rule_tests {
 
         let active = ActiveRules::new(Some(&carried), &pkg, &[]);
         assert_eq!(
-            values(&active.assignments(&pkg, &lib, &[], &[])),
+            values(&active.assignments(&pkg, &lib, &[], &[], &BTreeMap::new())),
             [(
                 "VENDOR_DATA_DIR".to_string(),
                 pkg.join("share/vendor/data").to_string_lossy().into_owned()
@@ -4333,7 +4422,7 @@ mod carried_rule_tests {
         assert_eq!(active.hooks, [RuntimeHookId::FontconfigGenerate]);
 
         let fallback = ActiveRules::new(None, &pkg, &[]);
-        let mapped = values(&fallback.assignments(&pkg, &lib, &[], &[]));
+        let mapped = values(&fallback.assignments(&pkg, &lib, &[], &[], &BTreeMap::new()));
         assert!(mapped.iter().any(|(name, _)| name == "ALSA_CONFIG_DIR"));
         assert!(!mapped.iter().any(|(name, _)| name == "VENDOR_DATA_DIR"));
         assert_eq!(fallback.hooks, all_runtime_hooks());
@@ -4380,7 +4469,7 @@ mod carried_rule_tests {
         let roots = [set.clone()];
         let chosen = |pins: &[ActivePin]| {
             let active = ActiveRules::new(Some(&carried), &pkg, pins);
-            values(&active.assignments(&pkg, &lib, &set_libs, &roots))
+            values(&active.assignments(&pkg, &lib, &set_libs, &roots, &BTreeMap::new()))
                 .into_iter()
                 .map(|(_, value)| value)
                 .collect::<Vec<_>>()
