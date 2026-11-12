@@ -3122,7 +3122,7 @@ const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
     ("libgirepository-1.0.so.1", "gi", 1, 1),
     ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
     ("libheif.so.1", "heif", 0, 0),
-    ("libpipewire-0.3.so.0", "pipewire", 2, 2),
+    ("libpipewire-0.3.so.0", "pipewire", 3, 3),
     ("libspa-0.2.so.0", "spa", 1, 1),
 ];
 

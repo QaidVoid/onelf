@@ -35,6 +35,19 @@ candidates = [
   { base = "installation-prefix", path = "share/pipewire/client.conf" },
 ]
 
+# Realtime clients before pipewire 1.4 load client-rt.conf for their
+# context, and a configuration directory that misses it fails the
+# context outright wherever the package's configuration directory is
+# mapped.
+[[resources.data]]
+id = "configuration-rt"
+kind = "file"
+destination = "share/pipewire/client-rt.conf"
+requirement = "optional"
+candidates = [
+  { base = "installation-prefix", path = "share/pipewire/client-rt.conf" },
+]
+
 [[runtime.paths]]
 id = "plugins"
 kind = "directory"

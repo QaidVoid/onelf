@@ -9619,12 +9619,20 @@ mod catalog_coverage_tests {
                 ),
                 ("spa", "plugins", "lib/spa-0.2", Requirement::Optional),
             ],
-            data: &[(
-                "pipewire",
-                "configuration",
-                "share/pipewire/client.conf",
-                Requirement::Optional,
-            )],
+            data: &[
+                (
+                    "pipewire",
+                    "configuration",
+                    "share/pipewire/client.conf",
+                    Requirement::Optional,
+                ),
+                (
+                    "pipewire",
+                    "configuration-rt",
+                    "share/pipewire/client-rt.conf",
+                    Requirement::Optional,
+                ),
+            ],
             helpers: &[],
             paths: &[
                 (
