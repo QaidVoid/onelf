@@ -373,17 +373,24 @@ jobs:
         if: always()
         run: cat "$RUNNER_TEMP/pipewire.log" || true
 
-  # The pinned distro fixtures drive docker directly: three images from
+  # The pinned distro fixtures drive docker directly: six images from
   # ci/fixtures/Dockerfile.* (base tags pinned by digest, packages
-  # installed only at image-prep time) run the application fixtures and
-  # the static musl runtime checks inside Ubuntu 24.04, Alpine 3.20 and
-  # Fedora 44, and the GTK and Qt packages also run on the bare base of
-  # the other libc family. Containers run without network and print
-  # their image IDs. The job claims docker in ONELF_REQUIRED_CAPS, so a runner
-  # without docker fails the preflight, and a fixture test that skips
-  # for any reason fails the job instead of passing as a skip.
+  # installed only at image-prep time) run the application fixtures
+  # and the static musl runtime checks inside Ubuntu 24.04, Alpine
+  # 3.20 and Fedora 44; the audio matrix assembles, packs and plays
+  # the audio fixture inside Ubuntu 22.04, Debian 12, Arch, Fedora 44
+  # and Alpine 3.20; and the GTK and Qt packages also run on the
+  # bare base of the other libc family. The audio matrix plays its
+  # fixture against a PipeWire server each cell starts inside its own
+  # container, with the session manager that distro's sound stack
+  # ships, and the descriptor-free framework
+  # fixture launches both with and without a user namespace. Containers
+  # run without network and print their image IDs. The job claims
+  # docker in ONELF_REQUIRED_CAPS, so a runner without docker fails the
+  # preflight, and a fixture test that skips for any reason fails the
+  # job instead of passing as a skip.
   distro-fixtures:
-    name: Distro fixtures, Ubuntu 24.04 Alpine 3.20 Fedora 44
+    name: Distro fixtures, six pinned hosts
     runs-on: ubuntu-latest
     env:
       ONELF_REQUIRED_CAPS: docker

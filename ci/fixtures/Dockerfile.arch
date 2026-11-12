@@ -1,0 +1,22 @@
+# Pinned Arch Linux fixture image: base locked by digest, package list
+# spelled out, nothing installed later. Arch moves under the pinned base,
+# so a fresh pull of the digest keeps the packages the audio matrix
+# compiles against inside the container, and the image's PipeWire stack
+# is the sound server the matrix cells start. pipewire-pulse is the
+# pulse socket of the desktop sound stack the audio cells start, and
+# binutils' strip strips the packed libraries.
+# Xvfb gives the pinned host a display so a GUI application can be run
+# against its bundle here; the suite itself needs none.
+FROM archlinux:base@sha256:fcee73ea1b96e236248f53a213f71276cc9072d9025b58bce9915e32f19963ae
+
+RUN pacman -Syu --noconfirm --needed \
+        alsa-lib \
+        binutils \
+        gcc \
+        pkgconf \
+        pipewire \
+        pipewire-alsa \
+        pipewire-pulse \
+        wireplumber \
+        xorg-server-xvfb \
+    && pacman -Scc --noconfirm

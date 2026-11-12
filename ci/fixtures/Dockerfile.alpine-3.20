@@ -2,9 +2,17 @@
 # list spelled out, nothing installed later. This is the musl side of the
 # isolation fixtures: a glibc application packed with the static musl
 # runtime must run here on its bundled glibc, never on the host's musl.
+# The image's PipeWire stack with wireplumber is the sound server the
+# audio matrix cells start, and its musl alsa-lib is what the audio
+# fixture compiles against. pipewire-pulse is the pulse socket of the
+# desktop sound stack the audio cells start. Xvfb gives the pinned
+# host a display so a GUI
+# application can be run against its bundle here; the suite itself
+# needs none.
 FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
 
 RUN apk add --no-cache \
+        alsa-lib-dev \
         binutils \
         file \
         g++ \
@@ -14,4 +22,11 @@ RUN apk add --no-cache \
         musl-dev \
         patchelf \
         pkgconfig \
-        qt6-qtbase-dev
+        pipewire \
+        pipewire-alsa \
+        pipewire-pulse \
+        pipewire-spa-tools \
+        pipewire-tools \
+        qt6-qtbase-dev \
+        wireplumber \
+        xvfb

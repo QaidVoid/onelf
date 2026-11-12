@@ -1,6 +1,7 @@
 //! Pinned distro fixtures: pack and run the documented application kinds
-//! inside Ubuntu 24.04, Alpine 3.20 and Fedora 44 container images, and
-//! prove what the static musl runtime guarantees there.
+//! inside Ubuntu 24.04, Ubuntu 22.04, Debian 12, Arch, Alpine 3.20 and
+//! Fedora 44 container images, and prove what the static musl runtime
+//! guarantees there.
 //!
 //! The images build from `ci/fixtures/Dockerfile.*`: base tags pinned by
 //! digest, package lists installed only at image-prep time. Each test
@@ -24,9 +25,21 @@
 //! * a package built on one distro runs on the other two, with the
 //!   compiled-in marker naming the distro that produced it,
 //! * the slim and update-feature runtimes are static musl (no
-//!   interpreter segment, no `DT_NEEDED`), advertise selection-view and
-//!   additionally store-import through the doctor report, and run on all
-//!   three distros,
+//!   interpreter segment, no `DT_NEEDED`), advertise
+//!   selection-view+anchors (and store-import on the update runtime)
+//!   through the doctor report, and run on all three distros,
+//! * the audio fixture is compiled, packed and played against a
+//!   PipeWire server started inside each pinned image's own container,
+//!   under the distribution's defaults, under a user configuration
+//!   naming the host's PipeWire and PulseAudio ALSA plugins, and under
+//!   one naming plugins that do not exist, which must decline safely,
+//!   and the Ubuntu and Alpine packages also run on the foreign image
+//!   across the libc line, where the run must stay healthy whatever it
+//!   reports,
+//! * a descriptor-free framework fixture builds from a realistic
+//!   install prefix on Ubuntu 24.04 and launches namespaced and
+//!   namespace-free, with an overlaid configuration pair and anchored
+//!   inference answers asserted in both modes,
 //! * a glibc application packed with the musl runtime and a
 //!   host-libs-never package prints its bundled glibc version on Ubuntu,
 //!   on Fedora and on Alpine, so Alpine's musl never answers, and a musl
@@ -964,11 +977,13 @@ fn slim_and_update_runtimes_are_static_musl_and_advertise_their_capabilities() {
     let update = pkg_path(&td, "cli-update", "onelf-distro-update");
 
     // The note decoder packaging and the loader share, on the host: slim
-    // advertises selection-view, update adds store-import.
+    // advertises selection-view and the anchor record, update adds
+    // store-import.
     let view = onelf_format::elf::RuntimeCapabilities::SELECTION_VIEW;
-    let both = view.union(onelf_format::elf::RuntimeCapabilities::STORE_IMPORT);
-    assert_note(&slim, view, "slim runtime note");
-    assert_note(&update, both, "update runtime note");
+    let anchored = view.union(onelf_format::elf::RuntimeCapabilities::ANCHORS);
+    let all = anchored.union(onelf_format::elf::RuntimeCapabilities::STORE_IMPORT);
+    assert_note(&slim, anchored, "slim runtime note");
+    assert_note(&update, all, "update runtime note");
 
     // Static musl, per the pinned distro's own binutils.
     let report = static_report(
@@ -998,8 +1013,10 @@ fn slim_and_update_runtimes_are_static_musl_and_advertise_their_capabilities() {
     must(&out, "runtimes: doctor on the slim package");
     let report = stdout_of(&out);
     assert!(
-        report.contains("this runtime advertises: payload metadata version 1, selection-view"),
-        "slim doctor omits the selection-view advertisement:\n{report}"
+        report.contains(
+            "this runtime advertises: payload metadata version 1, selection-view+anchors"
+        ),
+        "slim doctor omits the anchor advertisement:\n{report}"
     );
     assert!(
         !report.contains("store-import"),
@@ -1020,7 +1037,7 @@ fn slim_and_update_runtimes_are_static_musl_and_advertise_their_capabilities() {
     must(&out, "runtimes: doctor on the update package");
     assert!(
         stdout_of(&out).contains(
-            "this runtime advertises: payload metadata version 1, selection-view+store-import"
+            "this runtime advertises: payload metadata version 1, selection-view+store-import+anchors"
         ),
         "update doctor omits the store-import advertisement:\n{}",
         transcript(&out)
@@ -1150,5 +1167,282 @@ fn a_glibc_app_packed_with_the_musl_runtime_stays_on_glibc_on_every_host() {
         stdout_of(&out).contains("libc: musl"),
         "isolation: the musl package did not answer musl on Ubuntu:\n{}",
         transcript(&out)
+    );
+}
+
+/// The five pinned hosts the audio matrix plays on.
+const AUDIO_DISTROS: [&str; 5] = [
+    "ubuntu-22.04",
+    "debian-12",
+    "arch",
+    "fedora-44",
+    "alpine-3.20",
+];
+
+/// Start the image's PipeWire stack on a private runtime directory,
+/// wait until it answers, and run the packed package against it. The
+/// session manager is whatever the image's sound stack ships (wireplumber
+/// where the pinned images carry it, pipewire-media-session on the older
+/// Debian and Ubuntu lines), and every image the audio matrix plays on
+/// carries pipewire-pulse, the desktop pulse socket, which the cell
+/// starts whenever present, so every cell's server
+/// matches what that distro's desktop would run. The settle wait lets
+/// the session manager finish starting before the null sink arrives:
+/// a node created mid-startup is one its policy never adopts. The sink
+/// must outlive its creating client, hence object.linger. The server's
+/// log stays in the scratch tree.
+///
+/// `asoundrc` selects the ALSA configuration the run sees: the
+/// distribution's defaults, a user configuration naming the host's
+/// PipeWire and PulseAudio ALSA plugins by absolute path and routing
+/// the default device through whichever of them the host ships, or one
+/// naming plugins that do not exist, which the package must decline by
+/// falling back safely. A configuration from an earlier cell would
+/// leak into later cells sharing the tree, so the script removes
+/// `/work/.asoundrc` before writing one, and an EXIT trap dumps the
+/// server's log on every exit path, so a failed cell shows why the
+/// server or the play went wrong even when the failure happens before
+/// the guarded run.
+fn run_with_sound_server(
+    engine: &Engine,
+    tag: &str,
+    scratch: &Workdir,
+    pkg_rel: &str,
+    asoundrc: Asoundrc,
+) -> Output {
+    let user_config = match asoundrc {
+        Asoundrc::Defaults => String::new(),
+        Asoundrc::HostPlugins => "pw=$(find /usr/lib /usr/lib64 -name libasound_module_pcm_pipewire.so 2>/dev/null | head -1); \
+         pu=$(find /usr/lib /usr/lib64 -name libasound_module_pcm_pulse.so 2>/dev/null | head -1); \
+         [ -n \"$pw\" ] || [ -n \"$pu\" ]; \
+         : > /work/.asoundrc; \
+         if [ -n \"$pw\" ]; then \
+           printf 'pcm_type.pipewire { lib \"%s\" }\\n' \"$pw\" >> /work/.asoundrc; \
+           printf 'pcm.!default { type pipewire }\\n' >> /work/.asoundrc; fi; \
+         if [ -n \"$pu\" ]; then \
+           printf 'pcm_type.pulse { lib \"%s\" }\\n' \"$pu\" >> /work/.asoundrc; fi; \
+         if [ -z \"$pw\" ]; then \
+           printf 'pcm.!default { type pulse }\\n' >> /work/.asoundrc; fi; "
+        .to_string(),
+        Asoundrc::AbsentPlugins => ": > /work/.asoundrc; \
+         printf 'pcm_type.pipewire { lib \"/nonexistent/libasound_module_pcm_pipewire.so\" }\\n' >> /work/.asoundrc; \
+         printf 'pcm_type.pulse { lib \"/nonexistent/libasound_module_pcm_pulse.so\" }\\n' >> /work/.asoundrc; \
+         printf 'pcm.!default { type pipewire }\\n' >> /work/.asoundrc; "
+        .to_string(),
+    };
+    let script = format!(
+        "set -e; rm -f /work/.asoundrc; install -d -m 0700 /work/xdg; export XDG_RUNTIME_DIR=/work/xdg; \
+         pipewire >/work/pipewire.log 2>&1 & server=$!; \
+         trap 'cat /work/pipewire.log >&2' EXIT; \
+         if command -v wireplumber >/dev/null 2>&1; then \
+           wireplumber >/work/session-manager.log 2>&1 & \
+         else \
+           pipewire-media-session >/work/session-manager.log 2>&1 & fi; \
+         if command -v pipewire-pulse >/dev/null 2>&1; then \
+           pipewire-pulse >/work/pipewire-pulse.log 2>&1 & \
+           for _ in $(seq 1 50); do [ -S /work/xdg/pulse/native ] && break; sleep 0.2; done; fi; \
+         for _ in $(seq 1 100); do pw-cli info 0 >/dev/null 2>&1 && break; sleep 0.2; done; \
+         pw-cli info 0 >/dev/null; \
+         sleep 3; \
+         pw-cli create-node adapter '{{ factory.name=support.null-audio-sink \
+         node.name=onelf-null media.class=Audio/Sink \
+         object.linger=true }}' >/dev/null; \
+         for _ in $(seq 1 50); do pw-cli ls Node 2>/dev/null | grep -q onelf-null && break; \
+           sleep 0.2; done; \
+         pw-cli ls Node 2>/dev/null | grep -q onelf-null; \
+         sleep 1; \
+         {user_config} \
+         if HOME=/work {pkg}; then status=0; else status=$?; fi; \
+         kill $server 2>/dev/null || true; \
+         exit $status",
+        user_config = user_config,
+        pkg = in_work(pkg_rel)
+    );
+    container_simple(engine, tag, scratch, &script)
+}
+
+/// The ALSA configuration a matrix cell runs under: the distribution's
+/// defaults, the host's real plugin paths named by a user
+/// configuration, or a user configuration naming plugins that do not
+/// exist, which the package must decline safely instead of crashing.
+#[derive(Clone, Copy)]
+enum Asoundrc {
+    Defaults,
+    HostPlugins,
+    AbsentPlugins,
+}
+
+/// The cross-host audio matrix: the audio fixture is compiled, packed
+/// and played against its host's own PipeWire server on every pinned
+/// image under three ALSA configurations - the distribution defaults,
+/// a user configuration naming the host's PipeWire and PulseAudio ALSA
+/// plugins by path, and one naming plugins that do not exist - and the
+/// Ubuntu and Alpine packages are carried across the libc line onto the
+/// foreign image, where the run must stay healthy whatever the foreign
+/// host's honoured sound stack does under the package's libc.
+#[test]
+fn the_audio_matrix_plays_on_the_pinned_hosts_and_falls_back_across_lines() {
+    let Some(engine) = gate() else { return };
+
+    let mut carried: Vec<(&str, String, Workdir, String)> = Vec::new();
+    for distro in AUDIO_DISTROS {
+        let tag = image(&engine, distro);
+        let td = Workdir::new(&format!("audio-{distro}"));
+        assemble(&engine, &tag, &td, distro, &["audio"]);
+        write_recipe(
+            &td,
+            "audio",
+            &recipe(&format!("onelf-audio-{distro}"), "bin/audio", &[], &[]),
+        );
+        must(
+            &pack(&engine, &tag, &td, "audio", false),
+            &format!("{distro}: packing the audio fixture"),
+        );
+        let pkg_rel = format!("apps/audio/onelf-audio-{distro}.onelf");
+        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::Defaults);
+        must(
+            &out,
+            &format!("{distro}: playing the audio fixture against its own sound server"),
+        );
+        assert!(
+            stdout_of(&out).starts_with(&format!("AUDIO_OK {distro}")),
+            "{distro}: the audio fixture did not play through the sound server:\n{}",
+            transcript(&out)
+        );
+        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::HostPlugins);
+        must(
+            &out,
+            &format!("{distro}: playing with a user configuration naming the host plugins"),
+        );
+        assert!(
+            stdout_of(&out).starts_with(&format!("AUDIO_OK {distro}")),
+            "{distro}: the package did not honour the user configuration's host plugin:\n{}",
+            transcript(&out)
+        );
+        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::AbsentPlugins);
+        must(
+            &out,
+            &format!("{distro}: declining a user configuration naming absent plugins"),
+        );
+        assert!(
+            stdout_of(&out).starts_with("AUDIO_FALLBACK"),
+            "{distro}: the user configuration naming absent plugins neither took effect nor \
+             declined safely:\n{}",
+            transcript(&out)
+        );
+        if distro == "ubuntu-22.04" || distro == "alpine-3.20" {
+            carried.push((distro, tag, td, pkg_rel));
+        }
+    }
+
+    // Each carried package keeps running on the foreign libc line, on
+    // the foreign host's own image, and the guarantee is the safe exit,
+    // not one particular outcome: the host's honoured sound stack may
+    // load under the package's own libc and play, or be refused by it
+    // and leave the fixture's fallback. Either way the run reports
+    // coherently and stays healthy instead of crashing.
+    for (from, to) in [(0usize, "alpine-3.20"), (1usize, "ubuntu-22.04")] {
+        let (origin, _, ref td, ref pkg_rel) = carried[from];
+        let host_tag = image(&engine, to);
+        let out = run_with_sound_server(&engine, &host_tag, td, pkg_rel, Asoundrc::Defaults);
+        must(
+            &out,
+            &format!("{origin}'s package on {to}: the run must not crash"),
+        );
+        let stdout = stdout_of(&out);
+        assert!(
+            stdout.starts_with(&format!("AUDIO_OK {origin}"))
+                || stdout.starts_with("AUDIO_FALLBACK"),
+            "{origin}'s package on {to}: the fixture neither played nor fell back safely:\n{}",
+            transcript(&out)
+        );
+    }
+}
+
+/// The descriptor-free framework fixture on Ubuntu 24.04: the framework
+/// is installed under its own /work/fwroot/usr prefix the way a real
+/// one is under its build-time prefix, the app tree names those paths,
+/// and the build anchors the inferred plugin and data directories
+/// while the recipe pair overlays a configuration path outside the
+/// prefix; a namespace launch answers the paired path from the bundle,
+/// and a forced namespace-free launch names the pair unredirected while
+/// the anchors still resolve.
+#[test]
+fn fixture_descriptor_free_framework_launches_namespaced_and_namespace_free() {
+    let Some(engine) = gate() else { return };
+    let tag = image(&engine, "ubuntu-24.04");
+    let td = Workdir::new("frameworkfw");
+    assemble(&engine, &tag, &td, "ubuntu-24.04", &["frameworkfw"]);
+    write_recipe(
+        &td,
+        "frameworkfw",
+        &recipe(
+            "onelf-fwfw",
+            "bin/fwfw",
+            &["host-libs = \"always\""],
+            &[
+                "[bundle]\nsearch-paths = [\"/work/fwroot/usr/lib\"]",
+                "[paths]\n\"/work/apps/hostcfg\" = \"share/fwcfg\"",
+            ],
+        ),
+    );
+    let packed = pack(&engine, &tag, &td, "frameworkfw", true);
+    let log = transcript(&packed);
+    must(&packed, "framework: packing the framework fixture");
+    assert!(
+        log.contains("Redirected inferred directories")
+            && log.contains("lib/fwplugins: anchor ")
+            && log.contains("share/fwconf: anchor "),
+        "framework: the build did not anchor both inferred directories:\n{log}"
+    );
+    must(
+        &container_simple(
+            &engine,
+            &tag,
+            &td,
+            "test -f /work/apps/frameworkfw/.onelf/anchors",
+        ),
+        "framework: the anchor record is missing",
+    );
+    let pkg_rel = "apps/frameworkfw/onelf-fwfw.onelf";
+
+    // A namespace launch, when the container allows one, answers the
+    // paired path from the bundle; a container that refuses namespaces
+    // leaves the pair in the host's and says so once. The anchored
+    // reads work either way.
+    let out = run_pkg(&engine, &tag, &td, pkg_rel, &[]);
+    must(&out, "framework: running the packed framework fixture");
+    let stdout = stdout_of(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stdout.contains("member=libfwgood.so") && stdout.contains("conf=CONF"),
+        "framework: the anchored reads did not resolve:\n{stdout}{stderr}"
+    );
+    if stderr.contains("stays in the host's user namespace") {
+        assert!(
+            stdout.contains("cfg=HOST"),
+            "framework: the pair answered from the bundle without a namespace:\n{stdout}{stderr}"
+        );
+    } else {
+        assert!(
+            stdout.contains("cfg=BUNDLED"),
+            "framework: the pair answered from the host with a namespace:\n{stdout}{stderr}"
+        );
+    }
+
+    // Forced namespace-free: the pair names itself unredirected, and
+    // the anchors keep resolving because they need only the descriptor.
+    let script = format!("HOME=/work ONELF_FUSE_NO_NAMESPACE=1 {}", in_work(pkg_rel));
+    let out = container_simple(&engine, &tag, &td, &script);
+    must(&out, "framework: the namespace-free launch failed");
+    let stdout = stdout_of(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stdout.contains("cfg=HOST") && stdout.contains("conf=CONF"),
+        "framework: the namespace-free launch did not read the host's copy while the anchors held:\n{stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("stays in the host's user namespace"),
+        "framework: the namespace-free launch did not name the unredirected pair:\n{stdout}{stderr}"
     );
 }

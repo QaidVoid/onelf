@@ -1,0 +1,27 @@
+# Pinned Debian 12 fixture image: base locked by digest, package list
+# spelled out, nothing installed later. The audio matrix compiles the
+# audio fixture against these libraries inside the container, and the
+# image's PipeWire stack is the sound server the matrix cells start.
+# pipewire-pulse is the pulse socket of the desktop sound stack the
+# audio cells start. libasound2-plugins is
+# the pulse plugin the matrix's user configuration names, and binutils'
+# strip strips the packed libraries. Xvfb gives the pinned host a
+# display so a GUI application can be run against its bundle here; the
+# suite itself needs none.
+FROM debian:12@sha256:366a6da5efcceffbaa19c560a101b97b87a1a9664eeeac8bc3d24395ddbf14f3
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        gcc \
+        libc6-dev \
+        libasound2-dev \
+        libasound2-plugins \
+        pkg-config \
+        pipewire \
+        pipewire-alsa \
+        pipewire-bin \
+        pipewire-media-session \
+        pipewire-pulse \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/*

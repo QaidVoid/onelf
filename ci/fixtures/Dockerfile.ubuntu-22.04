@@ -1,0 +1,27 @@
+# Pinned Ubuntu 22.04 fixture image: base locked by digest, package list
+# spelled out, nothing installed later. Jammy ships no pipewire-alsa, so
+# the ALSA route to the server is the pulse plugin through pipewire-pulse,
+# the same path a jammy desktop takes with PulseAudio replaced; the
+# image's /etc/asound.conf is that route spelled out, binutils' strip
+# strips the packed libraries, and the PipeWire stack is the sound
+# server the audio matrix cells start. Xvfb gives the pinned host a
+# display so a GUI application can be run against its bundle here; the
+# suite itself needs none.
+FROM ubuntu:22.04@sha256:45e9ddc6895604674618a409ca9f73d301da8fdb75fe330e8e9a27b3b219e4ad
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        gcc \
+        libc6-dev \
+        libasound2-dev \
+        libasound2-plugins \
+        pkg-config \
+        pipewire \
+        pipewire-bin \
+        pipewire-media-session \
+        pipewire-pulse \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf 'pcm.!default {\n    type pulse\n}\nctl.!default {\n    type pulse\n}\n' \
+        > /etc/asound.conf
