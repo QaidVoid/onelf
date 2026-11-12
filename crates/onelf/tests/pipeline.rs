@@ -27813,6 +27813,453 @@ int main(void) {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A framework nobody describes launches with its inferred
+/// redirections: its compiled-in plugin and data directories are
+/// anchored, a recipe pair overlays a configuration path outside its
+/// prefix, and a synthetic host module tree is admitted through the
+/// loader cache. A compatible module loads by path and by type through
+/// the anchor's view, while a module demanding a glibc version nothing
+/// defines, one built for another machine, and a musl-linked one are
+/// refused, each without its dependencies mapped.
+#[test]
+fn a_descriptor_free_framework_launches_its_host_modules_through_its_anchor() {
+    let td = workdir("synthfw-launch");
+    let td = td.canonicalize().unwrap();
+    let prefix = td.join("dist/usr");
+    let plugins = prefix.join("lib/synthfw/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    write(&prefix.join("share/synthfw/a.conf"), "CONF\n");
+    write(&plugins.join("readme.txt"), "bundled\n");
+    let host_cfg = td.join("synthhost/cfg");
+    write(&host_cfg.join("set.conf"), "HOST\n");
+    let app_cfg = td.join("app/share/synthcfg");
+    write(&app_cfg.join("set.conf"), "BUNDLED\n");
+
+    // The bundled plugin member, compiled for real.
+    write(&td.join("good.c"), "int synth_good(void){return 1;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("good.c").to_str().unwrap()],
+        &plugins.join("libsynth-good.so"),
+    ) {
+        return; // no compiler: documented soft-skip
+    }
+
+    // The framework library compiles in its plugin directory, its data
+    // directory, and a configuration path outside its prefix that only
+    // a recipe pair can answer.
+    write(
+        &td.join("synthfw.c"),
+        &format!(
+            "const char *fw_dirs[] = {{\"{}\", \"{}\"}};\n\
+             const char *cfg_path = \"{}\";\n\
+             int synth_fw(void){{return 0;}}\n",
+            plugins.display(),
+            prefix.join("share/synthfw").display(),
+            host_cfg.display(),
+        ),
+    );
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libsynthfw.so.1",
+            td.join("synthfw.c").to_str().unwrap(),
+        ],
+        &prefix.join("lib/libsynthfw.so.1"),
+    ) {
+        return;
+    }
+
+    // The program enumerates the plugin directory through its
+    // compiled-in spelling, loads a member by path and one by the type
+    // its configuration selects, tries the refused ones by name, and
+    // reads the anchored data directory and the paired configuration.
+    let main_body = r#"#include <dirent.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+static const char *dir = "DIRPLACEHOLDER";
+static const char *conf = "CONFPLACEHOLDER";
+static const char *cfg = "CFGPLACEHOLDER";
+static void try_load(const char *what, const char *name, const char *sym) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    void *h = dlopen(path, RTLD_NOW);
+    if (h) printf("%s=%d\n", what, ((int (*)(void))dlsym(h, sym))());
+    else printf("%s=missing\n", what);
+}
+int main(void) {
+    char path[512];
+    DIR *d = opendir(dir);
+    if (!d) {
+        printf("dir=missing\n");
+    } else {
+        struct dirent *e;
+        while ((e = readdir(d)))
+            if (strstr(e->d_name, ".so")) printf("member=%s\n", e->d_name);
+        closedir(d);
+    }
+    int bytype = -1;
+    d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!strstr(e->d_name, "synth-type")) continue;
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+            void *h = dlopen(path, RTLD_NOW);
+            if (h) bytype = ((int (*)(void))dlsym(h, "synth_type"))();
+            break;
+        }
+        closedir(d);
+    }
+    if (bytype >= 0) printf("bytype=%d\n", bytype);
+    else printf("bytype=missing\n");
+    snprintf(path, sizeof path, "%s/libsynth-type.so", dir);
+    void *t = dlopen(path, RTLD_NOW);
+    if (t) printf("type=%d\n", ((int (*)(void))dlsym(t, "synth_type"))());
+    else printf("type=missing\n");
+    try_load("good", "libsynth-good.so", "synth_good");
+    try_load("greedy", "libsynth-greedy.so", "synth_type");
+    try_load("foreign", "libsynth-foreign.so", "synth_type");
+    try_load("musl", "libsynth-musl.so", "synth_type");
+    FILE *f = fopen(conf, "r");
+    if (f) {
+        char buf[16] = {0};
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        printf("conf=%.*s", (int)n, buf);
+    } else {
+        printf("conf=missing\n");
+    }
+    f = fopen(cfg, "r");
+    if (f) {
+        char buf[16] = {0};
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        printf("cfg=%.*s", (int)n, buf);
+    } else {
+        printf("cfg=missing\n");
+    }
+    return 0;
+}
+"#;
+    write(
+        &td.join("main.c"),
+        &main_body
+            .replace("DIRPLACEHOLDER", &plugins.display().to_string())
+            .replace(
+                "CONFPLACEHOLDER",
+                &prefix.join("share/synthfw/a.conf").display().to_string(),
+            )
+            .replace(
+                "CFGPLACEHOLDER",
+                &host_cfg.join("set.conf").display().to_string(),
+            ),
+    );
+    let app = td.join("app");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    let lib_dir = format!("-L{}", prefix.join("lib").display());
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &lib_dir,
+            // Ubuntu's gcc defaults to `--as-needed`, which would drop
+            // the framework dependency nothing in main calls by name.
+            "-Wl,--no-as-needed",
+            "-l:libsynthfw.so.1",
+            "-ldl",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"synthfw\"\ncommand = \"bin/app\"\nmtime = 0\n\
+             host-libs = \"always\"\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\n\n\
+             [paths]\n\"{}\" = \"share/synthcfg\"\n",
+            prefix.join("lib").display(),
+            host_cfg.display(),
+        ),
+    );
+    let pkg = td.join("synthfw.onelf");
+    let mut c = Command::new(onelf());
+    c.args(["build", "onelf.toml", "-o", pkg.to_str().unwrap()])
+        .current_dir(&app)
+        .env("SOURCE_DATE_EPOCH", "1700000000");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let built = c.output().expect("spawn onelf build");
+    let err = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "{err}");
+    assert!(
+        err.contains("Redirected inferred directories:")
+            && err.contains("lib/synthfw/plugins: anchor ")
+            && err.contains("share/synthfw: anchor "),
+        "{err}"
+    );
+    assert!(app.join(".onelf/anchors").is_file(), "{err}");
+
+    // The host's modules, written after the build, so the package's
+    // copy of the directory lacks them. One is compatible; one demands
+    // a glibc version nothing defines; one is built for another machine
+    // and needs a library nothing supplies; one is musl-linked.
+    write(&td.join("type.c"), "int synth_type(void){return 7;}\n");
+    if !cc_with(
+        &["-shared", "-fPIC", td.join("type.c").to_str().unwrap()],
+        &plugins.join("libsynth-type.so"),
+    ) {
+        return;
+    }
+    // The package's machine, read off a bundled object: the arch check
+    // weighs the synthetic modules against it.
+    let good = std::fs::read(plugins.join("libsynth-good.so")).unwrap();
+    let machine = u16::from_le_bytes([good[18], good[19]]);
+    let foreign_machine: u16 = if cfg!(target_arch = "aarch64") {
+        62
+    } else {
+        183
+    };
+    write_bytes(
+        &plugins.join("libsynth-greedy.so"),
+        &synthetic_module(
+            machine,
+            &["libc.so.6"],
+            &[("libc.so.6", &[(0, "GLIBC_2.99")])],
+        ),
+    );
+    write_bytes(
+        &plugins.join("libsynth-foreign.so"),
+        &synthetic_module(foreign_machine, &["libsynth-dep.so.9"], &[]),
+    );
+    write_bytes(
+        &plugins.join("libsynth-musl.so"),
+        &synthetic_module(machine, &["libc.musl-x86_64.so.1"], &[]),
+    );
+
+    let cache = td.join("ld.so.cache");
+    std::fs::write(&cache, ld_so_cache(&[&prefix.join("lib")])).unwrap();
+    let cache = cache.to_str().unwrap().to_string();
+
+    let launch = |mode: Option<&str>, no_ns: bool| -> (String, String, bool) {
+        let mut run = Command::new(&pkg);
+        run.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_LD_CACHE", &cache);
+        if let Some(mode) = mode {
+            run.env("ONELF_MODE", mode);
+        }
+        if no_ns {
+            run.env("ONELF_FUSE_NO_NAMESPACE", "1");
+        }
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+
+    let mut modes: Vec<Option<&str>> = vec![None, Some("rundir"), Some("cache")];
+    if tmpfs_available() {
+        modes.push(Some("tmpfs"));
+    }
+    if fuse_available() {
+        modes.push(Some("fuse"));
+    }
+    for mode in modes {
+        let (out, err, ok) = launch(mode, false);
+        assert!(ok, "{mode:?}: the launch failed: {err}");
+        for want in [
+            "member=libsynth-good.so",
+            "member=libsynth-type.so",
+            "type=7",
+            "bytype=7",
+            "good=1",
+            "greedy=missing",
+            "foreign=missing",
+            "musl=missing",
+            "conf=CONF",
+        ] {
+            assert!(
+                out.contains(want),
+                "{mode:?}: the report lacks {want}:\n{out}--- stderr:\n{err}"
+            );
+        }
+        for absent in [
+            "member=libsynth-greedy.so",
+            "member=libsynth-foreign.so",
+            "member=libsynth-musl.so",
+            "member=libsynth-dep.so.9",
+        ] {
+            assert!(
+                !out.contains(absent),
+                "{mode:?}: a refused module or its dependency joined the view:\n{out}{err}"
+            );
+        }
+        // The paired configuration answers from the bundle when the
+        // launch can enter a namespace, and from the host with the
+        // message naming it when it cannot.
+        if user_namespaces_available() {
+            assert!(out.contains("cfg=BUNDLED"), "{mode:?}:\n{out}{err}");
+            assert!(
+                !err.contains("stays in the host's user namespace"),
+                "{mode:?}: {err}"
+            );
+        } else {
+            assert!(out.contains("cfg=HOST"), "{mode:?}:\n{out}{err}");
+            assert!(
+                err.contains("stays in the host's user namespace"),
+                "{mode:?}: {err}"
+            );
+        }
+    }
+
+    // Without a namespace the pair stays unredirected and says so once,
+    // while the anchor keeps resolving: it needs only the descriptor.
+    if user_namespaces_available() {
+        let (out, err, ok) = launch(None, true);
+        assert!(ok, "{err}");
+        assert!(
+            out.contains("cfg=HOST")
+                && err.contains("stays in the host's user namespace")
+                && out.contains("conf=CONF"),
+            "{out}{err}"
+        );
+    }
+
+    let mut doctor = Command::new(&pkg);
+    doctor
+        .arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", td.to_str().unwrap())
+        .env("ONELF_LD_CACHE", &cache);
+    isolate(&mut doctor, &td);
+    let report = String::from_utf8_lossy(&run_package(&mut doctor).stdout).into_owned();
+    assert!(report.contains("host-libs: always"), "{report}");
+    assert!(
+        report.contains("host modules admitted (2)")
+            && report.contains("libsynth-type.so")
+            && report.contains("libsynth-good.so"),
+        "{report}"
+    );
+    assert!(report.contains("host modules refused (3)"), "{report}");
+    assert!(
+        report.contains("libsynth-greedy.so") && report.contains("GLIBC_2.99"),
+        "{report}"
+    );
+    assert!(
+        report.contains("libsynth-foreign.so") && report.contains("architecture"),
+        "{report}"
+    );
+    assert!(
+        report.contains("libsynth-musl.so") && report.contains("glibc family"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("libsynth-dep.so.9"),
+        "a refused module's dependency is named as reachable:\n{report}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// Minimal ELF bytes of a synthetic module: `machine` in the header, a
+/// dynamic chain naming `needed`, and a version need table demanding
+/// `requirements`, each entry a dependency file with its `(flags, name)`
+/// versions. The unit-level shape the resolver's tests use, rebuilt here
+/// for launches.
+fn synthetic_module(
+    machine: u16,
+    needed: &[&str],
+    requirements: &[(&str, &[(u16, &str)])],
+) -> Vec<u8> {
+    let ehdr = 64usize;
+    let phentsize = 56usize;
+    let mut strings = vec![0u8];
+    let intern = |strings: &mut Vec<u8>, name: &str| -> u32 {
+        let at = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        at
+    };
+    let mut dynamic: Vec<u8> = Vec::new();
+    let entry = |dynamic: &mut Vec<u8>, tag: u64, value: u64| {
+        dynamic.extend_from_slice(&tag.to_le_bytes());
+        dynamic.extend_from_slice(&value.to_le_bytes());
+    };
+    for name in needed {
+        let off = intern(&mut strings, name);
+        entry(&mut dynamic, 1, u64::from(off)); // DT_NEEDED
+    }
+    let strtab_at = ehdr + 2 * phentsize;
+    entry(&mut dynamic, 5, strtab_at as u64); // DT_STRTAB
+    entry(&mut dynamic, 10, strings.len() as u64); // DT_STRSZ
+    let mut verneed: Vec<u8> = Vec::new();
+    for (i, (file, versions)) in requirements.iter().enumerate() {
+        let start = verneed.len();
+        let size = 16 + 16 * versions.len();
+        verneed.resize(start + size, 0);
+        verneed[start..start + 2].copy_from_slice(&1u16.to_le_bytes());
+        verneed[start + 2..start + 4].copy_from_slice(&(versions.len() as u16).to_le_bytes());
+        verneed[start + 4..start + 8].copy_from_slice(&intern(&mut strings, file).to_le_bytes());
+        verneed[start + 8..start + 12].copy_from_slice(&16u32.to_le_bytes());
+        if i + 1 < requirements.len() {
+            verneed[start + 12..start + 16].copy_from_slice(&(size as u32).to_le_bytes());
+        }
+        for (j, (flags, name)) in versions.iter().enumerate() {
+            let at = start + 16 + j * 16;
+            verneed[at..at + 4]
+                .copy_from_slice(&onelf_format::verdef::elf_hash(name).to_le_bytes());
+            verneed[at + 4..at + 6].copy_from_slice(&flags.to_le_bytes());
+            verneed[at + 6..at + 8].copy_from_slice(&((j + 2) as u16).to_le_bytes());
+            verneed[at + 8..at + 12].copy_from_slice(&intern(&mut strings, name).to_le_bytes());
+            if j + 1 < versions.len() {
+                verneed[at + 12..at + 16].copy_from_slice(&16u32.to_le_bytes());
+            }
+        }
+    }
+    if !requirements.is_empty() {
+        entry(
+            &mut dynamic,
+            0x6fff_fffe,
+            (strtab_at + strings.len()) as u64,
+        ); // DT_VERNEED
+        entry(&mut dynamic, 0x6fff_ffff, requirements.len() as u64); // DT_VERNEEDNUM
+    }
+    entry(&mut dynamic, 0, 0); // DT_NULL
+    let dynamic_at = strtab_at + strings.len() + verneed.len();
+    let len = dynamic_at + dynamic.len();
+    let mut v = vec![0u8; len];
+    v[0..4].copy_from_slice(b"\x7fELF");
+    v[4] = 2;
+    v[5] = 1;
+    v[6] = 1;
+    v[16..18].copy_from_slice(&3u16.to_le_bytes());
+    v[18..20].copy_from_slice(&machine.to_le_bytes());
+    v[32..40].copy_from_slice(&(ehdr as u64).to_le_bytes());
+    v[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes());
+    v[56..58].copy_from_slice(&2u16.to_le_bytes());
+    let phdr = |v: &mut [u8], index: usize, kind: u32, offset: u64, filesz: u64| {
+        let at = ehdr + index * phentsize;
+        v[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        v[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+        v[at + 16..at + 24].copy_from_slice(&offset.to_le_bytes());
+        v[at + 32..at + 40].copy_from_slice(&filesz.to_le_bytes());
+    };
+    phdr(&mut v, 0, 1, 0, len as u64); // PT_LOAD
+    phdr(&mut v, 1, 2, dynamic_at as u64, dynamic.len() as u64); // PT_DYNAMIC
+    v[strtab_at..strtab_at + strings.len()].copy_from_slice(&strings);
+    v[strtab_at + strings.len()..dynamic_at].copy_from_slice(&verneed);
+    v[dynamic_at..dynamic_at + dynamic.len()].copy_from_slice(&dynamic);
+    v
+}
+
 /// Minimal ELF bytes of another machine, enough for collection to refuse
 /// them for their architecture.
 fn foreign_object() -> Vec<u8> {
