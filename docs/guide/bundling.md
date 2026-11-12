@@ -266,43 +266,142 @@ at all, so `--scan-dlopen` is what finds those.
 
 The problem: GStreamer, PipeWire, ALSA, libheif, Tcl, libX11 and
 libmagic load plugins or read data from a directory built into them,
-such as `/usr/lib/gstreamer-1.0` or `/usr/share/alsa`. The runtime
-points each at the bundle's copy through a variable, but only when the
-bundle carries that copy (see
-[Environment](./environment#library-paths)). Without one, the library
-reads the host's directory, whose plugins were built against the host's
-libraries, or finds nothing on a host without the package.
+such as `/usr/lib/gstreamer-1.0` or `/usr/share/alsa`. The bundled
+library carries that host path inside it, and something must make the
+path find the bundle's own copy at launch.
 
-`bundle-libs` looks through every bundled file for the paths of a fixed
-list of such components and reports each one the bundle has no copy
-for as an `unchecked` completeness finding:
+onelf collects those directories for you. The build reads the absolute
+paths compiled into every bundled object and, when a compiled-in path
+is a plugin or data directory that exists on the pack host, carries the
+directory and redirects the path. A library the catalog has no
+descriptor for gets its plugin and data directories bundled anyway, and
+its compiled-in paths answer from the bundle.
+
+What is collected: a candidate must be a normalized absolute path below
+the prefix's `lib` family (including each multiarch directory) or
+`share` directory, and must name an existing directory. Shared roots
+and shared trees are never collected: `share/locale`, `share/icons`,
+`share/fonts`, `share/doc`, `lib/gcc`, `lib/modules`, `lib/firmware`
+and the rest hold many packages' files or the host's own. libc's own
+paths stay with the libc handling, driver stacks keep their own policy,
+and host configuration and system state (`/etc`, `/proc`, `/var`) are
+not candidates. Whatever a descriptor declares is the descriptor's,
+and those directories never appear as inferred findings; the
+descriptor's own finding covers them. Every built-in descriptor holds
+that claim whether enabled or not, so disabling a built-in keeps
+inference out of its directories, and every enabled project-local
+rule holds it too.
+
+A candidate that holds ELF objects is a plugin group, carried whole
+with its layout preserved, because frameworks keep scripts, manifests
+and caches beside their modules. Every ELF object inside passes the
+same architecture and ELF-class checks as a bundled library, with its
+dependencies judged like a library's, so one module
+built for another architecture is skipped with its reason while the
+rest of the directory still ships. Any other candidate is a data
+directory, copied under the prefix it compiles to. Each directory is
+collected once under its canonical path: a link and its target are one
+directory, and one copy answers for every spelling of it.
+
+Each collected directory is redirected by exactly one of three
+mechanisms, chosen when the package is built, in this order:
+
+1. A descriptor's environment mapping (the variables in
+   [Environment](./environment#library-paths)): the library's bytes are
+   left alone and the variable names the bundled copy. Only a lookup
+   that reaches the library through the variable is covered.
+2. An anchor: every occurrence of the compiled-in path in
+   the bundled copies is rewritten to `/dev/fd/77/<key>`, padded with
+   NUL bytes to the original length. At launch the runtime holds
+   descriptor 77 open on a private per-launch directory whose names
+   link to the bundled copies, so the path resolves only inside the
+   launch that holds it and for the processes it starts. No mount
+   namespace is needed, and nothing is created anywhere another user
+   could write. A package that uses anchors needs a runtime
+   advertising `anchors` support, which the packer checks.
+3. A path pair for a namespace overlay, recorded in the package's
+   `.onelf/paths`: for strings too short to rewrite, for a
+   carried-before directory that takes no fresh anchor, and when the
+   destination cannot enter the anchor record. A launch with a private
+   mount namespace binds the bundled copy over the path; a `[paths]`
+   pair from the recipe keeps precedence over an inferred one. A
+   spelling that cannot enter the pair record leaves the path
+   unredirected, and the findings say so.
+
+The completeness findings name every carried inferred directory with
+the object that compiled it in, its classification and its size. A
+build that carries a framework no descriptor describes, and ncurses
+beside it, reads
 
 ```
-  - lib/libasound.so.2: unchecked: reads /usr/lib/alsa-lib from the host unless the bundle carries alsa-lib in a library directory and the runtime sets ALSA_PLUGIN_DIR
-  - lib/libasound.so.2: unchecked: reads /usr/share/alsa from the host unless the bundle carries share/alsa and the runtime sets ALSA_CONFIG_DIR
+  - lib/widgetry-0.2: selected: plugin directory, 43 object(s) and 0 other file(s), 3.9 MB; inferred from /usr/lib/widgetry-0.2 below the prefix /usr, compiled in by libwidgetry.so.0 as /usr/lib/widgetry-0.2
+  - share/terminfo: selected: data directory, 209.9 KB, carried, not redirected yet; inferred from /usr/share/terminfo below the prefix /usr, compiled in by libncursesw.so.6 as /usr/share/terminfo
 ```
 
-- ✅ Copy the directory into the bundle where the line says, and the
-  finding goes away.
-- ✅ Or force-include the plugins by soname
-  (`include = ["libasound_module_pcm_pulse.so"]`): a resolved plugin
-  keeps the directory it was found in (`lib/alsa-lib/`), which is the
-  copy the line asks for, and the finding clears on the next run. The
-  soname alone is not enough to find the file: give the walk a
-  `search-paths` entry pointing at the host's plugin directory, such as
-  `/usr/lib/alsa-lib`.
-- ✅ For the data directories (`share/alsa` and the rest), nothing to
-  do: a bundled library brings its own data from beside it, and the
-  finding clears without a hand-placed copy. It stays when the build
-  host has none to bring.
-- ☑️ Leave it when the app never uses that part of the library, such as
-  an app that links libasound but plays no sound.
-- ⚠️ Only paths stored whole in a library are found. GLib, GTK,
-  gdk-pixbuf and gobject-introspection join theirs at run time, and a
-  compiler may build a short path from pieces, so no warning is no
-  proof. The driver stack, which comes from the host by design, and
-  directories the runtime extends rather than replaces, such as
-  terminfo and locales, are not reported.
+The build then prints a summary of the mechanism it chose for each
+carried directory (`Redirected inferred directories:`, one line per
+directory naming `environment mapping`, `anchor <key>` or `path pair`),
+and `--onelf-doctor` reports what a launch would do with them on the
+host you ask about: the anchor record, which pairs become overlays,
+and which pairs would stay unredirected, with the reason (see
+[Runtime flags](../reference/runtime-flags)).
+
+Inference cannot see a path that no bundled object spells out whole:
+GLib, GTK, gdk-pixbuf and gobject-introspection join theirs at run
+time, and a compiler may build a short path from pieces, so no finding
+is no proof. For those, give the walk a `search-paths` entry and an
+`include` for the plugin by soname, or set the library's own variable
+from the recipe (see
+[Environment](./environment#data-paths-compiled-into-a-library)).
+
+### Host plugin modules
+
+A plugin directory the bundle carries also sees the host's own
+modules. A configuration written by the user or the app can name one
+by absolute host path; an `.asoundrc` with
+`pcm_type.pulse { lib "/usr/lib/..." }` is the common case. The
+launch admits the named module when every object in its dependency
+closure passes the admission checks; among them the object must be
+built for the package's architecture and ELF class, be of no foreign
+libc family, demand only symbol
+versions the copy that would load defines, and need only sonames
+something supplies. The host's counterpart directories
+count as the same plugin directory, which is what makes a multiarch
+host's `/usr/lib/x86_64-linux-gnu/alsa-lib` answer for a bundle that
+carries `/usr/lib/alsa-lib`.
+
+An admitted module is never loaded beside the bundled ones. The launch
+presents the directory as a merged view: bundled members first, then
+every admitted host member whose name the package does not carry, and
+the compiled-in path resolves to that view. `--onelf-doctor` reports
+refused modules with the first object that failed and why. A
+musl-family module is always refused, so on a musl host the bundle
+plays through what it carries.
+
+`host-libs = "never"` (and `ONELF_NO_RESOLVER=1`) admit no host
+module. A module the launch reaches through a redirected directory,
+by name or through a `[paths]` pair bound over its path, then fails
+to load, and the application falls back to what it carries. A
+configuration that names a module's absolute host path is not
+affected: where the directory is redirected by an environment mapping
+or an anchor, that path is not covered, and the host's file is opened
+whatever the policy says. Neither setting stops the bundle from
+carrying its own inferred directories.
+
+### Trimming inferred directories
+
+Inferred directories are carried whole, and a framework's plugin tree
+can be large. A recipe whose build carries a trace, from `trace-run`
+or a `[sysroot]` trace, can add `trim-inferred = true` under
+`[bundle]`: a plugin group then keeps only the members the trace
+loaded, their dependencies, matches of the recipe's keep patterns and
+the targets of kept relative links, and a data directory keeps only
+the files the trace opened, keep-pattern matches and the targets of
+its kept relative links. Without the key nothing is trimmed, including
+in recipes that trace only to add libraries. A dry run of a traced
+host scan trims nothing because it never runs the target; a sysroot
+build trims by its recorded trace even in a dry run. Trimmed
+directories are reported as trace-limited rather than complete.
 
 ## Self-extracting binaries (Bun, etc.)
 
@@ -642,8 +741,12 @@ onelf bundle-libs ./myapp --include libsomething.so.1
 
 `--exclude` skips libraries by prefix, collected plugin group members
 included, so excluding a plugin by name keeps it and its dependencies
-out. Excluding a library that a retained object needs is a conflict
-that stops `onelf build`, since nothing at launch supplies it from the
+out. An exclude prefix also drops an inferred directory when a path
+component below its library dir or `share` begins with it, so
+`--exclude libdecor` leaves out the carried `lib/libdecor/plugins-1`
+group as well as the library, while `libx` leaves `libx32` alone.
+Excluding a library that a retained object needs is a conflict that
+stops `onelf build`, since nothing at launch supplies it from the
 host. `--include` forces a soname into the resolution queue.
 
 ☑️ Some prefixes are always excluded: `libnss_` (apart from the name

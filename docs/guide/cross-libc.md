@@ -134,3 +134,9 @@ is your signal to put a musl-built replacement on the `--search-path`.
   a glibc applies `.onelf/env` as usual, but `.onelf/preload` only when
   something in the bundle links `libdl.so.2`; otherwise it says so on
   stderr and goes on.
+- ☑️ A bundled glibc always carries `libpthread.so.0`, `libdl.so.2`,
+  `librt.so.1`, `libutil.so.1`, `libanl.so.1` and `libresolv.so.2`,
+  whether the application needs them or not. They exist so a host
+  plugin built against an older glibc can still load: such a module
+  names these sonames, and the launch satisfies them from the bundle's
+  copy instead of refusing the plugin.

@@ -215,6 +215,7 @@ trace-args = ["--version"]       # arguments for the traced run
 skip = false                     # no scan or audit: the tree is packed unchecked, with no completeness claim
 rules = ["vendor-framework.toml"]  # Vec<PathBuf>, local descriptor files, relative to the recipe's directory
 disable-rules = ["translations"] # Vec<String>, built-in or local rule identities to switch off
+trim-inferred = true             # with a trace (trace-run or [sysroot] trace), keep only traced members/files of inferred dirs
 ```
 
 `rules` names project-local framework descriptors in the built-in

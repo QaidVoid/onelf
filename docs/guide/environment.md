@@ -339,17 +339,23 @@ takes its place, or the variable stays unset.
 ## Data paths compiled into a library
 
 The problem: the variables above cover the toolkits, but an application
-that hardcodes an absolute data path cannot be helped. The path names the
-host's filesystem, so on a machine that happens to have the same package
-installed the app silently reads the host's copy, and on one that does
-not it fails. The bundled copy goes unused either way.
+that hardcodes an absolute data path cannot be helped by a variable
+alone. Paths below the prefix's `lib` and `share` directories that the
+build can infer are carried and redirected on their own (see
+[Bundling](./bundling#plugin-and-data-paths-compiled-into-a-library)).
+What remains unhelped is a path no bundled object spells out below
+its own `lib` or `share` directories, such as one under `/etc`,
+`/proc` or `/var`, one the build host has no copy of, and a path the
+library joins at run time so that no bundled object spells it out
+whole. The symptom is a package that works on the machine that built
+it and fails in a container with a message about a missing file under
+`/usr`.
 
-The symptom is a package that works on the machine that built it and
-fails in a container with a message about a missing file under `/usr`.
-`libqalculate` reading `/usr/share/qalculate` is one example.
-`bundle-libs` reports the known components whose compiled-in
-directory the bundle carries no copy of; see
-[Bundling](./bundling#plugin-and-data-paths-compiled-into-a-library).
+When the build host has `libqalculate` installed, inference carries
+`/usr/share/qalculate` and the path answers from the bundle. The
+`[env]` route below still applies when the build host has no copy to
+carry, or when you want the app to read a different copy than the
+host's.
 
 - ✅ Test in a container that does not have the app installed.
 - ✅ Where the app offers an environment variable for the directory, set

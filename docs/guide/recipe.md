@@ -267,6 +267,7 @@ Everything `bundle-libs` accepts, as recipe keys.
 | `skip` | bool | `false` | Don't run bundle-libs at all: the tree stands as authored, unchecked. See [Unchecked trees](#unchecked-trees) |
 | `rules` | array | `[]` | Project-local framework descriptor files, relative to the recipe's directory. See [Project-local rules](./bundling#project-local-rules) |
 | `disable-rules` | array | `[]` | Built-in or local rule identities that never activate and whose mappings are not carried |
+| `trim-inferred` | bool | `false` | With a trace (`trace-run` or a `[sysroot]` trace), keep only the traced members and files of inferred plugin groups and data directories. See [Trimming inferred directories](./bundling#trimming-inferred-directories) |
 
 ### `[sysroot]`
 
