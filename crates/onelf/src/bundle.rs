@@ -9546,7 +9546,7 @@ mod catalog_coverage_tests {
         Family {
             name: "alsa",
             descriptors: &["alsa"],
-            plugins: &[("alsa", "plugins", "lib/alsa-lib", Requirement::Optional)],
+            plugins: &[],
             data: &[("alsa", "configuration", "share/alsa", Requirement::Required)],
             helpers: &[],
             paths: &[
@@ -9699,7 +9699,7 @@ mod catalog_coverage_tests {
         Family {
             name: "heif",
             descriptors: &["heif"],
-            plugins: &[("heif", "plugins", "lib/libheif", Requirement::Optional)],
+            plugins: &[],
             data: &[],
             helpers: &[],
             paths: &[(
@@ -9714,10 +9714,7 @@ mod catalog_coverage_tests {
         Family {
             name: "babl-gegl",
             descriptors: &["babl", "gegl"],
-            plugins: &[
-                ("babl", "plugins", "lib/babl-0.1", Requirement::Optional),
-                ("gegl", "plugins", "lib/gegl-0.4", Requirement::Optional),
-            ],
+            plugins: &[],
             data: &[],
             helpers: &[],
             paths: &[
@@ -9762,10 +9759,8 @@ mod catalog_coverage_tests {
         },
         Family {
             name: "qt-gdk-gtk",
-            descriptors: &["qt", "qt5", "qt6", "gdk-pixbuf", "gtk3"],
+            descriptors: &["qt", "gdk-pixbuf", "gtk3"],
             plugins: &[
-                ("qt5", "plugins", "lib/qt5/plugins", Requirement::Optional),
-                ("qt6", "plugins", "lib/qt6/plugins", Requirement::Optional),
                 (
                     "gdk-pixbuf",
                     "loaders",
@@ -9782,12 +9777,7 @@ mod catalog_coverage_tests {
             ],
             runtime_hooks: &[RuntimeHookId::GdkCacheAbsolutise],
             build_hooks: &[],
-            sonames: &[
-                "libQt5Core.so.5",
-                "libQt6Core.so.6",
-                "libgdk_pixbuf-2.0.so.0",
-                "libgtk-3.so.0",
-            ],
+            sonames: &["libgdk_pixbuf-2.0.so.0", "libgtk-3.so.0"],
         },
         Family {
             name: "fontconfig",
@@ -10017,6 +10007,59 @@ mod catalog_coverage_tests {
             .expect("the carried snippet directory is anchored");
         assert!(host < carried, "{patched}");
         let _ = fs::remove_dir_all(&work);
+    }
+
+    /// The frameworks whose libraries assemble their resource
+    /// directories at run time from pieces, so inference never sees a
+    /// compiled-in whole path for them and their descriptors stay:
+    /// GLib, GTK, gdk-pixbuf and GObject introspection.
+    const RUNTIME_ASSEMBLED: &[&str] = &["gio", "gtk3", "gdk-pixbuf", "gi"];
+
+    /// Every resource section a built-in descriptor still declares is
+    /// one inference cannot reproduce: a file, a required group whose
+    /// absence must fail the build, a member allowlist that selects a
+    /// subset, a runtime-assembled framework, or a group hosting one
+    /// of the same descriptor's helpers. A section inference
+    /// reproduces belongs to the fixture-verified reduction, not the
+    /// catalog.
+    #[test]
+    fn every_remaining_resource_section_is_beyond_inference() {
+        for descriptor in catalog::builtins() {
+            let id = descriptor.id.as_str();
+            let assembled = RUNTIME_ASSEMBLED.contains(&id);
+            for (group, kind) in descriptor
+                .resources
+                .plugins
+                .iter()
+                .map(|g| (g, "plugins"))
+                .chain(descriptor.resources.data.iter().map(|g| (g, "data")))
+            {
+                let hosts_helper = descriptor
+                    .resources
+                    .helpers
+                    .iter()
+                    .any(|helper| helper.group == group.id);
+                let beyond = group.kind == ResourceKind::File
+                    || group.requirement == Requirement::Required
+                    || !group.members.is_empty()
+                    || assembled
+                    || hosts_helper;
+                assert!(
+                    beyond,
+                    "{id}/{} {}: inference reproduces this section, so the \
+                     descriptor must not carry it",
+                    kind,
+                    group.id.as_str()
+                );
+            }
+            for helper in &descriptor.resources.helpers {
+                assert!(
+                    helper.kind == ResourceKind::File,
+                    "{id}/{}: a helper is a file, which inference never carries",
+                    helper.id.as_str()
+                );
+            }
+        }
     }
 }
 

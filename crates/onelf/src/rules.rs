@@ -371,7 +371,7 @@ candidates = [{ base = "library-root", path = "vendor-plugins" }]
         let d = dir("records");
         let plain = RuleCatalog::default();
         assert_eq!(plain.runtime_records(&[]).unwrap(), None);
-        let no_runtime = load(&d, &[], &["qt5"]).unwrap();
+        let no_runtime = load(&d, &[], &["tcl-8.6"]).unwrap();
         assert_eq!(no_runtime.runtime_records(&[]).unwrap(), None);
         let silent = VENDOR[..VENDOR.find("[[runtime.paths]]").unwrap()].to_string();
         let discovery_only = load(&d, &[("silent.toml", &silent)], &[]).unwrap();

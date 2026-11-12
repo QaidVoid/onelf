@@ -4,15 +4,6 @@ id = "gegl"
 [[triggers]]
 soname-prefix = "libgegl-0.4.so"
 
-[[resources.plugins]]
-id = "plugins"
-kind = "directory"
-destination = "lib/gegl-0.4"
-requirement = "optional"
-candidates = [
-  { base = "library-dir", path = "gegl-0.4" },
-]
-
 [[runtime.paths]]
 id = "plugins"
 kind = "directory"

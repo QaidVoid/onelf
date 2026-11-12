@@ -11,8 +11,6 @@ heif
 magic
 pipewire
 qt
-qt5
-qt6
 spa
 tcl-8.6
 tcl-9.0

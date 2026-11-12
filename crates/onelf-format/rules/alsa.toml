@@ -4,13 +4,6 @@ id = "alsa"
 [[triggers]]
 soname-prefix = "libasound.so"
 
-[[resources.plugins]]
-id = "plugins"
-kind = "directory"
-destination = "lib/alsa-lib"
-requirement = "optional"
-candidates = [{ base = "library-dir", path = "alsa-lib" }]
-
 [[resources.data]]
 id = "configuration"
 kind = "directory"

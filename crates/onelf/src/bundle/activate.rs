@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].rule, "alsa");
         assert_eq!(report[0].reason, "libasound.so.2");
-        assert_eq!(report[0].groups, vec!["plugins", "configuration"]);
+        assert_eq!(report[0].groups, vec!["configuration"]);
     }
 
     #[test]
@@ -419,7 +419,7 @@ mod tests {
                 WorkItem::Object(_) => panic!("an activation queues no object"),
             }
         }
-        assert_eq!(seen, ["plugins", "configuration"]);
+        assert_eq!(seen, ["configuration"]);
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
             forward, reversed_input,
             "the sorted seed set must fix the queue order"
         );
-        assert_eq!(forward, ["plugins", "configuration", "plugins", "scanner"]);
+        assert_eq!(forward, ["configuration", "plugins", "scanner"]);
     }
 
     #[test]

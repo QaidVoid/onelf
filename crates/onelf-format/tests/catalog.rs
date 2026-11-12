@@ -74,17 +74,11 @@ fn runtime_mapping_golden_retains_variables_alternatives_and_policies() {
 
 #[test]
 fn existing_plugin_subdirectory_table_is_covered_without_flattening() {
-    let expected = [
-        "libheif/plugins",
-        "alsa-lib",
-        "babl-0.1",
-        "gegl-0.4",
-        "gio/modules",
-        "gstreamer-1.0",
-        "libheif",
-        "pipewire-0.3",
-        "spa-0.2",
-    ];
+    // The plugin trees the descriptors still carry, with the group
+    // layouts a distribution installs. The trees the reduced
+    // descriptors gave to inference keep their layouts by the pipeline
+    // fixtures, and their runtime mappings below still name them.
+    let expected = ["gio/modules", "gstreamer-1.0", "pipewire-0.3", "spa-0.2"];
     for subdirectory in expected {
         assert!(
             builtins()
@@ -300,10 +294,6 @@ fn heif_prefers_nested_plugins_for_each_library_root() {
             .iter()
             .all(|candidate| candidate.base == RuntimeBase::LibraryRoot)
     );
-    assert_eq!(
-        descriptor("heif").resources.plugins[0].destination.as_str(),
-        "lib/libheif"
-    );
 }
 
 #[test]
@@ -397,8 +387,6 @@ fn tcl_tk_versions_retain_required_scripts_and_library_prefix_alternatives() {
     for (id, directory) in [
         ("gdk-pixbuf", "lib/gdk-pixbuf-2.0"),
         ("gtk3", "lib/gtk-3.0"),
-        ("qt5", "lib/qt5/plugins"),
-        ("qt6", "lib/qt6/plugins"),
     ] {
         assert_eq!(
             descriptor(id).resources.plugins[0].destination.as_str(),

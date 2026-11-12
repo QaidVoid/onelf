@@ -506,15 +506,15 @@ mod tests {
             std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib");
-        write(&lib.join("libasound.so.2"), &fake_elf(2, 62));
-        write(&lib.join("alsa-lib/pulse.so"), &fake_elf(2, 62));
-        write(&lib.join("alsa-lib/loop.so"), &fake_elf(2, 62));
-        write(&lib.join("alsa-lib/README"), b"notes");
-        let libs = [admitted_lib(&lib.join("libasound.so.2"))];
+        write(&lib.join("libgstreamer-1.0.so.0"), &fake_elf(2, 62));
+        write(&lib.join("gstreamer-1.0/pulse.so"), &fake_elf(2, 62));
+        write(&lib.join("gstreamer-1.0/loop.so"), &fake_elf(2, 62));
+        write(&lib.join("gstreamer-1.0/README"), b"notes");
+        let libs = [admitted_lib(&lib.join("libgstreamer-1.0.so.0"))];
 
         let collection = collect_group(
-            "alsa",
-            &builtin_group("alsa"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),
@@ -522,11 +522,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(collection.search_dirs, vec![lib.join("alsa-lib")]);
+        assert_eq!(collection.search_dirs, vec![lib.join("gstreamer-1.0")]);
         assert_eq!(collection.plugins.len(), 2, "{:?}", collection.plugins);
         assert_eq!(
             collected(&collection, "pulse.so").destination,
-            PathBuf::from("lib/alsa-lib/pulse.so")
+            PathBuf::from("lib/gstreamer-1.0/pulse.so")
         );
         assert!(collection.skipped.is_empty(), "{:?}", collection.skipped);
         let _ = fs::remove_dir_all(&dir);
@@ -541,15 +541,21 @@ mod tests {
             std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib");
-        write(&lib.join("libbabl-0.1.so.0"), &fake_elf(2, 62));
-        write(&lib.join("babl-0.1/x86-64-v2/cmyk.so"), &fake_elf(2, 62));
-        write(&lib.join("babl-0.1/x86-64-v3/cmyk.so"), &fake_elf(2, 62));
-        write(&lib.join("babl-0.1/cmyk.so"), &fake_elf(2, 62));
-        let libs = [admitted_lib(&lib.join("libbabl-0.1.so.0"))];
+        write(&lib.join("libgstreamer-1.0.so.0"), &fake_elf(2, 62));
+        write(
+            &lib.join("gstreamer-1.0/x86-64-v2/cmyk.so"),
+            &fake_elf(2, 62),
+        );
+        write(
+            &lib.join("gstreamer-1.0/x86-64-v3/cmyk.so"),
+            &fake_elf(2, 62),
+        );
+        write(&lib.join("gstreamer-1.0/cmyk.so"), &fake_elf(2, 62));
+        let libs = [admitted_lib(&lib.join("libgstreamer-1.0.so.0"))];
 
         let collection = collect_group(
-            "babl",
-            &builtin_group("babl"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),
@@ -566,16 +572,16 @@ mod tests {
             found,
             vec![
                 (
-                    PathBuf::from("lib/babl-0.1/cmyk.so"),
-                    lib.join("babl-0.1/cmyk.so")
+                    PathBuf::from("lib/gstreamer-1.0/cmyk.so"),
+                    lib.join("gstreamer-1.0/cmyk.so")
                 ),
                 (
-                    PathBuf::from("lib/babl-0.1/x86-64-v2/cmyk.so"),
-                    lib.join("babl-0.1/x86-64-v2/cmyk.so")
+                    PathBuf::from("lib/gstreamer-1.0/x86-64-v2/cmyk.so"),
+                    lib.join("gstreamer-1.0/x86-64-v2/cmyk.so")
                 ),
                 (
-                    PathBuf::from("lib/babl-0.1/x86-64-v3/cmyk.so"),
-                    lib.join("babl-0.1/x86-64-v3/cmyk.so")
+                    PathBuf::from("lib/gstreamer-1.0/x86-64-v3/cmyk.so"),
+                    lib.join("gstreamer-1.0/x86-64-v3/cmyk.so")
                 ),
             ]
         );
@@ -595,22 +601,25 @@ mod tests {
         let outside = dir.join("outside/libasound_module_pcm_far.so");
         write(&lib.join("libasound.so.2"), &fake_elf(2, 62));
         write(
-            &lib.join("alsa-lib/libasound_module_pcm_pulse.so"),
+            &lib.join("gstreamer-1.0/libasound_module_pcm_pulse.so"),
             &fake_elf(2, 62),
         );
         write(&outside, &fake_elf(2, 62));
         std::os::unix::fs::symlink(
             "libasound_module_pcm_pulse.so",
-            lib.join("alsa-lib/libasound_module_pcm_alias.so"),
+            lib.join("gstreamer-1.0/libasound_module_pcm_alias.so"),
         )
         .unwrap();
-        std::os::unix::fs::symlink(&outside, lib.join("alsa-lib/libasound_module_pcm_far.so"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            lib.join("gstreamer-1.0/libasound_module_pcm_far.so"),
+        )
+        .unwrap();
         let libs = [admitted_lib(&lib.join("libasound.so.2"))];
 
         let collection = collect_group(
-            "alsa",
-            &builtin_group("alsa"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),
@@ -620,11 +629,11 @@ mod tests {
         let alias = collected(&collection, "libasound_module_pcm_alias.so");
         assert_eq!(
             alias.destination,
-            PathBuf::from("lib/alsa-lib/libasound_module_pcm_alias.so")
+            PathBuf::from("lib/gstreamer-1.0/libasound_module_pcm_alias.so")
         );
         assert_eq!(
             alias.resolved,
-            lib.join("alsa-lib/libasound_module_pcm_pulse.so")
+            lib.join("gstreamer-1.0/libasound_module_pcm_pulse.so")
         );
         assert!(
             !collection
@@ -643,14 +652,14 @@ mod tests {
             std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib/x86_64-linux-gnu");
-        write(&lib.join("libheif.so.1"), &fake_elf(2, 62));
-        write(&lib.join("libheif/plugins/x264.so"), &fake_elf(2, 62));
-        write(&lib.join("libheif/deep/a/avif.so"), &fake_elf(2, 62));
-        let libs = [admitted_lib(&lib.join("libheif.so.1"))];
+        write(&lib.join("gstreamer-1.0.so.1"), &fake_elf(2, 62));
+        write(&lib.join("gstreamer-1.0/plugins/x264.so"), &fake_elf(2, 62));
+        write(&lib.join("gstreamer-1.0/deep/a/avif.so"), &fake_elf(2, 62));
+        let libs = [admitted_lib(&lib.join("gstreamer-1.0.so.1"))];
 
         let collection = collect_group(
-            "heif",
-            &builtin_group("heif"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),
@@ -660,12 +669,12 @@ mod tests {
 
         assert_eq!(
             collected(&collection, "x264.so").destination,
-            PathBuf::from("lib/libheif/plugins/x264.so"),
+            PathBuf::from("lib/gstreamer-1.0/plugins/x264.so"),
             "the nested layout a distribution ships is kept"
         );
         assert_eq!(
             collected(&collection, "avif.so").destination,
-            PathBuf::from("lib/libheif/deep/a/avif.so")
+            PathBuf::from("lib/gstreamer-1.0/deep/a/avif.so")
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -765,16 +774,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib");
         write(&lib.join("libasound.so.2"), &fake_elf(2, 62));
-        write(&lib.join("alsa-lib/arm.so"), &fake_elf(2, 183));
+        write(&lib.join("gstreamer-1.0/arm.so"), &fake_elf(2, 183));
         let libs = [admitted_lib(&lib.join("libasound.so.2"))];
-        let mut required = builtin_group("alsa");
+        let mut required = builtin_group("gstreamer");
         required.requirement = Requirement::Required;
 
-        let err = collect_group("alsa", &required, &libs, None, Some(2), Some(62))
+        let err = collect_group("gstreamer", &required, &libs, None, Some(2), Some(62))
             .expect_err("a required group with only an incompatible member fails");
         assert!(
             err.to_string()
-                .contains("rule alsa group plugins is required but no usable plugin"),
+                .contains("rule gstreamer group plugins is required but no usable plugin"),
             "{err}"
         );
         assert!(
@@ -782,8 +791,8 @@ mod tests {
             "the refusal names the incompatible member: {err}"
         );
 
-        fs::remove_dir_all(lib.join("alsa-lib")).unwrap();
-        let err = collect_group("alsa", &required, &libs, None, Some(2), Some(62))
+        fs::remove_dir_all(lib.join("gstreamer-1.0")).unwrap();
+        let err = collect_group("gstreamer", &required, &libs, None, Some(2), Some(62))
             .expect_err("a required group with no directory fails");
         assert!(
             err.to_string().contains("absent"),
@@ -798,12 +807,12 @@ mod tests {
             std::env::temp_dir().join(format!("onelf-gather-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         let lib = dir.join("usr/lib");
-        write(&lib.join("libbabl-0.1.so.0"), &fake_elf(2, 62));
-        let libs = [admitted_lib(&lib.join("libbabl-0.1.so.0"))];
+        write(&lib.join("libgstreamer-1.0.so.0"), &fake_elf(2, 62));
+        let libs = [admitted_lib(&lib.join("libgstreamer-1.0.so.0"))];
 
         let collection = collect_group(
-            "babl",
-            &builtin_group("babl"),
+            "gstreamer",
+            &builtin_group("gstreamer"),
             &libs,
             None,
             Some(2),

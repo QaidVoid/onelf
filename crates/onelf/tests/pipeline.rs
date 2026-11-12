@@ -1276,11 +1276,13 @@ fn a_framework_soname_dependency_activates_its_rule_without_includes() {
 
 /// One activated framework group's fixture: the sonames the app names,
 /// the group directories of a fake distribution tree with the plugin
-/// files each holds (which may name subdirectories), and the rules whose
-/// collection the report must name.
+/// files each holds (which may name subdirectories), and the report
+/// lines the collection must print. A described group prints its
+/// `plugin(s) for` collection line; a tree inference now carries prints
+/// its findings line, named by the destination it arrives at.
 /// One fixture: a tag, the framework sonames the app names, each
-/// group directory with its plugins, and the rules whose collection
-/// the report must name.
+/// group directory with its plugins, and the report lines the
+/// collection must print.
 type PluginGroupFixture<'a> = (
     &'a str,
     &'a [&'a str],
@@ -1299,7 +1301,7 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
                 "libasound_module_ctl_oss.so",
             ],
         )],
-        &["alsa"],
+        &["lib/alsa-lib: selected: plugin directory"],
     ),
     (
         "gstreamer",
@@ -1308,7 +1310,7 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
             "gstreamer-1.0",
             &["libgstcoreelements.so", "libgsttypefindfunctions.so"],
         )],
-        &["gstreamer"],
+        &["plugin(s) for gstreamer/"],
     ),
     (
         "pipewire-spa",
@@ -1323,19 +1325,19 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
                 ],
             ),
         ],
-        &["pipewire", "spa"],
+        &["plugin(s) for pipewire/", "plugin(s) for spa/"],
     ),
     (
         "gio",
         &["libgio-2.0.so.0"],
         &[("gio/modules", &["libgiognutls.so", "libgiolibproxy.so"])],
-        &["gio"],
+        &["plugin(s) for gio/"],
     ),
     (
         "heif",
         &["libheif.so.1"],
         &[("libheif", &["libheif-x264.so", "plugins/libheif-avif.so"])],
-        &["heif"],
+        &["lib/libheif: selected: plugin directory"],
     ),
     (
         "babl-gegl",
@@ -1344,7 +1346,10 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
             ("babl-0.1", &["libbabl-cmyk.so"]),
             ("gegl-0.4", &["gegl-brightness.so"]),
         ],
-        &["babl", "gegl"],
+        &[
+            "lib/babl-0.1: selected: plugin directory",
+            "lib/gegl-0.4: selected: plugin directory",
+        ],
     ),
     (
         "qt6",
@@ -1353,27 +1358,61 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
             "qt6/plugins",
             &["platforms/libqsix.so", "styles/libqsty.so"],
         )],
-        &["qt6"],
+        &["lib/qt6/plugins: selected: plugin directory"],
     ),
     (
         "qt5",
         &["libQt5Core.so.5"],
         &[("qt5/plugins", &["platforms/libqminimal.so"])],
-        &["qt5"],
+        &["lib/qt5/plugins: selected: plugin directory"],
     ),
     (
         "gdk-pixbuf",
         &["libgdk_pixbuf-2.0.so.0"],
         &[("gdk-pixbuf-2.0", &["2.10.0/loaders/libpixbuf-png.so"])],
-        &["gdk-pixbuf"],
+        &["plugin(s) for gdk-pixbuf/"],
     ),
     (
         "gtk3",
         &["libgtk-3.so.0"],
         &[("gtk-3.0", &["printbackends/libprintbackend-file.so"])],
-        &["gtk3"],
+        &["plugin(s) for gtk3/"],
     ),
 ];
+
+/// The compiled-in resource directories the fixture framework
+/// libraries carry, the way the real libraries compile them in: whole
+/// absolute paths, so inference sees them too. GLib, GTK, gdk-pixbuf
+/// and GObject introspection assemble theirs at run time from pieces,
+/// so their libraries plant none, and their descriptors stay.
+const COMPILED_IN_DIRS: &[(&str, &[&str])] = &[
+    ("libasound.so.2", &["lib/alsa-lib", "share/alsa"]),
+    ("libbabl-0.1.so.0", &["lib/babl-0.1"]),
+    ("libgegl-0.4.so.0", &["lib/gegl-0.4"]),
+    ("libheif.so.1", &["lib/libheif"]),
+    ("libQt5Core.so.5", &["lib/qt5/plugins"]),
+    ("libQt6Core.so.6", &["lib/qt6/plugins"]),
+];
+
+/// The C prefix that compiles one fixture framework library's
+/// directories in: a `framework_dirs` array of quoted absolute paths,
+/// or nothing for a library that assembles its directories at run
+/// time.
+fn compiled_in_c(soname: &str, usr: &Path) -> String {
+    match COMPILED_IN_DIRS.iter().find(|(name, _)| *name == soname) {
+        Some((_, dirs)) => {
+            let spelled: Vec<String> = dirs
+                .iter()
+                .map(|dir| format!("\"{}\"", usr.join(dir).display()))
+                .collect();
+            format!(
+                "const char *framework_dirs[] = {{{}}};\n",
+                spelled.join(", ")
+            )
+        }
+        None => String::new(),
+    }
+}
 
 /// Compile the shared objects of a fake distribution tree: the framework
 /// libraries and every plugin file their group directories hold, laid
@@ -1384,18 +1423,8 @@ fn plugin_tree_sources(td: &Path, sonames: &[&str], groups: &[(&str, &[&str])]) 
     let libdir = td.join("dist/usr/lib");
     std::fs::create_dir_all(&libdir).unwrap();
     for soname in sonames {
-        // libasound names its plugin and configuration directories the
-        // way a distribution's build does, so inference sees them too.
-        let compiled = if *soname == "libasound.so.2" {
-            let usr = td.canonicalize().unwrap().join("dist/usr");
-            format!(
-                "const char *alsa_dirs[] = {{\"{}\", \"{}\"}};\n",
-                usr.join("lib/alsa-lib").display(),
-                usr.join("share/alsa").display()
-            )
-        } else {
-            String::new()
-        };
+        let usr = td.canonicalize().unwrap().join("dist/usr");
+        let compiled = compiled_in_c(soname, &usr);
         write(
             &td.join("dist/framework.c"),
             &format!("{compiled}int framework(void){{return 1;}}\n"),
@@ -1522,13 +1551,18 @@ fn nested_same_named_and_symlinked_members_all_arrive() {
             .exists(),
         "the module alias arrives:\n{err}"
     );
-    // The described groups name their host counterparts: each group's
-    // candidate is a library-directory base, so its declared path is
-    // the spelling, and the record lists them sorted with no compiled-in
-    // absolutes, which a described group never has.
+    // The record names every carried plugin directory's host
+    // counterpart: a described group spells its declaration, an
+    // inferred one adds the compiled-in absolute it was found by.
+    let usr = td.canonicalize().unwrap().join("dist/usr");
     assert_eq!(
         std::fs::read(app.join(".onelf/plugin-dirs")).unwrap(),
-        b"lib/alsa-lib\talsa-lib\nlib/babl-0.1\tbabl-0.1".to_vec(),
+        format!(
+            "lib/alsa-lib\talsa-lib\t{}\nlib/babl-0.1\tbabl-0.1\t{}",
+            usr.join("lib/alsa-lib").display(),
+            usr.join("lib/babl-0.1").display()
+        )
+        .into_bytes(),
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&td);
@@ -1540,9 +1574,12 @@ fn nested_same_named_and_symlinked_members_all_arrive() {
 /// only holds the framework's own directory, and the packaged tree
 /// carries every plugin the group directories hold, laid out as the
 /// source laid them out, never flattened into the library directory.
+/// The report names each collection: a described group by its
+/// `plugin(s) for` line, a tree inference carries by its findings
+/// line.
 #[test]
 fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
-    for (tag, sonames, groups, rules) in PLUGIN_GROUP_FIXTURES {
+    for (tag, sonames, groups, findings) in PLUGIN_GROUP_FIXTURES {
         let td = workdir(&format!("plugingroup-{tag}"));
         let Some(libdir) = plugin_tree_sources(&td, sonames, groups) else {
             return;
@@ -1575,10 +1612,10 @@ fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
                 );
             }
         }
-        for rule in *rules {
+        for line in *findings {
             assert!(
-                err.contains(&format!("plugin(s) for {rule}/")),
-                "{tag}: the report must name {rule}'s collection:\n{err}"
+                err.contains(line),
+                "{tag}: the report must name the collection {line:?}:\n{err}"
             );
         }
     }
@@ -2056,37 +2093,32 @@ fn foreign_plugin_bytes(machine: u16) -> Vec<u8> {
 #[test]
 fn incompatible_plugins_are_skipped_without_shadowing_valid_ones() {
     let td = workdir("pluginincompatible");
-    let groups = [("alsa-lib", &["libasound_module_pcm_pulse.so"] as &[&str])];
-    let Some(libdir) = plugin_tree_sources(&td, &["libasound.so.2"], &groups) else {
+    let groups = [("gstreamer-1.0", &["libgstcoreelements.so"] as &[&str])];
+    let Some(libdir) = plugin_tree_sources(&td, &["libgstreamer-1.0.so.0"], &groups) else {
         return;
     };
     write_bytes(
-        &libdir
-            .join("alsa-lib")
-            .join("libasound_module_pcm_foreign.so"),
+        &libdir.join("gstreamer-1.0").join("libgstforeign.so"),
         &foreign_plugin_bytes(183),
     );
     write(
-        &libdir.join("alsa-lib").join("libasound_module_pcm_junk.so"),
+        &libdir.join("gstreamer-1.0").join("libgstjunk.so"),
         "this is not an ELF object\n",
     );
 
-    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libasound.so.2"], &libdir) else {
+    let Some((app, out)) = bundle_with_plugin_tree(&td, &["libgstreamer-1.0.so.0"], &libdir) else {
         return;
     };
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "bundle-libs failed:\n{err}");
     assert!(
-        app.join("lib/alsa-lib/libasound_module_pcm_pulse.so")
+        app.join("lib/gstreamer-1.0/libgstcoreelements.so")
             .is_file(),
         "the compatible plugin is collected:\n{err}"
     );
-    for refused in [
-        "libasound_module_pcm_foreign.so",
-        "libasound_module_pcm_junk.so",
-    ] {
+    for refused in ["libgstforeign.so", "libgstjunk.so"] {
         assert!(
-            !app.join("lib/alsa-lib").join(refused).exists(),
+            !app.join("lib/gstreamer-1.0").join(refused).exists(),
             "{refused} must not be copied into the group layout"
         );
         assert!(
@@ -2095,11 +2127,11 @@ fn incompatible_plugins_are_skipped_without_shadowing_valid_ones() {
         );
     }
     assert!(
-        err.contains("libasound_module_pcm_foreign.so") && err.contains("machine 183"),
+        err.contains("libgstforeign.so") && err.contains("machine 183"),
         "the foreign-architecture refusal names the file and the reason:\n{err}"
     );
     assert!(
-        err.contains("libasound_module_pcm_junk.so") && err.contains("not an ELF object"),
+        err.contains("libgstjunk.so") && err.contains("not an ELF object"),
         "the non-ELF refusal names the file and the reason:\n{err}"
     );
 }
@@ -2129,12 +2161,35 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
     ) {
         return;
     }
+    write(&td.join("gstreamer.c"), "int gst_probe(void){return 1;}\n");
+    if !cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libgstreamer-1.0.so.0",
+            td.join("gstreamer.c").to_str().unwrap(),
+        ],
+        &rootfs.join("usr/lib/libgstreamer-1.0.so.0"),
+    ) {
+        return;
+    }
+    // The scanner the rule requires ships at its libexec alternative,
+    // beside no plugin directory at all.
+    std::fs::create_dir_all(rootfs.join("usr/libexec/gstreamer-1.0")).unwrap();
+    write(&td.join("scanner.c"), "int main(void){return 0;}\n");
+    if !cc_with(
+        &[td.join("scanner.c").to_str().unwrap()],
+        &rootfs.join("usr/libexec/gstreamer-1.0/gst-plugin-scanner"),
+    ) {
+        return;
+    }
     write(&td.join("main.c"), "int main(void){return 0;}\n");
     if !cc_with(
         &[
             td.join("main.c").to_str().unwrap(),
             &format!("-L{}", rootfs.join("usr/lib").display()),
             "-l:libasound.so.2",
+            "-l:libgstreamer-1.0.so.0",
         ],
         &rootfs.join("usr/bin/app"),
     ) {
@@ -2159,8 +2214,9 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
         &["usr/lib/libc.so.6", "usr/lib/ld-linux-x86-64.so.2"],
     );
     // The ALSA library with its required configuration but without its
-    // plugin directory: the data group has its declared location, the
-    // plugin group has nowhere to look inside the sysroot.
+    // plugin directory: the data group has its declared location, and
+    // the gstreamer library ships without its plugin directory at all,
+    // so its plugin group has nowhere to look inside the sysroot.
     std::fs::create_dir_all(rootfs.join("usr/share/alsa")).unwrap();
     write(&rootfs.join("usr/share/alsa/alsa.conf"), "conf\n");
     write_pacman_entry(
@@ -2173,9 +2229,20 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
     );
     write_pacman_entry(
         &rootfs,
+        "gstreamer",
+        "1.0-1",
+        &["glibc"],
+        &[],
+        &[
+            "usr/lib/libgstreamer-1.0.so.0",
+            "usr/libexec/gstreamer-1.0/gst-plugin-scanner",
+        ],
+    );
+    write_pacman_entry(
+        &rootfs,
         "app",
         "1.0-1",
-        &["glibc", "alsa-lib"],
+        &["glibc", "alsa-lib", "gstreamer"],
         &[],
         &["usr/bin/app"],
     );
@@ -2214,7 +2281,11 @@ fn an_optional_group_the_source_lacks_is_an_omission_not_a_failure() {
         "the required data group is still carried from the sysroot:\n{err}"
     );
     assert!(
-        err.lines().any(|l| l.starts_with("  - alsa: ")
+        !appdir.join("lib/gstreamer-1.0").exists(),
+        "no group directory is invented:\n{err}"
+    );
+    assert!(
+        err.lines().any(|l| l.starts_with("  - gstreamer: ")
             && l.contains(": optional omission: group ")
             && l.contains("no usable plugin group")),
         "the omission names the rule and group:\n{err}"
@@ -3039,19 +3110,19 @@ const PT_DYNAMIC: u32 = 2;
 /// report lines and never a failure. `libpipewire-0.3.so.0` matches two
 /// rules at once and `libspa-0.2.so.0` reaches the already-activated
 /// `spa` group again, which is the deduplication the fixture exists to
-/// show.
+/// show. The reduced descriptors queue no groups: inference carries
+/// the babl, gegl and heif plugin trees, and the Qt descriptors are
+/// gone.
 const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
-    ("libbabl-0.1.so.0", "babl", 1, 1),
+    ("libbabl-0.1.so.0", "babl", 0, 0),
     ("libfontconfig.so.1", "fontconfig", 0, 0),
     ("libgdk_pixbuf-2.0.so.0", "gdk-pixbuf", 1, 1),
-    ("libgegl-0.4.so.0", "gegl", 1, 1),
+    ("libgegl-0.4.so.0", "gegl", 0, 0),
     ("libgio-2.0.so.0", "gio", 1, 1),
     ("libgirepository-1.0.so.1", "gi", 1, 1),
     ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
-    ("libheif.so.1", "heif", 1, 1),
+    ("libheif.so.1", "heif", 0, 0),
     ("libpipewire-0.3.so.0", "pipewire", 2, 2),
-    ("libQt5Core.so.5", "qt5", 1, 1),
-    ("libQt6Core.so.6", "qt6", 1, 1),
     ("libspa-0.2.so.0", "spa", 1, 1),
 ];
 
@@ -3356,13 +3427,13 @@ fn traced_counts(cmd: &mut Command, log: &Path) -> SyscallCounts {
 }
 
 /// A hundred-object scale fixture with the catalog sonames in play
-/// activates all thirteen rules and queues their thirteen groups, and
-/// deduplicates what two sonames reach: the `spa` group is processed
-/// once though both pipewire spellings match its rule and reach it, and
-/// the library both rules name is copied once. Two independent builds
-/// of the same fixture render byte-identical reports and pack
-/// byte-identical packages, and every object enters the report exactly
-/// once.
+/// activates all ten remaining triggered rules and queues their eight
+/// groups, and deduplicates what two sonames reach: the `spa` group is
+/// processed once though both pipewire spellings match its rule and
+/// reach it, and the library both rules name is copied once. Two
+/// independent builds of the same fixture render byte-identical reports
+/// and pack byte-identical packages, and every object enters the report
+/// exactly once.
 #[test]
 fn a_hundred_object_fixture_activates_rules_deduplicates_groups_and_reproduces_itself() {
     let td = workdir("scale100");
@@ -3885,6 +3956,12 @@ fn all_families_dist(td: &Path) -> Option<(PathBuf, PathBuf)> {
         "libxkbcommon.so.0",
     ];
     for soname in sonames {
+        let usr = td.canonicalize().unwrap().join("dist/usr");
+        let compiled = compiled_in_c(soname, &usr);
+        write(
+            &dist.join("framework.c"),
+            &format!("{compiled}int framework(void){{return 1;}}\n"),
+        );
         if !cc_with(
             &[
                 "-shared",
@@ -3969,12 +4046,15 @@ fn all_families_dist(td: &Path) -> Option<(PathBuf, PathBuf)> {
 
 /// The catalog coverage matrix: one bundling walk over a minimal
 /// fixture holding every framework family. Every family's activation
-/// fires, its plugin groups arrive complete at their declared
-/// destinations with the source layout preserved, its required data
-/// lands where the runtime mappings look, the required gstreamer
-/// scanner helper reaches its `libexec` destination, and the ALSA
-/// configuration patch anchors the carried snippets between the host's
-/// and the user's.
+/// fires, the plugin groups the descriptors still carry arrive complete
+/// at their declared destinations with the source layout preserved,
+/// and the plugin trees the deleted or reduced descriptors used to
+/// carry arrive at the same places through inference, named by their
+/// findings. Every plugin keeps its place, never flattened into the
+/// library directory; the required data lands where the runtime
+/// mappings look; the required gstreamer scanner helper reaches its
+/// `libexec` destination; and the ALSA configuration patch anchors the
+/// carried snippets between the host's and the user's.
 #[test]
 fn every_framework_family_arrives_complete_from_one_catalog_walk() {
     let td = workdir("familymatrix");
@@ -4016,11 +4096,11 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
             "{soname} is bundled:\n{err}"
         );
     }
-    // Every activated rule is reported: nineteen distinct rules over the
-    // twenty sonames, since the runtime-only translations rule has no
-    // build trigger.
+    // Every activated rule is reported: seventeen distinct rules over
+    // the twenty sonames. libintl activates no rule, and inference
+    // carries the Qt plugin trees the deleted Qt descriptors used to.
     assert!(
-        err.contains("Rules:") && err.contains("19 activated by soname prefix"),
+        err.contains("Rules:") && err.contains("17 activated by soname prefix"),
         "every family's rule activates:\n{err}"
     );
 
@@ -4056,23 +4136,29 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
             "{rule}: {plugin} is not flattened into lib/"
         );
     }
-    for rule in [
-        "alsa",
-        "gstreamer",
-        "pipewire",
-        "spa",
-        "gio",
-        "heif",
-        "babl",
-        "gegl",
-        "qt5",
-        "qt6",
-        "gdk-pixbuf",
-        "gtk3",
-    ] {
+    // The groups the descriptors still carry name their collections;
+    // the plugin trees inference carries are named by their findings,
+    // one per directory, with the library that compiles it in.
+    for rule in ["gstreamer", "pipewire", "spa", "gio", "gdk-pixbuf", "gtk3"] {
         assert!(
             err.contains(&format!("plugin(s) for {rule}/")),
             "the report names {rule}'s collection:\n{err}"
+        );
+    }
+    for (directory, library) in [
+        ("lib/alsa-lib", "libasound.so.2"),
+        ("lib/babl-0.1", "libbabl-0.1.so.0"),
+        ("lib/gegl-0.4", "libgegl-0.4.so.0"),
+        ("lib/libheif", "libheif.so.1"),
+        ("lib/qt5/plugins", "libQt5Core.so.5"),
+        ("lib/qt6/plugins", "libQt6Core.so.6"),
+    ] {
+        assert!(
+            err.lines().any(|l| l
+                .contains(&format!("  - {directory}: selected: plugin directory"))
+                && l.contains("inferred from")
+                && l.contains(&format!("compiled in by {library}"))),
+            "the report names the inferred tree at {directory}:\n{err}"
         );
     }
 
@@ -26792,6 +26878,8 @@ int main(void) {
     show("VENDOR_PLUGIN_DIR");
     show("ALSA_PLUGIN_DIR");
     show("ALSA_CONFIG_DIR");
+    show("GST_PLUGIN_SYSTEM_PATH_1_0");
+    show("GST_PLUGIN_SCANNER");
     const char *dir = getenv("VENDOR_PLUGIN_DIR");
     if (dir) {
         char path[4096];
@@ -26937,21 +27025,25 @@ fn an_excluded_plugin_member_is_left_out_of_its_group() {
 }
 
 /// `disable-rules` keeps a built-in rule from activating: its plugin
-/// group and required data stay uncollected and its mapping is absent
-/// at launch, while the same fixture without the disable collects and
-/// maps both.
+/// group, required helper and mappings stay uncollected and absent at
+/// launch, while the same fixture without the disable collects and
+/// maps them.
 #[test]
 fn disabling_a_builtin_rule_leaves_its_group_and_mapping_out() {
     for disabled in [false, true] {
-        let td = workdir(if disabled { "alsa-off" } else { "alsa-on" });
+        let td = workdir(if disabled {
+            "gstreamer-off"
+        } else {
+            "gstreamer-on"
+        });
         let Some(lib) = plugin_tree_sources(
             &td,
-            &["libasound.so.2"],
-            &[("alsa-lib", &["libasound_module_pcm_probe.so"])],
+            &["libgstreamer-1.0.so.0"],
+            &[("gstreamer-1.0", &["libgstcoreelements.so"])],
         ) else {
             return;
         };
-        let Some(app) = mapping_probe_app(&td, &lib, &["libasound.so.2"]) else {
+        let Some(app) = mapping_probe_app(&td, &lib, &["libgstreamer-1.0.so.0"]) else {
             return;
         };
         write(
@@ -26961,7 +27053,7 @@ fn disabling_a_builtin_rule_leaves_its_group_and_mapping_out() {
                  [bundle]\nsearch-paths = [\"{}\"]\n{}",
                 lib.display(),
                 if disabled {
-                    "disable-rules = [\"alsa\"]\n"
+                    "disable-rules = [\"gstreamer\"]\n"
                 } else {
                     ""
                 }
@@ -26978,34 +27070,34 @@ fn disabling_a_builtin_rule_leaves_its_group_and_mapping_out() {
             "{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let plugin = app.join("lib/alsa-lib/libasound_module_pcm_probe.so");
+        let plugin = app.join("lib/gstreamer-1.0/libgstcoreelements.so");
         let listing = run_onelf(&["list", pkg.to_str().unwrap()], None);
         let carried = String::from_utf8_lossy(&listing.stdout).contains(".onelf/runtime-rules");
         if disabled {
-            assert!(!err.contains("Rule alsa activated"), "{err}");
+            assert!(!err.contains("Rule gstreamer activated"), "{err}");
             assert!(
-                !plugin.exists() && !app.join("share/alsa").exists(),
+                !plugin.exists() && !app.join("libexec/gstreamer-1.0").exists(),
                 "{err}"
             );
             assert_eq!(
-                probe_line(&stdout, "ALSA_PLUGIN_DIR"),
+                probe_line(&stdout, "GST_PLUGIN_SYSTEM_PATH_1_0"),
                 "(unset)",
                 "{stdout}"
             );
             assert_eq!(
-                probe_line(&stdout, "ALSA_CONFIG_DIR"),
+                probe_line(&stdout, "GST_PLUGIN_SCANNER"),
                 "(unset)",
                 "{stdout}"
             );
             assert!(carried, "the disable is carried to the launch");
         } else {
             assert!(
-                err.contains("Rule alsa activated by libasound.so.2"),
+                err.contains("Rule gstreamer activated by libgstreamer-1.0.so.0"),
                 "{err}"
             );
             assert!(plugin.is_file(), "{err}");
             assert!(
-                probe_line(&stdout, "ALSA_PLUGIN_DIR").ends_with("/lib/alsa-lib"),
+                probe_line(&stdout, "GST_PLUGIN_SYSTEM_PATH_1_0").ends_with("/lib/gstreamer-1.0"),
                 "{stdout}"
             );
             assert!(!carried, "the built-ins alone carry no record");
@@ -27244,7 +27336,7 @@ fn rule_declarations_that_change_no_mapping_pack_identically() {
     };
     let Some(quiet) = build(
         "rules-quiet",
-        "rules = [\"../rules/local.toml\"]\ndisable-rules = [\"qt5\"]\n",
+        "rules = [\"../rules/local.toml\"]\ndisable-rules = [\"tcl-8.6\"]\n",
         Some(discovery_only),
     ) else {
         return;

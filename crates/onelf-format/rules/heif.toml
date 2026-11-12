@@ -4,13 +4,6 @@ id = "heif"
 [[triggers]]
 soname-prefix = "libheif.so"
 
-[[resources.plugins]]
-id = "plugins"
-kind = "directory"
-destination = "lib/libheif"
-requirement = "optional"
-candidates = [{ base = "library-dir", path = "libheif" }]
-
 [[runtime.paths]]
 id = "plugins"
 kind = "directory"
