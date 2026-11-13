@@ -9722,7 +9722,10 @@ mod catalog_coverage_tests {
         Family {
             name: "babl-gegl",
             descriptors: &["babl", "gegl"],
-            plugins: &[],
+            plugins: &[
+                ("babl", "plugins", "lib/babl-0.1", Requirement::Optional),
+                ("gegl", "plugins", "lib/gegl-0.4", Requirement::Optional),
+            ],
             data: &[],
             helpers: &[],
             paths: &[
@@ -9767,8 +9770,10 @@ mod catalog_coverage_tests {
         },
         Family {
             name: "qt-gdk-gtk",
-            descriptors: &["qt", "gdk-pixbuf", "gtk3"],
+            descriptors: &["qt", "qt5", "qt6", "gdk-pixbuf", "gtk3"],
             plugins: &[
+                ("qt5", "plugins", "lib/qt5/plugins", Requirement::Optional),
+                ("qt6", "plugins", "lib/qt6/plugins", Requirement::Optional),
                 (
                     "gdk-pixbuf",
                     "loaders",
@@ -9785,7 +9790,12 @@ mod catalog_coverage_tests {
             ],
             runtime_hooks: &[RuntimeHookId::GdkCacheAbsolutise],
             build_hooks: &[],
-            sonames: &["libgdk_pixbuf-2.0.so.0", "libgtk-3.so.0"],
+            sonames: &[
+                "libQt5Core.so.5",
+                "libQt6Core.so.6",
+                "libgdk_pixbuf-2.0.so.0",
+                "libgtk-3.so.0",
+            ],
         },
         Family {
             name: "fontconfig",
@@ -10017,11 +10027,21 @@ mod catalog_coverage_tests {
         let _ = fs::remove_dir_all(&work);
     }
 
-    /// The frameworks whose libraries assemble their resource
-    /// directories at run time from pieces, so inference never sees a
-    /// compiled-in whole path for them and their descriptors stay:
-    /// GLib, GTK, gdk-pixbuf and GObject introspection.
-    const RUNTIME_ASSEMBLED: &[&str] = &["gio", "gtk3", "gdk-pixbuf", "gi"];
+    /// The frameworks whose libraries never compile in the whole path of
+    /// their resource directories, so inference cannot see them and their
+    /// descriptors stay: GLib, GTK, gdk-pixbuf, GObject introspection,
+    /// babl and gegl assemble theirs at run time from pieces, and Qt
+    /// compiles only paths relative to its install prefix.
+    const RUNTIME_ASSEMBLED: &[&str] = &[
+        "gio",
+        "gtk3",
+        "gdk-pixbuf",
+        "gi",
+        "babl",
+        "gegl",
+        "qt5",
+        "qt6",
+    ];
 
     /// Every resource section a built-in descriptor still declares is
     /// one inference cannot reproduce: a file, a required group whose

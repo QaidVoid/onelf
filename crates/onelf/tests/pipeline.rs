@@ -1346,10 +1346,7 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
             ("babl-0.1", &["libbabl-cmyk.so"]),
             ("gegl-0.4", &["gegl-brightness.so"]),
         ],
-        &[
-            "lib/babl-0.1: selected: plugin directory",
-            "lib/gegl-0.4: selected: plugin directory",
-        ],
+        &["plugin(s) for babl/", "plugin(s) for gegl/"],
     ),
     (
         "qt6",
@@ -1358,13 +1355,13 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
             "qt6/plugins",
             &["platforms/libqsix.so", "styles/libqsty.so"],
         )],
-        &["lib/qt6/plugins: selected: plugin directory"],
+        &["plugin(s) for qt6/"],
     ),
     (
         "qt5",
         &["libQt5Core.so.5"],
         &[("qt5/plugins", &["platforms/libqminimal.so"])],
-        &["lib/qt5/plugins: selected: plugin directory"],
+        &["plugin(s) for qt5/"],
     ),
     (
         "gdk-pixbuf",
@@ -1382,16 +1379,14 @@ const PLUGIN_GROUP_FIXTURES: &[PluginGroupFixture] = &[
 
 /// The compiled-in resource directories the fixture framework
 /// libraries carry, the way the real libraries compile them in: whole
-/// absolute paths, so inference sees them too. GLib, GTK, gdk-pixbuf
-/// and GObject introspection assemble theirs at run time from pieces,
-/// so their libraries plant none, and their descriptors stay.
+/// absolute paths, so inference sees them too. GLib, GTK, gdk-pixbuf,
+/// GObject introspection, babl and gegl assemble theirs at run time
+/// from pieces and Qt compiles only prefix-relative ones, so their
+/// libraries plant none, and their descriptors stay.
 const COMPILED_IN_DIRS: &[(&str, &[&str])] = &[
     ("libasound.so.2", &["lib/alsa-lib", "share/alsa"]),
-    ("libbabl-0.1.so.0", &["lib/babl-0.1"]),
-    ("libgegl-0.4.so.0", &["lib/gegl-0.4"]),
+    ("libgstreamer-1.0.so.0", &["lib/gstreamer-1.0"]),
     ("libheif.so.1", &["lib/libheif"]),
-    ("libQt5Core.so.5", &["lib/qt5/plugins"]),
-    ("libQt6Core.so.6", &["lib/qt6/plugins"]),
 ];
 
 /// The C prefix that compiles one fixture framework library's
@@ -1558,9 +1553,8 @@ fn nested_same_named_and_symlinked_members_all_arrive() {
     assert_eq!(
         std::fs::read(app.join(".onelf/plugin-dirs")).unwrap(),
         format!(
-            "lib/alsa-lib\talsa-lib\t{}\nlib/babl-0.1\tbabl-0.1\t{}",
+            "lib/alsa-lib\talsa-lib\t{}\nlib/babl-0.1\tbabl-0.1",
             usr.join("lib/alsa-lib").display(),
-            usr.join("lib/babl-0.1").display()
         )
         .into_bytes(),
         "{err}"
@@ -3110,19 +3104,20 @@ const PT_DYNAMIC: u32 = 2;
 /// report lines and never a failure. `libpipewire-0.3.so.0` matches two
 /// rules at once and `libspa-0.2.so.0` reaches the already-activated
 /// `spa` group again, which is the deduplication the fixture exists to
-/// show. The reduced descriptors queue no groups: inference carries
-/// the babl, gegl and heif plugin trees, and the Qt descriptors are
-/// gone.
+/// show. The reduced heif descriptor queues no group: inference
+/// carries its plugin tree.
 const SCALE_RULE_SONAMES: &[(&str, &str, usize, usize)] = &[
-    ("libbabl-0.1.so.0", "babl", 0, 0),
+    ("libbabl-0.1.so.0", "babl", 1, 1),
     ("libfontconfig.so.1", "fontconfig", 0, 0),
     ("libgdk_pixbuf-2.0.so.0", "gdk-pixbuf", 1, 1),
-    ("libgegl-0.4.so.0", "gegl", 0, 0),
+    ("libgegl-0.4.so.0", "gegl", 1, 1),
     ("libgio-2.0.so.0", "gio", 1, 1),
     ("libgirepository-1.0.so.1", "gi", 1, 1),
     ("libgstreamer-1.0.so.0", "gstreamer", 2, 1),
     ("libheif.so.1", "heif", 0, 0),
     ("libpipewire-0.3.so.0", "pipewire", 3, 3),
+    ("libQt5Core.so.5", "qt5", 1, 1),
+    ("libQt6Core.so.6", "qt6", 1, 1),
     ("libspa-0.2.so.0", "spa", 1, 1),
 ];
 
@@ -3427,8 +3422,8 @@ fn traced_counts(cmd: &mut Command, log: &Path) -> SyscallCounts {
 }
 
 /// A hundred-object scale fixture with the catalog sonames in play
-/// activates all ten remaining triggered rules and queues their eight
-/// groups, and deduplicates what two sonames reach: the `spa` group is
+/// activates every triggered rule and queues their groups, and
+/// deduplicates what two sonames reach: the `spa` group is
 /// processed once though both pipewire spellings match its rule and
 /// reach it, and the library both rules name is copied once. Two
 /// independent builds of the same fixture render byte-identical reports
@@ -4048,7 +4043,7 @@ fn all_families_dist(td: &Path) -> Option<(PathBuf, PathBuf)> {
 /// fixture holding every framework family. Every family's activation
 /// fires, the plugin groups the descriptors still carry arrive complete
 /// at their declared destinations with the source layout preserved,
-/// and the plugin trees the deleted or reduced descriptors used to
+/// and the plugin trees the reduced descriptors used to
 /// carry arrive at the same places through inference, named by their
 /// findings. Every plugin keeps its place, never flattened into the
 /// library directory; the required data lands where the runtime
@@ -4096,11 +4091,10 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
             "{soname} is bundled:\n{err}"
         );
     }
-    // Every activated rule is reported: seventeen distinct rules over
-    // the twenty sonames. libintl activates no rule, and inference
-    // carries the Qt plugin trees the deleted Qt descriptors used to.
+    // Every activated rule is reported: nineteen distinct rules over
+    // the twenty sonames, since libintl activates no rule.
     assert!(
-        err.contains("Rules:") && err.contains("17 activated by soname prefix"),
+        err.contains("Rules:") && err.contains("19 activated by soname prefix"),
         "every family's rule activates:\n{err}"
     );
 
@@ -4139,7 +4133,18 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
     // The groups the descriptors still carry name their collections;
     // the plugin trees inference carries are named by their findings,
     // one per directory, with the library that compiles it in.
-    for rule in ["gstreamer", "pipewire", "spa", "gio", "gdk-pixbuf", "gtk3"] {
+    for rule in [
+        "gstreamer",
+        "pipewire",
+        "spa",
+        "gio",
+        "babl",
+        "gegl",
+        "qt5",
+        "qt6",
+        "gdk-pixbuf",
+        "gtk3",
+    ] {
         assert!(
             err.contains(&format!("plugin(s) for {rule}/")),
             "the report names {rule}'s collection:\n{err}"
@@ -4147,11 +4152,7 @@ fn every_framework_family_arrives_complete_from_one_catalog_walk() {
     }
     for (directory, library) in [
         ("lib/alsa-lib", "libasound.so.2"),
-        ("lib/babl-0.1", "libbabl-0.1.so.0"),
-        ("lib/gegl-0.4", "libgegl-0.4.so.0"),
         ("lib/libheif", "libheif.so.1"),
-        ("lib/qt5/plugins", "libQt5Core.so.5"),
-        ("lib/qt6/plugins", "libQt6Core.so.6"),
     ] {
         assert!(
             err.lines().any(|l| l

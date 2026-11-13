@@ -31,13 +31,16 @@ shared-roots = [
 # dropped. PAM modules and policy, udev rules, kernel modules, a host JDK
 # and a Go toolchain must come from the host.
 shared-trees = [
+  { base = "lib-dirs", path = "binfmt.d" },
   { base = "lib-dirs", path = "debug" },
+  { base = "lib-dirs", path = "environment.d" },
   { base = "lib-dirs", path = "firmware" },
   { base = "lib-dirs", path = "gcc" },
   { base = "lib-dirs", path = "go" },
   { base = "lib-dirs", path = "jvm" },
   { base = "lib-dirs", path = "modprobe.d" },
   { base = "lib-dirs", path = "modules" },
+  { base = "lib-dirs", path = "modules-load.d" },
   { base = "lib-dirs", path = "pam.d" },
   { base = "lib-dirs", path = "security" },
   { base = "lib-dirs", path = "sysctl.d" },
@@ -47,6 +50,7 @@ shared-trees = [
   { base = "lib-dirs", path = "udev" },
   { base = "installation-prefix", path = "share/applications" },
   { base = "installation-prefix", path = "share/doc" },
+  { base = "installation-prefix", path = "share/factory" },
   { base = "installation-prefix", path = "share/fonts" },
   { base = "installation-prefix", path = "share/icons" },
   { base = "installation-prefix", path = "share/info" },

@@ -4,6 +4,15 @@ id = "babl"
 [[triggers]]
 soname-prefix = "libbabl-0.1.so"
 
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/babl-0.1"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "babl-0.1" },
+]
+
 [[runtime.paths]]
 id = "plugins"
 kind = "directory"

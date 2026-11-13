@@ -1,0 +1,14 @@
+schema = 1
+id = "qt6"
+
+[[triggers]]
+soname-prefix = "libQt6Core.so"
+
+[[resources.plugins]]
+id = "plugins"
+kind = "directory"
+destination = "lib/qt6/plugins"
+requirement = "optional"
+candidates = [
+  { base = "library-dir", path = "qt6/plugins" },
+]
