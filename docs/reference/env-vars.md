@@ -14,6 +14,7 @@ Reference for all environment variables onelf reads or sets.
 | `ONELF_ENTRYPOINT` | Resolved entrypoint name |
 | `ONELF_ENTRYPOINT_EXPORTED` | The same name, so a package the app launches ignores an inherited `ONELF_ENTRYPOINT` when it selects its own entrypoint |
 | `ONELF_LAUNCH_DIR` | Original cwd at launch time |
+| `ONELF_ANCHOR_DIR` | Set only for a package that anchors directories: the private per-launch directory descriptor 77 is open on. A bundled program started with that descriptor closed reopens it from here before its own code runs |
 
 `onelf run` sets `ONELF_DIR` (the AppDir), `ONELF_ACTIVE_MODE=dev`,
 `ONELF_ARGV0`, `ONELF_EXEC`, `ONELF_ENTRYPOINT` and

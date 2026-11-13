@@ -27,12 +27,19 @@ packed without one prints its name alone.
 The report covers:
 
 - **Host**: whether user namespaces are usable and which mount helper
-  would be used, if any.
+  would be used, if any. A helper `FUSERMOUNT_PROG` names is named by
+  the variable, never by its value.
 - **Metadata**: the payload records the package carries, the runtime
   support they require (`payload metadata version 1, selection-view`
   for a package with a selection table), what this runtime itself
   advertises, and whether the requirement is satisfied. Each anchored
-  directory is named as `anchor /dev/fd/77/<key> -> <directory>`. Each
+  directory is named as `anchor /dev/fd/77/<key> -> <directory>`, and
+  each environment mapping of the package's runtime rules as
+  `mapped <variables> -> <candidates>`, a candidate under every library
+  directory shown as `<library dir>/<path>`, and one that applies only
+  with a selected set followed by `(with the set <name>)`. A package
+  without a rules record runs with the built-in mappings, which are not
+  listed. Each
   pair of the paths record is named as `overlay <absolute> ->
   <relative>` when a launch here would bind it, or as
   `unredirected <absolute> -> <relative> (<why>)` when it would not:
@@ -49,9 +56,12 @@ The report covers:
 - **Libraries**: the `host-libs` policy, whether the GL stack is bundled,
   from the host or missing, any pinned GL build and whether it is
   stored, and the resolver's verdict for every library it compares: the
-  bundled copy, the host's newer one, or incomparable. Libraries only
-  the host has are listed together. The host loader and the link farm
-  are named when the host's glibc or any host library would be used.
+  bundled copy, the host's newer one, or incomparable. Each library
+  only the host has, and each member of the host libc's family that
+  follows a winning host libc, is named with its host path. The host
+  loader and the link farm are named when the host's glibc or any host
+  library would be used, and so are the host plugin modules admitted
+  and refused, each refusal with the object that failed and why.
 - **Dependency sets**: each pinned set and whether it is stored. The
   entrypoint's selection is named, including the legacy default when
   the package carries no selection record: every declared set.

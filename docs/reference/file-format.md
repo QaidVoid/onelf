@@ -307,30 +307,40 @@ whether the two agree; see
 ## Anchor record
 
 A library built to open an absolute directory can have that string
-rewritten in its bundled copy to `/dev/fd/77/<key>`, padded with NUL
-bytes to the original length. `.onelf/anchors` names the bundle
-directory each key stands for, one `KEY<tab>RELATIVE` line per anchor,
-separated by `\n`, with no trailing newline. The directories are listed
-in byte order, each once, and the keys are `a` to `z`, then `aa`, `ab`
-and so on, in line order, so the same directories always give the same
-record. A directory follows the rules of `.onelf/paths`: relative,
-normalized, inside the package, and free of control characters. A
-record holds at most 1024 anchors in at most 256 KiB, and a reader
-refuses anything else as a whole. Packing also refuses an empty record,
-and one naming anything but a directory of the package reached without
-passing through one of its symlinks.
+rewritten in its bundled copy: the first 11 bytes of every string that
+is the directory's path, or starts with it followed by `/`, become
+`/dev/fd/77/`, and the rest is kept, unless another carried
+directory or a recipe pair sends the string somewhere else. The
+string keeps its length, and the key is the kept tail with any
+leading `/` removed, so `/usr/share/alsa` becomes `/dev/fd/77/alsa`
+with the key `alsa`.
+`.onelf/anchors` names the bundle directory each key stands for, one
+`KEY<tab>RELATIVE` line per anchor, separated by `\n`, with no trailing
+newline. The keys are listed in byte order, each once, and no key lies
+below another one, since a path below a key already resolves through
+that key's link. A key may span several components. Keys and
+directories follow the rules of `.onelf/paths` for a bundle path:
+relative, normalized, inside the package, and free of control
+characters. A record holds at most 1024 anchors in at most 256 KiB, and
+a reader refuses anything else as a whole. Packing also refuses an
+empty record, and one naming anything but a directory of the package
+reached without passing through one of its symlinks.
 
 Before the entrypoint runs, the runtime makes a directory of its own in
 the private runtime directory, links each key in it to the bundle
-directory, and leaves descriptor 77 open on it, without close-on-exec,
-in every mode that runs from a package tree. `/dev/fd/77` names the
+directory, creating the leading components of a multi-component key as
+plain directories, and leaves descriptor 77 open on it, without
+close-on-exec, in every mode that runs from a package tree. It also
+names that directory in `ONELF_ANCHOR_DIR`. `/dev/fd/77` names the
 process's own descriptor, so another process or user cannot create or
 replace what an anchored path resolves to, and no namespace is needed.
 The application's children inherit the descriptor. A descriptor 77 the
-launch was started with is replaced, and a process that closes it, or a
-child started without it, finds nothing at the anchored paths. A package
-with anchors never runs from a memfd, which keeps no tree for them to
-name.
+launch was started with is replaced. A bundled program started without
+the descriptor reopens it from `ONELF_ANCHOR_DIR` before its own code
+runs, while a host program started that way, or any process started
+with a cleared environment, finds nothing at the anchored paths. A
+package with anchors never runs from a memfd, which keeps no tree for
+them to name.
 
 ## Format compatibility
 

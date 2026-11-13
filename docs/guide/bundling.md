@@ -310,41 +310,82 @@ mechanisms, chosen when the package is built, in this order:
    [Environment](./environment#library-paths)): the library's bytes are
    left alone and the variable names the bundled copy. Only a lookup
    that reaches the library through the variable is covered.
-2. An anchor: every occurrence of the compiled-in path in
-   the bundled copies is rewritten to `/dev/fd/77/<key>`, padded with
-   NUL bytes to the original length. At launch the runtime holds
-   descriptor 77 open on a private per-launch directory whose names
-   link to the bundled copies, so the path resolves only inside the
-   launch that holds it and for the processes it starts. No mount
-   namespace is needed, and nothing is created anywhere another user
-   could write. A package that uses anchors needs a runtime
-   advertising `anchors` support, which the packer checks.
+2. An anchor: every string in the bundled copies that is the compiled-in
+   path, or starts with it followed by `/`, has its first 11 bytes
+   overwritten with `/dev/fd/77/`. The rest of the string is kept, so
+   `/usr/share/alsa` becomes `/dev/fd/77/alsa` and
+   `/usr/share/alsa/alsa.conf` becomes `/dev/fd/77/alsa/alsa.conf`. The
+   string keeps its length, a file named below the directory is covered
+   too, and a shorter string the linker stored inside the original keeps
+   its bytes. A path below the directory that another carried directory
+   or a recipe `[paths]` pair sends somewhere else keeps its bytes
+   instead, for that answer. A recipe pair that sends the compiled-in
+   path itself to another bundle directory owns it: an inferred
+   directory whose every compiled-in path a recipe pair sends elsewhere
+   is not carried, and its finding names the pair. A tree rebuilt in
+   place keeps the bytes and the anchors its earlier build made, so a
+   recipe pair added later over an anchored path applies only to a fresh
+   tree, and the build says so. The key is the kept tail (`alsa` here).
+   At launch the runtime holds descriptor 77 open on a private
+   per-launch directory whose keys link to the bundled copies, so the
+   path resolves only inside the launch that holds it and for the
+   processes it starts. No mount namespace is needed, and nothing is
+   created anywhere another user could write. A package that uses
+   anchors needs a runtime advertising `anchors` support, which the
+   packer checks. Strip runs before the rewrite, so the rewritten bytes
+   are the ones packed. A bundled program started with every inherited
+   descriptor closed, as Python's `subprocess`, GLib's spawn functions
+   and Chromium's launcher do, reopens descriptor 77 from
+   `ONELF_ANCHOR_DIR` before its own code runs. A host program started
+   that way, or one started with a cleared environment, finds nothing at
+   an anchored path.
 3. A path pair for a namespace overlay, recorded in the package's
-   `.onelf/paths`: for strings too short to rewrite, for a
-   carried-before directory that takes no fresh anchor, and when the
-   destination cannot enter the anchor record. A launch with a private
-   mount namespace binds the bundled copy over the path; a `[paths]`
-   pair from the recipe keeps precedence over an inferred one. A
-   spelling that cannot enter the pair record leaves the path
-   unredirected, and the findings say so.
+   `.onelf/paths`, for every compiled-in path of a directory that
+   cannot take an anchor: one of its paths has 11 bytes or fewer, which
+   leaves no key, another directory already takes one of its keys, a
+   recipe pair sends one of its paths elsewhere, or the anchor record
+   is full. A tree built once keeps the keys its record names while a
+   carried directory or a tree object still uses them, and a path a
+   rebuild newly finds for an anchored directory takes a pair of its
+   own when it cannot take a key. A key whose directory the tree lost
+   is held back for the build that loses it. An anchored path the
+   tree's objects still carry that the record no longer explains is
+   reported in the build that finds it, with what it now resolves to
+   or that nothing serves it, and a fresh tree clears it.
+   A launch with a private mount namespace binds the bundled copy over
+   the path; a `[paths]` pair from the recipe keeps precedence over an
+   inferred one. A spelling that cannot enter the pair record leaves
+   the path unredirected, and the findings say so. Running
+   `bundle-libs` and `pack` as separate steps keeps the inferred pairs:
+   the build leaves them in the tree's `.onelf/inferred-paths`, which
+   the pack merges into `.onelf/paths` and does not ship.
 
 The completeness findings name every carried inferred directory with
-the object that compiled it in, its classification and its size. A
-build that carries a framework no descriptor describes, and ncurses
-beside it, reads
+the object that compiled it in, its classification, its size and how
+it is redirected. A build that carries a framework no descriptor
+describes, and ncurses beside it, reads
 
 ```
-  - lib/widgetry-0.2: selected: plugin directory, 43 object(s) and 0 other file(s), 3.9 MB; inferred from /usr/lib/widgetry-0.2 below the prefix /usr, compiled in by libwidgetry.so.0 as /usr/lib/widgetry-0.2
-  - share/terminfo: selected: data directory, 209.9 KB, carried, not redirected yet; inferred from /usr/share/terminfo below the prefix /usr, compiled in by libncursesw.so.6 as /usr/share/terminfo
+  - lib/widgetry-0.2: selected: plugin directory, 43 object(s) and 0 other file(s), 3.9 MB, redirected through /dev/fd/77/dgetry-0.2; inferred from /usr/lib/widgetry-0.2 below the prefix /usr, compiled in by libwidgetry.so.0 as /usr/lib/widgetry-0.2
+  - share/terminfo: selected: data directory, 209.9 KB, carried, redirected through /dev/fd/77/terminfo; inferred from /usr/share/terminfo below the prefix /usr, compiled in by libncursesw.so.6 as /usr/share/terminfo
 ```
 
 The build then prints a summary of the mechanism it chose for each
 carried directory (`Redirected inferred directories:`, one line per
-directory naming `environment mapping`, `anchor <key>` or `path pair`),
+directory naming `environment mapping`, `anchor /dev/fd/77/<key>` or
+`path pair`),
 and `--onelf-doctor` reports what a launch would do with them on the
 host you ask about: the anchor record, which pairs become overlays,
 and which pairs would stay unredirected, with the reason (see
 [Runtime flags](../reference/runtime-flags)).
+
+A compiled-in path of a component the catalog knows, which neither its
+descriptor nor inference answered, stays an `unchecked` completeness
+finding naming what the bundle would have to carry:
+
+```
+  - lib/libasound.so.2: unchecked: reads /usr/share/alsa from the host unless the bundle carries share/alsa and the runtime sets ALSA_CONFIG_DIR
+```
 
 Inference cannot see a path that no bundled object spells out whole:
 GLib, GTK, gdk-pixbuf and gobject-introspection join theirs at run
@@ -363,12 +404,18 @@ by absolute host path; an `.asoundrc` with
 launch admits the named module when every object in its dependency
 closure passes the admission checks; among them the object must be
 built for the package's architecture and ELF class, be of no foreign
-libc family, demand only symbol
-versions the copy that would load defines, and need only sonames
-something supplies. The host's counterpart directories
-count as the same plugin directory, which is what makes a multiarch
-host's `/usr/lib/x86_64-linux-gnu/alsa-lib` answer for a bundle that
-carries `/usr/lib/alsa-lib`.
+libc family, demand only symbol versions the copy that would load
+defines, and need only sonames something supplies. The module and its
+directory, with links resolved, and every directory above them must
+also be owned by root or the user running the package and be writable
+by no one else, a sticky directory excepted, so another user cannot
+plant a module the launch would admit. The module's dependencies come
+through the loader cache, as host driver libraries do. On a host
+without a loader cache, a musl one say, the default library
+directories stand in for the ones a cache would name. The host's
+counterpart directories count as the same plugin directory, which is
+what makes a multiarch host's `/usr/lib/x86_64-linux-gnu/alsa-lib`
+answer for a bundle that carries `/usr/lib/alsa-lib`.
 
 An admitted module is never loaded beside the bundled ones. The launch
 presents the directory as a merged view: bundled members first, then
@@ -385,7 +432,8 @@ to load, and the application falls back to what it carries. A
 configuration that names a module's absolute host path is not
 affected: where the directory is redirected by an environment mapping
 or an anchor, that path is not covered, and the host's file is opened
-whatever the policy says. Neither setting stops the bundle from
+whatever the policy says, with whatever its own run path reaches. No
+admission check applies to it. Neither setting stops the bundle from
 carrying its own inferred directories.
 
 ### Trimming inferred directories
@@ -397,11 +445,17 @@ or a `[sysroot]` trace, can add `trim-inferred = true` under
 loaded, their dependencies, matches of the recipe's keep patterns and
 the targets of kept relative links, and a data directory keeps only
 the files the trace opened, keep-pattern matches and the targets of
-its kept relative links. Without the key nothing is trimmed, including
-in recipes that trace only to add libraries. A dry run of a traced
-host scan trims nothing because it never runs the target; a sysroot
-build trims by its recorded trace even in a dry run. Trimmed
-directories are reported as trace-limited rather than complete.
+its kept relative links. A traced run of a glibc target records only
+the objects the loader maps, so there only plugin objects are trimmed
+and data is carried whole; a traced run of a musl target and a sysroot
+trace record every file opened. Without the key nothing is trimmed,
+including in recipes that trace only to add libraries, and the key
+without a trace that applies fails the build. A `[sysroot]` build
+trims by its recorded trace, even in a dry run, and refuses
+`trace-run` outside one, since the run would be against this machine;
+a dry run of a traced host scan trims nothing because it never runs
+the target. Trimmed directories are reported as trace-limited rather
+than complete.
 
 ## Self-extracting binaries (Bun, etc.)
 
