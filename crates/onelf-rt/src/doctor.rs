@@ -17,7 +17,8 @@ use std::path::Path;
 use onelf_format::elf::{self, RuntimeNote, RuntimeRequirements};
 use onelf_format::paths::PathPair;
 use onelf_format::resolve::{self, Gl, Request};
-use onelf_format::runtime_metadata::EntrypointSets;
+use onelf_format::rules::RuntimeBase;
+use onelf_format::runtime_metadata::{EntrypointSets, RuntimeRuleMetadata};
 use onelf_format::verdef::Choice;
 use onelf_format::{HostLibsPolicy, drivers};
 
@@ -38,6 +39,17 @@ fn plain(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
+}
+
+/// How the report names the mount helper: its path when a lookup
+/// found it, and only the variable when `FUSERMOUNT_PROG` named it,
+/// since that value is the environment's.
+fn helper_text(helper: &Path) -> String {
+    if std::env::var_os("FUSERMOUNT_PROG").is_some_and(|p| !p.is_empty()) {
+        "the helper FUSERMOUNT_PROG names".to_string()
+    } else {
+        plain(&helper.display().to_string())
+    }
 }
 
 /// Why a launch's pairs would be left unredirected, in the order the
@@ -188,10 +200,7 @@ fn modes(
         match (why_not_ns, &helper) {
             (None, _) => Ok(("mounted in a private user namespace".to_string(), true)),
             (Some(why), Some(helper)) => Ok((
-                format!(
-                    "mounted through {} ({why})",
-                    plain(&helper.display().to_string())
-                ),
+                format!("mounted through {} ({why})", helper_text(helper)),
                 false,
             )),
             (Some(why), None) => Err(format!("{why}, and there is no mount helper")),
@@ -311,7 +320,7 @@ pub(crate) fn report(pkg: &mut PackageData, ep_idx: usize) -> String {
     match mount::helper() {
         Some(helper) => line(
             &mut out,
-            &format!("  mount helper: {}", plain(&helper.display().to_string())),
+            &format!("  mount helper: {}", helper_text(&helper)),
         ),
         None => line(
             &mut out,
@@ -478,6 +487,45 @@ fn metadata_section(
         }
         Some(Err(why)) => line(out, &format!("  anchor record: unreadable: {why}")),
         _ => {}
+    }
+    match rules.as_deref().map(RuntimeRuleMetadata::decode) {
+        Some(Ok(record)) => {
+            // A library-root candidate is looked up under each library
+            // directory, and a set-bound record applies only when the
+            // entrypoint selects its set.
+            let mut shown: Vec<String> = Vec::new();
+            for rule in &record.rules {
+                for group in &rule.runtime.paths {
+                    let variables: Vec<&str> = group.variables.iter().map(|v| v.as_str()).collect();
+                    let candidates: Vec<String> = group
+                        .candidates
+                        .iter()
+                        .map(|c| match c.base {
+                            RuntimeBase::PackageRoot => c.path.as_str().to_string(),
+                            RuntimeBase::LibraryRoot => {
+                                format!("<library dir>/{}", c.path.as_str())
+                            }
+                        })
+                        .collect();
+                    let set = rule
+                        .binding
+                        .as_ref()
+                        .map(|pin| format!(" (with the set {})", plain(pin.name.as_str())))
+                        .unwrap_or_default();
+                    let text = format!(
+                        "  mapped {} -> {}{set}",
+                        variables.join(", "),
+                        candidates.join(", ")
+                    );
+                    if !shown.contains(&text) {
+                        line(out, &text);
+                        shown.push(text);
+                    }
+                }
+            }
+        }
+        Some(Err(why)) => line(out, &format!("  runtime rules: unreadable: {why}")),
+        None => {}
     }
     let carried_paths = paths.is_some();
     match paths {
@@ -755,7 +803,6 @@ fn verdicts(
         uid: rustix::process::getuid().as_raw(),
         trust: None,
     });
-    let mut host_only: Vec<String> = Vec::new();
     for (name, choice) in &decision.compared {
         let host = decision
             .winners
@@ -763,7 +810,11 @@ fn verdicts(
             .map(|p| plain(&p.display().to_string()));
         let name = plain(name);
         match (choice, host) {
-            (None, _) => host_only.push(name),
+            (None, Some(host)) => line(
+                out,
+                &format!("  {name}: from the host, not bundled, {host}"),
+            ),
+            (None, None) => line(out, &format!("  {name}: from the host, not bundled")),
             (Some(Choice::Host), Some(host)) => {
                 line(out, &format!("  {name}: the host's is newer, {host}"))
             }
@@ -774,13 +825,22 @@ fn verdicts(
             }
         }
     }
-    if !host_only.is_empty() {
+    // The host libc's own family follows it without a comparison of
+    // its own, and is named all the same.
+    for (name, path) in &decision.winners {
+        if decision
+            .compared
+            .iter()
+            .any(|(compared, _)| compared == name)
+        {
+            continue;
+        }
         line(
             out,
             &format!(
-                "  from the host, not bundled ({}): {}",
-                host_only.len(),
-                host_only.join(", ")
+                "  {}: from the host with its libc, {}",
+                plain(name),
+                plain(&path.display().to_string())
             ),
         );
     }
@@ -1225,6 +1285,92 @@ mod tests {
         assert!(!selected.contains("gtk"), "{selected}");
     }
 
+    /// Every environment mapping the runtime rules carry is named with
+    /// its variables and candidate paths, and an unreadable record says
+    /// so instead.
+    #[test]
+    fn a_runtime_rule_record_names_each_mapped_path() {
+        use onelf_format::rules::{
+            EnvironmentName, Inheritance, PathSelection, RelativePath, ResourceKind, RuntimeBase,
+            RuntimeCandidate, RuntimePathGroup, RuntimeRules,
+        };
+        use onelf_format::runtime_metadata::{RuntimeRuleMetadata, RuntimeRuleRecord};
+        let group = RuntimePathGroup {
+            id: RuleId::new("config").unwrap(),
+            kind: ResourceKind::Directory,
+            candidates: vec![
+                RuntimeCandidate {
+                    base: RuntimeBase::PackageRoot,
+                    path: RelativePath::new("share/alsa").unwrap(),
+                },
+                RuntimeCandidate {
+                    base: RuntimeBase::PackageRoot,
+                    path: RelativePath::new("etc/alsa").unwrap(),
+                },
+            ],
+            variables: vec![EnvironmentName::new("ALSA_CONFIG_DIR").unwrap()],
+            selection: PathSelection::First,
+            inheritance: Inheritance::Preserve,
+        };
+        let plugins = RuntimePathGroup {
+            id: RuleId::new("plugins").unwrap(),
+            kind: ResourceKind::Directory,
+            candidates: vec![RuntimeCandidate {
+                base: RuntimeBase::LibraryRoot,
+                path: RelativePath::new("alsa-lib").unwrap(),
+            }],
+            variables: vec![EnvironmentName::new("ALSA_PLUGIN_DIR").unwrap()],
+            selection: PathSelection::First,
+            inheritance: Inheritance::Preserve,
+        };
+        let rule = |id: &str, binding, paths| RuntimeRuleRecord {
+            id: RuleId::new(id).unwrap(),
+            binding,
+            runtime: RuntimeRules {
+                paths,
+                hooks: Vec::new(),
+            },
+        };
+        let pin = onelf_format::runtime_metadata::SetPin {
+            name: RuleId::new("audio").unwrap(),
+            hash: [7; 32],
+        };
+        let rules = RuntimeRuleMetadata {
+            rules: vec![
+                rule("alsa", None, vec![group.clone(), plugins]),
+                rule("alsa-again", None, vec![group.clone()]),
+                rule("alsa-set", Some(pin), vec![group]),
+            ],
+        }
+        .encode()
+        .unwrap();
+        let mut out = String::new();
+        metadata_section(&mut out, &Some(rules), &None, &None, None, None, &|_| true);
+        let config = "  mapped ALSA_CONFIG_DIR -> share/alsa, etc/alsa\n";
+        assert_eq!(out.matches(config).count(), 1, "{out}");
+        assert!(
+            out.contains("  mapped ALSA_PLUGIN_DIR -> <library dir>/alsa-lib\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  mapped ALSA_CONFIG_DIR -> share/alsa, etc/alsa (with the set audio)"),
+            "{out}"
+        );
+
+        let mut out = String::new();
+        metadata_section(
+            &mut out,
+            &Some(b"junk".to_vec()),
+            &None,
+            &None,
+            None,
+            None,
+            &|_| true,
+        );
+        assert!(out.contains("  runtime rules: unreadable: "), "{out}");
+        assert!(!out.contains("  mapped "), "{out}");
+    }
+
     /// The pairs record is named pair by pair: overlaid when a launch
     /// here would bind it, unredirected with the reason when it would
     /// not, and an unreadable record says so instead of naming pairs.
@@ -1267,6 +1413,7 @@ mod tests {
         );
         assert!(out.contains("records: paths"), "{out}");
         assert!(!out.contains("  anchor "), "{out}");
+        assert!(!out.contains("  mapped "), "{out}");
 
         let mut out = String::new();
         metadata_section(

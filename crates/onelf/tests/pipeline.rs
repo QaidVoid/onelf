@@ -21569,9 +21569,7 @@ fn the_doctor_never_prints_an_environment_value() {
         ("XDG_CONFIG_DIRS", "/onelf-marker-config"),
         ("XDG_CACHE_HOME", "/onelf-marker-cache"),
         ("XDG_RUNTIME_DIR", "/onelf-marker-run"),
-        // A newline in an environment-derived path must not forge a
-        // report line: the helper is echoed with control bytes as '?'.
-        ("FUSERMOUNT_PROG", "/onelf-marker\nhelper"),
+        ("FUSERMOUNT_PROG", "/onelf-marker-helper"),
     ];
 
     // A forced mode the runtime does not know skips every mode; the skip
@@ -21602,8 +21600,8 @@ fn the_doctor_never_prints_an_environment_value() {
         "{stdout}"
     );
     assert!(
-        !stdout.lines().any(|l| l.starts_with("helper")),
-        "an environment value forged a report line:\n{stdout}"
+        stdout.contains("mount helper: the helper FUSERMOUNT_PROG names"),
+        "{stdout}"
     );
 
     // With the mode left to the runtime, a mode is chosen and the
@@ -21622,6 +21620,27 @@ fn the_doctor_never_prints_an_environment_value() {
     assert!(out.status.success(), "{stdout}");
     assert!(stdout.contains("would run"), "{stdout}");
     assert!(stdout.contains("host-libs: always"), "{stdout}");
+    for (_, value) in markers {
+        assert!(!stdout.contains(value), "{value} leaked:\n{stdout}");
+    }
+
+    // Kept out of a namespace, the fuse verdict names the helper it
+    // would mount through, on every host.
+    let mut cmd = Command::new(&pkg);
+    cmd.arg("--onelf-doctor")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONELF_FUSE_NO_NAMESPACE", "1");
+    for (name, value) in markers {
+        cmd.env(name, value);
+    }
+    let out = run_package(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("fuse: would run, mounted through the helper FUSERMOUNT_PROG names"),
+        "{stdout}"
+    );
     for (_, value) in markers {
         assert!(!stdout.contains(value), "{value} leaked:\n{stdout}");
     }
