@@ -133,6 +133,12 @@ mod sys {
     pub unsafe fn munmap(addr: *mut u8, len: usize) {
         sys3(11, addr as i64, len as i64, 0);
     }
+    pub unsafe fn fd_open(fd: i32) -> bool {
+        sys3(72, fd as i64, 1, 0) >= 0 // fcntl(fd, F_GETFD)
+    }
+    pub unsafe fn dup_to(old: i32, new: i32) -> i64 {
+        sys3(33, old as i64, new as i64, 0) // dup2
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -185,6 +191,12 @@ mod sys {
     }
     pub unsafe fn munmap(addr: *mut u8, len: usize) {
         svc4(215, addr as i64, len as i64, 0, 0);
+    }
+    pub unsafe fn fd_open(fd: i32) -> bool {
+        svc4(25, fd as i64, 1, 0, 0) >= 0 // fcntl(fd, F_GETFD)
+    }
+    pub unsafe fn dup_to(old: i32, new: i32) -> i64 {
+        svc4(24, old as i64, new as i64, 0, 0) // dup3 without flags
     }
 }
 
@@ -257,6 +269,12 @@ mod sys {
     }
     pub unsafe fn munmap(addr: *mut u8, len: usize) {
         sys3(91, addr as i32, len as i32, 0);
+    }
+    pub unsafe fn fd_open(fd: i32) -> bool {
+        sys3(55, fd, 1, 0) >= 0 // fcntl(fd, F_GETFD)
+    }
+    pub unsafe fn dup_to(old: i32, new: i32) -> i64 {
+        sys3(63, old, new, 0) as i64 // dup2
     }
 }
 
@@ -872,8 +890,37 @@ unsafe fn apply_preload() {
     }
 }
 
+/// The descriptor the runtime holds the package's anchor directory on.
+const ANCHOR_FD: i32 = 77;
+const O_PATH: i64 = 0o10000000;
+
+/// Put descriptor 77 back on the anchor directory when this program was
+/// started without it, as spawners that close every inherited descriptor
+/// do. The runtime names the directory in `ONELF_ANCHOR_DIR`; a 77 that is
+/// open is left as it is, whoever opened it.
+unsafe fn reopen_anchor() {
+    if sys::fd_open(ANCHOR_FD) {
+        return;
+    }
+    let dir = getenv(b"ONELF_ANCHOR_DIR\0".as_ptr());
+    if dir.is_null() || *dir != b'/' {
+        return;
+    }
+    // Opened without close-on-exec, as is the duplicate, so children
+    // inherit 77 whichever number the open itself landed on.
+    let fd = sys::open(dir, O_PATH | sys::O_DIRECTORY);
+    if fd < 0 {
+        return;
+    }
+    if fd as i32 != ANCHOR_FD {
+        sys::dup_to(fd as i32, ANCHOR_FD);
+        sys::close(fd as i32);
+    }
+}
+
 extern "C" fn onelf_env_init() {
     unsafe {
+        reopen_anchor();
         exec::resolve();
         if !find_root() {
             return;

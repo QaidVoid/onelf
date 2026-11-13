@@ -12,7 +12,7 @@ use crate::bundle::format_size;
 use crate::payload::{ONELF_ENV_SONAME, ONELF_ENV32_SONAME};
 use onelf_format::HostLibsPolicy;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -209,6 +209,67 @@ pub fn require_anchor_runtime(
         )
     })?;
     Ok(anchors)
+}
+
+/// The most symlinks [`check_walked_pairs`] follows for one pair, as the
+/// kernel bounds its own resolution.
+const PAIR_LINK_HOPS: usize = 40;
+
+/// Check every pair's bundle side against the tree the walk will pack:
+/// resolved through the package's own symlinks the way the kernel would,
+/// it must stay inside the package, so a bind never reaches a host
+/// directory another user could fill. A target that names no carried
+/// directory is left to the launch, which skips it.
+fn check_walked_pairs(pairs: &[PathPair], symlinks: &[CollectedSymlink]) -> io::Result<()> {
+    use std::path::Component;
+    let links: HashMap<&Path, &Path> = symlinks
+        .iter()
+        .map(|l| (l.rel_path.as_path(), l.target.as_path()))
+        .collect();
+    for pair in pairs {
+        let refuse = |why: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "path pair \"{}\" = \"{}\": {why}",
+                    pair.absolute, pair.relative
+                ),
+            )
+        };
+        let mut queue: VecDeque<Component> = Path::new(&pair.relative).components().collect();
+        let mut at = PathBuf::new();
+        let mut hops = 0usize;
+        while let Some(component) = queue.pop_front() {
+            match component {
+                Component::Normal(name) => {
+                    let next = at.join(name);
+                    let Some(target) = links.get(next.as_path()) else {
+                        at = next;
+                        continue;
+                    };
+                    hops += 1;
+                    if hops > PAIR_LINK_HOPS {
+                        return Err(refuse("too many symlinks to resolve".to_string()));
+                    }
+                    if target.is_absolute() {
+                        return Err(refuse(format!(
+                            "{} links to {}, outside the package",
+                            next.display(),
+                            target.display()
+                        )));
+                    }
+                    for (i, c) in target.components().enumerate() {
+                        queue.insert(i, c);
+                    }
+                }
+                Component::ParentDir if !at.pop() => {
+                    return Err(refuse("a symlink leads outside the package".to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Check the anchor record among the walked `files` against the tree the
@@ -748,7 +809,7 @@ fn build_dictionary_sampled(files: &[CollectedFile], dict_size: usize) -> io::Re
     compress::build_dictionary(&samples, dict_size)
 }
 
-pub(crate) fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
+fn auto_detect_lib_dirs(directory: &Path) -> Vec<String> {
     let mut lib_dirs = Vec::new();
     let Ok(canonical) = directory.canonicalize() else {
         return lib_dirs;
@@ -803,9 +864,6 @@ pub(crate) fn resolve_lib_dirs(raw: &[String], directory: &Path) -> Vec<String> 
                 dirs.push(d);
             }
         }
-        if !dirs.is_empty() {
-            eprintln!("  Auto-detected lib dirs: {}", dirs.join(", "));
-        }
         dirs
     } else {
         raw.to_vec()
@@ -814,7 +872,7 @@ pub(crate) fn resolve_lib_dirs(raw: &[String], directory: &Path) -> Vec<String> 
     lib_dirs
 }
 
-pub(crate) fn check_libgl_conflicts(directory: &Path, lib_dirs: &mut Vec<String>) {
+fn check_libgl_conflicts(directory: &Path, lib_dirs: &mut Vec<String>) {
     let mut glvnd_dirs = Vec::new();
     let mut legacy_dirs = Vec::new();
 
@@ -1193,6 +1251,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
     let dir = opts.directory.canonicalize()?;
 
     let lib_dirs = resolve_lib_dirs(&opts.lib_dirs, &dir);
+    if opts.lib_dirs.iter().any(|d| d == "auto") && !lib_dirs.is_empty() {
+        eprintln!("  Auto-detected lib dirs: {}", lib_dirs.join(", "));
+    }
 
     // Collect all filesystem entries
     let pb = ProgressBar::new_spinner();
@@ -1378,6 +1439,7 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
                 && p.as_path() != Path::new(crate::bundle::sysroot::SHIPPED_FILE)
                 && p.as_path() != Path::new(onelf_format::anchors::ANCHORS_FILE)
                 && p.as_path() != Path::new(onelf_format::plugindirs::PLUGIN_DIRS_FILE)
+                && p.as_path() != Path::new(onelf_format::paths::INFERRED_PATHS_FILE)
         });
     if let Some(p) = collision {
         return Err(io::Error::new(
@@ -1389,6 +1451,37 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         ));
     }
     check_walked_anchors(&opts.runtime_note, &files, &dirs, &symlinks)?;
+    // The bundle step's inferred pairs fold into the paths record below;
+    // the file itself is build input, not package content, and only a
+    // regular file is read as one.
+    let inferred = Path::new(onelf_format::paths::INFERRED_PATHS_FILE);
+    if dirs.iter().any(|d| d.rel_path == inferred)
+        || symlinks.iter().any(|l| l.rel_path == inferred)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", inferred.display()),
+        ));
+    }
+    let mut inferred_pairs = opts.inferred_pairs.clone();
+    if let Some(at) = files
+        .iter()
+        .position(|f| f.rel_path == Path::new(onelf_format::paths::INFERRED_PATHS_FILE))
+    {
+        let record = files.remove(at);
+        let refuse = |why: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {why}", onelf_format::paths::INFERRED_PATHS_FILE),
+            )
+        };
+        if record.size > onelf_format::paths::MAX_RECORD_BYTES as u64 {
+            return Err(refuse("over the record's size limit".to_string()));
+        }
+        let pairs = onelf_format::paths::decode(&record.source.read()?)
+            .map_err(|e| refuse(e.to_string()))?;
+        inferred_pairs.extend(pairs);
+    }
 
     // Inject .onelf/update-url if requested
     if let Some(ref url) = opts.update_url {
@@ -1570,8 +1663,9 @@ pub fn pack(opts: &PackOptions, runtime_binary: &[u8]) -> io::Result<()> {
         );
     }
 
-    if !opts.paths.is_empty() || !opts.inferred_pairs.is_empty() {
-        let pairs = merged_path_pairs(&path_pairs(&opts.paths), &opts.inferred_pairs);
+    if !opts.paths.is_empty() || !inferred_pairs.is_empty() {
+        let pairs = merged_path_pairs(&path_pairs(&opts.paths), &inferred_pairs);
+        check_walked_pairs(&pairs, &symlinks)?;
         inject_onelf_file(
             &mut dirs,
             &mut files,
@@ -2735,6 +2829,103 @@ mod tests {
         let pkg = onelf_rt::loader::load_file(fs::File::open(&plain).unwrap()).unwrap();
         assert!(onelf_rt::hostpaths::read(&pkg).unwrap().is_empty());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The pairs a separate bundle run left in the tree reach the packed
+    /// record after the recipe's own, and the file itself is not shipped.
+    #[test]
+    fn the_tree_s_inferred_pairs_reach_the_packed_record() {
+        let dir = tmpdir("inferred-pairs-file");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(app.join("share/fw")).unwrap();
+        fs::create_dir_all(app.join(".onelf")).unwrap();
+        fs::write(
+            app.join(onelf_format::paths::INFERRED_PATHS_FILE),
+            onelf_format::paths::encode(&[pair("/a/fw", "share/fw")]).unwrap(),
+        )
+        .unwrap();
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+        opts.paths = vec![("/z/recipe".to_string(), "share/fw".to_string())];
+        pack(&opts, b"stub-runtime").unwrap();
+
+        let pkg = onelf_rt::loader::load_file(fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(
+            onelf_rt::hostpaths::read(&pkg).unwrap(),
+            vec![pair("/z/recipe", "share/fw"), pair("/a/fw", "share/fw")]
+        );
+        assert!(
+            (0..pkg.manifest.entries.len())
+                .all(|i| pkg.manifest.entry_path(i) != onelf_format::paths::INFERRED_PATHS_FILE),
+            "the bundle step's file is not shipped"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A tree carrying an anchor record packs only with a runtime whose
+    /// note advertises anchor support, and the refusal comes before the
+    /// output is written.
+    #[test]
+    fn an_anchor_record_needs_a_runtime_that_advertises_anchors() {
+        let dir = tmpdir("anchor-note");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(app.join("share/fw")).unwrap();
+        fs::create_dir_all(app.join(".onelf")).unwrap();
+        fs::write(app.join(onelf_format::anchors::ANCHORS_FILE), "a\tshare/fw").unwrap();
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+        let text = pack(&opts, b"stub-runtime").unwrap_err().to_string();
+        assert!(text.contains("must advertise anchor support"), "{text}");
+        assert!(!out.exists(), "the refusal must come before any writing");
+
+        opts.runtime_note = onelf_format::elf::RuntimeNote::Present {
+            metadata_version: 0,
+            capabilities: onelf_format::elf::RuntimeCapabilities::ANCHORS,
+        };
+        pack(&opts, b"stub-runtime").unwrap();
+        assert!(out.is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pair whose bundle side resolves outside the package through the
+    /// package's own links, directly or through a chain, fails the pack.
+    #[test]
+    fn a_pair_through_an_escaping_link_fails_the_pack() {
+        let dir = tmpdir("pair-escape");
+        let app = dir.join("app");
+        fs::create_dir_all(app.join("bin")).unwrap();
+        fs::write(app.join("bin/run"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(app.join("share")).unwrap();
+        std::os::unix::fs::symlink("alias", app.join("share/fw")).unwrap();
+        std::os::unix::fs::symlink("../../outside", app.join("share/alias")).unwrap();
+        let out = dir.join("pkg.onelf");
+        let mut opts = base_opts(&app, &out, "bin/run");
+        opts.paths = vec![("/usr/share/fw".to_string(), "share/fw".to_string())];
+        let err = pack(&opts, b"stub-runtime").unwrap_err();
+        assert!(err.to_string().contains("outside the package"), "{err}");
+
+        fs::remove_file(app.join("share/alias")).unwrap();
+        std::os::unix::fs::symlink("/usr/share/fw", app.join("share/alias")).unwrap();
+        let err = pack(&opts, b"stub-runtime").unwrap_err();
+        assert!(err.to_string().contains("outside the package"), "{err}");
+
+        fs::remove_file(app.join("share/alias")).unwrap();
+        fs::create_dir_all(app.join("share/alias")).unwrap();
+        pack(&opts, b"stub-runtime").expect("a link inside the package is fine");
+
+        fs::create_dir_all(app.join(".onelf")).unwrap();
+        std::os::unix::fs::symlink(
+            "elsewhere",
+            app.join(onelf_format::paths::INFERRED_PATHS_FILE),
+        )
+        .unwrap();
+        let err = pack(&opts, b"stub-runtime").unwrap_err();
+        assert!(err.to_string().contains("is not a regular file"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 

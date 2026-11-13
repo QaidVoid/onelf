@@ -1,33 +1,47 @@
 //! The descriptor anchor record, `.onelf/anchors`.
 //!
 //! A library compiled to open an absolute directory, `/usr/share/name`
-//! say, can have that string rewritten in its bundled copy to
-//! `/dev/fd/77/<key>`. At launch the runtime opens descriptor 77 on a
-//! private per-launch directory holding one symlink per key, each naming
-//! the bundle directory the key stands for. `/dev/fd/77` resolves through
-//! the opening process's own descriptor table, so no other process or
-//! user can create or replace what it names, and it needs no namespace.
+//! say, can have that string rewritten in its bundled copy so it opens
+//! `/dev/fd/77/name` instead. At launch the runtime opens descriptor 77
+//! on a private per-launch directory holding one symlink per key, each
+//! naming the bundle directory the key stands for. `/dev/fd/77` resolves
+//! through the opening process's own descriptor table, so no other
+//! process or user can create or replace what it names, and it needs no
+//! namespace.
+//!
+//! The rewrite replaces only a path's first [`ANCHOR_PREFIX_LEN`] bytes
+//! with [`ANCHOR_PREFIX`] and keeps the rest, so the key is the original
+//! path's tail ([`key_of`]). The string keeps its length and needs no
+//! padding, a library that measures it rather than reading up to its
+//! terminator still sees a whole path, and a shorter string the linker
+//! stored inside the tail, such as `"input"` inside
+//! `"/usr/share/libinput"`, keeps its bytes. A path below the directory
+//! takes the same rewrite and resolves through the same key.
 //!
 //! Each line pairs a key with the bundle directory it stands for, as
 //! `KEY<tab>RELATIVE`, with lines separated by a single `\n` and no
-//! trailing newline. The directories are listed in byte order, each once,
-//! and the keys are [`key`] of the line's index, so the shortest names go
-//! to the first directories and a given set of directories always yields
-//! the same record. The bundle side follows the same rules as the path
-//! overlay record's: relative, normalized, inside the package and free of
+//! trailing newline. The keys are listed in byte order, each once, and no
+//! key lies below another one: a path below a key already resolves
+//! through that key's link. Keys and directories follow the path overlay
+//! record's rules for a bundle path: relative, normalized and free of
 //! control characters. Anything else is refused as a whole.
 //!
-//! The descriptor is an ordinary inherited one, which shapes two edge
+//! The descriptor is an ordinary inherited one, which shapes three edge
 //! cases:
 //!
 //! - A descriptor 77 the launch was started with is replaced. Whatever
 //!   the caller had open there is closed in the launched application, as
 //!   `exec 77<file` in a shell would close it.
-//! - A process that closes descriptor 77, or a child started without it,
-//!   resolves no anchor: every anchored path fails as a missing file. It
-//!   never resolves somewhere else, because `/dev/fd/77` then names no
-//!   descriptor at all.
+//! - A bundled program started without descriptor 77, as Python's
+//!   `subprocess`, GLib's spawn functions and Chromium's launcher do by
+//!   closing every inherited descriptor, reopens it from the path in
+//!   [`ANCHOR_DIR_ENV`] before its own code runs.
+//! - A process that has neither, such as a host program or one started
+//!   with a cleared environment, resolves no anchor: every anchored path
+//!   fails as a missing file. It never resolves somewhere else, because
+//!   `/dev/fd/77` then names no descriptor at all.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::paths::{self, PathsErrorKind};
@@ -40,6 +54,13 @@ pub const ANCHORS_FILE: &str = ".onelf/anchors";
 pub const ANCHOR_FD: i32 = 77;
 /// The directory an anchored path starts with.
 pub const ANCHOR_ROOT: &str = "/dev/fd/77";
+/// What a rewrite puts over the start of a compiled-in path.
+pub const ANCHOR_PREFIX: &str = "/dev/fd/77/";
+/// The bytes of a compiled-in path a rewrite replaces.
+pub const ANCHOR_PREFIX_LEN: usize = ANCHOR_PREFIX.len();
+/// The environment variable naming the anchor directory, so a bundled
+/// program started without descriptor 77 can reopen it.
+pub const ANCHOR_DIR_ENV: &str = "ONELF_ANCHOR_DIR";
 /// The most anchors one record holds.
 pub const MAX_ANCHORS: usize = 1024;
 /// The largest complete record, in bytes, checked before anything is
@@ -50,7 +71,7 @@ pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 /// root, that `/dev/fd/77/<key>` resolves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
-    /// The key, the anchored path's last component.
+    /// The key: the anchored path below the anchor root.
     pub key: String,
     /// The bundle directory, relative to the package root.
     pub relative: String,
@@ -63,18 +84,21 @@ impl Anchor {
     }
 }
 
-/// The key of the anchor at `index`: `a` to `z`, then `aa`, `ab` and so
-/// on, so each key is as short as the count before it allows.
-pub fn key(index: usize) -> String {
-    let mut n = index + 1;
-    let mut out = Vec::new();
-    while n > 0 {
-        n -= 1;
-        out.push(b'a' + (n % 26) as u8);
-        n /= 26;
+/// The key a compiled-in path takes, or `None` when it cannot take one:
+/// the bytes after its first [`ANCHOR_PREFIX_LEN`], without the slash a
+/// component boundary there leaves, when they form a path a record may
+/// name. A path no longer than the prefix leaves nothing to key on.
+pub fn key_of(spelling: &str) -> Option<String> {
+    if spelling.len() <= ANCHOR_PREFIX_LEN || !spelling.is_char_boundary(ANCHOR_PREFIX_LEN) {
+        return None;
     }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_default()
+    let key = spelling[ANCHOR_PREFIX_LEN..].trim_start_matches('/');
+    paths::relative_error(key).is_none().then(|| key.to_owned())
+}
+
+/// Whether `key` lies strictly below `parent`, component by component.
+pub fn key_below(key: &str, parent: &str) -> bool {
+    key.len() > parent.len() && key.starts_with(parent) && key.as_bytes()[parent.len()] == b'/'
 }
 
 /// Why a record or an anchor was refused.
@@ -92,10 +116,12 @@ pub enum AnchorsErrorKind {
     MissingSeparator,
     /// A line has a tab after its directory.
     TrailingField,
-    /// A key is not the one its position assigns.
-    WrongKey,
-    /// A directory does not sort after the one before it, or repeats it.
+    /// A key is not one a record may hold.
+    Key(PathsErrorKind),
+    /// A key does not sort after the one before it, or repeats it.
     Unsorted,
+    /// A key lies below another key of the record.
+    Nested,
     /// The bundle directory is not one a record may name.
     Directory(PathsErrorKind),
 }
@@ -141,10 +167,9 @@ impl fmt::Display for AnchorsError {
                 "the line has no tab between its key and directory".into()
             }
             AnchorsErrorKind::TrailingField => "the line goes on after the directory".into(),
-            AnchorsErrorKind::WrongKey => "the key is not the one its position assigns".into(),
-            AnchorsErrorKind::Unsorted => {
-                "the directory does not sort after the one before it".into()
-            }
+            AnchorsErrorKind::Key(kind) => format!("the key: {}", kind.reason()),
+            AnchorsErrorKind::Unsorted => "the key does not sort after the one before it".into(),
+            AnchorsErrorKind::Nested => "the key lies below another key".into(),
             AnchorsErrorKind::Directory(kind) => kind.reason(),
         };
         match self.line {
@@ -156,41 +181,17 @@ impl fmt::Display for AnchorsError {
 
 impl std::error::Error for AnchorsError {}
 
-/// The anchors for `dirs`: sorted, each once, with keys assigned in that
-/// order. This is how the packer derives a record, so the same set of
-/// directories always gets the same keys.
-pub fn assign<I, S>(dirs: I) -> Result<Vec<Anchor>, AnchorsError>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut dirs: Vec<String> = dirs.into_iter().map(Into::into).collect();
-    dirs.sort();
-    dirs.dedup();
-    if dirs.len() > MAX_ANCHORS {
-        return Err(AnchorsError::record(AnchorsErrorKind::TooManyAnchors));
-    }
-    let anchors: Vec<Anchor> = dirs
-        .into_iter()
-        .enumerate()
-        .map(|(index, relative)| Anchor {
-            key: key(index),
-            relative,
-        })
-        .collect();
-    encode(&anchors)?;
-    Ok(anchors)
-}
-
 /// Encode anchors as a record, refusing any record [`decode`] would refuse.
 pub fn encode(anchors: &[Anchor]) -> Result<Vec<u8>, AnchorsError> {
     if anchors.len() > MAX_ANCHORS {
         return Err(AnchorsError::record(AnchorsErrorKind::TooManyAnchors));
     }
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (index, anchor) in anchors.iter().enumerate() {
-        let previous = index.checked_sub(1).map(|i| anchors[i].relative.as_str());
-        check_anchor(index, &anchor.key, &anchor.relative, previous)?;
+        let previous = index.checked_sub(1).map(|i| anchors[i].key.as_str());
+        check_anchor(index, &anchor.key, &anchor.relative, previous, &seen)?;
+        seen.insert(anchor.key.as_str());
         if index > 0 {
             out.push(b'\n');
         }
@@ -218,6 +219,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Anchor>, AnchorsError> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| AnchorsError::record(AnchorsErrorKind::NotUtf8))?;
     let mut anchors: Vec<Anchor> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for (index, line) in text.split('\n').enumerate() {
         if index >= MAX_ANCHORS {
             return Err(AnchorsError::record(AnchorsErrorKind::TooManyAnchors));
@@ -234,8 +236,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Anchor>, AnchorsError> {
         if relative.contains('\t') {
             return Err(AnchorsError::line(AnchorsErrorKind::TrailingField, index));
         }
-        let previous = anchors.last().map(|a| a.relative.as_str());
-        check_anchor(index, key, relative, previous)?;
+        let previous = anchors.last().map(|a| a.key.as_str());
+        check_anchor(index, key, relative, previous, &seen)?;
+        seen.insert(key);
         anchors.push(Anchor {
             key: key.to_owned(),
             relative: relative.to_owned(),
@@ -244,22 +247,31 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Anchor>, AnchorsError> {
     Ok(anchors)
 }
 
-/// Check the anchor at `index`: its key is the one the position assigns,
-/// its directory is one a record may name and sorts after `previous`.
+/// Check the anchor at `index`: its key is one a record may hold, sorts
+/// after `previous` and lies below none of the keys in `seen`, and its
+/// directory is one a record may name.
 fn check_anchor(
     index: usize,
-    key_text: &str,
+    key: &str,
     relative: &str,
     previous: Option<&str>,
+    seen: &HashSet<&str>,
 ) -> Result<(), AnchorsError> {
-    if key_text != key(index) {
-        return Err(AnchorsError::line(AnchorsErrorKind::WrongKey, index));
+    if let Some(kind) = paths::relative_error(key) {
+        return Err(AnchorsError::line(AnchorsErrorKind::Key(kind), index));
     }
     if let Some(kind) = paths::relative_error(relative) {
         return Err(AnchorsError::line(AnchorsErrorKind::Directory(kind), index));
     }
-    if previous.is_some_and(|previous| relative <= previous) {
+    if previous.is_some_and(|previous| key <= previous) {
         return Err(AnchorsError::line(AnchorsErrorKind::Unsorted, index));
+    }
+    let mut ancestor = key;
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        if seen.contains(parent) {
+            return Err(AnchorsError::line(AnchorsErrorKind::Nested, index));
+        }
+        ancestor = parent;
     }
     Ok(())
 }
@@ -272,35 +284,65 @@ mod tests {
         decode(bytes).unwrap_err().kind()
     }
 
-    #[test]
-    fn keys_are_as_short_as_the_count_allows() {
-        assert_eq!(key(0), "a");
-        assert_eq!(key(25), "z");
-        assert_eq!(key(26), "aa");
-        assert_eq!(key(27), "ab");
-        assert_eq!(key(26 + 26 * 26 - 1), "zz");
-        assert_eq!(key(26 + 26 * 26), "aaa");
-        assert!(key(MAX_ANCHORS - 1).len() <= 3);
-        let all: std::collections::BTreeSet<String> = (0..MAX_ANCHORS).map(key).collect();
-        assert_eq!(all.len(), MAX_ANCHORS, "no key repeats");
+    fn anchor(key: &str, relative: &str) -> Anchor {
+        Anchor {
+            key: key.into(),
+            relative: relative.into(),
+        }
     }
 
     #[test]
-    fn assignment_is_sorted_unique_and_round_trips() {
-        let anchors = assign(["share/zz", "lib/alsa-lib", "share/alsa", "lib/alsa-lib"]).unwrap();
-        let expected = [
-            ("a", "lib/alsa-lib"),
-            ("b", "share/alsa"),
-            ("c", "share/zz"),
+    fn a_key_is_the_tail_after_the_prefix() {
+        assert_eq!(key_of("/usr/share/libinput").as_deref(), Some("libinput"));
+        assert_eq!(key_of("/usr/lib64/alsa-lib").as_deref(), Some("alsa-lib"));
+        assert_eq!(key_of("/usr/lib/alsa-lib").as_deref(), Some("sa-lib"));
+        assert_eq!(key_of("/usr/share/X11/xkb").as_deref(), Some("X11/xkb"));
+        assert_eq!(key_of("/opt/vendor/lib/fw").as_deref(), Some("lib/fw"));
+        let spelling = "/usr/share/libinput";
+        let rewritten = format!("{ANCHOR_PREFIX}{}", &spelling[ANCHOR_PREFIX_LEN..]);
+        assert_eq!(
+            rewritten.len(),
+            spelling.len(),
+            "the string keeps its length"
+        );
+        assert_eq!(rewritten, anchor("libinput", "share/libinput").path());
+    }
+
+    #[test]
+    fn a_path_without_a_usable_tail_takes_no_key() {
+        for spelling in [
+            "/usr/lib/x",
+            "/usr/share/",
+            "/usr/lib/a..",
+            "/usr/lib/ab/.",
+            "/usr/lib/ab/../c",
+        ] {
+            assert_eq!(key_of(spelling), None, "{spelling}");
+        }
+        assert_eq!(key_of("/usr/lib/ab/c").as_deref(), Some("c"));
+        assert_eq!(key_of("/usr/lib/abc/d").as_deref(), Some("c/d"));
+    }
+
+    #[test]
+    fn nesting_is_by_component() {
+        assert!(key_below("alsa/ucm2", "alsa"));
+        assert!(!key_below("alsa-lib", "alsa"));
+        assert!(!key_below("alsa", "alsa"));
+    }
+
+    #[test]
+    fn a_record_round_trips() {
+        let anchors = vec![
+            anchor("X11/locale", "share/X11/locale"),
+            anchor("X11/xkb", "share/xkeyboard-config-2"),
+            anchor("alsa", "share/alsa"),
+            anchor("xkeyboard-config-2", "share/xkeyboard-config-2"),
         ];
-        let got: Vec<(&str, &str)> = anchors
-            .iter()
-            .map(|a| (a.key.as_str(), a.relative.as_str()))
-            .collect();
-        assert_eq!(got, expected);
-        assert_eq!(anchors[1].path(), "/dev/fd/77/b");
         let bytes = encode(&anchors).unwrap();
-        assert_eq!(bytes, b"a\tlib/alsa-lib\nb\tshare/alsa\nc\tshare/zz");
+        assert_eq!(
+            bytes,
+            b"X11/locale\tshare/X11/locale\nX11/xkb\tshare/xkeyboard-config-2\nalsa\tshare/alsa\nxkeyboard-config-2\tshare/xkeyboard-config-2"
+        );
         assert_eq!(decode(&bytes).unwrap(), anchors);
         assert_eq!(decode(b"").unwrap(), Vec::new());
     }
@@ -312,16 +354,36 @@ mod tests {
             (b"a\tshare/x\n\nb\tshare/y", AnchorsErrorKind::EmptyLine),
             (b"a share/x", AnchorsErrorKind::MissingSeparator),
             (b"a\tshare/x\textra", AnchorsErrorKind::TrailingField),
-            (b"b\tshare/x", AnchorsErrorKind::WrongKey),
-            (b"a\tshare/x\nc\tshare/y", AnchorsErrorKind::WrongKey),
-            (b"A\tshare/x", AnchorsErrorKind::WrongKey),
-            (b"a\tshare/y\nb\tshare/x", AnchorsErrorKind::Unsorted),
-            (b"a\tshare/x\nb\tshare/x", AnchorsErrorKind::Unsorted),
+            (b"b\tshare/x\na\tshare/y", AnchorsErrorKind::Unsorted),
+            (b"a\tshare/x\na\tshare/y", AnchorsErrorKind::Unsorted),
+            (b"a\tshare/x\na/b\tshare/y", AnchorsErrorKind::Nested),
+            (
+                b"a\tshare/x\na-b\tshare/y\na/b\tshare/z",
+                AnchorsErrorKind::Nested,
+            ),
+            (
+                b"/a\tshare/x",
+                AnchorsErrorKind::Key(PathsErrorKind::RelativeIsAbsolute),
+            ),
+            (
+                b"a/../b\tshare/x",
+                AnchorsErrorKind::Key(PathsErrorKind::Escapes),
+            ),
+            (
+                b"a//b\tshare/x",
+                AnchorsErrorKind::Key(PathsErrorKind::Unnormalized),
+            ),
             (b"\xff\tshare/x", AnchorsErrorKind::NotUtf8),
         ];
         for (bytes, kind) in cases {
             assert_eq!(refused(bytes), *kind, "{bytes:?}");
         }
+        assert_eq!(
+            encode(&[anchor("a", "share/x"), anchor("a/b", "share/y")])
+                .unwrap_err()
+                .kind(),
+            AnchorsErrorKind::Nested
+        );
     }
 
     #[test]
@@ -343,7 +405,7 @@ mod tests {
                 "{relative:?}"
             );
             assert_eq!(
-                assign([relative]).unwrap_err().kind(),
+                encode(&[anchor("a", relative)]).unwrap_err().kind(),
                 AnchorsErrorKind::Directory(kind),
                 "{relative:?}"
             );
@@ -359,21 +421,22 @@ mod tests {
     fn the_bounds_are_checked_first() {
         let huge = vec![b'a'; MAX_RECORD_BYTES + 1];
         assert_eq!(refused(&huge), AnchorsErrorKind::RecordTooLarge);
-        let dirs: Vec<String> = (0..=MAX_ANCHORS).map(|i| format!("d/{i:05}")).collect();
+        let anchors: Vec<Anchor> = (0..=MAX_ANCHORS)
+            .map(|i| anchor(&format!("k{i:05}"), &format!("d/{i:05}")))
+            .collect();
         assert_eq!(
-            assign(dirs.clone()).unwrap_err().kind(),
+            encode(&anchors).unwrap_err().kind(),
             AnchorsErrorKind::TooManyAnchors
         );
-        let lines: Vec<String> = dirs
+        let lines: Vec<String> = anchors
             .iter()
-            .enumerate()
-            .map(|(i, d)| format!("{}\t{d}", key(i)))
+            .map(|a| format!("{}\t{}", a.key, a.relative))
             .collect();
         assert_eq!(
             refused(lines.join("\n").as_bytes()),
             AnchorsErrorKind::TooManyAnchors
         );
-        assert!(assign(dirs[..MAX_ANCHORS].to_vec()).is_ok());
+        assert!(encode(&anchors[..MAX_ANCHORS]).is_ok());
     }
 
     #[test]

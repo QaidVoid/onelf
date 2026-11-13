@@ -1785,6 +1785,51 @@ fn collect_inferred(
     reachable: &HashSet<String>,
     state: &mut WalkState,
 ) -> io::Result<()> {
+    // A recipe pair that sends every compiled-in path of the directory
+    // to another bundle directory owns those paths: nothing would reach
+    // this copy. A directory an earlier build in this tree anchored is
+    // the exception, where the record still sends one of its paths to it
+    // and the tree's objects carry that path rewritten: that anchor
+    // answers, and the pair cannot undo it in place.
+    let claim = |spelling: &String| {
+        opts.recipe_pairs
+            .iter()
+            .find(|pair| pair.absolute == *spelling && Path::new(&pair.relative) != dir.destination)
+    };
+    let recorded = || -> io::Result<bool> {
+        let persisted = redir::persisted(&opts.directory)?;
+        let tree = find_elf_files(&opts.directory);
+        for spelling in &dir.compiled {
+            if redir::recorded_reach(&persisted, spelling).as_deref()
+                == Some(dir.destination.as_path())
+                && redir::rewritten_in(&tree, spelling)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !dir.compiled.is_empty()
+        && dir
+            .compiled
+            .iter()
+            .all(|spelling| claim(spelling).is_some())
+        && !recorded()?
+    {
+        let pair = dir
+            .compiled
+            .iter()
+            .find_map(claim)
+            .expect("a claimed spelling");
+        infer::omit(
+            dir,
+            &format!(
+                "the recipe pair for {} sends that path to {}",
+                pair.absolute, pair.relative
+            ),
+        );
+        return Ok(());
+    }
     for (dest, source, carry) in carried.iter() {
         let inner = dir.destination.strip_prefix(dest).ok();
         let outer = dest.strip_prefix(&dir.destination).ok();
@@ -2847,6 +2892,30 @@ fn publish_prepared(prepared: Vec<PreparedPin>) {
 /// failed before preparation, leaves none.
 pub fn take_prepared() -> Vec<PreparedPin> {
     LAST_PREPARED.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Leave the pairs a bundle run chose for inferred directories in the
+/// tree, so a later `onelf pack` of it carries them: the packer folds the
+/// file into the package's paths record. An empty choice drops a file a
+/// previous build left, with its ledger entry.
+fn write_inferred_paths(directory: &Path, pairs: &[PathPair]) -> io::Result<()> {
+    let file = onelf_format::paths::INFERRED_PATHS_FILE;
+    let path = directory.join(file);
+    if pairs.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => sysroot::remove_generated(directory, &[file.to_string()])?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+    let bytes = onelf_format::paths::encode(pairs).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, bytes)?;
+    normalize_mtime(&path);
+    sysroot::record_generated(directory, vec![file.to_string()])
 }
 
 /// Publish the pairs one bundle run chose for the package's paths
@@ -6082,9 +6151,9 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     // the rewrites land before the ledger attests the copies, and the
     // needs audit runs on the rewritten bytes. The record lands before
     // the rewrite, since a build that fails from the first rewritten
-    // byte on still reruns against bytes only the record can interpret;
-    // the drop pass may empty a carried directory the choice named, so
-    // what survives is recorded again after the audit, and only the
+    // byte on still reruns against bytes only the record can interpret.
+    // The audit's drop pass removes files, never a directory, so the
+    // records written after it name the same directories, and only the
     // report waits for it.
     // The carried inferred directories, as the redirection decision's
     // own input: the plan's dirs the tree holds, whether it just plans
@@ -6099,9 +6168,8 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         .filter(|(.., carry)| matches!(*carry, Carry::Planned | Carry::Held))
         .filter_map(|(_, source, _)| inference.get(source))
         // A plan the walk emptied leaves no destination: a member
-        // every strict-libc skip condemned, say, copies nothing.
-        // The record's keys are positional, so an anchor over
-        // nothing would consume a key the record cannot carry.
+        // every strict-libc skip condemned, say, copies nothing, and
+        // a redirection over nothing would resolve to nothing.
         .filter(|dir| opts.directory.join(&dir.destination).is_dir())
         .collect();
     // Anchoring a directory keeps it in the tree, so it stays a plugin
@@ -6121,64 +6189,55 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     let (redirections, carried_dirs) = if opts.dry_run {
         (Vec::new(), Vec::new())
     } else {
-        let persisted = redir::persisted(&opts.directory)?;
-        // A destination the record anchors keeps that anchor: a fresh
-        // one over it could move the recorded key, which the merge
-        // refuses, so the choice never sees it as carried.
-        let carried_dirs: Vec<&infer::InferredDir> = carried_dirs
-            .iter()
-            .filter(|dir| !redir::persisted_anchored(&persisted, dir.destination.as_path()))
-            .copied()
-            .collect();
-        let held: std::collections::HashSet<PathBuf> = inferred_carried
-            .iter()
-            .filter(|(.., carry)| *carry == Carry::Held)
-            .map(|(dest, ..)| dest.clone())
-            .collect();
         let tree_elfs = find_elf_files(&opts.directory);
-        // A directory the tree already holds takes the rewrite too when
-        // an anchor names it: an object newly bundled this run may carry
-        // fresh spellings for it, and only an anchor reaches those
-        // bytes. A directory that rides such a carried parent has no
-        // carry entry of its own, so the scan's own view names it; the
-        // same source test collection applies decides a child rides,
-        // and one overlapping from another source stays out.
-        let rewrite_dirs: Vec<&infer::InferredDir> = inferred_carried
-            .iter()
-            .filter(|(.., carry)| matches!(*carry, Carry::Planned | Carry::Held))
-            .filter_map(|(_, source, _)| inference.get(source))
-            .chain(
-                inference
-                    .all()
-                    .filter(|dir| rides_carried(dir, &inferred_carried)),
-            )
+        // A recorded anchor no carried directory accounts for, itself or
+        // through a carried directory above it, and that no tree object
+        // resolves through, is forgotten: nothing reaches it any more.
+        let tails = redir::anchor_tails(&tree_elfs)?;
+        let reaches =
+            |tail: &String, key: &str| tail == key || onelf_format::anchors::key_below(tail, key);
+        let persisted: Vec<onelf_format::anchors::Anchor> = redir::persisted(&opts.directory)?
+            .into_iter()
+            .filter(|anchor| {
+                carried_dirs
+                    .iter()
+                    .any(|dir| Path::new(&anchor.relative).starts_with(&dir.destination))
+                    || tails.iter().any(|tail| reaches(tail, &anchor.key))
+            })
             .collect();
         let lib_dirs = crate::pack::resolve_lib_dirs(&opts.lib_dirs, &opts.directory);
         // The launch evaluates only the rules the package carries, which
         // are the catalog's enabled descriptors, so a disabled built-in's
         // runtime mapping covers nothing.
         let enabled_rules = opts.rules.enabled();
-        let fresh = redir::choose(
+        // The anchored paths the tree's objects carry from an earlier
+        // build that the record no longer explains, reported once the
+        // choice is known.
+        // An anchor whose directory the tree lost explains nothing: this
+        // build holds its key back and serves nothing through it.
+        let unexplained: Vec<String> = tails
+            .iter()
+            .filter(|tail| {
+                !persisted.iter().any(|anchor| {
+                    opts.directory.join(&anchor.relative).is_dir() && reaches(tail, &anchor.key)
+                })
+            })
+            .cloned()
+            .collect();
+        let redirections = redir::choose(
             &carried_dirs,
             &enabled_rules,
             &lib_dirs,
             &opts.directory,
-            &held,
+            &persisted,
+            &opts.recipe_pairs,
         );
-        let redirections = redir::merge(fresh, &persisted, &opts.directory)?;
-        // The record lands before the rewrite, so a decision the
-        // rewrite would refuse stops first: a fresh anchor's merged
-        // key can be longer than the one its eligibility was checked
-        // against, and a refused rewrite must not leave a record
-        // naming it.
-        redir::ensure_spellings_fit(&redirections, &persisted, &rewrite_dirs)?;
+        report_stale_anchor_paths(&unexplained, &redirections);
         // The record lands before the rewrite: a rewrite that fails
         // part way, or any build that fails after it, leaves the tree
         // carrying bytes only the record can interpret, and every
         // anchor the decision holds is known before the first byte
-        // moves. The drop pass may still empty a carried directory, so
-        // what survives is recorded again after the audit, and only the
-        // report waits for it.
+        // moves.
         let survived: Vec<redir::Redirection> = redirections
             .iter()
             .filter(|r| r.resolves(&opts.directory))
@@ -6189,8 +6248,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         // reason: an anchor rewrite replaces the compiled-in spellings
         // the record names, so any build that fails after it leaves
         // bytes only the record can explain. The write after the audit
-        // below stays what a successful build publishes, pruned to
-        // what the drop pass left.
+        // below stays what a successful build publishes.
         let plugin_dirs = merge_plugin_dirs(
             plugin_dir_records(
                 &opts.directory,
@@ -6204,7 +6262,42 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         write_plugin_dirs_record(&opts.directory, &plugin_dirs)?;
         // The rewrite lands exactly what the record holds: an anchor
         // the record cannot name would leave a path nothing resolves.
-        let (files, occurrences) = redir::rewrite_anchors(&survived, &rewrite_dirs, &tree_elfs)?;
+        // A carried directory or a recipe pair the enclosing anchor
+        // would not reach keeps its strings out of that anchor.
+        let answers: Vec<(&str, &Path)> = carried_dirs
+            .iter()
+            .flat_map(|dir| {
+                dir.compiled
+                    .iter()
+                    .map(|spelling| (spelling.as_str(), dir.destination.as_path()))
+            })
+            .chain(
+                opts.recipe_pairs
+                    .iter()
+                    .map(|pair| (pair.absolute.as_str(), Path::new(&pair.relative))),
+            )
+            .collect();
+        let kept = redir::kept_spellings(&survived, &answers);
+        let (files, occurrences) = redir::rewrite_anchors(&survived, &kept, &tree_elfs)?;
+        // A tree rebuilt in place keeps the anchors an earlier build
+        // made, so a recipe pair over a path one of them sends elsewhere
+        // cannot take effect while the tree's objects, as this build
+        // leaves them, carry that path rewritten.
+        for pair in &opts.recipe_pairs {
+            let stale = redir::recorded_reach(&persisted, &pair.absolute)
+                .is_some_and(|reached| reached != Path::new(&pair.relative));
+            if stale && redir::rewritten_in(&tree_elfs, &pair.absolute)? {
+                record_finding(Finding::new(
+                    pair.relative.clone(),
+                    Outcome::Unchecked,
+                    format!(
+                        "the recipe pair for {} has no effect in this tree, whose earlier \
+                         build anchored that path; build into a fresh tree for it to apply",
+                        pair.absolute
+                    ),
+                ));
+            }
+        }
         if occurrences > 0 {
             eprintln!(
                 "{} {} compiled-in paths to anchor paths in {} binaries",
@@ -6262,17 +6355,15 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             audit_entrypoint_selections(opts, sysroot_platform.as_ref(), providers, unchecked)?;
         }
         // The choice was taken before the audit; what it names is
-        // reported, and recorded again for what the drop pass left,
-        // only while the bundled copy is in place.
+        // reported and recorded while the bundled copy is in place.
         let survived: Vec<redir::Redirection> = redirections
             .into_iter()
             .filter(|r| r.resolves(&opts.directory))
             .collect();
         redir::write_record(&survived, &opts.directory)?;
-        // The drop pass may have emptied a carried directory, so what
-        // the tree still holds is what the record names, with a
-        // previous record folding in for what this build rediscovered
-        // nothing about.
+        // What the tree holds is what the record names, with a previous
+        // record folding in for what this build rediscovered nothing
+        // about.
         let plugin_dirs = merge_plugin_dirs(
             plugin_dir_records(
                 &opts.directory,
@@ -6284,15 +6375,68 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             &opts.directory,
         );
         write_plugin_dirs_record(&opts.directory, &plugin_dirs)?;
-        publish_pairs(redir::record_pairs(
-            &survived,
-            carried_dirs,
-            &opts.recipe_pairs,
-        ));
+        let pairs = redir::record_pairs(&survived, carried_dirs, &opts.recipe_pairs);
+        write_inferred_paths(&opts.directory, &pairs)?;
+        publish_pairs(pairs);
         redir::report(&survived);
+        for (dest, how) in redir::descriptions(&survived) {
+            completeness::settle(Some(&dest), infer::PENDING_REDIRECTION, &how);
+        }
+        completeness::settle(
+            None,
+            infer::PENDING_REDIRECTION,
+            "not redirected, since nothing of it survived the build",
+        );
+    } else {
+        completeness::settle(
+            None,
+            infer::PENDING_REDIRECTION,
+            "not redirected, since a dry run decides no redirection",
+        );
     }
 
     Ok(())
+}
+
+/// Report the anchored paths `unexplained`, which the tree's objects
+/// carry from an earlier build that its anchor record no longer
+/// explains: each now resolves through an anchor this build chose, or
+/// through none, and either may not be what those objects meant, so the
+/// finding says to build into a fresh tree. A path below another one
+/// reported is covered by it.
+fn report_stale_anchor_paths(unexplained: &[String], redirections: &[redir::Redirection]) {
+    use onelf_format::anchors::{ANCHOR_PREFIX, key_below};
+    for tail in unexplained {
+        if unexplained.iter().any(|other| key_below(tail, other)) {
+            continue;
+        }
+        let reached = redirections
+            .iter()
+            .filter(|r| r.mechanism == redir::Mechanism::Anchor)
+            .find_map(|r| {
+                r.keys.iter().find_map(|key| {
+                    if tail == key {
+                        Some(r.dest.clone())
+                    } else if key_below(tail, key) {
+                        Some(r.dest.join(&tail[key.len() + 1..]))
+                    } else {
+                        None
+                    }
+                })
+            });
+        let what = match &reached {
+            Some(dest) => format!("which now resolves to {}", dest.display()),
+            None => "which no anchor serves now".to_string(),
+        };
+        record_finding(Finding::new(
+            format!("{ANCHOR_PREFIX}{tail}"),
+            Outcome::Unchecked,
+            format!(
+                "objects in the tree carry this path from an earlier build, {what}; build \
+                 into a fresh tree for them to name only what this build chose"
+            ),
+        ));
+    }
 }
 
 /// One object the drop pass omitted: where it sat relative to the tree,

@@ -3,27 +3,30 @@
 //! Each directory a library compiled in reaches the application at launch
 //! by exactly one mechanism, decided here when the package is built: a
 //! descriptor's runtime mapping that already names the directory, else a
-//! descriptor anchor path the compiled-in strings are long enough to
-//! carry, else a path pair for a namespace overlay. The choice is a pure
-//! function of the carried directories, the descriptors and the assembled
-//! tree, so fixed inputs give fixed output.
+//! descriptor anchor its compiled-in strings can carry, else a path pair
+//! for a namespace overlay. The choice is a pure function of the carried
+//! directories, the descriptors, the assembled tree and the anchor record
+//! a previous build left, so fixed inputs give fixed output.
 //!
-//! A directory carried inside another carried one takes its parent's
-//! mechanism. The overlay binds the parent's tree path, so spellings
-//! beneath it resolve; the anchor record exposes everything under the
-//! anchored directory; and an environment mapping covers a lookup that
-//! reaches the child through the mapped variable. A child spelling that
-//! names the parent through a different alias, or names the child by its
-//! own absolute path while only the variable redirects the parent, is
-//! not redirected by the parent's choice; the anchor record writer and
-//! the compiled-in rewrite decide those per spelling. Only top-level
-//! carried directories are decided here.
+//! An anchor rewrites only a compiled-in path's first
+//! [`anchors::ANCHOR_PREFIX_LEN`] bytes, so the key is the path's own tail
+//! ([`anchors::key_of`]) and every string that starts with the directory,
+//! the directory itself or a path below it, takes the same rewrite. A
+//! directory carried inside another carried one takes its parent's
+//! mechanism: the overlay binds the parent's tree path, the anchor's
+//! rewrite reaches every string below the parent's spelling, and an
+//! environment mapping covers a lookup that reaches the child through
+//! the variable. A child spelling that names the parent through a
+//! different alias, or names the child by its own absolute path while
+//! only the variable redirects the parent, is not redirected by the
+//! parent's choice. Only top-level carried directories are decided here.
 //!
 //! The record a previous build left (`.onelf/anchors`) folds into the
-//! decision, so a re-run keeps reporting and recording the anchors its
-//! bytes already name; `merge` holds those rules.
+//! decision. Its keys are already in the tree's bytes, so they stay, and
+//! a fresh spelling whose key would make one of them resolve somewhere
+//! else takes a pair instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::Read;
@@ -44,11 +47,12 @@ pub(crate) enum Mechanism {
     /// sets its environment variable to the bundled copy and the
     /// compiled-in strings stay as they are.
     Env,
-    /// Every compiled-in string is rewritten to the anchor path.
+    /// Every compiled-in string starting with the directory is rewritten
+    /// to start with the anchor root.
     Anchor,
-    /// The compiled-in strings are too short for an anchor path: a path
-    /// pair redirects a launch that has one, and an unredirected launch
-    /// is reported.
+    /// The compiled-in strings cannot carry an anchor: a path pair
+    /// redirects a launch that has a namespace, and an unredirected
+    /// launch is reported.
     Pair,
 }
 
@@ -65,8 +69,57 @@ pub(crate) struct Redirection {
     pub dest: PathBuf,
     /// The mechanism chosen for it.
     pub mechanism: Mechanism,
-    /// The anchor key, for an anchor.
-    pub key: Option<String>,
+    /// The anchor keys that resolve to it, for an anchor.
+    pub keys: Vec<String>,
+    /// The compiled-in spellings the rewrite reaches, for an anchor; for
+    /// a pair, the spellings it answers, every one of the directory's
+    /// when empty.
+    pub spellings: Vec<String>,
+}
+
+/// The anchor keys taken so far: a key and the destination it resolves
+/// to, plus the keys a previous record named for a destination the tree
+/// no longer holds, which no fresh destination may take, since the bytes
+/// that name them may still be in the tree.
+struct Keys {
+    taken: BTreeMap<String, PathBuf>,
+    retired: HashSet<String>,
+}
+
+impl Keys {
+    /// Whether `key` may resolve to `dest` alongside every key taken so
+    /// far: no key is taken by another destination, and a key below
+    /// another reaches, through that key's link, exactly the directory
+    /// it stands for.
+    fn fits(&self, key: &str, dest: &Path) -> bool {
+        if self
+            .retired
+            .iter()
+            .any(|old| old == key || anchors::key_below(key, old) || anchors::key_below(old, key))
+        {
+            return false;
+        }
+        self.taken.iter().all(|(taken, taken_dest)| {
+            if taken == key {
+                taken_dest == dest
+            } else if anchors::key_below(key, taken) {
+                dest == taken_dest.join(&key[taken.len() + 1..])
+            } else if anchors::key_below(taken, key) {
+                *taken_dest == dest.join(&taken[key.len() + 1..])
+            } else {
+                true
+            }
+        })
+    }
+
+    /// How many record lines the taken keys need: a key below another
+    /// resolves through that one's link.
+    fn lines(&self) -> usize {
+        self.taken
+            .keys()
+            .filter(|key| !self.taken.keys().any(|k| anchors::key_below(key, k)))
+            .count()
+    }
 }
 
 /// Decide the mechanism for every carried directory.
@@ -78,117 +131,161 @@ pub(crate) struct Redirection {
 /// `view_env_assignments`). Sets and prepared subtrees answer later
 /// scopes and are skipped, since the application package alone carries
 /// inferred directories and an application scope match outranks theirs.
-/// `held` names the destinations the tree already holds from a previous
-/// build: they take no fresh anchor (the tree's own record restores
-/// theirs, and a fresh key over a held destination could move a
-/// recorded one) and only their pair, which is keyed by the path
-/// itself and safe to re-derive.
+/// `persisted` is the anchor record the tree already carries. A fresh
+/// spelling a `recipe` pair names for another bundle directory takes no
+/// key: the recipe's pair answers for it, so rewriting it would leave
+/// that pair unused. A recorded destination keeps the keys its record
+/// holds whatever a recipe says, since the tree's copies may already
+/// carry them.
 pub(crate) fn choose(
     dirs: &[&InferredDir],
     descriptors: &[&Descriptor],
     lib_dirs: &[String],
     directory: &Path,
-    held: &std::collections::HashSet<PathBuf>,
+    persisted: &[anchors::Anchor],
+    recipe: &[PathPair],
 ) -> Vec<Redirection> {
-    let mut out: Vec<Redirection> = dirs
-        .iter()
-        .filter(|dir| env_covered(dir, descriptors, lib_dirs, directory))
-        .map(|dir| Redirection {
-            source: Some(dir.source.clone()),
-            dest: dir.destination.clone(),
-            mechanism: Mechanism::Env,
-            key: None,
-        })
-        .collect();
-    // A held carry takes no fresh anchor: the tree's own record restores
-    // its anchors, and a fresh key over a held destination could move a
-    // recorded one, which the key-move refusal exists to stop. Its pair
-    // is keyed by the path itself, so it takes the overlay and a
-    // rebuild restores what it would otherwise lose. An environment
-    // mapping needs no build-time action; the launch evaluates the
-    // descriptors on their own.
-    // The rest compete for anchors: keys go to the destinations in sorted
-    // order, shortest first. A destination that is not UTF-8 cannot enter
-    // the anchor record, so it takes the overlay. A directory keeps its
-    // anchor only while every spelling it compiles in is long enough to
-    // hold the provisional anchor path. Filtering can only shrink the set,
-    // and the keys are assigned in the same sorted order, so the final
-    // keys are never longer than the provisional ones the check used.
-    let (utf8, mut pairs): (Vec<&InferredDir>, Vec<&InferredDir>) = dirs
-        .iter()
-        .filter(|dir| !env_covered(dir, descriptors, lib_dirs, directory))
-        .filter(|dir| !held.contains(&dir.destination))
-        .partition(|dir| dir.destination.to_str().is_some());
-    pairs.extend(dirs.iter().filter(|dir| {
-        held.contains(&dir.destination) && !env_covered(dir, descriptors, lib_dirs, directory)
-    }));
-    let mut rest = utf8;
-    rest.sort_by(|a, b| a.destination.cmp(&b.destination));
-    let Ok(provisional) = anchors::assign(
-        rest.iter()
-            .map(|dir| dir.destination.to_string_lossy().into_owned()),
-    ) else {
-        // More destinations than the record holds, or a malformed one:
-        // none of them is anchored, and every one takes the overlay.
-        pairs.extend(rest);
-        return sort_by_dest(finish(out, &pairs));
-    };
-    let anchored: Vec<&InferredDir> = rest
-        .iter()
-        .filter(|dir| {
-            let anchor = provisional
-                .iter()
-                .find(|anchor| Path::new(&anchor.relative) == dir.destination)
-                .expect("assign returns every destination");
-            dir.compiled.iter().all(|s| s.len() >= anchor.path().len())
-        })
-        .copied()
-        .collect();
-    let unanchored = |dir: &InferredDir| {
-        !anchored
+    let claimed = |dir: &InferredDir, spelling: &str| {
+        recipe
             .iter()
-            .any(|kept| kept.destination == dir.destination)
+            .any(|pair| pair.absolute == spelling && Path::new(&pair.relative) != dir.destination)
     };
-    let Ok(final_anchors) = anchors::assign(
-        anchored
-            .iter()
-            .map(|dir| dir.destination.to_string_lossy().into_owned()),
-    ) else {
-        // The kept set no longer fits the record: every one of them takes
-        // the overlay, and the rest keeps its own.
-        pairs.extend(anchored.iter().copied());
-        pairs.extend(rest.iter().copied().filter(|dir| unanchored(dir)));
-        return sort_by_dest(finish(out, &pairs));
+    let key = |dir: &InferredDir, spelling: &str| {
+        if claimed(dir, spelling) {
+            None
+        } else {
+            anchors::key_of(spelling)
+        }
     };
-    for dir in &anchored {
-        let anchor = final_anchors
-            .iter()
-            .find(|anchor| Path::new(&anchor.relative) == dir.destination)
-            .expect("assign returns every destination");
+    let mut keys = Keys {
+        taken: BTreeMap::new(),
+        retired: HashSet::new(),
+    };
+    let mut recorded: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for anchor in persisted {
+        if directory.join(&anchor.relative).is_dir() {
+            keys.taken
+                .insert(anchor.key.clone(), PathBuf::from(&anchor.relative));
+            recorded
+                .entry(PathBuf::from(&anchor.relative))
+                .or_default()
+                .push(anchor.key.clone());
+        } else {
+            keys.retired.insert(anchor.key.clone());
+        }
+    }
+    let mut out: Vec<Redirection> = Vec::new();
+    let mut rest: Vec<&InferredDir> = Vec::new();
+    for dir in dirs {
+        if recorded.contains_key(&dir.destination) {
+            // The record anchors it already, so its bytes name the
+            // anchor root and only an anchor reaches them; fresh
+            // spellings join it where their keys fit.
+            continue;
+        }
+        if env_covered(dir, descriptors, lib_dirs, directory) {
+            out.push(Redirection {
+                source: Some(dir.source.clone()),
+                dest: dir.destination.clone(),
+                mechanism: Mechanism::Env,
+                keys: Vec::new(),
+                spellings: Vec::new(),
+            });
+        } else {
+            rest.push(dir);
+        }
+    }
+    for (dest, mut taken) in recorded {
+        let mut spellings = Vec::new();
+        for dir in dirs.iter().filter(|dir| dir.destination == dest) {
+            // A spelling that takes no key beside the recorded ones is
+            // answered by a pair of its own.
+            let mut leftover = Vec::new();
+            for spelling in &dir.compiled {
+                // A key the record holds stays, whatever a recipe says,
+                // since the tree's copies may carry it; a fresh one
+                // honours the recipe's claim.
+                let recorded = anchors::key_of(spelling).filter(|key| taken.contains(key));
+                match recorded.or_else(|| key(dir, spelling)) {
+                    Some(key) if keys.fits(&key, &dest) => {
+                        keys.taken.insert(key.clone(), dest.clone());
+                        taken.push(key);
+                        spellings.push(spelling.clone());
+                    }
+                    // The recipe's own pair answers a claimed spelling.
+                    _ if claimed(dir, spelling) => {}
+                    _ => leftover.push(spelling.clone()),
+                }
+            }
+            if !leftover.is_empty() {
+                out.push(Redirection {
+                    source: Some(dir.source.clone()),
+                    dest: dest.clone(),
+                    mechanism: Mechanism::Pair,
+                    keys: Vec::new(),
+                    spellings: leftover,
+                });
+            }
+        }
+        taken.sort();
+        taken.dedup();
         out.push(Redirection {
-            source: Some(dir.source.clone()),
-            dest: dir.destination.clone(),
+            source: None,
+            dest,
             mechanism: Mechanism::Anchor,
-            key: Some(anchor.key.clone()),
+            keys: taken,
+            spellings,
         });
     }
-    for dir in rest.iter().copied().filter(|dir| unanchored(dir)) {
-        pairs.push(dir);
-    }
-    sort_by_dest(finish(out, &pairs))
-}
-
-/// The pair redirection for every directory left without a mechanism.
-fn finish(mut out: Vec<Redirection>, pairs: &[&InferredDir]) -> Vec<Redirection> {
-    for dir in pairs {
-        out.push(Redirection {
-            source: Some(dir.source.clone()),
-            dest: dir.destination.clone(),
-            mechanism: Mechanism::Pair,
-            key: None,
+    // The rest take anchors in sorted destination order, so a key two of
+    // them would share goes to the same one every time. A destination
+    // keeps its anchor only when every spelling it compiles in yields a
+    // key that fits with the keys already taken; one that is not UTF-8
+    // cannot enter the record, so it takes the overlay.
+    rest.sort_by(|a, b| a.destination.cmp(&b.destination));
+    for dir in rest {
+        let wanted: Option<Vec<String>> = dir.destination.to_str().and_then(|_| {
+            dir.compiled
+                .iter()
+                .map(|spelling| key(dir, spelling))
+                .collect()
         });
+        let fits = wanted.as_ref().is_some_and(|wanted| {
+            let mut trial = Keys {
+                taken: keys.taken.clone(),
+                retired: keys.retired.clone(),
+            };
+            wanted.iter().all(|key| {
+                let ok = trial.fits(key, &dir.destination);
+                trial.taken.insert(key.clone(), dir.destination.clone());
+                ok
+            }) && trial.lines() <= anchors::MAX_ANCHORS
+        });
+        match wanted {
+            Some(mut wanted) if fits => {
+                for key in &wanted {
+                    keys.taken.insert(key.clone(), dir.destination.clone());
+                }
+                wanted.sort();
+                wanted.dedup();
+                out.push(Redirection {
+                    source: Some(dir.source.clone()),
+                    dest: dir.destination.clone(),
+                    mechanism: Mechanism::Anchor,
+                    keys: wanted,
+                    spellings: dir.compiled.iter().cloned().collect(),
+                });
+            }
+            _ => out.push(Redirection {
+                source: Some(dir.source.clone()),
+                dest: dir.destination.clone(),
+                mechanism: Mechanism::Pair,
+                keys: Vec::new(),
+                spellings: Vec::new(),
+            }),
+        }
     }
-    out
+    sort_by_dest(out)
 }
 
 /// Report the choice per carried directory.
@@ -198,22 +295,63 @@ pub(crate) fn report(redirections: &[Redirection]) {
     }
     eprintln!("  Redirected inferred directories:");
     for r in redirections {
-        let detail = match (&r.mechanism, &r.key) {
-            (Mechanism::Env, _) => "environment mapping".to_string(),
-            (Mechanism::Anchor, Some(key)) => format!("anchor {key}"),
-            _ => "path pair".to_string(),
+        let detail = match r.mechanism {
+            Mechanism::Env => "environment mapping".to_string(),
+            Mechanism::Anchor => {
+                let paths: Vec<String> = r
+                    .keys
+                    .iter()
+                    .map(|key| format!("{}{key}", anchors::ANCHOR_PREFIX))
+                    .collect();
+                format!("anchor {}", paths.join(", "))
+            }
+            Mechanism::Pair => "path pair".to_string(),
         };
         eprintln!("    {}: {}", r.dest.display(), detail);
     }
 }
 
 impl Redirection {
+    /// The mechanism as the completeness findings name it.
+    pub(crate) fn describe(&self) -> String {
+        match self.mechanism {
+            Mechanism::Env => "redirected by its environment mapping".to_string(),
+            Mechanism::Anchor => {
+                let paths: Vec<String> = self
+                    .keys
+                    .iter()
+                    .map(|key| format!("{}{key}", anchors::ANCHOR_PREFIX))
+                    .collect();
+                format!("redirected through {}", paths.join(", "))
+            }
+            Mechanism::Pair => {
+                "redirected by a path pair where the launch has a mount namespace".to_string()
+            }
+        }
+    }
+
     /// Whether the mechanism still names something: a carried directory
-    /// the drop pass emptied is gone from the tree, and no mechanism
-    /// reaches through an absent copy.
+    /// the walk left out, every member of it condemned say, is not in
+    /// the tree, and no mechanism reaches through an absent copy.
     pub(crate) fn resolves(&self, directory: &Path) -> bool {
         directory.join(&self.dest).is_dir()
     }
+}
+
+/// How each destination is redirected, for its finding: a destination
+/// some of whose spellings take a pair beside its anchor is named with
+/// both.
+pub(crate) fn descriptions(redirections: &[Redirection]) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for r in redirections {
+        out.entry(r.dest.display().to_string())
+            .and_modify(|how| {
+                how.push_str(", and ");
+                how.push_str(&r.describe());
+            })
+            .or_insert_with(|| r.describe());
+    }
+    out
 }
 
 /// The pairs the surviving pair redirections add to the package's
@@ -263,7 +401,12 @@ pub(crate) fn record_pairs<'a>(
         else {
             continue;
         };
-        for absolute in &dir.compiled {
+        let spellings: Vec<&String> = if choice.spellings.is_empty() {
+            dir.compiled.iter().collect()
+        } else {
+            choice.spellings.iter().collect()
+        };
+        for absolute in spellings {
             if claimed.contains(absolute.as_str()) {
                 continue;
             }
@@ -329,256 +472,254 @@ pub(crate) fn persisted(directory: &Path) -> io::Result<Vec<anchors::Anchor>> {
     anchors::decode(&bytes).map_err(io::Error::other)
 }
 
-/// Fold the record a previous build left into the fresh decision.
+/// Rewrite every compiled-in string that starts with an anchored
+/// spelling, the directory itself or a path below it, in the bundled
+/// copies: its first [`anchors::ANCHOR_PREFIX_LEN`] bytes become the
+/// anchor root and the rest stays. Strings are whole NUL-terminated ones
+/// in loadable read-only data, `.dynstr` excluded, and a spelling matches
+/// only up to a separator, so a longer name that shares the prefix is
+/// untouched. A string is judged by the longest of the anchored and the
+/// `kept` spellings it is or lies below, so a path below an anchored
+/// directory that a carried directory or a recipe pair answers for
+/// differently ([`kept_spellings`]) keeps its bytes. A binary carrying
+/// an embedded payload is left alone, as every other in-place writer
+/// leaves it.
 ///
-/// A destination the record anchors stays anchored whatever the fresh
-/// decision says: the tree's copies already name its key, and no other
-/// mechanism reaches through a rewritten string. A destination the drop
-/// pass emptied leaves. The record's keys are positional over its
-/// sorted entries, so the merged anchor list takes canonical keys from
-/// its own order, and an anchor whose key the merge would move stops
-/// the build: the existing rewrites name the old key, and a moved key
-/// would resolve them to the wrong directory. A fresh tree bundles
-/// every directory whole and is the way out.
-pub(crate) fn merge(
-    fresh: Vec<Redirection>,
-    persisted: &[anchors::Anchor],
-    directory: &Path,
-) -> io::Result<Vec<Redirection>> {
-    if persisted.is_empty() {
-        return Ok(fresh);
-    }
-    // Every destination the record still anchors, plus every fresh
-    // anchor, sorted the way the record orders its entries. A fresh
-    // decision for a destination the record anchors loses: the rewrite
-    // is already in the tree's bytes.
-    let mut candidates: Vec<String> = persisted
-        .iter()
-        .filter(|anchor| directory.join(&anchor.relative).is_dir())
-        .map(|anchor| anchor.relative.clone())
-        .collect();
-    candidates.extend(
-        fresh
-            .iter()
-            .filter(|r| r.mechanism == Mechanism::Anchor && !persisted_anchored(persisted, &r.dest))
-            .map(|r| r.dest.to_string_lossy().into_owned()),
-    );
-    candidates.sort();
-    candidates.dedup();
-    let assigned = anchors::assign(candidates).map_err(io::Error::other)?;
-    for anchor in persisted {
-        let Some(merged) = assigned
-            .iter()
-            .find(|merged| merged.relative == anchor.relative)
-        else {
-            continue;
-        };
-        if merged.key != anchor.key {
-            return Err(io::Error::other(format!(
-                "anchor {} names {} in the tree's record but the merged anchors assign it to {}; \
-                 bundle a fresh tree",
-                anchor.key, anchor.relative, merged.key,
-            )));
-        }
-    }
-    let mut merged: Vec<Redirection> = assigned
-        .iter()
-        .map(|anchor| Redirection {
-            source: None,
-            dest: PathBuf::from(&anchor.relative),
-            mechanism: Mechanism::Anchor,
-            key: Some(anchor.key.clone()),
-        })
-        .collect();
-    merged.extend(
-        fresh.into_iter().filter(|r| {
-            r.mechanism != Mechanism::Anchor && !persisted_anchored(persisted, &r.dest)
-        }),
-    );
-    merged.sort_by(|a, b| a.dest.cmp(&b.dest));
-    Ok(merged)
-}
-
-/// Whether the record anchors `dest`.
-pub(crate) fn persisted_anchored(persisted: &[anchors::Anchor], dest: &Path) -> bool {
-    persisted
-        .iter()
-        .any(|anchor| Path::new(&anchor.relative) == dest)
-}
-
-/// Rewrite every exact occurrence of an anchored directory's compiled-in
-/// spellings in the bundled copies to the anchor path, padded with NUL
-/// bytes to the original length. Occurrences are whole NUL-terminated
-/// strings in loadable read-only data, `.dynstr` excluded, so a longer
-/// path that shares the prefix without a separator is untouched.
-///
-/// Returns the number of files changed and the number of occurrences
+/// Returns the number of files changed and the number of strings
 /// rewritten. The bytes land before the ledger attests them, so the
 /// recorded hashes are the rewritten ones.
 pub(crate) fn rewrite_anchors(
     redirections: &[Redirection],
-    dirs: &[&InferredDir],
+    kept: &[&str],
     files: &[PathBuf],
 ) -> io::Result<(usize, usize)> {
-    let mut patterns: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for r in redirections {
-        let (Mechanism::Anchor, Some(key)) = (&r.mechanism, &r.key) else {
-            continue;
-        };
-        let Some(dir) = dirs.iter().find(|dir| dir.destination == r.dest) else {
-            continue;
-        };
-        let anchor = anchors::Anchor {
-            key: key.clone(),
-            relative: r.dest.to_string_lossy().into_owned(),
-        };
-        for spelling in &dir.compiled {
-            patterns.push(padded_pair(spelling, &anchor, &r.dest)?);
-        }
+    let mut spellings: HashMap<&[u8], bool> = kept
+        .iter()
+        .map(|spelling| (spelling.as_bytes(), false))
+        .collect();
+    let mut any = false;
+    for spelling in redirections
+        .iter()
+        .filter(|r| r.mechanism == Mechanism::Anchor)
+        .flat_map(|r| r.spellings.iter())
+        .map(|spelling| spelling.as_bytes())
+        .filter(|spelling| spelling.len() > anchors::ANCHOR_PREFIX_LEN)
+    {
+        spellings.insert(spelling, true);
+        any = true;
     }
-    if patterns.is_empty() {
+    if !any {
         return Ok((0, 0));
     }
-    patterns.sort();
-    patterns.dedup();
     let mut files_changed = 0;
     let mut occurrences = 0;
     for file in files {
         let mut data = fs::read(file)?;
-        let ranges = super::infer::read_only_ranges(&data);
-        if ranges.is_empty() {
+        if super::elf::has_embedded_payload(&data) {
             continue;
         }
+        let ranges = super::infer::read_only_ranges(&data);
         let mut modified = false;
         for (start, end) in ranges {
-            for (pattern, replacement) in &patterns {
-                let mut from = start;
-                while let Some(found) = find(&data[from..end], pattern) {
-                    let at = from + found;
-                    let preceded = at == start || data[at - 1] == 0;
-                    if preceded {
-                        data[at..at + pattern.len()].copy_from_slice(replacement);
-                        modified = true;
-                        occurrences += 1;
-                    }
-                    from = at + pattern.len();
-                    if from + pattern.len() > end {
-                        break;
-                    }
+            let mut at = start;
+            while at < end {
+                let len = data[at..end]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(end - at);
+                if anchored(&data[at..at + len], &spellings) {
+                    data[at..at + anchors::ANCHOR_PREFIX_LEN]
+                        .copy_from_slice(anchors::ANCHOR_PREFIX.as_bytes());
+                    modified = true;
+                    occurrences += 1;
                 }
+                at += len + 1;
             }
         }
         if modified {
-            // The copy step may have left the file owner-read-only, and
-            // a hardlink may share its inode, so the write follows
-            // finalize_tree: give the file its own inode, grant the
-            // owner write, then re-pin the mtime and restore the mode
-            // the copy step left. A link that cannot be detached would
-            // carry the write to the file it shares its inode with, so
-            // the rewrite refuses rather than proceed.
-            super::elf::break_hardlink(file)?;
-            let perms = fs::metadata(file)
-                .map(|m| m.permissions().mode())
-                .unwrap_or(0o755);
-            let needs_chmod = perms & 0o200 == 0;
-            if needs_chmod {
-                let _ = fs::set_permissions(file, PermissionsExt::from_mode(perms | 0o200));
-            }
-            let written = fs::write(file, &data);
-            super::normalize_mtime(file);
-            if needs_chmod {
-                let _ = fs::set_permissions(file, PermissionsExt::from_mode(perms));
-            }
-            written?;
+            write_in_place(file, &data)?;
             files_changed += 1;
         }
     }
     Ok((files_changed, occurrences))
 }
 
-/// The NUL-terminated pattern for `spelling` and its replacement, the
-/// anchor path padded with NUL bytes to the pattern's length. The
-/// window is the spelling plus its terminator, and the replacement
-/// must leave a terminator: a spelling shorter than the anchor path
-/// cannot be padded, so the rewrite would run over it.
-fn padded_pair(
-    spelling: &str,
-    anchor: &anchors::Anchor,
-    dest: &Path,
-) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let replacement = anchor.path().into_bytes();
-    let mut pattern = spelling.as_bytes().to_vec();
-    pattern.push(0);
-    if spelling.len() < replacement.len() {
-        return Err(io::Error::other(format!(
-            "compiled-in path {spelling} is shorter than its anchor path {} for {}, \
-             so it cannot be rewritten; bundle a fresh tree",
-            anchor.path(),
-            dest.display()
-        )));
-    }
-    let mut bytes = replacement;
-    bytes.resize(pattern.len(), 0);
-    Ok((pattern, bytes))
-}
-
-/// A fresh anchor's spellings must fit the key the merged assignment
-/// gave it before the record lands: `choose` checked them against the
-/// key the fresh assignment alone produced, and the record's entries
-/// sort in ahead of the fresh ones, so the merged key can be longer
-/// and the rewrite would refuse a decision already recorded. A
-/// destination the record already anchors was rewritten under exactly
-/// the key the merge keeps, so it fits by construction.
-pub(crate) fn ensure_spellings_fit(
+/// The spellings among `answers`, each with the bundle directory that
+/// answers for it, that lie below an anchored spelling but name another
+/// directory than the one the anchor's link would reach there, so the
+/// enclosing rewrite must leave them alone. A spelling the anchor
+/// reaches correctly, a directory nested in its anchored parent's copy
+/// say, is left to that rewrite, which needs no namespace.
+pub(crate) fn kept_spellings<'a>(
     redirections: &[Redirection],
-    persisted: &[anchors::Anchor],
-    dirs: &[&InferredDir],
-) -> io::Result<()> {
-    for r in redirections {
-        let (Mechanism::Anchor, Some(key)) = (&r.mechanism, &r.key) else {
-            continue;
-        };
-        if persisted
-            .iter()
-            .any(|anchor| Path::new(&anchor.relative) == r.dest)
-        {
+    answers: &[(&'a str, &'a Path)],
+) -> Vec<&'a str> {
+    let anchored: Vec<(&str, &Path)> = redirections
+        .iter()
+        .filter(|r| r.mechanism == Mechanism::Anchor)
+        .flat_map(|r| r.spellings.iter().map(|s| (s.as_str(), r.dest.as_path())))
+        .collect();
+    let mut out = Vec::new();
+    for &(spelling, answer) in answers {
+        if anchored.iter().any(|(a, _)| *a == spelling) {
             continue;
         }
-        let Some(dir) = dirs.iter().find(|dir| dir.destination == r.dest) else {
-            continue;
-        };
-        let anchor = anchors::Anchor {
-            key: key.clone(),
-            relative: r.dest.to_string_lossy().into_owned(),
-        };
-        for spelling in &dir.compiled {
-            padded_pair(spelling, &anchor, &r.dest)?;
+        let enclosing = anchored
+            .iter()
+            .filter(|(a, _)| {
+                spelling.len() > a.len()
+                    && spelling.starts_with(a)
+                    && spelling.as_bytes()[a.len()] == b'/'
+            })
+            .max_by_key(|(a, _)| a.len());
+        if let Some((a, dest)) = enclosing
+            && dest.join(&spelling[a.len() + 1..]) != answer
+        {
+            out.push(spelling);
         }
     }
-    Ok(())
+    out
 }
 
-/// The first offset of `pattern` in `data`, or `None`.
-fn find(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    if pattern.is_empty() || data.len() < pattern.len() {
-        return None;
+/// Where the anchor record `persisted` sends `spelling`: the directory
+/// of the record's key for it, or of a recorded key it lies below.
+pub(crate) fn recorded_reach(persisted: &[anchors::Anchor], spelling: &str) -> Option<PathBuf> {
+    let key = anchors::key_of(spelling)?;
+    persisted.iter().find_map(|anchor| {
+        if anchor.key == key {
+            Some(PathBuf::from(&anchor.relative))
+        } else if anchors::key_below(&key, &anchor.key) {
+            Some(Path::new(&anchor.relative).join(&key[anchor.key.len() + 1..]))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether any of `files` holds `spelling` as an earlier rewrite left
+/// it: the anchor root over its first bytes, as a whole string or
+/// followed by a separator.
+pub(crate) fn rewritten_in(files: &[PathBuf], spelling: &str) -> io::Result<bool> {
+    let Some(tail) = spelling.get(anchors::ANCHOR_PREFIX_LEN..) else {
+        return Ok(false);
+    };
+    key_in_use(files, tail)
+}
+
+/// The anchored paths `files` carry: every string the anchor root
+/// starts, with the separators after the root left out, the way a key
+/// leaves them out.
+pub(crate) fn anchor_tails(files: &[PathBuf]) -> io::Result<BTreeSet<String>> {
+    let root = anchors::ANCHOR_PREFIX.as_bytes();
+    let mut out = BTreeSet::new();
+    for file in files {
+        let data = fs::read(file)?;
+        for (at, w) in data.windows(root.len()).enumerate() {
+            if w != root {
+                continue;
+            }
+            let rest = &data[at + root.len()..];
+            let rest = &rest[rest.iter().take_while(|&&b| b == b'/').count()..];
+            let end = rest
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(rest.len())
+                .min(4096);
+            if end > 0 {
+                out.insert(String::from_utf8_lossy(&rest[..end]).into_owned());
+            }
+        }
     }
-    (0..=data.len() - pattern.len()).find(|at| &data[*at..at + pattern.len()] == pattern)
+    Ok(out)
+}
+
+/// Whether any of `files` holds a string that resolves through the
+/// anchor `key`: the anchor root, any further separators, since a key
+/// leaves out the ones its path had there, and the key, whole or
+/// followed by a separator.
+pub(crate) fn key_in_use(files: &[PathBuf], key: &str) -> io::Result<bool> {
+    let key = key.trim_start_matches('/').as_bytes();
+    let root = anchors::ANCHOR_PREFIX.as_bytes();
+    for file in files {
+        let data = fs::read(file)?;
+        let found = data.windows(root.len()).enumerate().any(|(at, w)| {
+            if w != root {
+                return false;
+            }
+            let rest = &data[at + root.len()..];
+            let rest = &rest[rest.iter().take_while(|&&b| b == b'/').count()..];
+            rest.starts_with(key) && matches!(rest.get(key.len()), Some(0 | b'/'))
+        });
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the longest of `spellings` that `string` is, or is a path
+/// below, is an anchored one.
+fn anchored(string: &[u8], spellings: &HashMap<&[u8], bool>) -> bool {
+    if string.first() != Some(&b'/') || string.len() <= anchors::ANCHOR_PREFIX_LEN {
+        return false;
+    }
+    if let Some(&anchor) = spellings.get(string) {
+        return anchor;
+    }
+    (anchors::ANCHOR_PREFIX_LEN..string.len())
+        .rev()
+        .filter(|&i| string[i] == b'/')
+        .find_map(|i| spellings.get(&string[..i]).copied())
+        .unwrap_or(false)
+}
+
+/// Replace `file`'s bytes with `data` without ever leaving it half
+/// written: a temporary sibling takes the bytes, the mode and the pinned
+/// mtime, then replaces the file. The rename also leaves any hardlink to
+/// the old inode alone.
+fn write_in_place(file: &Path, data: &[u8]) -> io::Result<()> {
+    let mode = fs::symlink_metadata(file)?.permissions().mode() & 0o7777;
+    let name = file
+        .file_name()
+        .ok_or_else(|| io::Error::other(format!("{} names no file", file.display())))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".onelf-anchor-{}", std::process::id()));
+    let tmp = file.with_file_name(tmp_name);
+    let written = fs::write(&tmp, data)
+        .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)))
+        .and_then(|()| {
+            super::normalize_mtime(&tmp);
+            fs::rename(&tmp, file)
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Write `.onelf/anchors` for the anchored redirections whose destination
 /// the tree still carries, and record the file in the generated ledger.
-/// Returns the number of records written. An empty decision drops a
-/// record a previous build left, with its ledger entry.
+/// A key below another resolves through that one's link, so only the
+/// outermost keys enter the record. Returns the number of records
+/// written. An empty decision drops a record a previous build left, with
+/// its ledger entry.
 pub(crate) fn write_record(redirections: &[Redirection], directory: &Path) -> io::Result<usize> {
-    let anchored: Vec<anchors::Anchor> = redirections
+    let mut taken: BTreeMap<&str, &Path> = BTreeMap::new();
+    for r in redirections
         .iter()
-        .filter(|r| {
-            matches!((r.mechanism, &r.key), (Mechanism::Anchor, Some(_))) && r.resolves(directory)
-        })
-        .map(|r| anchors::Anchor {
-            key: r.key.clone().expect("anchored redirection has a key"),
-            relative: r.dest.to_string_lossy().into_owned(),
+        .filter(|r| r.mechanism == Mechanism::Anchor && r.resolves(directory))
+    {
+        for key in &r.keys {
+            taken.insert(key, &r.dest);
+        }
+    }
+    let anchored: Vec<anchors::Anchor> = taken
+        .iter()
+        .filter(|(key, _)| !taken.keys().any(|k| anchors::key_below(key, k)))
+        .map(|(key, dest)| anchors::Anchor {
+            key: (*key).to_owned(),
+            relative: dest.to_string_lossy().into_owned(),
         })
         .collect();
     if anchored.is_empty() {
@@ -810,13 +951,7 @@ mod tests {
             dir(&root, "lib/loong", &["/usr/share/looooooooong"]),
         ];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 2);
         let pairs = record_pairs(&out, &dirs, &[]);
         assert_eq!(
@@ -853,7 +988,8 @@ mod tests {
             source: Some(dirs[0].source.clone()),
             dest: PathBuf::from(std::ffi::OsStr::from_bytes(&raw)),
             mechanism: Mechanism::Pair,
-            key: None,
+            keys: Vec::new(),
+            spellings: Vec::new(),
         }];
         assert!(record_pairs(&survived, &dirs, &[]).is_empty());
         // The limit is named durably: the completeness findings carry
@@ -879,13 +1015,7 @@ mod tests {
         let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
         let dirs = [dir(&root, "lib/fw", &refs)];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Pair);
         let pairs = record_pairs(&out, &dirs, &[]);
@@ -912,13 +1042,7 @@ mod tests {
         let refs: Vec<&str> = spellings.iter().map(String::as_str).collect();
         let dirs = [dir(&root, "lib/fw", &refs)];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         let recipe: Vec<PathPair> = (0..onelf_format::paths::MAX_PAIRS - 5)
             .map(|i| PathPair {
                 absolute: format!("/u/r{i}"),
@@ -958,13 +1082,7 @@ mod tests {
         let refs = ["/u/claimed", "/u/fresh"];
         let dirs = [dir(&root, "lib/fw", &refs)];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         let pairs = record_pairs(&out, &dirs, &recipe);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].absolute, "/u/fresh");
@@ -976,44 +1094,6 @@ mod tests {
                 .all(|f| !f.reason.contains("stay unredirected")),
             "{findings:?}"
         );
-    }
-
-    /// A held carry takes no fresh decision but its pair: a fresh
-    /// anchor over a held destination is dropped (the record restoring
-    /// its anchor and the launch evaluating the environment mapping on
-    /// its own), the planned directory's key stands without a gap, and
-    /// the held pairs re-enter the record a rebuild would lose.
-    #[test]
-    fn a_held_carry_takes_no_fresh_decision_but_its_pair() {
-        use std::collections::HashSet;
-        let root = temp_root("redir-held");
-        let held_pair = dir(&root, "lib/hp", &["/u/hp"]);
-        let held_anchor = dir(&root, "lib/ha", &["/usr/share/held-anchor"]);
-        let planned_anchor = dir(&root, "lib/pa", &["/usr/share/planned-anchor"]);
-        let dirs = [held_pair, held_anchor, planned_anchor];
-        let held: HashSet<PathBuf> = ["lib/hp", "lib/ha"].iter().map(PathBuf::from).collect();
-        let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(&refs, &[], &["lib".to_string()], &root, &held);
-        let kept: Vec<(&Path, Mechanism, Option<&str>)> = out
-            .iter()
-            .map(|r| (r.dest.as_path(), r.mechanism, r.key.as_deref()))
-            .collect();
-        assert_eq!(
-            kept,
-            vec![
-                (Path::new("lib/ha"), Mechanism::Pair, None),
-                (Path::new("lib/hp"), Mechanism::Pair, None),
-                // The planned directory's key is the first of the
-                // surviving anchor set: the held ones consumed none.
-                (Path::new("lib/pa"), Mechanism::Anchor, Some("a")),
-            ]
-        );
-        // Both held directories' pairs re-enter the record: the
-        // rebuild restores what it would otherwise lose. The planned
-        // directory is anchored, so it names none.
-        let pairs = record_pairs(&out, &dirs, &[]);
-        let relatives: Vec<&str> = pairs.iter().map(|p| p.relative.as_str()).collect();
-        assert_eq!(relatives, vec!["lib/hp", "lib/ha"]);
     }
 
     /// A pair redirection matches its directory by source as well as
@@ -1030,13 +1110,7 @@ mod tests {
         };
         let dirs = [decoy, carried];
         let refs: Vec<&InferredDir> = dirs[1..].iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Pair);
         let pairs = record_pairs(&out, &dirs, &[]);
@@ -1070,16 +1144,10 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
-        assert_eq!(out[0].key, None);
+        assert!(out[0].keys.is_empty());
     }
 
     /// A directory the descriptors never name anchors when its compiled
@@ -1093,16 +1161,14 @@ mod tests {
             &["lib/appdiraaaaaaaaaaaaaaaaaaaa"],
         )];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
-        assert!(out[0].key.is_some());
+        assert_eq!(out[0].keys, vec!["a".repeat(19)]);
+        assert_eq!(
+            out[0].spellings,
+            vec!["lib/appdiraaaaaaaaaaaaaaaaaaaa".to_string()]
+        );
     }
 
     /// A directory whose only compiled spelling is too short for the
@@ -1112,44 +1178,10 @@ mod tests {
         let root = temp_root("redir-pair");
         let dirs = [dir(&root, "lib/s", &["lib/s"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Pair);
-        assert_eq!(out[0].key, None);
-    }
-
-    /// Anchors go to the destinations in sorted order: the earlier
-    /// destination keeps the short key, and one long-enough competitor
-    /// stays anchored while a short one beside it falls to the pair, so
-    /// the short key is never wasted on a directory that cannot use it.
-    #[test]
-    fn short_competitor_does_not_waste_a_short_key() {
-        let root = temp_root("redir-keep");
-        let mut dirs = [
-            dir(&root, "lib/b", &["lib/b"]),
-            dir(&root, "lib/aaaaaaaaaa", &["lib/aaaaaaaaaaaaaaaaaaaa"]),
-        ];
-        dirs.sort_by(|a, b| a.destination.cmp(&b.destination));
-        let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].dest, Path::new("lib/aaaaaaaaaa"));
-        assert_eq!(out[0].mechanism, Mechanism::Anchor);
-        assert_eq!(out[0].key.as_deref(), Some("a"));
-        assert_eq!(out[1].dest, Path::new("lib/b"));
-        assert_eq!(out[1].mechanism, Mechanism::Pair);
+        assert!(out[0].keys.is_empty());
     }
 
     /// The build directory's own spelling does not flip the decision:
@@ -1177,13 +1209,7 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -1222,7 +1248,8 @@ mod tests {
             &refs_rules,
             &["lib".to_string(), "lib/a".to_string()],
             &root,
-            &std::collections::HashSet::new(),
+            &[],
+            &[],
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
@@ -1252,13 +1279,7 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
@@ -1284,13 +1305,7 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -1326,13 +1341,7 @@ mod tests {
             )],
         )];
         let refs_rules: Vec<&Descriptor> = rules.iter().collect();
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Env);
     }
@@ -1359,13 +1368,7 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = [&rules];
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
@@ -1400,7 +1403,8 @@ mod tests {
             &refs_rules,
             &["lib".to_string(), "lib64".to_string()],
             &root,
-            &std::collections::HashSet::new(),
+            &[],
+            &[],
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
@@ -1430,95 +1434,44 @@ mod tests {
             inheritance: Inheritance::Replace,
         }];
         let refs_rules = vec![&rules];
-        let out = choose(
-            &refs,
-            &refs_rules,
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &refs_rules, &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
     }
 
-    /// A spelling exactly as long as the anchor path carries it; one
-    /// byte short does not.
+    /// A spelling one byte longer than the anchor prefix carries a key;
+    /// one no longer than the prefix leaves nothing to key on.
     #[test]
     fn spelling_length_boundary_at_the_anchor_path() {
-        // "/dev/fd/77/a" is 12 bytes.
+        // "/dev/fd/77/" is 11 bytes.
         let root = temp_root("redir-boundary");
         let dirs = [dir(&root, "lib/b", &["lib/b1234567"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out[0].mechanism, Mechanism::Anchor);
 
         let root = temp_root("redir-boundary-short");
         let dirs = [dir(&root, "lib/b", &["lib/b123456"])];
         let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
         assert_eq!(out[0].mechanism, Mechanism::Pair);
-    }
-
-    /// The final keys are never longer than the provisional ones the
-    /// eligibility check used: with twenty-six short competitors ahead of
-    /// it, the one eligible directory takes the key the filtered set
-    /// gives it, the single letter, though its provisional key was the
-    /// two-letter one.
-    #[test]
-    fn filtered_keys_shrink_with_the_set() {
-        let root = temp_root("redir-shrink");
-        let mut dirs: Vec<InferredDir> = (1..=26)
-            .map(|n| {
-                let dest = format!("lib/comp{n:02}");
-                dir(&root, &dest, &[&dest])
-            })
-            .collect();
-        dirs.push(dir(&root, "lib/zz", &["lib/zzaaaaaaaaaaaaaaaaaaaaaaaa"]));
-        dirs.sort_by(|a, b| a.destination.cmp(&b.destination));
-        let refs: Vec<&InferredDir> = dirs.iter().collect();
-        let out = choose(
-            &refs,
-            &[],
-            &["lib".to_string()],
-            &root,
-            &std::collections::HashSet::new(),
-        );
-        assert_eq!(out.len(), 27);
-        let eligible = out
-            .iter()
-            .find(|r| r.dest == Path::new("lib/zz"))
-            .expect("the eligible directory is reported");
-        assert_eq!(eligible.mechanism, Mechanism::Anchor);
-        assert_eq!(eligible.key.as_deref(), Some("a"));
-        assert!(
-            out.iter()
-                .all(|r| r.dest == Path::new("lib/zz") || r.mechanism == Mechanism::Pair),
-            "every short competitor takes the overlay"
-        );
     }
 
     const READ: u32 = 4;
 
     /// An anchored redirection over a directory with the given compiled
-    /// spellings.
-    fn anchored(dir: &InferredDir, key: &str) -> Redirection {
+    /// spellings, keyed by their tails.
+    fn anchored(dir: &InferredDir) -> Redirection {
         Redirection {
             source: Some(dir.source.clone()),
             dest: dir.destination.clone(),
             mechanism: Mechanism::Anchor,
-            key: Some(key.to_string()),
+            keys: dir
+                .compiled
+                .iter()
+                .filter_map(|s| anchors::key_of(s))
+                .collect(),
+            spellings: dir.compiled.iter().cloned().collect(),
         }
     }
 
@@ -1527,7 +1480,8 @@ mod tests {
             source: None,
             dest: PathBuf::from(relative),
             mechanism: Mechanism::Anchor,
-            key: Some(key.to_string()),
+            keys: vec![key.to_string()],
+            spellings: Vec::new(),
         }
     }
 
@@ -1598,11 +1552,12 @@ mod tests {
         f
     }
 
-    /// Every exact occurrence of every spelling becomes the anchor path
-    /// padded with NUL bytes to the original length, and nothing else
-    /// changes: a longer path that shares the prefix without a separator
-    /// keeps its bytes, a spelling preceded by other bytes is not a
-    /// whole string, and the file length is unchanged.
+    /// Every string that starts with an anchored spelling, the directory
+    /// itself or a path below it, takes the anchor root over its first
+    /// bytes and keeps the rest; nothing else changes. A longer name that
+    /// shares the prefix without a separator keeps its bytes, a spelling
+    /// preceded by other bytes is not a whole string, and every string
+    /// keeps its length, so a library measuring it sees no padding.
     #[test]
     fn rewrite_hits_whole_spellings_only() {
         let root = temp_root("redir-rewrite");
@@ -1612,33 +1567,225 @@ mod tests {
             &[
                 "/usr/share/fw",
                 "/usr/share/fwalias",
-                "/usr/share/fw/sub",
+                "/usr/share/fw/sub/a.conf",
+                "/usr/share/fwx",
                 "x/usr/share/fw",
             ],
         )]);
         let file = root.join("lib/libfw.so");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, &data).unwrap();
-        let redirection = anchored(&dir, "a");
         let (files, occurrences) =
-            rewrite_anchors(&[redirection], &[&dir], std::slice::from_ref(&file)).unwrap();
-        assert_eq!((files, occurrences), (1, 2));
+            rewrite_anchors(&[anchored(&dir)], &[], std::slice::from_ref(&file)).unwrap();
+        assert_eq!((files, occurrences), (1, 3));
         let rewritten = fs::read(&file).unwrap();
         assert_eq!(rewritten.len(), data.len(), "the file length is unchanged");
-        assert!(rewritten.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"));
-        assert!(!rewritten.windows(13).any(|w| w == b"/usr/share/fw\0"));
+        let has = |needle: &[u8]| rewritten.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"\0/dev/fd/77/fw\0"));
+        assert!(has(b"\0/dev/fd/77/fwalias\0"));
         assert!(
-            rewritten
-                .windows("/usr/share/fw/sub\0".len())
-                .any(|w| w == b"/usr/share/fw/sub\0"),
-            "a longer path sharing the prefix keeps its bytes"
+            has(b"\0/dev/fd/77/fw/sub/a.conf\0"),
+            "a path below the directory"
         );
+        assert!(!has(b"\0/usr/share/fw\0"));
+        assert!(has(b"\0/usr/share/fwx\0"), "a longer name keeps its bytes");
         assert!(
-            rewritten
-                .windows("x/usr/share/fw\0".len())
-                .any(|w| w == b"x/usr/share/fw\0"),
+            has(b"x/usr/share/fw\0"),
             "a spelling preceded by other bytes is not a whole string"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A shorter string the linker stored inside a rewritten path's tail
+    /// keeps its bytes: only the prefix moves, so `"input"` inside
+    /// `"/usr/share/libinput"` still reads `"input"`.
+    #[test]
+    fn a_tail_merged_string_survives_the_rewrite() {
+        let root = temp_root("redir-rewrite-tail");
+        let dir = dir(&root, "share/libinput", &["/usr/share/libinput"]);
+        let data = crate::bundle::infer::test_elf(&[(READ, &["/usr/share/libinput"])]);
+        let at = data
+            .windows(b"/usr/share/libinput\0".len())
+            .position(|w| w == b"/usr/share/libinput\0")
+            .unwrap();
+        let file = root.join("lib/libinput.so");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, &data).unwrap();
+        rewrite_anchors(&[anchored(&dir)], &[], std::slice::from_ref(&file)).unwrap();
+        let rewritten = fs::read(&file).unwrap();
+        assert_eq!(&rewritten[at..at + 20], b"/dev/fd/77/libinput\0");
+        assert_eq!(&rewritten[at + 14..at + 20], b"input\0", "the inner string");
+        assert_eq!(
+            &rewritten[at + 11..at + 20],
+            b"libinput\0",
+            "the inner string"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A path below an anchored directory that another spelling answers
+    /// for keeps its bytes: the longest spelling a string starts with
+    /// decides, so a pair below an anchor is not overridden by it.
+    #[test]
+    fn rewrite_leaves_a_path_another_spelling_answers() {
+        let root = temp_root("redir-rewrite-longest");
+        let parent = dir(&root, "share/alsa", &["/usr/share/alsa"]);
+        let file = root.join("lib/libfw.so");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            crate::bundle::infer::test_elf(&[(
+                READ,
+                &[
+                    "/usr/share/alsa/alsa.conf",
+                    "/usr/share/alsa/other",
+                    "/usr/share/alsa/other/x.conf",
+                ],
+            )]),
+        )
+        .unwrap();
+        let (_, occurrences) = rewrite_anchors(
+            &[anchored(&parent)],
+            &["/usr/share/alsa/other"],
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+        assert_eq!(occurrences, 1);
+        let rewritten = fs::read(&file).unwrap();
+        let has = |needle: &[u8]| rewritten.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"/dev/fd/77/alsa/alsa.conf\0"));
+        assert!(has(b"/usr/share/alsa/other\0"));
+        assert!(has(b"/usr/share/alsa/other/x.conf\0"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A spelling below an anchored one is kept out of the rewrite only
+    /// when it names another directory than the anchor's link reaches
+    /// there; one the anchor reaches correctly is left to it.
+    #[test]
+    fn only_a_differently_answered_nested_spelling_is_kept() {
+        let root = temp_root("redir-kept");
+        let parent = dir(&root, "share/alsa", &["/usr/share/alsa"]);
+        let nested = dir(&root, "share/alsa/ucm2", &["/usr/share/alsa/ucm2"]);
+        let stray = dir(&root, "share/elsewhere", &["/usr/share/alsa/other"]);
+        let outside = dir(&root, "share/fw", &["/usr/share/fw"]);
+        let kept = kept_spellings(
+            &[anchored(&parent)],
+            &[&parent, &nested, &stray, &outside]
+                .iter()
+                .flat_map(|d| {
+                    d.compiled
+                        .iter()
+                        .map(|s| (s.as_str(), d.destination.as_path()))
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(kept, vec!["/usr/share/alsa/other"]);
+    }
+
+    /// The anchored paths a tree object carries are read with the
+    /// separators after the anchor root left out.
+    #[test]
+    fn anchor_tails_reads_every_anchored_path() {
+        let root = temp_root("redir-tails");
+        let file = root.join("lib/libfw.so");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            crate::bundle::infer::test_elf(&[(
+                READ,
+                &["/dev/fd/77/fw/a.conf", "/dev/fd/77//share/wfw"],
+            )]),
+        )
+        .unwrap();
+        let tails = anchor_tails(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(
+            tails.into_iter().collect::<Vec<_>>(),
+            vec!["fw/a.conf".to_string(), "share/wfw".to_string()]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A spelling a recipe pair names for another directory takes no
+    /// key, so the directory takes the overlay and the recipe's pair
+    /// answers for it; a recipe pair that agrees leaves the anchor.
+    #[test]
+    fn a_recipe_pair_for_another_directory_takes_the_spelling() {
+        let root = temp_root("redir-claimed");
+        let fw = dir(&root, "share/fw", &["/usr/share/fw"]);
+        let refs: Vec<&InferredDir> = vec![&fw];
+        let pair = |relative: &str| PathPair {
+            absolute: "/usr/share/fw".to_string(),
+            relative: relative.to_string(),
+        };
+        let lib = ["lib".to_string()];
+        let out = choose(&refs, &[], &lib, &root, &[], &[pair("share/other")]);
+        assert_eq!(out[0].mechanism, Mechanism::Pair);
+        let out = choose(&refs, &[], &lib, &root, &[], &[pair("share/fw")]);
+        assert_eq!(out[0].mechanism, Mechanism::Anchor);
+        assert_eq!(
+            kept_spellings(&out, &[("/usr/share/fw/x", Path::new("share/other"))]),
+            vec!["/usr/share/fw/x"]
+        );
+        assert!(kept_spellings(&out, &[("/usr/share/fw/x", Path::new("share/fw/x"))]).is_empty());
+        // A destination the record already anchors keeps its key, since
+        // the tree's copies may carry it.
+        fs::create_dir_all(root.join("share/fw")).unwrap();
+        let persisted = [anchors::Anchor {
+            key: "fw".to_string(),
+            relative: "share/fw".to_string(),
+        }];
+        let out = choose(&refs, &[], &lib, &root, &persisted, &[pair("share/other")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mechanism, Mechanism::Anchor);
+        // A spelling the record does not hold yet still honours the
+        // recipe: it takes no key, and the recipe's own pair answers for
+        // it, so the destination keeps only its anchor.
+        let linked = dir(&root, "share/fw", &["/usr/share/fw", "/usr/share/link"]);
+        let refs: Vec<&InferredDir> = vec![&linked];
+        let claim = PathPair {
+            absolute: "/usr/share/link".to_string(),
+            relative: "share/other".to_string(),
+        };
+        let out = choose(&refs, &[], &lib, &root, &persisted, &[claim]);
+        let got: Vec<(Mechanism, Vec<String>, Vec<String>)> = out
+            .iter()
+            .map(|r| (r.mechanism, r.keys.clone(), r.spellings.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(
+                Mechanism::Anchor,
+                vec!["fw".to_string()],
+                vec!["/usr/share/fw".to_string()]
+            )]
+        );
+    }
+
+    /// An earlier rewrite is found by the anchor root over the path's
+    /// first bytes, as a whole string or before a separator, and not as
+    /// the start of a longer name.
+    #[test]
+    fn an_earlier_rewrite_is_found_in_the_tree() {
+        let root = temp_root("redir-rewritten-in");
+        let file = |name: &str, string: &str| {
+            let file = root.join(name);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, crate::bundle::infer::test_elf(&[(READ, &[string])])).unwrap();
+            file
+        };
+        let whole = file("whole.so", "/dev/fd/77/fw");
+        let below = file("below.so", "/dev/fd/77/fw/a.conf");
+        let longer = file("longer.so", "/dev/fd/77/fwx");
+        assert!(rewritten_in(std::slice::from_ref(&whole), "/usr/share/fw").unwrap());
+        assert!(rewritten_in(std::slice::from_ref(&below), "/usr/share/fw").unwrap());
+        assert!(!rewritten_in(std::slice::from_ref(&longer), "/usr/share/fw").unwrap());
+        // A path with a separator right after the overwritten bytes keeps
+        // it in the rewrite, while its key leaves it out.
+        let slashed = file("slashed.so", "/dev/fd/77//share/wfw");
+        assert!(key_in_use(std::slice::from_ref(&slashed), "share/wfw").unwrap());
+        assert!(rewritten_in(std::slice::from_ref(&slashed), "/var/tmp/fv/share/wfw").unwrap());
+        assert!(!key_in_use(std::slice::from_ref(&slashed), "share/wf").unwrap());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1655,8 +1802,7 @@ mod tests {
             crate::bundle::infer::test_elf(&[(READ, &["/other/thing"])]),
         )
         .unwrap();
-        let redirection = anchored(&dir, "a");
-        let (files, occurrences) = rewrite_anchors(&[redirection], &[&dir], &[file]).unwrap();
+        let (files, occurrences) = rewrite_anchors(&[anchored(&dir)], &[], &[file]).unwrap();
         assert_eq!((files, occurrences), (0, 0));
         let _ = fs::remove_dir_all(&root);
     }
@@ -1675,7 +1821,8 @@ mod tests {
                 source: None,
                 dest: PathBuf::from("lib/kept"),
                 mechanism: Mechanism::Env,
-                key: None,
+                keys: Vec::new(),
+                spellings: Vec::new(),
             },
             anchor("b", "share/gone"),
         ];
@@ -1723,145 +1870,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A mechanism resolves while the tree still holds its bundled
-    /// directory, and not after the drop pass removed it.
+    /// A mechanism resolves while the tree holds its bundled directory,
+    /// and not when the tree lacks it.
     #[test]
     fn resolves_follows_the_tree() {
         let root = temp_root("redir-resolves");
         fs::create_dir_all(root.join("share/fw")).unwrap();
         assert!(anchor("a", "share/fw").resolves(&root));
         assert!(!anchor("a", "share/gone").resolves(&root));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    fn persisted_anchor(key: &str, relative: &str) -> onelf_format::anchors::Anchor {
-        onelf_format::anchors::Anchor {
-            key: key.to_string(),
-            relative: relative.to_string(),
-        }
-    }
-
-    /// A quiet re-run, whose fresh decision is empty because the rewrite
-    /// erased discovery's input, restores every persisted anchor the tree
-    /// still carries, under the record's own keys.
-    #[test]
-    fn merge_restores_persisted_anchors_on_a_quiet_rerun() {
-        let root = temp_root("redir-merge-quiet");
-        fs::create_dir_all(root.join("share/fw")).unwrap();
-        fs::create_dir_all(root.join("share/other")).unwrap();
-        let persisted = [
-            persisted_anchor("a", "share/fw"),
-            persisted_anchor("b", "share/other"),
-        ];
-        let merged = merge(Vec::new(), &persisted, &root).unwrap();
-        assert_eq!(
-            merged,
-            [anchor("a", "share/fw"), anchor("b", "share/other")]
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A persisted anchor whose destination the tree no longer carries
-    /// leaves the decision, as long as no key behind it moves: the
-    /// dropped entry sorted last, so the rest keeps its keys.
-    #[test]
-    fn merge_drops_a_persisted_anchor_whose_tree_left() {
-        let root = temp_root("redir-merge-dropped");
-        fs::create_dir_all(root.join("share/fw")).unwrap();
-        let persisted = [
-            persisted_anchor("a", "share/fw"),
-            persisted_anchor("b", "share/gone"),
-        ];
-        let merged = merge(Vec::new(), &persisted, &root).unwrap();
-        assert_eq!(merged, [anchor("a", "share/fw")]);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// The record's keys are positional over its sorted entries, so a
-    /// merge that would hand a carried destination a different key
-    /// cannot stand in for the existing rewrites and stops the build.
-    #[test]
-    fn merge_refuses_to_move_a_persisted_key() {
-        let root = temp_root("redir-merge-move");
-        fs::create_dir_all(root.join("share/fw")).unwrap();
-        let persisted = [
-            persisted_anchor("a", "share/gone"),
-            persisted_anchor("b", "share/fw"),
-        ];
-        let err = merge(Vec::new(), &persisted, &root).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("anchor b names share/fw in the tree's record"),
-            "{err}"
-        );
-        assert!(err.to_string().contains("bundle a fresh tree"), "{err}");
-    }
-
-    /// A fresh environment mapping for a destination the record anchors
-    /// loses: the tree's bytes already name the anchor. A fresh mapping
-    /// for any other destination passes through.
-    #[test]
-    fn merge_keeps_a_persisted_anchor_over_a_fresh_env() {
-        let root = temp_root("redir-merge-env");
-        fs::create_dir_all(root.join("share/fw")).unwrap();
-        fs::create_dir_all(root.join("share/new")).unwrap();
-        let fresh = vec![
-            Redirection {
-                source: None,
-                dest: PathBuf::from("share/fw"),
-                mechanism: Mechanism::Env,
-                key: None,
-            },
-            Redirection {
-                source: None,
-                dest: PathBuf::from("share/new"),
-                mechanism: Mechanism::Env,
-                key: None,
-            },
-        ];
-        let merged = merge(fresh, &[persisted_anchor("a", "share/fw")], &root).unwrap();
-        assert_eq!(
-            merged,
-            [
-                anchor("a", "share/fw"),
-                Redirection {
-                    source: None,
-                    dest: PathBuf::from("share/new"),
-                    mechanism: Mechanism::Env,
-                    key: None,
-                },
-            ]
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A spelling shorter than its anchor path cannot be rewritten in
-    /// place, and the rewrite says so loudly instead of padding past the
-    /// string's end. A spelling exactly one byte longer than the anchor
-    /// path, whose window is the path plus its terminator, is the
-    /// shortest one the rewrite accepts.
-    #[test]
-    fn rewrite_refuses_a_spelling_shorter_than_the_anchor_path() {
-        let root = temp_root("redir-rewrite-short");
-        let short_dir = dir(&root, "share/fw", &["/usr/fw"]);
-        let redirection = anchored(&short_dir, "a");
-        let err = rewrite_anchors(&[redirection], &[&short_dir], &[]).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("/usr/fw is shorter than its anchor path /dev/fd/77/a"),
-            "{err}"
-        );
-        let tight_dir = dir(&root, "share/aa", &["/usr/share/f"]);
-        let err = rewrite_anchors(&[anchored(&tight_dir, "aa")], &[&tight_dir], &[]).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("/usr/share/f is shorter than its anchor path /dev/fd/77/aa"),
-            "{err}"
-        );
-        let fitting_dir = dir(&root, "share/ab", &["/usr/share/f"]);
-        let (files, occurrences) =
-            rewrite_anchors(&[anchored(&fitting_dir, "a")], &[&fitting_dir], &[]).unwrap();
-        assert_eq!((files, occurrences), (0, 0), "no files to scan");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1882,12 +1898,8 @@ mod tests {
         let file = root.join("lib/libfw.so");
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, &data).unwrap();
-        let (files, occurrences) = rewrite_anchors(
-            &[anchored(&anchor_dir, "a")],
-            &[&anchor_dir],
-            std::slice::from_ref(&file),
-        )
-        .unwrap();
+        let (files, occurrences) =
+            rewrite_anchors(&[anchored(&anchor_dir)], &[], std::slice::from_ref(&file)).unwrap();
         assert_eq!(
             (files, occurrences),
             (1, 1),
@@ -1902,41 +1914,9 @@ mod tests {
         assert!(
             rewritten[end..]
                 .windows(14)
-                .any(|w| w == b"/dev/fd/77/a\0\0"),
+                .any(|w| w == b"/dev/fd/77/fw\0"),
             "the rodata copy takes the anchor"
         );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A fresh anchor's spellings are re-checked against the key the
-    /// merged assignment handed out: the record's entries sort in
-    /// ahead of the fresh ones, so a key `choose` found long enough
-    /// can grow past a spelling. The record's own anchors are not
-    /// re-checked: the merge keeps their keys, and their bytes carry
-    /// exactly those keys.
-    #[test]
-    fn ensure_spellings_fit_refuses_a_fresh_anchor_the_merged_key_cannot_fit() {
-        let root = temp_root("redir-fit");
-        fs::create_dir_all(root.join("share/aaa")).unwrap();
-        let fresh_dir = dir(&root, "share/fw", &["/usr/share/f"]);
-        let persisted = [anchors::Anchor {
-            key: "a".to_string(),
-            relative: "share/aaa".to_string(),
-        }];
-        let err = ensure_spellings_fit(&[anchor("aa", "share/fw")], &persisted, &[&fresh_dir])
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("/usr/share/f is shorter than its anchor path /dev/fd/77/aa"),
-            "{err}"
-        );
-        let recorded_dir = dir(&root, "share/aaa", &["/a"]);
-        ensure_spellings_fit(
-            &[anchor("aa", "share/aaa")],
-            &persisted,
-            &[&fresh_dir, &recorded_dir],
-        )
-        .expect("the record's own anchor is not re-checked");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1952,12 +1932,8 @@ mod tests {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, &data).unwrap();
         fs::set_permissions(&file, PermissionsExt::from_mode(0o500)).unwrap();
-        let (files, occurrences) = rewrite_anchors(
-            &[anchored(&ro_dir, "a")],
-            &[&ro_dir],
-            std::slice::from_ref(&file),
-        )
-        .unwrap();
+        let (files, occurrences) =
+            rewrite_anchors(&[anchored(&ro_dir)], &[], std::slice::from_ref(&file)).unwrap();
         assert_eq!((files, occurrences), (1, 1));
         let meta = fs::metadata(&file).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o500, "mode restored");
@@ -1967,7 +1943,142 @@ mod tests {
             .unwrap_or(std::time::UNIX_EPOCH);
         assert_eq!(mtime, expected, "mtime re-pinned");
         let rewritten = fs::read(&file).unwrap();
-        assert!(rewritten.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"));
+        assert!(rewritten.windows(14).any(|w| w == b"/dev/fd/77/fw\0"));
+        let _ = fs::remove_dir_all(&root);
+    }
+    fn persisted_anchor(key: &str, relative: &str) -> anchors::Anchor {
+        anchors::Anchor {
+            key: key.to_string(),
+            relative: relative.to_string(),
+        }
+    }
+
+    /// The record a previous build left keeps its keys: its directory
+    /// stays anchored with no fresh spelling at all, a fresh spelling
+    /// that would make a recorded key name another directory takes a
+    /// pair, and a key the record named for a directory the tree lost
+    /// is not handed to a new one, whose bytes could still name it.
+    #[test]
+    fn a_recorded_key_keeps_its_directory() {
+        let root = temp_root("redir-recorded");
+        fs::create_dir_all(root.join("share/fw")).unwrap();
+        let persisted = [
+            persisted_anchor("fw", "share/fw"),
+            persisted_anchor("gone", "share/gone"),
+        ];
+        let clash = dir(&root, "lib/fw", &["/usr/share/fw"]);
+        let retired = dir(&root, "lib/gone", &["/usr/share/gone"]);
+        let fresh = dir(&root, "lib/new", &["/usr/share/new"]);
+        let refs: Vec<&InferredDir> = vec![&clash, &retired, &fresh];
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &persisted, &[]);
+        let got: Vec<(&Path, Mechanism, Vec<String>)> = out
+            .iter()
+            .map(|r| (r.dest.as_path(), r.mechanism, r.keys.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Path::new("lib/fw"), Mechanism::Pair, vec![]),
+                (Path::new("lib/gone"), Mechanism::Pair, vec![]),
+                (
+                    Path::new("lib/new"),
+                    Mechanism::Anchor,
+                    vec!["new".to_string()]
+                ),
+                (
+                    Path::new("share/fw"),
+                    Mechanism::Anchor,
+                    vec!["fw".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// A recorded directory that gains a spelling no key can carry keeps
+    /// its anchor for the rest, and the new spelling alone takes a pair.
+    #[test]
+    fn a_recorded_directory_pairs_a_spelling_it_cannot_anchor() {
+        let root = temp_root("redir-recorded-leftover");
+        fs::create_dir_all(root.join("share/fw")).unwrap();
+        let persisted = [persisted_anchor("fw", "share/fw")];
+        let fw = dir(&root, "share/fw", &["/usr/share/fw", "/u/fw"]);
+        let refs: Vec<&InferredDir> = vec![&fw];
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &persisted, &[]);
+        let got: Vec<(Mechanism, Vec<String>, Vec<String>)> = out
+            .iter()
+            .map(|r| (r.mechanism, r.keys.clone(), r.spellings.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Mechanism::Pair, vec![], vec!["/u/fw".to_string()]),
+                (
+                    Mechanism::Anchor,
+                    vec!["fw".to_string()],
+                    vec!["/usr/share/fw".to_string()]
+                ),
+            ]
+        );
+        let pairs = record_pairs(&out, refs.iter().copied(), &[]);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|p| (p.absolute.as_str(), p.relative.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("/u/fw", "share/fw")]
+        );
+        assert_eq!(
+            descriptions(&out).get("share/fw").map(String::as_str),
+            Some(
+                "redirected by a path pair where the launch has a mount namespace, and \
+                 redirected through /dev/fd/77/fw"
+            )
+        );
+    }
+
+    /// A key below another rides its link when it reaches the same
+    /// directory the parent's link does, and takes a pair when it would
+    /// need a directory of its own there.
+    #[test]
+    fn a_nested_key_must_agree_with_its_parent() {
+        let root = temp_root("redir-nested");
+        let parent = dir(&root, "share/alsa", &["/usr/share/alsa"]);
+        let rider = dir(&root, "share/alsa/ucm2", &["/usr/share/alsa/ucm2"]);
+        let stray = dir(&root, "share/elsewhere", &["/usr/share/alsa/other"]);
+        let refs: Vec<&InferredDir> = vec![&parent, &rider, &stray];
+        let out = choose(&refs, &[], &["lib".to_string()], &root, &[], &[]);
+        let mechanism = |dest: &str| {
+            out.iter()
+                .find(|r| r.dest == Path::new(dest))
+                .map(|r| r.mechanism)
+                .unwrap()
+        };
+        assert_eq!(mechanism("share/alsa"), Mechanism::Anchor);
+        assert_eq!(mechanism("share/alsa/ucm2"), Mechanism::Anchor);
+        assert_eq!(mechanism("share/elsewhere"), Mechanism::Pair);
+    }
+
+    /// The record lists only the outermost keys: a key below another
+    /// resolves through that one's link.
+    #[test]
+    fn the_record_holds_only_outermost_keys() {
+        let root = temp_root("redir-record-nested");
+        fs::create_dir_all(root.join("share/alsa/ucm2")).unwrap();
+        fs::create_dir_all(root.join("share/xkb")).unwrap();
+        let redirections = [
+            anchor("alsa", "share/alsa"),
+            anchor("alsa/ucm2", "share/alsa/ucm2"),
+            Redirection {
+                keys: vec!["X11/xkb".to_string(), "xkb".to_string()],
+                ..anchor("unused", "share/xkb")
+            },
+        ];
+        assert_eq!(write_record(&redirections, &root).unwrap(), 3);
+        let bytes = fs::read(root.join(".onelf/anchors")).unwrap();
+        assert_eq!(
+            bytes,
+            b"X11/xkb\tshare/xkb\nalsa\tshare/alsa\nxkb\tshare/xkb".to_vec()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

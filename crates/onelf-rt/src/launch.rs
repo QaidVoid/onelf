@@ -202,6 +202,17 @@ fn run(launch: &Launch) {
             None
         }
     };
+    // A bundled program started without descriptor 77 reopens the
+    // directory from this path; a launch without anchors leaves no stale
+    // one from a launch that started it.
+    match &_anchors {
+        // SAFETY: the runtime is single-threaded here, before the exec.
+        Some(claim) => unsafe {
+            std::env::set_var(onelf_format::anchors::ANCHOR_DIR_ENV, claim.path())
+        },
+        // SAFETY: as above.
+        None => unsafe { std::env::remove_var(onelf_format::anchors::ANCHOR_DIR_ENV) },
+    }
     // Last, so the mount namespace this may enter holds nothing but the
     // exec that follows.
     match crate::hostpaths::read(launch.pkg) {

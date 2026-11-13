@@ -20086,6 +20086,74 @@ fn a_launch_without_its_anchors_closes_an_inherited_descriptor_77() {
     );
 }
 
+/// A package without anchors leaves descriptor 77 as its caller left
+/// it: the runtime's placeholder closes on exec, whether it was opened
+/// onto 77 because every lower descriptor was taken or moved there, and
+/// a 77 the caller opened reaches the application untouched.
+#[test]
+fn a_package_without_anchors_leaves_descriptor_77_as_its_caller_left_it() {
+    if !have("bash") {
+        skip("bash", "no bash to drive the entrypoint");
+        return;
+    }
+    let td = workdir("anchors-none-77");
+    let app = td.join("app");
+    write(
+        &app.join("bin/run"),
+        "#!/usr/bin/env bash\nreadlink /proc/self/fd/77 || echo CLOSED\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &app.join("onelf.toml"),
+        "[package]\ncommand = \"bin/run\"\n\n[bundle]\nskip = true\n",
+    );
+    let pkg = td.join("plain.onelf");
+    let o = Command::new(onelf())
+        .current_dir(&app)
+        .args(["build", "onelf.toml", "-o", pkg.to_str().unwrap()])
+        .output()
+        .expect("spawn onelf build");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::create_dir_all(td.join("decoy")).unwrap();
+
+    let launch = |prelude: &str| {
+        let mut run = Command::new("bash");
+        run.arg("-c")
+            .arg(format!("{prelude} exec \"$0\""))
+            .arg(&pkg)
+            .arg(td.join("decoy"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache");
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(launch(""), "CLOSED\n", "the placeholder reached the app");
+    assert_eq!(
+        launch("for i in $(seq 3 76); do eval \"exec $i</dev/null\"; done;"),
+        "CLOSED\n",
+        "the placeholder opened onto 77 reached the app"
+    );
+    assert_eq!(
+        launch("exec 77<\"$1\";"),
+        format!("{}\n", td.join("decoy").display()),
+        "the caller's descriptor 77 did not reach the app"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A recorded pair overlays its absolute path when the launch has a
 /// namespace: the bundled copy answers for the path and the host's own
 /// directory is hidden. A launch that cannot overlay says so once,
@@ -20308,6 +20376,83 @@ fn an_anchored_package_does_not_run_from_a_memfd() {
     assert!(!forced.status.success());
     let err = String::from_utf8_lossy(&forced.stderr);
     assert!(err.contains("memfd mode cannot provide"), "{err}");
+}
+
+/// A bundled program started without descriptor 77, as spawners that
+/// close every inherited descriptor start it, reopens the anchor
+/// directory from the path the runtime left in the environment before
+/// its own code runs. A host program has no such hook and finds nothing,
+/// and neither does a bundled one whose environment was cleared.
+#[test]
+fn a_bundled_program_started_without_descriptor_77_reopens_it() {
+    if !have("bash") {
+        skip("bash", "no bash to close the descriptor before the exec");
+        return;
+    }
+    let td = workdir("anchors-reopen");
+    let app = td.join("app");
+    let src = td.join("reader.c");
+    write(
+        &src,
+        "#include <stdio.h>\nint main(void){FILE *f=fopen(\"/dev/fd/77/a/file\",\"r\");\
+         char b[64]={0};if(f&&fgets(b,sizeof b,f))fputs(b,stdout);else puts(\"NOTHING\");\
+         return 0;}\n",
+    );
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(&[src.to_str().unwrap()], &app.join("bin/reader")) {
+        return;
+    }
+    write(&app.join("share/fixture/file"), "ANCHORED\n");
+    write(&app.join(".onelf/anchors"), "a\tshare/fixture");
+    write(
+        &app.join("bin/run"),
+        "#!/usr/bin/env bash\n\
+         here=$(dirname \"$0\")\n\
+         exec 77<&-\n\
+         case \"$1\" in\n\
+         bundled) exec \"$here/reader\" ;;\n\
+         host) cat /dev/fd/77/a/file 2>/dev/null || echo NOTHING ;;\n\
+         cleared) exec env -i \"$here/reader\" ;;\n\
+         esac\n",
+    );
+    std::fs::set_permissions(
+        app.join("bin/run"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    write(
+        &app.join("onelf.toml"),
+        "[package]\nname = \"reopen\"\ncommand = \"bin/run\"\nmtime = 0\n",
+    );
+    let pkg = td.join("reopen.onelf");
+    let mut c = Command::new(onelf());
+    c.args(["build", "onelf.toml", "-o", pkg.to_str().unwrap()])
+        .current_dir(&app);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let o = c.output().expect("spawn onelf build");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for (arg, expected) in [
+        ("bundled", "ANCHORED\n"),
+        ("host", "NOTHING\n"),
+        ("cleared", "NOTHING\n"),
+    ] {
+        let mut run = Command::new(&pkg);
+        run.arg(arg)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", td.to_str().unwrap())
+            .env("ONELF_MODE", "cache");
+        isolate(&mut run, &td);
+        let out = run_package(&mut run);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "{arg}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// An earlier output inside the packed directory is never content, under
@@ -26547,6 +26692,21 @@ fn hostile_user_alsa_snippets_leave_the_private_stack_working() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(o.status.success(), "{log}");
+    // The host's plugin directory is inferred, and the descriptor's
+    // variable redirects it, so the library keeps its compiled-in bytes.
+    let plugins = host_library("libasound.so.2")
+        .and_then(|lib| lib.parent().map(|dir| dir.join("alsa-lib")))
+        .filter(|dir| dir.is_dir());
+    if plugins.is_some() {
+        assert!(log.contains("lib/alsa-lib: environment mapping"), "{log}");
+        let lib = std::fs::read(dir.join("lib/libasound.so.2")).unwrap();
+        assert!(
+            !lib.windows(11).any(|w| w == b"/dev/fd/77/"),
+            "the mapped library was rewritten: {log}"
+        );
+    } else {
+        eprintln!("the host has no ALSA plugin directory to infer; the mapping is not checked");
+    }
     let pkg = dir.join("alsahost.onelf");
     let line = |stdout: &str, key: &str| {
         stdout
@@ -27432,6 +27592,21 @@ fn a_skipped_tree_carries_its_local_mappings_unchecked() {
     );
 }
 
+/// The anchor key a compiled-in spelling takes, the tail after the
+/// anchor prefix.
+fn anchor_key(spelling: &str) -> String {
+    onelf_format::anchors::key_of(spelling).expect("the spelling takes a key")
+}
+
+/// The bytes a rewrite leaves for `spelling`: the anchor prefix over its
+/// start, the rest kept, then the terminator.
+fn anchored_bytes(spelling: &str) -> Vec<u8> {
+    let mut out = onelf_format::anchors::ANCHOR_PREFIX.as_bytes().to_vec();
+    out.extend_from_slice(&spelling.as_bytes()[onelf_format::anchors::ANCHOR_PREFIX_LEN..]);
+    out.push(0);
+    out
+}
+
 /// A host scan reports the directories a library compiles in against the
 /// library's own installation prefix, anchors the copy it carries, and
 /// rewrites the compiled-in spellings in the tree's binaries to the
@@ -27491,6 +27666,14 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
         assert!(out.status.success(), "{err}");
         err
     };
+    let spelling = prefix.join("share/demo").display().to_string();
+    let key = anchor_key(&spelling);
+    let rewritten = anchored_bytes(&spelling);
+    let has = |lib: &[u8]| {
+        lib.windows(rewritten.len())
+            .filter(|w| *w == rewritten.as_slice())
+            .count()
+    };
     let first = run();
     assert!(app.join("lib/libdemo.so.1").is_file());
     assert!(
@@ -27501,7 +27684,7 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
     );
     assert!(
         first.contains("  Redirected inferred directories:")
-            && first.contains("    share/demo: anchor a"),
+            && first.contains(&format!("    share/demo: anchor /dev/fd/77/{key}")),
         "{first}"
     );
     assert!(
@@ -27509,9 +27692,9 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
         "{first}"
     );
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/demo");
+    assert_eq!(record, format!("{key}\tshare/demo").into_bytes());
     let lib = std::fs::read(app.join("lib/libdemo.so.1")).unwrap();
-    assert!(lib.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"));
+    assert_eq!(has(&lib), 1);
 
     let second = run();
     assert!(
@@ -27520,7 +27703,7 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
     );
     assert!(
         second.contains("  Redirected inferred directories:")
-            && second.contains("    share/demo: anchor a"),
+            && second.contains(&format!("    share/demo: anchor /dev/fd/77/{key}")),
         "the record restores the redirect: {second}"
     );
     assert!(
@@ -27533,11 +27716,7 @@ fn a_rerun_reports_compiled_in_directories_against_the_same_prefix() {
         "the record stays byte-identical"
     );
     let lib = std::fs::read(app.join("lib/libdemo.so.1")).unwrap();
-    assert_eq!(
-        lib.windows(14).filter(|w| w == b"/dev/fd/77/a\0\0").count(),
-        1,
-        "no double rewrite"
-    );
+    assert_eq!(has(&lib), 1, "no double rewrite");
 }
 
 /// A library's compiled-in plugin directory is carried as a plugin
@@ -29485,8 +29664,8 @@ fn an_inferred_link_yields_to_a_descriptors_write() {
 }
 
 /// An anchored inferred directory rewrites the library's compiled-in
-/// path to the anchor path in the bundled copy, NUL-padded to the
-/// original length, writes the anchor record beside the package
+/// path to start with the anchor root in the bundled copy, keeping its
+/// length and tail, writes the anchor record beside the package
 /// metadata, and records both in the generated ledger.
 #[test]
 fn an_anchored_directory_rewrites_the_compiled_in_path_to_the_anchor() {
@@ -29514,10 +29693,13 @@ fn an_anchored_directory_rewrites_the_compiled_in_path_to_the_anchor() {
     assert!(out.status.success(), "{err}");
     let compiled = td.join("fp/share/fw");
     let compiled = compiled.to_str().unwrap();
+    let key = anchor_key(compiled);
+    let rewritten = anchored_bytes(compiled);
     let lib = std::fs::read(app.join("lib/libfw.so.1")).unwrap();
     assert!(
-        lib.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"),
-        "the compiled-in path becomes the anchor path: {err}"
+        lib.windows(rewritten.len())
+            .any(|w| w == rewritten.as_slice()),
+        "the compiled-in path becomes the anchor path, at its own length: {err}"
     );
     assert!(
         !lib.windows(compiled.len())
@@ -29525,11 +29707,12 @@ fn an_anchored_directory_rewrites_the_compiled_in_path_to_the_anchor() {
         "the original spelling is gone from the copy: {err}"
     );
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/fw", "{err}");
+    assert_eq!(record, format!("{key}\tshare/fw").into_bytes(), "{err}");
     let ledger = std::fs::read_to_string(app.join(".onelf/generated")).unwrap();
     assert!(ledger.contains(".onelf/anchors"), "{ledger}");
     assert!(
-        err.contains("Redirected inferred directories:") && err.contains("share/fw: anchor a"),
+        err.contains("Redirected inferred directories:")
+            && err.contains(&format!("share/fw: anchor /dev/fd/77/{key}")),
         "{err}"
     );
     assert!(
@@ -29591,11 +29774,14 @@ fn an_incremental_rerun_rewrites_a_new_library_to_the_persisted_anchor() {
             prefix.join("lib").display()
         ),
     );
+    let spelling = prefix.join("share/demo").display().to_string();
+    let key = anchor_key(&spelling);
+    let rewritten = anchored_bytes(&spelling);
     let first = onelf_build(&app);
     let err = String::from_utf8_lossy(&first.stderr);
     assert!(first.status.success(), "{err}");
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/demo", "{err}");
+    assert_eq!(record, format!("{key}\tshare/demo").into_bytes(), "{err}");
 
     // The second library names the same directory, and the app is
     // relinked to need it. The tree already holds the directory, so the
@@ -29637,14 +29823,18 @@ fn an_incremental_rerun_rewrites_a_new_library_to_the_persisted_anchor() {
     assert!(second.status.success(), "{err}");
     let more = std::fs::read(app.join("lib/libmore.so.1")).unwrap();
     assert!(
-        more.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"),
+        more.windows(rewritten.len())
+            .any(|w| w == rewritten.as_slice()),
         "the new library's spelling is rewritten to the record's anchor: {err}"
     );
     assert!(
         err.contains("Rewrote 1 compiled-in paths to anchor paths in 1 binaries"),
         "{err}"
     );
-    assert!(err.contains("share/demo: anchor a"), "{err}");
+    assert!(
+        err.contains(&format!("share/demo: anchor /dev/fd/77/{key}")),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read(app.join(".onelf/anchors")).unwrap(),
         record,
@@ -29654,11 +29844,10 @@ fn an_incremental_rerun_rewrites_a_new_library_to_the_persisted_anchor() {
 }
 
 /// An incremental rerun whose new library names a held carried
-/// directory and an anchored directory inside it rewrites the new
-/// library's bytes for the anchored child too: the child rides the
-/// held parent, so it has no carry entry of its own, and only the
-/// record's anchor reaches its spellings. The parent names no anchor,
-/// so its own spelling stays the host path.
+/// directory and an anchored directory inside it anchors the parent as
+/// well and rewrites both of the new library's spellings: the parent's
+/// key holds the recorded child's below it, so the record keeps only the
+/// parent's line, and the first build's bytes still resolve through it.
 #[test]
 fn an_incremental_rerun_rewrites_a_riding_child_to_its_persisted_anchor() {
     let td = workdir("infer-anchor-riding");
@@ -29707,11 +29896,19 @@ fn an_incremental_rerun_rewrites_a_riding_child_to_its_persisted_anchor() {
             prefix.join("lib").display()
         ),
     );
+    let child_spelling = prefix.join("share/fw/sub").display().to_string();
+    let parent_spelling = prefix.join("share/fw").display().to_string();
+    let child_key = anchor_key(&child_spelling);
+    let parent_key = anchor_key(&parent_spelling);
     let first = onelf_build(&app);
     let err = String::from_utf8_lossy(&first.stderr);
     assert!(first.status.success(), "{err}");
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/fw/sub", "{err}");
+    assert_eq!(
+        record,
+        format!("{child_key}\tshare/fw/sub").into_bytes(),
+        "{err}"
+    );
 
     // The second library names both the parent and the anchored child
     // inside it, and the app is relinked to need it. The tree holds
@@ -29754,29 +29951,27 @@ fn an_incremental_rerun_rewrites_a_riding_child_to_its_persisted_anchor() {
     let err = String::from_utf8_lossy(&second.stderr);
     assert!(second.status.success(), "{err}");
     let more = std::fs::read(app.join("lib/libmore.so.1")).unwrap();
+    for spelling in [&parent_spelling, &child_spelling] {
+        let rewritten = anchored_bytes(spelling);
+        assert!(
+            more.windows(rewritten.len())
+                .any(|w| w == rewritten.as_slice()),
+            "{spelling} is rewritten: {err}"
+        );
+    }
     assert!(
-        more.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"),
-        "the riding child's spelling is rewritten to the record's anchor: {err}"
-    );
-    let parent = format!("{}\0", prefix.join("share/fw").display());
-    assert!(
-        more.windows(parent.len()).any(|w| w == parent.as_bytes()),
-        "the parent names no anchor, so its whole spelling stays: {err}"
-    );
-    let child = format!("{}\0", prefix.join("share/fw/sub").display());
-    assert!(
-        !more.windows(child.len()).any(|w| w == child.as_bytes()),
-        "the riding child's raw spelling is gone: {err}"
-    );
-    assert!(
-        err.contains("Rewrote 1 compiled-in paths to anchor paths in 1 binaries"),
+        err.contains("Rewrote 2 compiled-in paths to anchor paths in 1 binaries"),
         "{err}"
     );
-    assert!(err.contains("share/fw/sub: anchor a"), "{err}");
+    assert!(
+        err.contains(&format!("share/fw: anchor /dev/fd/77/{parent_key}"))
+            && err.contains(&format!("share/fw/sub: anchor /dev/fd/77/{child_key}")),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read(app.join(".onelf/anchors")).unwrap(),
-        record,
-        "the record stays byte-identical: {err}"
+        format!("{parent_key}\tshare/fw").into_bytes(),
+        "the recorded child resolves through its parent's line: {err}"
     );
     let _ = std::fs::remove_dir_all(&td);
 }
@@ -29840,11 +30035,13 @@ fn an_overlapping_child_from_another_prefix_stays_unrewritten() {
             prefix_b.join("lib").display()
         ),
     );
+    let carried = prefix_a.join("share/fw/sub").display().to_string();
+    let key = anchor_key(&carried);
     let first = onelf_build(&app);
     let err = String::from_utf8_lossy(&first.stderr);
     assert!(first.status.success(), "{err}");
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/fw/sub", "{err}");
+    assert_eq!(record, format!("{key}\tshare/fw/sub").into_bytes(), "{err}");
 
     // The second library names the carried directory's parent from
     // prefix A, which its own prefix never claims, and the child of
@@ -29892,20 +30089,27 @@ fn an_overlapping_child_from_another_prefix_stays_unrewritten() {
         more.windows(other.len()).any(|w| w == other.as_bytes()),
         "the overlapping child is omitted whole, its bytes stay: {err}"
     );
+    let other_rewritten = anchored_bytes(&prefix_b.join("share/fw/sub").display().to_string());
     assert!(
-        !more.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"),
+        !more
+            .windows(other_rewritten.len())
+            .any(|w| w == other_rewritten.as_slice()),
         "no anchor reaches the omitted child: {err}"
     );
     let demo = std::fs::read(app.join("lib/libdemo.so.1")).unwrap();
     assert!(
-        demo.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"),
+        demo.windows(anchored_bytes(&carried).len())
+            .any(|w| w == anchored_bytes(&carried).as_slice()),
         "the tree's carried copy keeps the record's anchor: {err}"
     );
     assert!(
         !err.contains("compiled-in paths"),
         "the recorded bytes already are the anchor, so the rerun rewrites nothing: {err}"
     );
-    assert!(err.contains("share/fw/sub: anchor a"), "{err}");
+    assert!(
+        err.contains(&format!("share/fw/sub: anchor /dev/fd/77/{key}")),
+        "{err}"
+    );
     assert_eq!(
         std::fs::read(app.join(".onelf/anchors")).unwrap(),
         record,
@@ -29985,14 +30189,21 @@ fn a_failed_build_leaves_the_record_its_rerun_needs() {
     // The needed library is unreachable, so the strict host scan stops
     // the build after the rewrite has landed.
     std::fs::remove_file(&missing).unwrap();
+    let spelling = prefix.join("share/demo").display().to_string();
+    let key = anchor_key(&spelling);
+    let rewritten = anchored_bytes(&spelling);
     let failed = onelf_build(&app);
     let err = String::from_utf8_lossy(&failed.stderr);
     assert!(!failed.status.success(), "{err}");
     assert!(err.contains("libmissing.so.1"), "{err}");
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/demo", "{err}");
+    assert_eq!(record, format!("{key}\tshare/demo").into_bytes(), "{err}");
     let lib = std::fs::read(app.join("lib/libdemo.so.1")).unwrap();
-    assert!(lib.windows(14).any(|w| w == b"/dev/fd/77/a\0\0"), "{err}");
+    assert!(
+        lib.windows(rewritten.len())
+            .any(|w| w == rewritten.as_slice()),
+        "{err}"
+    );
 
     // The fix makes the library reachable again. The rebuild refreshes
     // the staged copy from the host, so discovery also runs again; what
@@ -30003,7 +30214,8 @@ fn a_failed_build_leaves_the_record_its_rerun_needs() {
     let err = String::from_utf8_lossy(&fixed.stderr);
     assert!(fixed.status.success(), "{err}");
     assert!(
-        err.contains("Redirected inferred directories:") && err.contains("share/demo: anchor a"),
+        err.contains("Redirected inferred directories:")
+            && err.contains(&format!("share/demo: anchor /dev/fd/77/{key}")),
         "{err}"
     );
     assert_eq!(
@@ -30279,6 +30491,280 @@ fn an_unreadable_file_omits_its_inferred_directory_without_failing() {
     );
 }
 
+/// A recipe pair that sends an inferred directory's compiled-in path to
+/// another bundle directory owns that path: the directory is omitted
+/// naming the pair and the path keeps its bytes, also below an anchored
+/// parent. A pair that names the inferred directory itself leaves its
+/// anchor to rewrite the path. A tree an earlier build anchored keeps
+/// those bytes, and the build says the new pair has no effect there.
+#[test]
+fn a_recipe_pair_decides_whether_its_compiled_in_path_is_anchored() {
+    let setup = |name: &str, dirs: &'static [&'static str]| {
+        let guard = workdir(name);
+        let td = guard.canonicalize().unwrap();
+        write(&td.join("fp/share/wirefw/a.conf"), "fw\n");
+        write(&td.join("fp/share/wirefw/sub/s.conf"), "sub\n");
+        std::os::unix::fs::symlink("wirefw", td.join("fp/share/linkfw")).unwrap();
+        let (app, _) = inferred_dirs_app(&td, &[("fp", "libfw.so.1", dirs)])?;
+        write(&app.join("share/otherfw/b.conf"), "other\n");
+        Some((guard, td, app))
+    };
+    let add_pair = |app: &Path, absolute: &Path, relative: &str| {
+        let toml = std::fs::read_to_string(app.join("onelf.toml")).unwrap();
+        write(
+            &app.join("onelf.toml"),
+            &format!(
+                "{toml}\n[paths]\n\"{}\" = \"{relative}\"\n",
+                absolute.display()
+            ),
+        );
+    };
+    let build = |app: &Path| {
+        let out = onelf_build(app);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        let lib = std::fs::read(app.join("lib/libfw.so.1")).unwrap();
+        (err, lib)
+    };
+    let holds = |lib: &[u8], path: &Path| {
+        let mut whole = path.display().to_string().into_bytes();
+        whole.push(0);
+        lib.windows(whole.len()).any(|w| w == whole.as_slice())
+    };
+
+    // The pair agrees: the anchor rewrites the path.
+    let Some((_guard, td, app)) = setup("infer-recipe-agree", &["share/wirefw"]) else {
+        return;
+    };
+    let wirefw = td.join("fp/share/wirefw");
+    add_pair(&app, &wirefw, "share/wirefw");
+    let (err, lib) = build(&app);
+    assert!(!holds(&lib, &wirefw), "{err}");
+    assert!(
+        findings_block(&err)
+            .iter()
+            .any(|l| l.contains("share/wirefw: ") && l.contains("redirected through /dev/fd/77/")),
+        "{err}"
+    );
+
+    // The pair sends the path elsewhere: the directory is omitted and
+    // the path keeps its bytes.
+    let Some((_guard, td, app)) = setup("infer-recipe-other", &["share/wirefw"]) else {
+        return;
+    };
+    let wirefw = td.join("fp/share/wirefw");
+    add_pair(&app, &wirefw, "share/otherfw");
+    let (err, lib) = build(&app);
+    assert!(holds(&lib, &wirefw), "{err}");
+    assert!(
+        findings_block(&err)
+            .iter()
+            .any(|l| l
+                .contains("share/wirefw: optional omission: omitted because the recipe pair for")),
+        "{err}"
+    );
+    assert!(!app.join("share/wirefw").exists(), "{err}");
+
+    // Below an anchored parent, the pair's path keeps its bytes while
+    // the parent's own path is rewritten.
+    let Some((_guard, td, app)) =
+        setup("infer-recipe-below", &["share/wirefw", "share/wirefw/sub"])
+    else {
+        return;
+    };
+    let wirefw = td.join("fp/share/wirefw");
+    add_pair(&app, &wirefw.join("sub"), "share/otherfw");
+    let (err, lib) = build(&app);
+    assert!(!holds(&lib, &wirefw), "{err}");
+    assert!(holds(&lib, &wirefw.join("sub")), "{err}");
+    // Rebuilt in place unchanged, the kept path still works, and the
+    // build does not claim otherwise.
+    let (err, lib) = build(&app);
+    assert!(holds(&lib, &wirefw.join("sub")), "{err}");
+    assert!(!err.contains("has no effect in this tree"), "{err}");
+    assert!(
+        findings_block(&err).iter().any(|l| l
+            .contains("share/wirefw/sub: optional omission: omitted because the recipe pair for")),
+        "the kept path is the recipe pair's on a rebuild too: {err}"
+    );
+
+    // Added after an in-place build anchored the path, the pair cannot
+    // undo those bytes, and the build says so.
+    let Some((_guard, td, app)) = setup("infer-recipe-stale", &["share/wirefw"]) else {
+        return;
+    };
+    let wirefw = td.join("fp/share/wirefw");
+    let (err, _) = build(&app);
+    assert!(err.contains("share/wirefw: anchor "), "{err}");
+    add_pair(&app, &wirefw, "share/otherfw");
+    let (err, _) = build(&app);
+    let findings = findings_block(&err);
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/otherfw: ") && l.contains("has no effect in this tree")),
+        "{err}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/wirefw: ") && l.contains("redirected through /dev/fd/77/")),
+        "the anchored copy still answers, as the finding must say: {err}"
+    );
+    // With the rewritten copy gone, nothing in the tree carries the
+    // anchor any more: the fresh copy keeps the path, the pair applies,
+    // and the build no longer says otherwise.
+    std::fs::remove_file(app.join("lib/libfw.so.1")).unwrap();
+    let (err, lib) = build(&app);
+    assert!(holds(&lib, &wirefw), "{err}");
+    assert!(!err.contains("has no effect in this tree"), "{err}");
+    // Nothing reaches the old anchor any more, so it is forgotten.
+    assert!(!err.contains("share/wirefw: anchor "), "{err}");
+    let record = std::fs::read_to_string(app.join(".onelf/anchors")).unwrap_or_default();
+    assert!(!record.contains("share/wirefw"), "{record}");
+
+    // A claimed parent with an anchored child is omitted on a rebuild in
+    // place too: the child's rewrite is not the parent's.
+    let Some((_guard, td, app)) =
+        setup("infer-recipe-parent", &["share/wirefw", "share/wirefw/sub"])
+    else {
+        return;
+    };
+    let wirefw = td.join("fp/share/wirefw");
+    add_pair(&app, &wirefw, "share/otherfw");
+    for step in ["fresh", "rebuild"] {
+        let (err, lib) = build(&app);
+        assert!(holds(&lib, &wirefw), "{step}: {err}");
+        assert!(
+            findings_block(&err).iter().any(|l| l
+                .contains("share/wirefw: optional omission: omitted because the recipe pair for")),
+            "{step}: {err}"
+        );
+        assert!(!err.contains("share/wirefw: path pair"), "{step}: {err}");
+    }
+
+    // A second spelling of an anchored directory, claimed after the
+    // build anchored it: a fresh copy of the library is rewritten to the
+    // recorded key again, so the build says the pair has no effect.
+    let Some((_guard, td, app)) = setup("infer-recipe-link", &["share/wirefw", "share/linkfw"])
+    else {
+        return;
+    };
+    let (err, _) = build(&app);
+    assert!(err.contains("share/wirefw: anchor "), "{err}");
+    add_pair(&app, &td.join("fp/share/linkfw"), "share/otherfw");
+    std::fs::remove_file(app.join("lib/libfw.so.1")).unwrap();
+    let (err, _) = build(&app);
+    assert!(err.contains("has no effect in this tree"), "{err}");
+}
+
+/// A spelling below an anchored directory that names another carried
+/// directory, through a link in the source, keeps its bytes for that
+/// directory's pair instead of resolving inside the anchored copy.
+#[test]
+fn a_nested_spelling_naming_another_directory_keeps_its_bytes() {
+    let td = workdir("infer-nested-kept");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/alsafw/a.conf"), "fw\n");
+    write(&td.join("fp/share/elsewhere/x.conf"), "else\n");
+    std::os::unix::fs::symlink("../elsewhere", td.join("fp/share/alsafw/other")).unwrap();
+    let Some((app, _)) = inferred_dirs_app(
+        &td,
+        &[("fp", "libfw.so.1", &["share/alsafw", "share/alsafw/other"])],
+    ) else {
+        return;
+    };
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let lib = std::fs::read(app.join("lib/libfw.so.1")).unwrap();
+    let mut nested = td
+        .join("fp/share/alsafw/other")
+        .display()
+        .to_string()
+        .into_bytes();
+    nested.push(0);
+    assert!(
+        lib.windows(nested.len()).any(|w| w == nested.as_slice()),
+        "the nested spelling was rewritten into the anchored copy: {err}"
+    );
+    assert!(err.contains("share/alsafw: anchor "), "{err}");
+}
+
+/// A key whose directory the tree lost is held back for the build that
+/// loses it. After that, an anchored path the tree's objects still carry
+/// from an earlier build is reported with what it now resolves to: the
+/// same directory when it comes back, another one when a later directory
+/// takes the key.
+#[test]
+fn an_anchored_path_old_bytes_still_carry_is_reported() {
+    let setup = |name: &str| {
+        let guard = workdir(name);
+        let td = guard.canonicalize().unwrap();
+        write(&td.join("fp/share/wfw/a.conf"), "fw\n");
+        let (app, _) = inferred_dirs_app(
+            &td,
+            &[("fp", "libfw.so.1", &["share/wfw", "share/wfw/a.conf"])],
+        )?;
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(err.contains("share/wfw: anchor "), "{err}");
+        // An unchanged rebuild finds every anchored path, the file below
+        // the directory too, explained by the record.
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(!err.contains("objects in the tree carry"), "{err}");
+        assert!(!err.contains("path pair"), "{err}");
+        Some((guard, td, app))
+    };
+    let build = |app: &Path| {
+        let out = onelf_build(app);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        err
+    };
+    let stale = |err: &str, reached: &str| {
+        findings_block(err).iter().any(|l| {
+            l.contains("objects in the tree carry this path from an earlier build")
+                && l.contains(reached)
+        })
+    };
+
+    // The directory moves behind a link and the tree loses its copy,
+    // while the tree's library keeps its rewritten bytes.
+    let Some((_guard, td, app)) = setup("infer-stale-moved") else {
+        return;
+    };
+    std::fs::create_dir_all(td.join("fp/share/real")).unwrap();
+    std::fs::rename(td.join("fp/share/wfw"), td.join("fp/share/real/wfw")).unwrap();
+    std::os::unix::fs::symlink("real/wfw", td.join("fp/share/wfw")).unwrap();
+    std::fs::remove_dir_all(app.join("share/wfw")).unwrap();
+    let err = build(&app);
+    assert!(
+        err.contains("share/real/wfw: path pair"),
+        "the key is held back: {err}"
+    );
+    assert!(stale(&err, "which no anchor serves now"), "{err}");
+    let err = build(&app);
+    assert!(err.contains("share/real/wfw: anchor "), "{err}");
+    assert!(stale(&err, "which now resolves to share/real/wfw"), "{err}");
+
+    // The directory goes away and comes back unchanged: it takes its key
+    // again, and the report says the old paths resolve to it.
+    let Some((_guard, td, app)) = setup("infer-stale-back") else {
+        return;
+    };
+    std::fs::rename(td.join("fp/share/wfw"), td.join("fp/wfw-away")).unwrap();
+    std::fs::remove_dir_all(app.join("share/wfw")).unwrap();
+    build(&app);
+    std::fs::rename(td.join("fp/wfw-away"), td.join("fp/share/wfw")).unwrap();
+    let err = build(&app);
+    assert!(err.contains("share/wfw: anchor "), "{err}");
+    assert!(stale(&err, "which now resolves to share/wfw"), "{err}");
+}
+
 /// Two prefixes whose inferred directories nest at one destination are
 /// never both written: whichever sorts first is carried, and the other
 /// is omitted, the inner one naming the source it overlaps and the outer
@@ -30376,13 +30862,12 @@ fn an_inferred_dir_through_a_symlinked_appdir_path_is_omitted_without_failing() 
 }
 
 /// An incremental build that adds a directory sorting before the
-/// recorded one cannot keep the record's keys: the tree's rewritten
-/// bytes name the old key, and handing that key to the new directory
-/// would resolve them into the wrong content. The build stops naming
-/// both, the record and its bytes stay as they were, and the next run
-/// proceeds with the new directory held, which takes no fresh decision.
+/// recorded one leaves the recorded key where it is: keys come from the
+/// compiled-in paths themselves, so the new directory takes its own,
+/// the first build's bytes are not touched again, and the record gains
+/// one line.
 #[test]
-fn an_anchor_addition_that_would_move_a_recorded_key_stops_the_build() {
+fn an_anchor_addition_leaves_the_recorded_keys_alone() {
     let td = workdir("infer-anchor-move");
     let td = td.canonicalize().unwrap();
     let prefix = td.join("fp");
@@ -30433,10 +30918,16 @@ fn an_anchor_addition_that_would_move_a_recorded_key_stops_the_build() {
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         (out.status.success(), err)
     };
+    let fw = prefix.join("share/fw").display().to_string();
+    let fw_key = anchor_key(&fw);
     let (ok, first) = run(&[]);
     assert!(ok, "{first}");
     let record = std::fs::read(app.join(".onelf/anchors")).unwrap();
-    assert_eq!(record, b"a\tshare/fw", "{first}");
+    assert_eq!(
+        record,
+        format!("{fw_key}\tshare/fw").into_bytes(),
+        "{first}"
+    );
     let demo_before = std::fs::read(app.join("lib/libdemo.so.1")).unwrap();
 
     // The second run adds a second directory sorting before share/fw,
@@ -30474,43 +30965,31 @@ fn an_anchor_addition_that_would_move_a_recorded_key_stops_the_build() {
         &app.join("bin/app"),
     ));
     let (ok, second) = run(&[]);
-    assert!(!ok, "{second}");
-    assert!(
-        second.contains("anchor a names share/fw in the tree's record"),
-        "{second}"
-    );
-    assert!(second.contains("bundle a fresh tree"), "{second}");
+    assert!(ok, "{second}");
     assert_eq!(
         std::fs::read(app.join("lib/libdemo.so.1")).unwrap(),
         demo_before,
-        "the refused merge rewrote no recorded bytes: {second}"
+        "the recorded bytes are not touched again: {second}"
     );
-    let intro = std::fs::read(app.join("lib/libintro.so.1")).unwrap();
     let aaa = prefix.join("share/aaa").display().to_string();
-    let anchor_prefix = b"/dev/fd/77/";
+    let aaa_key = anchor_key(&aaa);
+    let intro = std::fs::read(app.join("lib/libintro.so.1")).unwrap();
+    let rewritten = anchored_bytes(&aaa);
     assert!(
-        intro.windows(aaa.len()).any(|w| w == aaa.as_bytes())
-            && !intro
-                .windows(anchor_prefix.len())
-                .any(|w| w == anchor_prefix),
-        "the refused merge left the new library's spelling alone: {second}"
+        intro
+            .windows(rewritten.len())
+            .any(|w| w == rewritten.as_slice()),
+        "the new library takes its own key: {second}"
     );
+    let mut lines = [
+        format!("{aaa_key}\tshare/aaa"),
+        format!("{fw_key}\tshare/fw"),
+    ];
+    lines.sort();
     assert_eq!(
         std::fs::read(app.join(".onelf/anchors")).unwrap(),
-        record,
-        "the record stays byte-identical: {second}"
-    );
-
-    // The next run proceeds: the refused run had already copied the new
-    // directory, so it is held now, and a held carry takes no fresh
-    // decision. The recorded keys stand, and the record is untouched.
-    let (ok, third) = run(&[]);
-    assert!(ok, "{third}");
-    assert!(third.contains("share/fw: anchor a"), "{third}");
-    assert_eq!(
-        std::fs::read(app.join(".onelf/anchors")).unwrap(),
-        record,
-        "the record stays byte-identical: {third}"
+        lines.join("\n").into_bytes(),
+        "the record gains one line: {second}"
     );
     let _ = std::fs::remove_dir_all(&td);
 }

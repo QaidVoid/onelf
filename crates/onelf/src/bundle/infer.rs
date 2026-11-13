@@ -465,13 +465,16 @@ pub(crate) enum Carried<'a> {
     Within(&'a Path),
 }
 
+/// The words a carried directory's finding holds until the redirection
+/// choice settles them with its mechanism.
+pub(crate) const PENDING_REDIRECTION: &str = "redirection pending";
+
 /// Record the finding for one inferred directory: what it holds, its
-/// size, how the bundle carries it and where it came from. A data
-/// directory's compiled-in paths are not redirected to the bundle's
-/// copy yet, and the finding says so; a plugin directory's objects are
-/// redirected by the walk that admits them, and its finding names what
-/// was skipped and why. A directory the trace limited is reported
-/// trace-limited, not complete.
+/// size, how the bundle carries it and where it came from. The finding
+/// carries [`PENDING_REDIRECTION`] until the redirection choice names the
+/// mechanism; a plugin directory's finding also names what was skipped
+/// and why. A directory the trace limited is reported trace-limited, not
+/// complete.
 pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
     let kind = match dir.kind {
         InferredKind::Plugins => "plugin directory",
@@ -480,20 +483,23 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
     let (outcome, mut what) = match carried {
         Carried::Data => (
             Outcome::Selected,
-            format!("{kind}, {}, carried, not redirected yet", format_size(size)),
+            format!(
+                "{kind}, {}, carried, {PENDING_REDIRECTION}",
+                format_size(size)
+            ),
         ),
         Carried::Trimmed { kept, total } => (
             Outcome::TraceLimited,
             format!(
                 "{kind}, {kept} of {total} member(s) kept by the trace, {}; the rest \
-                 the trace did not open, not redirected yet",
+                 the trace did not open; {PENDING_REDIRECTION}",
                 format_size(size)
             ),
         ),
         Carried::Held => (
             Outcome::Selected,
             format!(
-                "{kind}, {}, held by the tree's own copy, not redirected yet",
+                "{kind}, {}, held by the tree's own copy, {PENDING_REDIRECTION}",
                 format_size(size)
             ),
         ),
@@ -501,7 +507,7 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
             Outcome::TraceLimited,
             format!(
                 "{kind}, whole size {}, carried within {}, only what the trace opened \
-                 rides, not redirected yet",
+                 rides, redirected with it",
                 format_size(size),
                 outer.display()
             ),
@@ -509,7 +515,7 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
         Carried::Within(outer) => (
             Outcome::Selected,
             format!(
-                "{kind}, {}, carried within {}, not redirected yet",
+                "{kind}, {}, carried within {}, redirected with it",
                 format_size(size),
                 outer.display()
             ),
@@ -521,7 +527,8 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
         Carried::Plugins(collection, files, None) => (
             Outcome::Selected,
             format!(
-                "plugin directory, {} object(s) and {files} other file(s), {}",
+                "plugin directory, {} object(s) and {files} other file(s), {}, \
+                 {PENDING_REDIRECTION}",
                 collection.plugins.len(),
                 format_size(size)
             ),
@@ -530,7 +537,8 @@ pub(crate) fn report(dir: &InferredDir, size: u64, carried: Carried) {
             Outcome::TraceLimited,
             format!(
                 "plugin directory, {} object(s) and {files} other file(s), {}; {kept} of \
-                 {total} member(s) kept by the trace; the rest the trace did not open",
+                 {total} member(s) kept by the trace; the rest the trace did not open; \
+                 {PENDING_REDIRECTION}",
                 collection.plugins.len(),
                 format_size(size)
             ),
@@ -829,14 +837,27 @@ pub(crate) fn read_only_ranges(data: &[u8]) -> Vec<(usize, usize)> {
             _ => merged.push((start, end)),
         }
     }
-    let Some((skip_start, skip_end)) = dynstr_range(&elf) else {
-        return merged;
-    };
+    // The section header and the dynamic segment can each name a string
+    // table, and the loader reads the dynamic segment's: both are left out
+    // when they disagree.
+    let mut skips: Vec<(usize, usize)> = dynstr_range(&elf).into_iter().collect();
+    if let Some(dynamic) = elf.dynamic.as_ref() {
+        let (strtab, strsz) = (dynamic.info.strtab, dynamic.info.strsz);
+        if strtab != 0
+            && strsz != 0
+            && let Some(end) = strtab.checked_add(strsz)
+        {
+            skips.push((strtab, end));
+        }
+    }
+    for (skip_start, skip_end) in skips {
+        merged = merged
+            .into_iter()
+            .flat_map(|(start, end)| [(start, end.min(skip_start)), (start.max(skip_end), end)])
+            .filter(|(start, end)| start < end)
+            .collect();
+    }
     merged
-        .into_iter()
-        .flat_map(|(start, end)| [(start, end.min(skip_start)), (start.max(skip_end), end)])
-        .filter(|(start, end)| start < end)
-        .collect()
 }
 
 /// `piece` as a path the lint would read, with no empty, `.` or `..`

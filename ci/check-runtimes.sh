@@ -18,8 +18,9 @@ fail() {
 }
 
 # The note description is the magic OCAP, the metadata version 1 and the
-# capability bits: selection-view for slim, plus store-import for update.
-for spec in slim:01 update:03; do
+# capability bits: selection-view and anchors for slim, plus store-import
+# for update.
+for spec in slim:05 update:07; do
     variant="${spec%%:*}"
     bits="${spec#*:}"
     # The newest build directory, since a restored cache may hold stale

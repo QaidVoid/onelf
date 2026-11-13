@@ -28,6 +28,10 @@ use std::fmt;
 
 /// Where a package carries the record.
 pub const PATHS_FILE: &str = ".onelf/paths";
+/// Where the bundle step leaves the pairs it chose for inferred
+/// directories, in this record's format. The packer folds them into
+/// [`PATHS_FILE`] after the recipe's own and does not ship this file.
+pub const INFERRED_PATHS_FILE: &str = ".onelf/inferred-paths";
 /// The most pairs one record holds.
 pub const MAX_PAIRS: usize = 1024;
 /// The longest absolute side, in bytes. The kernel's `PATH_MAX` of 4096

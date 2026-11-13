@@ -141,6 +141,18 @@ pub(crate) fn record(finding: Finding) {
     PENDING.with(|p| p.borrow_mut().push(finding));
 }
 
+/// Replace `marker` in the reason of every pending finding about
+/// `object`, or of every pending finding when `object` is `None`.
+pub(crate) fn settle(object: Option<&str>, marker: &str, replacement: &str) {
+    PENDING.with(|p| {
+        for finding in p.borrow_mut().iter_mut() {
+            if object.is_none_or(|object| finding.object == object) {
+                finding.reason = finding.reason.replace(marker, replacement);
+            }
+        }
+    });
+}
+
 /// End the assembly in progress: attribute each framework finding to
 /// the soname that activated its rule, print the sorted block to
 /// stderr, and keep the findings for [`take_reported`].

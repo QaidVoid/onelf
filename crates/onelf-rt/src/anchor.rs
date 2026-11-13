@@ -6,8 +6,10 @@
 //! runtime makes a directory of its own under the private runtime
 //! directory, puts one symlink per key in it naming the bundle directory
 //! the key stands for, and leaves descriptor 77 open on it across the
-//! exec. The application and every child it starts resolve the anchored
-//! paths through their own descriptor table, with or without a mount
+//! exec. The directory's path goes into the environment as well, so a
+//! bundled program started without the descriptor reopens it. The
+//! application and every child it starts resolve the anchored paths
+//! through their own descriptor table, with or without a mount
 //! namespace, and nothing outside the private runtime directory is
 //! created or consulted.
 //!
@@ -117,10 +119,14 @@ pub fn hold(
     let claim = crate::paths::create_anchor_dir()
         .ok_or_else(|| io::Error::other("no private runtime directory to keep the anchors in"))?;
     for anchor in anchors {
-        std::os::unix::fs::symlink(
-            link_target(pkg_root, anchor, views),
-            claim.path().join(&anchor.key),
-        )?;
+        // A key spelled over several components keeps its leading ones as
+        // plain directories; the record never lists a key below another,
+        // so none of them is a link.
+        let link = claim.path().join(&anchor.key);
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(link_target(pkg_root, anchor, views), link)?;
     }
     let dir = rustix::fs::open(
         claim.path(),
