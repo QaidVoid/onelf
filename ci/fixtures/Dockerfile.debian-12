@@ -1,13 +1,15 @@
 # Pinned Debian 12 fixture image: base locked by digest, package list
-# spelled out, nothing installed later. The audio matrix compiles the
+# spelled out, nothing installed later. The audio matrix packs the
 # audio fixture against these libraries inside the container, and the
 # image's PipeWire stack is the sound server the matrix cells start.
-# pipewire-pulse is the pulse socket of the desktop sound stack the
-# audio cells start. libasound2-plugins is
-# the pulse plugin the matrix's user configuration names, and binutils'
-# strip strips the packed libraries. Xvfb gives the pinned host a
-# display so a GUI application can be run against its bundle here; the
-# suite itself needs none.
+# Bookworm's desktop runs wireplumber, but bookworm's build of it exits
+# without systemd-logind, which a container lacks, so the image carries
+# pipewire-media-session, which bookworm also packages, as its session
+# manager. pipewire-pulse is the pulse socket of the desktop sound
+# stack, libasound2-plugins is the pulse plugin the matrix's user
+# configuration names, and binutils' strip strips the packed
+# libraries. Xvfb gives the pinned host a display so a GUI application
+# can be run against its bundle here; the suite itself needs none.
 FROM debian:12@sha256:366a6da5efcceffbaa19c560a101b97b87a1a9664eeeac8bc3d24395ddbf14f3
 
 RUN apt-get update \

@@ -21,12 +21,14 @@
 # inherited GStreamer, Qt, GTK and GIO search paths with a conflicting
 # /etc/asound.conf. The tests print the image ID of each image they use.
 #
-# The audio matrix starts a PipeWire stack inside each cell's container:
-# the server, the session manager that distro's desktop ships
-# (wireplumber, or pipewire-media-session on the Debian and Ubuntu
-# 22.04 lines) and pipewire-pulse, the desktop pulse socket every
-# image the audio matrix plays on carries, which the cell starts
-# whenever present. Ubuntu
+# The audio matrix packs the audio fixture once, on Debian 12, and
+# plays it on Ubuntu 22.04, Debian 12, Arch, Fedora 44 and Alpine 3.20:
+# older, equal and newer glibc than the package, and musl. Each cell
+# starts a PipeWire stack inside its container: the server, the session
+# manager (wireplumber, or pipewire-media-session on Ubuntu 22.04,
+# whose desktop ships it, and on Debian 12, whose wireplumber exits
+# without systemd-logind, which a container lacks) and pipewire-pulse, the
+# desktop pulse socket every image the matrix plays on carries. Ubuntu
 # 22.04 is the pulse-route image: jammy ships no pipewire-alsa, so its
 # /etc/asound.conf names the pulse plugin and pipewire-pulse serves it,
 # the same path a jammy desktop takes with PulseAudio replaced. Each
@@ -34,11 +36,16 @@
 # distribution's defaults, a user ~/.asoundrc naming the host's
 # PipeWire and PulseAudio ALSA plugins by absolute path and defaulting
 # to whichever of them the host ships, and one naming plugins that do
-# not exist, which the package must decline safely. The descriptor-free
-# framework
-# fixture builds from a /work/fwroot/usr install prefix the way a real
-# framework is installed under its build-time prefix, and the pack
-# anchors the plugin and data directories its objects compile in.
+# not exist, which the package must decline safely. Every run is
+# bounded in time, and fails on any host library it maps that the
+# doctor's explanation of the same launch does not admit.
+#
+# The descriptor-free framework fixture builds from a /work/fwroot/usr
+# install prefix the way a real framework is installed under its
+# build-time prefix, and the pack anchors the plugin and data
+# directories its objects compile in. The prefix is removed before the
+# fixture runs, and its namespace launch runs without the engine's
+# seccomp and AppArmor profiles, which refuse user namespaces.
 #
 # Building an image by hand, with docker or podman:
 #

@@ -28140,6 +28140,7 @@ fn a_descriptor_free_framework_launches_its_host_modules_through_its_anchor() {
     write(&host_cfg.join("set.conf"), "HOST\n");
     let app_cfg = td.join("app/share/synthcfg");
     write(&app_cfg.join("set.conf"), "BUNDLED\n");
+    std::fs::create_dir_all(td.join("pairview")).unwrap();
 
     // The bundled plugin member, compiled for real.
     write(&td.join("good.c"), "int synth_good(void){return 1;}\n");
@@ -28187,6 +28188,7 @@ fn a_descriptor_free_framework_launches_its_host_modules_through_its_anchor() {
 static const char *dir = "DIRPLACEHOLDER";
 static const char *conf = "CONFPLACEHOLDER";
 static const char *cfg = "CFGPLACEHOLDER";
+static const char *pairdir = "PAIRPLACEHOLDER";
 static void try_load(const char *what, const char *name, const char *sym) {
     char path[512];
     snprintf(path, sizeof path, "%s/%s", dir, name);
@@ -28196,6 +28198,7 @@ static void try_load(const char *what, const char *name, const char *sym) {
 }
 int main(void) {
     char path[512];
+    printf("dir=%s\n", dir);
     DIR *d = opendir(dir);
     if (!d) {
         printf("dir=missing\n");
@@ -28203,6 +28206,13 @@ int main(void) {
         struct dirent *e;
         while ((e = readdir(d)))
             if (strstr(e->d_name, ".so")) printf("member=%s\n", e->d_name);
+        closedir(d);
+    }
+    d = opendir(pairdir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)))
+            if (strstr(e->d_name, ".so")) printf("pairmember=%s\n", e->d_name);
         closedir(d);
     }
     int bytype = -1;
@@ -28246,6 +28256,13 @@ int main(void) {
     } else {
         printf("cfg=missing\n");
     }
+    char line[1024];
+    FILE *maps = fopen("/proc/self/maps", "r");
+    while (maps && fgets(line, sizeof line, maps)) {
+        char *at = strchr(line, '/');
+        if (at && strstr(at, "libsynth")) printf("map=%s", at);
+    }
+    if (maps) fclose(maps);
     return 0;
 }
 "#;
@@ -28260,6 +28277,10 @@ int main(void) {
             .replace(
                 "CFGPLACEHOLDER",
                 &host_cfg.join("set.conf").display().to_string(),
+            )
+            .replace(
+                "PAIRPLACEHOLDER",
+                &td.join("pairview").display().to_string(),
             ),
     );
     let app = td.join("app");
@@ -28285,9 +28306,10 @@ int main(void) {
             "[package]\nname = \"synthfw\"\ncommand = \"bin/app\"\nmtime = 0\n\
              host-libs = \"always\"\n\n\
              [bundle]\nsearch-paths = [\"{}\"]\n\n\
-             [paths]\n\"{}\" = \"share/synthcfg\"\n",
+             [paths]\n\"{}\" = \"share/synthcfg\"\n\"{}\" = \"lib/synthfw/plugins\"\n",
             prefix.join("lib").display(),
             host_cfg.display(),
+            td.join("pairview").display(),
         ),
     );
     let pkg = td.join("synthfw.onelf");
@@ -28346,6 +28368,10 @@ int main(void) {
         &synthetic_module(machine, &["libc.musl-x86_64.so.1"], &[]),
     );
 
+    // The source's data directory goes before any launch, so the data
+    // can only come from the package through the rewritten spelling.
+    std::fs::remove_dir_all(prefix.join("share/synthfw")).unwrap();
+
     let cache = td.join("ld.so.cache");
     std::fs::write(&cache, ld_so_cache(&[&prefix.join("lib")])).unwrap();
     let cache = cache.to_str().unwrap().to_string();
@@ -28381,6 +28407,35 @@ int main(void) {
     for mode in modes {
         let (out, err, ok) = launch(mode, false);
         assert!(ok, "{mode:?}: the launch failed: {err}");
+        assert!(
+            out.contains("dir=/dev/fd/77/"),
+            "{mode:?}: the compiled-in directory was not rewritten:\n{out}"
+        );
+        // The bundled member loads from the package, never the host's
+        // same-named copy, and the admitted host module from the host.
+        let host_map = |name: &str| format!("map={}\n", plugins.join(name).display());
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("map=") && l.ends_with("/libsynth-good.so"))
+                && !out.contains(&host_map("libsynth-good.so")),
+            "{mode:?}: the bundled member was not mapped from the package:\n{out}"
+        );
+        assert!(
+            out.contains(&host_map("libsynth-type.so")),
+            "{mode:?}: the admitted host module was not mapped from the host:\n{out}"
+        );
+        for name in [
+            "libsynth-greedy",
+            "libsynth-foreign",
+            "libsynth-musl",
+            "libsynth-dep",
+        ] {
+            assert!(
+                !out.lines()
+                    .any(|l| l.starts_with("map=") && l.contains(name)),
+                "{mode:?}: the refused {name} was mapped:\n{out}"
+            );
+        }
         for want in [
             "member=libsynth-good.so",
             "member=libsynth-type.so",
@@ -28413,6 +28468,13 @@ int main(void) {
         // message naming it when it cannot.
         if user_namespaces_available() {
             assert!(out.contains("cfg=BUNDLED"), "{mode:?}:\n{out}{err}");
+            // A pair whose bundle side has a merged view is bound from
+            // the view, so the admitted host module shows there too.
+            assert!(
+                out.contains("pairmember=libsynth-good.so")
+                    && out.contains("pairmember=libsynth-type.so"),
+                "{mode:?}: the pair was not bound from the merged view:\n{out}{err}"
+            );
             assert!(
                 !err.contains("stays in the host's user namespace"),
                 "{mode:?}: {err}"

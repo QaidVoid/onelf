@@ -92,7 +92,7 @@ build_frameworkfw() {
         -DFW_CONF_PATH="\"/work/fwroot/usr/share/fwconf/a.conf\"" \
         -DFW_CFG_PATH="\"/work/apps/hostcfg/set.conf\"" \
         -o "$APPS_DIR/frameworkfw/bin/fwfw" "$SRC/frameworkfw_app.c" \
-        -L/work/fwroot/usr/lib -Wl,--no-as-needed -l:libfwfw.so.1
+        -L/work/fwroot/usr/lib -Wl,--no-as-needed -l:libfwfw.so.1 -ldl
 }
 
 for app in $APPS; do

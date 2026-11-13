@@ -1170,27 +1170,36 @@ fn a_glibc_app_packed_with_the_musl_runtime_stays_on_glibc_on_every_host() {
     );
 }
 
-/// The five pinned hosts the audio matrix plays on.
-const AUDIO_DISTROS: [&str; 5] = [
-    "ubuntu-22.04",
-    "debian-12",
-    "arch",
-    "fedora-44",
-    "alpine-3.20",
+/// The pinned host the audio package is packed on. Its glibc, 2.36,
+/// sits between the matrix's older and newer glibc hosts.
+const AUDIO_ORIGIN: &str = "debian-12";
+
+/// The pinned hosts the audio package plays on, each with its libc
+/// against the package's: older, equal and newer glibc, and musl.
+const AUDIO_HOSTS: [(&str, &str); 5] = [
+    ("ubuntu-22.04", "older glibc"),
+    ("debian-12", "equal glibc"),
+    ("arch", "newer glibc"),
+    ("fedora-44", "newer glibc"),
+    ("alpine-3.20", "musl"),
 ];
+
+/// How long one play may take before the cell fails instead of hanging
+/// the job.
+const AUDIO_SECONDS: u32 = 60;
 
 /// Start the image's PipeWire stack on a private runtime directory,
 /// wait until it answers, and run the packed package against it. The
-/// session manager is whatever the image's sound stack ships (wireplumber
-/// where the pinned images carry it, pipewire-media-session on the older
-/// Debian and Ubuntu lines), and every image the audio matrix plays on
-/// carries pipewire-pulse, the desktop pulse socket, which the cell
-/// starts whenever present, so every cell's server
-/// matches what that distro's desktop would run. The settle wait lets
-/// the session manager finish starting before the null sink arrives:
-/// a node created mid-startup is one its policy never adopts. The sink
-/// must outlive its creating client, hence object.linger. The server's
-/// log stays in the scratch tree.
+/// session manager is wireplumber where it runs in a container, and
+/// pipewire-media-session on Ubuntu 22.04, whose desktop ships it, and
+/// on Debian 12, whose wireplumber exits without systemd-logind. Every image the audio matrix plays on carries
+/// pipewire-pulse, the desktop pulse socket, which the cell starts
+/// whenever present, so every cell's server matches what that distro's
+/// desktop would run. The settle wait lets the session manager finish
+/// starting before the null sink arrives: a node created mid-startup is
+/// one its policy never adopts. The sink must outlive its creating
+/// client, hence object.linger. The server's log stays in the scratch
+/// tree.
 ///
 /// `asoundrc` selects the ALSA configuration the run sees: the
 /// distribution's defaults, a user configuration naming the host's
@@ -1202,7 +1211,14 @@ const AUDIO_DISTROS: [&str; 5] = [
 /// `/work/.asoundrc` before writing one, and an EXIT trap dumps the
 /// server's log on every exit path, so a failed cell shows why the
 /// server or the play went wrong even when the failure happens before
-/// the guarded run.
+/// the guarded run. The play is bounded by [`AUDIO_SECONDS`].
+///
+/// After the play the doctor explains the same launch, and every host
+/// path it names as admitted, as a library the resolver takes from the
+/// host, or as the host's loader is resolved inside the container into
+/// `/work/admitted`, so [`host_leaks`] can hold the play's mapped
+/// objects against it. A user configuration naming host plugins leaves
+/// their resolved paths in `/work/named`.
 fn run_with_sound_server(
     engine: &Engine,
     tag: &str,
@@ -1215,6 +1231,7 @@ fn run_with_sound_server(
         Asoundrc::HostPlugins => "pw=$(find /usr/lib /usr/lib64 -name libasound_module_pcm_pipewire.so 2>/dev/null | head -1); \
          pu=$(find /usr/lib /usr/lib64 -name libasound_module_pcm_pulse.so 2>/dev/null | head -1); \
          [ -n \"$pw\" ] || [ -n \"$pu\" ]; \
+         for p in $pw $pu; do readlink -f \"$p\"; done > /work/named; \
          : > /work/.asoundrc; \
          if [ -n \"$pw\" ]; then \
            printf 'pcm_type.pipewire { lib \"%s\" }\\n' \"$pw\" >> /work/.asoundrc; \
@@ -1231,7 +1248,9 @@ fn run_with_sound_server(
         .to_string(),
     };
     let script = format!(
-        "set -e; rm -f /work/.asoundrc; install -d -m 0700 /work/xdg; export XDG_RUNTIME_DIR=/work/xdg; \
+        "set -e; rm -f /work/.asoundrc /work/admitted /work/named; \
+         install -d -m 0700 /work/xdg; \
+         export XDG_RUNTIME_DIR=/work/xdg; \
          pipewire >/work/pipewire.log 2>&1 & server=$!; \
          trap 'cat /work/pipewire.log >&2' EXIT; \
          if command -v wireplumber >/dev/null 2>&1; then \
@@ -1252,110 +1271,150 @@ fn run_with_sound_server(
          pw-cli ls Node 2>/dev/null | grep -q onelf-null; \
          sleep 1; \
          {user_config} \
-         if HOME=/work {pkg}; then status=0; else status=$?; fi; \
+         if HOME=/work timeout {seconds} {pkg}; then status=0; else status=$?; fi; \
+         [ $status -ne 124 ] || echo 'the play outlived its {seconds}s bound' >&2; \
+         HOME=/work {pkg} --onelf-doctor > /work/doctor.txt 2>&1 || true; \
+         awk '/^  host modules admitted/ {{ a = 1; next }} \
+              /^    / {{ if (a) print $1; next }} {{ a = 0 }} \
+              /: (the host.s is newer|from the host, not bundled|from the host with its libc), \\// {{ print $NF }} \
+              /^  loader: the host.s \\/.*, run from a private copy/ {{ sub(/,$/, \"\", $4); print $4 }}' \
+           /work/doctor.txt | while read -r p; do \
+           [ -e \"$p\" ] && readlink -f \"$p\"; done > /work/admitted || true; \
          kill $server 2>/dev/null || true; \
          exit $status",
         user_config = user_config,
+        seconds = AUDIO_SECONDS,
         pkg = in_work(pkg_rel)
     );
     container_simple(engine, tag, scratch, &script)
+}
+
+/// The host objects a play mapped that the doctor's explanation of the
+/// same launch does not name: anything under the host's system
+/// directories that is not an admitted module, a library the resolver
+/// took from the host, or its loader. The package's own files live
+/// under the scratch tree or a runtime directory, never there.
+fn host_leaks(out: &Output, scratch: &Workdir) -> Vec<String> {
+    let admitted = lines_of(scratch, "admitted");
+    stdout_of(out)
+        .lines()
+        .filter_map(|l| l.strip_prefix("MAP "))
+        .filter(|path| {
+            ["/usr/", "/lib/", "/lib64/", "/lib32/", "/opt/"]
+                .iter()
+                .any(|dir| path.starts_with(dir))
+        })
+        .filter(|path| !admitted.contains(*path))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The lines of the scratch file `name`, none when it is missing.
+fn lines_of(scratch: &Workdir, name: &str) -> HashSet<String> {
+    std::fs::read_to_string(scratch.join(name))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// The ALSA configuration a matrix cell runs under: the distribution's
 /// defaults, the host's real plugin paths named by a user
 /// configuration, or a user configuration naming plugins that do not
 /// exist, which the package must decline safely instead of crashing.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Asoundrc {
     Defaults,
     HostPlugins,
     AbsentPlugins,
 }
 
-/// The cross-host audio matrix: the audio fixture is compiled, packed
-/// and played against its host's own PipeWire server on every pinned
-/// image under three ALSA configurations - the distribution defaults,
-/// a user configuration naming the host's PipeWire and PulseAudio ALSA
-/// plugins by path, and one naming plugins that do not exist - and the
-/// Ubuntu and Alpine packages are carried across the libc line onto the
-/// foreign image, where the run must stay healthy whatever the foreign
-/// host's honoured sound stack does under the package's libc.
+/// The cross-host audio matrix: the audio fixture is compiled and
+/// packed on [`AUDIO_ORIGIN`] and played against each pinned host's own
+/// PipeWire server, on glibc hosts older, equal to and newer than the
+/// package's and on a musl host, under three ALSA configurations: the
+/// distribution defaults, a user configuration naming the host's
+/// PipeWire and PulseAudio ALSA plugins by path, and one naming plugins
+/// that do not exist. Every run must exit cleanly within its bound and
+/// map no host object the resolver did not admit. Every host plays
+/// with the defaults, through the plugins the package carries, and
+/// with its own plugins whenever the resolver admits one the
+/// configuration names. A host plugin the resolver refuses, a newer one
+/// demanding more of the package's libasound than it defines say, or a
+/// musl one, may fall back instead. Absent plugins fall back
+/// everywhere.
 #[test]
-fn the_audio_matrix_plays_on_the_pinned_hosts_and_falls_back_across_lines() {
+fn the_audio_matrix_plays_one_package_across_older_equal_and_newer_hosts() {
     let Some(engine) = gate() else { return };
 
-    let mut carried: Vec<(&str, String, Workdir, String)> = Vec::new();
-    for distro in AUDIO_DISTROS {
-        let tag = image(&engine, distro);
-        let td = Workdir::new(&format!("audio-{distro}"));
-        assemble(&engine, &tag, &td, distro, &["audio"]);
-        write_recipe(
-            &td,
-            "audio",
-            &recipe(&format!("onelf-audio-{distro}"), "bin/audio", &[], &[]),
-        );
-        must(
-            &pack(&engine, &tag, &td, "audio", false),
-            &format!("{distro}: packing the audio fixture"),
-        );
-        let pkg_rel = format!("apps/audio/onelf-audio-{distro}.onelf");
-        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::Defaults);
-        must(
-            &out,
-            &format!("{distro}: playing the audio fixture against its own sound server"),
-        );
-        assert!(
-            stdout_of(&out).starts_with(&format!("AUDIO_OK {distro}")),
-            "{distro}: the audio fixture did not play through the sound server:\n{}",
-            transcript(&out)
-        );
-        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::HostPlugins);
-        must(
-            &out,
-            &format!("{distro}: playing with a user configuration naming the host plugins"),
-        );
-        assert!(
-            stdout_of(&out).starts_with(&format!("AUDIO_OK {distro}")),
-            "{distro}: the package did not honour the user configuration's host plugin:\n{}",
-            transcript(&out)
-        );
-        let out = run_with_sound_server(&engine, &tag, &td, &pkg_rel, Asoundrc::AbsentPlugins);
-        must(
-            &out,
-            &format!("{distro}: declining a user configuration naming absent plugins"),
-        );
-        assert!(
-            stdout_of(&out).starts_with("AUDIO_FALLBACK"),
-            "{distro}: the user configuration naming absent plugins neither took effect nor \
-             declined safely:\n{}",
-            transcript(&out)
-        );
-        if distro == "ubuntu-22.04" || distro == "alpine-3.20" {
-            carried.push((distro, tag, td, pkg_rel));
-        }
-    }
+    let origin_tag = image(&engine, AUDIO_ORIGIN);
+    let td = Workdir::new("audio");
+    assemble(&engine, &origin_tag, &td, AUDIO_ORIGIN, &["audio"]);
+    write_recipe(&td, "audio", &recipe("onelf-audio", "bin/audio", &[], &[]));
+    must(
+        &pack(&engine, &origin_tag, &td, "audio", false),
+        &format!("{AUDIO_ORIGIN}: packing the audio fixture"),
+    );
+    let pkg_rel = "apps/audio/onelf-audio.onelf";
+    let played = format!("AUDIO_OK {AUDIO_ORIGIN}");
 
-    // Each carried package keeps running on the foreign libc line, on
-    // the foreign host's own image, and the guarantee is the safe exit,
-    // not one particular outcome: the host's honoured sound stack may
-    // load under the package's own libc and play, or be refused by it
-    // and leave the fixture's fallback. Either way the run reports
-    // coherently and stays healthy instead of crashing.
-    for (from, to) in [(0usize, "alpine-3.20"), (1usize, "ubuntu-22.04")] {
-        let (origin, _, ref td, ref pkg_rel) = carried[from];
-        let host_tag = image(&engine, to);
-        let out = run_with_sound_server(&engine, &host_tag, td, pkg_rel, Asoundrc::Defaults);
-        must(
-            &out,
-            &format!("{origin}'s package on {to}: the run must not crash"),
-        );
-        let stdout = stdout_of(&out);
-        assert!(
-            stdout.starts_with(&format!("AUDIO_OK {origin}"))
-                || stdout.starts_with("AUDIO_FALLBACK"),
-            "{origin}'s package on {to}: the fixture neither played nor fell back safely:\n{}",
-            transcript(&out)
-        );
+    for (host, libc) in AUDIO_HOSTS {
+        let tag = image(&engine, host);
+        for asoundrc in [
+            Asoundrc::Defaults,
+            Asoundrc::HostPlugins,
+            Asoundrc::AbsentPlugins,
+        ] {
+            let cell = format!("{host} ({libc}), {asoundrc:?}");
+            let out = run_with_sound_server(&engine, &tag, &td, pkg_rel, asoundrc);
+            must(&out, &format!("{cell}: the run must exit cleanly"));
+            let stdout = stdout_of(&out);
+            let admitted = lines_of(&td, "admitted");
+            let named_admitted = lines_of(&td, "named").iter().any(|p| admitted.contains(p));
+            let must_play = match asoundrc {
+                Asoundrc::Defaults => true,
+                Asoundrc::HostPlugins => named_admitted,
+                Asoundrc::AbsentPlugins => false,
+            };
+            let outcome_ok = match asoundrc {
+                Asoundrc::AbsentPlugins => stdout.starts_with("AUDIO_FALLBACK"),
+                _ if must_play => stdout.starts_with(&played),
+                _ => stdout.starts_with(&played) || stdout.starts_with("AUDIO_FALLBACK"),
+            };
+            assert!(
+                outcome_ok,
+                "{cell}: the fixture did not reach the expected outcome:\n{}",
+                transcript(&out)
+            );
+            // A musl host has no loader cache, and the doctor still
+            // names the host modules it refuses there.
+            if libc == "musl" {
+                let doctor = std::fs::read_to_string(td.join("doctor.txt")).unwrap_or_default();
+                assert!(
+                    doctor.contains("host modules refused"),
+                    "{cell}: the doctor named no refused host module:\n{doctor}"
+                );
+            }
+            assert!(
+                stdout
+                    .lines()
+                    .any(|l| l.starts_with("MAP ") && l.contains("libasound")),
+                "{cell}: the run reported no mapped libasound, so the leak check would see nothing:\n{}",
+                transcript(&out)
+            );
+            let leaks = host_leaks(&out, &td);
+            eprintln!(
+                "{cell}: {}, host plugin admitted: {named_admitted}",
+                stdout.lines().next().unwrap_or_default()
+            );
+            assert!(
+                leaks.is_empty(),
+                "{cell}: the run mapped host libraries the resolver did not admit: {leaks:?}\n\
+                 doctor:\n{}\n{}",
+                std::fs::read_to_string(td.join("doctor.txt")).unwrap_or_default(),
+                transcript(&out)
+            );
+        }
     }
 }
 
@@ -1364,9 +1423,11 @@ fn the_audio_matrix_plays_on_the_pinned_hosts_and_falls_back_across_lines() {
 /// one is under its build-time prefix, the app tree names those paths,
 /// and the build anchors the inferred plugin and data directories
 /// while the recipe pair overlays a configuration path outside the
-/// prefix; a namespace launch answers the paired path from the bundle,
-/// and a forced namespace-free launch names the pair unredirected while
-/// the anchors still resolve.
+/// prefix. The framework is removed before any launch, so every answer
+/// comes from the package. A namespace launch, in a container that
+/// permits user namespaces, loads the bundled plugin and answers the
+/// paired path from the bundle, and a forced namespace-free launch
+/// names the pair unredirected while the anchors still resolve.
 #[test]
 fn fixture_descriptor_free_framework_launches_namespaced_and_namespace_free() {
     let Some(engine) = gate() else { return };
@@ -1405,30 +1466,40 @@ fn fixture_descriptor_free_framework_launches_namespaced_and_namespace_free() {
         "framework: the anchor record is missing",
     );
     let pkg_rel = "apps/frameworkfw/onelf-fwfw.onelf";
+    std::fs::remove_dir_all(td.join("fwroot")).expect("remove the installed framework");
 
-    // A namespace launch, when the container allows one, answers the
-    // paired path from the bundle; a container that refuses namespaces
-    // leaves the pair in the host's and says so once. The anchored
-    // reads work either way.
-    let out = run_pkg(&engine, &tag, &td, pkg_rel, &[]);
+    // A namespace launch answers the paired path from the bundle. The
+    // engine's default seccomp and AppArmor profiles refuse user
+    // namespaces, so this container runs without them.
+    let unconfined = [
+        "--security-opt".to_string(),
+        "seccomp=unconfined".to_string(),
+        "--security-opt".to_string(),
+        "apparmor=unconfined".to_string(),
+    ];
+    let script = format!("HOME=/work {}", in_work(pkg_rel));
+    let out = container(&engine, &tag, &td, &[], &unconfined, &script);
     must(&out, "framework: running the packed framework fixture");
     let stdout = stdout_of(&out);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        stdout.contains("member=libfwgood.so") && stdout.contains("conf=CONF"),
-        "framework: the anchored reads did not resolve:\n{stdout}{stderr}"
+        stdout.contains("dir=/dev/fd/77/")
+            && stdout.contains("loaded=yes")
+            && stdout.contains("member=libfwgood.so")
+            && stdout.contains("conf=CONF"),
+        "framework: the anchored reads did not resolve from the package:\n{stdout}{stderr}"
     );
-    if stderr.contains("stays in the host's user namespace") {
-        assert!(
-            stdout.contains("cfg=HOST"),
-            "framework: the pair answered from the bundle without a namespace:\n{stdout}{stderr}"
-        );
-    } else {
-        assert!(
-            stdout.contains("cfg=BUNDLED"),
-            "framework: the pair answered from the host with a namespace:\n{stdout}{stderr}"
-        );
-    }
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("MAP ") && l.ends_with("/libfwgood.so"))
+            && !stdout.contains("MAP /work/fwroot/"),
+        "framework: the plugin was not mapped from the package:\n{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("cfg=BUNDLED") && !stderr.contains("stays in the host's user namespace"),
+        "framework: the namespace launch did not answer the pair from the bundle:\n{stdout}{stderr}"
+    );
 
     // Forced namespace-free: the pair names itself unredirected, and
     // the anchors keep resolving because they need only the descriptor.
@@ -1438,7 +1509,9 @@ fn fixture_descriptor_free_framework_launches_namespaced_and_namespace_free() {
     let stdout = stdout_of(&out);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        stdout.contains("cfg=HOST") && stdout.contains("conf=CONF"),
+        stdout.contains("cfg=HOST")
+            && stdout.contains("conf=CONF")
+            && stdout.contains("loaded=yes"),
         "framework: the namespace-free launch did not read the host's copy while the anchors held:\n{stdout}{stderr}"
     );
     assert!(

@@ -1,10 +1,12 @@
 /* The descriptor-free framework fixture's program: enumerates the
  * plugin directory through its compiled-in spelling, which the build
- * rewrites to the anchor, and reads the anchored data directory and the
- * paired configuration path. What each read answers tells the fixture
- * whether the launch bound the pair or left it in the host's
- * namespace. */
+ * rewrites to the anchor, loads its plugin through that spelling, and
+ * reads the anchored data directory and the paired configuration path.
+ * What each read answers tells the fixture whether the launch bound the
+ * pair or left it in the host's namespace, and the MAP line shows where
+ * the plugin was mapped from. */
 #include <dirent.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,6 +21,20 @@
 #endif
 
 int main(void) {
+    char line[4096];
+    printf("dir=%s\n", FW_PLUGIN_DIR);
+    snprintf(line, sizeof line, "%s/libfwgood.so", FW_PLUGIN_DIR);
+    printf("loaded=%s\n", dlopen(line, RTLD_NOW) ? "yes" : "no");
+    FILE *maps = fopen("/proc/self/maps", "r");
+    while (maps && fgets(line, sizeof line, maps)) {
+        char *path = strchr(line, '/');
+        if (path && strstr(path, "libfwgood")) {
+            printf("MAP %s", path);
+            break;
+        }
+    }
+    if (maps)
+        fclose(maps);
     DIR *d = opendir(FW_PLUGIN_DIR);
     if (!d) {
         printf("dir=missing\n");
