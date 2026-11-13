@@ -247,6 +247,8 @@ pub fn run(
                         "a development run never takes the host's glibc",
                     ),
                     nsswitch: resolve::nsswitch_file(),
+                    uid: rustix::process::getuid().as_raw(),
+                    trust: None,
                 },
                 &onelf_rt::sets::pins(),
             )

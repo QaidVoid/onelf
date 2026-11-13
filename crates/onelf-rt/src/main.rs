@@ -119,6 +119,10 @@ fn main() {
         }
     };
 
+    // Ownership is judged before any mode enters a user namespace, where
+    // root's files and another user's look the same.
+    onelf_rt::hostpaths::judge_host_trust(&pkg);
+
     // Handle --onelf-icon / --onelf-desktop before dispatching
     if metadata::handle_metadata_flags(&args, &mut pkg, &ep_name) {
         return;

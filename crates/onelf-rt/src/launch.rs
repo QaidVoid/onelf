@@ -859,6 +859,8 @@ pub fn resolve_launch(
             host_libc: can_shadow,
             loader_store: loader_place.store(),
             nsswitch: resolve::nsswitch_file(),
+            uid: rustix::process::getuid().as_raw(),
+            trust: crate::hostpaths::early_trust(),
         },
         &crate::sets::pins(),
     );

@@ -65,6 +65,54 @@ pub fn read_plugin_dirs(pkg: &PackageData) -> io::Result<Vec<PluginDir>> {
     })
 }
 
+/// Who owns the host counterpart modules, judged once at startup.
+static EARLY_TRUST: std::sync::OnceLock<onelf_format::resolve::HostTrust> =
+    std::sync::OnceLock::new();
+
+/// Judge who owns the package's host counterpart modules now, before any
+/// mode enters a user namespace: inside one, every owner but the
+/// launching user reads as the same overflow id. A package without a
+/// plugin directory record has nothing to judge.
+pub fn judge_host_trust(pkg: &PackageData) {
+    let Ok(plugin_dirs) = read_plugin_dirs(pkg) else {
+        return;
+    };
+    if plugin_dirs.is_empty() {
+        return;
+    }
+    let _ = EARLY_TRUST.set(onelf_format::resolve::judge_host_modules(
+        &plugin_dirs,
+        &onelf_format::drivers::cache_file(),
+        rustix::process::getuid().as_raw(),
+    ));
+}
+
+/// The verdicts [`judge_host_trust`] reached, when it ran.
+pub fn early_trust() -> Option<&'static onelf_format::resolve::HostTrust> {
+    EARLY_TRUST.get()
+}
+
+/// Whether `view` holds a link to a file that really lives in `target`
+/// or below it. Both sides are resolved first, so a member reached
+/// through another spelling of the directory, `/lib64` for
+/// `/usr/lib64` on a merged host say, is still noticed, and a link
+/// spelled below the target counts whether or not it resolves.
+fn links_below(view: &Path, target: &Path) -> bool {
+    let real_target = std::fs::canonicalize(target).ok();
+    std::fs::read_dir(view).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let Ok(link) = std::fs::read_link(entry.path()) else {
+                return false;
+            };
+            link.starts_with(target)
+                || real_target.as_ref().is_some_and(|real_target| {
+                    std::fs::canonicalize(entry.path())
+                        .is_ok_and(|real| real.starts_with(real_target))
+                })
+        })
+    })
+}
+
 /// The directory a pair answers from: its merged view when one stands,
 /// else the package's bundled directory. A view that vanished between
 /// the resolution and the mount or the anchor hold falls back, so a
@@ -113,10 +161,25 @@ pub fn apply(pkg_root: &Path, wanted: &[PathPair], views: &BTreeMap<PathBuf, Pat
     let mut mounted = 0;
     // Targets that do not exist, by the directory they are to appear in.
     let mut absent: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
-    for pair in wanted {
+    // A path is bound before any path below it, whatever the record's
+    // order, so a deeper pair is never hidden by its ancestor's bind.
+    let mut ordered: Vec<&PathPair> = wanted.iter().collect();
+    ordered.sort_by_key(|pair| Path::new(&pair.absolute).components().count());
+    for pair in ordered {
         let target = Path::new(&pair.absolute);
         let bundled = pkg_root.join(&pair.relative);
-        let source = mapped_or_bundled(views, bundled);
+        let mut source = mapped_or_bundled(views, bundled.clone());
+        // A view whose host members live under the very path it is bound
+        // over would link them to itself once mounted: that path takes
+        // the bundled directory, and its host members are not offered.
+        if source != bundled && links_below(&source, target) {
+            eprintln!(
+                "onelf-rt: {}: the host's own modules there are not offered, since the \
+                 bundled directory is bound over the place they live",
+                target.display()
+            );
+            source = bundled;
+        }
         if !source.is_dir() {
             continue;
         }
@@ -257,6 +320,37 @@ mod tests {
     use crate::pkgmeta::tests::fixture;
 
     use super::*;
+
+    /// A view links into the path it would be bound over when one of its
+    /// host members lives there, whatever spelling of the directory the
+    /// link uses; a view whose members live elsewhere does not.
+    #[test]
+    fn a_view_linking_below_its_target_is_noticed() {
+        let root = std::env::temp_dir().join(format!("onelf-links-below-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join("usr/lib/dp");
+        let elsewhere = root.join("usr/lib/x86_64-linux-gnu/dp");
+        let view = root.join("view");
+        for dir in [&target, &elsewhere, &view] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in [elsewhere.join("libm.so"), target.join("libt.so")] {
+            File::create(file).unwrap();
+        }
+        std::os::unix::fs::symlink("usr/lib", root.join("lib64")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("libm.so"), view.join("libm.so")).unwrap();
+        assert!(!links_below(&view, &target));
+        std::os::unix::fs::symlink(root.join("lib64/dp/libt.so"), view.join("libt.so")).unwrap();
+        assert!(links_below(&view, &target));
+        assert!(links_below(&view, &root.join("lib64/dp")));
+        // A link spelled below the target counts even when it cannot be
+        // resolved, a host file an earlier bind hid say.
+        let dangling = root.join("view-dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(target.join("gone.so"), dangling.join("gone.so")).unwrap();
+        assert!(links_below(&dangling, &target));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A fixture package carrying `files`, loaded through the real loader.
     fn load(name: &str, files: &[(&str, Vec<u8>)]) -> PackageData {

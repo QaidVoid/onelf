@@ -32,6 +32,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::drivers::{self, DRIVER_FAMILIES};
@@ -173,6 +174,37 @@ pub struct Request<'a> {
     /// The host's name service configuration. A host libc opens the
     /// modules it names by soname. [`nsswitch_file`] outside of tests.
     pub nsswitch: &'a Path,
+    /// The user the launch runs as. A host module, and every directory
+    /// above it, must belong to this user or to root and be writable by
+    /// no one else, or another user could plant what the launch loads.
+    pub uid: u32,
+    /// Who owns the host modules, as [`judge_host_modules`] found it
+    /// before the launch entered a user namespace, where every owner but
+    /// the launching user reads as the same overflow id and nothing can
+    /// be told apart. `None` judges on the spot, outside a namespace.
+    pub trust: Option<&'a HostTrust>,
+}
+
+/// The ownership verdict on each host counterpart directory and module:
+/// `None` when only root or the launching user could have put it there,
+/// else why someone else could have.
+pub type HostTrust = BTreeMap<PathBuf, Option<String>>;
+
+/// Judge who could have planted each counterpart directory of
+/// `plugin_dirs` and each module in it, for a launch that will decide
+/// inside a user namespace. A directory past the module bound is judged
+/// alone; [`decide`] refuses it whole anyway.
+pub fn judge_host_modules(plugin_dirs: &[PluginDir], ld_cache: &Path, uid: u32) -> HostTrust {
+    let mut out = HostTrust::new();
+    for dir in counterpart_dirs(plugin_dirs, ld_cache) {
+        let verdict = untrusted(&dir, uid);
+        for module in modules_in(&dir).unwrap_or_default() {
+            let module_verdict = verdict.clone().or_else(|| untrusted(&module, uid));
+            out.insert(module, module_verdict);
+        }
+        out.insert(dir, verdict);
+    }
+    out
 }
 
 /// Where hosts keep their name service configuration, in the order the
@@ -551,7 +583,20 @@ pub fn decide(req: &Request) -> Decision {
     }
     let host = HostIndex::load(req.ld_cache, req.icd_dirs, req.extra_root);
     if host.libs.is_empty() {
-        return Decision::default();
+        // No glibc library to weigh anything against, as on a musl host:
+        // every counterpart module is refused, and named.
+        let mut decision = Decision::default();
+        for dir in counterpart_dirs(req.plugin_dirs, req.ld_cache) {
+            for module in modules_in(&dir).unwrap_or_default() {
+                decision.refused.push(ModuleRefusal {
+                    object: module.clone(),
+                    module,
+                    reason: "the host offers no glibc libraries to load it against".to_string(),
+                });
+            }
+        }
+        decision.refused.sort();
+        return decision;
     }
     let mut decision = decide_on(req, &host);
     if !decision.winners.is_empty() {
@@ -701,6 +746,8 @@ fn decide_on(req: &Request, host: &HostIndex) -> Decision {
             &counterpart,
             bundled.get(LIBC).map(|p| p.as_path()),
             loader,
+            req.uid,
+            req.trust,
         );
         decision.admitted = admitted;
         decision.refused = refused;
@@ -1052,8 +1099,8 @@ fn module_dirs(ld_cache: &Path) -> Vec<PathBuf> {
 
 /// The host counterpart directories of the package's carried plugin
 /// directories: each compiled-in absolute path, and the directory's
-/// path under every library directory the loader cache names, which
-/// covers a multiarch host where `/usr/lib/alsa-lib` has
+/// path under every host library directory [`counterpart_lib_dirs`]
+/// names, which covers a multiarch host where `/usr/lib/alsa-lib` has
 /// `/usr/lib/x86_64-linux-gnu/alsa-lib` beside it. Only those that
 /// exist are returned, like the driver directories: a directory that
 /// is not there holds no modules for the decision to weigh, and its
@@ -1062,37 +1109,97 @@ fn counterpart_dirs(plugin_dirs: &[PluginDir], ld_cache: &Path) -> Vec<PathBuf> 
     if plugin_dirs.is_empty() {
         return Vec::new();
     }
-    let libs = drivers::cache_dirs_in(ld_cache);
-    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
-    for dir in plugin_dirs {
-        for absolute in &dir.absolutes {
-            out.insert(PathBuf::from(absolute));
-        }
-        if !dir.lib_relative.is_empty() {
-            for lib in &libs {
-                out.insert(Path::new(lib).join(&dir.lib_relative));
-            }
-        }
-    }
-    out.into_iter().filter(|dir| dir.is_dir()).collect()
+    let libs = counterpart_lib_dirs(ld_cache);
+    let out: BTreeSet<PathBuf> = plugin_dirs
+        .iter()
+        .flat_map(|dir| counterpart_spellings(dir, &libs))
+        .collect();
+    // Two spellings of one directory, `/usr/lib/x` and `/lib/x` on a
+    // merged host say, hold the same modules: the first in sorted order
+    // stands for both, so each module is weighed and named once.
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    out.into_iter()
+        .filter(|dir| {
+            fs::metadata(dir).is_ok_and(|md| md.is_dir() && seen.insert((md.dev(), md.ino())))
+        })
+        .collect()
 }
 
+/// The library directories a host without a loader cache searches, as
+/// musl's loader does by default.
+#[cfg(not(test))]
+const DEFAULT_LIB_DIRS: &[&str] = &["/lib", "/usr/local/lib", "/usr/lib"];
+/// None in the unit tests, whose synthetic hosts the real directories
+/// would leak into.
+#[cfg(test)]
+const DEFAULT_LIB_DIRS: &[&str] = &[];
+
+/// The host library directories a carried plugin directory's
+/// counterparts sit under: the ones the loader cache at `ld_cache`
+/// names, or, on a host with no cache, such as a musl one, the
+/// default directories that exist.
+fn counterpart_lib_dirs(ld_cache: &Path) -> Vec<String> {
+    let dirs = drivers::cache_dirs_in(ld_cache);
+    if !dirs.is_empty() {
+        return dirs;
+    }
+    DEFAULT_LIB_DIRS
+        .iter()
+        .filter(|dir| Path::new(dir).is_dir())
+        .map(|dir| dir.to_string())
+        .collect()
+}
+
+/// The most modules one counterpart directory may hold. A directory
+/// over it is refused whole: weighing it would cost every launch time
+/// and memory the host could inflate at will.
+pub const MAX_COUNTERPART_MODULES: usize = 4096;
+
 /// The module files a directory holds: regular files whose name ends in
-/// `.so`, sorted. A directory that cannot be read holds none.
-fn modules_in(dir: &Path) -> Vec<PathBuf> {
+/// `.so`, sorted, or `None` when there are more than
+/// [`MAX_COUNTERPART_MODULES`]. A directory that cannot be read holds
+/// none.
+fn modules_in(dir: &Path) -> Option<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().is_some_and(|e| e == "so")
-                && fs::metadata(path).is_ok_and(|md| md.is_file())
-        })
-        .collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().is_some_and(|e| e == "so")
+            && fs::metadata(&path).is_ok_and(|md| md.is_file())
+        {
+            if out.len() == MAX_COUNTERPART_MODULES {
+                return None;
+            }
+            out.push(path);
+        }
+    }
     out.sort();
-    out
+    Some(out)
+}
+
+/// Why `path` could be replaced by someone other than root and `uid`, or
+/// `None` when it cannot: the path resolved, it and every directory above
+/// it belong to root or `uid`, and none of them is writable by its group
+/// or by others unless it is sticky, as `/tmp` is, where no one may
+/// replace an entry they do not own and every entry below is checked in
+/// turn. A module there was planted by one of the two.
+fn untrusted(path: &Path, uid: u32) -> Option<String> {
+    let Ok(resolved) = fs::canonicalize(path) else {
+        return Some(format!("{} cannot be resolved", path.display()));
+    };
+    for step in resolved.ancestors() {
+        let Ok(md) = fs::symlink_metadata(step) else {
+            return Some(format!("{} cannot be read", step.display()));
+        };
+        if md.uid() != 0 && md.uid() != uid {
+            return Some(format!("{} belongs to another user", step.display()));
+        }
+        if md.mode() & 0o022 != 0 && (!md.is_dir() || md.mode() & 0o1000 == 0) {
+            return Some(format!("{} can be written by another user", step.display()));
+        }
+    }
+    None
 }
 
 /// The facts of one object, read once per decision. A file whose facts
@@ -1192,6 +1299,7 @@ fn supplier_versions(
 /// Without a bundled pair to check against there is no admission:
 /// every module is refused. `loader` is the interpreter the host's
 /// pair runs, when that pair won.
+#[allow(clippy::too_many_arguments)]
 fn admit_modules(
     host: &HostIndex,
     bundled: &BTreeMap<String, PathBuf>,
@@ -1199,27 +1307,60 @@ fn admit_modules(
     dirs: &[PathBuf],
     reference: Option<&Path>,
     loader: Option<&Path>,
+    uid: u32,
+    trust: Option<&HostTrust>,
 ) -> (Vec<PathBuf>, Vec<ModuleRefusal>, BTreeSet<String>) {
+    let untrusted = |path: &Path| match trust {
+        Some(judged) => match judged.get(path) {
+            Some(verdict) => verdict.clone(),
+            None => Some(format!(
+                "{} appeared after the launch judged its owners",
+                path.display()
+            )),
+        },
+        None => untrusted(path, uid),
+    };
     let mut admitted: Vec<PathBuf> = Vec::new();
     let mut refused: Vec<ModuleRefusal> = Vec::new();
     let mut candidates: BTreeSet<String> = BTreeSet::new();
-    let Some(pair) = reference.and_then(|path| verdef::read_facts(path).ok()) else {
-        for dir in dirs {
-            for module in modules_in(dir) {
+    let refuse_all = |refused: &mut Vec<ModuleRefusal>, modules: Vec<PathBuf>, reason: &str| {
+        for module in modules {
+            refused.push(ModuleRefusal {
+                object: module.clone(),
+                module,
+                reason: reason.to_string(),
+            });
+        }
+    };
+    let pair = reference.and_then(|path| verdef::read_facts(path).ok());
+    let mut facts: BTreeMap<PathBuf, Option<ElfFacts>> = BTreeMap::new();
+    for dir in dirs {
+        let Some(modules) = modules_in(dir) else {
+            refused.push(ModuleRefusal {
+                object: dir.clone(),
+                module: dir.clone(),
+                reason: format!("the directory holds over {MAX_COUNTERPART_MODULES} modules"),
+            });
+            continue;
+        };
+        let Some(pair) = &pair else {
+            refuse_all(&mut refused, modules, "no bundled pair to check against");
+            continue;
+        };
+        if let Some(why) = untrusted(dir) {
+            refuse_all(&mut refused, modules, &why);
+            continue;
+        }
+        for module in modules {
+            if let Some(why) = untrusted(&module) {
                 refused.push(ModuleRefusal {
                     object: module.clone(),
                     module,
-                    reason: "no bundled pair to check against".to_string(),
+                    reason: why,
                 });
+                continue;
             }
-        }
-        refused.sort();
-        return (admitted, refused, candidates);
-    };
-    let mut facts: BTreeMap<PathBuf, Option<ElfFacts>> = BTreeMap::new();
-    for dir in dirs {
-        for module in modules_in(dir) {
-            match closure_verdict(&module, host, bundled, winners, &pair, loader, &mut facts) {
+            match closure_verdict(&module, host, bundled, winners, pair, loader, &mut facts) {
                 Ok(reached) => {
                     candidates.extend(reached);
                     admitted.push(module);
@@ -1331,6 +1472,15 @@ fn closure_verdict(
             }
         }
         for name in &object.needed {
+            // A needed name holding a separator is opened as a path, not
+            // looked up by soname: nothing the decision chooses answers
+            // it, and it must never become a farm link name.
+            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                return Err(refuse(
+                    path,
+                    format!("needs {name:?}, which is a path rather than a soname"),
+                ));
+            }
             // The copy that loads is the decision's winner when there
             // is one: the farm links it over the bundle's own copy, so
             // its closure is walked here, whatever the bundle carries.
@@ -1534,7 +1684,6 @@ fn fingerprint(
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
-                use std::os::unix::fs::MetadataExt;
                 out.push_str(&format!(
                     "={}:{mtime}:{}.{}",
                     md.len(),
@@ -1558,7 +1707,7 @@ fn fingerprint(
         // The module files themselves, so an in-place rewrite at the
         // same size, invisible to the directory stamp, still recomputes
         // the decision.
-        for module in modules_in(&dir) {
+        for module in modules_in(&dir).unwrap_or_default() {
             stamp(&module);
         }
     }
@@ -1617,30 +1766,37 @@ fn farm_dir(
     winners: &BTreeMap<String, PathBuf>,
     loader_copy: Option<&Path>,
 ) -> PathBuf {
-    // FNV-1a, so the names are stable across runs without a hash
-    // dependency.
-    let mix = |h: &mut u64, b: u8| {
-        *h ^= u64::from(b);
-        *h = h.wrapping_mul(0x0100_0000_01b3);
-    };
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in fingerprint.bytes() {
-        mix(&mut h, b);
-    }
-    let mut w: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = Fnv::new();
+    h.write(fingerprint.as_bytes());
+    let mut w = Fnv::new();
     for (name, path) in winners {
-        for b in name.bytes().chain(path.to_string_lossy().bytes()) {
-            mix(&mut w, b);
+        w.write(name.as_bytes());
+        w.write(path.to_string_lossy().as_bytes());
+        w.write(&[0x1f]);
+    }
+    w.write(
+        loader_copy
+            .map(|p| p.as_os_str().as_bytes())
+            .unwrap_or_default(),
+    );
+    store.join(format!("farm-{:016x}-{:016x}", h.0, w.0))
+}
+
+/// FNV-1a, so the store's names are stable across runs without a hash
+/// dependency.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
         }
-        mix(&mut w, 0x1f);
     }
-    for b in loader_copy
-        .map(|p| p.as_os_str().as_bytes())
-        .unwrap_or_default()
-    {
-        mix(&mut w, *b);
-    }
-    store.join(format!("farm-{h:016x}-{w:016x}"))
 }
 
 /// The cache root subdirectory closed host loader copies are kept in,
@@ -1819,27 +1975,15 @@ fn materialize(
 /// tree is part of the key because a view's bundled members aim into
 /// it, and a launch tree belongs to its launch alone.
 fn views_dir(store: &Path, fingerprint: &str, admitted: &[PathBuf], pkg_root: &Path) -> PathBuf {
-    // FNV-1a, so the names are stable across runs without a hash
-    // dependency.
-    let mix = |h: &mut u64, b: u8| {
-        *h ^= u64::from(b);
-        *h = h.wrapping_mul(0x0100_0000_01b3);
-    };
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in fingerprint.bytes() {
-        mix(&mut h, b);
-    }
-    let mut w: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = Fnv::new();
+    h.write(fingerprint.as_bytes());
+    let mut w = Fnv::new();
     for path in admitted {
-        for b in path.to_string_lossy().bytes() {
-            mix(&mut w, b);
-        }
-        mix(&mut w, 0x1f);
+        w.write(path.to_string_lossy().as_bytes());
+        w.write(&[0x1f]);
     }
-    for b in pkg_root.to_string_lossy().bytes() {
-        mix(&mut w, b);
-    }
-    store.join(format!("view-{h:016x}-{w:016x}"))
+    w.write(pkg_root.to_string_lossy().as_bytes());
+    store.join(format!("view-{:016x}-{:016x}", h.0, w.0))
 }
 
 /// Whether `dir` links exactly `expected`, names and targets, and
@@ -1941,19 +2085,26 @@ fn views_materialized(root: &Path, wanted: &[WantedView]) -> io::Result<()> {
     Ok(())
 }
 
-/// The counterpart directories of one record that exist on this host:
-/// its compiled-in absolute paths, and its library-relative path under
-/// every loader-cache library directory.
+/// Every place a host may keep `dir`'s counterpart: its compiled-in
+/// absolute paths, and its library-relative path under every
+/// loader-cache library directory in `libs`.
+fn counterpart_spellings<'a>(
+    dir: &'a PluginDir,
+    libs: &'a [String],
+) -> impl Iterator<Item = PathBuf> + 'a {
+    let below = (!dir.lib_relative.is_empty())
+        .then(|| {
+            libs.iter()
+                .map(|lib| Path::new(lib).join(&dir.lib_relative))
+        })
+        .into_iter()
+        .flatten();
+    dir.absolutes.iter().map(PathBuf::from).chain(below)
+}
+
+/// The counterpart directories of one record that exist on this host.
 fn record_counterpart_dirs(dir: &PluginDir, libs: &[String]) -> Vec<PathBuf> {
-    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
-    for absolute in &dir.absolutes {
-        out.insert(PathBuf::from(absolute));
-    }
-    if !dir.lib_relative.is_empty() {
-        for lib in libs {
-            out.insert(Path::new(lib).join(&dir.lib_relative));
-        }
-    }
+    let out: BTreeSet<PathBuf> = counterpart_spellings(dir, libs).collect();
     out.into_iter().filter(|dir| dir.is_dir()).collect()
 }
 
@@ -1999,7 +2150,7 @@ fn plugin_views(req: &Request, fingerprint: &str, admitted: &[PathBuf]) -> Vec<P
     if admitted.is_empty() || req.plugin_dirs.is_empty() {
         return Vec::new();
     }
-    let libs = drivers::cache_dirs_in(req.ld_cache);
+    let libs = counterpart_lib_dirs(req.ld_cache);
     let mut wanted: Vec<WantedView> = Vec::new();
     for (index, dir) in req.plugin_dirs.iter().enumerate() {
         let dirs = record_counterpart_dirs(dir, &libs);
@@ -2526,6 +2677,8 @@ mod tests {
                 host_libc: true,
                 loader_store: self.loader_store(),
                 nsswitch: &self.nsswitch,
+                uid: self.uid,
+                trust: None,
             })
         }
 
@@ -2551,6 +2704,8 @@ mod tests {
                     host_libc,
                     loader_store: self.loader_store(),
                     nsswitch: &self.nsswitch,
+                    uid: self.uid,
+                    trust: None,
                 },
                 &[],
             );
@@ -2582,6 +2737,8 @@ mod tests {
                     host_libc: true,
                     loader_store: self.loader_store(),
                     nsswitch: &self.nsswitch,
+                    uid: self.uid,
+                    trust: None,
                 },
                 pins,
             );
@@ -2718,6 +2875,8 @@ mod tests {
             host_libc: true,
             loader_store: w.loader_store(),
             nsswitch: &w.nsswitch,
+            uid: w.uid,
+            trust: None,
         };
 
         let d = decide(&req);
@@ -3057,6 +3216,8 @@ mod tests {
             host_libc: true,
             loader_store: LoaderStore::Refused("the loader copy's filesystem is mounted noexec"),
             nsswitch: &w.nsswitch,
+            uid: w.uid,
+            trust: None,
         };
         let r = resolve_selected(&req, &[]);
         assert!(r.host_interp.is_none());
@@ -3651,6 +3812,178 @@ mod tests {
         assert!(decision.refused[0].reason.contains("architecture"));
         assert!(!decision.winners.contains_key("libdep.so.2"));
         assert!(!decision.compared.iter().any(|(n, _)| n == "libdep.so.2"));
+    }
+
+    /// A module of the package's machine but the other ELF class is
+    /// refused, as is one linking two libc families at once.
+    #[test]
+    fn a_module_of_the_other_class_or_of_mixed_libcs_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let narrow = dir.join("libnarrow.so");
+        fs::write(
+            &narrow,
+            fixture::facts_elf(false, 0, None, &["libc.so.6"], &[]).bytes,
+        )
+        .unwrap();
+        let mixed = dir.join("libmixed.so");
+        fs::write(
+            &mixed,
+            module_bytes(0, &["libc.so.6", "libc.musl-x86_64.so.1"], &[]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        assert!(
+            refusal_for(&decision.refused, &narrow)
+                .reason
+                .contains("architecture")
+        );
+        assert!(
+            refusal_for(&decision.refused, &mixed)
+                .reason
+                .contains("mixes libc families")
+        );
+    }
+
+    /// A dependency of a module that demands a glibc version nothing here
+    /// defines refuses the module, naming the dependency and the version,
+    /// and the dependency is never offered to the farm.
+    #[test]
+    fn a_dependency_demanding_an_undefined_version_refuses_its_module() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let needy = w.host(
+            "libneedy.so.1",
+            &module_bytes(0, &["libc.so.6"], &[("libc.so.6", &[(0, "GLIBC_2.99")])]),
+        );
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libneedy.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        let refusal = refusal_for(&decision.refused, &module);
+        assert_eq!(refusal.object, needy);
+        assert!(refusal.reason.contains("GLIBC_2.99"), "{}", refusal.reason);
+        assert!(!decision.winners.contains_key("libneedy.so.1"));
+    }
+
+    /// A needed name holding a separator is a path the loader opens
+    /// relative to the working directory, not a soname: the module is
+    /// refused, and the name never becomes a farm link.
+    #[test]
+    fn a_module_needing_a_path_is_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let module = dir.join("libplug.so");
+        fs::write(
+            &module,
+            module_bytes(0, &["ld-linux-evil/../../../x.so"], &[]),
+        )
+        .unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        assert!(
+            refusal_for(&decision.refused, &module)
+                .reason
+                .contains("a path rather than a soname")
+        );
+    }
+
+    /// A host without glibc libraries, a musl host say, admits no
+    /// module but still names each one it refused.
+    #[test]
+    fn a_host_without_glibc_names_every_module_refused() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        let dir = w.host_lib.join("alsa-lib");
+        fs::create_dir_all(&dir).unwrap();
+        w.carry(vec![PluginDir {
+            relative: "lib/alsa-lib".to_string(),
+            lib_relative: "alsa-lib".to_string(),
+            absolutes: vec![dir.display().to_string()],
+        }]);
+        let module = dir.join("libplug.so");
+        fs::write(&module, module_bytes(0, &["libc.musl-x86_64.so.1"], &[])).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+
+        assert!(decision.admitted.is_empty());
+        assert_eq!(decision.refused.len(), 1);
+        assert_eq!(decision.refused[0].module, module);
+        assert!(decision.farm.is_none());
+    }
+
+    /// A module someone else could have planted is refused: one in a
+    /// directory others can write, and one reached through a link into
+    /// such a directory. A sticky directory such as `/tmp` above a
+    /// directory of the launching user's own is not a hole.
+    #[test]
+    fn a_module_another_user_could_plant_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        let plain = || module_bytes(0, &["libc.so.6"], &[]);
+        fs::write(dir.join("libplug.so"), plain()).unwrap();
+        let open = w.host_lib.parent().unwrap().join("open");
+        fs::create_dir_all(&open).unwrap();
+        fs::write(open.join("libelsewhere.so"), plain()).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(open.join("libelsewhere.so"), dir.join("liblinked.so")).unwrap();
+
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert_eq!(decision.admitted, vec![dir.join("libplug.so")]);
+        assert_eq!(decision.refused.len(), 1);
+        assert!(
+            decision.refused[0]
+                .reason
+                .contains("can be written by another user"),
+            "{:?}",
+            decision.refused
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let decision = w.decide(HostLibsPolicy::Auto);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(decision.admitted.is_empty(), "{:?}", decision.admitted);
+        assert!(
+            decision
+                .refused
+                .iter()
+                .all(|r| r.reason.contains("can be written by another user")),
+            "{:?}",
+            decision.refused
+        );
+    }
+
+    /// A directory holding more modules than the bound is refused whole,
+    /// naming the bound, instead of costing every launch.
+    #[test]
+    fn a_counterpart_past_the_module_bound_is_refused_whole() {
+        let w = World::new();
+        w.bundle("libc.so.6", &versioned(&["GLIBC_2.32"]));
+        w.host("libdep.so.2", &versioned(&["DEP_1.0"]));
+        let dir = carry_counterpart(&w);
+        for i in 0..=MAX_COUNTERPART_MODULES {
+            fs::write(dir.join(format!("libm{i:05}.so")), b"").unwrap();
+        }
+        let decision = w.decide(HostLibsPolicy::Auto);
+        assert!(decision.admitted.is_empty());
+        assert_eq!(decision.refused.len(), 1);
+        assert!(decision.refused[0].reason.contains("holds over"));
     }
 
     /// A musl-linked module is refused: it must not pull its libc into
@@ -5177,6 +5510,8 @@ mod tests {
             host_libc: true,
             loader_store: w.loader_store(),
             nsswitch: &w.nsswitch,
+            uid: w.uid,
+            trust: None,
         };
         let d = decide(&req);
         assert_eq!(

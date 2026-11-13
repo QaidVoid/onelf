@@ -752,6 +752,8 @@ fn verdicts(
         host_libc: places_host_files,
         loader_store: loader_place.store(),
         nsswitch: resolve::nsswitch_file(),
+        uid: rustix::process::getuid().as_raw(),
+        trust: None,
     });
     let mut host_only: Vec<String> = Vec::new();
     for (name, choice) in &decision.compared {
