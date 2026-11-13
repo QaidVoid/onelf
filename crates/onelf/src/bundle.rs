@@ -1014,6 +1014,24 @@ fn carry_hit(
     }
 }
 
+/// Whether the tree holds `dest` as a directory of its own: neither it
+/// nor any directory above it is a symlink, so a held destination never
+/// stands for a place a link leads to, inside the tree or out of it.
+fn held_in_tree(directory: &Path, dest: &Path) -> bool {
+    tree_link(directory, dest).is_none()
+        && fs::symlink_metadata(directory.join(dest)).is_ok_and(|m| m.is_dir())
+}
+
+/// The symlink in the tree that `dest`, or a directory above it, is,
+/// relative to `directory`.
+fn tree_link(directory: &Path, dest: &Path) -> Option<PathBuf> {
+    plan::symlinked_ancestor(directory, dest).or_else(|| {
+        fs::symlink_metadata(directory.join(dest))
+            .is_ok_and(|m| m.file_type().is_symlink())
+            .then(|| dest.to_path_buf())
+    })
+}
+
 /// What carrying one found location planned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Carry {
@@ -1198,12 +1216,14 @@ enum InferredPlan {
     /// The collection an inferred plugin directory's members went
     /// through, boxed to keep the variant small, the members a group
     /// collected first, the members that are not objects to carry as
-    /// data, the planned byte size, and the member counts the trim
-    /// judged, when the trace limited the directory.
+    /// data, how many more of those the tree already holds, the planned
+    /// byte size, and the member counts the trim judged, when the trace
+    /// limited the directory.
     Plugins {
         collection: Box<collect::GroupCollection>,
         firsts: Vec<(String, PathBuf)>,
         files: Vec<(PathBuf, PathBuf)>,
+        held: usize,
         size: u64,
         trimmed: Option<(usize, usize)>,
     },
@@ -1214,11 +1234,14 @@ enum InferredPlan {
 /// recipe's `[sysroot] trace` and `[sysroot] keep`; a host scan takes
 /// what its traced run opened, and has no keep patterns. A host scan
 /// also carries the tree root, so an open of a copy the tree itself
-/// holds can stand in for a member no spelling names.
+/// holds can stand in for a member no spelling names. A glibc host
+/// trace sees only the objects the loader maps, so it trims objects
+/// alone and keeps every data member.
 struct Trim {
     opened: BTreeSet<String>,
     keep: Option<Policy>,
     tree: Option<String>,
+    objects_only: bool,
 }
 
 impl Trim {
@@ -1235,12 +1258,14 @@ impl Trim {
             opened,
             keep,
             tree: None,
+            objects_only: false,
         })
     }
 
-    /// From the absolute paths a traced host run opened, and the tree
-    /// root the run's copies live under.
-    fn from_paths(paths: Vec<PathBuf>, tree: Option<&Path>) -> Self {
+    /// From the absolute paths a traced host run opened, the tree root
+    /// the run's copies live under, and whether the trace saw only the
+    /// objects the loader mapped.
+    fn from_paths(paths: Vec<PathBuf>, tree: Option<&Path>, objects_only: bool) -> Self {
         let slash_trimmed = |p: &Path| {
             let rel = p.to_string_lossy();
             let rel = rel.trim_start_matches('/');
@@ -1250,6 +1275,7 @@ impl Trim {
             opened: paths.iter().filter_map(|p| slash_trimmed(p)).collect(),
             keep: None,
             tree: tree.and_then(slash_trimmed),
+            objects_only,
         }
     }
 
@@ -1364,12 +1390,17 @@ fn plan_plugin_carry(
         .filter_map(|p| fs::metadata(&p.resolved).ok())
         .map(|meta| meta.len())
         .sum();
-    let (files, files_size) = plan_member_data(dir, members, origin, sysroot, state)?;
+    let MemberData {
+        files,
+        size: files_size,
+        held,
+    } = plan_member_data(dir, members, origin, sysroot, state)?;
     size += files_size;
     Ok(InferredPlan::Plugins {
         collection: Box::new(collection),
         firsts,
         files,
+        held,
         size,
         trimmed: trimmed_total,
     })
@@ -1382,15 +1413,14 @@ fn plan_plugin_carry(
 /// directory the package lists. A member is judged by the entry the
 /// sysroot's tree holds for it, so a link there stays a link and is
 /// never followed into a copy of what it names; a host scan's members
-/// are already the files they resolved to. On `Ok` the
-/// (source, destination) pairs and the planned bytes.
+/// are already the files they resolved to.
 fn plan_member_data(
     dir: &infer::InferredDir,
     members: &[(PathBuf, PathBuf)],
     origin: &str,
     sysroot: Option<&sysroot::SysrootUniverse>,
     state: &mut WalkState,
-) -> io::Result<(Vec<(PathBuf, PathBuf)>, u64)> {
+) -> io::Result<MemberData> {
     let hit = dir.hit();
     // The member as the sysroot's tree holds it: every component but
     // the last resolved, so a link at the entry stays the link.
@@ -1400,6 +1430,7 @@ fn plan_member_data(
         onelf_sysroot::path::entry_in_root(universe.root(), &dir_rel.join(rel)).ok()
     };
     let mut size = 0u64;
+    let mut held = 0usize;
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (rel, file) in members {
         if read_elf_class(file).is_some() {
@@ -1424,14 +1455,30 @@ fn plan_member_data(
         } else {
             continue;
         };
+        if admission == Admission::Rejected {
+            continue;
+        }
+        if !meta.file_type().is_symlink() {
+            size += fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
+        }
         if admission == Admission::Write {
-            if !meta.file_type().is_symlink() {
-                size += fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
-            }
             files.push((member, to));
+        } else {
+            held += 1;
         }
     }
-    Ok((files, size))
+    Ok(MemberData { files, size, held })
+}
+
+/// What [`plan_member_data`] admitted.
+struct MemberData {
+    /// The (source, destination) pairs to write.
+    files: Vec<(PathBuf, PathBuf)>,
+    /// The bytes of every regular file admitted, written or not.
+    size: u64,
+    /// How many admitted members the tree already holds, which a
+    /// rebuild in place admits without writing.
+    held: usize,
 }
 
 /// The ledger spelling a member's populate-written tree copy is
@@ -1663,12 +1710,16 @@ mod trim_link_tests {
             compiled: BTreeSet::from(["/lib/examplefw".to_string()]),
             objects: BTreeSet::from(["libexamplefw.so.1".to_string()]),
         };
-        let trace = Trim::from_paths(vec![PathBuf::from("/usr/lib/examplefw/a.conf")], None);
+        let trace = Trim::from_paths(
+            vec![PathBuf::from("/usr/lib/examplefw/a.conf")],
+            None,
+            false,
+        );
         assert!(
             !trimmed_out(&dir, Path::new("a.conf"), Some(&universe), Some(&trace)),
             "the trace's root-relative spelling names the member"
         );
-        let none = Trim::from_paths(Vec::new(), None);
+        let none = Trim::from_paths(Vec::new(), None, false);
         assert!(trimmed_out(
             &dir,
             Path::new("a.conf"),
@@ -1780,7 +1831,7 @@ fn collect_inferred(
     opts: &BundleOptions,
     sysroot: Option<&sysroot::SysrootUniverse>,
     trim: Option<&Trim>,
-    (target_class, target_machine): (Option<u8>, Option<u16>),
+    (target_class, target_machine, target_libc): (Option<u8>, Option<u16>, Option<LibcFamily>),
     excludes: &[&str],
     reachable: &HashSet<String>,
     state: &mut WalkState,
@@ -1856,10 +1907,11 @@ fn collect_inferred(
                     return Ok(());
                 }
                 // A held parent stands for the child only while the
-                // tree holds the child too. A file there, or nothing,
-                // is answered by the carry below.
-                if opts.directory.join(&dir.destination).is_dir() {
-                    infer::report(dir, dir.size, infer::Carried::Held);
+                // tree holds the child too, and its redirection covers
+                // the child's spellings. A file there, or nothing, is
+                // answered by the carry below.
+                if held_in_tree(&opts.directory, &dir.destination) {
+                    infer::report(dir, dir.size, infer::Carried::Within(dest));
                     return Ok(());
                 }
             }
@@ -1893,8 +1945,7 @@ fn collect_inferred(
             &dir.destination.display().to_string(),
             &dir.hit(),
             &members,
-            target_class,
-            target_machine,
+            (target_class, target_machine, target_libc),
         ) {
             Ok(collection) => collection,
             Err(error) => {
@@ -1908,8 +1959,9 @@ fn collect_inferred(
         // survived in is omitted. A member the trim cannot name under
         // the directory, a link landing outside it, keeps: the
         // conservative side. A kept relative link keeps the member it
-        // names. The tree copies the sysroot populate wrote of the
-        // members left out are disposed by the ledger's hash.
+        // names. A trace that sees only objects judges no data member.
+        // The tree copies the sysroot populate wrote of the members left
+        // out are disposed by the ledger's hash.
         if let Some(trim) = trim {
             let total = members.len();
             let mut kept = Vec::new();
@@ -1939,7 +1991,8 @@ fn collect_inferred(
             collection.plugins = kept;
             let mut trimmed_members: Vec<(PathBuf, PathBuf)> = Vec::new();
             for (rel, file) in std::mem::take(&mut members) {
-                if trimmed_out(dir, &rel, sysroot, Some(trim)) {
+                let judged = !trim.objects_only || read_elf_class(&file).is_some();
+                if judged && trimmed_out(dir, &rel, sysroot, Some(trim)) {
                     trimmed_members.push((rel, file));
                 } else {
                     members.push((rel, file));
@@ -1979,7 +2032,7 @@ fn collect_inferred(
     // trimmed members' copies are gone either way; the next build
     // re-populates whatever it needs.
     let trimmed_data = if plugin.is_none() {
-        match trim {
+        match trim.filter(|t| !t.objects_only) {
             Some(trim) => match collect::members(&dir.hit(), sysroot) {
                 Ok(members) => {
                     let total = members.len();
@@ -2051,14 +2104,14 @@ fn collect_inferred(
                         meta.is_file().then_some(meta.len())
                     })
                     .sum();
-                plan_member_data(dir, &members, &origin, sysroot, state).map(|(files, _)| {
-                    InferredPlan::TrimmedData {
+                plan_member_data(dir, &members, &origin, sysroot, state).map(
+                    |MemberData { files, .. }| InferredPlan::TrimmedData {
                         files,
                         size,
                         kept,
                         total,
-                    }
-                })
+                    },
+                )
             }
             _ => carry_hit(
                 &opts.directory,
@@ -2096,11 +2149,20 @@ fn collect_inferred(
                 carried.push((dir.destination.clone(), dir.source.clone(), carry));
             }
             Carry::Held => {
-                if opts.directory.join(&dir.destination).is_dir() {
+                if held_in_tree(&opts.directory, &dir.destination) {
                     infer::report(dir, dir.size, infer::Carried::Held);
                     carried.push((dir.destination.clone(), dir.source.clone(), carry));
                 } else {
-                    infer::omit(dir, "its destination is already in the tree");
+                    match tree_link(&opts.directory, &dir.destination) {
+                        Some(link) => infer::omit(
+                            dir,
+                            &format!(
+                                "its destination is reached through the symlink {} in the tree",
+                                link.display()
+                            ),
+                        ),
+                        None => infer::omit(dir, "its destination is already in the tree"),
+                    }
                 }
             }
             Carry::Rejected => {
@@ -2133,12 +2195,15 @@ fn collect_inferred(
             // nested directories.
             if wrote {
                 carried.push((dir.destination.clone(), dir.source.clone(), Carry::Planned));
+            } else if held_in_tree(&opts.directory, &dir.destination) {
+                carried.push((dir.destination.clone(), dir.source.clone(), Carry::Held));
             }
         }
         InferredPlan::Plugins {
             collection,
             firsts,
             files,
+            held,
             size,
             trimmed,
         } => {
@@ -2163,13 +2228,17 @@ fn collect_inferred(
                     members: Some(files),
                 });
             }
+            // The data members the tree already holds count as carried:
+            // a rebuild in place admits them without writing them.
             infer::report(
                 dir,
                 size,
-                infer::Carried::Plugins(&collection, carried_files, trimmed),
+                infer::Carried::Plugins(&collection, carried_files + held, trimmed),
             );
             if !collection.plugins.is_empty() || carried_files > 0 {
                 carried.push((dir.destination.clone(), dir.source.clone(), Carry::Planned));
+            } else if held > 0 && held_in_tree(&opts.directory, &dir.destination) {
+                carried.push((dir.destination.clone(), dir.source.clone(), Carry::Held));
             }
         }
     }
@@ -4704,6 +4773,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
     }
 
     let mut traced_opened: Vec<PathBuf> = Vec::new();
+    let mut traced_objects_only = false;
     // What the target loads when it runs: dlopen by computed name leaves
     // nothing in DT_NEEDED for the scan above to find. The run is against
     // this machine, so it has no meaning for a sysroot build, whose trace
@@ -4788,6 +4858,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             loader.as_deref(),
         )?;
         traced_opened = opened;
+        traced_objects_only = family != Some(LibcFamily::Musl);
         let (loaded, gpu_stack) = split_gpu_stack(loaded);
         if !gpu_stack.is_empty() {
             let names: Vec<&str> = gpu_stack
@@ -4841,7 +4912,11 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
             // an earlier build carried into the tree.
             None if opts.trace_run && !opts.dry_run => {
                 let tree = opts.directory.canonicalize().ok();
-                Some(Trim::from_paths(traced_opened, tree.as_deref()))
+                Some(Trim::from_paths(
+                    traced_opened,
+                    tree.as_deref(),
+                    traced_objects_only,
+                ))
             }
             None => None,
         }
@@ -5363,7 +5438,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
                     opts,
                     sysroot_universe.as_ref(),
                     trim.as_ref(),
-                    (target_class, target_machine),
+                    (target_class, target_machine, target_libc),
                     &excludes,
                     &reachable,
                     &mut WalkState {
@@ -6170,7 +6245,7 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         // A plan the walk emptied leaves no destination: a member
         // every strict-libc skip condemned, say, copies nothing, and
         // a redirection over nothing would resolve to nothing.
-        .filter(|dir| opts.directory.join(&dir.destination).is_dir())
+        .filter(|dir| held_in_tree(&opts.directory, &dir.destination))
         .collect();
     // Anchoring a directory keeps it in the tree, so it stays a plugin
     // directory the launch must consider, and a directory riding a
@@ -6437,6 +6512,74 @@ fn report_stale_anchor_paths(unexplained: &[String], redirections: &[redir::Redi
             ),
         ));
     }
+}
+
+/// The objects that cannot load and what of the inferred directories
+/// they take with them.
+struct Unloadable {
+    /// Every name an object that cannot load answers to: the audit's
+    /// condemned objects and every inferred member that reaches one.
+    names: HashSet<String>,
+    /// The inferred members whose own needs are met but reach an object
+    /// that cannot load, each with the need that does.
+    members: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// Follow `failing`, the objects whose needs nothing satisfies, into the
+/// carried `inferred` directories: a member needing one of them cannot
+/// load either, and neither can a member needing such a member, until
+/// nothing new turns up.
+fn unloadable_closure(
+    opts: &BundleOptions,
+    failing: &[(PathBuf, Vec<String>)],
+    inferred: &[PathBuf],
+) -> Unloadable {
+    let names_of = |object: &Path| -> Vec<String> {
+        object
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .into_iter()
+            .chain(crate::bundle::elf::parse_soname(object))
+            .collect()
+    };
+    let mut names: HashSet<String> = failing
+        .iter()
+        .flat_map(|(object, _)| names_of(object))
+        .collect();
+    let failing_objects: HashSet<&Path> = failing.iter().map(|(o, _)| o.as_path()).collect();
+    let mut members: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let candidates: Vec<(PathBuf, Vec<String>)> = inferred
+        .iter()
+        .flat_map(|dest| find_elf_files(&opts.directory.join(dest)))
+        .filter(|object| !failing_objects.contains(object.as_path()))
+        .map(|object| {
+            let needed = parse_needed(&object).unwrap_or_default();
+            (object, needed)
+        })
+        .collect();
+    loop {
+        let mut grew = false;
+        for (object, needed) in &candidates {
+            if members.iter().any(|(m, _)| m == object) {
+                continue;
+            }
+            let reached: Vec<String> = needed
+                .iter()
+                .filter(|n| names.contains(n.as_str()))
+                .cloned()
+                .collect();
+            if reached.is_empty() {
+                continue;
+            }
+            names.extend(names_of(object));
+            members.push((object.clone(), reached));
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    Unloadable { names, members }
 }
 
 /// One object the drop pass omitted: where it sat relative to the tree,
@@ -6949,6 +7092,7 @@ fn drop_unloadable(
     classifier: &SourceClassifier,
     required: &HashSet<PathBuf>,
     droppable: &[PathBuf],
+    unloadable: &HashSet<String>,
 ) -> io::Result<Vec<Dropped>> {
     let generated: HashSet<PathBuf> = sysroot::read_generated(&opts.directory)?
         .into_iter()
@@ -6966,7 +7110,7 @@ fn drop_unloadable(
             .iter()
             .filter_map(|e| e.path.clone()),
     );
-    let mut gone: HashSet<String> = HashSet::new();
+    let mut gone: HashSet<String> = unloadable.clone();
     let mut dropped: Vec<Dropped> = Vec::new();
     loop {
         let mut progressed = false;
@@ -7293,7 +7437,15 @@ fn verify_needs(
     if strict {
         let mut failing = findings.clone();
         condemnable(&mut failing);
-        dropped = drop_unloadable(opts, &mut failing, audit, classifier, required, &[])?;
+        dropped = drop_unloadable(
+            opts,
+            &mut failing,
+            audit,
+            classifier,
+            required,
+            &[],
+            &HashSet::new(),
+        )?;
         if !dropped.is_empty() {
             findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
             for (_, libs) in &mut findings {
@@ -7305,7 +7457,21 @@ fn verify_needs(
     } else if !inferred.is_empty() {
         let mut failing = findings.clone();
         condemnable(&mut failing);
-        let omitted = drop_unloadable(opts, &mut failing, audit, classifier, required, inferred)?;
+        // A member whose own needs are met but reach an object that
+        // cannot load cannot load either: it joins the audit with that
+        // need, so the restricted pass omits it like a member whose
+        // need is missing outright.
+        let broken = unloadable_closure(opts, &failing, inferred);
+        failing.extend(broken.members);
+        let omitted = drop_unloadable(
+            opts,
+            &mut failing,
+            audit,
+            classifier,
+            required,
+            inferred,
+            &broken.names,
+        )?;
         if !omitted.is_empty() {
             findings = audit_unbundled_needs(&opts.directory, &opts.lib_dir, &follow);
             for (_, libs) in &mut findings {
@@ -10594,6 +10760,7 @@ mod provider_audit_tests {
             &SourceClassifier::host_only(),
             &required,
             &[],
+            &HashSet::new(),
         )
         .unwrap();
         let gone: Vec<&Path> = dropped.iter().map(|x| x.object.as_path()).collect();
@@ -10652,6 +10819,7 @@ mod provider_audit_tests {
             &SourceClassifier::host_only(),
             &HashSet::new(),
             &[PathBuf::from("lib/libfw/plugins")],
+            &HashSet::new(),
         )
         .unwrap();
         let gone: Vec<&Path> = dropped.iter().map(|x| x.object.as_path()).collect();

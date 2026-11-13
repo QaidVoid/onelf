@@ -593,6 +593,16 @@ fn candidates_of(object: &Object, scope: &Scope, exclude: &[&str]) -> io::Result
     let Some(own_prefix) = object_prefix(installed) else {
         return Ok(Vec::new());
     };
+    // An object inside the tree takes its prefix inside the tree: a climb
+    // past the tree's root would make whatever directory holds the tree,
+    // a build machine's own state, look like the object's installation.
+    if scope
+        .trees
+        .iter()
+        .any(|tree| installed.starts_with(tree) && !own_prefix.starts_with(tree))
+    {
+        return Ok(Vec::new());
+    }
     let Ok(data) = fs::read(path) else {
         return Ok(Vec::new());
     };
@@ -1761,6 +1771,25 @@ mod tests {
         assert_eq!(dirs[0].prefix, root.join("usr"));
     }
 
+    /// A program the tree holds outside any library or program directory
+    /// of its own takes no prefix above the tree: a tree checked out below
+    /// some `lib` directory of the build machine never makes that
+    /// machine's own state look like the program's installation.
+    #[test]
+    fn a_tree_object_takes_no_prefix_above_the_tree() {
+        let tree = Tree::new("tree-climb");
+        let outside = tree.0.join("op/lib/hoststate");
+        tree.dir("op/lib/hoststate");
+        let app = tree.0.join("op/lib/ci/AppDir");
+        let spelled = outside.display().to_string();
+        tree.file(
+            "op/lib/ci/AppDir/opt/foo/foo",
+            &elf(&[(READ, &[spelled.as_str()])]),
+        );
+        let objects = [("foo".to_string(), app.join("opt/foo/foo"))];
+        assert!(run_in(&objects, None, &[&app]).unwrap().is_empty());
+    }
+
     /// The directories of one object under its prefix that survive the
     /// filter, for an object at `object` compiling in each of `dirs`,
     /// which all exist.
@@ -2164,6 +2193,7 @@ mod tests {
         let opened = Trim::from_paths(
             vec![PathBuf::from("/dist/usr/lib/examplefw/plugins/a.conf")],
             None,
+            false,
         );
         assert!(!trimmed_out(&dir, a, None, Some(&opened)));
         // A keep glob names it through one of the spellings tried.
@@ -2179,10 +2209,11 @@ mod tests {
             opened: Default::default(),
             keep,
             tree: None,
+            objects_only: false,
         };
         assert!(!trimmed_out(&dir, a, None, Some(&globbed)));
         // Nothing observed, nothing matching: the member goes.
-        let empty = Trim::from_paths(Vec::new(), None);
+        let empty = Trim::from_paths(Vec::new(), None, false);
         assert!(trimmed_out(&dir, a, None, Some(&empty)));
         // An open of a same-named copy inside the tree stands in for
         // the member: the tree's own library directories lead the run's
@@ -2191,6 +2222,7 @@ mod tests {
         let shadowed = Trim::from_paths(
             vec![PathBuf::from("/tree/lib/a.conf")],
             Some(Path::new("/tree")),
+            false,
         );
         assert!(!trimmed_out(&dir, a, None, Some(&shadowed)));
         // A tree copy of another name is not the member, and neither is
@@ -2198,11 +2230,13 @@ mod tests {
         let other = Trim::from_paths(
             vec![PathBuf::from("/tree/lib/b.conf")],
             Some(Path::new("/tree")),
+            false,
         );
         assert!(trimmed_out(&dir, a, None, Some(&other)));
         let outside = Trim::from_paths(
             vec![PathBuf::from("/elsewhere/a.conf")],
             Some(Path::new("/tree")),
+            false,
         );
         assert!(trimmed_out(&dir, a, None, Some(&outside)));
         // Without a trim nothing goes.

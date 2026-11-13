@@ -1615,6 +1615,113 @@ fn plugin_groups_arrive_complete_without_per_plugin_includes_or_search_paths() {
     }
 }
 
+/// An inferred member whose own needs are met, but whose dependency
+/// cannot load, is omitted too in a scan that is not strict: it would
+/// fail at launch all the same. The dependency itself, outside the
+/// inferred directory, is only reported, and the rest of the directory
+/// stays carried.
+#[test]
+fn an_inferred_member_reaching_an_unloadable_library_is_omitted() {
+    let td = workdir("plugin-unloadable-transitive");
+    let libdir = td.join("dist/usr/lib");
+    let plugins = libdir.join("libfw/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let fw_dirs = format!(
+        "const char *fw_dirs[] = {{\"{}\"}};\n",
+        td.canonicalize()
+            .unwrap()
+            .join("dist/usr/lib/libfw")
+            .display()
+    );
+    write(
+        &td.join("dist/framework.c"),
+        &format!("{fw_dirs}int framework(void){{return 1;}}\n"),
+    );
+    std::fs::create_dir_all(td.join("absent")).unwrap();
+    write(&td.join("dist/absent.c"), "int absent(void){return 0;}\n");
+    write(
+        &td.join("dist/x.c"),
+        "int absent(void);\nint x_fn(void){return absent();}\n",
+    );
+    write(
+        &td.join("dist/t.c"),
+        "int x_fn(void);\nint t_fn(void){return x_fn();}\n",
+    );
+    write(&td.join("dist/good.c"), "int good_fn(void){return 2;}\n");
+    let built = cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libfw.so.1",
+            td.join("dist/framework.c").to_str().unwrap(),
+        ],
+        &libdir.join("libfw.so.1"),
+    ) && cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libmissing.so.9",
+            td.join("dist/absent.c").to_str().unwrap(),
+        ],
+        &td.join("absent/libmissing.so.9"),
+    ) && cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libx.so.1",
+            td.join("dist/x.c").to_str().unwrap(),
+            td.join("absent/libmissing.so.9").to_str().unwrap(),
+        ],
+        &libdir.join("libx.so.1"),
+    ) && cc_with(
+        &[
+            "-shared",
+            "-fPIC",
+            td.join("dist/t.c").to_str().unwrap(),
+            &format!("-L{}", libdir.display()),
+            "-l:libx.so.1",
+        ],
+        &plugins.join("t.so"),
+    ) && cc_with(
+        &["-shared", "-fPIC", td.join("dist/good.c").to_str().unwrap()],
+        &plugins.join("good.so"),
+    );
+    if !built {
+        return;
+    }
+    std::fs::remove_dir_all(td.join("absent")).unwrap();
+    let app = td.join("app");
+    write(&td.join("main.c"), "int main(void){return 0;}\n");
+    std::fs::create_dir_all(app.join("bin")).unwrap();
+    if !cc_with(
+        &[
+            td.join("main.c").to_str().unwrap(),
+            &format!("-L{}", libdir.display()),
+            "-l:libfw.so.1",
+        ],
+        &app.join("bin/app"),
+    ) {
+        return;
+    }
+    let mut c = Command::new(onelf());
+    c.arg("bundle-libs")
+        .arg(&app)
+        .arg("--search-path")
+        .arg(&libdir);
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf bundle-libs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(app.join("lib/libfw/plugins/good.so").is_file(), "{err}");
+    assert!(
+        !app.join("lib/libfw/plugins/t.so").exists(),
+        "a member reaching an unloadable library is omitted: {err}"
+    );
+    assert!(err.contains("t.so"), "the omission is named: {err}");
+}
+
 /// An inferred member whose dependency the tree cannot satisfy is
 /// omitted and reported even when the scan is not strict, while the
 /// rest of its directory stays carried: the omission is that member's
@@ -28482,7 +28589,8 @@ fn foreign_object() -> Vec<u8> {
 /// One plugin directory holds a module that needs a library of the
 /// prefix and compiles in a third data directory, a module built for
 /// another machine, and the scripts and manifests that go with them, the
-/// way Perl's does. The other holds a backend named `*.so.N`. Returns
+/// way Perl's does, and a module linking musl's libc. The other holds a
+/// backend named `*.so.N`. Returns
 /// the prefix and an AppDir whose program links the library, or None
 /// without a compiler.
 fn examplefw_sources(td: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -28491,6 +28599,7 @@ fn examplefw_sources(td: &Path) -> Option<(PathBuf, PathBuf)> {
     let backends = prefix.join("lib/examplefw/backends");
     std::fs::create_dir_all(plugins.join("nested")).unwrap();
     std::fs::create_dir_all(&backends).unwrap();
+    std::fs::create_dir_all(td.join("muslstub")).unwrap();
     write(&prefix.join("share/examplefw/conf.d/a.conf"), "conf\n");
     write(&prefix.join("share/examplefw-extra/b.conf"), "extra\n");
     write(&prefix.join("share/probefw/c.conf"), "probe\n");
@@ -28549,6 +28658,20 @@ fn examplefw_sources(td: &Path) -> Option<(PathBuf, PathBuf)> {
         "int backend_value(void){return 5;}\n",
         &backends.join("backend.so.1"),
         &[],
+    ) && library(
+        "muslstub",
+        "int musl_stub(void){return 0;}\n",
+        &td.join("muslstub/libc.musl-x86_64.so.1"),
+        &["-Wl,-soname,libc.musl-x86_64.so.1"],
+    ) && library(
+        "muslmod",
+        "int musl_stub(void);\nint musl_mod(void){return musl_stub();}\n",
+        &plugins.join("muslmod.so"),
+        &[
+            "-nostdlib",
+            &format!("-L{}", td.join("muslstub").display()),
+            "-l:libc.musl-x86_64.so.1",
+        ],
     );
     if !ok {
         return None;
@@ -28647,6 +28770,10 @@ fn a_descriptor_free_framework_has_its_directories_collected() {
         "the helper script beside the plugins stays executable: {err}"
     );
     assert!(!app.join("lib/examplefw/plugins/foreign.so").exists());
+    assert!(
+        !app.join("lib/examplefw/plugins/muslmod.so").exists(),
+        "a member linking another libc stays out: {err}"
+    );
     let ledger = std::fs::read_to_string(app.join(".onelf/generated")).unwrap();
     for file in [
         "share/examplefw/conf.d/a.conf",
@@ -28667,6 +28794,7 @@ fn a_descriptor_free_framework_has_its_directories_collected() {
         .unwrap_or_else(|| panic!("{findings:#?}"));
     assert!(
         plugin.contains("foreign.so omitted: machine")
+            && plugin.contains("muslmod.so omitted: links Musl libc")
             && plugin.contains("compiled in by libexamplefw.so.1"),
         "{plugin}"
     );
@@ -28730,7 +28858,6 @@ fn a_sysroot_build_collects_inferred_directories_from_the_sysroot() {
     );
     let out = onelf_build(&dir);
     let err = String::from_utf8_lossy(&out.stderr);
-    eprintln!("DEBUG-SYSROOT-BASELINE\n{err}");
     assert!(out.status.success(), "{err}");
     assert!(
         dir.join("lib/examplefw/plugins/probe.so").is_file(),
@@ -28858,7 +28985,7 @@ fn a_trim_inferred_plugin_directory_keeps_the_members_the_trace_opened() {
         findings.iter().any(|l| {
             l.contains(
                 "lib/examplefw/plugins: trace-limited: plugin directory, \
-                 2 object(s) and 0 other file(s), ",
+                 2 object(s) and 1 other file(s), ",
             ) && l.contains("; 3 of 9 member(s) kept by the trace")
                 && l.contains("the rest the trace did not open")
                 && l.split("other file(s), ")
@@ -28878,6 +29005,13 @@ fn a_trim_inferred_plugin_directory_keeps_the_members_the_trace_opened() {
             )
         }),
         "the data directory is reported trace-limited with the kept bytes: {findings:#?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/examplefw: trace-limited")
+                && l.contains("redirected through /dev/fd/77/")),
+        "the trimmed data directory, held by the tree's copies, keeps its anchor: {findings:#?}"
     );
 
     // A second build over the trimmed tree re-populates every sysroot
@@ -28934,6 +29068,13 @@ fn a_trim_inferred_plugin_directory_keeps_the_members_the_trace_opened() {
             )
         }),
         "the second build reports the same data trim: {findings:#?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("share/examplefw: trace-limited")
+                && l.contains("redirected through /dev/fd/77/")),
+        "the trimmed data directory, held by the tree's copies, keeps its anchor: {findings:#?}"
     );
     // A tripwire, not a populate proof: record_generated merges prior
     // entries, so the assertion pins the real invariant, the kept
@@ -29046,11 +29187,12 @@ fn a_traced_recipe_without_trim_inferred_keeps_the_inferred_directories_whole() 
     );
 }
 
-/// A host-scan build with `trace-run` and the key trims what its traced
-/// run never opened: an app that loads none of the compiled-in
-/// directories' members carries none of them, and each is omitted
-/// naming the trace. The dependencies DT_NEEDED names are bundled
-/// regardless: the trim touches only what inference collects.
+/// A host-scan build with `trace-run` and the key trims the objects its
+/// traced run never loaded. A glibc trace sees only what the loader
+/// maps, so every data member is carried whole, and a directory left
+/// with nothing is omitted naming the trace. The dependencies DT_NEEDED
+/// names are bundled regardless: the trim touches only what inference
+/// collects.
 #[test]
 fn a_trace_run_with_trim_inferred_leaves_out_the_directories_nothing_opened() {
     let td = workdir("examplefw-trim-run");
@@ -29081,25 +29223,88 @@ fn a_trace_run_with_trim_inferred_leaves_out_the_directories_nothing_opened() {
     );
     for gone in [
         "lib/examplefw/plugins/nested/probe.so",
-        "lib/examplefw/plugins/Probe.pm",
         "lib/examplefw/backends/backend.so.1",
-        "share/examplefw/conf.d/a.conf",
-        "share/examplefw-extra/b.conf",
         "share/probefw/c.conf",
     ] {
         assert!(
             !app.join(gone).exists(),
-            "{gone}: the run opened nothing in its directory: {err}"
+            "{gone}: the run never loaded the object, or the object that \
+             compiles the directory in: {err}"
+        );
+    }
+    for kept in [
+        "lib/examplefw/plugins/Probe.pm",
+        "share/examplefw/conf.d/a.conf",
+        "share/examplefw-extra/b.conf",
+    ] {
+        assert!(
+            app.join(kept).is_file(),
+            "{kept}: a glibc trace cannot see data opens, so data stays: {err}"
         );
     }
     let findings = findings_block(&err);
-    let omitted = findings
-        .iter()
-        .filter(|l| l.contains("omitted because the trace opened nothing in it"))
-        .count();
     assert!(
-        omitted >= 4,
-        "every compiled-in directory is omitted naming the trace: {findings:#?}"
+        findings
+            .iter()
+            .any(|l| l.contains("omitted because the trace opened nothing in it")),
+        "the objects-only directory is omitted naming the trace: {findings:#?}"
+    );
+}
+
+/// A plugin directory whose members the trim keeps are all the tree's
+/// own copies still redirects its compiled-in path: nothing of it is
+/// written, and the tree's directory stands for it.
+#[test]
+fn a_trimmed_plugin_directory_the_tree_holds_keeps_its_redirection() {
+    let td = workdir("examplefw-trim-held");
+    let Some((prefix, app)) = examplefw_sources(&td) else {
+        return;
+    };
+    // Every data member of the plugin directory, nested ones too, is
+    // already the tree's own copy.
+    let plugins = prefix.join("lib/examplefw/plugins");
+    let mut pending = vec![plugins.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let is_elf = std::fs::read(&path).is_ok_and(|b| b.starts_with(b"\x7fELF"));
+            if path.is_file() && !is_elf {
+                let rel = path.strip_prefix(&plugins).unwrap();
+                let to = app.join("lib/examplefw/plugins").join(rel);
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                std::fs::copy(&path, &to).unwrap();
+            }
+        }
+    }
+    write(
+        &app.join("onelf.toml"),
+        &format!(
+            "[package]\nname = \"examplefw\"\ncommand = \"bin/app\"\nmtime = 0\n\n\
+             [bundle]\nsearch-paths = [\"{}\"]\ntrace-run = true\ntrim-inferred = true\n",
+            prefix.join("lib").display()
+        ),
+    );
+    let mut c = Command::new(onelf());
+    c.arg("build")
+        .current_dir(&app)
+        .env("SOURCE_DATE_EPOCH", "1700000000");
+    if let Some(pe) = patchelf() {
+        c.env("ONELF_PATCHELF", pe);
+    }
+    let out = c.output().expect("spawn onelf build");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let findings = findings_block(&err);
+    assert!(
+        findings
+            .iter()
+            .any(|l| l.contains("lib/examplefw/plugins: trace-limited")
+                && l.contains("redirected through /dev/fd/77/")),
+        "the tree-held plugin directory lost its redirection: {findings:#?}"
     );
 }
 
@@ -30491,6 +30696,110 @@ fn an_unreadable_file_omits_its_inferred_directory_without_failing() {
     );
 }
 
+/// A destination the tree reaches through a symlinked directory, or
+/// that is itself a symlink, is not the tree's own: the inferred
+/// directory is omitted rather than held, naming the link, and nothing
+/// redirects its compiled-in path through it.
+#[test]
+fn a_destination_behind_a_symlinked_tree_directory_is_not_held() {
+    let td = workdir("infer-held-link");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/linkedfw/a.conf"), "fw\n");
+    write(&td.join("fp/lib/leaffw/b.conf"), "fw\n");
+    let Some((app, _)) = inferred_dirs_app(
+        &td,
+        &[("fp", "libfw.so.1", &["share/linkedfw", "lib/leaffw"])],
+    ) else {
+        return;
+    };
+    write(&td.join("outside/linkedfw/other.conf"), "outside\n");
+    std::os::unix::fs::symlink(td.join("outside"), app.join("share")).unwrap();
+    std::fs::create_dir_all(app.join("lib/real")).unwrap();
+    std::os::unix::fs::symlink("real", app.join("lib/leaffw")).unwrap();
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| l.contains(
+            "share/linkedfw: optional omission: omitted because its destination is reached through the symlink share in the tree"
+        )),
+        "{findings:#?}"
+    );
+    assert!(
+        findings.iter().any(|l| l.contains(
+            "lib/leaffw: optional omission: omitted because its destination is reached through the symlink lib/leaffw in the tree"
+        )),
+        "{findings:#?}"
+    );
+    assert!(!err.contains("share/linkedfw: anchor"), "{err}");
+    assert!(!err.contains("lib/leaffw: anchor"), "{err}");
+    let anchors = std::fs::read_to_string(app.join(".onelf/anchors")).unwrap_or_default();
+    assert!(!anchors.contains("share/linkedfw"), "{anchors}");
+    assert!(!td.join("outside/linkedfw/a.conf").exists(), "{err}");
+}
+
+/// A directory nested in another that the tree already holds, and that
+/// the tree holds too, rides the outer one's redirection: its compiled-in
+/// path lies below the outer one's, so the outer rewrite covers it.
+#[test]
+fn a_held_child_of_a_held_directory_rides_its_redirection() {
+    let td = workdir("infer-held-child");
+    let td = td.canonicalize().unwrap();
+    write(&td.join("fp/share/heldfw/a.conf"), "fw\n");
+    write(&td.join("fp/share/heldfw/sub/b.conf"), "fw\n");
+    let Some((app, _)) = inferred_dirs_app(
+        &td,
+        &[("fp", "libfw.so.1", &["share/heldfw", "share/heldfw/sub"])],
+    ) else {
+        return;
+    };
+    write(&app.join("share/heldfw/a.conf"), "fw\n");
+    write(&app.join("share/heldfw/sub/b.conf"), "fw\n");
+    let out = onelf_build(&app);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let findings = findings_block(&err);
+    assert!(
+        findings.iter().any(|l| l.contains("share/heldfw: ")
+            && l.contains("held by the tree's own copy, redirected through /dev/fd/77/")),
+        "{findings:#?}"
+    );
+    assert!(
+        findings.iter().any(|l| l.contains("share/heldfw/sub: ")
+            && l.contains("carried within share/heldfw, redirected with it")),
+        "{findings:#?}"
+    );
+}
+
+/// A plugin directory whose only object the bundle cannot carry still
+/// carries its data, and a rebuild in place, which finds that data
+/// already in the tree, keeps the directory and its redirection rather
+/// than calling it empty.
+#[test]
+fn a_rebuild_keeps_a_plugin_directory_carrying_only_data() {
+    let td = workdir("infer-plugin-data-only");
+    let td = td.canonicalize().unwrap();
+    write_bytes(&td.join("fp/lib/onlyfw/foreign.so"), &foreign_object());
+    write(&td.join("fp/lib/onlyfw/b.conf"), "fw\n");
+    let Some((app, _)) = inferred_dirs_app(&td, &[("fp", "libfw.so.1", &["lib/onlyfw"])]) else {
+        return;
+    };
+    for build in ["first", "rebuild"] {
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{build}: {err}");
+        let findings = findings_block(&err);
+        assert!(
+            findings.iter().any(|l| l.contains(
+                "lib/onlyfw: selected: plugin directory, 0 object(s) and 1 other file(s)"
+            ) && l.contains("redirected through /dev/fd/77/")),
+            "{build}: {findings:#?}"
+        );
+        assert!(app.join("lib/onlyfw/b.conf").is_file(), "{build}: {err}");
+    }
+}
+
 /// A recipe pair that sends an inferred directory's compiled-in path to
 /// another bundle directory owns that path: the directory is omitted
 /// naming the pair and the path keeps its bytes, also below an anchored
@@ -30656,6 +30965,35 @@ fn a_recipe_pair_decides_whether_its_compiled_in_path_is_anchored() {
     std::fs::remove_file(app.join("lib/libfw.so.1")).unwrap();
     let (err, _) = build(&app);
     assert!(err.contains("has no effect in this tree"), "{err}");
+}
+
+/// A plugin directory that takes a path pair, because a nested spelling
+/// of another directory claims its key, keeps that pair across a rebuild
+/// in place, though the rebuild writes none of its members.
+#[test]
+fn a_rebuild_keeps_a_paired_plugin_directory_carrying_only_data() {
+    let td = workdir("infer-plugin-pair-rebuild");
+    let td = td.canonicalize().unwrap();
+    write_bytes(&td.join("fp/lib/zfw/foreign.so"), &foreign_object());
+    write(&td.join("fp/lib/zfw/b.conf"), "fw\n");
+    write(&td.join("fp/lib/other/c.conf"), "other\n");
+    std::os::unix::fs::symlink("../other", td.join("fp/lib/zfw/sub")).unwrap();
+    let Some((app, _)) =
+        inferred_dirs_app(&td, &[("fp", "libfw.so.1", &["lib/zfw", "lib/zfw/sub"])])
+    else {
+        return;
+    };
+    let zfw = td.join("fp/lib/zfw").display().to_string();
+    for build in ["first", "rebuild"] {
+        let out = onelf_build(&app);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{build}: {err}");
+        let pairs = std::fs::read_to_string(app.join(".onelf/inferred-paths")).unwrap_or_default();
+        assert!(
+            pairs.lines().any(|l| l == format!("{zfw}\tlib/zfw")),
+            "{build}: the plugin directory's pair is gone: {pairs:?}\n{err}"
+        );
+    }
 }
 
 /// A spelling below an anchored directory that names another carried

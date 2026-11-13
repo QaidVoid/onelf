@@ -569,10 +569,10 @@ pub struct Bundle {
     /// the recipe's keep patterns name and the kept relative links'
     /// targets, a plugin directory keeps the members the trace loaded,
     /// their dependencies and the keep patterns. Needs a trace:
-    /// `trace-run`, or `[sysroot] trace`. A traced run on a glibc host
-    /// sees only the modules the loader maps, so there a data
-    /// directory keeps nothing; musl runs and sysroot traces record
-    /// file opens.
+    /// `trace-run`, or `[sysroot] trace`. A traced run of a glibc
+    /// target sees only the modules the loader maps, so there only
+    /// plugin objects are trimmed and data is carried whole; runs of a
+    /// musl target and sysroot traces record file opens.
     #[serde(default)]
     pub trim_inferred: bool,
     /// Skip running bundle-libs entirely (e.g. pre-bundled AppDir).

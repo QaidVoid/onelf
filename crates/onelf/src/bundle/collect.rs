@@ -25,10 +25,12 @@ use std::path::{Path, PathBuf};
 
 use onelf_format::rules::{RelativePath, Requirement, ResourceGroup};
 
+use super::elf::libc_family_of_soname;
 use super::plan::TREE_WALK_LIMIT;
 use super::{
-    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, counterpart_spelling,
-    discover_group, is_nix_stub_ld, miss_text, read_elf_class, read_elf_machine, resolve_within,
+    AdmittedLibrary, AdmittedUniverse, CandidateHit, GroupQuery, LibcFamily, counterpart_spelling,
+    discover_group, is_nix_stub_ld, miss_text, parse_needed, read_elf_class, read_elf_machine,
+    resolve_within,
 };
 use crate::bundle::sysroot::SysrootUniverse;
 
@@ -207,8 +209,7 @@ pub(crate) fn collect_objects(
     group: &str,
     hit: &CandidateHit,
     members: &[(PathBuf, PathBuf)],
-    target_class: Option<u8>,
-    target_machine: Option<u16>,
+    (target_class, target_machine, target_libc): (Option<u8>, Option<u16>, Option<LibcFamily>),
 ) -> io::Result<GroupCollection> {
     let mut collection = GroupCollection {
         rule: rule.to_string(),
@@ -219,6 +220,21 @@ pub(crate) fn collect_objects(
     let mut taken: HashMap<PathBuf, PathBuf> = HashMap::new();
     for (rel, path) in members {
         if read_elf_class(path).is_some() {
+            // An object linking another libc than the bundle runs would
+            // pull that libc into the process: it stays out, named.
+            if let Some(want) = target_libc
+                && let Some(have) = parse_needed(path)
+                    .unwrap_or_default()
+                    .iter()
+                    .find_map(|d| libc_family_of_soname(d))
+                && have != want
+            {
+                collection.skipped.push((
+                    rel.to_string_lossy().into_owned(),
+                    format!("links {have:?} libc, the bundle runs {want:?}"),
+                ));
+                continue;
+            }
             take_member(
                 &mut collection,
                 &mut taken,
