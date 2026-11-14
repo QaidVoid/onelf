@@ -1,4 +1,10 @@
 
+## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-sysroot-v0.5.1...onelf-sysroot-v0.6.0) - 2026-11-14
+
+### ⛰️  Features
+
+- *(bundle)* Trim inferred dirs to what a trace opened - ([05d5b1a](https://github.com/QaidVoid/onelf/commit/05d5b1a79efeefba83c4f33f1b7c07b87c327bb6))
+
 
 
 ## [0.4.2](https://github.com/QaidVoid/onelf/compare/onelf-sysroot-v0.4.1...onelf-sysroot-v0.4.2) - 2026-10-21

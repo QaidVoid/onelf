@@ -1,4 +1,65 @@
 
+## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.5.1...onelf-format-v0.6.0) - 2026-11-14
+
+### ⛰️  Features
+
+- *(bundle)* Drop shared, libc and driver dirs from inference - ([f6cc1df](https://github.com/QaidVoid/onelf/commit/f6cc1df73481cdf118067179376fe58f6f8e6f79))
+- *(catalog)* Carry pipewire client-rt.conf for pre-1.4 clients - ([44e4862](https://github.com/QaidVoid/onelf/commit/44e4862819ff3c5e7436f02faee0c3825a6177dd))
+- *(catalog)* Remove sections inference reproduces - ([ea6acde](https://github.com/QaidVoid/onelf/commit/ea6acdefb79a181c42dec39c856de3335f039df0))
+- *(doctor)* Name admitted and refused host modules - ([e385728](https://github.com/QaidVoid/onelf/commit/e385728af513b64d917a055f8303ea077b2e2c37))
+- *(format)* Add the plugin directory record codec - ([9ce9b5a](https://github.com/QaidVoid/onelf/commit/9ce9b5adaa688e90b48ff76e5011e51a463fa788))
+- *(format)* Add the inference exclusions table to the catalog - ([1050694](https://github.com/QaidVoid/onelf/commit/1050694159813a4febc025d3aa5bc713334da522))
+- *(format)* Share the glibc loader scrub and count its search dirs - ([d3ab06a](https://github.com/QaidVoid/onelf/commit/d3ab06a50a736cafd5ddddcf24f5ee14005b9356))
+- *(format)* Parse the path overlay record strictly and bounded - ([3c2ad07](https://github.com/QaidVoid/onelf/commit/3c2ad07ae815c0a798d4cdab8ff6414d12dedf32))
+- *(format)* Add canonical selection identity and storage - ([d8c2e2e](https://github.com/QaidVoid/onelf/commit/d8c2e2e7e6e6712847c0abeb33ba73aa1508e1dc))
+- *(format)* Derive lint and runtime env knowledge - ([1dd4525](https://github.com/QaidVoid/onelf/commit/1dd4525693465a92fd59142ec142fd853abc9afd))
+- *(format)* Add runtime capability note and gate - ([aff116c](https://github.com/QaidVoid/onelf/commit/aff116c2b76a8a9917b69e2ec356295e5537c05d))
+- *(format)* Add bounded ELF fact inspection - ([2355f11](https://github.com/QaidVoid/onelf/commit/2355f11d495ecf326fea3ed6b99c5056db6e134b))
+- *(format)* Add built-in rule catalog and metadata codecs - ([e0e0625](https://github.com/QaidVoid/onelf/commit/e0e06255115f14ede6f66231a099bb30fa94e3a7))
+- *(format)* Add validated framework descriptor schemas - ([5b43504](https://github.com/QaidVoid/onelf/commit/5b4350481ad3f9fc674e3d216e3c1e479c10fed4))
+- *(pack)* Append inferred pairs to the paths record - ([b923a0d](https://github.com/QaidVoid/onelf/commit/b923a0d9cb8ce50d12ff0039df64ef04b29e7684))
+- *(resolve)* Admit checked host counterpart modules - ([feeeeb7](https://github.com/QaidVoid/onelf/commit/feeeeb7ce0bb9e86d006eb725132d8de3b3ac0da))
+- *(resolve)* Derive host counterpart directories - ([d34c6f7](https://github.com/QaidVoid/onelf/commit/d34c6f7207b9ac9d0e59cc8485e6e1e78da38747))
+- *(rt)* Present admitted host plugin modules as merged views - ([b8d78b0](https://github.com/QaidVoid/onelf/commit/b8d78b011d8f7f07f742f9e91d1c877d1946647e))
+- *(rt)* Hold descriptor 77 on the package's anchor directory - ([280fdae](https://github.com/QaidVoid/onelf/commit/280fdaef4efc32c2442c303f939a620bf3361a16))
+- *(rt)* Evaluate carried runtime rules and prepared pins - ([23f0af9](https://github.com/QaidVoid/onelf/commit/23f0af93b64fa02460921070d6c2d99e9b6b8e53))
+- *(rt)* Export the resolved store through launch env - ([d65b2ee](https://github.com/QaidVoid/onelf/commit/d65b2eef5070ce08a8d013f6da0981253b5ea399))
+- *(rules)* Collect only client-side PipeWire and SPA members - ([589925d](https://github.com/QaidVoid/onelf/commit/589925dd99119741a9c140b7003085ac52fdb56d))
+- *(rules)* Let plugin groups list the members they collect - ([443ca55](https://github.com/QaidVoid/onelf/commit/443ca5582da0132769a369d6a6e36f34bf40aaee))
+- *(sysroot)* Verify provider index for set pins - ([bc0c474](https://github.com/QaidVoid/onelf/commit/bc0c47477087f0398b539e529fd8c614a5798cf8))
+
+### 🐛 Bug Fixes
+
+- *(bundle)* Anchor by path prefix and keep inferred pairs - ([19eefbb](https://github.com/QaidVoid/onelf/commit/19eefbb9568346e7cc92a83483b88ac5e4884fd1))
+- *(bundle)* Scrub PowerPC glibc loaders too - ([6fdf366](https://github.com/QaidVoid/onelf/commit/6fdf3662677796c2da0ca2ab801e629d23031be5))
+- *(bundle)* Find data for tree-copied rule libraries on the host - ([9360155](https://github.com/QaidVoid/onelf/commit/93601555e520d9a0c422cbfd29c98b7b7c5cfffe))
+- *(catalog)* Restore the qt, babl and gegl plugin sections - ([fbfd16b](https://github.com/QaidVoid/onelf/commit/fbfd16b305c18fffce7a8f45d1c7e3e02e7d837e))
+- *(cli)* Publish verified sets only and persist root's cache - ([7d08f6e](https://github.com/QaidVoid/onelf/commit/7d08f6e246f9d656fb5074aed15123e71a75d055))
+- *(format)* Bind provider indexes to the pin, not the name - ([2dfabd4](https://github.com/QaidVoid/onelf/commit/2dfabd473959c55219d21e2a8d0847436d251901))
+- *(format)* Treat malformed onelf notes as incompatible - ([aaf49a3](https://github.com/QaidVoid/onelf/commit/aaf49a3debc31953237299ab117c13b7289aa1a6))
+- *(format)* Accept lld version chains and read dynstr once - ([35eec27](https://github.com/QaidVoid/onelf/commit/35eec27274d6c12738e4f1c67894ad7d9e7d494d))
+- *(resolve)* Refuse host modules another user could plant - ([980c517](https://github.com/QaidVoid/onelf/commit/980c517c45bd2c25e6845329b147846b4be8e692))
+- *(resolve)* Run the host loader from a closed private copy - ([e13a1f5](https://github.com/QaidVoid/onelf/commit/e13a1f5f7fc680dd7d717b2c88ae1439256bcbe1))
+- *(rt)* Keep nvidia-settings libraries out of the driver closure - ([67cc8ba](https://github.com/QaidVoid/onelf/commit/67cc8ba3923a2bb7d802c7bb3b8de2134473f01f))
+- *(rt)* Scope resolver decisions and provider checks to selections - ([faebd83](https://github.com/QaidVoid/onelf/commit/faebd83a5753c356fd7c7dad2c04ddff7bff9fd3))
+- *(rt)* Keep root's cache and base off env-chosen paths - ([5c9227b](https://github.com/QaidVoid/onelf/commit/5c9227b64962ec594c7f0a1fee4abd39093a5425))
+- *(rules)* Map translations at runtime without copying locales - ([a947b40](https://github.com/QaidVoid/onelf/commit/a947b40d4d19a38d7922257dae12e674361038a3))
+- *(rules)* Refuse loader, runtime-owned and shared env names - ([b656df1](https://github.com/QaidVoid/onelf/commit/b656df16fb2005725ce7ec274fe1b53bffe8a34f))
+- *(runtime)* Warn about missing GL only when the package links it - ([2f9904c](https://github.com/QaidVoid/onelf/commit/2f9904c9a97e6042619aa8ce2623d23f8963beca))
+- Treat libGLESv1_CM as a glvnd front end like libGLESv2 - ([984290c](https://github.com/QaidVoid/onelf/commit/984290c1b7a8eefee40f5dabf1f1dfeb81909ea4))
+
+### 🚜 Refactor
+
+- Drop stale dead-code allows and unused FUSE structs - ([a11dab9](https://github.com/QaidVoid/onelf/commit/a11dab984bcb31c9618f61aa4efbb816fc062c8b))
+
+### 📚 Documentation
+
+- *(rt)* Note that nvidia-settings itself loads its GTK libraries - ([cacfeb9](https://github.com/QaidVoid/onelf/commit/cacfeb903d9c5bbe1f3247ded0b130fbdb3f5f51))
+
+### 🧪 Testing
+
+- *(format)* Run rules-toml tests and use canonical rule files - ([c17659a](https://github.com/QaidVoid/onelf/commit/c17659a7796d45eddbc471fdd3fda109cd1e5208))
+
 
 ## [0.5.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.4.2...onelf-format-v0.5.0) - 2026-10-29
 
