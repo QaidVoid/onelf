@@ -25,6 +25,7 @@ use std::ffi::OsString;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -916,36 +917,158 @@ fn hardened_agent(redirects: u32) -> ureq::Agent {
 /// transfer, because a total would cut off a full download on a slow link,
 /// while a stalled connection still fails within 30 seconds of its last
 /// byte.
+///
+/// It asks for the bytes as stored: a resumed range counts the bytes the
+/// server stores, which a decoded gzip body does not.
 fn streaming_agent(redirects: u32) -> ureq::Agent {
     transport(redirects)
-        .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+        .timeout_per_read(Some(std::time::Duration::from_secs(30)))
+        .accept_encoding("identity")
         .build()
         .new_agent()
 }
 
-/// Download `url` through the hardened client into the already open
+/// The pauses before each retry of a GL build or dependency set download,
+/// in seconds: three attempts in all.
+const DOWNLOAD_RETRY_PAUSES: [u64; 2] = [2, 5];
+
+/// Download `url` through the streaming client into the already open
 /// `into`, refusing the transfer as soon as the body exceeds `max`
 /// bytes. Used for a pinned GL build or dependency set, which its hash
 /// verifies afterwards.
+///
+/// A dropped connection, a timeout or a server error is retried, and a
+/// retry resumes after the bytes already written when the server can
+/// prove it serves the same file. A refusal such as 404, a host that
+/// cannot be resolved, a TLS failure or a failed write is final.
 pub fn download(url: &str, into: &mut std::fs::File, max: u64) -> Result<(), String> {
-    let response = streaming_agent(10)
-        .get(url)
-        .call()
-        .map_err(|e| format!("{url}: {e}"))?;
-    let copied = io::copy(
-        &mut response
-            .into_body()
-            .into_reader()
-            .take(max.saturating_add(1)),
-        into,
-    )
-    .map_err(|e| format!("{url}: {e}"))?;
-    if copied > max {
-        return Err(format!(
+    download_with(&streaming_agent(10), url, into, max, &DOWNLOAD_RETRY_PAUSES)
+}
+
+/// One download attempt's failure: worth another attempt, or not.
+enum Attempt {
+    Again(String),
+    Final(String),
+}
+
+fn download_with(
+    agent: &ureq::Agent,
+    url: &str,
+    into: &mut std::fs::File,
+    max: u64,
+    pauses: &[u64],
+) -> Result<(), String> {
+    // A validator from the response that started the file, without which
+    // a later range could splice two different files together.
+    let mut validator: Option<String> = None;
+    let mut pauses = pauses.iter();
+    loop {
+        match download_once(agent, url, into, max, &mut validator) {
+            Ok(()) => return Ok(()),
+            Err(Attempt::Final(why)) => return Err(why),
+            Err(Attempt::Again(why)) => {
+                let Some(pause) = pauses.next() else {
+                    return Err(why);
+                };
+                eprintln!("onelf-rt: {why}; retrying in {pause}s");
+                std::thread::sleep(std::time::Duration::from_secs(*pause));
+            }
+        }
+    }
+}
+
+fn download_once(
+    agent: &ureq::Agent,
+    url: &str,
+    into: &mut std::fs::File,
+    max: u64,
+    validator: &mut Option<String>,
+) -> Result<(), Attempt> {
+    let final_err = |e: io::Error| Attempt::Final(format!("{url}: {e}"));
+    let have = into.metadata().map_err(final_err)?.len();
+    let mut request = agent.get(url);
+    if have > 0
+        && let Some(v) = validator.as_deref()
+    {
+        request = request
+            .header("Range", format!("bytes={have}-"))
+            .header("If-Range", v);
+    }
+    let mut start_over = |why: String| -> Result<(), Attempt> {
+        *validator = None;
+        into.set_len(0).map_err(final_err)?;
+        Err(Attempt::Again(why))
+    };
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(416)) => {
+            return start_over(format!("{url}: HTTP 416 for the rest of the file"));
+        }
+        Err(ureq::Error::StatusCode(code)) if code == 408 || code == 429 || code >= 500 => {
+            return Err(Attempt::Again(format!("{url}: HTTP {code}")));
+        }
+        Err(
+            e @ (ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::BodyStalled),
+        ) => return Err(Attempt::Again(format!("{url}: {e}"))),
+        Err(e) => return Err(Attempt::Final(format!("{url}: {e}"))),
+    };
+    let start = if response.status().as_u16() == 206 {
+        let from_have = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().starts_with(&format!("bytes {have}-")));
+        if !from_have {
+            return start_over(format!("{url}: a range that does not start at byte {have}"));
+        }
+        have
+    } else {
+        *validator = resume_validator(response.headers());
+        into.set_len(0).map_err(final_err)?;
+        0
+    };
+    into.seek(io::SeekFrom::Start(start)).map_err(final_err)?;
+    let budget = max - start.min(max);
+    let mut body = response
+        .into_body()
+        .into_reader()
+        .take(budget.saturating_add(1));
+    let mut chunk = vec![0u8; 64 << 10];
+    let mut copied = 0u64;
+    loop {
+        let n = body
+            .read(&mut chunk)
+            .map_err(|e| Attempt::Again(format!("{url}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        into.write_all(&chunk[..n]).map_err(final_err)?;
+        copied += n as u64;
+    }
+    if copied > budget {
+        return Err(Attempt::Final(format!(
             "{url}: the body is larger than the {max}-byte bound a staged build may take"
-        ));
+        )));
     }
     Ok(())
+}
+
+/// What an If-Range may name so a resumed range is of the same file: a
+/// strong ETag, else the Last-Modified date. A weak ETag cannot be used,
+/// since it does not promise the same bytes.
+fn resume_validator(headers: &ureq::http::HeaderMap) -> Option<String> {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    value("etag")
+        .filter(|tag| !tag.starts_with("W/"))
+        .or_else(|| value("last-modified"))
 }
 
 /// Stream `reader` into `file` from its start, refusing a body longer
@@ -1256,6 +1379,355 @@ mod tests {
         assert_eq!(
             report_available(Some(&running), Some(&release), None, Some(8)),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::{download_with, resume_validator};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// One scripted connection: the request head it expects to contain,
+    /// and the raw response it writes back before closing.
+    struct Exchange {
+        expect: Vec<&'static str>,
+        refuse: Vec<&'static str>,
+        response: Vec<u8>,
+    }
+
+    /// Serve `exchanges` in order on a loopback port and return the URL
+    /// and the request heads the server saw.
+    fn serve(exchanges: Vec<Exchange>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/build.onelf", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for exchange in exchanges {
+                let mut stream = accept(&listener);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line.to_ascii_lowercase());
+                }
+                for want in &exchange.expect {
+                    assert!(head.contains(want), "{want:?} missing from {head}");
+                }
+                for unwanted in &exchange.refuse {
+                    assert!(!head.contains(unwanted), "{unwanted:?} in {head}");
+                }
+                let _ = stream.write_all(&exchange.response);
+                heads.push(head);
+            }
+            heads
+        });
+        (url, server)
+    }
+
+    /// The next connection, or a panic once the client has gone five
+    /// seconds without making the request the script expects.
+    fn accept(listener: &TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client never made the expected request"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    fn agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build()
+            .new_agent()
+    }
+
+    fn body() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn head(status: &str, headers: &[String]) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+        for h in headers {
+            out.push_str(h);
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\n");
+        out.into_bytes()
+    }
+
+    /// A fresh staging file for the test `name`, removed when dropped.
+    struct Staging(std::path::PathBuf, std::fs::File);
+
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn staging(name: &str) -> Staging {
+        let path =
+            std::env::temp_dir().join(format!("onelf-download-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        Staging(path, file)
+    }
+
+    fn contents(file: &mut std::fs::File) -> Vec<u8> {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_dropped_transfer_resumes_from_the_bytes_it_has() {
+        let full = body();
+        let mut first = head(
+            "200 OK",
+            &[
+                format!("Content-Length: {}", full.len()),
+                "ETag: \"v1\"".into(),
+            ],
+        );
+        first.extend_from_slice(&full[..400]);
+        let mut second = head(
+            "206 Partial Content",
+            &[
+                format!("Content-Length: {}", full.len() - 400),
+                format!("Content-Range: bytes 400-999/{}", full.len()),
+            ],
+        );
+        second.extend_from_slice(&full[400..]);
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec!["range:"],
+                response: first,
+            },
+            Exchange {
+                expect: vec!["range: bytes=400-", "if-range: \"v1\""],
+                refuse: vec![],
+                response: second,
+            },
+        ]);
+        let mut staged = staging("resume");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(contents(&mut staged.1), full);
+    }
+
+    #[test]
+    fn without_a_validator_a_retry_starts_over() {
+        let full = body();
+        let mut first = head("200 OK", &[format!("Content-Length: {}", full.len())]);
+        first.extend_from_slice(&full[..400]);
+        let mut second = head("200 OK", &[format!("Content-Length: {}", full.len())]);
+        second.extend_from_slice(&full);
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: first,
+            },
+            Exchange {
+                expect: vec![],
+                refuse: vec!["range:"],
+                response: second,
+            },
+        ]);
+        let mut staged = staging("restart");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        server.join().unwrap();
+        assert_eq!(contents(&mut staged.1), full);
+    }
+
+    /// The first 400 bytes of the body, served whole with ETag "v1".
+    fn first_part() -> Vec<u8> {
+        let full = body();
+        let mut out = head(
+            "200 OK",
+            &[
+                format!("Content-Length: {}", full.len()),
+                "ETag: \"v1\"".into(),
+            ],
+        );
+        out.extend_from_slice(&full[..400]);
+        out
+    }
+
+    fn whole() -> Vec<u8> {
+        let full = body();
+        let mut out = head("200 OK", &[format!("Content-Length: {}", full.len())]);
+        out.extend_from_slice(&full);
+        out
+    }
+
+    #[test]
+    fn a_ranged_request_answered_whole_starts_over() {
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: first_part(),
+            },
+            Exchange {
+                expect: vec!["range: bytes=400-"],
+                refuse: vec![],
+                response: whole(),
+            },
+        ]);
+        let mut staged = staging("whole");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        server.join().unwrap();
+        assert_eq!(contents(&mut staged.1), body());
+    }
+
+    #[test]
+    fn a_416_starts_over_without_a_range() {
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: first_part(),
+            },
+            Exchange {
+                expect: vec!["range: bytes=400-"],
+                refuse: vec![],
+                response: head("416 Range Not Satisfiable", &["Content-Length: 0".into()]),
+            },
+            Exchange {
+                expect: vec![],
+                refuse: vec!["range:"],
+                response: whole(),
+            },
+        ]);
+        let mut staged = staging("416");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(contents(&mut staged.1), body());
+    }
+
+    #[test]
+    fn a_range_from_the_wrong_offset_starts_over() {
+        let full = body();
+        let mut wrong = head(
+            "206 Partial Content",
+            &[
+                format!("Content-Length: {}", full.len()),
+                format!("Content-Range: bytes 0-999/{}", full.len()),
+            ],
+        );
+        wrong.extend_from_slice(&full);
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: first_part(),
+            },
+            Exchange {
+                expect: vec!["range: bytes=400-"],
+                refuse: vec![],
+                response: wrong,
+            },
+            Exchange {
+                expect: vec![],
+                refuse: vec!["range:"],
+                response: whole(),
+            },
+        ]);
+        let mut staged = staging("offset");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+        assert_eq!(contents(&mut staged.1), full);
+    }
+
+    #[test]
+    fn a_server_error_is_retried() {
+        let (url, server) = serve(vec![
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: head("503 Service Unavailable", &["Content-Length: 0".into()]),
+            },
+            Exchange {
+                expect: vec![],
+                refuse: vec![],
+                response: whole(),
+            },
+        ]);
+        let mut staged = staging("503");
+        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(contents(&mut staged.1), body());
+    }
+
+    #[test]
+    fn a_refusal_is_not_retried() {
+        let (url, server) = serve(vec![Exchange {
+            expect: vec![],
+            refuse: vec![],
+            response: head("404 Not Found", &["Content-Length: 0".into()]),
+        }]);
+        let mut staged = staging("refusal");
+        let err = download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap_err();
+        assert!(err.contains("404"), "{err}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_body_over_the_bound_is_refused_for_good() {
+        let full = body();
+        let mut response = head("200 OK", &[format!("Content-Length: {}", full.len())]);
+        response.extend_from_slice(&full);
+        let (url, server) = serve(vec![Exchange {
+            expect: vec![],
+            refuse: vec![],
+            response,
+        }]);
+        let mut staged = staging("bound");
+        let err = download_with(&agent(), &url, &mut staged.1, 100, &[0, 0]).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_weak_etag_is_no_validator() {
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.insert("etag", "W/\"v1\"".parse().unwrap());
+        assert_eq!(resume_validator(&headers), None);
+        headers.insert(
+            "last-modified",
+            "Sat, 14 Nov 2026 10:00:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            resume_validator(&headers).as_deref(),
+            Some("Sat, 14 Nov 2026 10:00:00 GMT")
         );
     }
 }
