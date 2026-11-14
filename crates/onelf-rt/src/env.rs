@@ -2409,6 +2409,61 @@ mod store_hint_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The sweep after a launch's acquisitions keeps every build the
+    /// launch used, however long they sat idle before, and removes the
+    /// store's other idle builds.
+    #[test]
+    fn the_launch_sweep_keeps_every_build_the_launch_used() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = temp_dir("sweep-after-launch");
+        let hint = dir.join("store");
+        let (bytes, digest) = container();
+        let store = resolved(&hint);
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400);
+        let put = |label: &str, name: &str| {
+            let path = store.join(label).join(format!("{name}.onelf"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+            path
+        };
+        let first = put("set", &digest);
+        let second = put("gl", &digest);
+        let idle = put("old", &"0".repeat(64));
+
+        unsafe {
+            env::set_var(HINT, &hint);
+            env::set_var("ONELF_GC_MAX_AGE", "30");
+            env::remove_var(NO_FETCH);
+        }
+        for label in ["set", "gl"] {
+            let pin = crate::platform::Pin {
+                label: label.into(),
+                url: format!("file://{}", dir.join("absent-source").display()),
+                blake3: digest.clone(),
+            };
+            crate::platform::store_build(&pin).expect("the stored build serves");
+        }
+        crate::platform::sweep_used_stores();
+
+        assert!(
+            first.exists() && second.exists(),
+            "a build this launch used went"
+        );
+        assert!(!idle.exists(), "the idle build stays");
+
+        unsafe {
+            env::remove_var(HINT);
+            env::remove_var("ONELF_GC_MAX_AGE");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Fetch prohibition still permits a safe cached import: the
     /// artifact already at the exported location verifies against the
     /// pin and is served without any fetch, though the configured source

@@ -605,12 +605,9 @@ fn exec_cache(
     // Auto-GC: prune stale cache entries and reclaim the view store's
     // idle views (best-effort). Only now, with this launch's view leased,
     // so the sweep cannot take the view the launch is about to use.
-    let gc_max_age = std::env::var("ONELF_GC_MAX_AGE")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
+    let gc_max_age = cache::gc_max_age_days();
     if gc_max_age > 0 {
-        cache::auto_gc(&cache_base, gc_max_age * 86400, &package_id);
+        cache::auto_gc(&cache_base, gc_max_age.saturating_mul(86400), &package_id);
     }
 
     let built = links::view::ensure_view(&store, &identity, &lease, |staging| {

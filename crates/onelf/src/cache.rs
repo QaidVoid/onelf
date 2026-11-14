@@ -156,52 +156,9 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / 1_048_576.0
 }
 
-/// A pinned GL build the store holds: its label, the hash it is named by,
-/// its file, when a package last used it, and its size. The store keys a
-/// build by its hash, so one label may hold several as its pin moves on.
-struct StoredBuild {
-    label: String,
-    hash: String,
-    file: PathBuf,
-    used: Option<SystemTime>,
-    bytes: u64,
-}
-
-/// The builds the store holds: every `<hash>.onelf` under every label
-/// directory. A partial download (a dotfile) is skipped.
-fn stored_builds(root: &Path) -> Vec<StoredBuild> {
-    let Ok(labels) = fs::read_dir(layout::platform_dir(root)) else {
-        return Vec::new();
-    };
-    let mut builds: Vec<StoredBuild> = Vec::new();
-    for label in labels.flatten() {
-        if !label.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let label_name = label.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(label.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let name = file.file_name().to_string_lossy().into_owned();
-            let Some(hash) = name.strip_suffix(".onelf") else {
-                continue;
-            };
-            if hash.starts_with('.') {
-                continue;
-            }
-            let md = file.metadata().ok();
-            builds.push(StoredBuild {
-                label: label_name.clone(),
-                hash: hash.to_string(),
-                file: file.path(),
-                used: md.as_ref().and_then(|m| m.modified().ok()),
-                bytes: md.map(|m| m.len()).unwrap_or(0),
-            });
-        }
-    }
-    builds.sort_by(|a, b| (&a.label, &a.hash).cmp(&(&b.label, &b.hash)));
-    builds
+/// The builds the store under `root` holds.
+fn stored_builds(root: &Path) -> Vec<onelf_rt::platform::StoredBuild> {
+    onelf_rt::platform::stored_builds(&layout::platform_dir(root))
 }
 
 pub fn cache_list() -> io::Result<()> {
@@ -355,23 +312,8 @@ fn gc_cache(root: &Path, max_age_days: u64) -> io::Result<String> {
     // A build's file is touched on every use, so its age is its idleness.
     // Its extraction is a package like any other and goes through the
     // package pass below when idle.
-    let mut builds_removed = 0u64;
-    let mut build_bytes = 0u64;
-    for build in stored_builds(root) {
-        let idle = match build.used.map(|t| now.duration_since(t)) {
-            None => true,
-            Some(Ok(age)) => age > max_age,
-            Some(Err(_)) => false,
-        };
-        if idle && fs::remove_file(&build.file).is_ok() {
-            builds_removed += 1;
-            build_bytes += build.bytes;
-            // Drop the label directory once its last build is gone.
-            if let Some(parent) = build.file.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
-    }
+    let (builds_removed, build_bytes) =
+        onelf_rt::platform::sweep_idle_builds(&layout::platform_dir(root), max_age, true);
     if builds_removed > 0 {
         report.push(format!(
             "Removed {builds_removed} GL build(s) unused for {max_age_days} days, \

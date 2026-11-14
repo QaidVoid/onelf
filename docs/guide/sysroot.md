@@ -622,8 +622,12 @@ directories are never searched as a whole. Its libraries reach the
 application through the link farm by name, the ones the drivers open
 by name (glvnd vendors, gallium, ICDs) included, and are shown in the
 bundle's library directory as the host's are. `onelf cache list` shows the
-store and `onelf cache gc` collects a build no package has used past
-the age threshold.
+store. Once a launch holds the GL build and the sets it uses, it removes
+the builds and sets no package has used past the age threshold
+(`ONELF_GC_MAX_AGE`, 30 days by default), so they are reclaimed where the
+onelf command is not installed; `onelf cache gc` does the same on demand.
+With `ONELF_NO_PLATFORM_FETCH` set the launch removes none, since a
+removed build could not be had again.
 
 - ⚠️ Anything that prevents a fetch, including a missing pin, is a
   warning naming the reason, and the application is launched anyway.

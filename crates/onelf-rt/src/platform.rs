@@ -365,14 +365,130 @@ fn stored_location(pin: &Pin) -> Result<(PathBuf, String), String> {
 pub(crate) fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
     let (store, relative) = stored_location(pin)?;
     let hint = import_hint();
-    acquire(
+    let artifact = acquire(
         &store,
         &relative,
         pin,
         !env_set("ONELF_NO_PLATFORM_FETCH"),
         crate::paths::uid(),
         hint.as_deref().filter(|h| *h != store),
-    )
+    )?;
+    note_used_store(&store);
+    Ok(artifact)
+}
+
+/// The stores this process used a build from, which [`sweep_used_stores`]
+/// sweeps once the launch holds every build it needs.
+static USED_STORES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn note_used_store(store: &Path) {
+    let mut used = USED_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    if !used.iter().any(|s| s == store) {
+        used.push(store.to_path_buf());
+    }
+}
+
+/// Remove the idle builds of every store this launch used a build from,
+/// once it has all of them: they carry a fresh use, and a build untouched
+/// for `ONELF_GC_MAX_AGE` days goes. Best effort, and skipped when that
+/// age is 0 or fetching is disabled, since a build removed then could not
+/// be had again. Label directories stay, as another launch may be about
+/// to stage into one.
+pub(crate) fn sweep_used_stores() {
+    let stores = std::mem::take(&mut *USED_STORES.lock().unwrap_or_else(|e| e.into_inner()));
+    let days = crate::cache::gc_max_age_days();
+    if days == 0 || env_set("ONELF_NO_PLATFORM_FETCH") {
+        return;
+    }
+    for store in stores {
+        sweep_idle_builds(
+            &store,
+            std::time::Duration::from_secs(days.saturating_mul(86400)),
+            false,
+        );
+    }
+}
+
+/// A build the store holds: its label, the hash it is named by, its file,
+/// when a package last used it, and its size. The store keys a build by
+/// its hash, so one label may hold several as its pin moves on.
+pub struct StoredBuild {
+    /// The label directory it is stored under.
+    pub label: String,
+    /// The BLAKE3 digest its file is named by.
+    pub hash: String,
+    /// Its path.
+    pub file: PathBuf,
+    /// Its last use: every use touches the file.
+    pub used: Option<std::time::SystemTime>,
+    /// Its size in bytes.
+    pub bytes: u64,
+}
+
+/// The builds `store` holds: every `<hash>.onelf` under every label
+/// directory, the hash a BLAKE3 digest in lowercase hex. Anything else,
+/// a partial download included, is not a build.
+pub fn stored_builds(store: &Path) -> Vec<StoredBuild> {
+    let Ok(labels) = fs::read_dir(store) else {
+        return Vec::new();
+    };
+    let mut builds: Vec<StoredBuild> = Vec::new();
+    for label in labels.flatten() {
+        if !label.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let label_name = label.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(label.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            let Some(hash) = name.strip_suffix(".onelf") else {
+                continue;
+            };
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                continue;
+            }
+            let md = file.metadata().ok();
+            builds.push(StoredBuild {
+                label: label_name.clone(),
+                hash: hash.to_string(),
+                file: file.path(),
+                used: md.as_ref().and_then(|m| m.modified().ok()),
+                bytes: md.map(|m| m.len()).unwrap_or(0),
+            });
+        }
+    }
+    builds.sort_by(|a, b| (&a.label, &a.hash).cmp(&(&b.label, &b.hash)));
+    builds
+}
+
+/// Remove the builds in `store` unused for longer than `max_age`, and with
+/// `empty_labels` each label directory its last build leaves empty. A
+/// build whose use time lies in the future is kept. Returns how many
+/// builds went and the bytes they held.
+pub fn sweep_idle_builds(
+    store: &Path,
+    max_age: std::time::Duration,
+    empty_labels: bool,
+) -> (u64, u64) {
+    let now = std::time::SystemTime::now();
+    let (mut removed, mut bytes) = (0u64, 0u64);
+    for build in stored_builds(store) {
+        let idle = match build.used.map(|t| now.duration_since(t)) {
+            None => true,
+            Some(Ok(age)) => age > max_age,
+            Some(Err(_)) => false,
+        };
+        if idle && fs::remove_file(&build.file).is_ok() {
+            removed += 1;
+            bytes += build.bytes;
+            if empty_labels && let Some(parent) = build.file.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+    (removed, bytes)
 }
 
 /// [`store_build`] against an explicit store root, the store-relative
@@ -1270,6 +1386,45 @@ mod tests {
         footer.write_to(&mut bytes).unwrap();
         let digest = blake3::hash(&bytes).to_hex().to_string();
         Container { bytes, digest }
+    }
+
+    #[test]
+    fn the_sweep_removes_only_idle_builds() {
+        let store = temp_dir("sweep");
+        let day = std::time::Duration::from_secs(86400);
+        let now = std::time::SystemTime::now();
+        let put = |relative: &str, used: std::time::SystemTime| {
+            let path = store.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = fs::File::create(&path).unwrap();
+            file.set_len(10).unwrap();
+            file.set_modified(used).unwrap();
+            path
+        };
+        let hash = |c: char| c.to_string().repeat(64);
+        let old = put(&format!("gl/{}.onelf", hash('a')), now - 40 * day);
+        let fresh = put(&format!("gl/{}.onelf", hash('b')), now - day);
+        let lone = put(&format!("qt/{}.onelf", hash('c')), now - 40 * day);
+        let partial = put(&format!("gl/.{}.onelf", hash('d')), now - 40 * day);
+        let ahead = put(&format!("gl/{}.onelf", hash('e')), now + day);
+        let package = put("apps/editor.onelf", now - 40 * day);
+
+        assert_eq!(sweep_idle_builds(&store, 30 * day, false), (2, 20));
+        assert!(!old.exists() && !lone.exists());
+        assert!(
+            store.join("qt").exists(),
+            "a launch's sweep keeps the emptied label"
+        );
+        assert!(fresh.exists() && partial.exists() && ahead.exists());
+        assert!(
+            package.exists(),
+            "a file not named by a digest is not a build"
+        );
+
+        put(&format!("qt/{}.onelf", hash('f')), now - 40 * day);
+        assert_eq!(sweep_idle_builds(&store, 30 * day, true), (1, 10));
+        assert!(!store.join("qt").exists(), "the emptied label goes");
+        let _ = fs::remove_dir_all(&store);
     }
 
     /// A private store directory for one test.

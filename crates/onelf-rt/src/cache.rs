@@ -552,6 +552,16 @@ fn reclaim_view(store: &Path, name: &str, max_idle_secs: u64) -> bool {
     reclaimed
 }
 
+/// The idle age, in days, past which the runtime collects cached
+/// packages, views and stored builds: `ONELF_GC_MAX_AGE`, default 30, and
+/// 0 turns collection off.
+pub fn gc_max_age_days() -> u64 {
+    std::env::var("ONELF_GC_MAX_AGE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
 /// Sweep the cache for state unused for more than `max_age_secs`,
 /// reclaiming base extractions, their blobs, and the views no live lease
 /// holds. `current_pkg_id`, the package of the launch that sweeps, is

@@ -522,7 +522,7 @@ anything else, as the hook would have.
 | `ONELF_MODE` | Force a specific [execution mode](./execution-modes) |
 | `ONELF_CACHE` | `1` allows the persistent cache for this launch without forcing it |
 | `ONELF_ENTRYPOINT` | Select an [entrypoint](./entrypoints) by name |
-| `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30, `0` disables) |
+| `ONELF_GC_MAX_AGE` | Cache GC threshold in days (default 30, `0` disables), for cached packages and for stored GL builds and sets |
 | `ONELF_FUSE_NO_NAMESPACE` | Force the `fusermount3` path even when user namespaces work |
 | `ONELF_FUSE_NO_SHARE` | Mount the package for this launch alone rather than run from a running instance's mount |
 | `ONELF_NO_RESOLVER` | Take nothing from the host for this launch, to tell whether a failure is the resolver's |

@@ -145,6 +145,8 @@ fn run(launch: &Launch) {
             &resolved_owned
         }
     };
+    // Every set and the GL build this launch needs is in hand by now.
+    crate::platform::sweep_used_stores();
     let resolution = &resolved.resolution;
     for name in &resolution.incomparable {
         eprintln!("onelf-rt: resolver: cannot order {name}; keeping the bundled copy");
