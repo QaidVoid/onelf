@@ -26865,9 +26865,24 @@ fn hostile_user_alsa_snippets_leave_the_private_stack_working() {
         cfg_dir.starts_with(&tree) && cfg_dir.ends_with("/share/alsa"),
         "the configuration directory is not the package's: {report}"
     );
+    // A host with ALSA modules the resolver admits gets a merged view, in
+    // which every bundled member links into the package's directory.
     let plugin_dir = line(&stdout, "plugin_dir=");
+    let bundled = Path::new(&tree).join("lib/alsa-lib");
+    let members: Vec<_> = std::fs::read_dir(dir.join("lib/alsa-lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    let from_package = Path::new(&plugin_dir) == bundled
+        || (!members.is_empty()
+            && members.iter().all(|name| {
+                std::fs::read_link(Path::new(&plugin_dir).join(name))
+                    .is_ok_and(|target| target == bundled.join(name))
+            }));
     assert!(
-        plugin_dir.starts_with(&tree) && plugin_dir.ends_with("/lib/alsa-lib"),
+        from_package,
         "the plugin directory is not the package's: {report}"
     );
     assert!(
