@@ -28481,10 +28481,7 @@ int main(void) {
             );
         } else {
             assert!(out.contains("cfg=HOST"), "{mode:?}:\n{out}{err}");
-            assert!(
-                err.contains("stays in the host's user namespace"),
-                "{mode:?}: {err}"
-            );
+            assert!(err.contains("it will read the host's"), "{mode:?}: {err}");
         }
     }
 
