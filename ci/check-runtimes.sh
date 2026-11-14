@@ -24,9 +24,11 @@ for spec in slim:05 update:07; do
     variant="${spec%%:*}"
     bits="${spec#*:}"
     # The newest build directory, since a restored cache may hold stale
-    # ones beside it.
+    # ones beside it. Cargo names it build/onelf-<hash>, or build/onelf/<hash>
+    # from 1.100 on.
+    tail="out/onelf-rt-$variant/x86_64-unknown-linux-musl/$profile/onelf-rt"
     # shellcheck disable=SC2012 # the paths are cargo's own, no odd names
-    rt=$(ls -t "$target_dir/$profile"/build/onelf-*/out/onelf-rt-"$variant"/x86_64-unknown-linux-musl/"$profile"/onelf-rt 2>/dev/null | head -n 1)
+    rt=$(ls -t "$target_dir/$profile"/build/onelf-*/"$tail" "$target_dir/$profile"/build/onelf/*/"$tail" 2>/dev/null | head -n 1)
     [ -n "$rt" ] || fail "no $profile $variant runtime under $target_dir; build onelf first"
 
     phdrs=$(readelf -lW "$rt") || fail "readelf -l failed on $rt"
