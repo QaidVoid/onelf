@@ -396,21 +396,6 @@ pub(crate) mod tests {
         assert!(validate(&case.pkg, "app").is_err());
     }
 
-    /// The built runtime's bytes: the executable prefix every packed
-    /// fixture runs as.
-    fn runtime_bytes() -> Vec<u8> {
-        let from_cargo = std::env::var("CARGO_BIN_EXE_onelf-rt")
-            .ok()
-            .map(PathBuf::from);
-        let from_test_exe = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.ancestors().nth(2).map(|dir| dir.join("onelf-rt")));
-        let path = from_cargo
-            .or(from_test_exe)
-            .unwrap_or_else(|| panic!("cannot locate the built onelf-rt binary"));
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-    }
-
     /// Run a fixture as a packed executable: the built runtime is the
     /// prefix, the fixture is its package, and the child's exit code and
     /// stderr report how far the launch got. Acquisition cannot succeed
@@ -449,7 +434,7 @@ pub(crate) mod tests {
         // The fixture's prefix is the runtime itself: its manifest and
         // payload offsets are only correct in a file that runs as this
         // runtime with the package appended.
-        let runtime = runtime_bytes();
+        let runtime = crate::built_runtime();
         let mut files: Vec<(&str, Vec<u8>)> = vec![("bin/app", b"elf bytes".to_vec())];
         files.extend_from_slice(records);
         let package = fixture::build(&runtime, &files, &[("app", 0)]);
@@ -498,7 +483,7 @@ pub(crate) mod tests {
     /// consistent record shows the same entrypoint does run in memfd.
     #[test]
     fn an_inconsistent_selection_stops_a_memfd_entrypoint_before_it_runs() {
-        let runtime = runtime_bytes();
+        let runtime = crate::built_runtime();
         let script = b"#!/bin/sh\necho MEMFD-RAN >&2\nexit 42\n".to_vec();
         let package = |record: Vec<u8>| {
             fixture::build_flagged(

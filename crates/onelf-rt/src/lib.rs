@@ -56,6 +56,28 @@ pub(crate) mod providers;
 pub(crate) mod selfextract;
 pub(crate) mod ulexec;
 
+/// The built runtime's bytes: the executable prefix every packed test
+/// fixture runs as.
+#[cfg(test)]
+pub(crate) fn built_runtime() -> Vec<u8> {
+    // A unit test runs from below the profile directory that holds the
+    // runtime: `deps/` in Cargo's old layout, `build/onelf-rt/<hash>/out/`
+    // in the newer one.
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let profile = exe
+        .ancestors()
+        .find(|dir| {
+            matches!(
+                dir.file_name().and_then(|n| n.to_str()),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| panic!("{}: not below a Cargo profile directory", exe.display()));
+    let path = profile.join("onelf-rt");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 /// Keeps the tests that start a process apart from the tests that expect
 /// a file lock of theirs to be released. A child inherits every descriptor
 /// open when it is forked, a lock that survives an exec among them, and a
