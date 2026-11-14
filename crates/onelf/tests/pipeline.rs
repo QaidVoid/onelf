@@ -10812,7 +10812,9 @@ fn a_daemonized_process_outlives_the_launcher() {
     let mut got = String::new();
     for _ in 0..60 {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        if let Ok(s) = std::fs::read_to_string(&result) {
+        if let Ok(s) = std::fs::read_to_string(&result)
+            && !s.is_empty()
+        {
             got = s;
             break;
         }
@@ -12002,7 +12004,10 @@ fn a_join_launch_holds_the_mount_with_its_own_guardian() {
         // closed and its executable is outside the mount.
         let mut daemon = String::new();
         for _ in 0..200 {
-            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            // The file exists before the pid is written into it.
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                && !pid.trim().is_empty()
+            {
                 daemon = pid.trim().to_string();
                 break;
             }
@@ -12442,7 +12447,10 @@ fn an_abandoned_rundir_tree_is_reclaimed_by_the_next_launch() {
     use std::os::unix::process::CommandExt;
 
     let td = workdir("rundirkill");
-    let sleeper = pack_script(&td, "sleeper", "#!/bin/sh\nsleep 4\n");
+    // Outlives the wait for the tree below, so the kill finds the app
+    // running: an app that ended first has its guardian reap it, leave
+    // the process group and remove the tree before the kill arrives.
+    let sleeper = pack_script(&td, "sleeper", "#!/bin/sh\nsleep 60\n");
     let other = pack_script(&td, "other", "#!/bin/sh\necho OTHER\n");
     let run_dir = td.join("xdg-run");
 
