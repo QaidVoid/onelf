@@ -154,7 +154,8 @@ fn line(out: &mut String, text: &str) {
 }
 
 /// What a mode would do, and whether it could put a host file over a
-/// bundled one: only a private namespace or a tree of its own can.
+/// bundled one: a private namespace, a tree of its own or a FUSE server
+/// of its own can.
 type Verdict = Result<(String, bool), String>;
 
 /// The modes a launch tries, in order, each with what it would do or why
@@ -201,7 +202,7 @@ fn modes(
             (None, _) => Ok(("mounted in a private user namespace".to_string(), true)),
             (Some(why), Some(helper)) => Ok((
                 format!("mounted through {} ({why})", helper_text(helper)),
-                false,
+                true,
             )),
             (Some(why), None) => Err(format!("{why}, and there is no mount helper")),
         }
