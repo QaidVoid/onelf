@@ -941,8 +941,20 @@ const DOWNLOAD_RETRY_PAUSES: [u64; 2] = [2, 5];
 /// retry resumes after the bytes already written when the server can
 /// prove it serves the same file. A refusal such as 404, a host that
 /// cannot be resolved, a TLS failure or a failed write is final.
-pub fn download(url: &str, into: &mut std::fs::File, max: u64) -> Result<(), String> {
-    download_with(&streaming_agent(10), url, into, max, &DOWNLOAD_RETRY_PAUSES)
+pub fn download(
+    url: &str,
+    into: &mut std::fs::File,
+    max: u64,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<(), String> {
+    download_with(
+        &streaming_agent(10),
+        url,
+        into,
+        max,
+        &DOWNLOAD_RETRY_PAUSES,
+        progress,
+    )
 }
 
 /// One download attempt's failure: worth another attempt, or not.
@@ -957,19 +969,23 @@ fn download_with(
     into: &mut std::fs::File,
     max: u64,
     pauses: &[u64],
+    progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
     // A validator from the response that started the file, without which
     // a later range could splice two different files together.
     let mut validator: Option<String> = None;
     let mut pauses = pauses.iter();
     loop {
-        match download_once(agent, url, into, max, &mut validator) {
+        match download_once(agent, url, into, max, &mut validator, progress) {
             Ok(()) => return Ok(()),
             Err(Attempt::Final(why)) => return Err(why),
             Err(Attempt::Again(why)) => {
                 let Some(pause) = pauses.next() else {
                     return Err(why);
                 };
+                if io::IsTerminal::is_terminal(&io::stderr()) {
+                    eprint!("\r\x1b[K");
+                }
                 eprintln!("onelf-rt: {why}; retrying in {pause}s");
                 std::thread::sleep(std::time::Duration::from_secs(*pause));
             }
@@ -983,6 +999,7 @@ fn download_once(
     into: &mut std::fs::File,
     max: u64,
     validator: &mut Option<String>,
+    progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<(), Attempt> {
     let final_err = |e: io::Error| Attempt::Final(format!("{url}: {e}"));
     let have = into.metadata().map_err(final_err)?.len();
@@ -1030,6 +1047,12 @@ fn download_once(
         into.set_len(0).map_err(final_err)?;
         0
     };
+    let total = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|len| start + len);
     into.seek(io::SeekFrom::Start(start)).map_err(final_err)?;
     let budget = max - start.min(max);
     let mut body = response
@@ -1047,6 +1070,7 @@ fn download_once(
         }
         into.write_all(&chunk[..n]).map_err(final_err)?;
         copied += n as u64;
+        progress(start + copied, total);
     }
     if copied > budget {
         return Err(Attempt::Final(format!(
@@ -1537,7 +1561,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("resume");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(server.join().unwrap().len(), 2);
         assert_eq!(contents(&mut staged.1), full);
     }
@@ -1562,7 +1594,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("restart");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(contents(&mut staged.1), full);
     }
@@ -1603,7 +1643,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("whole");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(contents(&mut staged.1), body());
     }
@@ -1628,7 +1676,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("416");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(server.join().unwrap().len(), 3);
         assert_eq!(contents(&mut staged.1), body());
     }
@@ -1662,7 +1718,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("offset");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(server.join().unwrap().len(), 3);
         assert_eq!(contents(&mut staged.1), full);
     }
@@ -1682,7 +1746,15 @@ mod download_tests {
             },
         ]);
         let mut staged = staging("503");
-        download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap();
+        download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(server.join().unwrap().len(), 2);
         assert_eq!(contents(&mut staged.1), body());
     }
@@ -1695,7 +1767,15 @@ mod download_tests {
             response: head("404 Not Found", &["Content-Length: 0".into()]),
         }]);
         let mut staged = staging("refusal");
-        let err = download_with(&agent(), &url, &mut staged.1, 1 << 20, &[0, 0]).unwrap_err();
+        let err = download_with(
+            &agent(),
+            &url,
+            &mut staged.1,
+            1 << 20,
+            &[0, 0],
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(err.contains("404"), "{err}");
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1711,7 +1791,8 @@ mod download_tests {
             response,
         }]);
         let mut staged = staging("bound");
-        let err = download_with(&agent(), &url, &mut staged.1, 100, &[0, 0]).unwrap_err();
+        let err =
+            download_with(&agent(), &url, &mut staged.1, 100, &[0, 0], &mut |_, _| {}).unwrap_err();
         assert!(err.contains("larger than"), "{err}");
         assert_eq!(server.join().unwrap().len(), 1);
     }

@@ -307,6 +307,10 @@ fn main() {
     // that unshares first would make that mount private to this launch.
     // The carried selection record scopes acquisition to the invoked
     // entrypoint's selection, which the launch gate resolved and checked.
+    onelf_rt::notify::set_app(match pkg.manifest.name() {
+        "" => &ep_name,
+        name => name,
+    });
     sets::init(&selected, &ep_name);
 
     // The app runs setuid binaries, so it has to stay in the namespace it

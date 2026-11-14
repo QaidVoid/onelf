@@ -89,8 +89,13 @@ fn carry_rules(records: Vec<onelf_format::runtime_metadata::RuntimeRuleRecord>) 
 }
 
 /// The CLI's HTTPS client, supplied as acquisition's `https://`
-/// operation.
-fn https_fetch(url: &str, into: &mut std::fs::File, max: u64) -> Result<(), String> {
+/// operation. A development launch reports no progress.
+fn https_fetch(
+    url: &str,
+    into: &mut std::fs::File,
+    max: u64,
+    _progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<(), String> {
     let response = ureq::get(url).call().map_err(|e| format!("{url}: {e}"))?;
     let copied = io::copy(
         &mut io::Read::take(response.into_body().into_reader(), max.saturating_add(1)),

@@ -418,6 +418,8 @@ pub(crate) mod tests {
             .env_remove("ONELF_MODE")
             .env_remove("ONELF_ENTRYPOINT_EXPORTED")
             .env_remove("ONELF_CACHE")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
             .env("ONELF_ENTRYPOINT", "app")
             .env("ONELF_NO_PLATFORM_FETCH", "1")
             .env("ONELF_PLATFORM_STORE", &store)

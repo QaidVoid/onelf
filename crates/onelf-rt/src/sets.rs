@@ -251,6 +251,7 @@ pub fn init(pins: &[Pin], entrypoint: &str) {
                             "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
                             pin.label
                         );
+                        crate::notify::cannot_start(&format!("dependency set {}", pin.label), &why);
                         std::process::exit(1);
                     }
                 }
@@ -260,6 +261,7 @@ pub fn init(pins: &[Pin], entrypoint: &str) {
                     "onelf-rt: dependency set {} required by entrypoint {entrypoint}: {why}",
                     pin.label
                 );
+                crate::notify::cannot_start(&format!("dependency set {}", pin.label), &why);
                 std::process::exit(1);
             }
         }
@@ -1054,6 +1056,8 @@ mod selection_tests {
         command
             .env_remove("ONELF_ENTRYPOINT_EXPORTED")
             .env_remove("ONELF_CACHE")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
             .env("ONELF_ENTRYPOINT", "app")
             .env("ONELF_MODE", "rundir")
             .env("ONELF_SET_MODE", "extract")

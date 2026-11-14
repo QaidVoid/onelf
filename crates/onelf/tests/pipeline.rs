@@ -752,8 +752,12 @@ fn isolate(cmd: &mut Command, td: &Path) {
         std::fs::create_dir_all(d).unwrap();
         std::fs::set_permissions(d, PermissionsExt::from_mode(0o700)).unwrap();
     }
+    // Without a display a launch reports on stderr alone: a dialog or a
+    // notification would land on the desktop of whoever runs the suite.
     cmd.env("XDG_RUNTIME_DIR", &run)
-        .env("XDG_CACHE_HOME", &cache);
+        .env("XDG_CACHE_HOME", &cache)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
 }
 
 /// Execute a packed binary, retrying briefly while the kernel reports the

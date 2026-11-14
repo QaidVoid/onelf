@@ -839,10 +839,13 @@ pub fn resolve_launch(
         // the application draws with GL.
         match crate::platform::obtain(pkg_root) {
             Some(Ok(fetched)) => platform = Some(fetched),
-            Some(Err(why)) => eprintln!(
-                "onelf-rt: this host has no GL stack and the pinned build cannot be used \
-                 ({why}); continuing without one"
-            ),
+            Some(Err(why)) => {
+                eprintln!(
+                    "onelf-rt: this host has no GL stack and the pinned build cannot be used \
+                     ({why}); continuing without one"
+                );
+                crate::notify::warn("running without GL", &why);
+            }
             None if gl == Gl::Missing => eprintln!(
                 "onelf-rt: this host has no GL stack, which the package links, and the \
                  package pins no GL build; continuing without one"

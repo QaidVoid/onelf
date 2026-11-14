@@ -63,8 +63,11 @@ use rustix::io::Errno;
 /// exceeds the byte bound, or fail with a description of what went
 /// wrong. The library carries no client of its own, so every embedding
 /// process hands its existing client over here and nothing in the
-/// library's base dependencies pulls an HTTPS stack in.
-pub type HttpsFetch = fn(&str, &mut fs::File, u64) -> Result<(), String>;
+/// library's base dependencies pulls an HTTPS stack in. The transfer
+/// reports the bytes it has written, and the total when the server says,
+/// through the progress callback.
+pub type HttpsFetch =
+    fn(&str, &mut fs::File, u64, &mut dyn FnMut(u64, Option<u64>)) -> Result<(), String>;
 
 static HTTPS_FETCH: OnceLock<HttpsFetch> = OnceLock::new();
 
@@ -566,11 +569,16 @@ fn acquire(
     if !allow_fetch {
         return Err(miss(&refused, prohibited()));
     }
-    stage(&dir, name, pin, uid, &pin.url, |staging| {
-        fetch(&pin.url, staging)
-    })
-    .map(|file| verified(path, file))
-    .map_err(|why| miss(&refused, why))
+    let mut download = crate::notify::Download::begin(&pin.label);
+    let staged = stage(&dir, name, pin, uid, &pin.url, |staging| {
+        fetch(&pin.url, staging, &mut |done, total| {
+            download.progress(done, total)
+        })
+    });
+    download.end(staged.is_ok());
+    staged
+        .map(|file| verified(path, file))
+        .map_err(|why| miss(&refused, why))
 }
 
 /// The own-store opportunity: the stored candidate's verified handle, or
@@ -1241,7 +1249,11 @@ const FETCH_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// request is made. Either scheme is bounded by [`FETCH_MAX_BYTES`]
 /// during the transfer, so a source that never ends cannot fill the
 /// store's disk.
-fn fetch(url: &str, staging: &mut fs::File) -> Result<(), String> {
+fn fetch(
+    url: &str,
+    staging: &mut fs::File,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<(), String> {
     if let Some(path) = url.strip_prefix("file://") {
         let mut source = PinnedFile::pin_path(path, url)
             .and_then(|pinned| pinned.readable(url, OFlags::empty()))
@@ -1264,7 +1276,7 @@ fn fetch(url: &str, staging: &mut fs::File) -> Result<(), String> {
         let Some(download) = HTTPS_FETCH.get() else {
             return Err(format!("this runtime has no HTTPS client to fetch {url}"));
         };
-        download(url, staging, FETCH_MAX_BYTES)?;
+        download(url, staging, FETCH_MAX_BYTES, progress)?;
         let len = staging.metadata().map_err(|e| e.to_string())?.len();
         if len > FETCH_MAX_BYTES {
             return Err(format!(
@@ -1522,14 +1534,14 @@ mod tests {
         let tmp = dir.join(&tmp_relative);
         fs::create_dir_all(tmp.parent().unwrap()).unwrap();
         let mut staging = fs::File::create(&tmp).unwrap();
-        let err = fetch(&pin.url, &mut staging)
+        let err = fetch(&pin.url, &mut staging, &mut |_, _| {})
             .and_then(|()| {
                 open_verified(&dir, &tmp_relative, &pin.blake3, &pin.url, me())
                     .map_err(PinError::message)
             })
             .unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
-        let err = fetch("http://e/gl.onelf", &mut staging).unwrap_err();
+        let err = fetch("http://e/gl.onelf", &mut staging, &mut |_, _| {}).unwrap_err();
         assert!(err.contains("https:// or file://"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2683,7 +2695,7 @@ mod tests {
 
         for (name, kind) in [("link", "a symlink"), ("fifo", "a FIFO")] {
             let url = format!("file://{}", dir.join(name).display());
-            let err = fetch(&url, &mut staging).unwrap_err();
+            let err = fetch(&url, &mut staging, &mut |_, _| {}).unwrap_err();
             assert!(
                 err.contains(kind) && err.contains("not a regular file"),
                 "{err}"

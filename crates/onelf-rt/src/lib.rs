@@ -43,6 +43,7 @@ pub mod launch;
 pub mod links;
 pub mod loader;
 pub mod multicall;
+pub mod notify;
 pub mod paths;
 pub mod pkgmeta;
 pub mod platform;
