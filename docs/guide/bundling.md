@@ -840,7 +840,7 @@ The granular framework flags:
 
 | Flag | What it bundles |
 |------|-----------------|
-| `--gl` | The glvnd dispatch libraries (`libGL`, `libGLX`, `libEGL`, `libGLESv2`, `libOpenGL`, `libGLdispatch`), Mesa's `libGLX_mesa`, `libEGL_mesa`, `libglapi`, `libgbm` and `libxatracker`, GBM backends, EGL vendor files, and Mesa's `drirc.d` and `libdrm` data |
+| `--gl` | The glvnd dispatch libraries (`libGL`, `libGLX`, `libEGL`, `libGLESv1_CM`, `libGLESv2`, `libOpenGL`, `libGLdispatch`), Mesa's `libGLX_mesa`, `libEGL_mesa`, `libglapi`, `libgbm` and `libxatracker`, GBM backends, EGL vendor files, and Mesa's `drirc.d` and `libdrm` data |
 | `--dri` | Mesa DRI drivers into `lib/dri` (filtered to your architecture) |
 | `--vulkan` | Vulkan ICD files into `share/vulkan/icd.d` and the drivers they name (filtered to your architecture) |
 | `--wayland` | `libwayland-client`, `-server`, `-cursor` and `-egl`, `libdecor-0` with its plugins, and `libxkbcommon` |

@@ -61,6 +61,7 @@ pub const DRIVER_FAMILIES: &[&str] = &[
     "libEGL.so",
     "libGLdispatch.so",
     "libOpenGL.so",
+    "libGLESv1_CM.so",
     "libGLESv2.so",
     "libvulkan.so",
     "libcuda.so",
