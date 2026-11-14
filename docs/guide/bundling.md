@@ -500,8 +500,11 @@ Some libraries are loaded at runtime via `dlopen` and don't appear in
 `DT_NEEDED`.
 
 - ✅ `--scan-dlopen` when the app loads known plugins. It searches the
-  binary strings for common candidates (GL, Wayland, Vulkan, X11,
-  audio, DBus, and so on) and bundles any matches.
+  binary for common candidates (Wayland, X11 and its extensions,
+  audio, DBus, fonts) and bundles any matches, including names a Rust
+  binary merges into its string data without a NUL between them. The
+  GPU stack is not a candidate: as on detection, the host's driver is
+  the one that works.
 
 ```bash
 onelf bundle-libs ./myapp --scan-dlopen

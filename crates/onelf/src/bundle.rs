@@ -4924,9 +4924,10 @@ fn bundle_tree(opts: &BundleOptions) -> io::Result<()> {
         None
     };
 
-    // Opt-in dlopen scan: match string literals against a known allow-list
-    // of commonly dlopen'd sonames (GL, Wayland, Vulkan, audio, etc.) and
-    // queue the hits as if the user had passed them via --include.
+    // Opt-in dlopen scan: find the names on a known allow-list of commonly
+    // dlopen'd sonames (Wayland, X11, audio, DBus, fonts) anywhere in the
+    // binaries and queue the hits as if the user had passed them via
+    // --include.
     if opts.scan_dlopen {
         let mut scanned: HashSet<String> = HashSet::new();
         for path in &elf_files {
@@ -8432,12 +8433,8 @@ fn detect_frameworks(files: &[PathBuf]) -> FrameworkFlags {
             }
         }
 
-        // Scan for NUL-terminated soname strings in the binary. C/C++
-        // apps like Blender don't DT_NEED libwayland-cursor or libdecor;
-        // they dlopen them at runtime. This catches those cases for
-        // binaries with proper NUL-separated string tables. Rust binaries
-        // with merged string sections won't trigger false positives here;
-        // users should pass --scan-dlopen or explicit framework flags.
+        // Apps like Blender dlopen libwayland-cursor or libdecor without a
+        // DT_NEEDED entry, so the soname strings are scanned too.
         scan_framework_strings(&bytes, &mut flags);
     }
     flags
@@ -8555,76 +8552,79 @@ fn versioned_soname_at(bytes: &[u8], start: usize) -> Option<String> {
 
 /// Sonames that applications commonly dlopen at runtime. Absence from DT_NEEDED
 /// doesn't mean absence from the runtime graph; these are known offenders.
+/// The GPU, video and compute driver families are not here: the host's
+/// copy is the one that works, as for a traced run, and `--gl`, `--dri`
+/// and `--vulkan` are what bundle Mesa.
 const DLOPEN_CANDIDATES: &[&str] = &[
-    // OpenGL / GLVND
-    "libGL.so.1",
-    "libEGL.so.1",
-    "libGLX.so.0",
-    "libGLdispatch.so.0",
-    "libOpenGL.so.0",
-    "libGLESv1_CM.so.1",
-    "libGLESv2.so.2",
-    "libgbm.so.1",
-    // Vulkan
-    "libvulkan.so.1",
     // Wayland
     "libwayland-client.so.0",
     "libwayland-cursor.so.0",
     "libwayland-egl.so.1",
     "libdecor-0.so.0",
-    // X11
+    // X11 and the extensions x11-dl, winit, SDL and GLFW open by name
     "libX11.so.6",
+    "libX11-xcb.so.1",
     "libxcb.so.1",
+    "libXcursor.so.1",
+    "libXext.so.6",
+    "libXfixes.so.3",
+    "libXi.so.6",
+    "libXinerama.so.1",
+    "libXrandr.so.2",
+    "libXrender.so.1",
+    "libXss.so.1",
     "libxkbcommon.so.0",
     "libxkbcommon-x11.so.0",
-    // Video acceleration
-    "libva.so.2",
-    "libva-drm.so.2",
-    "libva-x11.so.2",
-    "libva-wayland.so.2",
     // Audio
     "libpulse.so.0",
     "libasound.so.2",
     "libjack.so.0",
     // IPC / desktop
     "libdbus-1.so.3",
-    // NVIDIA proprietary stack
-    "libcuda.so.1",
-    "libnvidia-ml.so.1",
-    "libnvidia-encode.so.1",
-    "libnvidia-fbc.so.1",
     // Fonts / text
     "libfontconfig.so.1",
     "libfreetype.so.6",
     "libharfbuzz.so.0",
 ];
 
-/// Scan a binary's string table for soname-shaped values that match the
-/// dlopen allow-list (built-in plus any user-supplied additions). Matches
-/// are candidates for bundling even though they don't appear in DT_NEEDED.
+/// Scan a binary for the sonames on the dlopen allow-list (built-in plus
+/// any user-supplied additions). Matches are candidates for bundling even
+/// though they don't appear in DT_NEEDED.
+///
+/// A name counts wherever it starts, since Rust merges string literals
+/// without NUL separators (`...XcFileSavelibX11.so.6libX11.so...`), but
+/// not when a longer version follows it.
 fn scan_dlopen(path: &Path, extra: &[String]) -> io::Result<Vec<String>> {
     let data = fs::read(path)?;
-    let mut found: Vec<String> = Vec::new();
+    Ok(dlopen_hits(&data, extra))
+}
 
-    let mut start = None;
-    for (i, &b) in data.iter().enumerate() {
-        let printable = (0x20..=0x7e).contains(&b);
-        if printable {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start.take()
-            && i - s >= 5
-            && let Ok(text) = std::str::from_utf8(&data[s..i])
-        {
-            let match_builtin = DLOPEN_CANDIDATES.contains(&text);
-            let match_extra = extra.iter().any(|c| c == text);
-            if (match_builtin || match_extra) && !found.iter().any(|x| x == text) {
-                found.push(text.to_string());
+fn dlopen_hits(data: &[u8], extra: &[String]) -> Vec<String> {
+    let candidates: Vec<&str> = DLOPEN_CANDIDATES
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .filter(|name| !name.is_empty())
+        .collect();
+    let mut firsts: Vec<u8> = candidates.iter().map(|name| name.as_bytes()[0]).collect();
+    firsts.sort_unstable();
+    firsts.dedup();
+    let mut found: Vec<String> = Vec::new();
+    for i in 0..data.len() {
+        if !firsts.contains(&data[i]) {
+            continue;
+        }
+        for name in &candidates {
+            let end = i + name.len();
+            if data[i..].starts_with(name.as_bytes())
+                && !matches!(data.get(end), Some(b'.' | b'0'..=b'9'))
+                && !found.iter().any(|x| x == name)
+            {
+                found.push(name.to_string());
             }
         }
     }
-    Ok(found)
+    found
 }
 
 #[cfg(test)]
@@ -9402,6 +9402,63 @@ mod helper_tests {
             "the held helper is not requeued"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod dlopen_scan_tests {
+    use super::*;
+
+    #[test]
+    fn finds_sonames_merged_without_nul_separators() {
+        // x11-dl's names as winit's release binary carries them.
+        let blob = b"XcFileSavelibX11.so.6libX11.soXAc/usr/lib64libXi.so.6libXrender.so.1";
+        assert_eq!(
+            dlopen_hits(blob, &[]),
+            ["libX11.so.6", "libXi.so.6", "libXrender.so.1"]
+        );
+    }
+
+    #[test]
+    fn the_gpu_stack_is_left_to_the_host() {
+        assert!(dlopen_hits(b"eglWaitSynclibEGL.so.1libEGL.solibGL.so.1", &[]).is_empty());
+        for name in DLOPEN_CANDIDATES {
+            assert!(
+                !onelf_format::drivers::DRIVER_FAMILIES
+                    .iter()
+                    .any(|f| name.starts_with(f)),
+                "{name} is a driver family"
+            );
+        }
+    }
+
+    #[test]
+    fn a_longer_version_is_not_the_candidate() {
+        assert!(dlopen_hits(b"\0libX11.so.60\0libX11.so.6.4.0\0", &[]).is_empty());
+    }
+
+    #[test]
+    fn an_unversioned_extra_still_matches() {
+        let extra = ["libvendor.so".to_string()];
+        assert_eq!(dlopen_hits(b"\0libvendor.so\0", &extra), ["libvendor.so"]);
+    }
+
+    #[test]
+    fn repeats_and_empty_extras_are_ignored() {
+        let extra = [String::new(), "libX11.so.6".to_string()];
+        assert_eq!(
+            dlopen_hits(b"libX11.so.6\0libX11.so.6", &extra),
+            ["libX11.so.6"]
+        );
+    }
+
+    #[test]
+    fn an_extra_without_the_lib_prefix_matches() {
+        let extra = ["steamclient.so".to_string()];
+        assert_eq!(
+            dlopen_hits(b"\0steamclient.so\0", &extra),
+            ["steamclient.so"]
+        );
     }
 }
 

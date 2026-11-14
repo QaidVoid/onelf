@@ -90,8 +90,8 @@ dict = false
 # Skip libraries whose libc family (musl vs glibc) doesn't match the target.
 # strict-libc = false
 
-# Scan binaries for strings matching a known allow-list of dlopen'd libs
-# (GL/EGL/Wayland/Vulkan/audio/DBus/...) and bundle the matches.
+# Scan binaries for names on a known allow-list of dlopen'd libs
+# (Wayland, X11, audio, DBus, fonts) and bundle the matches.
 # scan-dlopen = false
 
 # Extra sonames added to the --scan-dlopen allow-list.

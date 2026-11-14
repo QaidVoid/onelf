@@ -455,9 +455,9 @@ enum Commands {
         #[arg(long)]
         strict_libc: bool,
 
-        /// Scan binary strings for soname-shaped values that match a known
-        /// allow-list of commonly dlopen'd libraries (GL, Wayland, Vulkan,
-        /// audio, DBus, etc.) and bundle the matches.
+        /// Scan binaries for the names on a known allow-list of commonly
+        /// dlopen'd libraries (Wayland, X11, audio, DBus, fonts) and bundle
+        /// the matches. The GPU stack is left to the host.
         #[arg(long)]
         scan_dlopen: bool,
 
