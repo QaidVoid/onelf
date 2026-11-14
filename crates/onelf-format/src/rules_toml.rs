@@ -75,17 +75,19 @@ pub fn parse_inference_exclusions(text: &str) -> Result<InferenceExclusions, Rul
 /// Parse TOML the caller has already bounded, with a parse error located
 /// by line and column and never copying an unbounded source line.
 fn parse_document(text: &str) -> Result<Value, RuleError> {
-    text.parse::<toml::Table>().map(Value::Table).map_err(|error| {
-        let message: String = error.message().chars().take(512).collect();
-        let offset = error.span().map_or(0, |span| span.start.min(text.len()));
-        let preceding = &text.as_bytes()[..offset];
-        let line = preceding.iter().filter(|b| **b == b'\n').count() + 1;
-        let column = preceding
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(offset + 1, |last| offset - last);
-        RuleError::new(&format!("TOML line {line} column {column}"), &message)
-    })
+    text.parse::<toml::Table>()
+        .map(Value::Table)
+        .map_err(|error| {
+            let message: String = error.message().chars().take(512).collect();
+            let offset = error.span().map_or(0, |span| span.start.min(text.len()));
+            let preceding = &text.as_bytes()[..offset];
+            let line = preceding.iter().filter(|b| **b == b'\n').count() + 1;
+            let column = preceding
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(offset + 1, |last| offset - last);
+            RuleError::new(&format!("TOML line {line} column {column}"), &message)
+        })
 }
 
 fn parse_exclusion_entry(value: Value) -> Result<ExclusionEntry, RuleError> {
