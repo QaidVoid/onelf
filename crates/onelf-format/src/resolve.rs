@@ -268,6 +268,12 @@ const GL_BUILD_SEEDS: &[&str] = &[
 /// vendor the host's display names.
 const HOST_SEEDS: &[&str] = &["libGLX_"];
 
+/// Driver-family names that do not start the host's closure walk.
+/// nvidia-settings' interface libraries ship with the driver but no
+/// application loads them, and their GTK closure would otherwise put
+/// libdbus, libsystemd and the like up for a host-or-bundle choice.
+const NOT_DRIVER_SEEDS: &[&str] = &["libnvidia-gtk"];
+
 /// Where a launch gets its GL stack from, if anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gl {
@@ -990,6 +996,7 @@ impl HostIndex {
             .libs
             .keys()
             .filter(|name| is_driver_family(name) || HOST_SEEDS.iter().any(|p| name.starts_with(p)))
+            .filter(|name| !NOT_DRIVER_SEEDS.iter().any(|p| name.starts_with(p)))
             .cloned()
             .collect();
         for path in &self.icd_libs {
@@ -2991,6 +2998,27 @@ mod tests {
             assert!(closure.contains(name), "{name} missing from {closure:?}");
         }
         assert!(!closure.contains("libunrelated.so.1"));
+    }
+
+    #[test]
+    fn nvidia_settings_interface_libraries_do_not_seed_the_closure() {
+        let w = World::new();
+        w.host(
+            "libnvidia-gtk3.so.580.196.07",
+            &driver_needing(&["libgtk-3.so.0"]),
+        );
+        w.host("libgtk-3.so.0", &driver_needing(&["libdbus-1.so.3"]));
+        w.host("libdbus-1.so.3", &versioned(&["LIBDBUS_PRIVATE_1.16.2"]));
+        w.host("libnvidia-glcore.so.580.196.07", &versioned(&[]));
+        let closure = HostIndex::load(&w.cache, &[], None).driver_closure();
+        assert!(closure.contains("libnvidia-glcore.so.580.196.07"));
+        for name in [
+            "libnvidia-gtk3.so.580.196.07",
+            "libgtk-3.so.0",
+            "libdbus-1.so.3",
+        ] {
+            assert!(!closure.contains(name), "{name} in {closure:?}");
+        }
     }
 
     /// A synthetic host loader carrying the default directory table and
