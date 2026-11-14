@@ -35,6 +35,10 @@ git_tag_enable = false
 [[package]]
 name = "onelf-rt"
 git_tag_enable = false
+# The published 0.6.0 resolves rustix 1.1.6 without a lockfile and no longer
+# builds, so it cannot be the baseline. Turn the check back on once a
+# release with the rustix bound is out.
+semver_check = false
 
 [[package]]
 name = "onelf-sysroot"

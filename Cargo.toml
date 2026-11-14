@@ -28,16 +28,18 @@ codegen-units = 1
 [workspace.dependencies]
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
-goblin = { version = "0.9", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
+goblin = { version = "0.10", default-features = false, features = ["elf64", "elf32", "endian_fd"] }
 indicatif = "0.18"
-jwalk = "0.8"
+jwalk = "0.9"
 onelf-format = { version = "0.6.0", path = "crates/onelf-format" }
 onelf-sysroot = { version = "0.6.0", path = "crates/onelf-sysroot" }
 rayon = "1.11"
-rustix = { version = "1", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
+# 1.1.5 renamed the experimental `runtime` module the runtime forks and
+# execs through, so a fresh resolution past 1.1.4 does not build.
+rustix = { version = "=1.1.4", features = ["fs", "mm", "event", "process", "pipe", "runtime", "net", "mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
 stipplefs = { version = "0.2.0", default-features = false }
-toml = "0.8"
+toml = "1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 zstd = { version = "0.14", default-features = false }
 

@@ -43,7 +43,7 @@ jobs:
 
       - name: Set the release version
         shell: bash
-        run: echo "RELEASE_VERSION=${GITHUB_REF:11}" >> $GITHUB_ENV
+        run: echo "RELEASE_VERSION=${GITHUB_REF:11}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         shell: bash
@@ -52,7 +52,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends musl-tools b3sum
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
         with:
           toolchain: stable
           targets: ${{ matrix.build.TARGET }}
