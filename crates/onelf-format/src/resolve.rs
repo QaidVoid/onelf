@@ -269,9 +269,10 @@ const GL_BUILD_SEEDS: &[&str] = &[
 const HOST_SEEDS: &[&str] = &["libGLX_"];
 
 /// Driver-family names that do not start the host's closure walk.
-/// nvidia-settings' interface libraries ship with the driver but no
-/// application loads them, and their GTK closure would otherwise put
-/// libdbus, libsystemd and the like up for a host-or-bundle choice.
+/// nvidia-settings' interface libraries ship with the driver and only
+/// nvidia-settings loads them, so a packed nvidia-settings loses its GTK
+/// interface. Otherwise their GTK closure would put libdbus, libsystemd
+/// and the like up for a host-or-bundle choice in every package.
 const NOT_DRIVER_SEEDS: &[&str] = &["libnvidia-gtk"];
 
 /// Where a launch gets its GL stack from, if anywhere.
