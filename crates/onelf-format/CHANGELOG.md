@@ -1,4 +1,10 @@
 
+## [0.6.1](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.6.0...onelf-format-v0.6.1) - 2026-11-14
+
+### 🎨 Styling
+
+- Fmt - ([4523f1c](https://github.com/QaidVoid/onelf/commit/4523f1c83e8b7e4b380a187d42a337a3436cfd1c))
+
 ## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-format-v0.5.1...onelf-format-v0.6.0) - 2026-11-14
 
 ### ⛰️  Features
