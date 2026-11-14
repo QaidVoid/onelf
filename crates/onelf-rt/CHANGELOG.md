@@ -1,4 +1,15 @@
 
+## [0.6.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.6.0...onelf-rt-v0.6.1) - 2026-11-14
+
+### ⛰️  Features
+
+- *(rt)* Show set downloads in a dialog, notification or terminal - ([fc7a965](https://github.com/QaidVoid/onelf/commit/fc7a96507f4a8610c159ccac5ba75a7eef6d7922))
+- *(rt)* Collect idle sets and GL builds at launch - ([0a278c8](https://github.com/QaidVoid/onelf/commit/0a278c800c0509f98b21830bb18596fbd1323097))
+
+### 🐛 Bug Fixes
+
+- *(rt)* Let set downloads finish slowly and resume after drops - ([6096cfd](https://github.com/QaidVoid/onelf/commit/6096cfdc274c28a7afc8f75c4ef11d9db6bd7719))
+
 ## [0.6.0](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.5.1...onelf-rt-v0.6.0) - 2026-11-14
 
 ### ⛰️  Features
