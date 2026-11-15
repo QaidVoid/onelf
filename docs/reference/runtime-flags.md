@@ -39,9 +39,8 @@ The report covers:
   directory shown as `<library dir>/<path>`, and one that applies only
   with a selected set followed by `(with the set <name>)`. A package
   without a rules record runs with the built-in mappings, which are not
-  listed. Each
-  pair of the paths record is named as `overlay <absolute> ->
-  <relative>` when a launch here would bind it, or as
+  listed. Each pair of the paths record is named as
+  `overlay <absolute> -> <relative>` when a launch here would bind it, or as
   `unredirected <absolute> -> <relative> (<why>)` when it would not:
   no mode to run in, a memfd launch's missing tree, the package's own
   setuid request, `ONELF_FUSE_NO_NAMESPACE`, restricted user
