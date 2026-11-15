@@ -16,11 +16,15 @@
 //! inherited `ONELF_PLATFORM_STORE` hint never overrides that ownership
 //! decision. A hint the target does not own is import input instead.
 //!
-//! Acquisition tries three opportunities in order: the verified copy in
-//! the target's own store, an import from the hinted store, and a fetch
-//! from the pin's configured source unless `ONELF_NO_PLATFORM_FETCH`
-//! forbids it. A rejected opportunity is unavailable, never fatal on its
-//! own; the error names every refusal once the last one is exhausted.
+//! Acquisition tries four opportunities in order: a verified copy in a
+//! provided store, the read-only `onelf/platform` directories under the
+//! XDG data directories that a package manager installs builds into; the
+//! verified copy in the target's own store; an import from the hinted
+//! store; and a fetch from the pin's configured source unless
+//! `ONELF_NO_PLATFORM_FETCH` forbids it. A rejected opportunity is
+//! unavailable, never fatal on its own; the error names every refusal
+//! once the last one is exhausted. A provided store is only ever read:
+//! nothing in it is written, touched or swept.
 //!
 //! A stored candidate is pinned before anything reads it: the
 //! store-relative name is walked one component at a time with
@@ -354,18 +358,130 @@ fn stored_location(pin: &Pin) -> Result<(PathBuf, String), String> {
         crate::cache::base_dir,
         crate::paths::private_dir,
     )?;
-    // The build is stored by its own hash, so two builds a label pins over
-    // its lifetime coexist rather than overwrite each other and force a
-    // refetch on every launch.
-    Ok((store, format!("{}/{}.onelf", pin.label, pin.blake3)))
+    Ok((store, store_relative(pin)))
 }
 
-/// The build `pin` names, from the shared store: the cached file is
-/// pinned and hashed through confined descriptors, and only a missing or
-/// mismatching file is imported from a hinted store the target does not
-/// own, or fetched, then verified and published in its place. Returns
-/// the verified handle every consumer reads through.
+/// The store-relative name of the build `pin` names, the same in every
+/// store. The build is stored by its own hash, so two builds a label pins
+/// over its lifetime coexist rather than overwrite each other and force a
+/// refetch on every launch.
+fn store_relative(pin: &Pin) -> String {
+    format!("{}/{}.onelf", pin.label, pin.blake3)
+}
+
+/// Where a provided store sits below each XDG data directory.
+const PROVIDED_STORE_DIR: &str = "onelf/platform";
+
+/// The read-only stores another package manager installs builds into, in
+/// lookup order, with `var` reading the environment: `onelf/platform`
+/// under `$XDG_DATA_HOME` (or `$HOME/.local/share`), then under each
+/// `$XDG_DATA_DIRS` entry (`/usr/local/share:/usr/share` when unset).
+/// Root takes only the two fixed system directories, since every other
+/// name was chosen by the unprivileged caller's environment. A relative
+/// value is ignored, as the cache root ignores one.
+fn provided_stores(uid: u32, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    const SYSTEM: &str = "/usr/local/share:/usr/share";
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if uid == 0 {
+        bases.extend(std::env::split_paths(SYSTEM));
+    } else {
+        let set = |name: &str| var(name).filter(|v| !v.is_empty());
+        let home = set("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+        bases.extend(home);
+        let dirs = set("XDG_DATA_DIRS").unwrap_or_else(|| SYSTEM.into());
+        bases.extend(std::env::split_paths(&dirs));
+    }
+    let mut stores: Vec<PathBuf> = Vec::new();
+    for base in bases.into_iter().filter(|b| b.is_absolute()) {
+        let store = base.join(PROVIDED_STORE_DIR);
+        if !stores.contains(&store) {
+            stores.push(store);
+        }
+    }
+    stores
+}
+
+/// Whether a provided store holds a regular file under the name of the
+/// build `pin` names. Nothing is hashed: like [`stored_path`], this
+/// answers where a launch would look, and the launch verifies.
+pub fn is_provided(pin: &Pin) -> bool {
+    let relative = store_relative(pin);
+    provided_stores(crate::paths::uid(), |name| std::env::var_os(name))
+        .iter()
+        .any(|store| store.join(&relative).is_file())
+}
+
+/// The build `pin` names from the first provided store that holds it,
+/// verified, or `None` when none does. A provided store belongs to
+/// whatever installed it there: the runtime only reads and hashes it,
+/// never writes, fetches into, touches or sweeps it. A candidate that is
+/// refused is reported and skipped, so the launch falls through to the
+/// uid's own store as though it were missing.
+fn provided_build(stores: &[PathBuf], pin: &Pin, uid: u32) -> Option<VerifiedArtifact> {
+    let relative = store_relative(pin);
+    for store in stores {
+        let path = store.join(&relative);
+        match open_provided(&path, &pin.blake3, uid) {
+            Ok(file) => return Some(VerifiedArtifact { path, file }),
+            Err(PinError::Missing) => {}
+            Err(other) => eprintln!(
+                "onelf-rt: ignoring the provided build of {}: {}",
+                pin.label,
+                other.message()
+            ),
+        }
+    }
+    None
+}
+
+/// Open the provided build at `path`, convert it to a readable handle for
+/// the same inode, and hash the handle's bytes against `expected`.
+///
+/// Unlike the own store, a provided store is laid out by a package manager
+/// that links builds in from where it keeps them, so `path` is resolved as
+/// it names itself, symlinks included. What is served is judged by the
+/// inode it resolves to: a regular file owned by the target uid or by
+/// root, with no untrusted write access, whose bytes match the pin. Those
+/// are the only parties that could change it in place after the hash.
+fn open_provided(path: &Path, expected: &str, uid: u32) -> Result<fs::File, PinError> {
+    let origin = path.display().to_string();
+    let fd = match rustix::fs::open(path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::NOTDIR) => return Err(PinError::Missing),
+        Err(e) => return Err(PinError::Final(format!("{origin}: {e}"))),
+    };
+    let meta = fstat(&fd).map_err(|e| PinError::Final(format!("{origin}: {e}")))?;
+    let kind = kind_name(FileType::from_raw_mode(meta.st_mode));
+    if kind != KIND_REGULAR {
+        return Err(PinError::Final(format!(
+            "{origin}: {kind}, not a regular file"
+        )));
+    }
+    if let Some(why) = insecure_provided(meta.st_uid, meta.st_mode, uid) {
+        return Err(PinError::Final(format!(
+            "{origin}: the provided file {why}, so it cannot serve as the pinned build"
+        )));
+    }
+    let mut file = PinnedFile { fd }.readable(&origin, OFlags::empty())?;
+    check_digest(&mut file, expected, &origin).map_err(PinError::Final)?;
+    Ok(file)
+}
+
+/// The build `pin` names: from a provided store when one holds it, else
+/// from the shared store, where the cached file is pinned and hashed
+/// through confined descriptors, and only a missing or mismatching file
+/// is imported from a hinted store the target does not own, or fetched,
+/// then verified and published in its place. Returns the verified handle
+/// every consumer reads through. A build served from a provided store
+/// leaves the shared store unused, so this launch does not sweep it.
 pub(crate) fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
+    let uid = crate::paths::uid();
+    let provided = provided_stores(uid, |name| std::env::var_os(name));
+    if let Some(artifact) = provided_build(&provided, pin, uid) {
+        return Ok(artifact);
+    }
     let (store, relative) = stored_location(pin)?;
     let hint = import_hint();
     let artifact = acquire(
@@ -373,7 +489,7 @@ pub(crate) fn store_build(pin: &Pin) -> Result<VerifiedArtifact, String> {
         &relative,
         pin,
         !env_set("ONELF_NO_PLATFORM_FETCH"),
-        crate::paths::uid(),
+        uid,
         hint.as_deref().filter(|h| *h != store),
     )?;
     note_used_store(&store);
@@ -856,6 +972,22 @@ fn insecure_artifact(file_uid: u32, mode: u32, uid: u32) -> Option<&'static str>
     } else if mode & 0o002 != 0 {
         Some("is writable by other")
     } else if uid == 0 && mode & 0o020 != 0 {
+        Some("is writable by group")
+    } else {
+        None
+    }
+}
+
+/// Why a provided regular file must not serve as the pinned build, or
+/// `None` when the target uid or root owns it and nobody else can write
+/// it. Group write access is refused whenever root is involved, as owner
+/// or as target.
+fn insecure_provided(file_uid: u32, mode: u32, uid: u32) -> Option<&'static str> {
+    if file_uid != uid && file_uid != 0 {
+        Some("is owned by a uid other than this one or root")
+    } else if mode & 0o002 != 0 {
+        Some("is writable by other")
+    } else if (uid == 0 || file_uid == 0) && mode & 0o020 != 0 {
         Some("is writable by group")
     } else {
         None
@@ -2306,6 +2438,132 @@ mod tests {
             Some("is accessible to group or other")
         );
         assert_eq!(insecure_dir(0, 0o700, 0), None);
+    }
+
+    /// An environment lookup over fixed pairs, for the store resolution.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+    }
+
+    #[test]
+    fn provided_stores_follow_the_xdg_data_directories() {
+        let stores = |pairs: &[(&str, &str)], uid| provided_stores(uid, env_of(pairs));
+        let at = |base: &str| PathBuf::from(base).join(PROVIDED_STORE_DIR);
+
+        assert_eq!(
+            stores(&[("HOME", "/home/me")], 1000),
+            [
+                at("/home/me/.local/share"),
+                at("/usr/local/share"),
+                at("/usr/share")
+            ]
+        );
+        assert_eq!(
+            stores(
+                &[
+                    ("HOME", "/home/me"),
+                    ("XDG_DATA_HOME", "/data"),
+                    ("XDG_DATA_DIRS", "relative:/opt/share:/data")
+                ],
+                1000
+            ),
+            [at("/data"), at("/opt/share")],
+            "the data home leads, a relative entry is ignored, a repeat is dropped"
+        );
+        assert_eq!(
+            stores(
+                &[
+                    ("HOME", "/home/me"),
+                    ("XDG_DATA_HOME", "/data"),
+                    ("XDG_DATA_DIRS", "/opt/share")
+                ],
+                0
+            ),
+            [at("/usr/local/share"), at("/usr/share")],
+            "root takes only the fixed system directories"
+        );
+    }
+
+    #[test]
+    fn a_provided_file_is_trusted_from_its_owner_or_root() {
+        assert_eq!(insecure_provided(1000, 0o644, 1000), None);
+        assert_eq!(insecure_provided(1000, 0o664, 1000), None);
+        assert_eq!(insecure_provided(0, 0o644, 1000), None);
+        assert_eq!(
+            insecure_provided(1001, 0o644, 1000),
+            Some("is owned by a uid other than this one or root")
+        );
+        assert_eq!(
+            insecure_provided(1000, 0o646, 1000),
+            Some("is writable by other")
+        );
+        assert_eq!(
+            insecure_provided(0, 0o664, 1000),
+            Some("is writable by group")
+        );
+        assert_eq!(
+            insecure_provided(1000, 0o644, 0),
+            Some("is owned by a uid other than this one or root")
+        );
+        assert_eq!(insecure_provided(0, 0o664, 0), Some("is writable by group"));
+        assert_eq!(insecure_provided(0, 0o644, 0), None);
+    }
+
+    /// A package manager links a build into its provided store from where
+    /// it keeps it. The link is followed, the bytes are verified, and the
+    /// build is served without being touched, so nothing the runtime does
+    /// marks it for collection. The first store holding it wins.
+    #[test]
+    fn a_provided_build_is_served_through_a_link_and_left_untouched() {
+        let c = container();
+        let root = temp_dir("provided");
+        let kept = root.join("kept/set.onelf");
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(&kept, &c.bytes).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86400);
+        fs::File::options()
+            .write(true)
+            .open(&kept)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let empty = root.join("empty");
+        let store = root.join("store");
+        fs::create_dir_all(stored_in(&store, &c.digest).parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&kept, stored_in(&store, &c.digest)).unwrap();
+
+        let pin = pin_for(&c.digest, &root.join("never-fetched"));
+        let artifact = provided_build(&[empty, store.clone()], &pin, me())
+            .expect("the second store provides the build");
+        assert_eq!(artifact.path(), stored_in(&store, &c.digest));
+        assert_eq!(entry_bytes(&reload(&artifact)), FILE_CONTENT);
+        assert_eq!(
+            fs::metadata(&kept).unwrap().modified().unwrap(),
+            old,
+            "a provided build is never touched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A provided file whose bytes are not the pinned ones is skipped, so
+    /// the launch falls through to its own store, and it is left as it
+    /// was: the store is not the runtime's to repair.
+    #[test]
+    fn a_mismatching_provided_build_is_skipped_and_kept() {
+        let c = container();
+        let store = temp_dir("provided-mismatch");
+        let path = stored_in(&store, &c.digest);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not the pinned build").unwrap();
+
+        let pin = pin_for(&c.digest, &store.join("never-fetched"));
+        assert!(provided_build(std::slice::from_ref(&store), &pin, me()).is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"not the pinned build");
+        let _ = fs::remove_dir_all(&store);
     }
 
     /// A user-owned store directory cannot back a privileged acquirer's

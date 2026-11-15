@@ -916,6 +916,9 @@ fn verdicts(
 /// from. The store's place follows the environment, so the report states
 /// the fact, never the path.
 fn stored(pin: &Pin) -> String {
+    if onelf_rt::platform::is_provided(pin) {
+        return "provided by a read-only store".to_string();
+    }
     match onelf_rt::platform::stored_path(pin) {
         Ok(file) if file.is_file() => "stored in the platform store".to_string(),
         _ if env_set("ONELF_NO_PLATFORM_FETCH") => {

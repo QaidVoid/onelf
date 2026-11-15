@@ -130,7 +130,8 @@ by anything else.
 | `ONELF_SET_MODE` | `mount` serves a dependency set from its stored build, the default; `extract` copies it out through the package cache. A host that cannot mount falls back to `extract`. |
 | `XDG_RUNTIME_DIR` | The private per-user directory for mountpoints and rundir trees. Without a usable one the runtime creates `/tmp/onelf-<uid>` with mode `0700` |
 | `XDG_CACHE_HOME` | The onelf cache lives in its `onelf/` subdirectory: the cache mode's packages and the fetched GL builds and dependency sets. Falls back to `$HOME/.cache`. A relative value is ignored, and root ignores both variables in favour of its own private base |
-| `XDG_DATA_HOME` | Where `onelf integrate` installs `.desktop` files and icons (falls back to `$HOME/.local/share`) |
+| `XDG_DATA_HOME` | Where `onelf integrate` installs `.desktop` files and icons (falls back to `$HOME/.local/share`). Its `onelf/platform/` is also the first place a launch looks for a [provided build](../guide/sysroot#provided-builds) |
+| `XDG_DATA_DIRS` | Each entry's `onelf/platform/` is searched for a [provided build](../guide/sysroot#provided-builds) after `XDG_DATA_HOME`'s (`/usr/local/share:/usr/share` when unset). Root ignores both variables and searches only those two directories |
 
 ## Portable directory redirection
 

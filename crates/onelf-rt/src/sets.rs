@@ -1063,7 +1063,9 @@ mod selection_tests {
             .env("ONELF_SET_MODE", "extract")
             .env("ONELF_NO_RESOLVER", "1")
             .env("ONELF_PLATFORM_STORE", &sandbox.store)
-            .env("XDG_CACHE_HOME", &sandbox.cache);
+            .env("XDG_CACHE_HOME", &sandbox.cache)
+            .env("XDG_DATA_HOME", sandbox.dir.join("data"))
+            .env("XDG_DATA_DIRS", sandbox.dir.join("data-dirs"));
         if fetch_prohibited {
             command.env("ONELF_NO_PLATFORM_FETCH", "1");
         } else {
@@ -1133,6 +1135,41 @@ mod selection_tests {
     /// A partial selection obtains exactly its canonical pin. The
     /// unselected set's source does not exist here, so any attempt at it
     /// would fail the launch and name it.
+    /// A set a package manager installed into the provided store under the
+    /// XDG data home is used as it stands: nothing is fetched, the uid's
+    /// own store is never written, and the provided build is not touched.
+    #[test]
+    fn a_provided_set_needs_neither_the_store_nor_a_fetch() {
+        let sandbox = sandbox("provided");
+        let kept = sandbox.dir.join("kept");
+        let qt = build_artifact(&kept, [4; 32]);
+        let provided = sandbox
+            .dir
+            .join("data/onelf/platform/qt")
+            .join(format!("{}.onelf", hex(&qt)));
+        fs::create_dir_all(provided.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&kept, &provided).unwrap();
+        let used = fs::metadata(&kept).unwrap().modified().unwrap();
+        let sets = table(&[("qt", "file:///nonexistent/qt.onelf", &hex(&qt))]);
+
+        let (code, stderr) = launch(
+            "provided",
+            &[(crate::sets::SETS_FILE, sets)],
+            &sandbox,
+            true,
+        );
+        assert_eq!(code, Some(7), "{stderr}");
+        assert!(
+            tree_is_empty(&sandbox.store),
+            "the own store must stay untouched"
+        );
+        assert_eq!(
+            fs::metadata(&kept).unwrap().modified().unwrap(),
+            used,
+            "a provided build is never touched"
+        );
+    }
+
     #[test]
     fn a_partial_selection_obtains_its_pin_and_ignores_unavailable_unselected_sets() {
         let sandbox = sandbox("partial");

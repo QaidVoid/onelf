@@ -185,6 +185,7 @@ Detail: [Execution Modes](./execution-modes).
 | provenance | The record of which sysroot and packages a bundle came from |
 | GL build | A package of Mesa and its drivers a sysroot names for hosts that have none, pinned by hash |
 | platform store | Where fetched GL builds live under the cache root, one directory per sysroot label |
+| provided build | A GL build or dependency set a package manager installed under an XDG data directory, which a launch uses without fetching and never removes |
 | resolver | The launch-time step that chooses each library from the bundle or the host |
 | link farm | The directory of chosen host libraries the resolver makes; each one the bundle lacks is shown in the bundle's library directory |
 | rung, mode | One way of exposing the bundle to the kernel; the ladder tries them in order |

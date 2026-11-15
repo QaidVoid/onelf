@@ -380,6 +380,38 @@ the reason, rather than failing later at the first missing symbol.
 `ONELF_NO_PLATFORM_FETCH` and `ONELF_PLATFORM_STORE` apply to sets as
 they do to the GL build.
 
+### Provided builds
+
+A package manager can install GL builds and dependency sets itself, so
+the packages it installs never fetch them. It places each build at
+`onelf/platform/<label>/<blake3>.onelf` under an XDG data directory,
+the same name the platform store uses, as a file or a symlink to where
+it keeps the build:
+
+```
+~/.local/share/onelf/platform/gtk3/eadb7e22...6bf3b.onelf
+```
+
+Before its own store, a launch looks under `$XDG_DATA_HOME` (or
+`~/.local/share`), then under each `$XDG_DATA_DIRS` entry
+(`/usr/local/share` and `/usr/share` when unset). Root looks only under
+`/usr/local/share` and `/usr/share`. The first build there whose bytes
+match the pin is used as it stands, and when none is, the launch goes
+on to its own store, the import and the fetch as before.
+
+✅ A provided store belongs to whatever installed into it. The runtime
+only reads it: nothing there is written, fetched into, touched to mark
+a use, or swept as idle, however long a build goes unused. Removing a
+build is the package manager's job, done when nothing installed still
+pins it. A launch served entirely from provided builds leaves the
+platform store under the cache root untouched.
+
+✅ What a provided build resolves to is checked like any stored build.
+A symlink is followed, and the file it reaches must be a regular file
+owned by the launching user or by root that no one else can write, and
+its bytes must match the pin. A provided build that fails any check is
+reported and skipped, never repaired.
+
 ### Store trust
 
 ✅ The pin is checked against the bytes, not the name. Before a stored
