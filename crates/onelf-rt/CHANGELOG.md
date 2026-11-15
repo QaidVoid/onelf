@@ -1,4 +1,10 @@
 
+## [0.6.2](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.6.1...onelf-rt-v0.6.2) - 2026-11-15
+
+### ⛰️  Features
+
+- *(rt)* Use builds provided under XDG data directories - ([96b2d7e](https://github.com/QaidVoid/onelf/commit/96b2d7e4c170f686449c867dd175ea4b0a970a20))
+
 ## [0.6.1](https://github.com/QaidVoid/onelf/compare/onelf-rt-v0.6.0...onelf-rt-v0.6.1) - 2026-11-14
 
 ### ⛰️  Features
